@@ -53,7 +53,9 @@
 //     adding it is a protocol change, not a panel change.
 //
 // So the fence is the PAIR: a turn must be in flight in this tab, AND the
-// conversation that turn was captured under must be the conversation on screen.
+// conversation that turn was captured under must be the conversation on screen
+// (with one carefully-bounded case for a turn that began before this view had a
+// conversation at all — see classifyInteractiveCard below).
 //
 // WHAT THIS DOES NOT REACH (my own adversarial gate, round 1 — recorded here so
 // the next reader does not have to rediscover it). Both residuals have the SAME
@@ -104,24 +106,55 @@ export const INTERACTIVE_CARD_CMDS = new Set(["request_secret", "ask_user"]);
  *  - `shownThreadId`  — the conversation currently on screen (`thread?.id`), or
  *                       null for the pre-first-message view.
  *
+ *  - `turnStartedAt`  — when that turn started (`liveTurnStartedAt`), 0 when none.
+ *  - `shownThreadCreatedAt` — the shown conversation's `createdAt`, or null.
+ *
  * Returns `{ paint, reason }`; `reason` is null when painting.
  *
- * The null-owner case (`turnThreadId === null` while a turn is in flight) is
- * ALLOWED only against a screen that is also conversation-less, and that is not
- * leniency — it is the same equality, and the pairing is safe by construction:
- * a turn whose owner is null began on a view that had no conversation, so there
- * is no other conversation for it to leak into, and every way the user REACHES a
- * different existing conversation (loadThread / newChat / a workflow switch)
- * calls endTurnLocally() first, which fails the `agentWorking` check above. The
- * remaining way the screen changes mid-turn — detachInvalidCurrentThread(), a
- * sync from another tab replacing the active conversation — can only fire when
- * there WAS an active conversation, i.e. when the owner is not null, and that is
- * caught by the inequality.
+ * THE NULL-OWNER CASE (`turnThreadId === null` while a turn is in flight) needs
+ * the last two arguments and is the subtlest part of this (my own gate, round 2 —
+ * an earlier version got it wrong in BOTH directions, so both are spelled out).
+ *
+ * `liveTurnThreadId` is captured in onTurn("working") as `thread?.id ?? null`, so
+ * it is null for a turn that began on a view with no conversation yet. Such a
+ * turn is not owner-less — it owns the conversation IT creates. record() mints
+ * that conversation from the turn's own first message/output, stamping
+ * `createdAt` with the same clock, and does NOT retroactively update
+ * liveTurnThreadId. So:
+ *
+ *   * Refusing whenever `owner !== shown` false-refuses that legitimate card: the
+ *     agent emits a progress `say` (which mints the thread) and then asks.
+ *   * Painting whenever `owner === null` re-opens a hole: loadThread()'s
+ *     cross-workflow BLOCKED branch calls detachInvalidCurrentThread({rebind}) and
+ *     returns WITHOUT endTurnLocally(), so a thread-less live turn can find an
+ *     OLD conversation on screen that it does not own.
+ *
+ * The discriminator is therefore whether the shown conversation came into
+ * existence DURING this turn: `createdAt >= turnStartedAt` means record() minted
+ * it here; anything older was put on screen by something else. Missing/unusable
+ * timestamps fail CLOSED.
  */
-export function classifyInteractiveCard({ agentWorking, turnThreadId, shownThreadId } = {}) {
+export function classifyInteractiveCard({
+  agentWorking,
+  turnThreadId,
+  shownThreadId,
+  turnStartedAt,
+  shownThreadCreatedAt,
+} = {}) {
   if (!agentWorking) return { paint: false, reason: "no_live_turn" };
   const owner = turnThreadId ?? null;
   const shown = shownThreadId ?? null;
+  if (owner === null) {
+    // Nothing on screen either: the turn began on an empty view and it is still
+    // empty. There is no other conversation for the card to land in.
+    if (shown === null) return { paint: true, reason: null };
+    const created = Number(shownThreadCreatedAt);
+    const started = Number(turnStartedAt);
+    if (Number.isFinite(created) && Number.isFinite(started) && started > 0 && created >= started) {
+      return { paint: true, reason: null };
+    }
+    return { paint: false, reason: "other_conversation" };
+  }
   if (owner !== shown) return { paint: false, reason: "other_conversation" };
   return { paint: true, reason: null };
 }

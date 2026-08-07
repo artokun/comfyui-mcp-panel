@@ -54,12 +54,74 @@ test("the normal path paints: a live turn in the conversation on screen", () => 
 });
 
 test("a turn in flight before any conversation exists paints against the empty view", () => {
-  // Owner and screen are both null — the same equality, not a special case. There
-  // is no other conversation for such a turn to leak into.
+  // Owner and screen are both null — there is no other conversation for such a
+  // turn to leak into.
   assert.deepEqual(
     classifyInteractiveCard({ agentWorking: true, turnThreadId: null, shownThreadId: null }),
     { paint: true, reason: null },
   );
+});
+
+test("an owner-less turn paints into the conversation IT minted", () => {
+  // Gate round 2: the turn began on a blank view (owner null), then its own
+  // progress `say` ran record(), which minted the conversation now on screen.
+  // That conversation IS this turn's. Refusing it was a real false refusal.
+  assert.deepEqual(
+    classifyInteractiveCard({
+      agentWorking: true,
+      turnThreadId: null,
+      shownThreadId: "t-new",
+      turnStartedAt: 1000,
+      shownThreadCreatedAt: 1000, // minted in the same tick as the turn start
+    }),
+    { paint: true, reason: null },
+  );
+  assert.equal(
+    classifyInteractiveCard({
+      agentWorking: true,
+      turnThreadId: null,
+      shownThreadId: "t-new",
+      turnStartedAt: 1000,
+      shownThreadCreatedAt: 4000,
+    }).paint,
+    true,
+    "minted later in the same turn is still this turn's conversation",
+  );
+});
+
+test("an owner-less turn does NOT paint into a conversation that predates it", () => {
+  // The hole the other direction would open: loadThread()'s cross-workflow
+  // BLOCKED branch calls detachInvalidCurrentThread({rebind:true}) and returns
+  // WITHOUT endTurnLocally(), so an OLD conversation can land on screen under a
+  // thread-less live turn.
+  assert.deepEqual(
+    classifyInteractiveCard({
+      agentWorking: true,
+      turnThreadId: null,
+      shownThreadId: "t-old",
+      turnStartedAt: 5000,
+      shownThreadCreatedAt: 4999,
+    }),
+    { paint: false, reason: "other_conversation" },
+  );
+});
+
+test("an owner-less turn fails CLOSED when the timestamps cannot decide", () => {
+  const base = { agentWorking: true, turnThreadId: null, shownThreadId: "t-x" };
+  for (const extra of [
+    {}, // no timestamps at all
+    { turnStartedAt: 0, shownThreadCreatedAt: 1000 }, // no turn start recorded
+    { turnStartedAt: 1000 }, // legacy thread with no createdAt
+    { turnStartedAt: 1000, shownThreadCreatedAt: null },
+    { turnStartedAt: 1000, shownThreadCreatedAt: "yesterday" },
+    { turnStartedAt: Number.NaN, shownThreadCreatedAt: 2000 },
+  ]) {
+    assert.deepEqual(
+      classifyInteractiveCard({ ...base, ...extra }),
+      { paint: false, reason: "other_conversation" },
+      `must fail closed for ${JSON.stringify(extra)}`,
+    );
+  }
 });
 
 test("no live turn → refused (the abandoned/superseded turn, the reported shape)", () => {
@@ -86,13 +148,11 @@ test("live turn, but the conversation on screen is a different one → refused",
   );
 });
 
-test("live turn owned by a conversation, screen has none (and vice versa) → refused", () => {
+test("live turn owned by a conversation, screen has none → refused", () => {
+  // detachInvalidCurrentThread() with no replacement: another tab deleted the
+  // conversation this turn belongs to.
   assert.deepEqual(
     classifyInteractiveCard({ agentWorking: true, turnThreadId: "t-A", shownThreadId: null }),
-    { paint: false, reason: "other_conversation" },
-  );
-  assert.deepEqual(
-    classifyInteractiveCard({ agentWorking: true, turnThreadId: null, shownThreadId: "t-B" }),
     { paint: false, reason: "other_conversation" },
   );
 });
@@ -106,7 +166,7 @@ test("undefined inputs are refused, never treated as a match", () => {
   assert.equal(
     classifyInteractiveCard({ agentWorking: true, shownThreadId: "t-B" }).paint,
     false,
-    "an absent owner against a real conversation must not paint",
+    "an absent owner against a real conversation, with no timestamps, must not paint",
   );
 });
 
@@ -191,11 +251,56 @@ test("the shipped handlers call the fence, and call it BEFORE painting", () => {
   assert.ok(onSecretSrc.includes('fenceInteractiveCard("request_secret")'));
 });
 
-test("the fence reads all three inputs from live panel state", () => {
+test("the fence reads every input from live panel state", () => {
   const src = fenceMatch[0];
   assert.ok(/agentWorking,/.test(src), "reads the live-turn flag");
   assert.ok(/turnThreadId: liveTurnThreadId/.test(src), "reads the live turn's owner");
   assert.ok(/shownThreadId: thread\?\.id \?\? null/.test(src), "reads the conversation on screen");
+  assert.ok(/turnStartedAt: liveTurnStartedAt/.test(src), "reads when the live turn started");
+  assert.ok(
+    /shownThreadCreatedAt: thread\?\.createdAt \?\? null/.test(src),
+    "reads when the shown conversation was created",
+  );
+});
+
+test("the owner-less discriminator is anchored to the SAME clock record() mints with", () => {
+  // The null-owner rule compares `thread.createdAt` against `liveTurnStartedAt`.
+  // That only means anything if the mint stamps createdAt from Date.now() and the
+  // turn start is stamped from Date.now() too. Pin both, so a future change to
+  // either (e.g. a monotonic counter, or a server-supplied createdAt) fails here
+  // rather than silently turning the comparison into nonsense.
+  const mint = panelSrc.match(/if \(!thread\) \{\n\s*const now = Date\.now\(\);[\s\S]*?createdAt: now,/);
+  assert.ok(mint, "record()'s mint must stamp createdAt from Date.now()");
+  assert.ok(
+    /liveTurnStartedAt = Date\.now\(\); \/\/ owner-less turns are identified by this/.test(panelSrc),
+    "onTurn('working') must stamp liveTurnStartedAt from Date.now()",
+  );
+  assert.ok(
+    /liveTurnThreadId = null;\n\s*liveTurnStartedAt = 0;/.test(panelSrc),
+    "onTurn('done') must clear liveTurnStartedAt alongside the owner",
+  );
+  // record() must NOT retroactively adopt the minted thread as the turn owner —
+  // if it ever did, the timestamp rule would be dead code pretending to guard.
+  const recordFn = panelSrc.slice(panelSrc.indexOf("if (!thread) {"), panelSrc.indexOf("if (!thread) {") + 2500);
+  assert.ok(
+    !recordFn.includes("liveTurnThreadId"),
+    "record() does not touch liveTurnThreadId — the timestamp rule is what covers the mint",
+  );
+});
+
+test("loadThread's BLOCKED cross-workflow branch is the reason the mint rule is timestamped", () => {
+  // It calls detachInvalidCurrentThread({rebind:true}) and RETURNS without
+  // endTurnLocally(), so an OLD conversation can appear under a thread-less live
+  // turn. Pin the shape — if this branch ever starts ending the turn, the
+  // timestamp rule becomes belt-and-braces rather than load-bearing, and whoever
+  // relaxes it should see this test.
+  const start = panelSrc.indexOf("function loadThread(t) {");
+  const blocked = panelSrc.slice(start, panelSrc.indexOf("endTurnLocally();", start));
+  assert.ok(
+    blocked.includes("detachInvalidCurrentThread({ scopeKey, rebind: true });"),
+    "the blocked branch rebinds the visible conversation",
+  );
+  assert.ok(blocked.includes("return false;"), "and returns before endTurnLocally()");
 });
 
 test("the fence never logs or journals a collected value", () => {
@@ -249,6 +354,7 @@ function buildHandlers() {
             bumpThinking, noteActivity, lsSet, SECRET_SET_AT_PREFIX, console } = deps;
     let agentWorking = false;
     let liveTurnThreadId = null;
+    let liveTurnStartedAt = 0;
     let thread = null;
     let pendingSecretRequest = null;
     ${fenceMatch[0]}
@@ -261,7 +367,10 @@ function buildHandlers() {
       setState(s) {
         agentWorking = s.agentWorking;
         liveTurnThreadId = s.turnThreadId ?? null;
-        thread = s.shownThreadId ? { id: s.shownThreadId } : null;
+        liveTurnStartedAt = s.turnStartedAt ?? 1000;
+        thread = s.shownThreadId
+          ? { id: s.shownThreadId, createdAt: s.shownThreadCreatedAt ?? 0 }
+          : null;
       },
       armSettingsRequest(req) { pendingSecretRequest = req; },
       pendingSecretRequest: () => pendingSecretRequest,
@@ -395,6 +504,7 @@ function buildLifecycle() {
             STALE_WORKING_GUARD_MS, now } = deps;
     let agentWorking = false;
     let liveTurnThreadId = null;
+    let liveTurnStartedAt = 0;
     let thread = null;
     let localEndAt = 0;
     let pendingSecretRequest = null;
@@ -410,7 +520,11 @@ function buildLifecycle() {
     return {
       host,
       endTurnLocally,
-      showConversation(id) { thread = id ? { id } : null; },
+      // Selecting an EXISTING conversation: createdAt is whatever it already had.
+      showConversation(id, createdAt) { thread = id ? { id, createdAt: createdAt ?? 0 } : null; },
+      // What record()'s mint branch does: id + createdAt stamped from the SAME
+      // Date.now() the rest of this closure reads.
+      mintConversation(id) { thread = { id, createdAt: Date.now() }; },
       state: () => ({ agentWorking, liveTurnThreadId, shown: thread?.id ?? null }),
     };
   `,
@@ -469,6 +583,35 @@ test("LIFECYCLE: the real interrupt path (endTurnLocally) makes the real handler
   assert.equal(reply.ok, false);
   assert.match(reply.error, /request_secret/);
   assert.deepEqual(h.painted, [], "the secure input never reached conversation B");
+});
+
+test("LIFECYCLE: a turn that starts blank and MINTS its conversation still paints", async () => {
+  // Gate round 2's false refusal, through the shipped onTurn + fence: the turn
+  // begins on an empty view, its own output mints the conversation, then it asks.
+  const h = buildLifecycle();
+  h.showConversation(null);
+  h.host.onTurn("working");
+  h.tick(40);
+  h.mintConversation("t-new"); // what record() does on the turn's first output
+  assert.deepEqual(h.state(), { agentWorking: true, liveTurnThreadId: null, shown: "t-new" });
+
+  assert.equal(await h.host.onSecret({ label: "Paste your API token" }), "typed-answer");
+  assert.deepEqual(h.painted.map((p) => p.card), ["secret"]);
+});
+
+test("LIFECYCLE: a blank-start turn is still refused against a PRE-EXISTING conversation", async () => {
+  // loadThread()'s blocked cross-workflow branch: detach rebinds an OLD
+  // conversation onto the screen without ending the turn.
+  const h = buildLifecycle();
+  h.showConversation(null);
+  h.tick(5000);
+  h.host.onTurn("working");
+  h.showConversation("t-old", h.at() - 60000); // created long before this turn
+
+  const reply = await dispatch(() => h.host.onSecret({ label: "Paste your API token" }));
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /different conversation/i);
+  assert.deepEqual(h.painted, []);
 });
 
 test("LIFECYCLE: an interrupted turn cannot resurrect a secure input in its OWN conversation", async () => {
