@@ -799,3 +799,110 @@ test("#695 gate r1: the type list is deduped and first-seen ordered, as it alway
     { type: "ZED", inputs: ["other"], linkProven: false },
   ]);
 });
+
+// ── #686: core V3 DYNAMIC-INPUT declarations ──────────────────────────────
+//
+// panel_add_node could not create ANY node whose schema uses ComfyUI 0.30's
+// autogrow input type — StringFormat, ComfyMathExpression — failing with
+// "Required custom widget COMFY_AUTOGROW_V3 have not registered … retry
+// shortly". It never resolved: refresh_nodes returned refreshed:true and the
+// next attempt failed identically, while dragging the same node in from
+// ComfyUI's own menu worked and the node then executed normally.
+//
+// It is a THIRD kind of required input that both existing waivers misclassify:
+// nothing OUTPUTS the type (so `linkProven` is structurally unreachable) and no
+// widget constructor is ever registered for it (the frontend implements it
+// natively), so the wait was for something that could never happen.
+
+const AUTOGROW = "COMFY_AUTOGROW_V3";
+/** app.widgets with the ordinary value types registered — AUTOGROW never is. */
+const REGISTERED = { STRING: () => {}, FLOAT: () => {}, INT: () => {} };
+
+/** StringFormat as ComfyUI 0.30 emits it. Autogrow's Input.as_dict() yields the
+ *  base neutral keys plus `template`, and NO widget-value keys. */
+const stringFormatDef = {
+  input: {
+    required: {
+      format: ["STRING", { default: "{a}_{b:02d}" }],
+      values: [AUTOGROW, { template: { input: ["STRING", {}], prefix: "value", min: 1, max: 10 } }],
+    },
+  },
+};
+
+test("#686 an autogrow node is addable — StringFormat no longer waits for a widget that never registers", () => {
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(stringFormatDef, REGISTERED, undefined, stringFormatDef),
+    [],
+  );
+});
+
+test("#686 the waiver cannot come from output evidence — knownSocketTypes can never contain it", () => {
+  // The load-bearing point. Nothing outputs COMFY_AUTOGROW_V3, so passing a fully
+  // populated knownSocketTypes changes nothing: if the fix depended on link-proof
+  // it would still fail closed forever. Same verdict with and without.
+  const known = new Set(["IMAGE", "MASK", "LATENT", "STRING"]);
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(stringFormatDef, REGISTERED, known, stringFormatDef),
+    [],
+  );
+});
+
+test("#686 covers the whole reserved COMFY_*_V3 family, not just the reported type", () => {
+  // ComfyMathExpression is the second node in the report, and the other three are
+  // declared alongside autogrow in ComfyUI's comfy_api/latest/_io.py. Fixing only
+  // the reported one would leave the identical bug for its siblings.
+  for (const type of [
+    "COMFY_AUTOGROW_V3",
+    "COMFY_DYNAMICCOMBO_V3",
+    "COMFY_DYNAMICSLOT_V3",
+    "COMFY_MATCHTYPE_V3",
+    "COMFY_MULTITYPED_V3",
+  ]) {
+    const def = { input: { required: { values: [type, { template: {} }] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, REGISTERED, undefined, def),
+      [],
+      `${type} must be addable`,
+    );
+  }
+});
+
+test("#686 does NOT weaken #580: an unregistered custom widget still fails closed", () => {
+  const def = { input: { required: { thing: ["SOME_CUSTOM_WIDGET", { default: 1, min: 0 }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, REGISTERED, undefined, def),
+    ["SOME_CUSTOM_WIDGET"],
+  );
+});
+
+test("#686 the input-level bar still applies — a COMFY_*_V3 input declaring WIDGET keys keeps waiting", () => {
+  // The waiver is namespace AND socket-shaped declaration, not namespace alone.
+  // An input that declares default/min/max is asking to carry a value, so it still
+  // needs a constructor — admitting it would be a #580 false accept.
+  const def = { input: { required: { v: [AUTOGROW, { default: 5, min: 0, max: 9 }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, REGISTERED, undefined, def),
+    [AUTOGROW],
+  );
+});
+
+test("#686 matches the RESERVED namespace only — a lookalike is not waived", () => {
+  // The rule is ComfyUI's own COMFY_*_V3 prefix. A third-party type that merely
+  // resembles it gets no waiver.
+  for (const type of ["COMFY_FAKE_V2", "COMFY_THING", "MYPACK_AUTOGROW_V3", "comfy_autogrow_v3"]) {
+    const def = { input: { required: { v: [type, {}] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, REGISTERED, undefined, def),
+      [type],
+      `${type} must NOT be waived`,
+    );
+  }
+});
+
+test("#686 a registered constructor still wins — the waiver never shadows a real widget", () => {
+  const def = { input: { required: { v: [AUTOGROW, { template: {} }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, { ...REGISTERED, [AUTOGROW]: () => {} }, undefined, def),
+    [],
+  );
+});

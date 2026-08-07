@@ -192,6 +192,16 @@ export function unavailableRequiredWidgetReport(
     // exactly the same bar — LTXV's `("FLOAT,INT", {default, min, max, step})` is a
     // widget that ACCEPTS an int link, not a socket, and still waits for its constructor.
     if (linkProven && socketDeclared.has(type)) continue;
+    // #686 — a CORE DYNAMIC-INPUT declaration is neither of the two things the waivers
+    // above test for, so both misclassify it and it fails closed forever. See
+    // isCoreDynamicV3Type: it is not a link datatype (nothing outputs it, so
+    // knownSocketTypes can never contain it and `linkProven` is unreachable), and it is
+    // not a value widget (no constructor is ever registered for it — the frontend
+    // implements it natively). The input-level bar still applies: the declaration must
+    // itself be socket-shaped, so a COMFY_*_V3 input that declares widget-value keys is
+    // still held for its constructor. Single-member only — a union naming a dynamic
+    // declaration is not a shape ComfyUI emits, and admitting one would be guessing.
+    if (members.length === 1 && isCoreDynamicV3Type(type) && socketDeclared.has(type)) continue;
     report.push({ type, inputs, linkProven });
   }
   return report;
@@ -224,6 +234,44 @@ export function unavailableRequiredWidgetMessage(report, classType, waitedMs) {
     "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
     "any wait."
   );
+}
+
+/**
+ * ComfyUI's CORE V3 dynamic-input declarations, which occupy the reserved `COMFY_*_V3`
+ * type namespace: `COMFY_AUTOGROW_V3`, `COMFY_DYNAMICCOMBO_V3`, `COMFY_DYNAMICSLOT_V3`,
+ * `COMFY_MATCHTYPE_V3`, `COMFY_MULTITYPED_V3` (declared with `@comfytype(io_type=…)` in
+ * ComfyUI's `comfy_api/latest/_io.py`).
+ *
+ * These are a THIRD kind of required input, and the reason #686 failed closed forever:
+ *
+ *   • Not a value widget. No widget constructor is ever registered for them — the
+ *     frontend implements the dynamic behaviour natively — so waiting for `app.widgets`
+ *     to gain one waits for something that never happens. The reporter proved this
+ *     directly: dragging `StringFormat` in from ComfyUI's own node menu works, and the
+ *     node then wires and executes normally, so the def is valid and complete.
+ *   • Not a link datatype. Nothing OUTPUTS `COMFY_AUTOGROW_V3`, so no fresh
+ *     /object_info can ever put it in `knownSocketTypes`, and `linkProven` is
+ *     structurally unreachable for it.
+ *
+ * The input is a TEMPLATE that makes the node grow real inputs; it carries no prompt
+ * value of its own, which is why `StringFormat` and `ComfyMathExpression` are perfectly
+ * valid the instant they are created.
+ *
+ * MATCHED BY RESERVED NAMESPACE, NOT BY A LIST — deliberately. This module already
+ * carries the lesson: "Growing [SAFE_SOCKET_TYPES] is not how a new core datatype gets
+ * fixed — #695 was filed after MASK, and would have been filed again after the next
+ * one." Enumerating today's five would need editing the moment ComfyUI adds a sixth, and
+ * that report would look exactly like this one. `COMFY_*_V3` is ComfyUI's own reserved
+ * prefix for these, so the rule covers the family rather than its current membership.
+ *
+ * #580's protection is intact: this waives ONLY the reserved core namespace, and the
+ * caller still requires the input to declare itself socket-shaped, so an input using one
+ * of these types while declaring widget-value keys keeps waiting for a constructor.
+ */
+const CORE_DYNAMIC_V3_TYPE_RE = /^COMFY_[A-Z0-9]+_V3$/;
+
+export function isCoreDynamicV3Type(type) {
+  return typeof type === "string" && CORE_DYNAMIC_V3_TYPE_RE.test(type);
 }
 
 /**
