@@ -143,6 +143,7 @@ import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot } from "./lib/active-sidebar-tab.js";
+import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -27264,16 +27265,39 @@ function registerExtensionWhenReady(tries = 0) {
         // switches to another sidebar tab) only DETACHES it — the agent keeps
         // working in the background and the sidebar-icon badge shows its state.
         render: (container) => {
-          if (!mounted) mounted = buildPanel();
-          // Make the tab content a full-height flex column so the panel's header
-          // and input pin to the edges and only the chat body scrolls (the
-          // container otherwise sizes to content and the whole panel scrolls).
-          container.style.height = "100%";
-          container.style.minHeight = "0";
-          container.style.display = "flex";
-          container.style.flexDirection = "column";
-          container.appendChild(mounted.root);
-          mounted.onShow?.();
+          // #779 — A BLANK TAB IS NOT AN ACCEPTABLE FAILURE STATE. ComfyUI mounts
+          // us with `mountCustomExtension = (e, t) => e.render(t)` and has no
+          // handler, so anything that throws in here leaves the container empty
+          // with nothing in the console attributed to us. A reporter could not
+          // tell "broken" from "not connected" from "not installed" and spent an
+          // hour reinstalling ComfyUI. Whatever fails, say so in the tab.
+          try {
+            if (!mounted) mounted = buildPanel();
+            // Make the tab content a full-height flex column so the panel's header
+            // and input pin to the edges and only the chat body scrolls (the
+            // container otherwise sizes to content and the whole panel scrolls).
+            container.style.height = "100%";
+            container.style.minHeight = "0";
+            container.style.display = "flex";
+            container.style.flexDirection = "column";
+            container.appendChild(mounted.root);
+            mounted.onShow?.();
+          } catch (err) {
+            // Do not leave a half-built root behind — it would be neither the
+            // panel nor the notice, and the next render() would append a second.
+            mounted = null;
+            try {
+              console.error("[comfyui-mcp-panel] panel construction failed", err);
+            } catch { /* a logger that throws must not also eat the notice */ }
+            const shell = buildPanelFailureShell(document, err, {
+              panelVersion: typeof PANEL_VERSION === "string" ? PANEL_VERSION : undefined,
+              frontendVersion:
+                window.__COMFYUI_FRONTEND_VERSION__ ??
+                app?.extensionManager?.frontendVersion ??
+                undefined,
+            });
+            if (shell) container.appendChild(shell);
+          }
         },
         destroy: () => {
           // Detach only — never mounted.destroy(). Tearing down here is what used
