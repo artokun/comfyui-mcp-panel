@@ -1,3 +1,5 @@
+import { importFailureNote } from "./pack-import-failures.js";
+
 /**
  * panel#775 — API/prompt-format workflows ARE loadable. The panel was refusing
  * them on a premise that is false.
@@ -106,7 +108,7 @@ export function apiLoadShortfall(apiData, landedNodes) {
  * consequence a caller cannot see from a node count. Names missing types only
  * when there are any.
  */
-export function apiLoadNote(shortfall) {
+export function apiLoadNote(shortfall, importFailures = []) {
   const layout =
     "Loaded from API/prompt format via the frontend's own importer. Node positions are " +
     "NOT in that format, so the layout is generated rather than the author's — execution " +
@@ -126,6 +128,13 @@ export function apiLoadNote(shortfall) {
     }, so ${nodeCount > 1 ? "those nodes" : "that node"} did not load and anything wired to ${
       nodeCount > 1 ? "them is" : "it is"
     } now disconnected — this graph will fail at queue time, not at load time. Install the ` +
-    `custom-node pack that provides ${typeCount > 1 ? "them" : "it"} and load again.`
+    `custom-node pack that provides ${typeCount > 1 ? "them" : "it"} and load again.` +
+    // #775 — "install the pack" is WRONG ADVICE when the pack is installed and
+    // failed to import. I followed it on my own machine, reported a missing
+    // dependency on a public issue, and had to correct it: ComfyUI-LTXVideo had
+    // IMPORT FAILED, so none of its nodes registered while the core comfy_extras
+    // LTX nodes resolved fine — 34 of 35 present, and a broken install looked
+    // exactly like a bad manifest.
+    importFailureNote(importFailures)
   );
 }
