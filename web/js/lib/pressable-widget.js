@@ -14,10 +14,16 @@
  * a bare availability list infers a typo, and the reporter's agent fell back to
  * chaining `LoraLoaderModelOnly` nodes — losing the stacking UI they wanted.
  *
- * This is the verification half of #757 and nothing more. Pressing the button is
- * a new capability (`panel_press_widget`) and is parked behind the stabilization
- * pass. Naming a control that is already visible in the message we ALREADY send
- * cannot make anything worse.
+ * This is the verification half of #757 and nothing more. Pressing the button
+ * would be a new capability — a press-a-widget tool that invokes the widget's own
+ * click handler — and is parked behind the stabilization pass. Naming a control
+ * that is already visible in the message we ALREADY send cannot make anything
+ * worse.
+ *
+ * (That tool is described in prose rather than by a `panel_`-prefixed name on
+ * purpose: the vocabulary gate scans every such identifier, comments included,
+ * and it is right to — a name in a comment is one copy-paste from a hint string,
+ * and a hint string is read by the model. It caught this exact line.)
  *
  * WHY NOT `type === "button"`. That was the obvious check and it is wrong here.
  * rgthree's `RgthreeBetterButtonWidget` sets `this.type = "custom"` (verified in
