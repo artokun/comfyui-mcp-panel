@@ -388,8 +388,12 @@ test("#607 the dispatch-time fence also re-advertises before refusing", () => {
   const marker = "const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];";
   const start = SRC.indexOf(marker);
   assert.notEqual(start, -1);
-  const end = SRC.indexOf("workflow instance mismatch:", start);
-  assert.notEqual(end, -1);
+  // #750 moved the refusal TEXT into one shared builder (both dispatch sites used
+  // to carry their own copy), so the literal no longer appears after this point.
+  // Anchor on the call to that builder instead — same place in the flow, and it
+  // now also fails if a site goes back to hand-rolling its own message.
+  const end = SRC.indexOf("workflowInstanceMismatchMessage(", start);
+  assert.notEqual(end, -1, "the dispatch fence must refuse via the shared builder");
   const fenceRegion = SRC.slice(start, end);
   const noteAt = fenceRegion.indexOf("noteWorkflowInstanceMismatch();");
   assert.notEqual(noteAt, -1, "the dispatch fence must re-advertise on refusal");

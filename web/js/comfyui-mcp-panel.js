@@ -2010,23 +2010,63 @@ function noteWorkflowInstanceMismatch() {
     // best-effort — the refusal stands regardless
   }
 }
+/** #750 — the ONE spelling of the fence refusal, reporting WHAT WAS COMPARED
+ *  rather than inferring why the two differed.
+ *
+ *  The old text asserted a single cause: "the workflow was switched or replaced
+ *  after it was issued". That is an inference, and it is frequently wrong. In the
+ *  report behind #750 no panel tab was connected at all, and it took six tool
+ *  calls to reach that far more actionable diagnosis. In the wedge behind
+ *  artokun/comfyui-mcp#932 the cause was that the session's fence could never be
+ *  REBOUND — nothing had been switched or replaced by anyone.
+ *
+ *  A mismatch is two identities failing to be equal. It can equally mean the
+ *  workflow was switched, that the fence was never established, that the identity
+ *  could not be read, or that the canvas is gone. Naming one of those sends the
+ *  diagnosis down a path the panel never observed — the same
+ *  reports-the-request-not-the-effect class cleared elsewhere in this file.
+ *
+ *  The leading `workflow instance mismatch:` token is preserved deliberately: it
+ *  is what readers and existing reports recognise this refusal by. Only the claim
+ *  about causation changes. */
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid } = {}) {
+  const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
+  const expected = str(commandUuid);
+  const live = str(activeUuid);
+  const canvasSays = live ? `the active canvas reports ${live}` : `the active canvas reports no resolvable identity`;
+  // An UNSTAMPED command is refused too (#718 — an advertised fence must not fail
+  // open), and saying so plainly is worth a line: "your command carried no stamp"
+  // and "your stamp names another workflow" need different fixes, and the old text
+  // described only the second.
+  const compared = expected
+    ? `this command was issued for workflow instance ${expected}, and ${canvasSays}`
+    : `this command carries no workflow-instance stamp, and ${canvasSays}`;
+  return (
+    `workflow instance mismatch: ${compared}. Nothing was applied.\n\n` +
+    `That is the comparison, not the cause — the panel observed only that the two ` +
+    `identities differ. It can mean the workflow was switched or replaced after the ` +
+    `command was issued, that this session's fence was never established or could not ` +
+    `be refreshed, or that the identity could not be read at all.\n\n` +
+    `Re-target with panel_set_workflow_target({mode:"current"}), or re-select the ` +
+    `intended workflow with panel_open_workflow, then retry. If NO panel tab is ` +
+    `connected, neither will help and the connection is the thing to fix — ` +
+    `panel_graph_outline reports connectivity directly.`
+  );
+}
+
 function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
   const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
+  const activeUuid = workflowStableUuid();
   if (
     !commandTargetsActiveWorkflow({
       cmd: msg?.cmd,
       commandUuid,
-      activeUuid: workflowStableUuid(),
+      activeUuid,
       targetsNonActive,
     })
   ) {
     noteWorkflowInstanceMismatch();
-    throw new Error(
-      `workflow instance mismatch: this command targets a different workflow than the ` +
-        `active canvas — the workflow was switched or replaced after it was issued. ` +
-        `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
-        `panel_set_workflow_target({mode:"current"}), then retry.`,
-    );
+    throw new Error(workflowInstanceMismatchMessage({ commandUuid, activeUuid }));
   }
 }
 
@@ -14967,11 +15007,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 targetsNonActive = selectorTargetsNonActiveWorkflow({ resolved, active });
               }
             }
+            // #750 — read both sides ONCE, so the refusal reports the same two
+            // identities the comparison actually used. Re-reading them inside the
+            // message would let a switch land in between and print a pair that was
+            // never compared: the reports-what-it-observed rule applied to the
+            // diagnostic itself.
+            const dispatchCommandUuid = msg?.[WORKFLOW_UUID_FIELD];
+            const dispatchActiveUuid = workflowStableUuid();
             if (
               !commandTargetsActiveWorkflow({
                 cmd: msg.cmd,
-                commandUuid: msg?.[WORKFLOW_UUID_FIELD],
-                activeUuid: workflowStableUuid(),
+                commandUuid: dispatchCommandUuid,
+                activeUuid: dispatchActiveUuid,
                 targetsNonActive,
               })
             ) {
@@ -14980,10 +15027,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // cached stamp; see noteWorkflowInstanceMismatch.
               noteWorkflowInstanceMismatch();
               throw new Error(
-                `workflow instance mismatch: this command targets a different workflow than the ` +
-                  `active canvas — the workflow was switched or replaced after it was issued. ` +
-                  `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
-                  `panel_set_workflow_target({mode:"current"}), then retry.`,
+                workflowInstanceMismatchMessage({
+                  commandUuid: dispatchCommandUuid,
+                  activeUuid: dispatchActiveUuid,
+                }),
               );
             }
             // #349: UUID fencing proves the command was issued for the active
