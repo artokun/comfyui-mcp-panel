@@ -54,6 +54,13 @@ import {
   WIDGET_ABSENT,
   WIDGET_NON_SERIALIZING,
 } from "../../web/js/lib/add-node-widget-guard.js";
+// #767 — graph_add_node now consults ONE node type instead of re-downloading the
+// whole schema. Both are free identifiers inside the extracted body, so they have
+// to be injected like every other dependency; without them the body throws a
+// ReferenceError that the resolver catches and reports as "object_info is
+// unavailable", which is how this harness caught the omission.
+import { isRegisteredNodeType } from "../../web/js/lib/node-resolve.js";
+import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -214,6 +221,8 @@ function realGraphAddNode(comfy, overrides = {}) {
     unavailableRequiredWidgetReport,
     unavailableRequiredWidgetMessage,
     snapshotBackendDef,
+    isRegisteredNodeType,
+    fetchSingleNodeDef,
     describeUnmaterializedRequiredWidgets,
     ...overrides,
   };
@@ -512,4 +521,84 @@ test("classifyUnmaterializedWidget distinguishes the two faults", () => {
   assert.equal(classifyUnmaterializedWidget(node, "upload"), WIDGET_NON_SERIALIZING);
   assert.equal(classifyUnmaterializedWidget(node, "image"), WIDGET_ABSENT);
   assert.equal(classifyUnmaterializedWidget(undefined, "image"), WIDGET_ABSENT);
+});
+
+// ---------------------------------------------------------------------------
+// #767 — the fast path: verify ONE node type, not the whole schema.
+// ---------------------------------------------------------------------------
+
+test("#767 an ALREADY-REGISTERED type is verified with one class, not the whole schema", async () => {
+  // The reported failure: ~10 parallel adds on an 88-node workflow, each pulling
+  // the full /object_info (5.4 MB on a 63-pack install), serialising behind the
+  // coalescer and blowing the 30 s deadline — after which the adds landed anyway
+  // and left ghosts. LoadImage is already registered here, which is the shape of
+  // every add in that report.
+  const comfy = makeComfy();
+  let fullFetches = 0;
+  const routes = [];
+  const addNode = realGraphAddNode(comfy, {
+    api: {
+      getNodeDefs: async () => {
+        fullFetches++;
+        return backendObjectInfo();
+      },
+      fetchApi: async (route) => {
+        routes.push(route);
+        return { status: 200, json: async () => ({ LoadImage: backendObjectInfo().LoadImage }) };
+      },
+    },
+  });
+
+  const res = await addNode({ class_type: "LoadImage", pos: [10, 10] });
+  assert.deepEqual(res.added.widgets, ["image", "upload"], "the add still succeeds, fully");
+  assert.deepEqual(routes, ["/object_info/LoadImage"], "it asked about exactly one class");
+  assert.equal(fullFetches, 0, "and never pulled the whole schema");
+});
+
+test("#767 ANY doubt on the single-class route falls back to the full fetch", async () => {
+  // The safety property this whole change rests on: the fast path may only
+  // CONFIRM. A 404 (an older ComfyUI without the route) must not become a verdict
+  // about the node type — it must reach exactly the code that runs today.
+  const comfy = makeComfy();
+  let fullFetches = 0;
+  const addNode = realGraphAddNode(comfy, {
+    api: {
+      getNodeDefs: async () => {
+        fullFetches++;
+        return backendObjectInfo();
+      },
+      fetchApi: async () => ({ status: 404, json: async () => ({}) }),
+    },
+  });
+
+  const res = await addNode({ class_type: "LoadImage", pos: [10, 10] });
+  assert.deepEqual(res.added.widgets, ["image", "upload"], "the add still succeeds, via the unchanged path");
+  assert.equal(fullFetches, 1, "the full fetch is the fallback and it ran");
+});
+
+test("#767 an UNREGISTERED type never takes the fast path", async () => {
+  // Not about speed. The resolver hands freshDefs to refreshComfyNodeDefs() when a
+  // type still needs registering, and a single-class payload reaching a
+  // whole-schema refresh could deregister everything else. The gate makes that
+  // branch unreachable; this proves the gate holds.
+  const comfy = makeComfy();
+  delete comfy.LG.registered_node_types.LoadImage;
+  let fullFetches = 0;
+  let singleFetches = 0;
+  const addNode = realGraphAddNode(comfy, {
+    api: {
+      getNodeDefs: async () => {
+        fullFetches++;
+        return backendObjectInfo();
+      },
+      fetchApi: async () => {
+        singleFetches++;
+        return { status: 200, json: async () => ({ LoadImage: backendObjectInfo().LoadImage }) };
+      },
+    },
+  });
+
+  await addNode({ class_type: "LoadImage", pos: [10, 10] });
+  assert.equal(singleFetches, 0, "an unregistered type must not use the single-class route");
+  assert.equal(fullFetches, 1, "it takes the full-schema path, which the refresh needs");
 });

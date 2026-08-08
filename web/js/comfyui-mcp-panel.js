@@ -138,7 +138,8 @@ import {
   findVisibleNodeByScopedId,
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
-import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
+import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
+import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -8581,6 +8582,32 @@ const GRAPH_TOOL_EXECUTORS = {
     let currentDef;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
+        // #767 — ask about ONE type instead of re-downloading the whole schema.
+        // Measured on a 63-pack install: /object_info is 5,413,770 bytes / 167 ms,
+        // /object_info/KSampler is 3,246 bytes / 1.2 ms. A burst of adds pulled
+        // ~54 MB and blew through the 30 s reply deadline, which is how the report's
+        // "ghost" nodes appeared — the adds landed after the timeout had already
+        // been reported as a failure.
+        //
+        // GATED ON ALREADY-REGISTERED, and not for speed. The resolver hands
+        // `freshDefs` to refreshComfyNodeDefs() when a type still needs
+        // registering, and a single-class payload reaching a whole-schema refresh
+        // could deregister everything else. When the type is already registered
+        // that branch is unreachable, so the hazard is removed by construction
+        // rather than by remembering not to trip it.
+        //
+        // The fast path only ever CONFIRMS. Any doubt — an empty {}, a non-200, an
+        // older build without the route, an unparseable body — returns null and
+        // falls through to the identical full fetch below, so no refusal, removal
+        // verdict or history check is decided on anything new.
+        if (isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
+          const one = await fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route));
+          if (one) {
+            freshDefs = recordObjectInfoTypes(one);
+            currentDef = snapshotBackendDef(freshDefs, class_type);
+            return freshDefs;
+          }
+        }
         freshDefs = recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
         );
