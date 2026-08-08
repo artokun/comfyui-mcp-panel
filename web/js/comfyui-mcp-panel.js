@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
   buildInstallRequest,
@@ -26032,12 +26033,19 @@ function buildPanel() {
     const urlLine = document.createElement("div");
     urlLine.style.cssText =
       "font-size:0.7rem;opacity:0.55;word-break:break-all;text-align:center;max-width:280px;";
-    qrWrap.append(canvas, statusMsg, urlLine);
+    // #749 — the durability of THIS url, rendered where the user is looking at it.
+    const durabilityLine = document.createElement("div");
+    durabilityLine.style.cssText =
+      "font-size:0.72rem;line-height:1.35;text-align:left;max-width:280px;margin-top:0.15rem;";
+    durabilityLine.hidden = true;
+    qrWrap.append(canvas, statusMsg, urlLine, durabilityLine);
 
     let reqId = 0;
     function requestPairing() {
       canvas.hidden = true;
       urlLine.textContent = "";
+      durabilityLine.hidden = true;
+      durabilityLine.textContent = "";
       statusMsg.textContent =
         mode === "tunnel" ? "Opening a secure tunnel…" : "Preparing a local link…";
       const myReq = ++reqId;
@@ -26052,6 +26060,17 @@ function buildPanel() {
           canvas.hidden = false;
           statusMsg.textContent = "Scan with your phone camera or the app";
           urlLine.textContent = res.url;
+          // Weighted by survivesRestart: a quiet confirmation when it holds, a
+          // visible caution when it does not. The SENTENCE is the orchestrator's
+          // own — it knows whether the token is pinned and whether the
+          // self-restarter is armed, and this side does not.
+          const dur = pairDurabilityView(res.durability);
+          if (dur) {
+            durabilityLine.textContent = `${dur.icon} ${dur.note}`;
+            durabilityLine.style.color = dur.tone === "warn" ? "#f0b429" : "inherit";
+            durabilityLine.style.opacity = dur.tone === "warn" ? "1" : "0.7";
+            durabilityLine.hidden = false;
+          }
         } catch {
           statusMsg.textContent = "⚠ Could not render the QR code.";
         }
