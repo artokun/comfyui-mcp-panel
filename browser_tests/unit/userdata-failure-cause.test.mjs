@@ -108,41 +108,33 @@ test("#771 a partial suffix must not match a different file", () => {
   assert.equal(extractSaveFailureCause(log, "workflows/report.json"), null);
 });
 
-test("#771 readSaveFailureCause tolerates every log shape, and never throws", async () => {
-  const entries = { entries: [{ m: REAL_LINE }], size: 1 };
-  const fetchOk = async () => ({ status: 200, json: async () => entries });
-  assert.match(await readSaveFailureCause("workflows/report.json", fetchOk), /WinError 3/);
+test("#771 readSaveFailureCause reads the log WITHOUT the /api prefix", async () => {
+  // The transport was the bug. api.fetchApi prefixes /api and this endpoint is
+  // not there, so this feature was a silent no-op in every real browser — the
+  // message always said "the server-side reason could NOT be read" — while these
+  // tests passed against an injected fake that did no URL rewriting.
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const api = { fileURL: (r) => `/base${r}` };
+  try {
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      return { ok: true, json: async () => ({ entries: [{ m: REAL_LINE }] }) };
+    };
+    assert.match(await readSaveFailureCause("workflows/report.json", api), /WinError 3/);
+    assert.deepEqual(calls, ["/base/internal/logs/raw"], "fileURL is honoured");
+    assert.ok(!calls[0].includes("/api/"), "the /api prefix is what 404s");
 
-  // A plain array, and a bare string body.
-  assert.ok(
-    await readSaveFailureCause("workflows/report.json", async () => ({
-      status: 200,
-      json: async () => [REAL_LINE],
-    })),
-  );
-  assert.ok(
-    await readSaveFailureCause("workflows/report.json", async () => ({
-      status: 200,
-      json: async () => REAL_LINE,
-    })),
-  );
-
-  // Every failure mode returns null rather than throwing — this runs on the way
-  // out of an already-failed save, the worst possible place to raise a second error.
-  for (const bad of [
-    async () => ({ status: 404, json: async () => ({}) }),
-    async () => {
-      throw new Error("offline");
-    },
-    async () => ({
-      status: 200,
-      json: async () => {
-        throw new Error("bad json");
-      },
-    }),
-    async () => null,
-  ]) {
-    assert.equal(await readSaveFailureCause("workflows/report.json", bad), null);
+    // Every failure mode still yields null rather than throwing — this runs on
+    // the way out of an already-failed save.
+    globalThis.fetch = async () => ({ ok: false, status: 404 });
+    assert.equal(await readSaveFailureCause("workflows/report.json", api), null);
+    globalThis.fetch = async () => { throw new Error("offline"); };
+    assert.equal(await readSaveFailureCause("workflows/report.json", api), null);
+    globalThis.fetch = async () => ({ ok: true, json: async () => { throw new Error("bad"); } });
+    assert.equal(await readSaveFailureCause("workflows/report.json", api), null);
+  } finally {
+    globalThis.fetch = realFetch;
   }
   assert.equal(await readSaveFailureCause("workflows/report.json", undefined), null);
 });
@@ -175,8 +167,5 @@ test("#771 WITHOUT a cause it says so, and does NOT blame the filename", () => {
 test("#771 WIRING: the panel supplies the reader over its own api", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(src, /import \{ readSaveFailureCause \} from "\.\/lib\/userdata-failure-cause\.js"/);
-  assert.match(
-    src,
-    /readSaveFailureCause: \(path\) => readSaveFailureCause\(path, \(route\) => api\?\.fetchApi\?\.\(route\)\)/,
-  );
+  assert.match(src, /readSaveFailureCause: \(path\) => readSaveFailureCause\(path, api\)/);
 });

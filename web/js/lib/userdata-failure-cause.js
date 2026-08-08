@@ -1,3 +1,5 @@
+import { readComfyLogText } from "./comfy-log.js";
+
 /**
  * panel#771 — ComfyUI knows exactly why a save failed and does not tell the
  * client. It tells its own log. So read the log.
@@ -75,27 +77,12 @@ export function extractSaveFailureCause(logText, relPath) {
  * @param {string} relPath
  * @param {(route: string) => Promise<{ status?: number, json?: () => Promise<unknown>, text?: () => Promise<string> }>} fetchApi
  */
-export async function readSaveFailureCause(relPath, fetchApi) {
-  if (typeof fetchApi !== "function") return null;
-  try {
-    const res = await fetchApi("/internal/logs/raw");
-    if (!res || (typeof res.status === "number" && (res.status < 200 || res.status >= 300))) {
-      return null;
-    }
-    let text = "";
-    if (typeof res.json === "function") {
-      const body = await res.json();
-      // { entries: [{ m: "…" }, …], size } on current builds; tolerate a plain
-      // array or a bare string rather than assuming one shape.
-      const entries = Array.isArray(body) ? body : Array.isArray(body?.entries) ? body.entries : null;
-      if (entries) text = entries.map((e) => (typeof e === "string" ? e : (e?.m ?? ""))).join("\n");
-      else if (typeof body === "string") text = body;
-    }
-    if (!text && typeof res.text === "function") text = await res.text();
-    return extractSaveFailureCause(text, relPath);
-  } catch {
-    return null;
-  }
+export async function readSaveFailureCause(relPath, api) {
+  // #775 — the log is NOT under /api; see readComfyLogText. Passing
+  // api.fetchApi here is what made this a silent no-op in a real browser.
+  const text = await readComfyLogText(api);
+  if (!text) return null;
+  return extractSaveFailureCause(text, relPath);
 }
 
 /**

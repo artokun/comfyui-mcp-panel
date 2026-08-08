@@ -3729,7 +3729,7 @@ async function programmaticSave(name) {
     // reads that line back so the caller is told what actually failed instead of
     // being sent to audit a filename that was never the problem. Read-only, and it
     // runs only once the 400 shape is already recognised.
-    readSaveFailureCause: (path) => readSaveFailureCause(path, (route) => api?.fetchApi?.(route)),
+    readSaveFailureCause: (path) => readSaveFailureCause(path, api),
   });
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with
@@ -8636,7 +8636,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // #775 — consulted ONLY when the type is about to be refused, so a healthy
       // add never pays for it. A pack that failed to import looks exactly like a
       // pack that is not installed, and the refusal used to name only the latter.
-      readImportFailures: () => readPackImportFailures((route) => api?.fetchApi?.(route)),
+      readImportFailures: () => readPackImportFailures(api),
     });
     const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY
@@ -8864,7 +8864,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // when something IS missing: a clean load must not pay for a log fetch,
         // and there would be nothing for the note to say.
         const importFailures = shortfall.length
-          ? await readPackImportFailures((route) => api?.fetchApi?.(route))
+          ? await readPackImportFailures(api)
           : [];
         return {
           loaded: true,
