@@ -17,6 +17,8 @@ import {
   armReloadBlockedNotice,
   reloadBlockedMessage,
   RELOAD_BLOCKED_AFTER_MS,
+  unsavedReloadBlockers,
+  reloadWouldBeBlockedMessage,
 } from "../../web/js/lib/reload-blocked.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -93,5 +95,68 @@ test("#701 WIRING: armed BEFORE the navigation, in the frontend branch", () => {
   const j = src.indexOf('u.searchParams.set("cmcpReload"', i);
   assert.ok(i !== -1, "the notice must be armed in the shipped source");
   assert.ok(j > i, "…and armed BEFORE location.replace, or the page may die first");
-  assert.match(src, /import \{ armReloadBlockedNotice \} from "\.\/lib\/reload-blocked\.js"/);
+  // The MEMBER LIST is not the invariant — #701's guard imports two more names
+  // from the same module. What must hold is that the notice comes from there.
+  assert.match(src, /import \{[^}]*armReloadBlockedNotice[^}]*\} from "\.\/lib\/reload-blocked\.js"/);
 });
+
+// panel#701 defect (2) — reproduced on the rig: with 3 unsaved workflows open,
+// panel_reload({scope:"frontend"}) reported "scheduled", the orchestrator logged
+// `panel tab disconnected`, and then nothing happened. The page never navigated
+// (no `cmcpReload` in the URL, unsaved `*` still in the title) and stopped
+// accepting script injection at all.
+//
+// beforeunload is the mechanism, and the ORDER is what turns it into a wedge: the
+// browser drops the socket first, THEN raises "Leave site?" — which nobody is
+// there to answer during an agent-commanded reload. The tab is left with neither
+// a reload nor a bridge, strictly worse than before the command.
+
+test("#701 unsaved workflows are reported as reload blockers", () => {
+  const blockers = unsavedReloadBlockers([
+    { isModified: true, filename: "a.json" },
+    { isModified: false, filename: "b.json" },
+    { isModified: true, path: "workflows/c.json" },
+  ])
+  assert.deepEqual(blockers, ["a.json", "workflows/c.json"])
+})
+
+test("#701 an UNKNOWN modified flag is not treated as unsaved work", () => {
+  // Refusing on an absent flag would make the reload unusable on any build that
+  // does not expose the field — an unobserved edit is not an observed one.
+  assert.deepEqual(unsavedReloadBlockers([{ filename: "a.json" }]), [])
+  assert.deepEqual(unsavedReloadBlockers([{ isModified: undefined }]), [])
+  assert.deepEqual(unsavedReloadBlockers([{ isModified: "yes" }]), [])
+  assert.deepEqual(unsavedReloadBlockers(null), [])
+  assert.deepEqual(unsavedReloadBlockers([]), [])
+})
+
+test("#701 a blocked reload names the tabs, the mechanism, and BOTH ways out", () => {
+  const msg = reloadWouldBeBlockedMessage(["a.json", "b.json"])
+  assert.match(msg, /Did NOT reload/)
+  assert.match(msg, /a\.json, b\.json/)
+  assert.match(msg, /drops this tab's bridge connection BEFORE/)
+  assert.match(msg, /Nothing was changed/)
+  assert.match(msg, /Save or close/)
+  assert.match(msg, /Ctrl\+Shift\+R/)
+})
+
+test("#701 WIRING: only the AGENT path refuses, and it refuses BEFORE navigating", async () => {
+  const { readFileSync } = await import("node:fs")
+  const { fileURLToPath } = await import("node:url")
+  const { dirname, join } = await import("node:path")
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  )
+  const i = src.indexOf('if (scope === "frontend")')
+  assert.ok(i > 0)
+  const block = src.slice(i, i + 2600)
+  // The guard is gated on the commanded path — a user standing at the keyboard
+  // can answer the dialog, so their reload must still proceed.
+  assert.match(block, /if \(origin === "agent"\)[\s\S]{0,400}unsavedReloadBlockers/)
+  // …and it must return BEFORE the navigation, not merely warn about it.
+  const guardAt = block.indexOf("unsavedReloadBlockers")
+  const navAt = block.indexOf("cmcpReload")
+  assert.ok(guardAt > 0 && navAt > guardAt, "the blocker check must precede the navigation")
+  assert.match(block.slice(guardAt, navAt), /return;/)
+})
