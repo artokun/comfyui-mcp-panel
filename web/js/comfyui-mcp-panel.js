@@ -8633,6 +8633,10 @@ const GRAPH_TOOL_EXECUTORS = {
       refresh: (defs) => refreshComfyNodeDefs(defs),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
+      // #775 — consulted ONLY when the type is about to be refused, so a healthy
+      // add never pays for it. A pack that failed to import looks exactly like a
+      // pack that is not installed, and the refusal used to name only the latter.
+      readImportFailures: () => readPackImportFailures((route) => api?.fetchApi?.(route)),
     });
     const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY

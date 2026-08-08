@@ -28,6 +28,8 @@ export const COMFY_CORE_SENTINEL_TYPES = [
   "SaveImage",
 ];
 
+import { importFailureNote } from "./pack-import-failures.js";
+
 /** True when `type` is registered in the live LiteGraph registry object
  *  (LG.registered_node_types). */
 export function isRegisteredNodeType(registry, type) {
@@ -448,7 +450,9 @@ export function assertAddNodeResolvable(registry, class_type) {
  *                        exempted (fail closed, pre-#496 behaviour).
  */
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
-  const { getFreshObjectInfo, refresh, wasTypeEverDefined } = opts;
+  // #775 — `readImportFailures` is injected and awaited ONLY on the refusal path,
+  // so a healthy add pays nothing for it.
+  const { getFreshObjectInfo, refresh, wasTypeEverDefined, readImportFailures } = opts;
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
 
@@ -522,9 +526,25 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // (create_workflow action:"node_info", the live /object_info) —
       // panel_search_nodes searches Manager PACKS, which structurally cannot
       // resolve an exact class_type.
+      // #775 — "not installed, or its pack was removed" is not the whole list, and
+      // the missing entry is the one that makes the advice useless: a pack that IS
+      // installed and FAILED TO IMPORT registers none of its nodes, so its types
+      // are absent from /object_info exactly as if it were gone. Installing it
+      // again cannot help. I walked into that dead end myself and filed a wrong
+      // diagnosis from it (ComfyUI-LTXVideo, ImportError on a core rename).
+      let failedNote = "";
+      if (typeof readImportFailures === "function") {
+        try {
+          failedNote = importFailureNote(await readImportFailures());
+        } catch {
+          // A diagnostic that throws must not replace the refusal it explains.
+        }
+      }
       throw new Error(
         `Unknown node type "${class_type}" — the ComfyUI backend does not provide it ` +
-          `(not installed, or its pack was removed). Check the exact class_type via create_workflow (action:"node_info")`,
+          `(not installed, its pack was removed, or its pack failed to import). ` +
+          `Check the exact class_type via create_workflow (action:"node_info")` +
+          failedNote,
       );
     }
     // Backend HAS it. Make sure LiteGraph can construct it — refresh to register the

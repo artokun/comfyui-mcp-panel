@@ -123,3 +123,74 @@ test("#775 WIRING: the load asks only when something is MISSING", () => {
   assert.match(block, /note: apiLoadNote\(shortfall, importFailures\)/);
   assert.match(block, /packs_failed_to_import: importFailures/);
 });
+
+// ---------------------------------------------------------------------------
+// #775 second site: panel_add_node's unknown-type refusal.
+// ---------------------------------------------------------------------------
+
+test("#775 the unknown-node refusal now NAMES the failed-import possibility", async () => {
+  // This is the message people actually hit — far more often than the API-load
+  // path — and it listed only "not installed, or its pack was removed". A pack
+  // that IS installed and failed to import produces exactly the same absence,
+  // and both listed remedies are dead ends for it.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "LTXVImgToVideoConditionOnly", {
+    getFreshObjectInfo: async () => ({ KSampler: {} }), // backend answers, type absent
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["ComfyUI-LTXVideo"],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an absent type must still be refused");
+  assert.match(err.message, /or its pack failed to import/);
+  assert.match(err.message, /ComfyUI-LTXVideo/);
+  assert.match(err.message, /installing it again will not help/);
+});
+
+test("#775 with NO failed imports the refusal is unchanged", async () => {
+  // The ordinary case must not gain a hedge it does not need.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "TotallyMadeUpNode", {
+    getFreshObjectInfo: async () => ({ KSampler: {} }),
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => [],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.match(err.message, /Unknown node type "TotallyMadeUpNode"/);
+  assert.doesNotMatch(err.message, /BEFORE INSTALLING ANYTHING/);
+});
+
+test("#775 a reader that THROWS does not replace the refusal", async () => {
+  // The diagnostic runs while explaining a failure. If it throws, the caller
+  // must still get the refusal it came for, not a second unrelated error.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "TotallyMadeUpNode", {
+    getFreshObjectInfo: async () => ({ KSampler: {} }),
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => {
+      throw new Error("log unreachable");
+    },
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.match(err.message, /Unknown node type "TotallyMadeUpNode"/);
+  assert.doesNotMatch(err.message, /log unreachable/);
+});
+
+test("#775 WIRING: the panel supplies the reader to the add-node resolver", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(
+    src,
+    /readImportFailures: \(\) => readPackImportFailures\(\(route\) => api\?\.fetchApi\?\.\(route\)\)/,
+  );
+});
