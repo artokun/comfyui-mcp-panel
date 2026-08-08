@@ -609,10 +609,26 @@ test("#695: a union whose members are only proven by /object_info outputs resolv
   );
 });
 
-test("#695: a union input that DECLARES a widget value still fails closed (#580/#626 intact)", () => {
+test("#788: a union of PRIMITIVES is added, not waited on (reverses #695's ruling)", () => {
   // LTXVEmptyLatentAudio.frame_rate = ["FLOAT,INT", {widgetType:"FLOAT", default:25, min, max, step}].
-  // Both members are output by some node, so the type half passes — but the input half
-  // says this carries a VALUE, so the wait for its widget constructor must survive.
+  //
+  // This test previously asserted the OPPOSITE, on the reasoning that the input
+  // declares a VALUE so the wait for its widget constructor must survive. The
+  // first half is right and the conclusion is wrong: nothing will ever register a
+  // constructor keyed "FLOAT,INT". FLOAT and INT are implemented by the core
+  // frontend, not by packs, so this was waiting on evidence that cannot arrive
+  // (#796) — and the refusal's own remedy, reload the tab, could not help.
+  //
+  // Three pieces of evidence, none of them inference:
+  //   - the node is CORE ComfyUI (comfy_extras), so no pack exists to register it;
+  //   - the stock frontend resolves it with `widgetType ?? type` — verified in the
+  //     shipped 1.47.12 bundle — and never looks for a union-keyed constructor;
+  //   - a reporter confirmed the stock UI adds this node fine by double-click,
+  //     while panel_add_node refused it after every restart and refresh.
+  //
+  // Cost of the old ruling: LTXVEmptyLatentAudio was permanently unaddable, which
+  // blocks every LTX-2.3 audio-video graph — the audio latent is mandatory for AV
+  // models (panel#788).
   const def = {
     input: {
       required: {
@@ -620,14 +636,38 @@ test("#695: a union input that DECLARES a widget value still fails closed (#580/
       },
     },
   };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(["FLOAT", "INT"]), def), []);
+  // …and with no output proof at all, which is the fresh-tab case.
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), []);
+});
+
+test("#788 #580 INTACT: a union naming a CUSTOM member still fails closed", () => {
+  // The guard this reverses is narrow. A pack's own type mixed with a primitive
+  // still needs that pack's constructor, and still waits for it — waiving on
+  // "contains a primitive" would be the #580 false accept all over again.
+  const def = {
+    input: { required: { style: ["ACME_VALUE,INT", { default: 1, min: 0, max: 9 }] } },
+  };
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["FLOAT", "INT"]), def),
-    ["FLOAT,INT"],
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["INT"]), def),
+    ["ACME_VALUE,INT"],
   );
-  // …and it clears the instant the constructor registers under the union's own key.
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(def, { "FLOAT,INT": () => {} }, new Set(["FLOAT", "INT"]), def),
+    unavailableRequiredCustomWidgetTypes(def, { "ACME_VALUE,INT": () => {} }, new Set(["INT"]), def),
     [],
+  );
+});
+
+test("#788 a union of SOCKET types is unchanged by this", () => {
+  // ("IMAGE,MASK", {widgetType:"IMAGE", default}) — the shape the old comment
+  // reasoned about. Sockets are not primitives, so the new waiver does not reach
+  // it and the existing input-level bar still decides.
+  const def = {
+    input: { required: { img: ["IMAGE,MASK", { widgetType: "IMAGE", default: null }] } },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["IMAGE", "MASK"]), def),
+    ["IMAGE,MASK"],
   );
 });
 
