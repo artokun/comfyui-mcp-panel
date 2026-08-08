@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import {
   readActiveSidebarTab,
   shouldDetachPanelRoot,
+  findSidebarTabButton,
 } from "../../web/js/lib/active-sidebar-tab.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -132,10 +133,14 @@ test("#779 a button with no getAttribute does not throw", () => {
 
 test("#779 WIRING: the guard uses the three-state read, not a class lookup", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(
-    src,
-    /import \{ readActiveSidebarTab, shouldDetachPanelRoot \} from "\.\/lib\/active-sidebar-tab\.js"/,
-  );
+  // Assert the NAMES are imported from that module, not the literal import line:
+  // pinning the exact list means every added export breaks an unrelated test,
+  // which is noise rather than protection.
+  const imp = src.match(/import \{([^}]*)\} from "\.\/lib\/active-sidebar-tab\.js"/);
+  assert.ok(imp, "the guard's helpers must come from lib/active-sidebar-tab.js");
+  const names = imp[1].split(",").map((n) => n.trim());
+  assert.ok(names.includes("readActiveSidebarTab"), `missing readActiveSidebarTab in ${imp[1]}`);
+  assert.ok(names.includes("shouldDetachPanelRoot"), `missing shouldDetachPanelRoot in ${imp[1]}`);
   const i = src.indexOf("function installSidebarTabGuard(");
   assert.ok(i > 0, "the guard must be findable");
   const body = src.slice(i, src.indexOf("\n}", i));
@@ -144,4 +149,65 @@ test("#779 WIRING: the guard uses the three-state read, not a class lookup", () 
   // The discredited lookup must be gone, not merely bypassed.
   assert.doesNotMatch(body, /classList\].*endsWith\("-tab-button"\)/);
   assert.doesNotMatch(body, /activeTabId\(\) === tabId/);
+});
+
+// ---------------------------------------------------------------------------
+// #779, second site: findAgentTabIcon read the id out of a CLASS too.
+// ---------------------------------------------------------------------------
+
+/** A document double whose querySelector understands the two forms we use. */
+function docWith(button, { supportsAttrSelector = true } = {}) {
+  return {
+    querySelector(sel) {
+      if (sel.startsWith("[data-testid=")) {
+        if (!supportsAttrSelector) throw new SyntaxError("unsupported selector");
+        const want = sel.slice('[data-testid="'.length, -2);
+        return button?.testId === want ? button : null;
+      }
+      if (sel.startsWith("button[class~=")) {
+        const want = sel.slice('button[class~="'.length, -2);
+        return button?.classes?.includes(want) ? button : null;
+      }
+      return null;
+    },
+  };
+}
+
+test("#779 the button is found on 1.50 (data-testid)", () => {
+  const btn = { testId: "comfyui-mcp.agent-tab-button", classes: [] };
+  assert.equal(findSidebarTabButton(docWith(btn), OURS), btn);
+});
+
+test("#779 the button is still found on <=1.49 (class)", () => {
+  const btn = { classes: ["comfyui-mcp.agent-tab-button"] };
+  assert.equal(findSidebarTabButton(docWith(btn), OURS), btn);
+});
+
+test("#779 a foreign tab's button is not ours", () => {
+  const other = { testId: "workflows-tab-button", classes: ["workflows-tab-button"] };
+  assert.equal(findSidebarTabButton(docWith(other), OURS), null);
+});
+
+test("#779 a thrown selector falls through to the class form, not out", () => {
+  // An engine that rejects the attribute selector must not take the fallback
+  // down with it — this runs on the badge path, where a throw is invisible.
+  const btn = { classes: ["comfyui-mcp.agent-tab-button"] };
+  assert.equal(findSidebarTabButton(docWith(btn, { supportsAttrSelector: false }), OURS), btn);
+});
+
+test("#779 bad inputs are null, never a throw", () => {
+  assert.equal(findSidebarTabButton(null, OURS), null);
+  assert.equal(findSidebarTabButton({}, OURS), null);
+  assert.equal(findSidebarTabButton(docWith(null), ""), null);
+  assert.equal(findSidebarTabButton(docWith(null), null), null);
+});
+
+test("#779 WIRING: findAgentTabIcon uses the finder, not a class query", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const i = src.indexOf("function findAgentTabIcon()");
+  assert.ok(i > 0, "findAgentTabIcon must be findable");
+  const body = src.slice(i, src.indexOf("\n}", i));
+  assert.match(body, /findSidebarTabButton\(document, SIDEBAR_TAB_ID\)/);
+  // The class-only query must be gone, not merely bypassed.
+  assert.doesNotMatch(body, /querySelector\(`button\[class~=/);
 });

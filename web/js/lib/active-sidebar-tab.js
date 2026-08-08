@@ -83,3 +83,50 @@ export function shouldDetachPanelRoot(active, ourTabId) {
   if (active.state === "unknown") return false;
   return active.id !== ourTabId;
 }
+
+/**
+ * The sidebar rail BUTTON for a given tab id, however this frontend marks it.
+ *
+ * #779 had two sites reading the id out of a CSS class. The guard was the one
+ * that blanked the panel; this is the other — `findAgentTabIcon`, which paints
+ * the unread/working badge on the rail. It fails softer (there is a fallback
+ * that scans the toolbar for our glyph), which is exactly why it would have gone
+ * unnoticed: on 1.50 the fallback is no longer a fallback, it is the only path,
+ * and it matches `.pi-comments` — an icon another extension is free to use.
+ *
+ * Verified against the shipped bundles: 1.50.3 marks the button with
+ * `data-testid="<tabId>-tab-button"`, 1.47.12 with a `<tabId>-tab-button` CLASS.
+ * Every other ComfyUI selector the panel relies on is present in both.
+ *
+ * The id contains a dot ("comfyui-mcp.agent"), which is why the class form uses
+ * `[class~=...]` rather than `.<id>-tab-button` — the latter would parse the dot
+ * as a descendant class.
+ *
+ * @param {Document|Element|null} root
+ * @param {string} tabId
+ * @returns {Element|null}
+ */
+export function findSidebarTabButton(root, tabId) {
+  if (!root || typeof root.querySelector !== "function") return null;
+  if (typeof tabId !== "string" || !tabId) return null;
+  // No regex here on purpose. The first draft escaped quotes with a character
+  // class, and the backslashes were eaten in transit — leaving `/["\]/g`, which
+  // is an invalid regular expression and took the whole module down at import.
+  // CSS.escape exists in every browser that runs ComfyUI; the bare fallback is
+  // only for a non-DOM test environment, and this id is a known constant with
+  // no quotes or backslashes in it.
+  const marker = `${tabId}-tab-button`;
+  const esc =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function" ? CSS.escape(marker) : marker;
+  try {
+    // 1.50+ — the current source of truth.
+    const byTestId = root.querySelector(`[data-testid="${esc}"]`);
+    if (byTestId) return byTestId;
+  } catch { /* an unsupported selector must not take the fallback down with it */ }
+  try {
+    // <=1.49 — the id was a class.
+    return root.querySelector(`button[class~="${esc}"]`) ?? null;
+  } catch {
+    return null;
+  }
+}
