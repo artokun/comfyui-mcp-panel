@@ -101,15 +101,35 @@ test("#775 no failures means NO note — the ordinary advice stands", () => {
   assert.equal(importFailureNote(undefined), "");
 });
 
-test("#775 the reader is never handed a throw", async () => {
-  // This runs while reporting a load that already went wrong.
-  assert.deepEqual(await readPackImportFailures(undefined), []);
-  assert.deepEqual(await readPackImportFailures(async () => { throw new Error("down"); }), []);
-  assert.deepEqual(await readPackImportFailures(async () => ({ status: 404 })), []);
-  assert.deepEqual(
-    await readPackImportFailures(async () => ({ status: 200, json: async () => ({ entries: [{ m: REAL_LOG }] }) })),
-    ["comfyui-does-not-exist-99999", "ComfyUI-LTXVideo"],
-  );
+test("#775 the reader is never handed a throw, and does not use /api", async () => {
+  // The transport is the whole bug: api.fetchApi prefixes /api and this endpoint
+  // is not there, so the feature was a silent no-op in every real browser while
+  // these tests passed against a fake. Stub the REAL global fetch instead.
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const api = { fileURL: (r) => `/base${r}` };
+  try {
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      return { ok: true, json: async () => ({ entries: [{ m: REAL_LOG }] }) };
+    };
+    assert.deepEqual(await readPackImportFailures(api), [
+      "comfyui-does-not-exist-99999",
+      "ComfyUI-LTXVideo",
+    ]);
+    assert.deepEqual(calls, ["/base/internal/logs/raw"], "fileURL is honoured, /api is not");
+    assert.ok(!calls[0].includes("/api/"), "the /api prefix is what 404s");
+
+    // Every failure mode still yields [] rather than throwing.
+    globalThis.fetch = async () => ({ ok: false, status: 404 });
+    assert.deepEqual(await readPackImportFailures(api), []);
+    globalThis.fetch = async () => { throw new Error("offline"); };
+    assert.deepEqual(await readPackImportFailures(api), []);
+    globalThis.fetch = async () => ({ ok: true, json: async () => { throw new Error("bad"); } });
+    assert.deepEqual(await readPackImportFailures(api), []);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test("#775 WIRING: the load asks only when something is MISSING", () => {
@@ -189,8 +209,5 @@ test("#775 a reader that THROWS does not replace the refusal", async () => {
 
 test("#775 WIRING: the panel supplies the reader to the add-node resolver", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(
-    src,
-    /readImportFailures: \(\) => readPackImportFailures\(\(route\) => api\?\.fetchApi\?\.\(route\)\)/,
-  );
+  assert.match(src, /readImportFailures: \(\) => readPackImportFailures\(api\)/);
 });

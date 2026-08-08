@@ -1,3 +1,5 @@
+import { readComfyLogText } from "./comfy-log.js";
+
 /**
  * panel#775/#778 — a missing node type is not proof of a missing PACK.
  *
@@ -61,25 +63,12 @@ export function packsThatFailedToImport(logText) {
  *
  * @param {(route: string) => Promise<{ status?: number, json?: () => Promise<unknown>, text?: () => Promise<string> }>} fetchApi
  */
-export async function readPackImportFailures(fetchApi) {
-  if (typeof fetchApi !== "function") return [];
-  try {
-    const res = await fetchApi("/internal/logs/raw");
-    if (!res || (typeof res.status === "number" && (res.status < 200 || res.status >= 300))) {
-      return [];
-    }
-    let text = "";
-    if (typeof res.json === "function") {
-      const body = await res.json();
-      const entries = Array.isArray(body) ? body : Array.isArray(body?.entries) ? body.entries : null;
-      if (entries) text = entries.map((e) => (typeof e === "string" ? e : (e?.m ?? ""))).join("\n");
-      else if (typeof body === "string") text = body;
-    }
-    if (!text && typeof res.text === "function") text = await res.text();
-    return packsThatFailedToImport(text);
-  } catch {
-    return [];
-  }
+export async function readPackImportFailures(api) {
+  // #775 — the log is NOT under /api; see readComfyLogText. Passing
+  // api.fetchApi here is what made this a silent no-op in a real browser.
+  const text = await readComfyLogText(api);
+  if (!text) return [];
+  return packsThatFailedToImport(text);
 }
 
 /**
