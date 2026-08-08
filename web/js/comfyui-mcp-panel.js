@@ -99,6 +99,7 @@ import {
 import {
   classifyPinnedTarget,
   commandIsCanvasIndependent,
+  commandIsCanvasTargetless,
   commandTargetsActiveWorkflow,
   hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
@@ -14999,7 +15000,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // a CANVAS write landing on the wrong workflow, and these commands write
             // to no canvas. Fencing them anyway re-creates the false refusal one
             // guard further down whenever a pinned session's active tab changed.
-            if (typeof pinnedPath === "string" && pinnedPath.trim() && !commandIsCanvasIndependent(msg.cmd)) {
+            if (typeof pinnedPath === "string" && pinnedPath.trim() && !commandIsCanvasTargetless(msg.cmd)) {
               const wf = activeWorkflowRef();
               // A pin identifier from panel_list_workflows / panel_new_workflow /
               // panel_set_workflow_target may be a path, a native key, a filename, OR
