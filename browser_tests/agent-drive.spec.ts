@@ -177,6 +177,9 @@ test.describe('agent-driven CivitAI modal', () => {
 })
 
 test.describe('agent-driven Training modal', () => {
+  // panel#793 — off-by-default flag; see fixtures/panelTest.ts.
+  test.use({ panelFlags: ['comfyui-mcp.featureFlag.training'] })
+
   test('training-first glow: step highlight works without the CivitAI CSS ever loading', async ({
     page,
     panel,
