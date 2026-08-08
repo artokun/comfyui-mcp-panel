@@ -739,8 +739,16 @@ export function scopeDroppedError({ toNodeId, verdict }) {
     `To render this branch now, either run it unscoped (panel_run without to_node_id, ` +
     `which executes the WHOLE graph — every other output branch included, at full GPU/API ` +
     `cost) or delete/bypass the output nodes you do not want and run unscoped. ` +
-    `Please report this with the body keys above — this path is not reproducible against ` +
-    `ComfyUI_frontend 1.42–1.50, where both argument shapes are honoured.`
+    // #752 — the removed clause said this path is "not reproducible against
+    // ComfyUI_frontend 1.42–1.50, where both argument shapes are honoured".
+    // Three field reports on 1.45.21 sit INSIDE that range and reproduced it, so
+    // the claim was false, and it was expensive: it told each reporter their own
+    // evidence could not be happening, and sent them (and me) to audit argument
+    // shapes that were fine. A build range is a claim about builds nobody here
+    // has run — the panel can measure the request it just made and nothing else.
+    `Please report this with the body keys above, and your ComfyUI_frontend version — ` +
+    `which builds honour which argument shape is not something the panel can determine ` +
+    `from inside one of them.`
   );
 }
 
@@ -994,7 +1002,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -1096,6 +1104,14 @@ export function createScopedRunGuard({
         forwardOptions = { ...options, body: repairedBody };
         targets = expected.slice();
         state.repaired++;
+        // #752 — WHAT THE BODY ACTUALLY CONTAINED. Three reports have not
+        // narrowed this because the note says the scope "did not reach the
+        // request" without saying what did. The keys distinguish the cases
+        // that matter: a frontend that dropped the field entirely, versus one
+        // that renamed it, versus one that put it somewhere else. Recorded
+        // from the FIRST repair only — later posts in a batch are the same
+        // shape, and a growing list would read as several distinct causes.
+        if (state.repairedFromKeys === null) state.repairedFromKeys = scopeRead.bodyKeys;
       }
     }
     if (contentOk && targets && sameSet(targets, expected)) {
@@ -1589,6 +1605,7 @@ export async function dispatchScopedRun({
         verified: guard.state.observed,
         repaired: guard.state.repaired,
         scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        repairedFromKeys: guard.state.repairedFromKeys,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
       };
@@ -1608,6 +1625,7 @@ export async function dispatchScopedRun({
         // ran with isPartialExecution=false. graph_run states this in the
         // result rather than letting the caller infer a native scoped run.
         scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        repairedFromKeys: guard.state.repairedFromKeys,
         // DISCLOSE a fenced overrun (r3). The requested prompts DID queue, so
         // this is not a failure and must not be reported as one — but an extra
         // identical-identity post was blocked, and the caller should know their
