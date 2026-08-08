@@ -142,7 +142,7 @@ import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/n
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
-import { readActiveSidebarTab, shouldDetachPanelRoot } from "./lib/active-sidebar-tab.js";
+import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
@@ -2347,7 +2347,12 @@ function findAgentTabIcon() {
   // ComfyUI stamps the toolbar button with `${tabId}-tab-button` — the precise
   // hook (attribute selector: the id contains a dot). Fall back to the chat
   // glyph inside a sidebar container for older frontends.
-  const btn = document.querySelector(`button[class~="${SIDEBAR_TAB_ID}-tab-button"]`);
+  // #779 — 1.50 moved this id from the CLASS to data-testid. That break blanked
+  // the panel at the guard; HERE it only degraded, because the toolbar scan below
+  // still found our glyph. That is why it went unnoticed — and why it is worth
+  // closing: on 1.50 the fallback is no longer a fallback, and it matches
+  // `.pi-comments`, which another extension is free to use.
+  const btn = findSidebarTabButton(document, SIDEBAR_TAB_ID);
   if (btn) {
     const icon = btn.querySelector("[data-cmcp-agent-icon]") || btn.querySelector(".pi");
     if (icon) {
