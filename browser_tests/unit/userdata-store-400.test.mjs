@@ -72,6 +72,36 @@ test("#771 WIRING: saveInPlace augments the thrown error, and only that shape", 
   assert.match(src, /const augmented = explainUserDataStoreFailure\(/);
   // …and rethrows the SAME error object, so nothing downstream that matches on
   // error identity or other fields is disturbed.
-  assert.match(src, /if \(err instanceof Error && augmented !== err\.message\) err\.message = augmented;/);
+  assert.match(src, /if \(err instanceof Error && augmented !== err\.message\)/);
+  assert.match(src, /err\.message = augmented \+ tail;/);
   assert.match(src, /\n\s*throw err;/);
+});
+
+test("#771 the server is asked WHY only for the userdata-400 shape", () => {
+  // `augmented !== raw` is the shape test, and the log request sits INSIDE it.
+  // Every other save failure keeps the byte-identical rethrow with no extra
+  // request — a save that failed for an unrelated reason must not start pulling
+  // the server log on its way out.
+  const src = readFileSync(SAVE_JS, "utf8");
+  const guard = src.indexOf("if (err instanceof Error && augmented !== err.message)");
+  const ask = src.indexOf("readSaveFailureCause(path)");
+  const rethrow = src.indexOf("throw err;", guard);
+  assert.ok(guard > 0, "the shape guard must exist");
+  assert.ok(ask > guard, "the log request must sit inside it");
+  assert.ok(rethrow > ask, "…and the rethrow still follows");
+});
+
+test("#771 the cause reader is INJECTED, never imported into the save path", () => {
+  // workflow-save.js keeps no opinion about how the log is reached, so a caller
+  // that cannot reach it simply omits the dependency and the message degrades to
+  // the standing explanation. An import here would make the module require a
+  // transport it has no business knowing about.
+  const src = readFileSync(SAVE_JS, "utf8");
+  assert.match(src, /readSaveFailureCause,/, "it is destructured from the options object");
+  assert.doesNotMatch(
+    src,
+    /import \{[^}]*\breadSaveFailureCause\b/,
+    "it must not be imported — only the message builder is",
+  );
+  assert.match(src, /import \{ describeSaveFailureCause \} from "\.\/userdata-failure-cause\.js"/);
 });
