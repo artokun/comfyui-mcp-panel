@@ -15061,8 +15061,25 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // flow (SOFT_RELOAD_KEY) continues the conversation afterward.
             if (!onReload) throw new Error("This panel build can't soft-reload.");
             const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
-            result = `soft reload (${scope}) scheduled`;
-            setTimeout(() => onReload(scope), 60);
+            // #701 — decide BEFORE replying. The guard that stops a doomed
+            // frontend reload runs 60ms later inside onReload, by which point
+            // this command has already told the agent "scheduled". Live-verified
+            // on the rig: the tab correctly did NOT navigate and its socket
+            // survived, and the agent was still told the reload was scheduled —
+            // so it has no reason to look, and the panel-side notice it does
+            // emit is not something the agent can read.
+            //
+            // Report what will actually happen, on the reply the caller gets.
+            const reloadBlockers =
+              scope === "frontend"
+                ? unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows)
+                : [];
+            if (reloadBlockers.length) {
+              result = reloadWouldBeBlockedMessage(reloadBlockers);
+            } else {
+              result = `soft reload (${scope}) scheduled`;
+              setTimeout(() => onReload(scope), 60);
+            }
           } else if (msg.cmd === "set_todo") {
             // Render/update the agent's live TODO checklist in the footer tray.
             const items = Array.isArray(msg.items) ? msg.items : [];
