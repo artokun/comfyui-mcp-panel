@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 
 import {
   RENDER_STARVATION_MS,
+  SATISFY_CONFIRM_MS,
   TAB_APPEAR_DEADLINE_MS,
   WATCHDOG_POLL_MS,
   WATCHDOG_GIVE_UP_MS,
@@ -55,7 +56,12 @@ test("#779 the starvation line carries everything a support answer needs", () =>
   assert.match(line, /NOT a connection problem/i, "dead end #1, closed");
   assert.match(line, /reinstalling.*cannot change it/i, "dead end #2 — the one that cost an hour");
   assert.match(line, /github\.com\/artokun\/comfyui-mcp-panel\/issues/, "where to send it");
-  assert.match(line, /--front-end-version comfyanonymous\/ComfyUI@/, "the workaround, in paste-able form");
+  // Comfy-Org/ComfyUI_frontend, NOT comfyanonymous/ComfyUI: the flag fetches
+  // releases from the named repo, and the frontend's 1.x tags only exist in the
+  // frontend repo — the other spelling silently falls back to the installed
+  // default and appears to work exactly when it did nothing (verified live
+  // against ComfyUI 0.30.2 while fixing this issue).
+  assert.match(line, /--front-end-version Comfy-Org\/ComfyUI_frontend@/, "the workaround, in paste-able form");
 });
 
 test("#779 the appearance line is distinct and equally complete", () => {
@@ -71,7 +77,7 @@ test("#779 the appearance line is distinct and equally complete", () => {
   assert.match(line, /1\.53\.0/);
   assert.match(line, /NOT a connection problem/i);
   assert.match(line, /github\.com\/artokun\/comfyui-mcp-panel\/issues/);
-  assert.match(line, /--front-end-version comfyanonymous\/ComfyUI@/);
+  assert.match(line, /--front-end-version Comfy-Org\/ComfyUI_frontend@/);
 });
 
 test("#779 unknown versions say 'unknown' — never a guess", () => {
@@ -86,7 +92,7 @@ test("#779 the workaround pin is a VERIFIED frontend, not a hardcoded relic", ()
   const newest = VERIFIED_FRONTENDS[VERIFIED_FRONTENDS.length - 1];
   const line = renderStarvationReport({});
   assert.ok(
-    line.includes(`--front-end-version comfyanonymous/ComfyUI@${newest}`),
+    line.includes(`--front-end-version Comfy-Org/ComfyUI_frontend@${newest}`),
     `the recommended pin should be ${newest} (the newest verified frontend)`,
   );
   for (const v of VERIFIED_FRONTENDS) {
@@ -99,6 +105,7 @@ test("#779 the workaround pin is a VERIFIED frontend, not a hardcoded relic", ()
 // ---------------------------------------------------------------------------
 
 const WINDOW = RENDER_STARVATION_MS;
+const CONFIRM = SATISFY_CONFIRM_MS;
 const ours = { state: "id", id: OURS };
 const other = { state: "id", id: "workflows" };
 const unknown = { state: "unknown" };
@@ -108,12 +115,32 @@ function machine(onStarve = () => {}) {
   return createRenderWatchdog({ tabId: OURS, onStarve });
 }
 
-test("#779 the healthy path retires the watchdog for good", () => {
+test("#779 the healthy path retires the watchdog — after the paint SURVIVES", () => {
   const m = machine(() => assert.fail("must not fire"));
-  assert.equal(m.sample(ours, true, 0).state, "satisfied");
+  // One glimpse of paint is only "verifying" — the real #779 removed the root
+  // instants after render() attached it.
+  assert.equal(m.sample(ours, true, 0).state, "verifying");
+  assert.equal(m.sample(ours, true, CONFIRM - 1).state, "verifying");
+  assert.equal(m.sample(ours, true, CONFIRM).state, "satisfied");
   // Retired means RETIRED: even a later selected-and-empty eternity says nothing.
   assert.equal(m.sample(ours, false, WINDOW * 100).state, "satisfied");
   assert.equal(m.fired(), false);
+});
+
+test("#779 paint-then-instant-removal STILL fires — the shape of the actual outage", () => {
+  // Live-drill regression: a saboteur that reproduced the pre-#784 guard
+  // (remove .cmcp-root the moment render attaches it) put the first draft of
+  // this watchdog to sleep, because its rail observer glimpsed the root in the
+  // instant between attach and removal and retired on that single sample. The
+  // glimpse must not count: only a paint that survives the confirmation dwell
+  // retires the watchdog.
+  let fired = 0;
+  const m = machine(() => (fired += 1));
+  m.sample(ours, false, 0); // armed on selection
+  assert.equal(m.sample(ours, true, 10).state, "verifying"); // the glimpse
+  assert.equal(m.sample(ours, false, 20).state, "armed"); // …and it is gone
+  assert.equal(m.sample(ours, false, 20 + WINDOW).state, "fired");
+  assert.equal(fired, 1);
 });
 
 test("#779 selected-and-empty shorter than the window never fires (slow first build)", () => {
@@ -121,7 +148,19 @@ test("#779 selected-and-empty shorter than the window never fires (slow first bu
   assert.equal(m.sample(ours, false, 0).state, "armed");
   assert.equal(m.sample(ours, false, WINDOW - 1).state, "armed");
   // The build lands just inside the deadline — a loaded machine, not a fault.
-  assert.equal(m.sample(ours, true, WINDOW - 1).state, "satisfied");
+  assert.equal(m.sample(ours, true, WINDOW - 1).state, "verifying");
+  assert.equal(m.sample(ours, true, WINDOW - 1 + CONFIRM).state, "satisfied");
+});
+
+test("#779 an interrupted confirmation dwell does not retire — it re-evaluates later", () => {
+  const m = machine(() => assert.fail("must not fire"));
+  assert.equal(m.sample(ours, true, 0).state, "verifying");
+  // The user wanders off before the dwell completes. The paint was probably
+  // real, but PROBABLY is not the retirement bar — stay alive, stay quiet.
+  assert.equal(m.sample(other, false, 100).state, "idle");
+  // Next dwell starts the confirmation over and completes it.
+  assert.equal(m.sample(ours, true, 5000).state, "verifying");
+  assert.equal(m.sample(ours, true, 5000 + CONFIRM).state, "satisfied");
 });
 
 test("#779 a full continuous window fires exactly once, with the waited time", () => {
@@ -214,7 +253,13 @@ function legacyButton(id) {
  * The whole harness: fake doc, fake timers, captured reports, an observer stub
  * whose callback we can pull. `state` is mutated by the tests to move the world.
  */
-function harness({ windowMs = 300, appearDeadlineMs = 1000, pollMs = 50, giveUpMs = 6000 } = {}) {
+function harness({
+  windowMs = 300,
+  confirmMs = 200,
+  appearDeadlineMs = 1000,
+  pollMs = 50,
+  giveUpMs = 6000,
+} = {}) {
   const state = {
     rail: null, // truthy once the rail exists
     button: false, // our tab button present in the rail?
@@ -261,6 +306,7 @@ function harness({ windowMs = 300, appearDeadlineMs = 1000, pollMs = 50, giveUpM
     },
     now: () => clock,
     windowMs,
+    confirmMs,
     appearDeadlineMs,
     pollMs,
     giveUpMs,
@@ -297,10 +343,34 @@ test("#779 installer: the healthy first open reports nothing and stands down", (
   h.state.painted = true; // render() attached the root, as it should
   h.mutate(); // the selection class change
   assert.equal(h.reports.length, 0);
+  assert.equal(h.handle.sample().state, "verifying", "one glimpse is not proof");
+  h.advance(400); // the paint survives the confirmation dwell
   assert.equal(h.handle.sample().state, "satisfied");
   h.advance(20000);
   assert.equal(h.reports.length, 0, "a satisfied watchdog never speaks");
   assert.equal(h.timersLeft(), 0, "…and holds no timers");
+});
+
+test("#779 installer: the live drill — root attached then instantly ripped out — fires", () => {
+  // This exact sequence put the first draft to sleep on a real 1.47.12 page:
+  // render attaches the root, the watchdog's observer glimpses it painted, and
+  // a saboteur (standing in for the pre-#784 guard) removes it within the same
+  // flush. The glimpse must leave the watchdog in "verifying", and the removal
+  // must re-arm it — ending in the one report.
+  const h = harness();
+  h.state.rail = {};
+  h.state.button = true;
+  h.advance(60);
+  h.state.selected = modernButton(OURS);
+  h.state.painted = true; // the attach…
+  h.mutate();
+  h.state.painted = false; // …and the same-flush removal
+  h.mutate();
+  h.advance(500); // past windowMs 300 + slack
+  assert.equal(h.reports.length, 1);
+  assert.match(h.reports[0], /no panel content exists/);
+  h.advance(20000);
+  assert.equal(h.reports.length, 1, "still exactly one line");
 });
 
 test("#779 installer: selected-but-never-painted produces EXACTLY the one line", () => {

@@ -23,10 +23,13 @@
  *    `.cmcp-root` and no `.cmcp-failure-shell` exists, continuously for
  *    RENDER_STARVATION_MS, re-verified at expiry. When the selected tab is
  *    another tab, or unidentifiable ("unknown"), the check DISARMS rather than
- *    counts — an unreadable marker is not evidence of our failure. The first
- *    successful paint while our tab is active retires the check for the page's
- *    lifetime: its charter is first-paint failure, the #779 class; content that
- *    later disappears is a different bug with a different symptom.
+ *    counts — an unreadable marker is not evidence of our failure. A paint that
+ *    SURVIVES SATISFY_CONFIRM_MS while our tab is active retires the check for
+ *    the page's lifetime: its charter is first-paint failure, the #779 class;
+ *    content that disappears after a confirmed dwell is a different bug with a
+ *    different symptom. A mere glimpse of paint retires nothing — the actual
+ *    #779 attached the root and removed it in the same mutation flush, and a
+ *    live drill proved a glimpse-trusting watchdog sleeps through it.
  *
  * 2. APPEARANCE — the sidebar rail exists but our tab button never showed up in
  *    it within TAB_APPEAR_DEADLINE_MS of the rail being seen. This is what a
@@ -47,6 +50,13 @@ import { VERIFIED_FRONTENDS } from "./comfyui-dom-deps.js";
 
 /** Continuous selected-but-empty time before the starvation line is spoken. */
 export const RENDER_STARVATION_MS = 3000;
+/** A paint must SURVIVE this long before it retires the watchdog. The actual
+ *  #779 failure attached the root and removed it within the same mutation
+ *  flush — to a single sample that instant is indistinguishable from healthy.
+ *  Found live: a drill that reproduced the historical remove-on-attach retired
+ *  the first draft of this watchdog instead of firing it. Never trust one
+ *  glimpse of paint. */
+export const SATISFY_CONFIRM_MS = 1500;
 /** Rail seen → our button still absent for this long = the appearance line. */
 export const TAB_APPEAR_DEADLINE_MS = 10000;
 /** Poll cadence for the appearance check (also re-samples starvation). */
@@ -65,14 +75,21 @@ function verifiedFrontendList() {
   return `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
 }
 
-/** The remedy sentence both reports end with — one wording, one place. */
+/** The remedy sentence both reports end with — one wording, one place.
+ *
+ *  The pin names Comfy-Org/ComfyUI_frontend, NOT comfyanonymous/ComfyUI: the
+ *  flag fetches GitHub releases from the named repo, and the frontend's 1.x
+ *  release tags exist only in the frontend repo. A comfyanonymous/ComfyUI pin
+ *  quietly falls back to whatever frontend package is installed — it appears
+ *  to work exactly when it did nothing. Verified live against ComfyUI 0.30.2's
+ *  frontend_management.py while fixing #779. */
 function remedyText() {
   const pin = VERIFIED_FRONTENDS[VERIFIED_FRONTENDS.length - 1] || "1.50.3";
   return (
     `This is NOT a connection problem, and reinstalling the pack or ComfyUI cannot change it. ` +
     `Please report it at ${ISSUES_URL} and include both version numbers from this message. ` +
     `Until it is fixed, relaunching ComfyUI with ` +
-    `--front-end-version comfyanonymous/ComfyUI@${pin} restores the panel ` +
+    `--front-end-version Comfy-Org/ComfyUI_frontend@${pin} restores the panel ` +
     `(frontends ${verifiedFrontendList()} are verified to render this panel version).`
   );
 }
@@ -123,16 +140,27 @@ export function tabNeverAppearedReport(info = {}) {
  * without a DOM or a clock.
  *
  * Feed it observations; it answers with the state they produce:
- *   "idle"      not our tab / painted / nothing to watch — any timer can drop
+ *   "idle"      not our tab / nothing to watch — any timer can drop
  *   "armed"     our tab is active and empty; `waited` ms so far
- *   "fired"     the window elapsed with the condition continuously true —
+ *   "verifying" our tab painted, and the paint has not yet SURVIVED
+ *               SATISFY_CONFIRM_MS — the actual #779 bug attached and removed
+ *               the root within one mutation flush, so one glimpse of paint
+ *               proves nothing; `waited` ms of confirmed dwell so far
+ *   "fired"     the window elapsed with selected-and-empty continuously true —
  *               onStarve(waitedMs) was invoked exactly once, ever
- *   "satisfied" our tab painted while active; the watchdog retires for good
+ *   "satisfied" the paint survived the confirmation dwell while our tab was
+ *               active; the watchdog retires for good
  *
- * @param {{ tabId: string, windowMs?: number, onStarve?: (waitedMs: number) => void }} opts
+ * @param {{ tabId: string, windowMs?: number, confirmMs?: number, onStarve?: (waitedMs: number) => void }} opts
  */
-export function createRenderWatchdog({ tabId, windowMs = RENDER_STARVATION_MS, onStarve } = {}) {
+export function createRenderWatchdog({
+  tabId,
+  windowMs = RENDER_STARVATION_MS,
+  confirmMs = SATISFY_CONFIRM_MS,
+  onStarve,
+} = {}) {
   let armedAt = null;
+  let paintedAt = null;
   let done = false; // fired OR satisfied — either way, permanently over
   let firedEver = false;
 
@@ -144,25 +172,35 @@ export function createRenderWatchdog({ tabId, windowMs = RENDER_STARVATION_MS, o
      *   readActiveSidebarTab — "none" / "unknown" / {state:"id", id}.
      * @param {boolean} painted is any of our content connected right now?
      * @param {number} at a monotonic-enough clock (Date.now()).
-     * @returns {{ state: "idle"|"armed"|"fired"|"satisfied", waited?: number }}
+     * @returns {{ state: "idle"|"armed"|"verifying"|"fired"|"satisfied", waited?: number }}
      */
     sample(active, painted, at) {
       if (done) return { state: firedEver ? "fired" : "satisfied" };
       const ours = !!active && active.state === "id" && active.id === tabId;
-      if (ours && painted) {
-        // First proven paint: the contract works here. Retire — later blanks
-        // are different bugs and get different (visible) symptoms.
-        done = true;
-        armedAt = null;
-        return { state: "satisfied" };
-      }
       if (!ours) {
         // Another tab, no tab, or a marker we cannot read. None of these is
-        // evidence about US — disarm rather than count (#784's rule).
+        // evidence about US — disarm rather than count (#784's rule). An
+        // interrupted confirmation dwell does NOT retire: stay alive and
+        // re-evaluate on the next dwell.
         armedAt = null;
+        paintedAt = null;
         return { state: "idle" };
       }
-      // Ours, and empty.
+      if (painted) {
+        // Painted — but a paint only counts once it has SURVIVED. The real
+        // #779 removed the root instants after render() attached it, and a
+        // watchdog that retired on the glimpse missed the entire outage.
+        armedAt = null;
+        if (paintedAt == null) paintedAt = at;
+        const dwell = at - paintedAt;
+        if (dwell >= confirmMs) {
+          done = true;
+          return { state: "satisfied" };
+        }
+        return { state: "verifying", waited: dwell };
+      }
+      // Ours, and empty. A prior unconfirmed paint is void.
+      paintedAt = null;
       if (armedAt == null) armedAt = at;
       const waited = at - armedAt;
       if (waited >= windowMs) {
@@ -216,6 +254,7 @@ export function installSidebarRenderWatchdog({
   clearTimer = (h) => clearTimeout(h),
   now = () => Date.now(),
   windowMs = RENDER_STARVATION_MS,
+  confirmMs = SATISFY_CONFIRM_MS,
   appearDeadlineMs = TAB_APPEAR_DEADLINE_MS,
   pollMs = WATCHDOG_POLL_MS,
   giveUpMs = WATCHDOG_GIVE_UP_MS,
@@ -246,6 +285,7 @@ export function installSidebarRenderWatchdog({
   const machine = createRenderWatchdog({
     tabId,
     windowMs,
+    confirmMs,
     onStarve: (waitedMs) => report(renderStarvationReport(versions(waitedMs))),
   });
 
@@ -275,11 +315,14 @@ export function installSidebarRenderWatchdog({
     }
     const active = readActiveSidebarTab(doc.querySelector(".side-bar-button-selected"));
     const res = machine.sample(active, !!isPainted(), now());
-    if (res.state === "armed") {
+    if (res.state === "armed" || res.state === "verifying") {
       if (expiryTimer == null) {
-        // Re-verify AT the deadline rather than firing blind: everything may
-        // have changed since arming, and only a fresh look is evidence.
-        const delay = Math.max(windowMs - (res.waited ?? 0), 0) + 80;
+        // Re-verify AT the deadline rather than deciding blind: everything may
+        // have changed since this sample, and only a fresh look is evidence.
+        // "armed" re-checks at the starvation deadline; "verifying" re-checks
+        // when the paint would have survived long enough to count.
+        const horizon = res.state === "armed" ? windowMs : confirmMs;
+        const delay = Math.max(horizon - (res.waited ?? 0), 0) + 80;
         expiryTimer = setTimer(() => {
           expiryTimer = null;
           sample();
