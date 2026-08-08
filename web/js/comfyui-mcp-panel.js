@@ -69,6 +69,7 @@ import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
+import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
@@ -8780,19 +8781,46 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!data || typeof data !== "object") {
       throw new Error("graph (object or JSON string) is required");
     }
-    // Validate UI/litegraph format. The live canvas loads UI-format graphs
-    // (top-level `nodes` array); API/prompt format (top-level numeric keys, each
-    // an object with `class_type`) is NOT loadable here.
+    // #775 — API/prompt format IS loadable, through the frontend's own importer.
+    // This branch used to refuse it outright and tell the caller to "provide the
+    // UI workflow JSON (the pack workflow.json is UI format)". Both halves were
+    // wrong: ComfyUI ships `app.loadApiJson` and uses it on its own file-drop
+    // path, and the pack that prompted the report ships API format — as does its
+    // upstream source — so the file it pointed at does not exist.
+    //
+    // Verified against the live rig (ComfyUI 0.30.2 / frontend 1.47.12) with that
+    // exact workflow: 59 API entries loaded as 56 nodes and 70 links with no
+    // throw, rgthree's Power Lora Loader included. The frontend instantiates real
+    // node classes, so widget/link separation is done by the nodes themselves
+    // rather than by a converter guessing from /object_info.
     if (!Array.isArray(data.nodes)) {
-      const keys = Object.keys(data);
-      const looksLikeApi =
-        keys.length > 0 &&
-        keys.every((k) => /^\d+$/.test(k)) &&
-        keys.some((k) => data[k] && typeof data[k] === "object" && "class_type" in data[k]);
-      if (looksLikeApi) {
-        throw new Error(
-          "workflow is in API/prompt format; provide the UI workflow JSON (the pack workflow.json is UI format)",
-        );
+      if (looksLikeApiWorkflow(data)) {
+        if (typeof app.loadApiJson !== "function") {
+          throw new Error(
+            "workflow is in API/prompt format and this frontend has no app.loadApiJson to " +
+              "import it. Provide a UI workflow JSON (one with a top-level `nodes` array), " +
+              "or open the API JSON in the ComfyUI tab by hand.",
+          );
+        }
+        const apiClone = JSON.parse(JSON.stringify(data));
+        // Snapshot first, exactly like the UI path — an API import replaces the
+        // canvas too, and must be as undoable as any other graph edit this turn.
+        captureGraphSnapshot(null, "before loading an API-format workflow");
+        await app.loadApiJson(apiClone, "graph_load.json");
+        // COMPARE WHAT ARRIVED. A missing node type is an uninstalled pack, and a
+        // load that quietly drops nodes and reports success is the exact failure
+        // this codebase keeps fixing — the graph then fails at QUEUE time, with a
+        // disconnected input, far from the call that caused it.
+        const landed = app?.graph?._nodes ?? [];
+        const shortfall = apiLoadShortfall(apiClone, landed);
+        return {
+          loaded: true,
+          format: "api",
+          node_count: landed.length,
+          entries_in: Object.keys(apiClone).length,
+          ...(shortfall.length ? { missing_node_types: shortfall } : {}),
+          note: apiLoadNote(shortfall),
+        };
       }
       throw new Error(
         "graph is not a UI workflow (missing a `nodes` array). Provide the UI workflow JSON.",
