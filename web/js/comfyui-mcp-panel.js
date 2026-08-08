@@ -67,7 +67,7 @@ import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
-import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
+import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
@@ -24857,6 +24857,23 @@ function buildPanel() {
       // session id persists in sessionStorage, so we reconnect + resume on load.
       // Arm the reopen flag so our sidebar tab re-activates after the reload
       // (ComfyUI won't, since our tab isn't registered yet when it restores).
+      // #701 defect (2) — an AGENT-commanded reload must not start something the
+      // browser will refuse to finish. With unsaved work open, `beforeunload`
+      // blocks the navigation, and it drops this tab's socket BEFORE raising the
+      // dialog: the tab ends up with no reload and no bridge, and nobody is at the
+      // keyboard to answer the prompt. Reproduced on the rig with 3 unsaved
+      // workflows — "soft reload (frontend) scheduled", then a disconnect, then
+      // nothing, with the page never navigating.
+      //
+      // A USER-initiated reload still proceeds: they are right there and can
+      // answer the dialog. Only the commanded path refuses.
+      if (origin === "agent") {
+        const blockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+        if (blockers.length) {
+          appendSystem(reloadWouldBeBlockedMessage(blockers));
+          return;
+        }
+      }
       ssSet(SIDEBAR_REOPEN_KEY, "1");
       appendSystem("Reloading the panel UI (new frontend code)…");
       // #584 — the cmcpReload page-URL param busts only the top document; the

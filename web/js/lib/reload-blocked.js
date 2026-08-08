@@ -73,3 +73,65 @@ export function reloadBlockedMessage() {
     "appear disconnected until the reload completes or is dismissed."
   );
 }
+
+/**
+ * The open workflows whose unsaved edits will make the browser block a
+ * programmatic navigation.
+ *
+ * panel#701 defect (2) — reproduced on the rig: with 3 unsaved workflows open,
+ * `panel_reload({scope:"frontend"})` reported "soft reload (frontend) scheduled",
+ * the orchestrator logged `panel tab disconnected`, and then nothing. The page
+ * never navigated (the URL still lacked `cmcpReload`, the title still carried its
+ * unsaved `*`) and stopped accepting script injection at all.
+ *
+ * `beforeunload` is why, and the ORDER is what makes it a wedge rather than a
+ * no-op: the browser tears the socket down first and only then puts up the
+ * "Leave site?" dialog. Nobody is at the keyboard to answer it during an
+ * agent-commanded reload, so the tab is left with no navigation AND no bridge —
+ * strictly worse off than before the command.
+ *
+ * We must NOT suppress the dialog. It is the only thing standing between an
+ * agent-issued reload and someone's unsaved graph.
+ *
+ * So detect it instead, and don't start something that cannot finish.
+ *
+ * @param {Array<{isModified?: boolean, filename?: string, path?: string, key?: string}>} openWorkflows
+ * @returns {string[]} human-readable labels of the blocking tabs
+ */
+export function unsavedReloadBlockers(openWorkflows) {
+  if (!Array.isArray(openWorkflows)) return [];
+  const out = [];
+  for (const w of openWorkflows) {
+    // Only a DEFINITE modification blocks. An absent/unknown flag is not
+    // evidence of unsaved work, and refusing on it would make the reload
+    // unusable on any build that does not expose the field.
+    if (w?.isModified !== true) continue;
+    const label =
+      (typeof w.filename === "string" && w.filename) ||
+      (typeof w.path === "string" && w.path) ||
+      (typeof w.key === "string" && w.key) ||
+      "an unsaved workflow";
+    if (!out.includes(label)) out.push(label);
+  }
+  return out;
+}
+
+/**
+ * What to say instead of navigating. Names the tabs, the mechanism, and the two
+ * ways forward — a refusal without a route out is just a different dead end.
+ *
+ * @param {string[]} blockers
+ */
+export function reloadWouldBeBlockedMessage(blockers) {
+  const list = blockers.join(", ");
+  const many = blockers.length > 1;
+  return (
+    `Did NOT reload the panel: ${many ? "these workflows have" : "this workflow has"} unsaved ` +
+    `changes — ${list}. The browser blocks a scripted navigation while unsaved work is open, ` +
+    `and it drops this tab's bridge connection BEFORE showing the "Leave site?" dialog — so ` +
+    `reloading now would leave the tab with neither a reload nor a connection, and no one at ` +
+    `the keyboard to answer the prompt. Nothing was changed. Save or close ` +
+    `${many ? "those tabs" : "that tab"} and ask again, or reload the tab yourself ` +
+    `(Ctrl+Shift+R) and confirm the dialog.`
+  );
+}
