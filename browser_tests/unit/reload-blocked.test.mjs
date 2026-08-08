@@ -160,3 +160,32 @@ test("#701 WIRING: only the AGENT path refuses, and it refuses BEFORE navigating
   assert.ok(guardAt > 0 && navAt > guardAt, "the blocker check must precede the navigation")
   assert.match(block.slice(guardAt, navAt), /return;/)
 })
+
+test("#701 WIRING: the soft_reload REPLY reports the refusal, before scheduling anything", async () => {
+  // Live-verified on the rig that the guard works and the socket survives — and
+  // that the agent was still told "soft reload (frontend) scheduled", with the
+  // panel-side notice nowhere the agent can read it. A command that reports the
+  // REQUEST instead of the observed EFFECT is the defect, not the navigation.
+  const { readFileSync } = await import("node:fs")
+  const { fileURLToPath } = await import("node:url")
+  const { dirname, join } = await import("node:path")
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  )
+  const i = src.indexOf('msg.cmd === "soft_reload"')
+  assert.ok(i > 0)
+  const block = src.slice(i, i + 1800)
+  // The blockers are consulted in the command handler…
+  assert.match(block, /unsavedReloadBlockers\(app\?\.extensionManager\?\.workflow\?\.openWorkflows\)/)
+  // …the refusal becomes the REPLY…
+  assert.match(block, /result = reloadWouldBeBlockedMessage\(reloadBlockers\)/)
+  // …and "scheduled" + the actual reload are the ELSE branch, so a blocked
+  // reload can never be reported as scheduled.
+  const refusalAt = block.indexOf("reloadWouldBeBlockedMessage(reloadBlockers)")
+  const schedAt = block.indexOf("scheduled`")
+  assert.ok(refusalAt > 0 && schedAt > refusalAt, "the refusal must be decided before the scheduled reply")
+  assert.match(block.slice(refusalAt, schedAt), /\} else \{/)
+  // Only the frontend scope is gated — an orchestrator respawn does not navigate.
+  assert.match(block, /scope === "frontend"\s*\?\s*unsavedReloadBlockers/)
+})
