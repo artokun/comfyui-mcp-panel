@@ -112,16 +112,42 @@ export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
  * The ordered list of 3rd-argument shapes to try for app.queuePrompt when a
  * run-to-node scope is requested. The positional array comes first (native on
  * positional builds, normalized by the Array.isArray shim on options builds);
- * the QueuePromptOptions object is the fallback for builds that dropped the
- * shim. `[undefined]` when no scope was requested — a plain full run, exactly
- * the historical call shape.
+ * the QueuePromptOptions object is next for builds that dropped the shim.
+ * `[undefined]` when no scope was requested — a plain full run, exactly the
+ * historical call shape.
+ *
+ * #752 — the THIRD shape, `{ partialExecutionTargets }`, exists because the
+ * frontend uses TWO DIFFERENT OPTION KEYS at two different layers. Read out of a
+ * shipped ComfyUI_frontend 1.47.12 bundle:
+ *
+ *   store  async queuePrompt(e,t=1,n={}){ let {queueNodeIds:r,intent:i} =
+ *            Array.isArray(n) ? {queueNodeIds:n} : n; …
+ *            await api.queuePrompt(e, m, {partialExecutionTargets:n, …})
+ *
+ *   api    async queuePrompt(e,t,n){ … ...n?.partialExecutionTargets &&
+ *            {partial_execution_targets: n.partialExecutionTargets} … }
+ *
+ * So the store speaks `queueNodeIds` and translates it, while the api layer
+ * speaks `partialExecutionTargets` and is the one that actually writes the
+ * request field. A build whose `app.queuePrompt` IS — or forwards straight to —
+ * the api-level function silently ignores both shapes we sent, the scope never
+ * reaches the body, and the run falls through to request_body_repair. That is
+ * exactly what two field reports show (#752, on frontend 1.45.21).
+ *
+ * Strictly additive: builds that already answered shape 1 or 2 never reach this
+ * one. Destructuring ignores unknown keys, so offering the extra key cannot harm
+ * a build that does not read it.
  *
  * @param {string[]|undefined} partialTargets
  * @returns {(string[]|{queueNodeIds:string[]}|undefined)[]}
  */
 export function queuePromptScopeArgs(partialTargets) {
   if (!Array.isArray(partialTargets) || !partialTargets.length) return [undefined];
-  return [partialTargets, { queueNodeIds: partialTargets }];
+  return [
+    partialTargets,
+    { queueNodeIds: partialTargets },
+    { partialExecutionTargets: partialTargets },
+  ];
 }
 
 /**
@@ -149,6 +175,7 @@ export function queuePromptScopeAttempts(partialTargets) {
   return [
     { arg: partialTargets, repair: false },
     { arg: { queueNodeIds: partialTargets }, repair: false },
+    { arg: { partialExecutionTargets: partialTargets }, repair: false },
     { arg: partialTargets, repair: true },
   ];
 }
