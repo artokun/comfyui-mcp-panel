@@ -100,6 +100,20 @@ test("#779 the workaround pin is a VERIFIED frontend, not a hardcoded relic", ()
   }
 });
 
+test("#779 the pin never recommends the frontend that is failing right now", () => {
+  // Live-drill finding: with the failing frontend equal to the newest verified
+  // one, a newest-only pin told the user to pin the version they were already
+  // on. Advice-shaped noise — prefer the newest verified frontend that DIFFERS.
+  const newest = VERIFIED_FRONTENDS[VERIFIED_FRONTENDS.length - 1];
+  const previous = VERIFIED_FRONTENDS[VERIFIED_FRONTENDS.length - 2];
+  const line = renderStarvationReport({ frontendVersion: newest });
+  assert.ok(
+    line.includes(`--front-end-version Comfy-Org/ComfyUI_frontend@${previous}`),
+    `running ${newest}, the pin should back off to ${previous}`,
+  );
+  assert.ok(!line.includes(`ComfyUI_frontend@${newest} `), "never the failing version itself");
+});
+
 // ---------------------------------------------------------------------------
 // The state machine. Times in ms; WINDOW below for readability.
 // ---------------------------------------------------------------------------

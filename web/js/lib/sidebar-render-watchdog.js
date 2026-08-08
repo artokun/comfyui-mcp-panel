@@ -82,9 +82,16 @@ function verifiedFrontendList() {
  *  release tags exist only in the frontend repo. A comfyanonymous/ComfyUI pin
  *  quietly falls back to whatever frontend package is installed — it appears
  *  to work exactly when it did nothing. Verified live against ComfyUI 0.30.2's
- *  frontend_management.py while fixing #779. */
-function remedyText() {
-  const pin = VERIFIED_FRONTENDS[VERIFIED_FRONTENDS.length - 1] || "1.50.3";
+ *  frontend_management.py while fixing #779.
+ *
+ *  The pin prefers the newest verified frontend that DIFFERS from the one
+ *  being reported: telling someone whose frontend is failing to pin that very
+ *  version would be advice-shaped noise.
+ *
+ *  @param {string|undefined} runningFrontend the version being reported on. */
+function remedyText(runningFrontend) {
+  const known = VERIFIED_FRONTENDS.filter((v) => v !== runningFrontend);
+  const pin = known[known.length - 1] || VERIFIED_FRONTENDS[VERIFIED_FRONTENDS.length - 1] || "1.50.3";
   return (
     `This is NOT a connection problem, and reinstalling the pack or ComfyUI cannot change it. ` +
     `Please report it at ${ISSUES_URL} and include both version numbers from this message. ` +
@@ -113,7 +120,7 @@ export function renderStarvationReport(info = {}) {
     `(no .cmcp-root in the document). The tab registered and was selected, yet the panel was ` +
     `either never asked to render or its content was removed as soon as it was attached. ` +
     `That is a compatibility fault between panel ${p} and ComfyUI frontend ${f}. ` +
-    remedyText()
+    remedyText(info.frontendVersion)
   );
 }
 
@@ -131,7 +138,7 @@ export function tabNeverAppearedReport(info = {}) {
     `appeared in the sidebar rail (waited ~${s}s after the rail was seen). This frontend most ` +
     `likely changed how a custom sidebar tab is declared, in a way panel ${p} does not speak ` +
     `yet — ComfyUI frontend here is ${f}. ` +
-    remedyText()
+    remedyText(info.frontendVersion)
   );
 }
 
