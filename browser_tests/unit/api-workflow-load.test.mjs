@@ -170,7 +170,9 @@ test("#775 WIRING: graph_load delegates to loadApiJson instead of refusing", () 
     "and stays undoable like every other graph edit",
   );
   assert.match(branch, /apiLoadShortfall\(apiClone, landed\)/, "and compares what arrived");
-  assert.match(branch, /note: apiLoadNote\(shortfall\)/, "and discloses it");
+  // #775 — the note now also receives the packs that failed to import, so this
+  // asserts the note is WIRED rather than pinning its exact argument list.
+  assert.match(branch, /note: apiLoadNote\(shortfall/, "and discloses it");
 });
 
 test("#775 the DISCREDITED refusal text is gone from the shipped panel", () => {

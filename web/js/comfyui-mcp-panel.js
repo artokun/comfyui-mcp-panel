@@ -70,6 +70,7 @@ import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing
 import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
+import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
@@ -8855,13 +8856,20 @@ const GRAPH_TOOL_EXECUTORS = {
         // disconnected input, far from the call that caused it.
         const landed = app?.graph?._nodes ?? [];
         const shortfall = apiLoadShortfall(apiClone, landed);
+        // #775 — a missing node type is not proof of a missing PACK. Only asked
+        // when something IS missing: a clean load must not pay for a log fetch,
+        // and there would be nothing for the note to say.
+        const importFailures = shortfall.length
+          ? await readPackImportFailures((route) => api?.fetchApi?.(route))
+          : [];
         return {
           loaded: true,
           format: "api",
           node_count: landed.length,
           entries_in: Object.keys(apiClone).length,
           ...(shortfall.length ? { missing_node_types: shortfall } : {}),
-          note: apiLoadNote(shortfall),
+          ...(importFailures.length ? { packs_failed_to_import: importFailures } : {}),
+          note: apiLoadNote(shortfall, importFailures),
         };
       }
       throw new Error(
