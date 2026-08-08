@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
@@ -24697,6 +24698,11 @@ function buildPanel() {
       } catch {
         /* reload regardless — worst case is the pre-#584 behaviour */
       }
+      // #701(2) — the navigation below can be CANCELLED by ComfyUI's unsaved-work
+      // beforeunload, after the browser has already torn down our socket. If that
+      // happens this code survives the deadline and says so; if the reload works, the
+      // document is destroyed and the notice never fires. Arm it BEFORE navigating.
+      armReloadBlockedNotice({ notify: (m) => appendSystem(m) });
       try {
         const u = new URL(window.location.href);
         u.searchParams.set("cmcpReload", String(Date.now()));
