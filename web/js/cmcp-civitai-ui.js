@@ -2014,7 +2014,20 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       dispatched: true,
     };
   }
-  function driveGetResults({ limit = 20 } = {}) {
+  async function driveGetResults({ limit = 20 } = {}) {
+    _assertOpen();
+    // Wait for an in-flight first page, exactly as driveHighlight does.
+    //
+    // panel#793 — without this, an agent that opens the browser and immediately
+    // asks for results gets `{ count: 0, total: 0, loading: true }`. That is not
+    // a lie, but it reads as "this search found nothing", and the agent has no
+    // reason to poll: `civitai_highlight` issued at the same instant DOES wait
+    // and DOES see the cards, so the two commands disagreed about whether any
+    // results existed. Same open, same moment, different answer.
+    //
+    // `loading` is still reported below — this only removes the window where the
+    // honest answer was available and we returned the empty one instead.
+    try { await state.activeReloadPromise; } catch { /* surfaces via state.error below */ }
     _assertOpen();
     const model = isModelTab();
     const source = model ? state.models : state.items;

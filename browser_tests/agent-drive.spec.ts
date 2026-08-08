@@ -24,31 +24,52 @@
  */
 import { test, expect } from './fixtures/panelTest'
 
-// A canned /v1/images feed page. Distinct ids so highlight-by-id is meaningful.
-// `page` selects which ids come back so a later "page" can carry a target that
-// the first page didn't (the scroll/append-highlight case).
-function imagesPage(ids: number[], nextCursor: string | null) {
+// A canned search page. Distinct ids so highlight-by-id is meaningful. `page`
+// selects which ids come back so a later "page" can carry a target that the
+// first page didn't (the scroll/append-highlight case).
+//
+// panel#793 — this used to emit the REST `/v1/images` shape,
+// `{ items, metadata: { nextCursor } }`. The panel does not call that endpoint
+// for a keyword search; it POSTs CivitAI's Meilisearch:
+//
+//     https://search-new.civitai.com/multi-search
+//
+// and reads `data.results[0].hits` (cmcp-civitai.js:925 → `_fromMeili`). The
+// stub therefore answered every search with a body the reader found no hits in,
+// so the grid stayed on its spinner with zero cards and all five specs here
+// failed waiting for a card that could never render. The ITEM fields were right
+// all along — only the envelope was stale.
+function imagesPage(ids: number[]) {
   return {
-    items: ids.map((id) => ({
-      id,
-      url: `https://cdn/${id}.jpeg`,
-      type: 'image',
-      width: 512,
-      height: 512,
-      nsfwLevel: 1,
-      username: `user${id}`,
-      stats: { likeCount: id },
-      meta: { prompt: `prompt for ${id}` }
-    })),
-    metadata: { nextCursor }
+    results: [
+      {
+        hits: ids.map((id) => ({
+          id,
+          url: `https://cdn/${id}.jpeg`,
+          type: 'image',
+          width: 512,
+          height: 512,
+          nsfwLevel: 1,
+          username: `user${id}`,
+          stats: { likeCount: id },
+          meta: { prompt: `prompt for ${id}` }
+        }))
+      }
+    ]
   }
 }
+
+/** An exhausted feed. Meili carries no cursor, so "no more results" is an empty
+ *  hit list — the job `metadata.nextCursor: null` used to do. Without it the
+ *  stub replays its last page forever and the grid fills with duplicates of the
+ *  same id, which makes a `[data-id=N]` locator ambiguous. */
+const EXHAUSTED = { results: [{ hits: [] as unknown[] }] }
 
 async function stubCivitai(page: import('@playwright/test').Page, pages: Record<string, unknown>[]) {
   let call = 0
   // All CivitAI REST/tRPC calls funnel through the same-origin POST proxy.
   await page.route('**/comfyui_mcp_panel/civitai/api', (route) => {
-    const body = pages[Math.min(call, pages.length - 1)]
+    const body = call < pages.length ? pages[call] : EXHAUSTED
     call += 1
     route.fulfill({ json: body })
   })
@@ -75,7 +96,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([11, 12, 13], null)])
+    await stubCivitai(page, [imagesPage([11, 12, 13])])
     await openPanel(panel, mockBridge)
 
     // Agent opens docked and IMMEDIATELY highlights — before results exist.
@@ -89,7 +110,7 @@ test.describe('agent-driven CivitAI modal', () => {
   })
 
   test('a reload (switch_tab / search) clears the glow', async ({ page, panel, mockBridge }) => {
-    await stubCivitai(page, [imagesPage([21, 22], null)])
+    await stubCivitai(page, [imagesPage([21, 22])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'a', dock: true })
     await mockBridge.command('civitai_highlight', { ids: [21] })
@@ -107,8 +128,8 @@ test.describe('agent-driven CivitAI modal', () => {
   }) => {
     // First page lacks id 99; the second page (next cursor) carries it.
     await stubCivitai(page, [
-      imagesPage([31, 32], 'c1'),
-      imagesPage([99], null)
+      imagesPage([31, 32]),
+      imagesPage([99])
     ])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'x', dock: true })
@@ -127,7 +148,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([41, 42, 43, 44], null)])
+    await stubCivitai(page, [imagesPage([41, 42, 43, 44])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'y', dock: true })
     const res = await mockBridge.command('civitai_results', { limit: 2 })
@@ -146,7 +167,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([51], null)])
+    await stubCivitai(page, [imagesPage([51])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'z', dock: true })
     await expect(page.locator('.cmcp-civitai-modal')).toBeVisible()
@@ -164,7 +185,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([61], null)])
+    await stubCivitai(page, [imagesPage([61])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'q', dock: true })
     const overlay = page.locator('.cmcp-cv-overlay.cmcp-docked')
