@@ -141,6 +141,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -10638,6 +10639,30 @@ const GRAPH_TOOL_EXECUTORS = {
         errorsStepBudget(GET_ERRORS_STEP_CAP_MS),
       );
     }
+    // #745 — the load-time missing-asset stores never see a node added since the
+    // load, so ask the SERVER about the widget values actually on the canvas now.
+    // Per-class /object_info (5,694 bytes vs 5,413,770 for the whole document), so
+    // this is a handful of small reads, deduped per node type.
+    //
+    // Shares the same budget as every other elective server wait here and fails
+    // CLOSED: with no budget left the scan is skipped, and whatever it did not
+    // reach is reported as UNCHECKED rather than as clean. Overrunning would be a
+    // "did not reply" that leaves the agent no error surface at all (#589) —
+    // worse than the omission this closes.
+    let liveScan = null;
+    try {
+      const scanBudgetMs = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
+      if (scanBudgetMs > 0) {
+        liveScan = await scanComboAvailability(
+          nodes,
+          (cls) => fetchSingleNodeDef(cls, (route) => api?.fetchApi?.(route)),
+          { budgetMs: scanBudgetMs },
+        );
+      }
+    } catch {
+      liveScan = null; // never let the scan take down the error report
+    }
+
     let postProbeRootGraph = null;
     try {
       postProbeRootGraph = getGraphCtx().rootGraph ?? null;
@@ -10846,6 +10871,20 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(missingAssetScanMayBeStale(activeWorkflowRef())
         ? { missing_asset_scope: missingAssetScopeNote() }
         : {}),
+      // #745 — the LIVE half. Named separately from missing_models because it was
+      // established differently: the server's current /object_info, not the scan
+      // ComfyUI ran at load. unchecked_nodes is emitted whenever the scan could
+      // not judge something, so an empty unavailable list is never mistaken for a
+      // clean canvas.
+      ...(liveScan?.unavailable?.length
+        ? {
+            unavailable_widget_values: liveScan.unavailable,
+            unavailable_widget_values_note: comboAvailabilityNote(liveScan.unavailable),
+          }
+        : {}),
+      ...(liveScan?.unknown?.length ? { unchecked_nodes: liveScan.unknown } : {}),
+      ...(liveScan?.unchecked_budget_exhausted ? { unchecked_budget_exhausted: true } : {}),
+      ...(liveScan?.unchecked_class_limit ? { unchecked_class_limit: liveScan.unchecked_class_limit } : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
