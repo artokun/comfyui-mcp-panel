@@ -1258,13 +1258,70 @@ export function normalizePath(path) {
     .replace(/\/+$/, "");
 }
 
+/**
+ * #771 — ComfyUI answers a userdata write with HTTP 400 for ANY OSError, and then
+ * blames the FILENAME regardless of what actually failed.
+ *
+ * app/user_manager.py, post_userdata — this is the only 400 on the write path:
+ *
+ *     except OSError as e:
+ *         logging.warning(f"Error saving file '{path}': {e}")
+ *         return web.Response(status=400,
+ *             reason="Invalid filename. Please avoid special characters like :\/*?\"<>|")
+ *
+ * So a full disk (ENOSPC), a read-only or unwritable directory, a missing parent
+ * (mkstemp on a directory that does not exist), or hitting an fd limit all arrive
+ * as "invalid filename". The reporter's name was `wan22_flf_seg1_alone_to_reaching`
+ * — no special characters anywhere — and they were on a remote box, where a full
+ * volume is a common failure.
+ *
+ * The real errno IS known, one line earlier, in the ComfyUI SERVER LOG. It never
+ * reaches the HTTP response, so the client cannot recover it — which makes naming
+ * where to look the entire value this can add.
+ *
+ * DELIBERATELY NAMES NO SINGLE CAUSE. Picking "your disk is full" would be the
+ * same defect one level up: an inference presented as a finding. It lists what 400
+ * can mean here and points at the one place that says which.
+ */
+export function explainUserDataStoreFailure(message) {
+  const text = typeof message === "string" ? message : "";
+  // Match the shape ComfyUI's client produces, and ONLY the 400: 409 is a genuine
+  // name collision with its own handling (#309/#442), and augmenting it would bury
+  // an accurate message under an irrelevant one.
+  // Deliberately NO word-boundary escapes here. An earlier revision used a word-boundary-
+  // anchored pattern and both escapes were mangled into literal BACKSPACE bytes
+  // (0x08) on the way into this file: the regex still PARSED, the file stayed
+  // git-text, the diff looked normal, and it silently matched nothing. A digit
+  // boundary expressed as a character class says the same thing with no escape
+  // that can be eaten in transit.
+  if (!/storing user data file/i.test(text)) return text;
+  if (!/(^|[^0-9])400([^0-9]|$)/.test(text)) return text;
+  return (
+    text +
+    " — NOTE: ComfyUI returns 400 here for ANY filesystem error while blaming the filename." +
+    " It is the same response for a full disk, an unwritable or read-only directory, a missing" +
+    " parent directory, or an fd limit, so the stated reason is only occasionally the real one." +
+    " ComfyUI logs the actual error one line earlier: look for \"Error saving file\" in the" +
+    " ComfyUI server log — that names the true cause. On a remote or container host, check free" +
+    " space first. The workflow is still open and unsaved; nothing was written or overwritten."
+  );
+}
+
 async function saveInPlace(svc, wf) {
   // Return the save API's own result: when it yields the workflow record it
   // PRODUCED (a re-registered successor object), that is the one unambiguous
   // replacement-event thread the identity carry can use (r10) — path occupancy
   // proves nothing (a close→reopen occupies the same path with a new identity).
-  if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
-  if (typeof wf.save === "function") return await wf.save();
+  try {
+    if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
+    if (typeof wf.save === "function") return await wf.save();
+  } catch (err) {
+    // #771 — augment ONLY the userdata-400 shape; every other failure is
+    // rethrown byte-identical so no existing message or matcher changes.
+    const augmented = explainUserDataStoreFailure(err instanceof Error ? err.message : String(err));
+    if (err instanceof Error && augmented !== err.message) err.message = augmented;
+    throw err;
+  }
   throw new Error("workflow save API unavailable on this frontend");
 }
 
