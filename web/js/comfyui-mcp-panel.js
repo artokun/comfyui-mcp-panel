@@ -68,6 +68,7 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
+import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
@@ -13399,7 +13400,10 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!w) {
       const names = widgets.map((x) => x?.name).filter(Boolean);
       throw new Error(
-        `Node ${node.id} (${node.type}) has no widget "${widget}". Available: ${names.join(", ") || "(none)"}`,
+        `Node ${node.id} (${node.type}) has no widget "${widget}". Available: ${names.join(", ") || "(none)"}` +
+          // #757 — same disclosure as the widget-write path: a button the panel
+          // cannot press may be what creates the missing slot.
+          pressableWidgetHint(node, widget),
       );
     }
     // The parent SubgraphNode instance(s) embedding this subgraph (root-level
