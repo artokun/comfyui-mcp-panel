@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice } from "./lib/reload-blocked.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
@@ -10721,6 +10722,13 @@ const GRAPH_TOOL_EXECUTORS = {
                 }
               : {}),
           }
+        : {}),
+      // #745 — the missing-asset stores are populated at workflow LOAD and never
+      // re-evaluated, so a loader added since is invisible here. Disclose that the
+      // answer has a known blind spot rather than let an empty list read as proof.
+      // Only when the workflow has actually been edited since the scan ran.
+      ...(missingAssetScanMayBeStale(activeWorkflowRef())
+        ? { missing_asset_scope: missingAssetScopeNote() }
         : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
