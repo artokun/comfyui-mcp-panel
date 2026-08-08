@@ -2109,17 +2109,47 @@ function isCanonicalWorkflowInstanceUuid(value) {
 // to publish as a command-fence refresh source.
 function establishedWorkflowReplyIdentity(wf) {
   if (!wf || typeof wf !== "object") return null;
+  // THE ESTABLISHMENT TEST, and the only one that matters here (#716): the uuid
+  // must ALREADY be in the live-object map. workflowObjectUuid() is a pure read —
+  // it never mints — so a reply still cannot initialize an identity. Everything
+  // below runs only for an object the panel has already established.
   const uuid = workflowObjectUuid(wf);
   if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
   const savedPath = savedWorkflowPath(wf);
-  if (!savedPath) return null;
   // #640 — the SHARED spelling of the handle format, not a second local one.
   // This value is compared against workflowTabId()'s elsewhere in the same reply
   // (each workflow_list record's `active` flag is `routingKey === activeRoutingKey`),
   // so two independent spellings are a silent divergence waiting to happen:
   // whichever changed first, every record would report active:false and the agent
   // would be told no tab is active.
-  const routingKey = savedWorkflowHandle(savedPath);
+  if (savedPath) {
+    const routingKey = savedWorkflowHandle(savedPath);
+    return routingKey ? { routingKey, uuid } : null;
+  }
+  // UNSAVED — previously `return null` here, on the reading that "a tmp: routing
+  // handle is not durable enough to publish as a command-fence refresh source".
+  //
+  // Durability is the wrong axis, and the cost of that reading was the wedge in
+  // #760. A fence REFRESH is not a durable-resume record: it re-stamps commands
+  // for the canvas that is live right now, and it is thrown away when the tab
+  // changes. What it needs is a per-INSTANCE identity, which is exactly what the
+  // uuid proven above is — it comes from the live-object WeakMap, and a copy,
+  // import or in-place replace never shares that (#570, resolveUnsavedInstanceUuid).
+  //
+  // Returning null here meant an unsaved canvas could never publish an identity,
+  // so `workflow_list`'s top-level `active` record carried null key/routing_key,
+  // corroborateActiveForFence() found no comparable field, and the fence was never
+  // adopted. Since panel_new_workflow CREATES an unsaved workflow, recovery was not
+  // failing for those sessions — it was unavailable, which is the "permanently
+  // wedged / documented recovery does not clear the guard" of artokun/comfyui-mcp#932,
+  // #607 and #688.
+  //
+  // The tmp: handle comes from workflowTabId(), the same function brief() uses for
+  // every list record, so the two spellings agree by construction — the #640 hazard
+  // above is reduced here, not introduced. (It reads a DIFFERENT map from the uuid
+  // and may mint the handle; that is the ordinary routing-handle mint dispatch does
+  // constantly, not an identity initialization — the identity was already proven.)
+  const routingKey = workflowTabId(wf);
   return routingKey ? { routingKey, uuid } : null;
 }
 

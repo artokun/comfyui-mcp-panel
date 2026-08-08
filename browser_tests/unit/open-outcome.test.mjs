@@ -1031,7 +1031,30 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   assert.equal(workflowUuids.has(malformedActive), false, "must not mint an ephemeral workflow UUID");
 });
 
-test("#716 P1: a temporary workflow UUID is never published as a durable refresh source", () => {
+// #760 — this test used to assert the OPPOSITE ("a temporary workflow UUID is
+// never published as a durable refresh source"), on the reading that "its tmp
+// routing identity is ephemeral, so it cannot refresh the MCP's durable command
+// fence". Two things in that premise do not hold, and the cost of acting on it
+// was that an unsaved canvas could never rebind its fence at all:
+//
+//   • it conflates two different values. What gets published as the fence source
+//     is `workflowObjectUuid` — the canonical per-instance uuid from the LIVE-
+//     OBJECT map — NOT the tmp handle. The tmp handle is only the routing key.
+//   • the tmp handle is not ephemeral either: `_tempWorkflowInstanceIds` is keyed
+//     on the live object exactly so "the same unsaved workflow must keep ONE tmp:
+//     id for its lifetime" (a churning id would cause a re-hello storm).
+//
+// And a fence REFRESH is not a durable-resume record: it re-stamps commands for
+// the canvas that is live right now and is discarded when the tab changes.
+// Decisively, the panel's own fence comparison uses workflowStableUuid(), which
+// for an unsaved workflow returns this same objectUuid — so publishing it makes
+// the orchestrator's stamp match the panel's active uuid exactly, which is the
+// whole point of the refresh.
+//
+// The #716 rule that DOES still hold — a reply must never INITIALIZE an identity
+// — is unchanged and separately pinned by the test below: workflowObjectUuid is a
+// pure read, so an object with no established uuid still publishes nothing.
+test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
@@ -1039,10 +1062,12 @@ test("#716 P1: a temporary workflow UUID is never published as a durable refresh
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const temporaryActive = { isPersisted: false, isTemporary: true };
   const workflowUuids = new WeakMap([[temporaryActive, "33333333-3333-4333-8333-333333333333"]]);
+  const tempIds = new WeakMap([[temporaryActive, "tmp:33333333-3333-4333-8333-333333333333"]]);
   const replyUuid = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
+    "workflowTabId",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
@@ -1051,11 +1076,66 @@ test("#716 P1: a temporary workflow UUID is never published as a durable refresh
     // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
     // `wf:` + path here would be the second spelling the shared helper removed.
     savedWorkflowHandle,
+    (wf) => tempIds.get(wf),
   );
 
-  // Even an existing object-map UUID is insufficient for a temporary tab:
-  // its tmp routing identity is ephemeral, so it cannot refresh the MCP's
-  // durable command fence.
+  // The FENCE uuid is published — the canonical live-object value, not the handle.
+  assert.equal(replyUuid(temporaryActive), "33333333-3333-4333-8333-333333333333");
+});
+
+test("#760: an unsaved canvas with NO established uuid still publishes nothing (#716 holds)", () => {
+  // The establishment test moved, it did not go away. workflowObjectUuid is a
+  // pure WeakMap read, so an object the panel has never established has no uuid
+  // and the reply refuses to invent one — which is the actual #716 invariant.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const unestablished = { isPersisted: false, isTemporary: true };
+  let tabIdCalls = 0;
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "workflowObjectUuid",
+    "savedWorkflowHandle",
+    "workflowTabId",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => unestablished,
+    () => undefined, // never established
+    savedWorkflowHandle,
+    () => {
+      tabIdCalls += 1;
+      return "tmp:should-never-be-reached";
+    },
+  );
+
+  assert.equal(replyUuid(unestablished), null);
+  // …and it bailed BEFORE reaching the handle, so nothing was minted on the way.
+  assert.equal(tabIdCalls, 0, "an unestablished object must not even ask for a routing handle");
+});
+
+test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
+  // The canonical-shape gate must not be bypassed by the new unsaved branch.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const temporaryActive = { isPersisted: false, isTemporary: true };
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "workflowObjectUuid",
+    "savedWorkflowHandle",
+    "workflowTabId",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => temporaryActive,
+    () => "tmp:not-a-uuid", // the ROUTING handle, wrongly offered as the uuid
+    savedWorkflowHandle,
+    (wf) => `tmp:${String(!!wf)}`,
+  );
+
   assert.equal(replyUuid(temporaryActive), null);
 });
 
