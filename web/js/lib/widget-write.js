@@ -1,3 +1,5 @@
+import { pressableWidgetHint } from "./pressable-widget.js";
+
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
 // RIGHT value and can be unit-tested by driving the SAME code path the handler
@@ -884,7 +886,11 @@ export function resolveWidgetWrite(
   if (!widget) {
     const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
     throw new WidgetWriteError(
-      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).`,
+      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).` +
+        // #757 — the available list may already contain the answer without saying
+        // so: a button that CREATES the missing slot. Empty for a node with no
+        // pressable widget, which is the ordinary typo case.
+        pressableWidgetHint(targetNode, widgetName),
     );
   }
 
