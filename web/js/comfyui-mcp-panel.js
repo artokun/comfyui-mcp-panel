@@ -141,6 +141,7 @@ import {
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
+import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -13204,6 +13205,10 @@ const GRAPH_TOOL_EXECUTORS = {
         ? (vueToggled ? "vue-nodes (forced litegraph paint for capture)" : "vue-nodes (could not force litegraph paint)")
         : "litegraph",
       viewing: describeActiveGraph(app?.canvas?.graph ?? graph),
+      // #754(2) — the reply reported size, renderer and which graph, but never the
+      // FRAMING, which is the one thing that explains three identical captures after
+      // moving the canvas. The reporter had to discover it by experiment.
+      framing: describeScreenshotFraming({ nodes: nodes.length, groups: groups.length }),
     };
   },
 
