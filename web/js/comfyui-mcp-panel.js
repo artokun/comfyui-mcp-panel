@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
 import {
   buildInstallRequest,
   classifyInstallOutcome,
@@ -25389,9 +25390,21 @@ function buildPanel() {
           const info = await res.json();
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+        } else {
+          // #756 — a non-200 had NO else at all. The status was in hand and thrown
+          // away, leaving "upload failed" as the whole of what anyone could learn.
+          att.uploadError = describeUploadFailure({
+            status: res.status,
+            statusText: res.statusText,
+            body: await res.text().catch(() => null),
+            name,
+            size: file.size,
+            mediaType: file.type,
+          });
         }
-      } catch {
-        /* upload failed — the chip still references it by name as a fallback */
+      } catch (err) {
+        // #756 — the bare catch swallowed transport failures identically.
+        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
       }
     })();
     att.ready.then(renderAttachmentChips, () => {}); // refresh once the thumb loads
@@ -25425,9 +25438,21 @@ function buildPanel() {
           const info = await res.json();
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+        } else {
+          // #756 — a non-200 had NO else at all. The status was in hand and thrown
+          // away, leaving "upload failed" as the whole of what anyone could learn.
+          att.uploadError = describeUploadFailure({
+            status: res.status,
+            statusText: res.statusText,
+            body: await res.text().catch(() => null),
+            name,
+            size: file.size,
+            mediaType: file.type,
+          });
         }
-      } catch {
-        /* upload failed — the chip still names the file as a fallback */
+      } catch (err) {
+        // #756 — the bare catch swallowed transport failures identically.
+        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
       }
     })();
   }
@@ -26162,13 +26187,26 @@ function buildPanel() {
     }
     const imageRefs = await collectImageRefs(text, refImgs);
     if (refImgs.length) {
-      const lines = refImgs.map((a) => `#${a.id}${a.inputRef ? ` (input/${a.inputRef})` : ""}`).join(", ");
+      // #756 — the image branch reported an absent input/ ref by saying NOTHING,
+      // which reads as "no path needed" rather than "the upload failed". The image
+      // is still shown inline, so this is less severe than the media case, but an
+      // agent asked to wire it into a LoadImage node needs the path and would
+      // otherwise discover the gap only when the node errors. Same swallow, one
+      // branch over — and having just captured the cause it would be worse to
+      // capture it and then drop it here.
+      const lines = refImgs
+        .map((a) =>
+          a.inputRef
+            ? `#${a.id} (input/${a.inputRef})`
+            : `#${a.id} (NOT in input/ — ${a.uploadError ?? "upload failed, cause unobserved"})`,
+        )
+        .join(", ");
       sendText += `\n\n[Attached image(s) ${lines} — shown inline below.]`;
     }
     const mediaUploads = [...refVideos, ...refUploads];
     if (mediaUploads.length) {
       const lines = mediaUploads
-        .map((a) => `${a.token} ${a.inputRef ? `→ input/${a.inputRef}` : `(${a.name} — upload failed)`}`)
+        .map((a) => attachmentSummaryLine(a))
         .join("\n");
       sendText +=
         `\n\n[Attached media in ComfyUI's input/ folder (not viewable inline — load via a ` +
