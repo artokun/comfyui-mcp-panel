@@ -130,6 +130,11 @@ function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_O
       const queueNodeIds =
         shape === "dropping"
           ? undefined
+          : // #752 — an api-layer build: it reads ONLY `partialExecutionTargets`,
+            // the key `api.queuePrompt` actually turns into the request field, and
+            // ignores a positional array and `queueNodeIds` alike.
+            shape === "apiOptions"
+            ? (Array.isArray(arg) ? undefined : arg?.partialExecutionTargets)
           : shape === "shim"
             ? Array.isArray(arg)
               ? arg
@@ -197,10 +202,16 @@ test("#630 queuePromptScopeAttempts: both argument shapes are tried BEFORE the b
   assert.deepEqual(queuePromptScopeAttempts(undefined), [{ arg: undefined, repair: false }]);
   assert.deepEqual(queuePromptScopeAttempts([]), [{ arg: undefined, repair: false }]);
   const attempts = queuePromptScopeAttempts(["76:34"]);
-  assert.equal(attempts.length, 3);
+  assert.equal(attempts.length, 4);
   assert.deepEqual(attempts[0], { arg: ["76:34"], repair: false });
   assert.deepEqual(attempts[1], { arg: { queueNodeIds: ["76:34"] }, repair: false });
-  assert.deepEqual(attempts[2], { arg: ["76:34"], repair: true });
+  // #752 — the api layer reads a DIFFERENT key than the store does. Verified in
+  // a shipped 1.47.12 bundle: the store destructures `queueNodeIds` and calls
+  // `api.queuePrompt(e, m, {partialExecutionTargets: n})`, and only that second
+  // key becomes `partial_execution_targets` in the request. A build whose
+  // app.queuePrompt forwards straight to the api layer ignores both shapes above.
+  assert.deepEqual(attempts[2], { arg: { partialExecutionTargets: ["76:34"] }, repair: false });
+  assert.deepEqual(attempts[3], { arg: ["76:34"], repair: true });
   assert.equal(
     attempts.filter((a) => a.repair).length,
     1,
@@ -743,9 +754,14 @@ test("#630 integration: a build honoring NEITHER shape is now HONOURED, not refu
     assert.equal(result.scopeAppliedBy, "request_body_repair", "the caller can tell HOW the scope was delivered");
     assert.equal(result.repaired, 1);
     // Both native shapes were tried first and both dropped the scope…
-    assert.equal(app.posted.length, 3, "array shape, options shape, then the repair attempt");
+    assert.equal(
+      app.posted.length,
+      4,
+      "array shape, queueNodeIds shape, partialExecutionTargets shape, then the repair attempt",
+    );
     assert.equal(app.posted[0].partial_execution_targets, undefined);
     assert.equal(app.posted[1].partial_execution_targets, undefined);
+    assert.equal(app.posted[2].partial_execution_targets, undefined);
     // …and exactly ONE request reached ComfyUI, carrying exactly node 14.
     assert.equal(server.calls.length, 1, "the two unrepaired attempts were blocked, not forwarded");
     const sent = JSON.parse(server.calls[0].options.body);
@@ -2675,3 +2691,37 @@ test("#752 WIRING: the graph_run note actually PRINTS the observed body keys", (
     "labelled as what was present INSTEAD of the scope, not as a bare key dump",
   );
 });
+
+test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, not by body repair", async () => {
+  // Two field reports (frontend 1.45.21) queued correctly but via
+  // `scope_applied_by: "request_body_repair"` — the fallback carrying the whole
+  // feature. Read out of a shipped 1.47.12 bundle, the reason is that the
+  // frontend uses two different option keys at two layers:
+  //
+  //   store: {queueNodeIds} -> api.queuePrompt(e, m, {partialExecutionTargets: n})
+  //   api:   ...n?.partialExecutionTargets && {partial_execution_targets: ...}
+  //
+  // so a build whose app.queuePrompt forwards straight to the api layer ignored
+  // both shapes the panel sent.
+  const stop = keepAlive()
+  try {
+  const server = makeServer()
+  const apiTarget = { fetchApi: server }
+  const app = makeFrontend({ shape: "apiOptions", apiTarget })
+  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 })
+
+  assert.equal(result.outcome, "dispatched")
+  assert.equal(result.scopeAppliedBy, "frontend", "the scope reached the body through app.queuePrompt, not the repair")
+  assert.ok(!result.repaired, "the body-repair fallback must not be needed for this build")
+  // Shapes 1 and 2 are dropped by this build; the third one lands.
+  assert.equal(app.posted.length, 3, "array, queueNodeIds, then the partialExecutionTargets shape")
+  assert.equal(app.posted[0].partial_execution_targets, undefined)
+  assert.equal(app.posted[1].partial_execution_targets, undefined)
+  assert.deepEqual(app.posted[2].partial_execution_targets, ["14"])
+  // Exactly one request reaches ComfyUI, carrying exactly node 14's branch.
+  assert.equal(server.calls.length, 1, "the two dropped attempts were blocked, not forwarded")
+  assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"])
+  } finally {
+    stop()
+  }
+})
