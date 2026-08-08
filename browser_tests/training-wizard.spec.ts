@@ -22,6 +22,10 @@
  */
 import { test, expect } from './fixtures/panelTest'
 
+// panel#793 — the Training entry point is behind an off-by-default flag; see
+// the note on `panelFlags` in fixtures/panelTest.ts.
+test.use({ panelFlags: ['comfyui-mcp.featureFlag.training'] })
+
 const OUT_IMAGES = [
   { filename: 'char_a.png', subfolder: '', type: 'output', size: 100, mtime: 2000 },
   { filename: 'char_b.png', subfolder: '', type: 'output', size: 100, mtime: 1000 }

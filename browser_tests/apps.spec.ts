@@ -13,6 +13,14 @@
 import { test, expect } from './fixtures/panelTest'
 import type { Page, Route } from '@playwright/test'
 
+// panel#793 — the Apps toolbar button is behind a flag that is `defaultValue:
+// false`, and the fixture strips panel settings for hermeticity. Without this
+// every test here spent 30s waiting to click a correctly-hidden button.
+// RunPod is listed too: two tests below drive the RunPod run path.
+test.use({
+  panelFlags: ['comfyui-mcp.featureFlag.apps', 'comfyui-mcp.featureFlag.runpod'],
+})
+
 const APP_ID = '123e4567-e89b-42d3-a456-426614174000'
 
 // 1x1 transparent PNG.
