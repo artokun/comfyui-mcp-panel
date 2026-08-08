@@ -141,6 +141,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { saveReplyIdentity } from "./lib/save-reply-identity.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
@@ -10906,13 +10907,20 @@ const GRAPH_TOOL_EXECUTORS = {
     const { name: workflow, ...outcome } = await programmaticSave(name);
     // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
     // first_save) so a rename-vs-copy is never silent (mcp#579).
-    return { saved: true, workflow, ...outcome };
+    //
+    // #747 — and report WHICH workflow instance is active now. A Save-As makes a
+    // DIFFERENT workflow active, which fences the very session that asked for the
+    // save; without an identity in this reply the caller has nothing to re-fence
+    // to, and every call that could tell it is itself refused.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
     const { name: workflow, ...outcome } = await programmaticSave(name);
-    return { saved: true, workflow, ...outcome };
+    // #747 — this path ALWAYS changes which workflow is active, so it is the one
+    // that strands a caller. Report the new instance identity here.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: true }) };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------
