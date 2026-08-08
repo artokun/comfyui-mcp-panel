@@ -30,14 +30,14 @@ export const VERIFIED_FRONTENDS = ["1.47.12", "1.50.3"];
 export const COMFYUI_DOM_DEPS = [
   {
     selector: ".side-bar-button-selected",
-    why: "Which sidebar tab is currently selected — the guard that detaches our root when another tab is active.",
-    fallback: "None. An unreadable selection is treated as UNKNOWN and changes nothing (#784).",
+    why: "Which sidebar tab is currently selected — read by the guard that detaches our root when another tab is active, and by the render watchdog that reports a selected-but-never-painted tab.",
+    fallback: "None. An unreadable selection is treated as UNKNOWN and changes nothing (#784); the watchdog likewise never speaks on UNKNOWN.",
     verified: ["1.47.12", "1.50.3"],
   },
   {
     selector: ".side-tool-bar-container",
-    why: "The sidebar rail, observed for tab-selection changes.",
-    fallback: "Retried for ~10s while the frontend boots; absent means the guard never arms.",
+    why: "The sidebar rail, observed for tab-selection changes by the guard and by the render watchdog (which also waits on it before judging that our tab button never appeared).",
+    fallback: "Retried while the frontend boots; absent means the guard never arms and the watchdog stays silent (no rail, no evidence).",
     verified: ["1.47.12", "1.50.3"],
   },
   {
