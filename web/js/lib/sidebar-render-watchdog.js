@@ -320,6 +320,12 @@ export function installSidebarRenderWatchdog({
       // gave up ("stopped") without ever having evidence either way.
       return { state: machine.done() ? (machine.fired() ? "fired" : "satisfied") : "stopped" };
     }
+    // No rail seen yet means the page has not shown us a sidebar we understand,
+    // and NOTHING may arm or speak on such a page — the same "no evidence, no
+    // claim" rule the appearance check follows (codex gate: without this, the
+    // one pre-rail sample could arm starvation and its expiry timer would fire
+    // on a page the watchdog had otherwise sworn silence about).
+    if (railSeenAt == null) return { state: "idle" };
     const active = readActiveSidebarTab(doc.querySelector(".side-bar-button-selected"));
     const res = machine.sample(active, !!isPainted(), now());
     if (res.state === "armed" || res.state === "verifying") {
@@ -365,6 +371,13 @@ export function installSidebarRenderWatchdog({
           }
         }
       }
+      // `buttonEverSeen` LATCHES, deliberately: the appearance check's charter
+      // is "registration was accepted and the button NEVER appeared". A button
+      // that appeared and later vanished is a different phenomenon — visibly
+      // different to the user (the tab is gone, not never-there), and firing
+      // "never appeared" about a button that demonstrably appeared would be a
+      // false statement. That class stays out of scope (codex gate, declined
+      // with reasons; pinned by test).
       if (!buttonEverSeen && findSidebarTabButton(doc, tabId)) buttonEverSeen = true;
       if (!buttonEverSeen && !appearanceSpoken && t - railSeenAt >= appearDeadlineMs) {
         appearanceSpoken = true;

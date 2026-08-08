@@ -480,6 +480,33 @@ test("#779 installer: no rail at all is 'I cannot tell' — permanent silence", 
   assert.equal(h.timersLeft(), 0, "gave up without a word — no rail, no evidence");
 });
 
+test("#779 installer: a selected-and-empty tab on a rail-LESS page still says nothing", () => {
+  // Codex-gate case: a page with a readable selected-button marker but no
+  // recognizable rail container. Starvation evidence exists in isolation, but
+  // "no rail seen" means this is not a sidebar we understand — the whole
+  // watchdog holds to no-evidence-no-claim, not just the appearance half.
+  const h = harness();
+  h.state.selected = modernButton(OURS); // marked selected, never painted…
+  h.advance(WATCHDOG_GIVE_UP_MS + 20000); // …forever, on a page with no rail
+  assert.equal(h.reports.length, 0, "no rail was ever seen, so nothing may speak");
+  assert.equal(h.timersLeft(), 0);
+});
+
+test("#779 installer: a button that appeared and later VANISHED is out of charter — silent", () => {
+  // Deliberate: the appearance line says "never appeared", and a button that
+  // demonstrably appeared makes that statement false. A vanished tab is also a
+  // different user-visible symptom (gone, not never-there). Pinned so the
+  // latch in pollAppearance reads as a decision, not an oversight.
+  const h = harness();
+  h.state.rail = {};
+  h.advance(120); // rail seen, poll running
+  h.state.button = true;
+  h.advance(120); // button seen — appearance satisfied, latched
+  h.state.button = false; // …and now it is gone
+  h.advance(20000);
+  assert.equal(h.reports.length, 0);
+});
+
 test("#779 installer: a button that appears late but within the deadline is fine", () => {
   const h = harness();
   h.state.rail = {};
