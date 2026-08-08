@@ -246,7 +246,11 @@ test.describe('agent-driven Training modal', () => {
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_training', { dock: true })
     await expect(page.locator('.cmcp-tr-modal')).toBeVisible()
-    const reply = await mockBridge.command('training_goto_step', { step: 2 })
+    // panel#793 — entering a wizard step runs the backend-capability probe,
+    // which callJson's with a 15s timeout. MockBridge.command defaults to 10s,
+    // so the harness gave up 5s before the panel could answer and the failure
+    // read as a hung command. The rejection itself is correct and honest.
+    const reply = await mockBridge.command('training_goto_step', { step: 2 }, 25_000)
     expect(reply.ok).toBe(false)
     // Backend-capability or dataset-name/image gate fires — either is an honest
     // rejection rather than a silent jump.
