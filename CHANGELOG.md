@@ -6,6 +6,51 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.45] - 2026-08-08
+
+> Covers changes since 0.11.44. Versions 0.11.42-0.11.44 shipped without CHANGELOG sections;
+> see their release commits (#709, #722, #743) until those are backfilled.
+
+### Added
+- show whether the QR's URL survives an orchestrator restart (#770)
+- return the workflow_uuid it just minted (#762)
+
+### Fixed
+- a value the widget's own grid explains is NOT a failed write (#806)
+- the soft_reload REPLY reports the refusal, not "scheduled" (#803)
+- refuse an agent reload that unsaved work will block (#801)
+- report the workflow instance a save leaves active (#800)
+- try the option key the api layer actually reads (#799)
+- scan the live graph for unavailable widget values (#745) (#798)
+- civitai_results reported an empty feed; e2e stubbed a retired endpoint (#796)
+- the internal-logs endpoint is NOT under /api — both readers were no-ops (#792)
+- an unknown node type may be a pack that FAILED TO IMPORT (#791)
+- a missing node type may be a pack that FAILED TO IMPORT (#790)
+- a union of PRIMITIVES needs no registered widget (#789)
+- find the tab button the way 1.50 marks it, at the SECOND site too (#786)
+- a blank tab is never an acceptable failure state (#785)
+- the sidebar guard must not destroy on an UNKNOWN active tab (#784)
+- say that a capture frames the WHOLE graph (#783)
+- read the reason ComfyUI logged instead of repeating the one it made up (#782)
+- a combo refresh that found nothing is not a refresh (#781)
+- API-format workflows ARE loadable — import them (#778)
+- drop the frontend version range, print what the body held (#777)
+- name the button the panel cannot press (#776)
+- disclose that missing-asset detection is load-time only (#774)
+- say when a commanded frontend reload did not happen (#773)
+- a userdata 400 says what it can mean, and where the real cause is (#772)
+- keep the upload status and the exception (#764)
+- report the comparison, not a cause the panel never observed (#763)
+- let an UNSAVED canvas publish its established identity (#761)
+- let the recovery probe through both target guards (#759)
+
+### Changed
+- give gotoStep the 15s its capability probe actually takes (#797)
+- recover 9 e2e tests — off-by-default flags and a routed mount probe (#795)
+- declare every reach into ComfyUI's own DOM (#787)
+- verify ONE node type, not the whole schema (#780)
+
+
 ## [0.11.41] - 2026-08-05
 
 ### Fixed
