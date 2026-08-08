@@ -13,7 +13,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -373,11 +373,16 @@ test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's o
 test("#630 scopeDroppedError: the no-scope refusal states the OBSERVATION and no longer asserts a cause it cannot see", () => {
   // The pre-#630 message asserted "this frontend build ignored the run-to-node
   // argument" for every no-usable-scope state. That is a bucket narrated as a
-  // cause, and the evidence contradicts it: ComfyUI_frontend 1.42 through 1.50
-  // all accept BOTH app.queuePrompt third-argument shapes and funnel them into
-  // api.queuePrompt's options.partialExecutionTargets. Three #556 field reports
-  // pasted that asserted cause into the tracker, which is why the real cause is
-  // still unknown. The message must survive that lesson.
+  // cause, and three #556 field reports pasted that asserted cause into the
+  // tracker, which is why the real cause is still unknown.
+  //
+  // #752 — THE REPLACEMENT WAS ALSO AN UNEARNED CLAIM, and this comment used to
+  // state it as fact: that ComfyUI_frontend 1.42 through 1.50 all accept BOTH
+  // third-argument shapes. Only 1.47.12 was ever measured. Three field reports on
+  // 1.45.21 — inside that range — hit this path, so the range was wrong, and
+  // saying so in the shipped message told each reporter their own evidence could
+  // not be happening. Whatever this note says next, it may not assert behaviour
+  // of a build nobody here has run.
   const msg = scopeDroppedError({
     toNodeId: 4995,
     verdict: { ok: false, reason: "scope_missing", expected: ["4995"], got: null, bodyKeys: ["client_id", "extra_data", "number", "prompt"] },
@@ -843,8 +848,20 @@ test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED fr
   // Rebuild the message the caller actually receives: the source spells it as
   // adjacent template chunks joined with `+`, so strip the concatenation
   // scaffolding and assert against the prose itself, not its line breaks.
+  //
+  // #752 — two things the first version of this got wrong, both of which made it
+  // assert against text that is not in the message. It sliced a magic 1800
+  // characters, so growing the note silently pushed the last assertion off the
+  // end; and it did not strip `//` comments, so a comment ABOUT the message read
+  // as part of it. Now it slices to the end of the statement and drops comment
+  // lines, which is what "the message the caller receives" actually means.
+  const end = source.indexOf("\n    }", start);
+  assert.ok(end > start, "the scope_note assignment must be a bounded block");
   const note = source
-    .slice(start, start + 1800)
+    .slice(start, end)
+    .split("\n")
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join("\n")
     .replace(/`\s*\+\s*\n\s*`/g, "")
     .replace(/\s+/g, " ");
   assert.match(note, /OBSERVED: the request ComfyUI received names ONLY node \$\{to_node_id\} as an execution root/,
@@ -2528,4 +2545,133 @@ test("#659 integration: a graph_changed refusal through dispatchScopedRun NAMES 
   } finally {
     stop();
   }
+});
+
+test("#752 the repair keeps WHAT THE BODY CONTAINED, not just that it repaired", async () => {
+  // Three field reports stalled because the note said the scope "did not reach
+  // the request" without saying what did reach it. The guard already computed the
+  // body keys and threw them away — yet a frontend that DROPPED the field and one
+  // that RENAMED it produce the same sentence otherwise, and that is precisely
+  // the distinction the next report has to carry.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14,
+      queueMark: MARK_A, repairScope: true,
+    });
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+    assert.equal(guard.state.repaired, 1, "an absent key is ours to fill");
+    assert.ok(Array.isArray(guard.state.repairedFromKeys), "and the keys survive the repair");
+    assert.deepEqual(
+      guard.state.repairedFromKeys,
+      ["client_id", "number", "prompt"],
+      "exactly what the frontend sent, sorted",
+    );
+    assert.ok(
+      !guard.state.repairedFromKeys.includes("partial_execution_targets"),
+      "the key that was MISSING must never appear in the list of what was present",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#752 the recorded keys are the FIRST repair's, not a growing list", async () => {
+  // A batch repairs once per post. Appending would read as several different
+  // causes in the report when it is one frontend behaving one way.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 2, toNodeId: 14,
+      queueMark: MARK_A, repairScope: true,
+    });
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A, extra_data: {} }));
+    assert.equal(guard.state.repaired, 2);
+    assert.deepEqual(guard.state.repairedFromKeys, ["client_id", "number", "prompt"], "first only");
+  } finally {
+    stop();
+  }
+});
+
+test("#752 an unrepaired run reports no keys, rather than an empty list", async () => {
+  // "" and [] would both render as 'the body carried these keys: ' in the note.
+  // null is the honest value for 'no repair happened, so nothing was observed'.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14,
+      queueMark: MARK_A, repairScope: true,
+    });
+    await guard(
+      ...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A, partial_execution_targets: ["14"] }),
+    );
+    assert.equal(guard.state.repaired, 0, "the frontend delivered it; nothing to repair");
+    assert.equal(guard.state.repairedFromKeys, null);
+  } finally {
+    stop();
+  }
+});
+
+test("#752 NO shipped message asserts a ComfyUI_frontend version range", () => {
+  // The messages claimed this path was "not reproducible against ComfyUI_frontend
+  // 1.42–1.50". Three field reports on 1.45.21 sit INSIDE that range and hit it.
+  // Only 1.47.12 was ever measured here, so the range was never earned — and
+  // shipping it told each reporter their own evidence could not be happening.
+  //
+  // Scanned across ALL shipped panel JS rather than asserted on one string: the
+  // claim lived in TWO places (the graph_run note and the guard's own refusal),
+  // and fixing only the one quoted in the issue would have left the other
+  // shipping the same false statement.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const offenders = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (name.endsWith(".js")) {
+        readFileSync(p, "utf8")
+          .split("\n")
+          .forEach((line, i) => {
+            // A comment ABOUT the removed claim is the record of why; only
+            // shipped prose is the problem.
+            if (/^\s*(\/\/|\*)/.test(line)) return;
+            if (/1\.\d\d\s*[-–]\s*1\.\d\d/.test(line)) offenders.push(`${name}:${i + 1}  ${line.trim()}`);
+          });
+      }
+    }
+  };
+  walk(join(here, "../../web/js"));
+  assert.deepEqual(offenders, [], `these ship a frontend version range:\n${offenders.join("\n")}`);
+});
+
+test("#752 WIRING: the graph_run note actually PRINTS the observed body keys", () => {
+  // Recording them on the guard and never rendering them would leave the note
+  // exactly as unhelpful as it was, with a passing test suite. The value has to
+  // reach the sentence a reporter reads.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+  const start = source.indexOf('accept.scope_applied_by = "request_body_repair"');
+  assert.ok(start > 0);
+  const end = source.indexOf("\n    }", start);
+  const raw = source.slice(start, end);
+  assert.match(raw, /runScopeResult\?\.repairedFromKeys/, "the note reads the recorded keys");
+  assert.match(raw, /repairedFromKeys\.join\(", "\)/, "and renders them into the prose");
+  // Same normalisation as the #630 reconstruction above: the prose is spelled as
+  // adjacent template chunks, so a phrase that reads as one sentence is not one
+  // string in the source.
+  const prose = raw
+    .split("\n")
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join("\n")
+    .replace(/`\s*\+\s*\n\s*`/g, "")
+    .replace(/\s+/g, " ");
+  assert.match(
+    prose,
+    /carried these keys and no partial_execution_targets/,
+    "labelled as what was present INSTEAD of the scope, not as a bare key dump",
+  );
 });

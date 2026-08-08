@@ -10372,13 +10372,33 @@ const GRAPH_TOOL_EXECUTORS = {
         `partial_execution_targets into this run's own request and confirmed it was ` +
         `there before dispatch. OBSERVED: the request ComfyUI received names ONLY ` +
         `node ${to_node_id} as an execution root, so only that branch executes. ` +
+        // #752 — say what the body DID contain. Three reports stalled on this note
+        // because "the scope did not reach the request" does not distinguish a
+        // frontend that dropped the field from one that renamed it or moved it,
+        // and every reporter (and I) went off inspecting argument shapes that turn
+        // out to be fine. The key list is the cheap discriminator, and the guard
+        // was already computing it — it just was not printed.
+        (Array.isArray(runScopeResult?.repairedFromKeys) && runScopeResult.repairedFromKeys.length
+          ? `The request the frontend produced carried these keys and no ` +
+            `partial_execution_targets: ${runScopeResult.repairedFromKeys.join(", ")}. ` +
+            `If a key there looks like it should have carried the scope, that name is ` +
+            `the useful part of a report. `
+          : "") +
         `NOT OBSERVED: whether the frontend also treated this as a partial execution ` +
         `internally — the panel can see the request body but not the frontend's queue ` +
         `loop. If it did not, its queue-time widget hooks ran as they would for a full ` +
         `run, so a control_after_generate widget may have advanced its value ` +
         `differently than a natively scoped run would. This does not change which ` +
-        `nodes execute. Please report this build (#556) — this path is not ` +
-        `reproducible against ComfyUI_frontend 1.42-1.50.`;
+        `nodes execute. ` +
+        // #752 — the removed sentence claimed this path was "not reproducible
+        // against ComfyUI_frontend 1.42-1.50". Three field reports on 1.45.21 are
+        // INSIDE that range and reproduced it, so the claim was false and it cost
+        // real time: it told reporters their own evidence could not be happening.
+        // A version range is a claim about builds nobody here has measured, and
+        // this note has no way to earn one — so it no longer makes it.
+        `Please report this build (#556), including your ComfyUI_frontend version — ` +
+        `which builds take which argument shape is not something the panel can ` +
+        `determine from inside one of them.`;
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
