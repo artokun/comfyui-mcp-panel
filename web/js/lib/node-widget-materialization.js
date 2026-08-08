@@ -62,6 +62,35 @@ const SAFE_SOCKET_TYPES = new Set([
 ]);
 
 /**
+ * Widget types ComfyUI's core frontend implements ITSELF.
+ *
+ * No pack registers these — they are built in — so waiting for a constructor to
+ * appear for one is waiting for evidence that cannot arrive.
+ */
+const PRIMITIVE_WIDGET_TYPES = new Set(["FLOAT", "INT", "STRING", "BOOLEAN"]);
+
+// COMBO is deliberately NOT in that set. A combo is declared as a LIST of options,
+// so a bare "COMBO" type string is not the ordinary case, and two existing tests
+// assert it must still wait. The justification here only reaches as far as the
+// numeric/text primitives the core frontend certainly implements.
+
+/**
+ * A keyed name (`INT:seed`) is deliberately NOT unwrapped here.
+ *
+ * It would only matter inside a UNION — a lone `INT:seed` never reaches this
+ * waiver, which requires more than one member — and no union naming a keyed
+ * primitive has been observed. Mutation testing found the unwrapping killed no
+ * test, which is the honest signal that it was handling a shape nobody has seen.
+ * If one turns up, this fails CLOSED (the node waits, as it does today) rather
+ * than silently accepting something unverified.
+ */
+function isPrimitiveWidgetType(member) {
+  if (typeof member !== "string") return false;
+  return PRIMITIVE_WIDGET_TYPES.has(member.trim().toUpperCase());
+}
+
+
+/**
  * The individual datatypes a declared input type names.
  *
  * ComfyUI declares a link-compatible UNION of datatypes as ONE COMMA-JOINED string:
@@ -215,6 +244,31 @@ export function unavailableRequiredWidgetReport(
     // widget constructor can ever appear, so there is nothing here that a retry could be
     // waiting for. Single-member only — a union naming a dynamic declaration is not a shape
     // ComfyUI emits, and admitting one would be guessing.
+    // panel#788 — A UNION OF PRIMITIVES NEEDS NO REGISTERED WIDGET. The comment
+    // above cites this exact shape and reaches the wrong conclusion about it:
+    // core ComfyUI declares `frame_rate: ("FLOAT,INT", {widgetType: "FLOAT",
+    // default, min, max})` on LTXVEmptyLatentAudio, and the panel waited 5s for a
+    // constructor keyed "FLOAT,INT" that nothing will ever register. The node was
+    // permanently unaddable — which blocks every LTX-2.3 audio-video graph, since
+    // the audio latent is mandatory for AV models.
+    //
+    // Nothing was ever coming. FLOAT/INT/STRING/BOOLEAN are implemented by the
+    // core frontend, not registered by packs, so this is the tracked pattern of
+    // waiting on evidence that cannot arrive (#796) — and a reload, the remedy the
+    // refusal named, cannot help.
+    //
+    // The stock frontend resolves it with `widgetType ?? type` (verified in the
+    // shipped 1.47.12 bundle), i.e. the config's own hint wins and the declared
+    // type is the fallback. Both are primitives here, so either way a native
+    // widget is built and no registration is involved.
+    //
+    // This does NOT waive a union that merely CONTAINS a primitive: a pack's
+    // ("ACME_VALUE,INT", …) still needs ACME_VALUE's constructor, and is still
+    // held to the bar above. Every member must be primitive.
+    // Restricted to UNIONS. A single primitive already resolves through the
+    // constructor registry checked above, so widening it further would change
+    // behaviour beyond the reported bug for no evidence.
+    if (members.length > 1 && members.every(isPrimitiveWidgetType)) continue;
     if (members.length === 1 && isCoreDynamicV3Type(type)) continue;
     report.push({ type, inputs, linkProven });
   }
