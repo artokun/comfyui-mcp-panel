@@ -9344,12 +9344,25 @@ const GRAPH_TOOL_EXECUTORS = {
       // payload falls back to the full frontend refresh (refreshComfyNodeDefs →
       // refreshComboInNodes), which re-fetches /object_info.
       refreshCombos: (defs, target, concreteType, nameMap) => {
-        if (defs) {
+        // A payload that does not CONTAIN the type we are keying on cannot refresh
+        // anything: refreshComboOptionsFromDefs looks up `defsByType[type]` and
+        // returns 0 on a miss, silently. The caller then treats the retry as
+        // having seen the authoritative list, so a value that IS valid stays
+        // rejected — "I could not look it up" behaving as "I looked and it is not
+        // there" (#796). Falling back to the full refresh is exactly what a
+        // MISSING payload already does, so this only ever replaces a silent no-op
+        // with the refresh that was intended.
+        //
+        // `concreteType` is resolved through the promotion chain, so it is not
+        // always the target's own type — which is how a payload can be present and
+        // still be the wrong one.
+        const keyType = concreteType ?? target?.type ?? target?.comfyClass;
+        if (defs && keyType && Object.prototype.hasOwnProperty.call(defs, keyType)) {
           // Key the combo options on the ULTIMATE CONCRETE type (resolved through the
           // promotion chain), not the intermediate virtual node's type, and bridge a
           // RENAMED nested promotion via nameMap, so a nested promoted combo is refreshed
           // from the real backend def under the right input name (#458×#366).
-          refreshComboOptionsFromDefs(target, defs, concreteType, nameMap);
+          refreshComboOptionsFromDefs(target, defs, keyType, nameMap);
           return;
         }
         return refreshComfyNodeDefs();
