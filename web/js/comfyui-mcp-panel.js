@@ -140,6 +140,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -3714,6 +3715,12 @@ async function programmaticSave(name) {
     canvasBinding: describeLiveCanvasBinding,
     details,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
+    // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
+    // 400 that blames the FILENAME, and logs the real cause a line earlier. This
+    // reads that line back so the caller is told what actually failed instead of
+    // being sent to audit a filename that was never the problem. Read-only, and it
+    // runs only once the 400 shape is already recognised.
+    readSaveFailureCause: (path) => readSaveFailureCause(path, (route) => api?.fetchApi?.(route)),
   });
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with

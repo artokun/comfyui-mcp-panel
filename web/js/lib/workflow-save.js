@@ -1,3 +1,5 @@
+import { describeSaveFailureCause } from "./userdata-failure-cause.js";
+
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
 // #442 defect 3 — the in-place-overwrite gate compares the on-disk file's RAW BYTES
@@ -352,7 +354,20 @@ export async function groundActiveWorkflow(svc, opts = {}) {
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, readDiskBytes, reconcileSavedCopy, canvasBinding, expect, details } = {},
+  {
+    autoWorkflowName,
+    existsOnDisk,
+    readDiskBytes,
+    reconcileSavedCopy,
+    canvasBinding,
+    expect,
+    details,
+    // #771 — ComfyUI answers EVERY filesystem error on this path with one 400 that
+    // blames the filename, and logs the real cause. Injected rather than imported so
+    // this module keeps no opinion about how the log is reached, and so a caller that
+    // cannot reach it simply omits it.
+    readSaveFailureCause,
+  } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
@@ -745,7 +760,7 @@ export async function saveActiveWorkflow(
   assertCanvasNotForeign();
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
-  const savedRecord = await saveInPlace(svc, wf);
+  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath });
   // r10 — thread the save API's own produced record (when it returns one) through
   // details, so the identity carry can prove succession from the replacement
   // EVENT. An empty/non-object return simply carries no thread (fail safe).
@@ -1307,7 +1322,7 @@ export function explainUserDataStoreFailure(message) {
   );
 }
 
-async function saveInPlace(svc, wf) {
+async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
   // Return the save API's own result: when it yields the workflow record it
   // PRODUCED (a re-registered successor object), that is the one unambiguous
   // replacement-event thread the identity carry can use (r10) — path occupancy
@@ -1318,8 +1333,18 @@ async function saveInPlace(svc, wf) {
   } catch (err) {
     // #771 — augment ONLY the userdata-400 shape; every other failure is
     // rethrown byte-identical so no existing message or matcher changes.
-    const augmented = explainUserDataStoreFailure(err instanceof Error ? err.message : String(err));
-    if (err instanceof Error && augmented !== err.message) err.message = augmented;
+    const raw = err instanceof Error ? err.message : String(err);
+    const augmented = explainUserDataStoreFailure(raw);
+    if (err instanceof Error && augmented !== err.message) {
+      // Only ask the server WHY once we know this is the userdata-400 shape —
+      // `augmented !== raw` is that test, and it keeps every other failure on the
+      // byte-identical rethrow path with no extra request.
+      let tail = "";
+      if (typeof readSaveFailureCause === "function") {
+        tail = describeSaveFailureCause(await readSaveFailureCause(path));
+      }
+      err.message = augmented + tail;
+    }
     throw err;
   }
   throw new Error("workflow save API unavailable on this frontend");
