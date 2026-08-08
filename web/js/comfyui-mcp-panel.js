@@ -147,6 +147,7 @@ import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
+import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -27420,6 +27421,25 @@ function registerExtensionWhenReady(tries = 0) {
           () => document.querySelector(".cmcp-root"),
           () => mounted?.onHide?.(),
         );
+        // #779 — the silence detector. If our tab is provably selected and
+        // neither the panel nor the #785 failure shell is in the document for a
+        // few continuous seconds — or the tab button never appears in the rail
+        // at all — say so ONCE in the console, with both version numbers and
+        // what to do. Both failure shapes are what a future sidebar-tab
+        // contract change looks like from here, and both were previously
+        // indistinguishable from "works on my machine" until a reporter lost
+        // an hour to reinstalls that could never have helped.
+        installSidebarRenderWatchdog({
+          tabId,
+          isPainted: () =>
+            !!document.querySelector(".cmcp-root") ||
+            !!document.querySelector(".cmcp-failure-shell"),
+          panelVersion: typeof PANEL_VERSION === "string" ? PANEL_VERSION : undefined,
+          getFrontendVersion: () =>
+            window.__COMFYUI_FRONTEND_VERSION__ ??
+            app?.extensionManager?.frontendVersion ??
+            undefined,
+        });
       } else {
         console.error(
           "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +
