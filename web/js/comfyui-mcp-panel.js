@@ -142,6 +142,7 @@ import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/n
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
+import { readActiveSidebarTab, shouldDetachPanelRoot } from "./lib/active-sidebar-tab.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -27056,20 +27057,21 @@ function buildPanel() {
 // extensions (e.g. ComfyUI-Easy-Use's NodesMap) render elsewhere and never touch
 // the shared host — so our panel stays painted when another tab is active and the
 // panels visibly stack. `activeSidebarTabId` is unreliable in this frontend build,
-// so we read the active tab from the DOM: the selected rail button carries
-// `side-bar-button-selected` plus a unique `<tabId>-tab-button` class. When our tab
-// isn't selected we remove our own root; render() rebuilds it on re-entry. We guard
-// only OUR root, never another tab's.
+// so we read the active tab from the DOM: the selected rail button identifies its
+// tab, on 1.50+ via `data-testid="<tabId>-tab-button"` and on earlier builds via a
+// `<tabId>-tab-button` CLASS. When our tab isn't selected we remove our own root;
+// render() rebuilds it on re-entry. We guard only OUR root, never another tab's.
+//
+// #779 — reading ONLY the class blanked the panel on frontend 1.50.x. The id moved
+// to an attribute there, the class lookup found nothing, and "I cannot tell which
+// tab is active" was read as "some other tab is active" — so this removed
+// `.cmcp-root` the instant render() attached it. An unidentifiable selection now
+// changes nothing, which is what keeps this cosmetic the next time the marker moves.
 function installSidebarTabGuard(tabId, getRoot, onDetach) {
-  const activeTabId = () => {
-    const b = document.querySelector(".side-bar-button-selected");
-    if (!b) return null;
-    const t = [...b.classList].find((c) => c.endsWith("-tab-button"));
-    return t ? t.slice(0, -"-tab-button".length) : null;
-  };
   const enforce = () => {
-    if (activeTabId() === tabId) return;             // our tab active → keep content
-    const r = getRoot();                              // inactive → drop our stray content
+    const active = readActiveSidebarTab(document.querySelector(".side-bar-button-selected"));
+    if (!shouldDetachPanelRoot(active, tabId)) return; // ours, or unknown → keep content
+    const r = getRoot();                               // provably elsewhere → drop our stray content
     if (r && r.isConnected) {
       // This is the OTHER path that detaches a live panel (the tab's own
       // destroy() is the first), so audio has to be paused here too — a
