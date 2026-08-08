@@ -168,6 +168,10 @@ test("#745 the note says the scan is LIVE — the whole point of it", async () =
   assert.match(note, /object_info/);
   assert.match(note, /DOES see nodes added this session/);
   assert.match(note, /unchecked_nodes/);
+  // The scan reads the graph level currently in view. Not saying so would let an
+  // empty list read as proof about nodes inside a subgraph it never looked at —
+  // the same silent-omission shape #745 is about.
+  assert.match(note, /inside a subgraph you are not in are NOT scanned/);
   assert.equal(comboAvailabilityNote([]), "");
 });
 

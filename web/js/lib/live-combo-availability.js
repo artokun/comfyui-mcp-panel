@@ -200,7 +200,9 @@ export function comboAvailabilityNote(unavailable) {
   return (
     `LIVE SCAN: ${parts.join(" and ")}. This was read from the server's own ` +
     `/object_info for each node type at the time of this call, so unlike the ` +
-    `load-time missing-model scan it DOES see nodes added this session. A node ` +
+    `load-time missing-model scan it DOES see nodes added this session. It covers ` +
+    `the graph level currently being viewed; nodes inside a subgraph you are not ` +
+    `in are NOT scanned, so an empty list here is not proof about them. A node ` +
     `whose type could not be resolved is listed under unchecked_nodes rather ` +
     `than being reported as healthy.`
   );
