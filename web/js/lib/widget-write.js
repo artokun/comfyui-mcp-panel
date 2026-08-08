@@ -1,4 +1,5 @@
 import { pressableWidgetHint } from "./pressable-widget.js";
+import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
@@ -1224,7 +1225,20 @@ export function applyWidgetWrite(
   let originalErr = null;
   let driftFailure = false;
   let writeWarning = null;
-  if (!matchesExpected(w.value)) {
+  // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
+  // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
+  // exactly its job (min 1 / step 2 snaps 4096 -> 4097) was reported as "did not
+  // retain the requested value" for a mutation that had APPLIED. Worse than merely
+  // wrong: the natural response to "did not retain" is a retry, and the retry
+  // normalizes identically forever.
+  //
+  // Only an EXACTLY reproducible snap counts. If the config does not explain the
+  // observed value, this stays the failure it was — no tolerance, because a
+  // tolerance would eventually swallow a real revert that landed nearby.
+  const normalization = matchesExpected(w.value)
+    ? null
+    : explainNumericNormalization(expected, w.value, w);
+  if (!matchesExpected(w.value) && !normalization) {
     failure =
       `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
       `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.` +
@@ -1555,6 +1569,21 @@ export function applyWidgetWrite(
     previous: parentWidget ? previousParent : previous,
     value: w.value,
     ...(writeWarning ? { write_warning: writeWarning } : {}),
+    // #805 — the write applied and the node quantized it. Report BOTH values so the
+    // caller can carry the stored one forward instead of retrying the request.
+    ...(normalization
+      ? {
+          normalized: true,
+          requested_value: expected,
+          normalization_rule: normalization.rule,
+          normalization_note: normalizationNote({
+            name: w.name,
+            requested: expected,
+            actual: w.value,
+            rule: normalization.rule,
+          }),
+        }
+      : {}),
     ...(promotedFrom
       ? {
           inner_previous: previous,
