@@ -84,6 +84,7 @@ import {
   isManagerRouteMissing,
   isManagerUnreachable,
   isMethodNotAllowed,
+  assertBatchOk,
   legacyUpdateBody,
   parseTaskHistoryItem,
   queueDrained,
@@ -4439,6 +4440,25 @@ function invalidateManagerDialectCache() {
   managerDialectCache = null;
 }
 
+/**
+ * Record a dialect the LIVE backend just proved, by rejecting the method the cached
+ * dialect routes to (#367).
+ *
+ * Detection picks `v2` vs `v2-batch` from `/v2/manager/is_legacy_manager_ui`, and a
+ * build that 405s `queue/task` without reporting a legacy UI is classified `v2` — so
+ * every later call re-POSTs the same dead route and 405s again. A 405 is not an
+ * ambiguous failure: it means the route is REGISTERED and refuses this method, which
+ * is exactly what separates the two pip dialects. So it is stronger evidence than the
+ * probe that produced the cache, and it replaces it.
+ *
+ * Only ever called after a method rejection on a route the cached dialect chose. It
+ * does not invalidate: the answer is known, and clearing would just make the next call
+ * re-run the probe that got it wrong.
+ */
+function noteManagerDialectDowngrade(dialect) {
+  managerDialectCache = dialect;
+}
+
 /** #605 — drop the cached dialect and re-probe the LIVE backend once. Returns
  *  the fresh dialect, or null when the Manager currently answers no dialect at
  *  all (mid-restart / disabled) — the caller then surfaces its ORIGINAL error,
@@ -4656,20 +4676,6 @@ async function managerQueueControl(call, route, { signal } = {}) {
     // (not ComfyUI's frontend catchall, which only serves UNREGISTERED GETs).
     if (!isMethodNotAllowed(err)) throw err;
     await call(route, { signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]) });
-  }
-}
-
-/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
- *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
- *  silent success on a failed op is exactly the #184 no-op bug. */
-function assertBatchOk(res, id, op) {
-  const failed = Array.isArray(res?.failed) ? res.failed : [];
-  if (failed.length && (id === undefined || failed.includes(id))) {
-    throw new Error(
-      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
-        "(check the ComfyUI server log for the underlying error — security_level " +
-        "gating is a common cause). The pack was NOT installed.",
-    );
   }
 }
 
@@ -14499,11 +14505,25 @@ const GRAPH_TOOL_EXECUTORS = {
           enqueued = true;
           await managerV2("manager/queue/start", { method: "POST" });
         } catch (err) {
-          // The 405 legacy self-update fallback wraps ONLY the enqueue: once the
-          // task POST landed, a legacyUpdate would queue a SECOND update.
+          // The 405 fallback wraps ONLY the enqueue: once the task POST landed, a
+          // retry on another dialect would queue a SECOND update.
+          //
+          // #367 — a 405 HERE goes to v2-batch, not straight to legacy. A 405 on
+          // `queue/task` is the DEFINITION of the v2-batch dialect ("POST
+          // /v2/manager/queue/task 405s (frontend catchall)"), and the backend that
+          // produced it is a pip v4 whose /v2 GETs all answer — so the legacy routes,
+          // which carry no /v2 prefix, are the one thing it is LEAST likely to serve.
+          // The reporter's Manager v4 405'd here and the legacy fallback failed too,
+          // leaving update unusable with a fully working batch route sitting unused.
+          //
+          // The legacy rung is not lost, it is reordered behind this one: the v2-batch
+          // branch below falls to legacy on its own 405, so the ladder is
+          // v2 → v2-batch → legacy, each step taken only on a proven method rejection.
+          // Monotonic, so it cannot cycle. #424's eventual legacy landing still
+          // happens for a backend that really is legacy — it just gets there second.
           if (!enqueued && isMethodNotAllowed(err)) {
-            methodRejected = true;
-            dialect = "legacy";
+            noteManagerDialectDowngrade("v2-batch");
+            dialect = "v2-batch";
             continue;
           }
           // codex P0: the heal retries ONLY a PROVEN route-level rejection (the

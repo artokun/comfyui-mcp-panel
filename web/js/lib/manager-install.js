@@ -899,3 +899,24 @@ export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
       `ComfyUI server log.`,
   };
 }
+
+/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
+ *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
+ *  silent success on a failed op is exactly the #184 no-op bug.
+ *
+ *  Lives HERE rather than in the panel (#367): the unit harness injects the panel's
+ *  mutation deps by name from this module, and it was destructuring an `assertBatchOk`
+ *  this module never exported — so every batch-path test would have crashed on
+ *  `assertBatchOk is not a function`. None did, because none reached the batch branch.
+ *  Exporting it is what makes that branch testable at all.
+ */
+export function assertBatchOk(res, id, op) {
+  const failed = Array.isArray(res?.failed) ? res.failed : [];
+  if (failed.length && (id === undefined || failed.includes(id))) {
+    throw new Error(
+      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
+        "(check the ComfyUI server log for the underlying error — security_level " +
+        "gating is a common cause). The pack was NOT installed.",
+    );
+  }
+}
