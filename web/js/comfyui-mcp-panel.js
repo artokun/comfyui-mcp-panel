@@ -14522,7 +14522,12 @@ const GRAPH_TOOL_EXECUTORS = {
           // Monotonic, so it cannot cycle. #424's eventual legacy landing still
           // happens for a backend that really is legacy — it just gets there second.
           if (!enqueued && isMethodNotAllowed(err)) {
-            noteManagerDialectDowngrade("v2-batch");
+            // NOTHING is cached here (codex): a 405 proves only that `queue/task` was
+            // refused, never that `batch` is usable. Recording it before the batch POST
+            // lands would leave a build that refuses BOTH — and updates fine on legacy —
+            // permanently cached as v2-batch, re-paying the refused batch POST on every
+            // later call, and the heal only runs on a route-MISSING verdict, not a 405.
+            // The cache is written below, once batch actually works.
             dialect = "v2-batch";
             continue;
           }
@@ -14549,6 +14554,11 @@ const GRAPH_TOOL_EXECUTORS = {
           });
           enqueued = true;
           assertBatchOk(res, id, "update");
+          // #367 — PROVEN, so record it. Detection reads /v2/manager/is_legacy_manager_ui
+          // and a build that refuses `queue/task` without reporting a legacy UI is
+          // classified `v2`, so every later call re-POSTs the refused route. This says
+          // what the backend just demonstrated: batch is the route that works here.
+          noteManagerDialectDowngrade("v2-batch");
           await managerV2("manager/queue/start", { method: "POST" });
         } catch (err) {
           // The 405 legacy self-update fallback wraps ONLY the enqueue (as above).

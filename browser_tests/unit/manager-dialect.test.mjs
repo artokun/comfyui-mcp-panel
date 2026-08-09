@@ -799,6 +799,61 @@ test("#367: the proven dialect is recorded so the dead route is not re-POSTed", 
   assert.deepEqual(noted, ["v2-batch"], "the method rejection must update the cached dialect");
 });
 
+test("#367: a build that refuses BOTH /v2 mutations caches nothing and lands on legacy", async () => {
+  // The case that makes the cache write dangerous (codex): `queue/task` 405s, and so
+  // does `batch`. Recording v2-batch on the first 405 would leave this backend — which
+  // updates FINE on legacy — permanently cached at a route it refuses, re-paying that
+  // POST on every later call. The heal only runs on a route-MISSING verdict, not a 405,
+  // so nothing would clear it.
+  const noted = [];
+  const calls = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        throw new Error(`Manager ${route}: HTTP 405`);
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        return {};
+      },
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.dialect, "legacy", "legacy is where this backend actually works");
+  assert.deepEqual(noted, [], "a dialect that never worked must not be cached");
+  assert.deepEqual(calls, [
+    ["v2", "manager/queue/task"],
+    ["v2", "manager/queue/batch"],
+    ["legacy", "manager/queue/update"],
+    ["legacy", "manager/queue/start"],
+  ]);
+});
+
+test("#367: task 405 then batch 404 heals through the ladder rather than caching", async () => {
+  // A 404 on batch is a route-level rejection, not a method one, so it takes the
+  // existing re-probe ladder instead of the legacy rung. Either way nothing is cached
+  // from a route that never ran an enqueue.
+  const noted = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      reProbeManagerDialect: async () => "legacy",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        throw routeMissing();
+      },
+      managerCall: async () => ({}),
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.dialect, "legacy");
+  assert.deepEqual(noted, [], "an enqueue that never landed must not be cached");
+});
+
 // ---------------------------------------------------------------------------
 // Real-source harness: nodes_install (the mutation path)
 // ---------------------------------------------------------------------------
