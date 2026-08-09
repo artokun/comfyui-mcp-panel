@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.61] - 2026-08-09
+
+> Covers changes since 0.11.60.
+
+### Fixed
+- Centring on a node now honours the zoom you asked for. `panel_canvas` with
+  `action:"center_on_node"` accepted a `scale` and quietly ignored it, so "centre on node
+  42 at 1.5x" centred at whatever zoom happened to be set — and the reply echoed the old
+  zoom back, so nothing said the request had been dropped. The zoom is applied before the
+  centring (applying it afterwards would slide the node straight back off-centre), the
+  reply reports the zoom that took effect, and a scale outside the accepted range is
+  refused rather than silently clamped — the same range `action:"zoom"` already enforced
+  (#876, #754)
+
 ## [0.11.60] - 2026-08-09
 
 > Covers changes since 0.11.59.
