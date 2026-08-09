@@ -784,8 +784,20 @@ export async function saveActiveWorkflow(
   //   · An ABSENT tracker/method is not a throw. Optional chaining takes no capture,
   //     which is the same position as an unproven binding and stays allowed.
   //
+  // WHY "bound" IS ENOUGH, since it is the highest-risk question here (codex).
+  // `prepareForSave()` serializes the ONE shared root into whichever tracker is
+  // ACTIVE, so the worry is a bound canvas coexisting with a non-active `wf`. It
+  // cannot write the wrong graph either way: ComfyUI's `prepareForSave` is a
+  // documented no-op unless its own workflow is the active one (isActiveTracker) —
+  // the same fact the copy route relies on below — so a `wf` that is not active
+  // captures NOTHING, and a `wf` that IS active captures a canvas "bound" has
+  // already proven to be this workflow's. Both branches are safe; the guard is the
+  // belt over ComfyUI's braces, not the only thing standing between us and #708.
+  //
   // Synchronous, immediately after the re-assert and with nothing awaited before the
-  // write, so it cannot open a window the assert just closed.
+  // write, so it cannot open a window the assert just closed — and, for the same
+  // reason, it cannot widen the #442 raw-byte gate's check-to-write interval either:
+  // no other JS runs between them.
   if (normalizeCanvasBinding(canvasBinding, wf) === "bound") {
     try {
       wf?.changeTracker?.prepareForSave?.();
