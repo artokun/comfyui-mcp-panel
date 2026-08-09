@@ -10242,6 +10242,24 @@ const GRAPH_TOOL_EXECUTORS = {
     switch (action) {
       case "center_on_node": {
         const node = resolveNode(graph, node_id);
+        // #754 — `scale` was accepted by this tool and silently ignored on this branch,
+        // so "centre on node 42 at 1.5x" centred at whatever zoom happened to be set.
+        //
+        // Applied BEFORE centring, and the order is the whole fix: the centring math
+        // below divides by `ds.scale`, and litegraph's own centerOnNode reads it too, so
+        // zooming afterwards would slide the node straight back off-centre — the #401
+        // hazard, one branch over.
+        //
+        // The #401 centre-preserving correction is deliberately NOT used here. It exists
+        // to hold the CURRENT viewport centre across a zoom; this action is about to
+        // choose a new centre, so preserving the old one is wasted work that the centring
+        // immediately overwrites. Same validated range as action:"zoom", so one tool does
+        // not accept a scale its sibling refuses.
+        if (scale !== undefined) {
+          const s = Number(scale);
+          if (!(s > 0.05 && s <= 4)) throw new Error("scale must be in (0.05, 4]");
+          ds.scale = s;
+        }
         if (typeof canvas.centerOnNode === "function") {
           canvas.centerOnNode(node);
         } else {
