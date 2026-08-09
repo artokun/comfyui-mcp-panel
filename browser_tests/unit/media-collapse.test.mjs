@@ -7,6 +7,7 @@ import {
   MAX_COLLAPSED_ENTRIES,
   mediaCollapseId,
   createMediaCollapseStore,
+  MAX_KEYABLE_URL_LENGTH,
 } from "../../web/js/lib/media-collapse.js";
 import { MAX_MEDIA_URL_LENGTH } from "../../web/js/lib/chat-media.js";
 
@@ -34,17 +35,18 @@ test("the id is stable for one url and different for another", () => {
   assert.notEqual(a, mediaCollapseId("/view?filename=out_00002_.png&type=output"));
 });
 
-test("the id is fixed width regardless of url size — a data: URI cannot bloat storage", () => {
+test("the id is fixed width whatever the url's size — it cannot bloat storage", () => {
+  // The whole point of hashing rather than storing the url: a stored key is 16
+  // characters whether the url was 20 or 8,000.
   const tiny = mediaCollapseId("/view?filename=a.png");
-  const huge = mediaCollapseId(`data:image/png;base64,${"A".repeat(4_000_000)}`);
-  assert.equal(tiny.length, 16);
-  assert.equal(huge.length, 16);
-  assert.match(huge, /^[0-9a-f]{16}$/);
+  const long = mediaCollapseId(`/view?filename=${"a".repeat(4000)}.png`);
+  assert.match(tiny, /^[0-9a-f]{16}$/);
+  assert.match(long, /^[0-9a-f]{16}$/);
 });
 
-test("two long urls sharing a head and tail still differ — the length is keyed in", () => {
-  // The sampled hash reads only fixed windows, which is exactly the shape a
-  // query-string variant takes. Without the length in the key these collide.
+test("a url is not confusable with the string it extends", () => {
+  const base = "/view?filename=a.png";
+  assert.notEqual(mediaCollapseId(base), mediaCollapseId(`${base}&type=output`));
   const head = "x".repeat(600);
   const tail = "y".repeat(600);
   assert.notEqual(
@@ -54,69 +56,80 @@ test("two long urls sharing a head and tail still differ — the length is keyed
 });
 
 test("same length, same head and tail, different MIDDLE ⇒ different ids (codex)", () => {
-  // Head + tail + length alone aliases deterministically here, which for a
-  // `data:` URI is not far-fetched: two renders of one size from one encoder
-  // share a long header and can share a trailing chunk. Interior windows are
-  // what make this case separate.
-  const head = "h".repeat(5000);
-  const tail = "t".repeat(5000);
-  const a = `${head}${"a".repeat(5000)}${tail}`;
-  const b = `${head}${"b".repeat(5000)}${tail}`;
+  // Head + tail + length alone aliased deterministically for this pair, which
+  // for a `data:` URI is not far-fetched: two renders of one size from one
+  // encoder share a long header and can share a trailing chunk. Reading the url
+  // whole is what separates them.
+  const head = "h".repeat(2000);
+  const tail = "t".repeat(2000);
+  const a = `${head}${"a".repeat(2000)}${tail}`;
+  const b = `${head}${"b".repeat(2000)}${tail}`;
   assert.equal(a.length, b.length);
   assert.notEqual(mediaCollapseId(a), mediaCollapseId(b));
 });
 
-test("every PERSISTABLE url is hashed exactly — no sampling gap can alias one", () => {
-  // The gap only matters for urls whose collapse state can outlive the page,
-  // and the panel refuses to persist a media record over MAX_MEDIA_URL_LENGTH.
-  // Hashing in full up to a limit above that ceiling is what makes the sampler
-  // unreachable for every url that counts (codex round 2).
-  assert.ok(
-    MAX_MEDIA_URL_LENGTH <= 8192,
-    "the full-read limit must stay above the durable-url ceiling",
-  );
-  const pad = "z".repeat(MAX_MEDIA_URL_LENGTH);
-  for (const at of [1, 700, 1300, 2500, MAX_MEDIA_URL_LENGTH - 2]) {
+test("a difference ANYWHERE in a keyable url separates the ids", () => {
+  // No sampling, so no gaps: a change at any offset must be visible. An earlier
+  // revision sampled fixed windows and a difference landing between two of them
+  // keyed identically — for a persisted record that means one media item
+  // restoring another's collapse state (codex rounds 2 and 3).
+  const pad = "z".repeat(MAX_KEYABLE_URL_LENGTH);
+  for (const at of [0, 1, 700, 1300, 2500, 5000, MAX_KEYABLE_URL_LENGTH - 1]) {
     const a = `${pad.slice(0, at)}A${pad.slice(at + 1)}`;
     const b = `${pad.slice(0, at)}B${pad.slice(at + 1)}`;
-    assert.equal(a.length, MAX_MEDIA_URL_LENGTH);
+    assert.equal(a.length, MAX_KEYABLE_URL_LENGTH);
     assert.notEqual(mediaCollapseId(a), mediaCollapseId(b), `differ at index ${at}`);
   }
 });
 
-test("a difference at ANY sampled position separates the ids", () => {
-  // Over the full-read limit: head, 25%, 50%, 75%, tail — one window each. A
-  // change landing in any of them must still be visible to the hash.
-  const base = "z".repeat(200_000);
-  const ids = new Set([mediaCollapseId(base)]);
-  for (const at of [0, 0.25, 0.5, 0.75, 1]) {
-    const i = Math.min(Math.floor(base.length * at), base.length - 1);
-    ids.add(mediaCollapseId(`${base.slice(0, i)}Q${base.slice(i + 1)}`));
-  }
-  assert.equal(ids.size, 6, "every sampled position must be load-bearing");
+test("the keyable limit clears the panel's own persistable-url ceiling", () => {
+  // Every url whose collapse state can outlive the page must be keyable, or the
+  // feature quietly stops persisting for long /view links.
+  assert.ok(
+    MAX_KEYABLE_URL_LENGTH > MAX_MEDIA_URL_LENGTH,
+    `keyable ${MAX_KEYABLE_URL_LENGTH} must exceed durable ${MAX_MEDIA_URL_LENGTH}`,
+  );
+  const long = `/view?filename=${"a".repeat(MAX_MEDIA_URL_LENGTH - 20)}`;
+  assert.equal(long.length <= MAX_MEDIA_URL_LENGTH, true);
+  assert.ok(mediaCollapseId(long), "a max-length durable url must still key");
 });
 
-test("above the limit it samples, and that residual limit is documented", () => {
-  // A 200k string is a data:/blob: url — never written to a media record, so an
-  // aliased id here cannot survive a reload, and within one page the worst case
-  // is a card starting collapsed when its neighbour was the one collapsed.
-  // Pinned so the trade stays a decision rather than a surprise.
-  const pad = "z".repeat(200_000);
-  const gap = 80_000; // between the 25% (50k) and 50% (100k) windows
-  const a = `${pad.slice(0, gap)}AAAA${pad.slice(gap + 4)}`;
-  const b = `${pad.slice(0, gap)}BBBB${pad.slice(gap + 4)}`;
-  assert.equal(a.length, b.length);
-  assert.equal(mediaCollapseId(a), mediaCollapseId(b));
+test("a url too long to key EXACTLY gets no id at all, never an approximate one", () => {
+  // A persisted role:"media" message replays without being re-validated, so an
+  // imported or legacy history can carry a url no live path would write. Rather
+  // than guess which of two such items the user hid, refuse to key it: the store
+  // no-ops and the card still toggles for the life of the page.
+  const over = "z".repeat(MAX_KEYABLE_URL_LENGTH + 1);
+  assert.equal(mediaCollapseId(over), null);
+  assert.equal(mediaCollapseId(`data:image/png;base64,${"A".repeat(4_000_000)}`), null);
 });
 
-test("hashing a multi-megabyte data URI stays cheap", () => {
-  // Sampling, not reading. A thread replay paints every card at once, so an
-  // O(n) hash over several megabytes per card would be felt.
+test("an over-limit url costs persistence only — never the toggle", () => {
+  const storage = memoryStorage();
+  const store = createMediaCollapseStore(storage);
+  const over = "z".repeat(MAX_KEYABLE_URL_LENGTH + 1);
+  assert.equal(store.setCollapsed(over, true), true, "the caller is told what it asked for");
+  assert.equal(store.isCollapsed(over), false, "nothing was remembered");
+  assert.equal(storage.values.has(MEDIA_COLLAPSE_KEY), false, "and nothing was written");
+});
+
+test("keying a max-length url stays cheap", () => {
+  // Bounded by construction now — the limit is the budget.
+  const url = "z".repeat(MAX_KEYABLE_URL_LENGTH);
+  const started = process.hrtime.bigint();
+  for (let i = 0; i < 200; i += 1) mediaCollapseId(url);
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(ms < 200, `200 max-length keyings took ${ms.toFixed(1)}ms`);
+});
+
+test("a multi-megabyte data URI is rejected on LENGTH, without being read", () => {
+  // A thread replay paints every card at once, so an O(n) pass over several
+  // megabytes per card would be felt. The length check runs before any hashing.
   const huge = `data:image/png;base64,${"A".repeat(8_000_000)}`;
   const started = process.hrtime.bigint();
-  mediaCollapseId(huge);
+  assert.equal(mediaCollapseId(huge), null);
   const ms = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.ok(ms < 50, `expected a bounded hash, took ${ms.toFixed(1)}ms`);
+  assert.ok(ms < 50, `expected an O(1) refusal, took ${ms.toFixed(1)}ms`);
 });
 
 test("nothing keyable is null, not a shared bucket every card falls into", () => {

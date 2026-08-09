@@ -13,7 +13,8 @@
 //     The url is the only stable thing a replayed card carries — but a url can
 //     also be a multi-megabyte `data:` URI, and putting one of those in
 //     sessionStorage is how you take the whole thread's storage down with it. So
-//     ids are HASHED to a fixed width, from a bounded sample of the url.
+//     ids are HASHED to a fixed width; a url too long to hash exactly gets NO id
+//     rather than an approximate one (see MAX_KEYABLE_URL_LENGTH).
 //
 //  2. STORAGE IS NOT GUARANTEED. sessionStorage throws outright in some browser
 //     privacy modes and on quota. A collapse toggle that throws while the user
@@ -41,52 +42,28 @@ export const MEDIA_COLLAPSE_KEY = "comfyui-mcp.panel.collapsedMedia";
  *  they collapsed a very long time ago comes back expanded. */
 export const MAX_COLLAPSED_ENTRIES = 300;
 
-/** Read a url of AT MOST this length in FULL. Set above the panel’s own ceiling
- *  on a persistable media url (MAX_MEDIA_URL_LENGTH, 4096 — lib/chat-media.js),
- *  which is what makes the sampling below unreachable for every url whose
- *  collapse state can actually outlive the page. A ComfyUI /view link is a
- *  couple of hundred characters; only a `data:` or `blob:` url gets anywhere
- *  near this, and neither is persisted as a media record at all. */
-const HASH_FULL_LIMIT = 8192;
-
-/** How much of an OVER-LIMIT url is fed to the hash from each sampled position.
- *  Reading a multi-megabyte `data:` URI in full would cost O(n) per painted
- *  card, and a thread replay paints every card at once. */
-const HASH_SAMPLE = 512;
-
-/** Fractions of an over-limit url the sampler reads from, besides the head and
- *  the tail. Head + tail + length alone aliases DETERMINISTICALLY for two urls
- *  that share their ends and their length (codex, #818) — which for a `data:`
- *  URI is not the far-fetched case it sounds like: two renders of the same size
- *  from the same encoder share a long header and can share a trailing chunk. */
-const HASH_INTERIOR = [0.25, 0.5, 0.75];
-
 /**
- * The slice of a url the hash actually reads.
+ * The longest url this module will key on. Above it, there IS no id (see
+ * mediaCollapseId) — the url is read in full or not at all.
  *
- * Up to HASH_FULL_LIMIT that is the WHOLE url, so every url the panel can
- * persist a collapse for is hashed exactly — no aliasing, at a cost bounded by a
- * constant. Past it, fixed windows at the head, at each HASH_INTERIOR fraction,
- * and at the tail.
+ * The alternative was a sampling hash: fixed windows at the head, the tail and a
+ * few interior fractions. It was written, and it was wrong. A sampler has gaps by
+ * construction, so two same-length urls differing only inside a gap key
+ * IDENTICALLY — and current-code admission rules are not a defence, because a
+ * persisted role:"media" message replays through paintImage/paintVideo without
+ * being re-validated (codex round 3), so an imported or legacy history can carry a
+ * url no live code path would write. Guessing which of two media items the user
+ * hid is exactly the kind of confident wrong answer this codebase refuses
+ * elsewhere, and it is not worth buying with anything.
  *
- * ABOVE THE LIMIT THIS IS A SAMPLING HASH, AND THAT LIMIT IS DELIBERATE. Two
- * over-limit urls agreeing in length and in every sampled window get one id. What
- * that can cost is bounded twice over: such a url is a `data:`/`blob:` source,
- * which is never written to a media record, so the mixup cannot survive a reload
- * — and within one page the worst outcome is a card starting collapsed when its
- * neighbour was the one collapsed. Reading megabytes per painted card to remove
- * that is the worse deal.
+ * Set well above the panel’s own ceiling on a persistable media url
+ * (MAX_MEDIA_URL_LENGTH, 4096 — lib/chat-media.js), so every url whose collapse
+ * CAN outlive the page is keyed exactly. Past it lie only `data:` and `blob:`
+ * sources, which are never written to a media record and so never come back after
+ * a reload anyway — losing their persistence costs nothing, and the toggle still
+ * works for the life of the page because the panel drives the DOM from the DOM.
  */
-function hashSample(s) {
-  if (s.length <= HASH_FULL_LIMIT) return s;
-  const parts = [s.slice(0, HASH_SAMPLE)];
-  for (const at of HASH_INTERIOR) {
-    const from = Math.floor(s.length * at);
-    parts.push(s.slice(from, from + HASH_SAMPLE));
-  }
-  parts.push(s.slice(-HASH_SAMPLE));
-  return parts.join("~");
-}
+export const MAX_KEYABLE_URL_LENGTH = 8192;
 
 /** FNV-1a, 32-bit, as an unsigned integer. */
 function fnv1a(str, seed) {
@@ -100,24 +77,24 @@ function fnv1a(str, seed) {
 }
 
 /**
- * The stable id for a media url, or null when there is nothing to key on.
+ * The stable id for a media url, or null when there is nothing to key on —
+ * including a url too long to key EXACTLY (MAX_KEYABLE_URL_LENGTH). Null is a
+ * decision, not a failure: the store no-ops, the card still toggles for the life
+ * of the page, and no other item can inherit its state.
  *
- * Two independently-seeded FNV-1a passes concatenated → 16 hex chars, i.e. a
- * 64-bit space. A collision would only mean one card starts collapsed when its
- * neighbour was the one collapsed, which is why a cryptographic digest (async,
- * and unavailable in a non-secure context) would be the wrong tool here.
- *
- * The sampled input carries the url's LENGTH plus interior windows, so two urls
- * that agree on a long head and tail — the shape query-string variants and
- * same-encoder `data:` URIs actually take — still differ.
+ * Two independently-seeded FNV-1a passes over the whole url, concatenated → 16
+ * hex chars, i.e. a 64-bit space — over the WHOLE url, so any difference at any
+ * offset shows up. A collision at this width
+ * would only mean one card starts collapsed when its neighbour was the one
+ * collapsed, which is why a cryptographic digest (async, and unavailable in a
+ * non-secure context) would be the wrong tool here.
  */
 export function mediaCollapseId(url) {
   if (typeof url !== "string") return null;
   const trimmed = url.trim();
-  if (!trimmed) return null;
-  const keyed = `${trimmed.length} ${hashSample(trimmed)}`;
-  const a = fnv1a(keyed, 0x811c9dc5);
-  const b = fnv1a(keyed, 0x01000193);
+  if (!trimmed || trimmed.length > MAX_KEYABLE_URL_LENGTH) return null;
+  const a = fnv1a(trimmed, 0x811c9dc5);
+  const b = fnv1a(trimmed, 0x01000193);
   return a.toString(16).padStart(8, "0") + b.toString(16).padStart(8, "0");
 }
 
