@@ -540,9 +540,17 @@ let _cardSeq = 0;
  * Render a VALIDATED spec as a live interactive card.
  * onAction(text): user clicked a button / submitted — send `text` as a visible
  * chat message and mark the card resolved. onDismiss(): user hit ✕.
+ *
+ * `cardId` (#832): reuse an EXISTING id instead of minting one. The id is the
+ * agent's only handle on a card — `panel_ui_update` names it — so a card that is
+ * re-mounted (a same-thread repaint puts the same unresolved card back on
+ * screen) has to come back as the SAME card, not a new one wearing its content.
+ * Minting unconditionally is what made a repaint silently orphan a card_id the
+ * agent was handed seconds earlier. Omitted ⇒ a fresh card, as before.
  */
-export function renderA2UICard(spec, { onAction, onDismiss } = {}) {
-  const cardId = `a2ui-${Date.now().toString(36)}-${++_cardSeq}`;
+export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = {}) {
+  const cardId =
+    typeof reuseId === "string" && reuseId ? reuseId : `a2ui-${Date.now().toString(36)}-${++_cardSeq}`;
   const el = document.createElement("div");
   el.className = "cmcp-a2ui";
   el.dataset.cardId = cardId;

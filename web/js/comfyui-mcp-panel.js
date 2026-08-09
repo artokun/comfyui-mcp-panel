@@ -20993,11 +20993,25 @@ function buildPanel() {
     if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
   }
 
-  /** Paint + record + register one live A2UI card. Returns its card_id. */
-  function appendA2UICard(spec) {
-    clearEmpty();
-    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
-    const handle = renderA2UICard(spec, {
+  /**
+   * Mount ONE live, interactive A2UI card for an existing record, wire its
+   * handlers, register it under its card_id and append it to the log.
+   *
+   * #832 — SHARED by the create path and the repaint path on purpose. The two
+   * used to be different code: creating a card produced a live, registered
+   * handle, while repainting the SAME card produced an inert clone with no
+   * registration and a brand-new id. A history repaint landing between
+   * `panel_ui_render` and `panel_ui_update` — with no user action at all — then
+   * invalidated a card_id the agent had just been handed. One mount path is what
+   * makes a repainted card the same card rather than a lookalike.
+   *
+   * `rec.cardId` is minted on first mount and REUSED on every later one, so the
+   * id the agent holds keeps naming this card across repaints and reloads. It is
+   * persisted with the record, which is what makes that true after a reload too.
+   */
+  function mountLiveA2UICard(rec) {
+    const handle = renderA2UICard(rec.spec, {
+      cardId: rec.cardId,
       onAction(text) {
         rec.resolved = true;
         rec.choice = text;
@@ -21015,19 +21029,51 @@ function buildPanel() {
         setChatSurfaceForCards();
       },
     });
-    record(rec);
+    rec.cardId = handle.cardId;
     liveA2uiCards.set(handle.cardId, { handle, rec });
     log.appendChild(handle.el);
+    return handle;
+  }
+
+  /** Paint + record + register one live A2UI card. Returns its card_id. */
+  function appendA2UICard(spec) {
+    clearEmpty();
+    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
+    // Mounted BEFORE record() so the stored record already carries its cardId —
+    // a record persisted without one cannot be re-registered on replay (#832).
+    const handle = mountLiveA2UICard(rec);
+    record(rec);
     scrollLog();
     if (spec.surface === "wide") setChatSurfaceForCards();
     return handle.cardId;
   }
 
-  /** Replay one persisted a2ui record inert (reload / thread switch). */
+  /**
+   * Replay one persisted a2ui record (reload / thread switch / same-thread
+   * repaint).
+   *
+   * RESOLVED records stay inert — they were answered or dismissed, and nothing
+   * should be able to answer them twice. An UNRESOLVED record is put back LIVE
+   * (#832): it is a question still on screen and still waiting, so it must stay
+   * answerable by the user and addressable by the agent. Painting it inert
+   * claimed the opposite twice over — the agent lost its card_id, and a user who
+   * reloaded mid-question was left looking at a card that rendered as already
+   * answered and could not be clicked.
+   *
+   * The previous-view guard this replaces is UNCHANGED in effect: `resetFeed()`
+   * still clears the registry, so only records belonging to the thread now being
+   * painted are re-registered. A `ui_update` naming a card from a different
+   * thread still finds nothing and still refuses — it just no longer refuses for
+   * a card sitting in front of the user.
+   */
   function paintA2UIRecord(m) {
     clearEmpty();
     try {
-      log.appendChild(renderA2UIInert(m.spec, m.choice));
+      if (m.resolved) {
+        log.appendChild(renderA2UIInert(m.spec, m.choice));
+        return;
+      }
+      mountLiveA2UICard(m);
     } catch {
       log.appendChild(renderA2UIFailCard(m.spec, ["stored card failed to render"]));
     }
@@ -21827,6 +21873,11 @@ function buildPanel() {
     // resetFeed() recreated the indicator (if a turn is live) ABOVE these
     // repainted messages — re-pin it to the bottom so it trails the newest one.
     if (agentWorking) bumpThinking();
+    // #832 — recompute AFTER the replay. resetFeed() ran this against an empty
+    // registry; any unresolved surface:"wide" card the replay just put back live
+    // has to widen the sidebar again, or a repaint silently narrows a card that
+    // asked for the room.
+    setChatSurfaceForCards();
     renderTodo(t.todos || [], { persist: false });
   }
 
