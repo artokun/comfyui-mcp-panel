@@ -21433,6 +21433,23 @@ function buildPanel() {
   }
   function mountHolderVideo(holder) {
     if (holder._video) return; // already live
+    // #909 — a failure is TERMINAL for this source (codex). `data-src` survives the error
+    // paint, so without this the lazy observer remounts the same known-bad media on the
+    // next scroll-in: the message vanishes, the decode fails again, and the card blinks
+    // back to blank. Cleared only by a new source, which is the only thing that could
+    // change the answer.
+    if (holder._mediaFailedSrc && holder._mediaFailedSrc === holder.dataset.src) return;
+    // A DIFFERENT source gets a real attempt — and must not inherit the previous
+    // failure's styling (codex). The error paint appends inline declarations
+    // (display:grid, padding, muted colour); without restoring, a later valid video
+    // renders inside them and repeated failures keep appending. Restore the exact
+    // cssText from before the failure rather than clearing, which would also discard the
+    // learned aspect-ratio and any unrelated inline state.
+    if (holder._preFailCss != null) {
+      holder.style.cssText = holder._preFailCss;
+      holder._preFailCss = null;
+      holder._mediaFailedSrc = null;
+    }
     const v = document.createElement("video");
     v.muted = true;
     v.setAttribute("muted", ""); // required for muted autoplay on some browsers
@@ -21446,6 +21463,47 @@ function buildPanel() {
     v.addEventListener("loadedmetadata", () => {
       // Learn the real aspect ratio so the placeholder (and layout) match exactly.
       if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
+    });
+    // #909 — SAY SO when the browser cannot decode it. `show_media` reports the DOM
+    // dispatch, not the decode, so an MP4 the browser refuses (the report: MPEG-4 Part 2,
+    // `mpeg4`/`mp4v`) answered ok:true and rendered a blank card — indistinguishable from
+    // a video that simply has not painted yet. The `play()` rejection is swallowed just
+    // below, deliberately (muted autoplay may be blocked, which is not a failure), so
+    // this listener is the only place the difference can be surfaced.
+    v.addEventListener("error", () => {
+      // UNMOUNT ALSO FIRES THIS. unmountHolderVideo clears `src` and calls load() to
+      // release the decoded buffers — that is a teardown, not a decode failure, and
+      // painting the message there would replace every healthy video with an error as
+      // soon as it scrolled out of view. Both tests are needed: the holder no longer
+      // owning this element, and the element no longer having a source.
+      if (holder._video !== v) return;
+      if (!v.getAttribute("src")) return;
+      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is "unsupported source or type" — NOT
+      // exclusively a codec/container verdict, and some decode failures arrive as code 3
+      // instead (codex). So re-encoding is offered as a useful remedy, never asserted as
+      // the only one, and the other codes get a narrower sentence that claims no cause.
+      const unsupported = v.error?.code === 4;
+      holder.textContent = unsupported
+        ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
+        : "This video could not be loaded.";
+      holder._preFailCss = holder.style.cssText;
+      holder.style.cssText +=
+        ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
+        "color:var(--p-text-muted-color,#a1a1aa);font-size:0.75rem;";
+      // Release the decode buffers the way unmountHolderVideo does — detaching alone is
+      // not deterministic release, and unmount will skip this element once `_video` is
+      // null, so this is the last chance to do it (codex).
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        // best-effort, exactly as the unmount path treats it
+      }
+      v.remove();
+      holder._video = null;
+      // Remember WHICH source failed, so a later card with a different source still gets
+      // a real attempt.
+      holder._mediaFailedSrc = holder.dataset.src;
     });
     holder.textContent = "";
     holder.appendChild(v);
