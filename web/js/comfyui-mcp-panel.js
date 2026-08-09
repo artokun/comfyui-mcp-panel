@@ -20979,6 +20979,13 @@ function buildPanel() {
   // the registry is mount-local on purpose — a workflow switch re-mounts and
   // replays cards INERT from the thread (live handles don't survive, by design).
   const liveA2uiCards = new Map(); // cardId -> { handle, rec }
+  // panel#832 (codex) — TRUE only during the synchronous pre-hydration restore paint.
+  // That pass declares itself "paint-only": settings are not hydrated yet, so the thread
+  // it paints comes from a tab pointer and may not be the authoritative one. Replaying a
+  // card INERT there was harmless; mounting it LIVE would register a card belonging to a
+  // thread that is about to be replaced, and an update could then land on it. Liveness
+  // waits until the real thread has been chosen.
+  let a2uiPaintProvisional = false;
 
   /** Round-trip: a card interaction becomes a normal, visible user message. */
   function sendCardReply(text) {
@@ -21066,7 +21073,7 @@ function buildPanel() {
   function paintA2UIRecord(m) {
     clearEmpty();
     try {
-      if (m && m.resolved !== true) {
+      if (m && m.resolved !== true && !a2uiPaintProvisional) {
         mountLiveA2UICard(m, typeof m.cardId === "string" ? m.cardId : undefined);
         return;
       }
@@ -27095,7 +27102,16 @@ function buildPanel() {
       const pointed = reloadThreadId
         ? threads.find((candidate) => candidate.id === reloadThreadId)
         : null;
-      if (pointed?.msgs?.length) paintThread(pointed);
+      if (pointed?.msgs?.length) {
+        // #832 — paint-only, as the comment above requires: cards replay inert here
+        // because the authoritative thread has not been selected yet.
+        a2uiPaintProvisional = true;
+        try {
+          paintThread(pointed);
+        } finally {
+          a2uiPaintProvisional = false;
+        }
+      }
     } catch {
       // Corrupt/absent state — start clean.
     }

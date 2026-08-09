@@ -136,3 +136,20 @@ test("#832 the card is RECORDED before it is mounted — record() can repaint", 
     "record(rec) must precede the mount",
   );
 });
+
+test("#832 (codex): the PRE-HYDRATION restore paint replays cards inert", () => {
+  // The synchronous restore pass declares itself "paint-only": settings are not hydrated,
+  // so the thread it paints comes from a tab pointer and may not be the authoritative one.
+  // Mounting a card LIVE there would register one belonging to a thread about to be
+  // replaced, and an update could land on it — a correctness bug traded for a convenience
+  // one. Liveness waits until the real thread is chosen.
+  assert.match(panelSrc, /let a2uiPaintProvisional = false;/);
+  assert.match(
+    fn(panelSrc, "paintA2UIRecord"),
+    /m\.resolved !== true && !a2uiPaintProvisional/,
+    "the live branch is suppressed during the provisional paint",
+  );
+  const restore = panelSrc.match(/\(function restoreLastThread\(\) \{[\s\S]*?\n  \}\)\(\);/)[0];
+  assert.match(restore, /a2uiPaintProvisional = true;/);
+  assert.match(restore, /finally \{\s*a2uiPaintProvisional = false;/, "reset even if paint throws");
+});
