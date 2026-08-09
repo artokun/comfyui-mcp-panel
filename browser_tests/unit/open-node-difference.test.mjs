@@ -257,9 +257,20 @@ test("a re-measured graph says nothing was lost, and drops the data-loss framing
     contentSurfaces: ["nodes"],
     contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["size"] },
   });
-  assert.match(msg, /nothing was lost/i);
+  // #696 (codex) — the claim is narrower than it was, and the assertion follows it.
+  // The old wording promised "the only difference is presentation, which the ComfyUI
+  // frontend recomputes on load"; the frontend does NOT recompute a node's colour,
+  // and colour is in the cosmetic set, so that was false whenever one differed. What
+  // the comparison actually proves is same nodes, same values, same links.
+  assert.match(msg, /no node and no value is missing/i);
+  assert.match(msg, /same widget values and links/i);
   assert.match(msg, /no missing work to redo/i);
-  assert.match(msg, /size/);
+  assert.match(msg, /size/, "the differing fields are named so a reader can judge for themselves");
+  assert.doesNotMatch(
+    msg,
+    /frontend recomputes on load/i,
+    "the panel must not claim a recompute it cannot know happened",
+  );
   assert.doesNotMatch(
     msg,
     /the load only\s+partly applied/i,
@@ -276,7 +287,10 @@ test("a MISSING node keeps the full warning and says the set itself differs", ()
   });
   assert.match(msg, /the node SET itself differs/);
   assert.match(msg, /partly applied/i, "a real content loss must keep the unresolved wording");
-  assert.doesNotMatch(msg, /nothing was lost/i);
+  // Pin the CURRENT reassurance, not a phrase the code no longer uses — a negative
+  // assertion against dead wording passes for free and guards nothing.
+  assert.doesNotMatch(msg, /no node and no value is missing/i);
+  assert.doesNotMatch(msg, /no missing work to redo/i);
 });
 
 test("a widget-value difference is same-set but gets no reassurance", () => {
@@ -499,4 +513,58 @@ test("showAdvanced alongside a REAL change is still not cosmetic", () => {
   });
   assert.deepEqual(out.fields, ["showAdvanced", "widgets_values"]);
   assert.equal(out.cosmeticOnly, false);
+});
+
+test("showAdvanced is trusted only when it is a BOOLEAN", () => {
+  // codex — a field NAME is not a contract. `showAdvanced` is a boolean display
+  // toggle in the packs that prompted this, but the classifier sees every node type
+  // there will ever be, and a pack storing real state under that name would
+  // otherwise collect an all-clear it never earned. A boolean cannot carry a lost
+  // widget value; anything richer is unknown and fails closed.
+  const node = (v) => ({ id: 1, type: "T", widgets_values: ["a"], showAdvanced: v });
+  const classify = (a, b) =>
+    classifyNodeDifference({ expectedNodes: [node(a)], actualNodes: [node(b)] });
+
+  assert.equal(classify(false, true).cosmeticOnly, true, "boolean toggle is cosmetic");
+
+  for (const [a, b, why] of [
+    [{ lora_1: "x" }, { lora_1: "y" }, "an object could be real state"],
+    [["a"], ["b"], "so could an array"],
+    ["basic", "advanced", "and a string"],
+    [0, 1, "numbers are not the toggle this trusts"],
+    [false, { on: true }, "a mixed pair is still unknown on one side"],
+  ]) {
+    const out = classify(a, b);
+    assert.deepEqual(out.fields, ["showAdvanced"], why);
+    assert.equal(out.cosmeticOnly, false, why);
+  }
+});
+
+test("a guard failure still REPORTS the field, it just refuses the all-clear", () => {
+  // The caller needs to know what differed either way; the guard decides only
+  // whether the reassuring sentence may be used.
+  const node = (v) => ({ id: 1, type: "T", widgets_values: ["a"], showAdvanced: v });
+  const out = classifyNodeDifference({
+    expectedNodes: [node({ deep: 1 })],
+    actualNodes: [node({ deep: 2 })],
+  });
+  assert.deepEqual(out.fields, ["showAdvanced"]);
+  assert.equal(out.sameNodeSet, true);
+  assert.equal(out.cosmeticOnly, false);
+});
+
+test("the reassuring sentence claims only what was compared", () => {
+  // #696 (codex) — `color`/`bgcolor` are cosmetic AND user-authored, and the
+  // frontend does not recompute them, so the old "which the ComfyUI frontend
+  // recomputes on load" was false whenever a colour differed. What the comparison
+  // establishes is same nodes, same values, same links.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["color"] },
+  });
+  assert.match(msg, /no node and no value is missing/i);
+  assert.match(msg, /color/, "the field is named rather than described as 'presentation'");
+  assert.doesNotMatch(msg, /recomputes on load/i);
 });
