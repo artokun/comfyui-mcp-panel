@@ -82,6 +82,10 @@ export class MockBridge {
   private readonly userMessages: UserMessage[] = []
   private readonly userMessageWaiters: Array<(m: UserMessage) => void> = []
   private streamSeq = 0
+  /** #793 — the active canvas's workflow-instance uuid, learned once per page
+   *  and reused. Cleared by `forgetWorkflowUuid()` when a spec deliberately
+   *  changes which workflow is active. */
+  private workflowUuid: string | null = null
 
   constructor(options: MockBridgeOptions = {}) {
     this.opts = {
@@ -283,7 +287,11 @@ export class MockBridge {
    * ({ rid, ok, result } | { rid, ok:false, error }). Used by the connect-matcher
    * suite to exercise GRAPH_TOOL_EXECUTORS against the live LiteGraph graph.
    */
-  command(
+  /**
+   * Send one command frame and resolve with the panel's reply. Internal: does
+   * NOT stamp, so the identity probe below can use it without recursing.
+   */
+  private sendCommand(
     cmd: string,
     args: Record<string, unknown> = {},
     timeoutMs = 10_000
@@ -305,6 +313,62 @@ export class MockBridge {
     })
   }
 
+  /**
+   * The active canvas's workflow-instance uuid, learned from the panel itself.
+   *
+   * #793 — `workflow_list` is the right source and the only one that always
+   * works: it reports `active.workflow_uuid`, and it is deliberately EXEMPT
+   * from the very fence we are trying to satisfy (#759/#932 — it is the
+   * orchestrator's own recovery probe, so fencing it would make the repair
+   * require the fence to be already correct). That is why the harness can read
+   * identity even from a wedged session, and why this needs no new panel API.
+   *
+   * Cached: the uuid is per workflow INSTANCE, so re-reading it before every
+   * command would double the frame count for no gain. A spec that switches or
+   * creates a workflow calls `forgetWorkflowUuid()`.
+   */
+  async activeWorkflowUuid(): Promise<string | null> {
+    if (this.workflowUuid) return this.workflowUuid
+    const reply = await this.sendCommand('workflow_list', {})
+    const uuid = reply?.result?.active?.workflow_uuid
+    this.workflowUuid = typeof uuid === 'string' && uuid ? uuid : null
+    return this.workflowUuid
+  }
+
+  /** Drop the cached uuid — call after a spec switches or creates a workflow. */
+  forgetWorkflowUuid(): void {
+    this.workflowUuid = null
+  }
+
+  /**
+   * Drive a graph command the way the real orchestrator does: send
+   * { rid, cmd, workflow_uuid, ...args } to the panel and resolve with the
+   * panel's reply frame ({ rid, ok, result } | { rid, ok:false, error }).
+   *
+   * #793 — THE STAMP IS WHY THIS SUITE WORKS. The panel advertises the
+   * workflow-stamp capability, so the #718 fence refuses any active-canvas
+   * MUTATION that arrives without one — correctly: an unstamped mutation is
+   * indistinguishable from one issued for a workflow the user has since
+   * switched away from. The harness never learned to stamp, so every
+   * graph-mutating spec was refused before it reached its executor and the
+   * suite silently stopped covering the thing it exists to cover.
+   *
+   * A caller that passes `workflow_uuid` explicitly keeps it verbatim — a spec
+   * testing the FENCE ITSELF needs to send a stale one, or none (pass
+   * `workflow_uuid: undefined`), and must not have this quietly repair it.
+   */
+  async command(
+    cmd: string,
+    args: Record<string, unknown> = {},
+    timeoutMs = 10_000
+  ): Promise<{ rid: string; ok: boolean; result?: any; error?: string }> {
+    if (Object.prototype.hasOwnProperty.call(args, 'workflow_uuid')) {
+      const { workflow_uuid: explicit, ...rest } = args
+      return this.sendCommand(cmd, explicit == null ? rest : args, timeoutMs)
+    }
+    const uuid = await this.activeWorkflowUuid()
+    return this.sendCommand(cmd, uuid ? { ...args, workflow_uuid: uuid } : args, timeoutMs)
+  }
   /** Close all sockets and the server. */
   async close(): Promise<void> {
     for (const s of this.sockets) {
