@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.51] - 2026-08-09
+
+> Covers changes since 0.11.50.
+
+### Fixed
+- Switching workflow tabs could leave every `panel_*` graph tool refusing the ACTIVE workflow
+  with `root-workflow-uuid-mismatch`, until the user re-opened the workflow that was already
+  open. ComfyUI reuses one canvas object across tabs and does not reset its metadata, so the
+  previous workflow's identity tag stays behind on a canvas that now holds the new one's graph.
+
+  The panel could already recover a canvas carrying NO tag — it proves the canvas is the active
+  workflow's by comparing content, then stamps it. It could not recover one carrying the WRONG
+  tag, because that stamp is never overwritten. A wrong tag was therefore stickier than no tag:
+  a byte-identical canvas was allowed in one case and refused in the other. The same content
+  proof now settles both.
+
+  Deliberately unchanged: a canvas that is genuinely a different workflow's still refuses, and
+  so does an ambiguous one — a second clean tab holding identical content, a tab with unsaved
+  edits (whose state can lag the real canvas), or a check that could not run at all (#817)
+
 ## [0.11.50] - 2026-08-09
 
 > Covers changes since 0.11.49.
