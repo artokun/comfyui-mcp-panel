@@ -63,10 +63,10 @@ test('an in-place save persists a value the tracker never saw', async ({
   // finally, which no-ops on an empty one.
   let name = ''
   try {
-  const first = await mockBridge.command('workflow_save', {})
-  expect(first.ok, 'the first save must succeed so the tab has a path').toBe(true)
-  name = String(first.result?.workflow || '')
-  expect(name, 'the save must report the workflow name').toBeTruthy()
+    const first = await mockBridge.command('workflow_save', {})
+    expect(first.ok, 'the first save must succeed so the tab has a path').toBe(true)
+    name = String(first.result?.workflow || '')
+    expect(name, 'the save must report the workflow name').toBeTruthy()
 
     // Change a value the way a NODE does: directly, no user input event — and issue no
     // panel command afterwards, because the dispatch captures after every completed
