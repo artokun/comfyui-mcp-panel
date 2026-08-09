@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.54] - 2026-08-09
+
+> Covers changes since 0.11.53.
+
+### Fixed
+
+- **The reboot reply now says WHICH ComfyUI it restarted (#851).** `comfy_reboot`
+  returned the route (`/v2/manager/reboot`) and never the host, so a caller could
+  not tell which server had just gone down. When the panel drives a ComfyUI that
+  is not the orchestrator's headless `COMFYUI_URL`, that gap sends a confirmation
+  timeout to a fallback aimed at the other machine — which answers "No ComfyUI
+  process found on port 8188" while the panel was operating on the live one all
+  along. Every branch now carries `target`, and the two failure messages name the
+  host in prose; an unknown target is omitted rather than reported blank. The
+  confirmation card and its timeout wording are orchestrator-side and unchanged.
+
+
 ## [0.11.53] - 2026-08-09
 
 > Covers changes since 0.11.52.
