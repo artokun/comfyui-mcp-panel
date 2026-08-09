@@ -7993,6 +7993,22 @@ const GRAPH_TOOL_EXECUTORS = {
       if (c.clipped) outlineTitlesClipped++;
       return c.text;
     };
+    /**
+     * Make user-controlled text safe INSIDE a bracketed annotation (#636, codex).
+     *
+     * This outline is read by the MODEL, and a label that can close its own tag can forge
+     * an adjacent one: `x"] [after_gen=randomize]` would report a control mode the widget
+     * does not have — the same class of harm as the wrong answer this fix exists to stop,
+     * pointed the other way. Clipping does not prevent that, so the delimiters are removed
+     * rather than trusted. Deliberately lossy on brackets: an annotation that cannot be
+     * closed early matters more than reproducing a bracket in a display name.
+     */
+    const tagText_ = (t) =>
+      String(t ?? "")
+        .replace(/[\r\n\t]+/g, " ")
+        .replace(/[[\]]/g, "")
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"');
     // Rebuilt per rung (not hoisted) so its title clips are counted against the rung that
     // actually emits them — a count carried in from outside would claim clips the
     // rendered text does not contain.
@@ -8062,8 +8078,10 @@ const GRAPH_TOOL_EXECUTORS = {
               // The NAME stays the addressable key and stays first — panel_set_widget
               // takes the name, not the label — with the label annotated beside it in the
               // same bracket idiom as [after_gen=…] and [bypass].
+              // ESCAPED, not merely clipped (codex): `title_` bounds the SIZE, `tagText_`
+              // stops a user-controlled label from closing this tag and forging the next.
               const label = renamed[w.name];
-              const withLabel = label ? `${base} [renamed "${title_(label)}"]` : base;
+              const withLabel = label ? `${base} [renamed "${tagText_(title_(label))}"]` : base;
               const mode = cagMode.get(w.name);
               const withMode = mode ? `${withLabel} [after_gen=${mode}]` : withLabel;
               return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
