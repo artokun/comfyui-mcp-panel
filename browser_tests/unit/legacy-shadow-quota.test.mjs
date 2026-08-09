@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   ChatHistoryStore,
@@ -941,4 +942,115 @@ test("a refused write grants no receipt for the refused id", async () => {
   stale.persist([legacyThread("L1", 1)], {});
   await stale._writePromise;
   assert.equal(stale._durableLegacy.has("L1"), false, "no receipt for a refused write");
+});
+
+test("a stale write AFTER a completed delete is still refused", async () => {
+  // codex r6, and the finding that made this a fence rather than a hint. The delete
+  // lands and its id used to be REMOVED from the marker — so a stale tab starting its
+  // write afterwards saw nothing and put the record straight back.
+  //
+  // I assumed the canonical tombstone covered this and tested that assumption first:
+  // it does not, and the reason is instructive. A legacyShadow thread is never IN
+  // canonical, so compaction prunes a tombstone that points at no thread. There is no
+  // fence for a legacy delete other than this one.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await store._writePromise;
+
+  store.persist([legacyThread("L1", 2)], {
+    deletedThreads: { L0: { updatedAt: 500, writerId: "a", sequence: 1 } },
+  });
+  await store._writePromise;
+  assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"), false, "the delete landed");
+  const record = indexedDb._store("snapshots").get("__cmcp_legacy_pending_deletes");
+  assert.deepEqual(record?.pending, [], "nothing is owed any more");
+  assert.deepEqual(record?.deleted, ["L0"], "…but the deletion is remembered for good");
+
+  // A stale tab that still believes L0 is live, persisting after all of that.
+  const stale = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  stale.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await stale._writePromise;
+  assert.equal(
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    false,
+    "a completed delete must fence a later stale write",
+  );
+  assert.equal(stale._durableLegacy.has("L0"), false, "and grant it no receipt");
+
+  // …and it is not restored as live history either.
+  const next = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await next._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.equal((restored.threads || []).some((t) => t.id === "L0"), false);
+});
+
+test("the permanent deleted list is bounded by what legacy threads ARE", () => {
+  // A never-pruned list of deleted ids would be an unbounded growth path — the exact
+  // shape of the bug this whole change fixes. It is bounded here by construction, not
+  // by a cap: legacyShadow threads are pre-v3 content, quarantined once and never
+  // created again, so the set of ids that can ever enter it is closed and finite.
+  //
+  // Pinned as a source fact, because the day something starts MINTING legacyShadow
+  // threads this reasoning silently stops being true. Exactly two sites may apply the
+  // flag, and only one of them can introduce an id that was not already legacy:
+  const src = readFileSync(new URL("../../web/js/lib/chat-history-store.js", import.meta.url), "utf8");
+  const sites = src.match(/legacyShadow: true/g) || [];
+  assert.equal(sites.length, 2, "a third site applying this flag needs this reasoning re-checked");
+
+  // 1. the quarantine in mergeUnderCanonicalCheckpoint — the ONE minter, and it can
+  //    only flag threads that already exist in a pre-v3 snapshot.
+  const quarantine = src.slice(src.indexOf("function mergeUnderCanonicalCheckpoint"), src.indexOf("function idbRead"));
+  assert.ok(
+    quarantine.includes("normalizeThread({ ...thread, legacyShadow: true })"),
+    "the quarantine must be the minting site",
+  );
+  // 2. the restore, which RE-flags records read back out of the legacy store. It can
+  //    never introduce a new id: everything it flags was already in that store.
+  const restore = src.slice(src.indexOf("async _restoreLegacyShadow"), src.indexOf("async persist") + 1 || undefined);
+  assert.ok(
+    restore.includes("...thread, legacyShadow: true"),
+    "the restore must only re-flag what the store already held",
+  );
+});
+
+test("a record that got past the writer is still not restored once deleted for good", async () => {
+  // Defence in depth, and it needed a case to be worth keeping. The writer refuses
+  // ids in the deleted list, so nothing on the normal path can produce this — but a
+  // database written by a build without that fence, or any other writer to the same
+  // store, can. Then the record exists AND the id is deleted for good, and only the
+  // restore filter stands between it and coming back as live history.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await store._writePromise;
+  store.persist([legacyThread("L1", 2)], {
+    deletedThreads: { L0: { updatedAt: 500, writerId: "a", sequence: 1 } },
+  });
+  await store._writePromise;
+  assert.deepEqual(
+    indexedDb._store("snapshots").get("__cmcp_legacy_pending_deletes")?.deleted,
+    ["L0"],
+    "precondition: deleted for good",
+  );
+
+  // Put the record back the way a fence-less writer would have.
+  const revived = legacyThread("L0", 1);
+  const db = await new Promise((resolve) => {
+    const req = indexedDb.open();
+    req.onsuccess = () => resolve(req.result);
+  });
+  await new Promise((resolve) => {
+    const tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readwrite");
+    tx.objectStore(CHAT_HISTORY_LEGACY_STORE).put(revived, "L0");
+    tx.oncomplete = () => resolve();
+  });
+  assert.ok(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"), "precondition: the record is back");
+
+  const next = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await next._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.equal(
+    (restored.threads || []).some((t) => t.id === "L0"),
+    false,
+    "a transcript deleted for good must not return as live history",
+  );
 });

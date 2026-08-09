@@ -1402,38 +1402,57 @@ function legacyFingerprint(thread) {
  */
 const LEGACY_PENDING_DELETES_KEY = "__cmcp_legacy_pending_deletes";
 
-/** Read the durable pending-delete list. `[]` when absent or unreadable — a missing
- *  list means nothing is known to be owed, which the in-memory set then adds to. */
-async function idbReadPendingDeletes(indexedDb) {
+/** Coerce a stored delete record into `{pending, deleted}` of clean string ids.
+ *  Tolerates the absent case and any shape a partial write could leave. */
+function normalizeDeleteRecord(raw) {
+  const clean = (v) => (Array.isArray(v) ? v.filter((id) => typeof id === "string" && id) : []);
+  return { pending: clean(raw?.pending), deleted: clean(raw?.deleted) };
+}
+
+/**
+ * Read the durable delete record: `{pending, deleted}` (#861, codex r6).
+ *
+ * TWO lists, and the second is why this is a fence rather than a hint. Removing an
+ * id once its delete landed left a window codex named: a stale tab that starts its
+ * write AFTER the removal sees nothing and puts the record back, with no intent
+ * anywhere to remove it again. The canonical tombstone does not cover this —
+ * verified, and it is the reason the window exists: a legacy thread was never IN
+ * canonical, so compaction prunes a tombstone that has no thread to point at.
+ *
+ * A permanently retained `deleted` list would be unbounded for ordinary threads.
+ * It is not here, and that is a property of what these records ARE: `legacyShadow`
+ * threads are pre-v3 content, migrated once and never created again, so the set of
+ * ids that can ever appear is closed and finite. The list cannot outgrow the
+ * transcripts it is about.
+ */
+async function idbReadDeleteRecord(indexedDb) {
+  const empty = { pending: [], deleted: [] };
   const db = await openDb(indexedDb);
-  if (!db) return [];
+  if (!db) return empty;
   try {
-    if (!db.objectStoreNames.contains("snapshots")) return [];
+    if (!db.objectStoreNames.contains("snapshots")) return empty;
     return await new Promise((resolve) => {
       let tx;
       try {
         tx = db.transaction("snapshots", "readonly");
       } catch {
-        resolve([]);
+        resolve(empty);
         return;
       }
       const req = tx.objectStore("snapshots").get(LEGACY_PENDING_DELETES_KEY);
-      req.onsuccess = () => {
-        const ids = req.result?.ids;
-        resolve(Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id) : []);
-      };
-      req.onerror = () => resolve([]);
-      tx.onabort = () => resolve([]);
+      req.onsuccess = () => resolve(normalizeDeleteRecord(req.result));
+      req.onerror = () => resolve(empty);
+      tx.onabort = () => resolve(empty);
     });
   } catch {
-    return [];
+    return empty;
   } finally {
     db.close();
   }
 }
 
 /**
- * Merge into the pending-delete list, in ONE transaction (codex r4).
+ * Merge into the durable delete record, in ONE transaction (codex r4/r6).
  *
  * NOT a whole-list overwrite. Two tabs both retrying is ordinary: tab A finishes
  * `L0` and writes `[]` while tab B's delete of `L1` fails and writes `[L1]`. If A's
@@ -1444,10 +1463,10 @@ async function idbReadPendingDeletes(indexedDb) {
  * Best effort: a store that will not take the marker is a store that will not be
  * taking new records either, and the in-memory set still drives retries here.
  */
-async function idbMergePendingDeletes(indexedDb, { add = [], remove = [] } = {}) {
-  const toAdd = add.filter((id) => typeof id === "string" && id);
-  const toRemove = new Set(remove.filter((id) => typeof id === "string" && id));
-  if (!toAdd.length && !toRemove.size) return true;
+async function idbMergeDeleteRecord(indexedDb, { pending = [], deleted = [] } = {}) {
+  const toPend = pending.filter((id) => typeof id === "string" && id);
+  const toDelete = deleted.filter((id) => typeof id === "string" && id);
+  if (!toPend.length && !toDelete.length) return true;
   const db = await openDb(indexedDb);
   if (!db) return false;
   try {
@@ -1469,12 +1488,17 @@ async function idbMergePendingDeletes(indexedDb, { add = [], remove = [] } = {})
         return;
       }
       req.onsuccess = () => {
-        const existing = Array.isArray(req.result?.ids) ? req.result.ids : [];
-        const merged = [...new Set([...existing, ...toAdd])]
-          .filter((id) => typeof id === "string" && id && !toRemove.has(id));
+        const held = normalizeDeleteRecord(req.result);
+        // A landed delete MOVES its id from pending to deleted; it never just
+        // disappears. Disappearing is what left the post-removal window.
+        const done = new Set([...held.deleted, ...toDelete]);
+        const owed = [...new Set([...held.pending, ...toPend])].filter((id) => !done.has(id));
         try {
-          if (merged.length) store.put({ ids: merged }, LEGACY_PENDING_DELETES_KEY);
-          else store.delete(LEGACY_PENDING_DELETES_KEY);
+          if (owed.length || done.size) {
+            store.put({ pending: owed, deleted: [...done] }, LEGACY_PENDING_DELETES_KEY);
+          } else {
+            store.delete(LEGACY_PENDING_DELETES_KEY);
+          }
         } catch {
           // The transaction settles below either way.
         }
@@ -1598,11 +1622,13 @@ async function idbWriteLegacy(indexedDb, threads) {
         return;
       }
       req.onsuccess = () => {
-        const owed = new Set(Array.isArray(req.result?.ids) ? req.result.ids : []);
-        // A thread someone is still trying to delete is not resurrected here. It
-        // stays whole in the shadow and unevictable — fail closed, as everywhere
-        // else in this file.
-        const allowed = list.filter((thread) => !owed.has(thread.id));
+        const held = normalizeDeleteRecord(req.result);
+        // Both lists. `pending` covers a delete still in flight; `deleted` covers
+        // one that already landed, which is the window a stale tab writes into —
+        // it starts after the id was cleared, sees nothing, and puts the record
+        // back with no intent anywhere to remove it again.
+        const fenced = new Set([...held.pending, ...held.deleted]);
+        const allowed = list.filter((thread) => !fenced.has(thread.id));
         try {
           const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
           for (const thread of allowed) store.put(thread, thread.id);
@@ -1916,9 +1942,8 @@ export class ChatHistoryStore {
     // Durable retry intent first (codex r3): a delete that failed in a PREVIOUS tab
     // must keep being retried and must keep being suppressed, even after its
     // tombstone has aged out of the capped map.
-    for (const id of await idbReadPendingDeletes(this.indexedDb)) {
-      this._pendingLegacyDeletes.add(id);
-    }
+    const deleteRecord = await idbReadDeleteRecord(this.indexedDb);
+    for (const id of deleteRecord.pending) this._pendingLegacyDeletes.add(id);
     const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
     if (stored === null) {
       // Unreachable. Keep whatever the shadow gave us and prove nothing durable.
@@ -1940,9 +1965,12 @@ export class ChatHistoryStore {
     // write has not landed yet — an unreachable store must not resurrect a delete.
     const tombstoned = new Set([
       ...Object.keys(snapshot?.meta?.deletedThreads || {}),
-      // …and anything whose durable delete has not landed yet, whose tombstone may
-      // already have aged out of the capped map above.
+      // …anything whose durable delete has not landed yet, whose tombstone may
+      // already have aged out of the capped map above…
       ...this._pendingLegacyDeletes,
+      // …and anything already deleted for good. Without this a record another tab
+      // put back after the delete landed would be restored as live history.
+      ...deleteRecord.deleted,
     ]);
     const restored = stored
       .filter((thread) => !known.has(thread.id))
@@ -2177,9 +2205,12 @@ export class ChatHistoryStore {
           // The DELTA, never the whole set (codex r4): another tab's outstanding
           // delete must not be erased by this tab writing a list that predates it.
           try {
-            await idbMergePendingDeletes(this.indexedDb, {
-              add: deleted ? [] : tombstoned,
-              remove: deleted ? tombstoned : [],
+            await idbMergeDeleteRecord(this.indexedDb, {
+              // A landed delete is recorded PERMANENTLY, not erased (codex r6): a
+              // stale tab writing after the erase saw nothing and put the record
+              // back. Bounded by construction — legacyShadow ids are a closed set.
+              pending: deleted ? [] : tombstoned,
+              deleted: deleted ? tombstoned : [],
             });
           } catch {
             // Best effort: the in-memory set still drives retries in this tab.
