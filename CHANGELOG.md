@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.59] - 2026-08-09
+
+> Covers changes since 0.11.58.
+
+### Fixed
+
+- **An open Chat history pane now updates itself when you save a workflow
+  (#847, partial).** The list was painted once when the pane opened, so if you
+  saved a workflow while it was on screen it kept showing the pre-save answer
+  until you closed and reopened it.
+
+  This does not yet fix the related report that a chat held on a workflow *before*
+  its first save can drop out of "Current workflow only". That needs the panel to
+  prove an old identity belonged to the same tab, and it currently cannot — the
+  workflow object is replaced by the save, and "no other tab claims this id" is not
+  the same as "this tab owned it". Guessing there would attach one workflow's
+  conversations to another, so it stays unfixed and #847 stays open.
+
+
 ## [0.11.58] - 2026-08-09
 
 > Covers changes since 0.11.57.
