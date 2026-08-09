@@ -23486,7 +23486,7 @@ function buildPanel() {
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
-    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs }) => {
+    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs, noMedia }) => {
       // #370: track whether the composed completion frame actually reached the
       // agent. sendFrame returns false when the bridge socket is down — in that
       // case the completion is LOST, so we re-pend the prompt (markUndelivered) so
@@ -23502,7 +23502,11 @@ function buildPanel() {
       // it's async (metadata HEADs / frame sampling), but the batch is already
       // captured — a failure inside must never wedge the lifecycle.
       composeRunCompletionFrame(
-        { promptId, images: flImages, videos: flVideos, durationMs },
+        // #356 Bug 2 — `noMedia` marks a panel-queued run that finished producing
+        // no image or video. Without it the composer returns null, the call site
+        // below reads that as "empty batch ⇒ already delivered", and the agent that
+        // panel_run told to end its turn and wait is never told anything.
+        { promptId, images: flImages, videos: flVideos, durationMs, noMedia },
         {
           sendFrame: (frame) => {
             const ok = client.sendFrame(frame);

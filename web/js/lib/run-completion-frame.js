@@ -34,7 +34,7 @@ import { withTimeout } from "./bounded-step.js";
  * @returns {Promise<object|null>}
  */
 export async function composeRunCompletionFrame(
-  { promptId, images = [], videos = [], durationMs },
+  { promptId, images = [], videos = [], durationMs, noMedia = false },
   deps,
 ) {
   const {
@@ -147,7 +147,36 @@ export async function composeRunCompletionFrame(
     if (note) noteSections.push(note);
   }
 
-  if (!outImages.length && !noteSections.length) return null;
+  // #356 Bug 2 — a run that finished with no image and no video still has to be
+  // REPORTED when the agent was told to wait for it. panel_run's reply says "you
+  // will be notified automatically — do NOT poll — end your turn now and wait", so
+  // composing nothing here does not mean "nothing worth saying": it means the agent
+  // waits forever and the user has to prompt again to break the stall. The promise
+  // is what makes silence a defect rather than an omission.
+  //
+  // Only a flush that DECLARES itself media-less gets this note. An empty compose
+  // arriving any other way still returns null, so the call site's existing
+  // "empty batch ⇒ treat as delivered" contract is unchanged for every path that
+  // relied on it.
+  if (!outImages.length && !noteSections.length) {
+    if (!noMedia) return null;
+    const took = durationMs != null ? ` in ${formatDuration(durationMs)}` : "";
+    const frame = {
+      type: "agent_event",
+      kind: "executed",
+      images: [],
+      note:
+        `The run you queued finished successfully${took}, and produced no image or ` +
+        "video output. This IS the completion you were told to wait for — nothing " +
+        "further is coming, so do not keep waiting for media. If this workflow was " +
+        "meant to save a file, no output node produced one; if its results are text " +
+        "or other non-media outputs, read them from the run's history entry.",
+      metadata: [{ outputs: "none", reason: "no_media" }],
+      ...(promptId != null ? { prompt_id: promptId } : {}),
+    };
+    sendFrame(frame);
+    return frame;
+  }
 
   const frame = {
     type: "agent_event",
