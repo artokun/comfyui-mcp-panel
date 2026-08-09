@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
+  migratableRouteIds,
 } from "../../web/js/lib/thread-workflow-match.js";
 
 /**
@@ -267,7 +268,7 @@ test("WIRING #847: the save migration revises EVERY thread holding the old id", 
   // it was not active when the save landed.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const site = src.slice(
-    src.indexOf("const priorRouteIds = new Set();"),
+    src.indexOf("const stillOpenRouteIds = (() => {"),
     src.indexOf("setActiveThread(\"panel:global\", thread.id);"),
   );
   assert.ok(site.length > 0, "the migration must live in the workflow-change path");
@@ -282,7 +283,7 @@ test("WIRING #847: the save migration revises EVERY thread holding the old id", 
   );
   // Both sources, because the WeakMap alone misses when ComfyUI replaces the
   // workflow object across the save — which is what it does.
-  assert.ok(site.includes("currentWorkflowId"), "the tracked id must be one source");
+  assert.ok(site.includes("candidateRouteIds: [currentWorkflowId"), "the tracked id must be one candidate");
   assert.ok(site.includes("_priorTempWorkflowIds.get(wf)"), "the WeakMap must be the other");
   // The active thread's own stamp follows too.
   assert.ok(site.includes("workflowRouteKey: workflowTabId()"), "the active thread must follow as well");
@@ -297,15 +298,100 @@ test("WIRING #847: a migration with no active thread is still persisted", () => 
   assert.ok(src.includes("if (migratedRouteStamp && !thread) persistThreads();"));
 });
 
-test("the sweep only fires on a real tmp: -> wf: migration", () => {
-  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  const site = src.slice(
-    src.indexOf("const priorRouteIds = new Set();"),
-    src.indexOf("if (migratedRouteStamp && !thread)"),
+test("codex P0: a switch from unsaved A to saved B migrates NOTHING", () => {
+  // The blocker on the first cut. `tmp:` -> `wf:` is the shape of a first save AND of
+  // a switch from an unsaved workflow A to an already-saved workflow B. Reading the
+  // tracked id as "this tab's pre-save identity" rewrote every one of A's threads to
+  // B's path — permanently attributing one workflow's conversations to another, which
+  // is worse than the bug being fixed.
+  //
+  // A is still OPEN and still answers to `tmp:A`, so it is not this tab's past.
+  const out = migratableRouteIds({
+    newRouteId: "wf:workflows/B.json",
+    candidateRouteIds: ["tmp:A"],
+    openRouteIds: new Set(["tmp:A"]),
+  });
+  assert.deepEqual([...out], [], "A's threads must not follow the switch to B");
+});
+
+test("a genuine first save DOES migrate — the tmp: identity is consumed", () => {
+  // The other side, so the guard above cannot be satisfied by refusing everything.
+  const out = migratableRouteIds({
+    newRouteId: "wf:workflows/Saved.json",
+    candidateRouteIds: ["tmp:this-tab"],
+    openRouteIds: new Set(), // nothing answers to it any more
+  });
+  assert.deepEqual([...out], ["tmp:this-tab"]);
+});
+
+test("an unreadable open list migrates nothing — fail closed", () => {
+  // Migrating on a guess is exactly how the cross-attribution happens, and the
+  // in-memory match still covers the session.
+  for (const openRouteIds of [null, undefined, [], "nope", new Map()]) {
+    const out = migratableRouteIds({
+      newRouteId: "wf:workflows/Saved.json",
+      candidateRouteIds: ["tmp:this-tab"],
+      openRouteIds,
+    });
+    assert.deepEqual([...out], [], `openRouteIds ${String(openRouteIds)} must refuse`);
+  }
+});
+
+test("only a SAVE is a migration, and only an UNSAVED id can be migrated from", () => {
+  const open = new Set();
+  // Not a save: the new id is still unsaved.
+  assert.deepEqual(
+    [...migratableRouteIds({ newRouteId: "tmp:other", candidateRouteIds: ["tmp:a"], openRouteIds: open })],
+    [],
   );
-  assert.ok(site.includes('wfid.startsWith("wf:")'), "only when the tab is now SAVED");
-  assert.ok(site.includes('id.startsWith("tmp:")'), "only from an UNSAVED id");
-  assert.ok(site.includes("id !== wfid"), "and only when the id actually changed");
+  // A `wf:` candidate is a saved workflow's id, never a pre-save identity — a rename
+  // is a different event and must not be swept up here.
+  assert.deepEqual(
+    [...migratableRouteIds({
+      newRouteId: "wf:workflows/New.json",
+      candidateRouteIds: ["wf:workflows/Old.json"],
+      openRouteIds: open,
+    })],
+    [],
+  );
+  // And an id identical to the new one is a no-op, not a migration.
+  assert.deepEqual(
+    [...migratableRouteIds({
+      newRouteId: "wf:workflows/Same.json",
+      candidateRouteIds: ["wf:workflows/Same.json"],
+      openRouteIds: open,
+    })],
+    [],
+  );
+});
+
+test("junk candidates are ignored rather than migrated", () => {
+  const out = migratableRouteIds({
+    newRouteId: "wf:workflows/S.json",
+    candidateRouteIds: [null, undefined, "", 42, {}, "tmp:real"],
+    openRouteIds: new Set(),
+  });
+  assert.deepEqual([...out], ["tmp:real"]);
+});
+
+test("WIRING #847: the panel decides through that function, not its own copy", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const decl = src.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/lib\/thread-workflow-match\.js";/);
+  assert.ok(decl, "the panel must import from the matcher module");
+  assert.ok(
+    decl[1].split(",").map((x) => x.trim()).includes("migratableRouteIds"),
+    "the decision must be bound, not reimplemented",
+  );
+  const site = src.slice(
+    src.indexOf("const stillOpenRouteIds = (() => {"),
+    src.indexOf("let migratedRouteStamp = false;"),
+  );
+  assert.ok(site.includes("migratableRouteIds({"), "…and called at the migration site");
+  assert.ok(site.includes("openRouteIds: stillOpenRouteIds"), "…with the OPEN set it computed");
+  assert.ok(
+    src.includes("if (!Array.isArray(open)) return null; // unknown — refuse to migrate"),
+    "an unreadable open list must produce null, which the function refuses on",
+  );
 });
 
 test("WIRING #847: an open history pane is repainted after a migration", () => {
@@ -333,7 +419,7 @@ test("WIRING #847: the tab's id lineage is recorded and consulted", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.ok(src.includes("const _routeIdLineage = new Map();"), "the lineage map must exist");
   const record = src.slice(
-    src.indexOf("const priorRouteIds = new Set();"),
+    src.indexOf("const priorRouteIds = migratableRouteIds({"),
     src.indexOf("let migratedRouteStamp = false;"),
   );
   assert.ok(record.includes("_routeIdLineage.set(wfid, held)"), "it must be recorded, keyed by the NEW id");

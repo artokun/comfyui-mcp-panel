@@ -86,3 +86,44 @@ export function threadMatchesCurrentWorkflow(thread, currentKeys) {
   const route = thread.workflowRouteKey;
   return typeof route === "string" && route !== "" && currentKeys.has(route);
 }
+
+/**
+ * Which previous route ids may this tab claim as ITS OWN past (#847)?
+ *
+ * A first save moves a tab from `tmp:<uuid>` to `wf:<path>`, and every thread stamped
+ * with the old id has to follow or it drops out of "Current workflow only". The whole
+ * difficulty is that `tmp:` -> `wf:` is ALSO the shape of a SWITCH from an unsaved
+ * workflow A to an already-saved workflow B. An earlier cut could not tell them apart
+ * and rewrote every one of A's threads to B's path — permanently attributing one
+ * workflow's conversations to another (codex). That is worse than the bug being fixed,
+ * and it is the failure this whole area exists to prevent.
+ *
+ * THE DISCRIMINATOR IS WHETHER THE OLD ID STILL NAMES AN OPEN TAB. A save CONSUMES the
+ * tmp: identity — nothing answers to it afterwards. A switch leaves A open and still
+ * answering. So a candidate is this tab's past only if no other open workflow claims it.
+ *
+ * FAILS CLOSED on an unreadable open list (`openRouteIds == null`): migrating on a guess
+ * is how the cross-attribution happens, and the in-memory match covers the session
+ * anyway. Returns a Set so the caller can test membership directly.
+ *
+ * @param {{newRouteId?: string, candidateRouteIds?: Array<string|null|undefined>,
+ *          openRouteIds?: Set<string>|null}} input
+ * @returns {Set<string>}
+ */
+export function migratableRouteIds({ newRouteId, candidateRouteIds, openRouteIds } = {}) {
+  const out = new Set();
+  // Only a SAVE produces a `wf:` id for this tab. Anything else is not a migration.
+  if (typeof newRouteId !== "string" || !newRouteId.startsWith("wf:")) return out;
+  // Unknown open set — refuse. See above.
+  if (!(openRouteIds instanceof Set)) return out;
+  for (const id of Array.isArray(candidateRouteIds) ? candidateRouteIds : []) {
+    if (typeof id !== "string" || !id) continue;
+    // Only an UNSAVED id can be a pre-save identity.
+    if (!id.startsWith("tmp:")) continue;
+    if (id === newRouteId) continue;
+    // Still open under that id ⇒ a different workflow, not this tab's past.
+    if (openRouteIds.has(id)) continue;
+    out.add(id);
+  }
+  return out;
+}

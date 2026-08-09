@@ -204,6 +204,7 @@ import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
+  migratableRouteIds,
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode } from "./lib/node-scope-locator.js";
@@ -22220,31 +22221,55 @@ function buildPanel() {
       // Rewrites a routing stamp and nothing else. No transcript is touched, and it
       // goes through `reviseThread` so it travels the same causal field-op path as
       // the other stamps rather than losing to a stale tab's write.
-      // The ids to migrate FROM. Two sources, because neither alone is enough:
+      // The ids to migrate FROM — and the hard part is PROVING one belongs to this
+      // tab rather than to a workflow the user merely switched away from (codex P0).
       //
-      //   currentWorkflowId  the id this panel was last using — a plain variable, so
-      //                      it survives ComfyUI replacing the activeWorkflow OBJECT.
-      //                      Verified necessary: in the failing spec the tab was
-      //                      already saved before the first message, yet the thread
-      //                      was stamped `tmp:` — the panel's VIEW of the tab changed
-      //                      later, and the object had been swapped by then, so the
-      //                      WeakMap below found nothing.
-      //   _priorTempWorkflowIds  the first tmp: id ever minted for this live object,
-      //                      which covers a migration this poll did not itself see.
+      // `tmp:` -> `wf:` is the shape of a first save. It is ALSO the shape of a
+      // switch from an unsaved workflow A to an already-saved workflow B, and an
+      // earlier cut could not tell them apart: it read `currentWorkflowId` starting
+      // with `tmp:` as "this tab's pre-save id" and rewrote every one of A's threads
+      // to B's path — permanently attributing one workflow's conversations to
+      // another. That is the cross-attribution this whole area exists to prevent,
+      // and it is worse than the bug being fixed.
       //
-      // Both are ids this panel MINTED for this tab, so neither can name another
-      // workflow's threads.
-      const priorRouteIds = new Set();
-      for (const id of [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null]) {
-        if (typeof id === "string" && id.startsWith("tmp:") && id !== wfid) priorRouteIds.add(id);
-      }
+      // The discriminator is whether the old id STILL NAMES AN OPEN TAB. A save
+      // consumes the tmp: identity — nothing answers to it afterwards. A switch
+      // leaves A open and answering. So an id is only a pre-save identity of THIS
+      // tab if no open workflow still claims it.
+      //
+      // Fails closed: if the open list cannot be read, nothing is migrated and the
+      // in-memory match (0.11.56) still covers the session.
+      const stillOpenRouteIds = (() => {
+        try {
+          const svc = app?.extensionManager?.workflow;
+          const open = svc?.openWorkflows;
+          if (!Array.isArray(open)) return null; // unknown — refuse to migrate
+          const ids = new Set();
+          for (const candidate of open) {
+            if (candidate === wf) continue; // the tab we are migrating TO
+            const id = workflowTabId(candidate);
+            if (typeof id === "string" && id) ids.add(id);
+          }
+          return ids;
+        } catch {
+          return null;
+        }
+      })();
+      // The decision itself lives in lib/ so it can be tested against the real
+      // function rather than asserted about at source — including the switch case
+      // that made an earlier cut re-attribute one workflow's chats to another.
+      const priorRouteIds = migratableRouteIds({
+        newRouteId: wfid,
+        candidateRouteIds: [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null],
+        openRouteIds: stillOpenRouteIds,
+      });
       if (priorRouteIds.size) {
         const held = _routeIdLineage.get(wfid) ?? new Set();
         for (const id of priorRouteIds) held.add(id);
         _routeIdLineage.set(wfid, held);
       }
       let migratedRouteStamp = false;
-      if (wfid.startsWith("wf:") && priorRouteIds.size) {
+      if (priorRouteIds.size) {
         for (const candidate of threads) {
           if (!priorRouteIds.has(candidate?.workflowRouteKey)) continue;
           historyStore.reviseThread(candidate, { workflowRouteKey: wfid });
