@@ -544,10 +544,30 @@ function restoreNodePosition(n, px, py) {
   const cur = [Number(n?.pos?.[0]), Number(n?.pos?.[1])];
   const ok = writePoint(n, "pos", px, py);
   refreshNodeArea(n, cur);
-  // "Back where it started" means the position is restored AND the cached rect
-  // describes it — a rect that never moved is already live and must not be
-  // reported as an unrestorable item, which would invent a partial move.
-  return ok && nodeAreaIsLive(n);
+  // panel#813 — the VERDICT IS THE POSITION, not the cached rect.
+  //
+  // This used to return `ok && nodeAreaIsLive(n)`, which answers a different
+  // question than the one the caller asks. `writePoint` already establishes the
+  // thing that matters for a rollback: is the node back at the coordinates it
+  // held before the move. `nodeAreaIsLive` asks whether the CACHED RECT agrees
+  // with the node's live footprint — a separate property that can be false for
+  // reasons entirely unrelated to this restore (a frozen/uncorrectable
+  // boundingRect, or a rect stale from before the move ever started).
+  //
+  // Conflating them meant a node whose position was restored EXACTLY still
+  // counted as unrestorable, and the caller reported "The graph is PARTIALLY
+  // moved — N item(s) could NOT be put back" over a graph it had put back
+  // perfectly. Verified directly against these functions: position restored to
+  // its original coordinates, and still listed as failed. That is a false alarm
+  // about data loss, told to a caller who cannot press Ctrl+Z — strictly worse
+  // than saying nothing, because it implies damage that did not occur.
+  //
+  // The rect is still refreshed above (a stale rect would corrupt later
+  // membership reads), and a rect that refuses correction is still caught where
+  // it belongs — by the move's own pre-flight (syncGraphNodeAreas), which
+  // refuses BEFORE any position is written. Nothing about rect health is lost;
+  // it is simply no longer allowed to masquerade as a failed restore.
+  return ok;
 }
 
 /**
