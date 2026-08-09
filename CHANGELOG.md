@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.57] - 2026-08-09
+
+> Covers changes since 0.11.56.
+
+### Fixed
+
+- **The panel no longer eats the storage ComfyUI needs for your workflow tabs
+  (#861).** Chat history kept every pre-v3 transcript in `localStorage` in full,
+  forever. That budget belongs to the whole origin, not to the panel, so past a
+  point ComfyUI itself could not save workflow drafts — "Failed to save workflow
+  draft", and every open workflow tab gone on the next browser restart, with
+  nothing in any log pointing at the panel.
+
+  Those transcripts had nowhere else to live, which is why they were never
+  trimmed: capping them would have been deleting them. They now have a durable
+  home of their own, and only then is the local copy bounded — by size, since one
+  transcript full of pasted JSON outweighs hundreds of short ones. Nothing is
+  dropped that is not safely stored elsewhere first: if the durable copy cannot be
+  written, nothing is trimmed at all.
+
+  Deleting a chat now removes it for good, including from the new store, and a
+  delete that fails is retried rather than quietly forgotten.
+
+
 ## [0.11.56] - 2026-08-09
 
 > Covers changes since 0.11.55.
