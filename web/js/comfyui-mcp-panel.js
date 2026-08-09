@@ -1670,9 +1670,18 @@ function captureCanvasIntoTracker(wf) {
  */
 function captureWasSuppressed(tracker) {
   try {
+    // SHAPE FIRST. Every field below is present on a real tracker (`changeCount = 0`,
+    // `_restoringState = false`, and the `isLoadingGraph` static). If one is missing,
+    // the frontend is not the shape these checks were validated against — and reading
+    // a renamed field's `undefined` as "not suppressed" would silently delete a
+    // refusal signal rather than degrade safely (codex). An unrecognised tracker is
+    // therefore SUPPRESSED: unproven, so the destructive callers confirm.
+    if (typeof tracker?._restoringState === "undefined") return true;
+    if (typeof tracker?.changeCount === "undefined") return true;
+    if (typeof tracker?.constructor?.isLoadingGraph === "undefined") return true;
     if (tracker._restoringState) return true; // an undo/redo is restoring
     if (Number(tracker.changeCount) > 0) return true; // inside a change transaction
-    if (tracker.constructor?.isLoadingGraph) return true; // a graph is loading
+    if (tracker.constructor.isLoadingGraph) return true; // a graph is loading
     const graph =
       window.comfyAPI?.app?.app?.graph ?? (typeof app !== "undefined" ? app?.graph : null);
     return !graph;

@@ -525,6 +525,13 @@ test("WIRING #882: the no-op windows are read defensively", () => {
   assert.ok(fn.length > 0, "the helper must exist");
   for (const flag of ["_restoringState", "changeCount", "isLoadingGraph"]) {
     assert.ok(fn.includes(flag), `it must account for ${flag}`);
+    // And each must be checked for PRESENCE first. A renamed field would otherwise
+    // read `undefined`, compare false, and silently delete a refusal signal instead
+    // of degrading safely — the frontend would have changed shape unnoticed.
+    assert.ok(
+      new RegExp(`typeof tracker\\?[^;]*\\b${flag}\\b === "undefined"\\) return true;`).test(fn),
+      `a missing ${flag} must be treated as suppressed, not as absent-and-safe`,
+    );
   }
   assert.ok(/catch\s*{\s*\n?\s*return true;/.test(fn), "an unreadable tracker must not claim a capture");
 });
