@@ -1524,6 +1524,177 @@ let currentWorkflowKey = null;
 // place on rename/Save-As (path and the derived .key getter both change), so the
 // instance is the only stable identity a rename leaves intact.
 let currentWorkflowRef = null;
+/**
+ * Flush the live canvas into a workflow's ChangeTracker, and say what happened (#882).
+ *
+ * ComfyUI captures on USER INPUT events only, and derives `isModified` from that same
+ * capture. So a value a NODE wrote — an ImpactWildcardEncode populate, a
+ * control_after_generate roll, a subgraph's promoted widgets — leaves the tab reading
+ * CLEAN while the canvas already differs from the file. Measured:
+ *
+ *     after save            isModified: false   (correct)
+ *     after a node writes   isModified: false   (WRONG)
+ *     after a capture       isModified: true    (correct)
+ *
+ * Anything about to DISCARD a canvas has to capture before it reads that flag, or it
+ * decides on a stale answer. Same family as #874 (reopen reverted the canvas) and #878
+ * (save wrote stale bytes); this one fools the data-loss guards themselves.
+ *
+ * Returns `{ verdict, settled }` rather than a boolean, because the callers need to
+ * tell apart "captured, the flag is now truthful" from "could not capture, so the flag
+ * proves nothing" — a guard that cannot distinguish those has to guess, which is how
+ * this bug reads in the first place. `settled` is present only for "pending", and is
+ * THE capture's own promise resolved to a final verdict:
+ *
+ *   "captured"    a snapshot demonstrably landed; the flag is now truthful
+ *   "unverified"  the call returned normally but may have been a silent NO-OP, so the
+ *                 flag is not known to be current. See `captureWasSuppressed`.
+ *   "pending"     the capture is asynchronous. `settled` resolves to the real verdict;
+ *                 a synchronous caller cannot wait, so its flag is still stale.
+ *   "failed"      it threw. The tracker is knowably behind the canvas.
+ *   "inactive"    not the active workflow — nothing to flush; see below.
+ *   "unavailable" no tracker/method (older frontend). Exactly today's position —
+ *                 not a new failure, and callers keep today's behaviour.
+ *
+ * ONLY the active workflow is flushed. Upstream `captureCanvasState()` returns early
+ * for a non-active tracker (`isActiveTracker` → `reportInactiveTrackerCall`), so asking
+ * would report a capture that never happened and log a spurious warning. An inactive
+ * tab is not exposed to this bug anyway: node writes land on the LIVE canvas, and
+ * ComfyUI's own `deactivate()` captures a tracker's state before its workflow goes
+ * inactive.
+ *
+ * A capture that returns normally has NOT necessarily snapshotted: upstream returns
+ * early — silently, with the same `undefined` — mid-undo, inside a change transaction,
+ * and while a graph is loading. Reporting those as "captured" would authorise a close
+ * on a stale flag, which is this very bug (codex). So "captured" is only claimed on
+ * EVIDENCE: either the snapshot object was replaced (proof it landed), or none of the
+ * documented suppression conditions holds. Otherwise the verdict is "unverified" and
+ * the destructive callers refuse, with `force` as the escape hatch.
+ *
+ * Why unchanged identity is not by itself a refusal: a capture that finds the canvas
+ * ALREADY equal to the snapshot legitimately leaves `activeState` untouched, and that
+ * is the ordinary state of every clean workflow. Refusing there would refuse every
+ * close of an unmodified tab and demand `force:true` for routine work — trading a
+ * data-loss bug for a cannot-close bug. So the no-change case is admitted, and the
+ * suppression windows are what separates it from a swallowed call.
+ *
+ * A frontend that RENAMES or drops one of those fields is detected, not assumed safe:
+ * `captureWasSuppressed` checks presence before value, so an unrecognised tracker is
+ * unproven. What is left cannot be distinguished from a clean no-change capture with
+ * the API upstream exposes — a new suppression condition built from fields that still
+ * exist, or, for an async capture, a window that both opens and closes between the two
+ * samples. Both land on today's behaviour, trusting `isModified`, so the residual is
+ * bounded by the status quo. Closing it properly needs an explicit capture outcome
+ * from upstream (something like `{ captured, changed }`); there is no panel-only proof.
+ */
+function captureCanvasIntoTracker(wf) {
+  if (!wf) return { verdict: "unverified" };
+  // A target may only be DISMISSED as inactive on a readable identity. `activeWorkflowRef()`
+  // answers null both when nothing is active and when the lookup itself threw, so null
+  // cannot be read as "inactive" — that would trust a stale flag on exactly the target
+  // that needed capturing (codex).
+  const active = activeWorkflowRef();
+  if (!active) return { verdict: "unverified" };
+  if (wf !== active) return { verdict: "inactive" };
+  const tracker = wf.changeTracker;
+  // `checkState` is DEPRECATED upstream — it warns, then delegates to this — so prefer
+  // the current name and keep the old one as the fallback for older frontends.
+  const capture = tracker?.captureCanvasState ?? tracker?.checkState;
+  if (typeof capture !== "function") return { verdict: "unavailable" };
+  // A capture that SEES a change assigns a brand-new state object. Identity change is
+  // therefore positive proof the snapshot landed, and needs no knowledge of internals.
+  // Read through a guard: `activeState` is a plain field today, but a version that
+  // makes it a throwing accessor must not blow past these callers (codex).
+  const readState = () => {
+    try {
+      return { ok: true, value: tracker.activeState };
+    } catch {
+      return { ok: false, value: undefined };
+    }
+  };
+  const before = readState();
+  if (!before.ok) return { verdict: "unverified" };
+  let result;
+  try {
+    result = capture.call(tracker);
+  } catch {
+    return { verdict: "failed" };
+  }
+  // Sample the suppression flags in the SAME tick as the call, before anything moves.
+  const suppressed = captureWasSuppressed(tracker);
+  const landed = () => {
+    const after = readState();
+    if (!after.ok) return "unverified";
+    if (after.value !== before.value) return "captured"; // proof: the snapshot landed
+    // Unchanged identity is the NO-CHANGE case — the snapshot already matches the
+    // canvas — unless a no-op window swallowed the call. Re-sample here as well as at
+    // call time: an asynchronous capture does its work later, so the window that
+    // matters may open after the first sample (codex).
+    return suppressed || captureWasSuppressed(tracker) ? "unverified" : "captured";
+  };
+  // Even asking whether the result is thenable can throw, if `then` is an accessor.
+  let isThenable = false;
+  try {
+    isThenable = !!result && typeof result.then === "function";
+  } catch {
+    return { verdict: "failed" };
+  }
+  if (!isThenable) return { verdict: landed() };
+  // Settle the capture's OWN promise. Starting a SECOND capture to await instead would
+  // run it twice — and a capture that sees a change is not a read: it pushes an undo
+  // entry and clears the redo queue. It would also leave this first promise unobserved.
+  //
+  // Normalised through `Promise.resolve` so `settled` is always a REAL promise: a
+  // callable thenable may return a non-promise from `.then()`, and awaiting that yields
+  // `undefined`, which matches no verdict and would slip past the refusal into the
+  // stale flag (codex). Assimilation failure rejects, and rejection means "failed".
+  let settled;
+  try {
+    settled = Promise.resolve(result).then(landed, () => "failed");
+  } catch {
+    return { verdict: "failed" };
+  }
+  return { verdict: "pending", settled };
+}
+
+/**
+ * Could the capture we just asked for have been a silent no-op? (#882)
+ *
+ * Upstream `captureCanvasState()` returns early — no throw, no return value, no signal
+ * of any kind — when a graph is loading, when an undo/redo is restoring, when a change
+ * transaction is open, or when there is no graph. A caller that reads `isModified`
+ * after one of those has a stale flag and cannot tell.
+ *
+ * These are the documented conditions, read defensively: a version that renames one is
+ * caught by the presence checks below rather than silently losing a refusal signal,
+ * and an unreadable tracker answers "suppressed" so the destructive callers confirm
+ * rather than assume. It is deliberately CONSERVATIVE —
+ * every condition here is transient (mid-undo, mid-load, mid-transaction), so the
+ * refusal it can cause is rare and clears on retry, which is the right side to err on
+ * for a guard that would otherwise discard a canvas.
+ */
+function captureWasSuppressed(tracker) {
+  try {
+    // SHAPE FIRST. Every field below is present on a real tracker (`changeCount = 0`,
+    // `_restoringState = false`, and the `isLoadingGraph` static). If one is missing,
+    // the frontend is not the shape these checks were validated against — and reading
+    // a renamed field's `undefined` as "not suppressed" would silently delete a
+    // refusal signal rather than degrade safely (codex). An unrecognised tracker is
+    // therefore SUPPRESSED: unproven, so the destructive callers confirm.
+    if (typeof tracker?._restoringState === "undefined") return true;
+    if (typeof tracker?.changeCount === "undefined") return true;
+    if (typeof tracker?.constructor?.isLoadingGraph === "undefined") return true;
+    if (tracker._restoringState) return true; // an undo/redo is restoring
+    if (Number(tracker.changeCount) > 0) return true; // inside a change transaction
+    if (tracker.constructor.isLoadingGraph) return true; // a graph is loading
+    const graph =
+      window.comfyAPI?.app?.app?.graph ?? (typeof app !== "undefined" ? app?.graph : null);
+    return !graph;
+  } catch {
+    return true; // cannot tell → do not claim a capture
+  }
+}
+
 function activeWorkflowRef() {
   try {
     return (
@@ -12152,6 +12323,40 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!target) throw new Error("no target workflow");
     // Guard against data loss: don't silently close a workflow with unsaved
     // changes (closeWorkflow bypasses the UI's save prompt). Save first.
+    //
+    // #882 — CAPTURE BEFORE READING THE FLAG. `isModified` comes from a snapshot
+    // ComfyUI takes on user input only, so a value a NODE wrote leaves this reading
+    // false while the canvas already differs from the file — and this guard then
+    // discards exactly the work it exists to protect.
+    //
+    // This executor is async, so unlike the synchronous confirm gate it CAN wait for
+    // a tracker that captures asynchronously — awaiting the capture's OWN promise, so
+    // a rejection becomes "failed" here rather than being swallowed into a verdict
+    // that still permits the close (codex).
+    const captured = captureCanvasIntoTracker(target);
+    // `?? "unverified"`: a verdict that somehow arrives empty must land on the refusal
+    // side, never slip through to the stale flag below.
+    const verdict =
+      captured.verdict === "pending"
+        ? ((await captured.settled) ?? "unverified")
+        : (captured.verdict ?? "unverified");
+    // A capture that FAILED — or that cannot be shown to have HAPPENED — leaves the
+    // tracker possibly behind the canvas, so the flag proves nothing. Refuse rather
+    // than close; `force` still discards, which is the caller saying they meant it.
+    // "inactive" is NOT a failure: a non-active tab was already frozen by ComfyUI's
+    // `deactivate()`, so its flag is trustworthy without any capture here.
+    if ((verdict === "failed" || verdict === "unverified") && !force) {
+      throw new Error(
+        `"${target.filename || target.path}" could not be checked for unsaved changes ` +
+          `(${
+            verdict === "failed"
+              ? "capturing the live canvas failed"
+              : "the live canvas could not be captured right now — an undo, a load, or a " +
+                "change already in flight suppresses it; this clears on its own"
+          }), so closing it might discard work. Save it first (panel_save_workflow), ` +
+          `retry, or pass force:true to close anyway.`,
+      );
+    }
     if (target.isModified && !force) {
       throw new Error(
         `"${target.filename || target.path}" has unsaved changes — save it first (panel_save_workflow) before closing, or pass force:true to discard.`,
@@ -19939,6 +20144,17 @@ function buildPanel() {
         try {
           const wf = app?.extensionManager?.workflow?.activeWorkflow;
           if (!wf || typeof wf.isModified !== "boolean") return true; // unknown → confirm
+          // #882 — capture first, or this reads a flag that a NODE-written value
+          // cannot set. It failed closed for an UNREADABLE flag and not for a STALE
+          // one, so the confirm was skipped and the canvas clobbered without asking.
+          //
+          // This caller is synchronous (graphDirtyForConfirm reads the return value
+          // directly), so a tracker that captures asynchronously cannot be waited
+          // for — and neither can one that threw. Both mean the flag below is not
+          // known to be current, which is the same position as unreadable: confirm.
+          const captured = captureCanvasIntoTracker(wf).verdict;
+          if (captured === "pending" || captured === "failed" || captured === "unverified")
+            return true;
           return wf.isModified;
         } catch { return true; }
       },
