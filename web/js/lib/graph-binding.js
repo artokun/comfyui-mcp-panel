@@ -273,10 +273,26 @@ const EXTRA_METADATA_STRING_KEYS = new Set([
   "revision",
 ]);
 
+/** Could this text be carrying STRUCTURED data rather than naming or stamping
+ *  something? A version, a hash and an extension's setting name are all short and
+ *  free of JSON delimiters; a stashed graph is neither. Applied to admitted string
+ *  VALUES and to the KEY itself, because a graph can be encoded in an object key
+ *  with a boolean value just as easily as in a string value (codex round 2). */
+const STRUCTURAL_TEXT_CHARS = ["{", "}", "[", "]"];
+const looksStructured = (text) =>
+  text.length > 64 || STRUCTURAL_TEXT_CHARS.some((ch) => text.includes(ch));
+
 const extraValueMayBeGraphContent = (key, value) => {
+  // The KEY first: a name carrying JSON delimiters is not a setting name, and the
+  // value's type says nothing about what the key is smuggling.
+  if (typeof key === "string" && looksStructured(key)) return true;
   if (isEmptySurfaceValue(value)) return false;
   if (typeof value === "boolean" || typeof value === "number") return false;
-  if (typeof value === "string") return !EXTRA_METADATA_STRING_KEYS.has(key);
+  if (typeof value === "string") {
+    // A named stamp still has to LOOK like one. Trusting the key alone would let
+    // `frontendVersion: '{"nodes":[…]}'` through on the strength of its name.
+    return !EXTRA_METADATA_STRING_KEYS.has(key) || looksStructured(value);
+  }
   // Arrays, objects, and anything exotic (bigint, symbol, function) stay content:
   // an unrecognized shape is not evidence of emptiness.
   return true;
@@ -289,7 +305,8 @@ const extraValueMayBeGraphContent = (key, value) => {
  * empty array (a missing/malformed read proves nothing) AND every own
  * surface outside the format-metadata allowlist is absent-or-empty. Inside
  * `extra`, `ds` (viewport) and `comfyui_mcp` (the panel's own identity tag)
- * are not content, and neither is a scalar (see above, #833); any other key
+ * are not content, and neither is a boolean, a number or a NAMED version stamp
+ * (see above, #833); any other key
  * must hold an empty value. A single non-empty subgraphs/groups/reroutes/links
  * surface — or any unknown non-empty STRUCTURED surface — defeats the proof, so
  * a foreign content-bearing canvas can never be re-stamped through the

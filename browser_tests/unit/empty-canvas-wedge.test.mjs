@@ -266,3 +266,29 @@ test("graphRootProvenEmpty refuses a root with structured extra content", () => 
   };
   assert.equal(graphRootProvenEmpty(root), false);
 });
+
+// ── codex round 2: a graph smuggled somewhere a type check does not look ────
+
+test("a graph encoded in the KEY is content, whatever the value's type is", () => {
+  const key = '{"nodes":[{"id":1}],"links":[]}';
+  assert.equal(serializedStateProvenEmpty(emptyState({ [key]: true })), false);
+  assert.equal(serializedStateProvenEmpty(emptyState({ [key]: 1 })), false);
+  assert.equal(serializedStateProvenEmpty(emptyState({ [key]: "x" })), false);
+});
+
+test("a NAMED stamp still has to look like a stamp", () => {
+  // Trusting the key alone admits anything an extension chooses to put there.
+  assert.equal(serializedStateProvenEmpty(emptyState({ frontendVersion: '{"nodes":[{"id":1}]}' })), false);
+  assert.equal(serializedStateProvenEmpty(emptyState({ workflowHash: "[1,2,3]" })), false);
+  assert.equal(serializedStateProvenEmpty(emptyState({ version: "x".repeat(200) })), false);
+  // …and a real one still passes.
+  assert.equal(serializedStateProvenEmpty(emptyState({ frontendVersion: "1.47.12" })), true);
+  assert.equal(serializedStateProvenEmpty(emptyState({ workflowHash: "9f3ac21e" })), true);
+});
+
+test("the same two routes are blocked on the STAMPING side", () => {
+  const rootWith = (extra) => ({ _nodes: [], extra: {}, serialize: () => ({ ...emptyState(), extra }) });
+  assert.equal(graphRootProvenEmpty(rootWith({ '{"nodes":[{"id":1}]}': true })), false);
+  assert.equal(graphRootProvenEmpty(rootWith({ frontendVersion: '{"nodes":[{"id":1}]}' })), false);
+  assert.equal(graphRootProvenEmpty(rootWith({ frontendVersion: "1.47.12" })), true);
+});
