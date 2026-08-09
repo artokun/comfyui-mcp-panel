@@ -268,6 +268,7 @@ import {
   getEffectiveClipboard,
 } from "./lib/clipboard-store.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
+import { createMediaCollapseStore } from "./lib/media-collapse.js";
 import { createLightboxModel } from "./lib/lightbox-gallery.js";
 import {
   vueNodesActive,
@@ -16428,18 +16429,51 @@ const PANEL_CSS = `
   background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
 .cmcp-lightbox-open:hover { border-color: var(--p-primary-color, #60a5fa); color: var(--p-primary-color, #60a5fa); }
-/* Expand affordance on video cards — images open on click, but a video's own
-   surface is owned by its native controls, so it gets a dedicated button. */
+/* Media-card controls. Two buttons that must never be confused for each other:
+   .cmcp-media-expand (⛶) makes the media BIGGER — it opens the lightbox (#163);
+   .cmcp-media-collapse (a disclosure chevron) makes the card SMALLER in place
+   (#818). Images open the lightbox on click, but a video's own surface is owned
+   by its native controls, so only videos carry the ⛶ button. */
 .cmcp-imgcard { position: relative; }
-.cmcp-media-expand {
+.cmcp-media-tools {
   position: absolute; top: 0.4rem; right: 0.4rem; z-index: 2;
+  display: flex; gap: 0.25rem;
+}
+.cmcp-media-expand, .cmcp-media-collapse {
   width: 1.8rem; height: 1.8rem; border-radius: 6px; cursor: pointer;
   font-size: 0.95rem; line-height: 1; display: flex; align-items: center; justify-content: center;
   color: #fff; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.25);
   opacity: 0; transition: opacity 0.12s ease;
 }
-.cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible { opacity: 1; }
-.cmcp-media-expand:hover { background: var(--p-primary-color, #3a7bd5); }
+.cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible,
+.cmcp-imgcard:hover .cmcp-media-collapse, .cmcp-media-collapse:focus-visible { opacity: 1; }
+.cmcp-media-expand:hover, .cmcp-media-collapse:hover { background: var(--p-primary-color, #3a7bd5); }
+/* The cluster is a hover target over the top-right corner of every card, and an
+   image card is click-to-zoom — so the box itself must not take clicks meant for
+   the picture. Only the buttons in it do. */
+.cmcp-media-tools { pointer-events: none; }
+.cmcp-media-tools > button { pointer-events: auto; }
+/* Collapsed (#818). The media element is display:none rather than height-0 —
+   that is what makes the video observer unmount the live <video> instead of
+   leaving a decoding, looping element behind an invisible box. The stub is the
+   only thing left, so its own toggle can NOT be hover-revealed: a control the
+   user cannot find is a card they cannot get back. */
+.cmcp-imgcard.cmcp-media-collapsed > img,
+.cmcp-imgcard.cmcp-media-collapsed > .cmcp-video-holder { display: none; }
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-expand { display: none; }
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-collapse { opacity: 1; }
+.cmcp-media-stub {
+  display: none; align-items: center; gap: 0.4rem; cursor: pointer;
+  min-height: 1.8rem; padding: 0.35rem 2.6rem 0.35rem 0.55rem; border-radius: 6px;
+  font-size: 0.7rem; color: var(--p-text-muted-color, #a1a1aa);
+  background: var(--p-content-hover-background, #2a2a2e);
+  border: 1px dashed var(--p-content-border-color, #3f3f46);
+}
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-stub { display: flex; }
+/* The stub already names the file — a caption under it would say it twice. */
+.cmcp-imgcard.cmcp-media-collapsed .cmcp-media-caption { display: none; }
+.cmcp-media-stub:hover { color: var(--p-text-color, #fafafa); border-color: var(--p-primary-color, #60a5fa); }
+.cmcp-media-stub-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Audio cards (#710) — a real <audio controls> player, and a link card for a
    kind the panel can neither draw nor play. Neither is a .cmcp-imgcard: the
    lightbox gallery collects those and renders every member as image/video. */
@@ -20210,6 +20244,12 @@ function buildPanel() {
     mediaRecorder.record(mkind, url, caption);
   }
 
+  // Per-item media collapse state (#818). sessionStorage-backed via ssGet/ssSet,
+  // so a collapse survives a reload and a thread switch inside this tab and is
+  // gone when the tab closes — the "for the session" semantics the issue asked
+  // for. See lib/media-collapse.js for why the key is a hash and not the url.
+  const mediaCollapse = createMediaCollapseStore({ getItem: ssGet, setItem: ssSet });
+
   /** Bind the agent's current session id to the open thread (for reload/resume). */
   function bindSession(sessionId) {
     const previousSessionId = thread?.sessionId || null;
@@ -20519,6 +20559,119 @@ function buildPanel() {
     openMediaLightbox(items, index);
   }
 
+  /** The absolutely-positioned control cluster on a media card. Both buttons
+   *  live here so a video's ⛶ and ▾ sit side by side instead of on top of each
+   *  other. */
+  function mediaToolsFor(card) {
+    const tools = document.createElement("div");
+    tools.className = "cmcp-media-tools";
+    card.appendChild(tools);
+    return tools;
+  }
+
+  /**
+   * Give one media card its inline collapse control (#818).
+   *
+   * WHAT COLLAPSING IS, AND WHAT IT IS NOT. This shrinks the card IN PLACE, in
+   * the transcript. It is the opposite of `.cmcp-media-expand` (⛶), which opens
+   * the lightbox — the two must not read as variations of one control, which is
+   * why one is a framing glyph and the other a disclosure chevron.
+   *
+   * HOW IT COMPOSES WITH THE VIDEO OBSERVER. `videoObserver()` swaps a
+   * `.cmcp-video-holder` between a live `<video>` and a gray placeholder as it
+   * scrolls in and out of view, and collapsing must not fight that:
+   *
+   *  - Collapsed media is `display:none`, so a collapsed holder has NO box and
+   *    the observer reports it as non-intersecting → the live `<video>` is
+   *    released exactly the way scrolling away releases it. The eager
+   *    `onCollapse` unmount here is the SAME operation done a frame earlier, so
+   *    a clip stops the instant the user hides it rather than on the next
+   *    observer cycle.
+   *  - Nothing here ever MOUNTS. Un-collapsing restores the box and the observer
+   *    decides — so expanding a card that is scrolled off-screen leaves it a
+   *    placeholder, instead of resurrecting a decoding video nobody can see.
+   *
+   * The state is applied at PAINT time, which is what makes it survive a reload
+   * and a thread switch for free: `paintThread` replays stored media through
+   * these same painters.
+   */
+  function attachMediaCollapse(card, { url, kind, name, tools, onCollapse }) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cmcp-media-collapse";
+    tools.appendChild(btn);
+
+    // The only thing left in the card when collapsed, so it has to say what is
+    // hidden AND be a way back on its own — the chevron is a 1.8rem target the
+    // user has to already know about.
+    const stub = document.createElement("div");
+    stub.className = "cmcp-media-stub";
+    stub.setAttribute("role", "button");
+    stub.tabIndex = 0;
+    stub.title = `Show this ${kind}`;
+    const icon = document.createElement("span");
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = kind === "video" ? "🎬" : "🖼";
+    const label = document.createElement("span");
+    label.className = "cmcp-media-stub-name";
+    label.textContent = name || (kind === "video" ? "Video" : "Image");
+    const hint = document.createElement("span");
+    hint.textContent = "· hidden, click to show";
+    stub.append(icon, label, hint);
+    card.appendChild(stub);
+
+    const apply = (collapsed) => {
+      card.classList.toggle("cmcp-media-collapsed", collapsed);
+      btn.textContent = collapsed ? "▸" : "▾";
+      const verb = collapsed ? "Show" : "Hide";
+      btn.title = `${verb} this ${kind}`;
+      btn.setAttribute("aria-label", `${verb} this ${kind}`);
+      btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      if (collapsed) {
+        try {
+          onCollapse?.();
+        } catch {
+          // Releasing the <video> early is an optimisation; the observer still
+          // does it. It must never cost the user the toggle they just clicked.
+        }
+      }
+    };
+    // Re-applied when ANOTHER card showing the same media is toggled, so two
+    // cards of one output can't disagree about whether it is hidden.
+    card._cmcpApplyCollapse = apply;
+
+    // Drive the DOM from the DOM, and tell the store afterwards. A url the store
+    // cannot key on (or storage that refuses to write) then costs the user
+    // persistence only — never the ability to expand a card they collapsed.
+    const set = (collapsed) => {
+      mediaCollapse.setCollapsed(url, collapsed);
+      for (const other of log.querySelectorAll(".cmcp-imgcard")) {
+        if (other === card || other._cmcpMedia?.url !== url) continue;
+        try {
+          other._cmcpApplyCollapse?.(collapsed);
+        } catch {
+          /* one stale card must not break the toggle */
+        }
+      }
+      apply(collapsed);
+    };
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      set(!card.classList.contains("cmcp-media-collapsed"));
+    });
+    stub.addEventListener("click", (e) => { e.stopPropagation(); set(false); });
+    stub.addEventListener("keydown", (e) => {
+      if (isImeComposing(e)) return;
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      e.stopPropagation();
+      set(false);
+    });
+
+    apply(mediaCollapse.isCollapsed(url));
+  }
+
   function paintImage(url, name) {
     // Coerce the caption at the painter boundary — a structured/persisted caption
     // must never render (or re-persist) as "[object Object]", live OR on replay (#276).
@@ -20527,6 +20680,7 @@ function buildPanel() {
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
     card._cmcpMedia = { url, type: "image", caption: name || "" };
+    const tools = mediaToolsFor(card);
     const img = document.createElement("img");
     img.src = url;
     img.alt = name || "output";
@@ -20534,8 +20688,10 @@ function buildPanel() {
     img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
     img.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
     card.appendChild(img);
+    attachMediaCollapse(card, { url, kind: "image", name, tools });
     if (name) {
       const cap = document.createElement("div");
+      cap.className = "cmcp-media-caption";
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
@@ -20617,6 +20773,7 @@ function buildPanel() {
     // A video's own surface is owned by its native controls, so it can't be
     // "click to zoom" like an image — give it a dedicated expand button that opens
     // the same in-panel lightbox (#163). The video still plays inline in the chat.
+    const tools = mediaToolsFor(card);
     const expandBtn = document.createElement("button");
     expandBtn.type = "button";
     expandBtn.className = "cmcp-media-expand";
@@ -20624,9 +20781,19 @@ function buildPanel() {
     expandBtn.setAttribute("aria-label", "View full size");
     expandBtn.innerHTML = "⛶";
     expandBtn.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
-    card.appendChild(expandBtn);
+    tools.appendChild(expandBtn);
+    // Release the decoded <video> the moment it is hidden rather than waiting for
+    // the observer's next cycle (#818) — see attachMediaCollapse.
+    attachMediaCollapse(card, {
+      url,
+      kind: "video",
+      name,
+      tools,
+      onCollapse: () => unmountHolderVideo(holder),
+    });
     if (name) {
       const cap = document.createElement("div");
+      cap.className = "cmcp-media-caption";
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
