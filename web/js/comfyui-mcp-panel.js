@@ -1578,10 +1578,14 @@ let currentWorkflowRef = null;
  * data-loss bug for a cannot-close bug. So the no-change case is admitted, and the
  * suppression windows are what separates it from a swallowed call.
  *
- * The residual: a future frontend could rename one of those fields AND take a silent
- * no-op in the renamed window AND be asked to close a canvas holding node-written
- * edits. That conjunction lands on today's behaviour — trusting `isModified` — so it
- * is bounded by the status quo, which is the trade taken here deliberately.
+ * A frontend that RENAMES or drops one of those fields is detected, not assumed safe:
+ * `captureWasSuppressed` checks presence before value, so an unrecognised tracker is
+ * unproven. What is left cannot be distinguished from a clean no-change capture with
+ * the API upstream exposes — a new suppression condition built from fields that still
+ * exist, or, for an async capture, a window that both opens and closes between the two
+ * samples. Both land on today's behaviour, trusting `isModified`, so the residual is
+ * bounded by the status quo. Closing it properly needs an explicit capture outcome
+ * from upstream (something like `{ captured, changed }`); there is no panel-only proof.
  */
 function captureCanvasIntoTracker(wf) {
   if (!wf) return { verdict: "unverified" };
@@ -1661,9 +1665,10 @@ function captureCanvasIntoTracker(wf) {
  * transaction is open, or when there is no graph. A caller that reads `isModified`
  * after one of those has a stale flag and cannot tell.
  *
- * These are the documented conditions, read defensively: a version that renames one
- * simply stops contributing, and an unreadable tracker answers "suppressed" so the
- * destructive callers confirm rather than assume. It is deliberately CONSERVATIVE —
+ * These are the documented conditions, read defensively: a version that renames one is
+ * caught by the presence checks below rather than silently losing a refusal signal,
+ * and an unreadable tracker answers "suppressed" so the destructive callers confirm
+ * rather than assume. It is deliberately CONSERVATIVE —
  * every condition here is transient (mid-undo, mid-load, mid-transaction), so the
  * refusal it can cause is rare and clears on retry, which is the right side to err on
  * for a guard that would otherwise discard a canvas.
