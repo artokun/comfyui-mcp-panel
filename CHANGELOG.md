@@ -6,6 +6,33 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.68] - 2026-08-09
+
+> Covers changes since 0.11.67.
+
+### Fixed
+
+- **The graph outline now shows widgets you've renamed (#636).** If you rename a
+  subgraph's promoted widgets, the canvas shows your new names — but the outline the
+  agent reads kept listing the original keys. One user was told their renames "hadn't
+  stuck" when they plainly had, and only a screenshot settled it.
+
+  The detailed reader was fixed for this in 0.11.42. The outline — the quick overview an
+  agent reaches for first — was not, so the misleading answer was still one call away. It
+  now shows both: `width=512 [renamed "Frame Width"]`. The original name stays first,
+  because that is the one you use to set the value; the name you gave it rides alongside.
+
+  Only renamed widgets are annotated, so an ordinary graph's outline is unchanged.
+
+### Security
+
+- **A renamed widget can no longer forge a status tag in the outline (#636).** The outline
+  is written for the agent to read, and marks widgets with tags like
+  `[after_gen=randomize]` — which means ComfyUI silently rewrites that value on every run.
+  Because widget names are yours to choose, a name containing the right punctuation could
+  close its own tag and invent one of those, describing behaviour the node does not have.
+  Names are now escaped so they cannot break out.
+
 ## [0.11.67] - 2026-08-09
 
 > Covers changes since 0.11.66.
