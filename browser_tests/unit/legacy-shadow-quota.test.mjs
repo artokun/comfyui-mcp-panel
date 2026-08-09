@@ -1086,4 +1086,16 @@ test("the fence exists BEFORE the record stops existing", async () => {
     "stale",
     "the pre-delete window must already be fenced",
   );
+
+  // The ORDER is the fix, and it is only observable DURING the operation — an
+  // interval no fake can interleave into. Both orderings leave the same end state,
+  // so a runtime assertion here cannot fail for the right reason. Pin the order at
+  // source instead: the intent write must precede the record delete.
+  const src = readFileSync(new URL("../../web/js/lib/chat-history-store.js", import.meta.url), "utf8");
+  const site = src.slice(src.indexOf("if (tombstoned.length) {"), src.indexOf("// Mirror the intent into the store"));
+  const intentAt = site.indexOf("idbMergeDeleteRecord(this.indexedDb, { pending: tombstoned })");
+  const deleteAt = site.indexOf("idbDeleteLegacy(this.indexedDb, tombstoned)");
+  assert.ok(intentAt > 0, "the intent must be recorded up front");
+  assert.ok(deleteAt > 0, "…and the record deleted after");
+  assert.ok(intentAt < deleteAt, "the fence must exist before the record does not");
 });
