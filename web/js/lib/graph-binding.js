@@ -1126,6 +1126,33 @@ export function resolveOpenRebindVerdict({
   return { status: OPEN_REBIND_STATUS.PROVEN, bindingProven: true, unproven: [] };
 }
 
+/**
+ * What a CONTENT_UNVERIFIED open must ALSO say (#702).
+ *
+ * That branch has already PROVEN the binding — instance, marker and identity all match —
+ * and only the content is unconfirmed. But the reply still throws, so it never reaches
+ * the line that publishes `workflow_uuid`, and the caller's fence keeps whatever it had.
+ * The disclosure then closed by recommending `panel_graph_outline`, which is precisely
+ * the call that is about to be refused as a `workflow instance mismatch`. Two reporters
+ * followed that advice into the refusal and concluded, reasonably, that only a full
+ * panel_reload could recover.
+ *
+ * So the reply names the state it leaves behind and the ONE cheap call that clears it.
+ * `workflow_list` is deliberately fence-EXEMPT (#759/#932) precisely to be the recovery
+ * probe, and it republishes the active identity — measured: after this outcome it
+ * returns the same uuid and a stamped graph read then succeeds.
+ *
+ * The note promises a fence refresh and nothing more (codex). On the fourth wording the
+ * panel could not READ the graph at all, and a refreshed fence cannot make that read
+ * succeed — it only stops the mismatch from being the reason it fails.
+ */
+const FENCE_NOT_REFRESHED =
+  " This reply carries NO fence refresh — an open that could not verify its content" +
+  " publishes no workflow_uuid, so a command stamped from an older one is still refused" +
+  " as a workflow instance mismatch. Call panel_list_workflows first: it is exempt from" +
+  " the fence and republishes the active identity, which permits a freshly stamped graph" +
+  " read. Reloading the panel is NOT required to refresh the fence (#702).";
+
 /** Did a content comparison actually HAPPEN? The single rule every sentence about
  *  content asks, so the headline and the per-part clause cannot disagree with each
  *  other — which they did, because one tested `=== true` and the other `=== false`
@@ -1318,7 +1345,7 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
           `presentation only, which the panel cannot call byte-identical, so the content ` +
           `is reported UNCONFIRMED rather than failed.${because} You are on the right workflow ` +
           `and there is no missing work to redo; if you need the exact graph, read it with ` +
-          `panel_graph_outline.`
+          `panel_graph_outline.` + FENCE_NOT_REFRESHED
         );
       }
       return (
@@ -1326,7 +1353,7 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
         `per-node fields; the panel cannot tell from here whether the ComfyUI frontend ` +
         `normalized those or the load applied them differently, so the content is reported ` +
         `UNCONFIRMED rather than failed.${because} You are on the right workflow; if you need ` +
-        `the exact graph, read it with panel_graph_outline.`
+        `the exact graph, read it with panel_graph_outline.` + FENCE_NOT_REFRESHED
       );
     }
     return (
@@ -1338,7 +1365,7 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
         : `the panel could not READ the graph on it to compare against the state that was loaded, so ` +
           `whether the whole graph landed is unestablished — NOT established as wrong. `) +
       `Treat the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} ` +
-      `You are NOT on the wrong workflow: ${workflow} IS the active one.`
+      `You are NOT on the wrong workflow: ${workflow} IS the active one.` + FENCE_NOT_REFRESHED
     );
   }
   if (verdict?.status === OPEN_REBIND_STATUS.UNPROVEN) {

@@ -661,3 +661,70 @@ test("#641: a save/reconnect INSTANCE REFRESH of the same file keeps its uuid (f
     "a genuine co-open copy must still get its own identity (#557/#570)",
   );
 });
+
+// ── #702: a proven-binding open must not strand the caller's fence ──────────
+//
+// CONTENT_UNVERIFIED throws, so it never reaches the line that publishes
+// `workflow_uuid`, and the caller's command fence keeps whatever it had. The
+// disclosure closed by recommending `panel_graph_outline` — precisely the call about
+// to be refused as a `workflow instance mismatch`. Two reporters followed that advice
+// into the refusal and concluded only a full panel_reload could recover.
+//
+// Measured end-to-end (browser_tests/open-unverified-names-recovery.spec.ts): after
+// this outcome, `workflow_list` still republishes the active identity and a graph read
+// stamped with it succeeds. The recovery existed; the reply never named it.
+
+test("#702: a content-unverified open discloses that no fence refresh rode with it", () => {
+  // EVERY content-unverified wording strands the caller the same way, so every one
+  // of them must carry the note. The generic branch was missed on the first pass and
+  // this loop is what caught it.
+  for (const observed of [
+    // Both CONTENT_UNVERIFIED wordings: values matched (presentation-only drift), and
+    // per-node fields differing. They are separate sentences and both stranded callers.
+    // node set intact + values matched — the presentation-only wording
+    { contentComparable: true, contentSurfaces: ["nodes"], contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true } },
+    // node set intact, values differ — the per-node-fields wording
+    { contentComparable: true, contentSurfaces: ["nodes"], contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: false } },
+    // node set NOT intact, and a second surface — the generic "treat as UNKNOWN" wording
+    { contentComparable: true, contentSurfaces: ["nodes", "links"], contentNodeDifference: { comparable: true, sameNodeSet: false } },
+    // the content could not be READ at all — the non-asserting wording
+    { contentComparable: false, contentSurfaces: [], contentNodeDifference: null },
+  ]) {
+    const text = describeOpenRebindOutcome(
+      { status: OPEN_REBIND_STATUS.CONTENT_UNVERIFIED, bindingProven: true, unproven: ["content"] },
+      { targetLabel: "My Workflow", ...observed },
+    );
+    assert.match(text, /carries NO fence refresh/, "it must say the fence was not refreshed");
+    assert.match(text, /panel_list_workflows/, "it must name the fence-exempt recovery probe");
+    assert.match(
+      text,
+      /Reloading the panel is NOT required to refresh the fence/,
+      "it must retract the panel_reload advice both reporters followed",
+    );
+    // It must promise a fence refresh and NOTHING more. On the wording where the panel
+    // could not read the graph at all, a refreshed fence cannot make that read succeed —
+    // it only stops the mismatch from being the reason it fails (codex).
+    assert.doesNotMatch(
+      text,
+      /the graph read then works/,
+      "the note must not promise a graph read will succeed",
+    );
+  }
+});
+
+test("#702: the fence note is ONLY on the content-unverified outcome", () => {
+  // An UNPROVEN open has not established identity, so `workflow_list` republishing the
+  // active identity is not a remedy for it — promising one there would send a caller
+  // to re-stamp against a canvas whose binding was never proven.
+  const unproven = describeOpenRebindOutcome(
+    { status: OPEN_REBIND_STATUS.UNPROVEN, bindingProven: false, unproven: ["identity"] },
+    { targetLabel: "My Workflow", expectedUuid: "a", observedUuid: "b" },
+  );
+  assert.doesNotMatch(unproven, /carries NO fence refresh/);
+  // It may still say to CHECK panel_list_workflows — it does, and that is right: with
+  // the binding unproven you look at what is actually active. What it must NOT do is
+  // retract the reload, because there the reload is the remedy. Re-stamping from the
+  // probe would otherwise be invited against a binding that was never proven.
+  assert.doesNotMatch(unproven, /Reloading the panel is NOT required/);
+  assert.match(unproven, /reload the panel before graph edits/);
+});
