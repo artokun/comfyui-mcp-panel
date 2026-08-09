@@ -535,3 +535,47 @@ test("a cosmetic-only difference still earns the stronger, narrower claim", () =
   assert.doesNotMatch(msg, /recomputes on load/i, "the frontend does not recompute a colour");
   assert.doesNotMatch(msg, /no value is missing/i, "colour IS a value, and it differed");
 });
+
+test("codex r3's duplicate-identity case fails closed, so the set claim holds", () => {
+  // The reassurance now rests on `sameNodeSet` alone, so it matters that the set
+  // comparison cannot be fooled by repeated identities. Codex's exact example:
+  //
+  //   expected: [1,A] [1,A] [2,B]      actual: [1,A] [2,B] [2,B]
+  //
+  // Both SETS are {[1,A],[2,B]} while an A was lost and a B appeared. Comparing
+  // sets rather than multiplicities would call that intact.
+  //
+  // It does not, and the guard predates this change: `byKey` refuses a duplicate
+  // identity outright ("cannot pair them up honestly"), which yields
+  // `comparable: false` — and `nodeSetIntact` requires `comparable === true`, so
+  // the cautious message stands.
+  const n = (id, type) => ({ id, type, widgets_values: ["v"] });
+  const out = classifyNodeDifference({
+    expectedNodes: [n(1, "A"), n(1, "A"), n(2, "B")],
+    actualNodes: [n(1, "A"), n(2, "B"), n(2, "B")],
+  });
+  assert.equal(out.comparable, false, "duplicate identities are not comparable");
+  assert.equal(out.sameNodeSet, false, "…so no set claim is made either");
+
+  // And the message that consumes it stays on the cautious path.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: out,
+  });
+  assert.doesNotMatch(msg, /no node was lost/i);
+  assert.match(msg, /partly applied/i);
+});
+
+test("a duplicate on EITHER side alone is enough to refuse the comparison", () => {
+  const n = (id, type) => ({ id, type });
+  for (const [expectedNodes, actualNodes] of [
+    [[n(1, "A"), n(1, "A")], [n(1, "A")]],
+    [[n(1, "A")], [n(1, "A"), n(1, "A")]],
+  ]) {
+    const out = classifyNodeDifference({ expectedNodes, actualNodes });
+    assert.equal(out.comparable, false);
+    assert.equal(out.sameNodeSet, false);
+  }
+});
