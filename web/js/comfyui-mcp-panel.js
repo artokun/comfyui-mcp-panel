@@ -21447,6 +21447,35 @@ function buildPanel() {
       // Learn the real aspect ratio so the placeholder (and layout) match exactly.
       if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
     });
+    // #909 — SAY SO when the browser cannot decode it. `show_media` reports the DOM
+    // dispatch, not the decode, so an MP4 the browser refuses (the report: MPEG-4 Part 2,
+    // `mpeg4`/`mp4v`) answered ok:true and rendered a blank card — indistinguishable from
+    // a video that simply has not painted yet. The `play()` rejection is swallowed just
+    // below, deliberately (muted autoplay may be blocked, which is not a failure), so
+    // this listener is the only place the difference can be surfaced.
+    v.addEventListener("error", () => {
+      // UNMOUNT ALSO FIRES THIS. unmountHolderVideo clears `src` and calls load() to
+      // release the decoded buffers — that is a teardown, not a decode failure, and
+      // painting the message there would replace every healthy video with an error as
+      // soon as it scrolled out of view. Both tests are needed: the holder no longer
+      // owning this element, and the element no longer having a source.
+      if (holder._video !== v) return;
+      if (!v.getAttribute("src")) return;
+      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is the codec/container case and is the only one
+      // with an actionable remedy. A network or decode error gets a truthful, narrower
+      // sentence rather than advice that would not help.
+      const unsupported = v.error?.code === 4;
+      holder.textContent = unsupported
+        ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
+        : "This video could not be loaded.";
+      holder.style.cssText +=
+        ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
+        "color:var(--p-text-muted-color,#a1a1aa);font-size:0.75rem;";
+      // The dead element goes, so the holder is not left with an invisible video on top
+      // of the message and unmount has nothing to tear down twice.
+      v.remove();
+      holder._video = null;
+    });
     holder.textContent = "";
     holder.appendChild(v);
     holder._video = v;
