@@ -7987,11 +7987,21 @@ const GRAPH_TOOL_EXECUTORS = {
     // raises these clips, so the footer must not pretend one does.
     let outlineClipped = 0;
     let outlineTitlesClipped = 0;
-    /** clipOutlineTitle, counting — every title in the outline goes through here. */
+    /**
+     * clipOutlineTitle, counting — every title in the outline goes through here.
+     *
+     * #904 — titles render INSIDE quotes, which is what keeps a bracket in one from
+     * reading as a status tag. That containment is only worth anything if the quotes
+     * are trustworthy, so a quote in the title is escaped rather than allowed to close
+     * the run early: `He said "hi" [bypass]` would otherwise end the quoted title at
+     * `hi` and leave `[bypass]` outside it, where the panel's own tags live.
+     */
     const title_ = (t) => {
       const c = clipOutlineTitle(t);
       if (c.clipped) outlineTitlesClipped++;
-      return c.text;
+      return String(c.text ?? "")
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"');
     };
     /**
      * Make user-controlled text safe INSIDE a bracketed annotation (#636, codex).
@@ -8021,11 +8031,38 @@ const GRAPH_TOOL_EXECUTORS = {
         // single title.
         return `  "${title_(g.title)}"${tag} → ${ids.join(",") || "(empty)"}`;
       });
+    /**
+     * A widget VALUE, rendered so it can never be mistaken for one of this outline's own
+     * status tags (#904).
+     *
+     * The tags here carry real meaning — `[after_gen=randomize]` says ComfyUI rewrites
+     * this value every run, `[bypass]`/`[mute]` say the node is not executing — and
+     * values render UNQUOTED in exactly the position a tag occupies, so
+     * `text=hello [after_gen=randomize] world` was indistinguishable from the genuine
+     * annotation. Widget values arrive inside workflows people DOWNLOAD, so the author of
+     * a shared JSON could put one there.
+     *
+     * Values are NOT stripped the way a label is (#636). ComfyUI prompt syntax uses
+     * brackets — `[cat|dog]` is ordinary content — so removing them would corrupt the
+     * very thing the caller asked to see, trading one false report for another.
+     *
+     * The invariant instead: a BARE token never contains a bracket, and anything that
+     * does is QUOTED. So a tag outside quotes is always the panel's own, content is
+     * preserved exactly, and only the rare bracketed value pays the two quote characters.
+     *
+     * The quoting decision is made on the POST-clip text, so a clip that removes the
+     * bracket leaves nothing to impersonate a tag and one that lands mid-bracket leaves a
+     * quoted partial — never a bare token. Escaping runs after the 60-char budget, so a
+     * quote/backslash-dense value can render slightly longer than 60; that costs a few
+     * characters against max_chars and cannot reintroduce a forgeable tag (codex).
+     */
     const fmtVal = (v) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
-      if (s.length <= 60) return s;
-      outlineClipped++;
-      return s.slice(0, 57) + "…";
+      const clipped = s.length <= 60 ? s : (outlineClipped++, s.slice(0, 57) + "…");
+      if (!/[[\]]/.test(clipped)) return clipped;
+      // Escape backslashes first, then quotes, so the escape introduced for a quote is
+      // not doubled — and the closing quote cannot be swallowed by a trailing backslash.
+      return `"${clipped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     };
     const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
