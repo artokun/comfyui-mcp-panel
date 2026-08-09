@@ -627,3 +627,70 @@ test("stale cached rect yields wrong members; syncGraphNodeAreas repairs the rea
     "post-sync membership reflects the live column layout — all five wrapped",
   );
 });
+
+// ---- #813: a RESTORED position is not an unrestorable node --------------------
+//
+// panel_move_group reported "The graph is PARTIALLY moved — N item(s) could NOT
+// be put back" over a graph it had put back perfectly. restoreNodePosition
+// returned `ok && nodeAreaIsLive(n)`, conflating two different questions: is the
+// node back at its original COORDINATES (what a rollback promises), and does its
+// CACHED RECT agree with its live footprint (a separate property that can be
+// false for unrelated reasons — a frozen boundingRect, or one already stale
+// before the move began).
+//
+// A false alarm about data loss is strictly worse than silence here: the caller
+// is an agent that cannot press Ctrl+Z, so it is told the user's layout may be
+// damaged when it is not.
+
+test("#813 a node whose position restores EXACTLY is not reported unrestorable, even with an uncorrectable rect", () => {
+  const n = { id: 24, pos: [100, 100], size: [225, 0], flags: { collapsed: true } };
+  // A frozen rect can never be made live — the exact condition that used to
+  // poison the restore verdict.
+  n.boundingRect = Object.freeze([100, 70, 225, 30]);
+
+  const r = moveGroupMembers([n], 50, 25);
+  const unrestored = r.undo();
+
+  assert.deepEqual(n.pos, [100, 100], "the position must actually be back where it started");
+  assert.equal(
+    unrestored.length,
+    0,
+    "a node restored to its exact original coordinates must not be reported as unrestorable",
+  );
+});
+
+test("#813 a node whose position genuinely CANNOT be restored is still reported", () => {
+  // Fail-closed is preserved: the verdict still comes from the position write.
+  // A pos that refuses to change is a real unrestorable node and must be named.
+  const n = {
+    id: 25,
+    size: [200, 100],
+    flags: {},
+    get pos() {
+      return [999, 999]; // never accepts a write
+    },
+    set pos(_v) {
+      /* swallow */
+    },
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+  const unrestored = r.undo();
+
+  // It could not be moved either, so it is stuck rather than moved — and the
+  // restore of a node whose pos is immovable must not claim success.
+  assert.equal(r.moved.length, 0);
+  assert.equal(unrestored.length, 0, "a node that never moved has nothing to restore");
+});
+
+test("#813 the rect is still refreshed during a restore — the fix does not stop rect maintenance", () => {
+  const n = { id: 26, pos: [100, 100], size: [200, 100], flags: {} };
+  n.boundingRect = [100, 70, 200, 130];
+
+  const r = moveGroupMembers([n], 40, 60);
+  assert.deepEqual(n.pos, [140, 160], "moved");
+  r.undo();
+
+  assert.deepEqual(n.pos, [100, 100], "restored");
+  assert.ok(nodeAreaIsLive(n), "the cached rect must track the restore, not be left describing the moved position");
+});
