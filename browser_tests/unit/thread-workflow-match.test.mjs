@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { threadMatchesCurrentWorkflow } from "../../web/js/lib/thread-workflow-match.js";
+import { readFileSync } from "node:fs";
+import {
+  threadMatchesCurrentWorkflow,
+  currentWorkflowIdentityKeys,
+} from "../../web/js/lib/thread-workflow-match.js";
 
 /**
  * #694 — "Current workflow only" showed 1 of 2 conversations created on the same
@@ -104,11 +108,111 @@ test("WIRING: threads are STAMPED with the route key and the picker matches on i
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
-  assert.match(src, /import \{ threadMatchesCurrentWorkflow \} from "\.\/lib\/thread-workflow-match\.js";/);
+  // The IMPORT BINDING, tolerant of formatting. Pinning the exact one-line form
+  // broke the moment a second named export was added; but relaxing it to three
+  // separate `includes` was worse (codex) — both identifiers appear elsewhere in
+  // this file, and the module path could belong to an import of something else
+  // entirely, so all three could pass with neither symbol bound. Parse the
+  // declaration instead: line wrapping is free, an unbound symbol is not.
+  const decl = src.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/lib\/thread-workflow-match\.js";/);
+  assert.ok(decl, "the panel must import from the matcher module");
+  const named = decl[1].split(",").map((s) => s.trim()).filter(Boolean);
+  assert.ok(named.includes("threadMatchesCurrentWorkflow"), "the matcher must be bound");
+  assert.ok(named.includes("currentWorkflowIdentityKeys"), "the identity-set builder must be bound");
   // Stamped at thread creation AND on the revise that follows it.
   const stamps = src.match(/workflowRouteKey: workflowTabId\(\),/g) ?? [];
   assert.ok(stamps.length >= 2, `expected the route stamp at creation and revise, saw ${stamps.length}`);
   // And actually consulted by the "Current workflow only" filter.
   assert.ok(src.includes("threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys)"),
     "the picker must use the matcher — otherwise #694's under-report returns");
+});
+
+test("WIRING #847: the filter's key set carries the PRIOR tmp: id", () => {
+  // The helper accepting a priorRouteId proves nothing if the panel never passes
+  // one. This is the whole fix: `_priorTempWorkflowIds` already retains that id for
+  // the live workflow object's lifetime, and `workflowRecordMatchesSelector` already
+  // honours it — the history filter was the one reader that did not.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const site = src.slice(
+    src.indexOf("const currentWorkflowKeys = currentWorkflowIdentityKeys({"),
+    src.indexOf("threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys)"),
+  );
+  assert.ok(site.length > 0, "the filter must build its key set through the shared builder");
+  assert.ok(site.includes("priorRouteId:"), "it must pass a prior route id");
+  assert.ok(site.includes("_priorTempWorkflowIds.get(activeWf)"), "…read from the map that retains it");
+  // Guarded: activeWorkflowRef() is null with no canvas, and a WeakMap.get(null)
+  // throws. A history pane that crashes on an empty canvas would be a worse bug
+  // than the one being fixed.
+  assert.ok(site.includes("activeWf ? _priorTempWorkflowIds.get(activeWf) : null"), "the lookup must be guarded");
+});
+
+// ── #847: a first SAVE moves both identity forms at once ───────────────────
+
+test("the prior tmp: id is part of the current workflow's identity set", () => {
+  // A first save migrates the route id (tmp:<uuid> -> wf:<path>) AND re-mints the
+  // storage uuid at the same boundary. A thread recorded before the save then holds
+  // neither live form, and "Current workflow only" hides a conversation the user had
+  // on the workflow they are looking at — same tab, same canvas, minutes earlier.
+  const keys = currentWorkflowIdentityKeys({
+    storageKey: "workflow:8765613d-614f-4cc6-a86b-607bdd3d2c2c",
+    routeId: "wf:workflows/Untitled.json",
+    priorRouteId: "tmp:15530147-0b52-4f52-9e09-732978ea6652",
+  });
+  // Observed in the live suite: these are the two stamps the two threads actually
+  // carried, and before this change nothing they held was in the set.
+  const beforeSave = {
+    workflowKey: "workflow:eff67d7a-4716-4c14-82f6-1ce4d47f0a72",
+    workflowRouteKey: "tmp:15530147-0b52-4f52-9e09-732978ea6652",
+  };
+  const afterSave = {
+    workflowKey: "workflow:8765613d-614f-4cc6-a86b-607bdd3d2c2c",
+    workflowRouteKey: "wf:workflows/Untitled.json",
+  };
+  assert.equal(threadMatchesCurrentWorkflow(beforeSave, keys), true, "the pre-save chat must not vanish");
+  assert.equal(threadMatchesCurrentWorkflow(afterSave, keys), true);
+});
+
+test("without the prior id, the pre-save thread is exactly the one that disappears", () => {
+  // The regression this guards. Stated as its own case so a future edit that drops
+  // priorRouteId fails with the reason rather than with an opaque count.
+  const keys = currentWorkflowIdentityKeys({
+    storageKey: "workflow:new-uuid",
+    routeId: "wf:workflows/Untitled.json",
+  });
+  assert.equal(
+    threadMatchesCurrentWorkflow(
+      { workflowKey: "workflow:old-uuid", workflowRouteKey: "tmp:abc" },
+      keys,
+    ),
+    false,
+  );
+});
+
+test("the identity set holds only real strings", () => {
+  // An absent form is absent, not a hole in the set. `undefined` could never match a
+  // thread's stamp anyway, but a set that silently carries holes invites a later
+  // reader to treat membership as meaningful when it is not.
+  const keys = currentWorkflowIdentityKeys({ storageKey: "workflow:x", routeId: null, priorRouteId: undefined });
+  assert.deepEqual([...keys], ["workflow:x"]);
+  assert.equal(currentWorkflowIdentityKeys({}).size, 0);
+  assert.equal(currentWorkflowIdentityKeys().size, 0);
+  // Empty strings are not identities.
+  assert.equal(currentWorkflowIdentityKeys({ storageKey: "", routeId: "" }).size, 0);
+});
+
+test("a thread from ANOTHER workflow still does not match", () => {
+  // Widening the identity set is only safe if it cannot pull in a foreign
+  // conversation — the failure the uuid re-mint exists to prevent (#570).
+  const keys = currentWorkflowIdentityKeys({
+    storageKey: "workflow:mine",
+    routeId: "wf:workflows/Mine.json",
+    priorRouteId: "tmp:mine-was",
+  });
+  assert.equal(
+    threadMatchesCurrentWorkflow(
+      { workflowKey: "workflow:theirs", workflowRouteKey: "tmp:theirs" },
+      keys,
+    ),
+    false,
+  );
 });

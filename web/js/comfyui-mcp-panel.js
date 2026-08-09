@@ -201,7 +201,10 @@ import {
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
-import { threadMatchesCurrentWorkflow } from "./lib/thread-workflow-match.js";
+import {
+  threadMatchesCurrentWorkflow,
+  currentWorkflowIdentityKeys,
+} from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode } from "./lib/node-scope-locator.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
@@ -22315,9 +22318,21 @@ function buildPanel() {
       listEl.textContent = "";
       const q = search.value.trim().toLocaleLowerCase();
       // Panel-owned threads keep workflow provenance instead of the global
-      // active-pointer key. Accept both the durable workflow UUID and the
-      // current bridge-tab id so the filter works before and after first save.
-      const currentWorkflowKeys = new Set([workflowStorageKey(), workflowTabId()]);
+      // active-pointer key. Accept the durable workflow UUID and the current
+      // bridge-tab id — which between them cover a thread written on either side
+      // of a first save, but NOT one written across it.
+      // #847 — the PRIOR tmp: id counts too. A first save migrates the route id
+      // (tmp:<uuid> -> wf:<path>) and re-mints the storage uuid at the same boundary, so a
+      // thread recorded minutes earlier on this very tab holds neither live form and drops
+      // out of this filter. `_priorTempWorkflowIds` already retains that id for the live
+      // object's lifetime, and `workflowRecordMatchesSelector` already honours it — this
+      // was the one reader that did not.
+      const activeWf = activeWorkflowRef();
+      const currentWorkflowKeys = currentWorkflowIdentityKeys({
+        storageKey: workflowStorageKey(),
+        routeId: workflowTabId(),
+        priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
+      });
       const visible = threads
         .filter((candidate) =>
           !currentOnly.checked || threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys))
