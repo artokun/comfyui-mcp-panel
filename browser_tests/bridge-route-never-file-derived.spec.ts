@@ -23,7 +23,7 @@
  * `wf:<one-shared-id>:<path>` for every tab matches the form and recreates #693 exactly
  * (codex). Uniqueness is the invariant; the form is only how it is carried.
  */
-import { test, expect, isolatePanelPage } from './fixtures/panelTest'
+import { test, expect, isolatePanelPage, deleteSavedWorkflow } from './fixtures/panelTest'
 import { PanelPage } from './fixtures/PanelPage'
 
 /** Record the `tab_id` of every hello this page sends, from before it connects. */
@@ -88,12 +88,7 @@ test('two tabs on one saved workflow never share a bridge route', async ({
     const savedPath = `workflows/${savedName}.json`
     // This spec PERSISTS a file on the developer's real ComfyUI. Remove it however the
     // test ends — an assertion failure must not leave litter behind (codex).
-    cleanup.push(async () => {
-      await page.evaluate(async (p) => {
-        const api = (window as any).comfyAPI?.api?.api
-        await api?.fetchApi?.(`/userdata/${encodeURIComponent(p)}`, { method: 'DELETE' })
-      }, savedPath)
-    })
+    cleanup.push(() => deleteSavedWorkflow(page, savedName))
     await page.waitForTimeout(2500)
 
     // Tab B: a second real browser tab in the same context, opening that same file.

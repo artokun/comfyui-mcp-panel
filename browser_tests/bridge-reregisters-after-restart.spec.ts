@@ -29,7 +29,7 @@
  * Engineering an abrupt kill is only worth it if the reconnect path starts telling those
  * apart, or if #654 evidence points there (codex).
  */
-import { test, expect } from './fixtures/panelTest'
+import { test, expect, deleteSavedWorkflow } from './fixtures/panelTest'
 import { MockBridge } from './fixtures/MockBridge'
 
 test.setTimeout(180_000)
@@ -49,12 +49,7 @@ test('the tab re-registers after the bridge dies and respawns', async ({
   const savedName = String(saved.result?.workflow || '')
   expect(savedName).toBeTruthy()
   // This spec persists a file on the real ComfyUI — remove it however the test ends.
-  const cleanup = async () => {
-    await page.evaluate(async (p) => {
-      const api = (window as any).comfyAPI?.api?.api
-      await api?.fetchApi?.(`/userdata/${encodeURIComponent(p)}`, { method: 'DELETE' })
-    }, `workflows/${savedName}.json`)
-  }
+  const cleanup = () => deleteSavedWorkflow(page, savedName)
 
   try {
     const port = mockBridge.port
