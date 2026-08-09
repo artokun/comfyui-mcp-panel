@@ -1,8 +1,12 @@
 // panel#754 part (3) — `panel_canvas` with action:"center_on_node" accepted `scale` and
-// silently ignored it, so "centre on node 42 at 1.5x" centred at whatever zoom happened to
-// be set. (There is no `panel_center_on_node` tool. Writing that name here is what the
-// vocabulary gate caught, and it was right to: a wrong tool name in a comment becomes a
-// tool-not-found the model cannot diagnose.)
+// silently ignored it, so "centre on node 42 at 1.5x" centred at whatever zoom happened
+// to be set.
+//
+// (An earlier draft of this header named a per-action tool that does not exist. The
+// vocabulary gate caught it and was right to: every panel_* identifier is scanned, not
+// just ones in string literals, because a wrong name in a comment or hint is read by the
+// MODEL and becomes a tool-not-found it cannot diagnose. Naming it even to deny it still
+// trips the gate — correctly, since the gate cannot know the intent.)
 //
 // ORDER IS THE FIX. The centring math divides by `ds.scale` (and litegraph's own
 // centerOnNode reads it too), so applying the zoom AFTER centring slides the node back
