@@ -6,6 +6,31 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.58] - 2026-08-09
+
+> Covers changes since 0.11.57.
+
+### Fixed
+
+- **Reopening a workflow no longer reads as though work went missing (#696).** When
+  the canvas came back with an unfamiliar per-node field — a display toggle like
+  `showAdvanced` from rgthree or Impact, alongside the usual re-measured sizes —
+  `panel_open_workflow` said it could not tell whether "the load only partly
+  applied", which sent people hunting for work to redo that was never gone.
+
+  The panel had been deciding this by checking every differing field against a list
+  of names it considered harmless, so one flag it had never seen was enough. It now
+  reports what it actually proved: every node that was loaded is on the canvas with
+  the same id and type, so no node was lost — whatever fields differ, and without
+  needing to know what any of them mean. A difference confined to sizes, positions
+  and colours still gets the stronger answer, that the widget values and links
+  matched too.
+
+  Also stopped claiming the difference was something "the ComfyUI frontend
+  recomputes on load". Node colours are on that same list and nothing recomputes
+  them, so that was untrue whenever a colour differed.
+
+
 ## [0.11.57] - 2026-08-09
 
 > Covers changes since 0.11.56.
