@@ -10245,10 +10245,17 @@ const GRAPH_TOOL_EXECUTORS = {
         // #754 — `scale` was accepted by this tool and silently ignored on this branch,
         // so "centre on node 42 at 1.5x" centred at whatever zoom happened to be set.
         //
-        // Applied BEFORE centring, and the order is the whole fix: the centring math
-        // below divides by `ds.scale`, and litegraph's own centerOnNode reads it too, so
+        // Applied BEFORE centring. The fallback math below divides by `ds.scale`, so
         // zooming afterwards would slide the node straight back off-centre — the #401
         // hazard, one branch over.
+        //
+        // For the `canvas.centerOnNode` path the ordering is chosen on the same
+        // principle but WITHOUT a claim about litegraph's internals: whether that
+        // implementation reads ds.scale is not verifiable from this repo (the frontend
+        // bundle is not vendored here). Zoom-first is correct either way — if it reads
+        // the scale, the centring accounts for the new zoom; if it does not, setting the
+        // scale first is harmless. Asserting which would be stating an unverified
+        // implementation detail as fact.
         //
         // The #401 centre-preserving correction is deliberately NOT used here. It exists
         // to hold the CURRENT viewport centre across a zoom; this action is about to
