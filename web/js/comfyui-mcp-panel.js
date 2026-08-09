@@ -1468,6 +1468,20 @@ const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 // migration (the orchestrator moves the pin unchanged), so the guard must still
 // recognize it as naming this same instance (#186).
 const _priorTempWorkflowIds = new WeakMap();
+/**
+ * Route ids this tab USED TO have, keyed by the id it has now (#847).
+ *
+ * `_priorTempWorkflowIds` above is keyed on the live workflow OBJECT, and ComfyUI
+ * replaces that object across a save — verified while fixing this: a thread stamped
+ * `tmp:` on a tab that was already saved could not be matched back to it, because by
+ * the time anything asked, the WeakMap's key was gone.
+ *
+ * A plain Map keyed by the NEW id survives that. It only ever holds ids this panel
+ * minted for this tab, so it cannot name another workflow's threads, and it is
+ * in-memory by design: the durable half is the stamp rewrite in
+ * `onWorkflowMaybeChanged`, which this exists to cover until that lands.
+ */
+const _routeIdLineage = new Map();
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 
@@ -7462,6 +7476,22 @@ function revalidateGraphMutationContext(captured) {
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
 // measure how much of the canvas the open sidebar panel overlays.
 let activePanelRoot = null;
+/**
+ * Repaint the open Chat-history list, if one is open (#847).
+ *
+ * The list paints once when the pane opens. A route-stamp migration lands on the
+ * 600 ms workflow poll, so a pane opened just before a first save shows the
+ * pre-migration answer and never corrects itself — the rows do not change, so
+ * Playwright's auto-retry cannot save it either, and neither can a user staring
+ * at it.
+ *
+ * Reassigned on every render of the pane rather than nulled on close: the pane is
+ * a popover that is re-rendered in place (`histPop.textContent = ""`) and has no
+ * teardown to hang a null on. A handle left over from a closed popover repaints a
+ * hidden node, which costs nothing and shows nobody anything — and it closes over
+ * the same `threads` BINDING, not a copy, so it cannot paint a stale list.
+ */
+let repaintHistoryList = null;
 
 /**
  * #851 — WHICH ComfyUI a reboot reply is about.
@@ -22173,9 +22203,76 @@ function buildPanel() {
     if (followsPanel) {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf) _tempWorkflowInstanceIds.delete(wf);
+      // #847 — CARRY THE ROUTE STAMP ACROSS THE SAVE, on every thread that holds it.
+      //
+      // A first save moves the tab from `tmp:<uuid>` to `wf:<path>` and re-mints the
+      // storage uuid at the same moment, so a conversation recorded before it holds
+      // neither of the live workflow's identity forms and drops out of "Current
+      // workflow only" — the workflow it was actually held on. 0.11.56 matched those
+      // threads in memory via `_priorTempWorkflowIds`; that is a WeakMap, so the
+      // match died on reload and this is the durable half.
+      //
+      // EVERY thread, not just the active one. Revising only `thread` is what left
+      // the reported case broken: chat, save, start a new chat, filter — and the
+      // FIRST chat is the one missing, because it was not the active thread when the
+      // save landed.
+      //
+      // Rewrites a routing stamp and nothing else. No transcript is touched, and it
+      // goes through `reviseThread` so it travels the same causal field-op path as
+      // the other stamps rather than losing to a stale tab's write.
+      // The ids to migrate FROM. Two sources, because neither alone is enough:
+      //
+      //   currentWorkflowId  the id this panel was last using — a plain variable, so
+      //                      it survives ComfyUI replacing the activeWorkflow OBJECT.
+      //                      Verified necessary: in the failing spec the tab was
+      //                      already saved before the first message, yet the thread
+      //                      was stamped `tmp:` — the panel's VIEW of the tab changed
+      //                      later, and the object had been swapped by then, so the
+      //                      WeakMap below found nothing.
+      //   _priorTempWorkflowIds  the first tmp: id ever minted for this live object,
+      //                      which covers a migration this poll did not itself see.
+      //
+      // Both are ids this panel MINTED for this tab, so neither can name another
+      // workflow's threads.
+      const priorRouteIds = new Set();
+      for (const id of [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null]) {
+        if (typeof id === "string" && id.startsWith("tmp:") && id !== wfid) priorRouteIds.add(id);
+      }
+      if (priorRouteIds.size) {
+        const held = _routeIdLineage.get(wfid) ?? new Set();
+        for (const id of priorRouteIds) held.add(id);
+        _routeIdLineage.set(wfid, held);
+      }
+      let migratedRouteStamp = false;
+      if (wfid.startsWith("wf:") && priorRouteIds.size) {
+        for (const candidate of threads) {
+          if (!priorRouteIds.has(candidate?.workflowRouteKey)) continue;
+          historyStore.reviseThread(candidate, { workflowRouteKey: wfid });
+          migratedRouteStamp = true;
+        }
+      }
+      // Persist it even with no active thread. The revise below carries its own
+      // `persistThreads()`, but it is inside `if (thread)` — and the whole point of
+      // the loop above is the threads that are NOT active, which on a save with the
+      // composer empty is all of them. Leaving it to that branch would migrate them
+      // in memory and lose it on reload, which is the bug being fixed.
+      if (migratedRouteStamp && !thread) persistThreads();
+      // A pane that is already open painted the pre-migration answer and will not
+      // repaint itself; nothing else changes its rows.
+      if (migratedRouteStamp) {
+        try {
+          repaintHistoryList?.();
+        } catch {
+          // A stale handle must never break the workflow poll.
+        }
+      }
       if (thread) {
         historyStore.reviseThread(thread, {
           workflowKey: workflowStorageKey(),
+          // The active thread's route stamp follows too. It was absent here because
+          // `workflowRouteKey` was not a revisable field at all (#847) — set once at
+          // creation, then stale forever.
+          workflowRouteKey: workflowTabId(),
           workflowTitle: getWorkflowTitle(),
         }); // archive provenance
         setActiveThread("panel:global", thread.id);
@@ -22346,11 +22443,16 @@ function buildPanel() {
       // object's lifetime, and `workflowRecordMatchesSelector` already honours it — this
       // was the one reader that did not.
       const activeWf = activeWorkflowRef();
+      const liveRouteId = workflowTabId();
       const currentWorkflowKeys = currentWorkflowIdentityKeys({
         storageKey: workflowStorageKey(),
-        routeId: workflowTabId(),
+        routeId: liveRouteId,
         priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
       });
+      // …plus every id this tab is known to have carried before (#847). The WeakMap
+      // above misses whenever ComfyUI replaced the workflow object across the save,
+      // which is most of the time.
+      for (const id of _routeIdLineage.get(liveRouteId) ?? []) currentWorkflowKeys.add(id);
       const visible = threads
         .filter((candidate) =>
           !currentOnly.checked || threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys))
@@ -22536,6 +22638,9 @@ function buildPanel() {
       picker.click();
     });
     paintList();
+    // Publish the repaint so a migration landing while this pane is open can
+    // correct it (#847).
+    repaintHistoryList = paintList;
 
     const footer = document.createElement("div");
     footer.className = "cmcp-hist-footer";
