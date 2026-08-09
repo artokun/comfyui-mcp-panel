@@ -27,32 +27,24 @@ interface CmdReply {
 }
 
 /**
- * Send a graph command through the bridge and resolve with its result. The panel
- * replies `{rid, ok, result|error}`; we match on rid via the MockBridge frame tap.
+ * Send a graph command and resolve with its result, throwing the panel's own
+ * error text on refusal.
+ *
+ * #793 — this used to build and send the frame itself, which meant it never
+ * carried a `workflow_uuid` and every mutation here was refused by the #718
+ * fence before it reached an executor. It now delegates to
+ * `MockBridge.command()`, which stamps. A second hand-rolled sender is exactly
+ * how this file drifted out of the fix the fixture already had.
  */
-function command(
+async function command(
   bridge: MockBridge,
   cmd: string,
   args: Record<string, unknown> = {},
   timeoutMs = 15_000
 ): Promise<Record<string, unknown>> {
-  const rid = `t-${cmd}-${Math.random().toString(36).slice(2)}`
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      off()
-      reject(new Error(`command "${cmd}" timed out`))
-    }, timeoutMs)
-    const off = bridge.onFrame((frame) => {
-      const f = frame as unknown as CmdReply
-      if (f.rid === rid && typeof f.ok === 'boolean') {
-        clearTimeout(timer)
-        off()
-        if (f.ok) resolve(f.result ?? {})
-        else reject(new Error(f.error ?? `command "${cmd}" failed`))
-      }
-    })
-    bridge.send({ rid, cmd, ...args })
-  })
+  const reply = (await bridge.command(cmd, args, timeoutMs)) as unknown as CmdReply
+  if (!reply.ok) throw new Error(reply.error ?? `command "${cmd}" failed`)
+  return reply.result ?? {}
 }
 
 /** Best-effort connect (ignores type-incompat refusals — layout is edge-tolerant). */

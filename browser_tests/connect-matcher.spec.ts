@@ -23,7 +23,7 @@
  */
 import { test, expect } from './fixtures/panelTest'
 import type { Page } from '@playwright/test'
-import { claimFreshCanvas } from './fixtures/canvasIdentity'
+import { claimFreshCanvas, settleCanvas } from './fixtures/canvasIdentity'
 import type { MockBridge } from './fixtures/MockBridge'
 
 interface SlotSpec {
@@ -52,7 +52,7 @@ async function buildGraph(
   // below is refused as dirty-mutation-binding-unproven, which is what made
   // this file fail 6/6 while the code under test was fine.
   await claimFreshCanvas(page, bridge)
-  return page.evaluate((nodeSpecs: NodeSpec[]) => {
+  const ids = await page.evaluate((nodeSpecs: NodeSpec[]) => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
     const LiteGraph = w.LiteGraph
@@ -84,6 +84,12 @@ async function buildGraph(
     }
     return ids
   }, specs)
+  // #793 — the tracker captures on the events the real UI emits, and
+  // graph.add() from the page fires none of them. Without this the workflow's
+  // own state still describes the canvas from BEFORE the build, and the
+  // binding guard correctly refuses the mismatch.
+  await settleCanvas(page)
+  return ids
 }
 
 /** Bring the panel up and connected to the MockBridge. */
@@ -124,7 +130,7 @@ test('1. omitted to_input auto-matches clip ← CLIP', async ({ panel, mockBridg
     // to_input omitted → auto-match by type
   })
 
-  expect(reply.ok).toBe(true)
+  expect(reply.ok, JSON.stringify(reply).slice(0, 500)).toBe(true)
   expect(reply.result.connected.to.input).toBe('clip')
   expect(reply.result.connected.from.output).toBe('CLIP')
   expect(reply.result.connected.type).toBe('CLIP')
@@ -203,7 +209,7 @@ test('3. auto_match:false + omitted slots reproduces legacy index-0 behavior', a
     // both slots omitted → legacy index 0 → MODEL(out 0) → model(in 0)
   })
 
-  expect(reply.ok).toBe(true)
+  expect(reply.ok, JSON.stringify(reply).slice(0, 500)).toBe(true)
   expect(reply.result.connected.from.output_index).toBe(0)
   expect(reply.result.connected.to.input_index).toBe(0)
   expect(reply.result.connected.from.output).toBe('MODEL')
@@ -303,7 +309,7 @@ test('6. wildcard ("*") connects but loses to an exact-type match', async ({
     // both omitted → exact MODEL→model must beat "*"→model
   })
 
-  expect(reply.ok).toBe(true)
+  expect(reply.ok, JSON.stringify(reply).slice(0, 500)).toBe(true)
   expect(reply.result.connected.from.output_index).toBe(1)
   expect(reply.result.connected.from.output).toBe('MODEL')
   expect(reply.result.connected.type).toBe('MODEL')

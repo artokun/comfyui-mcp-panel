@@ -55,3 +55,32 @@ export async function claimFreshCanvas(page: Page, bridge: MockBridge): Promise<
   bridge.forgetWorkflowUuid()
   return bridge.activeWorkflowUuid()
 }
+
+/**
+ * Let the panel SEE the nodes a spec just added (#793).
+ *
+ * ComfyUI's ChangeTracker captures the canvas on the events the real UI emits.
+ * A spec that builds its fixture by calling `graph.add()` from the page fires
+ * none of them, so the workflow's tracked state still reports the canvas it had
+ * BEFORE the build — and the binding guard, comparing the two, refuses:
+ *
+ *   [root-shape-mismatch] … the canvas's content does not match the active
+ *   workflow's own state … The panel cannot tell whether this is a DIFFERENT
+ *   workflow's canvas or this workflow's own canvas drifted …
+ *
+ * Which is the correct answer to the question it was asked. `checkState()` is
+ * the tracker's own capture — the same one a real edit triggers — so this makes
+ * the fixture look like an edit rather than like a desync.
+ *
+ * Call it after building, before the first command.
+ */
+export async function settleCanvas(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    const tracker = app?.extensionManager?.workflow?.activeWorkflow?.changeTracker
+    // Best-effort by design: a frontend without this hook leaves the spec to
+    // fail on its own assertion rather than on a confusing helper error.
+    tracker?.checkState?.()
+  })
+}
