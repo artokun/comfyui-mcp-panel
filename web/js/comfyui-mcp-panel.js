@@ -8046,14 +8046,26 @@ const GRAPH_TOOL_EXECUTORS = {
           );
           // #607: flag widgets overridden by a link so the stored value isn't read as effective.
           const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+          // #636 — the DISPLAY name a user renamed this widget to. graph_query already
+          // reports these (`widget_labels`), but the outline did not, and the outline is
+          // the reader an agent reaches for first: the reporter was told their renames
+          // "had not stuck" while the canvas plainly showed them, and only a screenshot
+          // settled it. Renamed widgets ONLY, so an unrenamed graph's outline is
+          // byte-identical to before and costs nothing against max_chars.
+          const renamed = widgetLabelMap(n);
           widgets = (n.widgets ?? [])
             .filter((w) => w && typeof w.name === "string")
             .map((w) => {
               // At "no_values" the widget NAMES still tell an agent what is configurable;
               // the VALUES are the bulk of the bytes, so they go first.
               const base = level === "full" ? `${w.name}=${fmtVal(w.value)}` : w.name;
+              // The NAME stays the addressable key and stays first — panel_set_widget
+              // takes the name, not the label — with the label annotated beside it in the
+              // same bracket idiom as [after_gen=…] and [bypass].
+              const label = renamed[w.name];
+              const withLabel = label ? `${base} [renamed "${title_(label)}"]` : base;
               const mode = cagMode.get(w.name);
-              const withMode = mode ? `${base} [after_gen=${mode}]` : base;
+              const withMode = mode ? `${withLabel} [after_gen=${mode}]` : withLabel;
               return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
             })
             .join(" ");
