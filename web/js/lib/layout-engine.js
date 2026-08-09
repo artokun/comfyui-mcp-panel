@@ -188,7 +188,12 @@ export function computeLayout(snapshot, opts = {}) {
     const fu = unitIdForNode(e.from);
     const tu = unitIdForNode(e.to);
     if (fu === undefined || tu === undefined || fu === tu) continue;
-    const key = String(fu) + "|" + String(tu);
+    // JSON-encoded, not delimiter-joined. This key used to be built with a literal
+    // NUL separator, which made git treat the whole file as BINARY (no reviewable
+    // diff); a "|" join fixes that but is not injective — node ids are arbitrary
+    // strings, so ("a|b","c") and ("a","b|c") would dedup to one edge and silently
+    // drop a real layout constraint. Encoding the boundary removes both problems.
+    const key = JSON.stringify([String(fu), String(tu)]);
     if (seenEdge.has(key)) continue;
     seenEdge.add(key);
     inputs.get(tu).push(fu);

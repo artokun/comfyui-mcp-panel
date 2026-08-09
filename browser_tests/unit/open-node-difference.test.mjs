@@ -77,6 +77,62 @@ test("a changed WIDGET VALUE is same-set but NOT cosmetic — it is real content
   assert.deepEqual(d.fields, ["widgets_values"]);
 });
 
+// ── codex round 1: four ways this could have reassured over real loss ───────
+
+test("a field ABSENT on one side is not equal to one explicitly null", () => {
+  // The `?? null` collapse erased exactly the field that would have blocked the
+  // all-clear: a node whose widgets_values vanished, alongside a resize, was
+  // reported as a pure resize.
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { widgets_values: null })],
+    actualNodes: [node(1, "KSampler", { size: [9, 9] })], // widgets_values GONE
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.ok(d.fields.includes("widgets_values"), "the lost field must be named");
+  assert.equal(d.cosmeticOnly, false, "losing a field is not a resize");
+});
+
+test("a reset TITLE is not cosmetic — the panel's own diff calls it a real edit", () => {
+  // graph_edit_node persists user titles, and diffGraphsForAgent reports a title
+  // change while ignoring moves/resizes/recolors. A load that reset a custom
+  // title HAS lost something.
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { title: "Base pass" })],
+    actualNodes: [node(1, "KSampler", { title: "KSampler", size: [9, 9] })],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, false);
+  assert.ok(d.fields.includes("title"));
+});
+
+test("flags are not cosmetic — graph_edit_node persists `pinned` there too", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { flags: { pinned: true } })],
+    actualNodes: [node(1, "KSampler", { flags: {}, size: [9, 9] })],
+  });
+  assert.equal(d.cosmeticOnly, false);
+  assert.ok(d.fields.includes("flags"));
+});
+
+test("mode (bypass/mute) is execution semantics, not presentation", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { mode: 0 })],
+    actualNodes: [node(1, "KSampler", { mode: 4, size: [9, 9] })],
+  });
+  assert.equal(d.cosmeticOnly, false);
+  assert.ok(d.fields.includes("mode"));
+});
+
+test("the identity key is injective — a delimiter collision is not a matched node", () => {
+  // With `id + "|" + type`, these two pair up as the same node.
+  const d = classifyNodeDifference({
+    expectedNodes: [node("a|b", "c")],
+    actualNodes: [node("a", "b|c")],
+  });
+  assert.equal(d.comparable, true);
+  assert.equal(d.sameNodeSet, false, "different nodes must not read as one set");
+});
+
 test("cosmetic requires EVERY differing field to be cosmetic", () => {
   const d = classifyNodeDifference({
     expectedNodes: [node(1, "KSampler", { widgets_values: [1] })],
@@ -326,4 +382,28 @@ test("no shipped web/js source carries a stray control character", () => {
   };
   walk(root);
   assert.deepEqual(offenders, []);
+});
+
+// ── layout-engine edge dedup: the same injectivity bug, one file over ───
+
+test("layout edge keys are injective — a delimiter collision cannot drop an edge", async () => {
+  const { computeLayout } = await import("../../web/js/lib/layout-engine.js");
+  // ("a|b" -> "c") and ("a" -> "b|c") are DIFFERENT edges that a "|" join folds
+  // into ONE key, so the second is discarded as a duplicate and its target loses
+  // its only input — which in a flow layout means it stops being placed downstream.
+  const box = (id) => ({ id, pos: [0, 0], size: [10, 10] });
+  const out = computeLayout({
+    nodes: [box("a|b"), box("c"), box("a"), box("b|c")],
+    edges: [
+      { from: "a|b", to: "c" },
+      { from: "a", to: "b|c" },
+    ],
+  });
+  // Both sinks have exactly one input, so both must sit in a LATER column than
+  // their source. A folded key leaves one sink sourceless and it lands in column 0
+  // alongside the roots.
+  const col = out.columnOf;
+  assert.ok(col instanceof Map, "computeLayout must expose columnOf");
+  assert.ok(col.get("c") > col.get("a|b"), "edge a|b -> c must order them");
+  assert.ok(col.get("b|c") > col.get("a"), "edge a -> b|c must survive dedup");
 });

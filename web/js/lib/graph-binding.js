@@ -398,24 +398,38 @@ function graphShape(state) {
  * Per-node fields that carry no workflow CONTENT — the ones the ComfyUI frontend
  * is free to rewrite while loading a graph it reproduced faithfully.
  *
- * `size` is the reported case (#825): a node's box is recomputed from the live
- * widget/DOM metrics on load, so a workflow saved by one frontend build and
- * loaded by another routinely comes back with different sizes and an identical
- * graph. `pos` moves with a layout pass, `order` and `flags.collapsed` are view
- * state, and `title` is echoed from the node definition when it was never
- * customized.
+ * THE LIST IS BORROWED, NOT INVENTED. `diffGraphsForAgent` — the panel's own
+ * user-facing graph diff — already draws this line, and states it: it reports
+ * adds, removes, mode, widget values, titles and connections, and "ignores pure
+ * moves/resizes/recolors (noise)". This set is exactly that noise, so the two
+ * places that decide what counts as a real edit cannot disagree.
  *
- * `widgets_values` is deliberately NOT here. A changed widget value IS content —
- * it is the difference between two runs — and calling it cosmetic is exactly the
- * kind of reassurance this module exists not to give.
+ * `size` is the reported case (#825): a node's box is recomputed from live
+ * widget/DOM metrics on load, so a workflow saved by one frontend build and
+ * loaded by another routinely comes back resized with an identical graph.
+ * `order` is LiteGraph's recomputed execution index, not user state.
+ *
+ * DELIBERATELY ABSENT, each one a way this could have lied (codex):
+ *  - `widgets_values` — the difference between two runs. Content.
+ *  - `title` — user-editable and persisted by `graph_edit_node`; the panel's own
+ *    diff reports a title change as a real edit. A load that reset a custom title
+ *    HAS lost something, and must not be waved through as a resize.
+ *  - `flags` — not just `collapsed`: `graph_edit_node` persists `pinned` here too.
+ *  - `mode` — bypass/mute is execution semantics.
  */
-const COSMETIC_NODE_FIELDS = new Set(["size", "pos", "order", "flags", "title", "shape", "color", "bgcolor"]);
+const COSMETIC_NODE_FIELDS = new Set(["size", "pos", "order", "color", "bgcolor"]);
 
 /** The node's identity for set comparison: what makes it THIS node rather than
  *  another one. Type included, because an id reused for a different type is a
- *  different node however the count reads. */
+ *  different node however the count reads.
+ *
+ *  JSON-encoded rather than joined on a delimiter, because a join is not
+ *  injective (codex): with `id + "|" + type`, `{id:"a|b",type:"c"}` and
+ *  `{id:"a",type:"b|c"}` produce the SAME key, and two different nodes reading as
+ *  one is precisely the mis-pairing `sameNodeSet` must never make. Any delimiter
+ *  has this problem for some input; encoding the boundary removes it. */
 function nodeIdentityKey(node) {
-  return String(node?.id ?? "") + "|" + String(node?.type ?? "");
+  return JSON.stringify([String(node?.id ?? ""), String(node?.type ?? "")]);
 }
 
 /**
@@ -464,13 +478,26 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
     }
 
     // Same set. Now: which per-node keys disagree?
+    //
+    // PRESENCE IS COMPARED BEFORE VALUE (codex). An earlier cut wrote
+    // `canonicalizeShapeValue(v) ?? null`, which made an ABSENT field equal to one
+    // explicitly set to `null` — so a node that lost its `widgets_values`
+    // (present-as-null on one side, gone on the other) dropped out of `fields`
+    // entirely, and a size change alongside it passed the cosmetic gate. A
+    // classifier that erases the very field that would have blocked the all-clear
+    // is the worst possible failure here.
+    const has = (node, field) => Object.prototype.hasOwnProperty.call(node, field);
     const fields = new Set();
     for (const [key, expectedNode] of expected) {
       const actualNode = actual.get(key);
       const keys = new Set([...Object.keys(expectedNode), ...Object.keys(actualNode)]);
       for (const field of keys) {
-        const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]) ?? null);
-        const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]) ?? null);
+        if (has(expectedNode, field) !== has(actualNode, field)) {
+          fields.add(field);
+          continue;
+        }
+        const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]));
+        const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]));
         if (a !== b) fields.add(field);
       }
     }
