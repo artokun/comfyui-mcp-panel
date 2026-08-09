@@ -83,6 +83,50 @@ test('opening a workflow does not dirty it and first record embeds silently', as
 
   await panel.setBridgeUrl(mockBridge.url)
   await panel.connect()
+
+  // #847 — SAVE FIRST, then assert the embed.
+  //
+  // The panel embeds its identity into `graph.extra` only for a PERSISTED
+  // workflow: #570 fails closed on the copyable carrier, because an embedded
+  // uuid on an unsaved canvas would be inherited by a copy/import and
+  // cross-resume the source's conversation. So on a rig whose default canvas is
+  // an unsaved 'Untitled' — which is most of them — this assertion could never
+  // pass, and the spec was failing on the environment rather than on the panel.
+  //
+  // Save through the panel's own command so the workflow is genuinely persisted,
+  // then re-zero the counters: saving legitimately touches the graph, and the
+  // claim under test is that the EMBED is silent, not that saving is.
+  const savedAs = `cmcp-e2e-identity-${Date.now().toString(36)}`
+  const saveReply = await mockBridge.command('workflow_save_as', { name: savedAs })
+  expect(saveReply.ok, JSON.stringify(saveReply).slice(0, 300)).toBe(true)
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          ((window as any).comfyAPI?.app?.app || (window as any).app)?.extensionManager?.workflow
+            ?.activeWorkflow?.isPersisted ?? false
+      )
+    )
+    .toBe(true)
+  await page.evaluate(() => {
+    ;(window as any).__cmcpIdentityMutationCalls = { before: 0, after: 0, dirty: 0 }
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    if (app.graph?.extra?.comfyui_mcp) delete app.graph.extra.comfyui_mcp
+  })
+
+  // The embed rides the next RECORD, so give it one.
+  await panel.sendMessage('first record after save')
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          ((window as any).comfyAPI?.app?.app || (window as any).app)?.graph?.extra?.comfyui_mcp
+            ?.workflow_uuid ?? null
+      )
+    )
+    .not.toBeNull()
+
   const recorded = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
@@ -93,6 +137,19 @@ test('opening a workflow does not dirty it and first record embeds silently', as
   })
   expect(recorded.uuid).toMatch(/^[0-9a-f-]{36}$/i)
   expect(recorded.calls).toEqual({ before: 0, after: 0, dirty: 0 })
+
+  // Do not leave the file behind. This spec has to SAVE to exercise the embed,
+  // and a suite that drops a workflow into the user's own workflows folder on
+  // every run is its own small defect.
+  await page.evaluate(async (name) => {
+    try {
+      await fetch(`/api/userdata/${encodeURIComponent(`workflows/${name}.json`)}`, {
+        method: 'DELETE'
+      })
+    } catch {
+      // Best-effort: a failed cleanup must not fail a passing assertion.
+    }
+  }, savedAs)
 })
 
 test('default mode opens pre-upgrade history without re-keying it', async ({
