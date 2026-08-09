@@ -507,20 +507,19 @@ function graphShape(state) {
  * By that test:
  *   size, pos     the frontend re-measures and re-places on load
  *   order         recomputed topologically, never authored directly
- *   color/bgcolor authored, and a difference here IS an authoring difference — but
- *                 not a lost node and not a lost value. See the note below: the
- *                 sentence downstream is worded to claim only that.
- *   showAdvanced  a display toggle. VALUE-GATED (codex): trusted only when both
- *                 sides are booleans, because the classifier knows field names and
- *                 not node packs — anything richer under that name could be real
- *                 state, and claiming otherwise would fabricate the all-clear.
+ *   color/bgcolor authored, and a difference IS an authoring difference — but not a
+ *                 lost node and not a lost widget value, which is all the sentence
+ *                 downstream now claims.
  *
- * `color`/`bgcolor` were already here before this rule was written down, and writing
- * it down exposed that the sentence they licensed overclaimed: the frontend does NOT
- * recompute a node's colour, so "the only difference is presentation, which the
- * frontend recomputes" was false whenever one differed. Rather than drop them —
- * a colour difference genuinely is not lost work — the claim was narrowed to what
- * the comparison actually establishes.
+ * `showAdvanced` was added here for #696 and then REMOVED again (codex). The
+ * argument for it was that a display toggle cannot carry a lost value; the argument
+ * against is simply that a boolean IS a value, and this classifier sees every node
+ * type there will ever be. A pack can legitimately serialize meaningful state under
+ * that name, and nothing here can tell the two apart — a field name is not a
+ * contract, and a value-shape guard only re-states the name's promise in another
+ * form. #696 is fixed instead by not needing the question answered: see
+ * `nodeSetIntact` below, where the reassurance that actually matters rests on the
+ * node SET, which is proven, rather than on guessing what a field means.
  *
  * DENYLIST, deliberately, and it must stay one. An unknown field reads as
  * non-cosmetic, so a pack the panel has never seen makes the disclosure cautious —
@@ -529,29 +528,8 @@ function graphShape(state) {
  * about a surface it has never heard of. That is the fabricated all-clear this whole
  * module exists to avoid, and it is worth more than the noise.
  */
-const COSMETIC_NODE_FIELDS = new Set([
-  "size",
-  "pos",
-  "order",
-  "color",
-  "bgcolor",
-  "showAdvanced",
-]);
+const COSMETIC_NODE_FIELDS = new Set(["size", "pos", "order", "color", "bgcolor"]);
 
-/**
- * Extra proof a named field must supply before it counts as cosmetic (#696, codex).
- *
- * A field name is not a contract. `showAdvanced` is a boolean display toggle in the
- * packs that prompted this, but the classifier sees every node type there will ever
- * be, and a pack storing real state under that name would otherwise collect an
- * all-clear it never earned. A boolean cannot carry a lost widget value; anything
- * else under that name is unknown, so it fails closed and the cautious sentence
- * stands.
- */
-const COSMETIC_FIELD_VALUE_GUARDS = {
-  showAdvanced: (a, b) =>
-    (a === undefined || typeof a === "boolean") && (b === undefined || typeof b === "boolean"),
-};
 
 /** The node's identity for set comparison: what makes it THIS node rather than
  *  another one. Type included, because an id reused for a different type is a
@@ -622,10 +600,7 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
     // is the worst possible failure here.
     const has = (node, field) => Object.prototype.hasOwnProperty.call(node, field);
     const fields = new Set();
-    // Fields whose NAME is cosmetic but whose VALUES failed the guard for it. Kept
-    // separate so the classifier still reports the field as differing (the caller
-    // needs that) while refusing to count it as cosmetic (codex).
-    const guardFailed = new Set();
+
     for (const [key, expectedNode] of expected) {
       const actualNode = actual.get(key);
       const keys = new Set([...Object.keys(expectedNode), ...Object.keys(actualNode)]);
@@ -636,20 +611,14 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
         }
         const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]));
         const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]));
-        if (a !== b) {
-          fields.add(field);
-          const guard = COSMETIC_FIELD_VALUE_GUARDS[field];
-          if (guard && !guard(expectedNode[field], actualNode[field])) guardFailed.add(field);
-        }
+        if (a !== b) fields.add(field);
       }
     }
     const list = [...fields].sort();
     return {
       comparable: true,
       sameNodeSet: true,
-      cosmeticOnly:
-        list.length > 0 &&
-        list.every((field) => COSMETIC_NODE_FIELDS.has(field) && !guardFailed.has(field)),
+      cosmeticOnly: list.length > 0 && list.every((field) => COSMETIC_NODE_FIELDS.has(field)),
       fields: list,
     };
   } catch {
@@ -1248,28 +1217,58 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // it falls back to the honest "cannot tell".
     const nodesOnly =
       (observed.contentSurfaces ?? []).length === 1 && (observed.contentSurfaces ?? [])[0] === "nodes";
+    // #696 — this used to also require `cosmeticOnly`, i.e. that every differing
+    // field be on an allowlist of names. That made the reassurance hostage to
+    // guessing what a field MEANS: one unrecognised display flag from any node pack
+    // (`showAdvanced` was the reported one) sent a perfectly healthy open down the
+    // "the load may only have partly applied" path. Chasing it by extending the
+    // allowlist just moves the problem to the next pack, and a value-shape guard only
+    // restates the name's promise in another form (codex).
+    //
+    // The node SET is what the panel actually PROVED: every node that was loaded is
+    // on the canvas with the same id and type, and nothing extra appeared. That is
+    // worth saying on its own, whatever fields differ — so it is what the headline
+    // now rests on, with the differing fields NAMED so the reader judges the rest.
     const nodeSetIntact =
       observed.contentNodeDifference?.comparable === true &&
-      observed.contentNodeDifference?.sameNodeSet === true &&
-      observed.contentNodeDifference?.cosmeticOnly === true;
+      observed.contentNodeDifference?.sameNodeSet === true;
+    const valuesMatched = observed.contentNodeDifference?.cosmeticOnly === true;
     if (compared && nodesOnly && nodeSetIntact) {
-      // #696 (codex) — claim only what the comparison ESTABLISHES, and name the
-      // fields. The old wording said the difference was "presentation, which the
-      // ComfyUI frontend recomputes on load"; `color`/`bgcolor` are in the cosmetic
-      // set and the frontend does NOT recompute those, so that sentence was false
-      // whenever a colour differed. What the comparison really proves is narrower
-      // and still exactly what the reader needs: same nodes, same values, same
-      // links. Naming the fields also lets a reader judge for themselves rather
-      // than trusting the word "presentation".
-      const differing = (observed.contentNodeDifference?.fields ?? []).join(", ");
-      const which = differing ? ` (${differing})` : "";
+      // Two claims, and only the ones the comparison supports (codex). The node set
+      // is proven in both branches. `cosmeticOnly` additionally establishes that the
+      // fields carrying VALUES — `widgets_values`, `inputs` — matched, because those
+      // are not on the cosmetic allowlist; it does NOT establish "no value is
+      // missing" in general, since `color`/`bgcolor` are authored values that may
+      // legitimately differ. So say the narrow thing.
+      // The differing fields are NOT named here: `because` already names them, in
+      // almost these words. An earlier cut added them to the headline too and a
+      // mutation test caught the duplication by refusing to fail — the assertion
+      // could not tell the addition from the clause that was already there. The
+      // headline states the conclusion; `because` carries the detail.
+      // Each branch is its OWN sentence. An earlier cut shared a `which the panel
+      // cannot call byte-identical` tail between them, which read fine after the
+      // cosmetic clause and attached to the wrong phrase after the other one
+      // ("...or the load applied them differently, which the panel cannot call
+      // byte-identical"). Sharing a tail across two different claims is how wording
+      // drifts away from meaning.
+      const head =
+        `workflow_open RAN, the canvas IS bound to ${workflow}, and every node that was loaded ` +
+        `is on it with the same id and type`;
+      if (valuesMatched) {
+        return (
+          `${head}, carrying the same widget values and links. What differs is per-node ` +
+          `presentation only, which the panel cannot call byte-identical, so the content ` +
+          `is reported UNCONFIRMED rather than failed.${because} You are on the right workflow ` +
+          `and there is no missing work to redo; if you need the exact graph, read it with ` +
+          `panel_graph_outline.`
+        );
+      }
       return (
-        `workflow_open RAN, the canvas IS bound to ${workflow}, and every node that was loaded is on ` +
-        `it with the same id and type, carrying the same widget values and links — no node and no ` +
-        `value is missing. What differs is per-node presentation only${which}, which the panel cannot ` +
-        `call byte-identical, so the content is reported UNCONFIRMED rather than failed.${because} ` +
-        `You are on the right workflow and there is no missing work to redo; if you need the exact ` +
-        `graph, read it with panel_graph_outline.`
+        `${head}, and nothing extra appeared — no node was lost. What differs is ` +
+        `per-node fields; the panel cannot tell from here whether the ComfyUI frontend ` +
+        `normalized those or the load applied them differently, so the content is reported ` +
+        `UNCONFIRMED rather than failed.${because} You are on the right workflow; if you need ` +
+        `the exact graph, read it with panel_graph_outline.`
       );
     }
     return (

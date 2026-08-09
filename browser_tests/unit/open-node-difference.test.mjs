@@ -262,7 +262,6 @@ test("a re-measured graph says nothing was lost, and drops the data-loss framing
   // frontend recomputes on load"; the frontend does NOT recompute a node's colour,
   // and colour is in the cosmetic set, so that was false whenever one differed. What
   // the comparison actually proves is same nodes, same values, same links.
-  assert.match(msg, /no node and no value is missing/i);
   assert.match(msg, /same widget values and links/i);
   assert.match(msg, /no missing work to redo/i);
   assert.match(msg, /size/, "the differing fields are named so a reader can judge for themselves");
@@ -289,7 +288,7 @@ test("a MISSING node keeps the full warning and says the set itself differs", ()
   assert.match(msg, /partly applied/i, "a real content loss must keep the unresolved wording");
   // Pin the CURRENT reassurance, not a phrase the code no longer uses — a negative
   // assertion against dead wording passes for free and guards nothing.
-  assert.doesNotMatch(msg, /no node and no value is missing/i);
+  assert.doesNotMatch(msg, /same widget values and links/i);
   assert.doesNotMatch(msg, /no missing work to redo/i);
 });
 
@@ -446,42 +445,74 @@ test("layout edge keys are injective — a delimiter collision cannot drop an ed
   assert.ok(col.get("b|c") > col.get("a"), "edge a -> b|c must survive dedup");
 });
 
-// ── #696: a display-only flag is not lost content ──────────────────────────
+// ── #696: an unrecognised field must not read as lost work ────────────────
 
-test("the reporter's trio — order + size + showAdvanced — is cosmetic", () => {
-  // The 0.11.50 regression on #696: `panel_open_workflow` reported a mismatch on a
-  // flat workflow that differed only in these three, with every node id and type
-  // present. Two were already cosmetic; `showAdvanced` alone was enough to send a
-  // healthy open down the "the panel cannot tell whether the load only partly
-  // applied" path, which reads as possible data loss.
-  const node = (over) => ({
-    id: 1, type: "ImpactWildcardEncode", pos: [10, 20], size: [300, 100],
-    flags: {}, order: 0, mode: 0, inputs: [], outputs: [],
-    properties: {}, widgets_values: ["a", "b"], showAdvanced: false, ...over,
+test("the reporter's trio still reassures, WITHOUT the panel guessing what a field means", () => {
+  // The 0.11.50 regression: `panel_open_workflow` reported a mismatch on a flat
+  // workflow differing only in `order`, `showAdvanced`, and `size`, every node id
+  // and type present. `showAdvanced` is not on the cosmetic allowlist and — per
+  // codex — must not be: a field NAME is not a contract, a boolean IS a value, and
+  // this classifier sees every node type there will ever be.
+  //
+  // So the fix is not to bless the name. The node SET is what was actually proven,
+  // and that is what the headline rests on now.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: false,
+      fields: ["order", "showAdvanced", "size"],
+    },
   });
-  const out = classifyNodeDifference({
-    expectedNodes: [node({})],
-    actualNodes: [node({ order: 2, size: [310, 120], showAdvanced: true })],
+  assert.match(msg, /no node was lost/i, "the set was compared; say so");
+  assert.match(msg, /showAdvanced/, "and name what differed so the reader can judge");
+  assert.doesNotMatch(
+    msg,
+    /the load only\s+partly applied/i,
+    "an intact node set must not read as possible data loss",
+  );
+});
+
+test("an unrecognised field does NOT earn the values claim", () => {
+  // The reassurance is tiered. An intact set gets "no node was lost"; only a
+  // cosmetic-only difference additionally gets "same widget values and links",
+  // because those fields are off the allowlist and therefore known to have matched.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true, sameNodeSet: true, cosmeticOnly: false, fields: ["showAdvanced"],
+    },
   });
-  assert.equal(out.comparable, true);
-  assert.equal(out.sameNodeSet, true);
-  assert.deepEqual(out.fields, ["order", "showAdvanced", "size"]);
-  assert.equal(out.cosmeticOnly, true, "a display toggle cannot mean a node or a value was lost");
+  assert.doesNotMatch(msg, /same widget values and links/i);
+  assert.doesNotMatch(msg, /no missing work to redo/i, "unknown fields cannot promise that");
+});
+
+test("showAdvanced is NOT on the cosmetic allowlist", () => {
+  // Pinned as a decision, not an oversight: adding it would have the panel assert a
+  // meaning it cannot know for an arbitrary node pack.
+  const node = (v) => ({ id: 1, type: "T", widgets_values: ["a"], showAdvanced: v });
+  const out = classifyNodeDifference({ expectedNodes: [node(false)], actualNodes: [node(true)] });
+  assert.deepEqual(out.fields, ["showAdvanced"]);
+  assert.equal(out.sameNodeSet, true, "the set is still intact, which is what carries the reassurance");
+  assert.equal(out.cosmeticOnly, false, "a field name is not a contract");
 });
 
 test("the rule's boundary: fields that CAN mean lost content stay non-cosmetic", () => {
-  // The point of stating a rule rather than keeping a list. Each of these fails the
-  // test "a difference here is compatible with 'nothing was lost'".
   const node = (over) => ({
     id: 1, type: "T", pos: [0, 0], size: [10, 10], flags: {}, order: 0, mode: 0,
     inputs: [], outputs: [], properties: {}, widgets_values: ["a"], title: "mine", ...over,
   });
   for (const [field, changed] of [
     ["widgets_values", { widgets_values: ["CHANGED"] }],
-    ["mode", { mode: 4 }],                    // bypass — changes what executes
-    ["title", { title: "renamed" }],          // authored, and losing it IS loss
-    ["properties", { properties: { k: 1 } }], // pack-specific; unknowable from here
-    ["inputs", { inputs: [{ name: "x" }] }],  // links
+    ["mode", { mode: 4 }],
+    ["title", { title: "renamed" }],
+    ["properties", { properties: { k: 1 } }],
+    ["inputs", { inputs: [{ name: "x" }] }],
   ]) {
     const out = classifyNodeDifference({ expectedNodes: [node({})], actualNodes: [node(changed)] });
     assert.deepEqual(out.fields, [field], `expected only ${field} to differ`);
@@ -489,82 +520,18 @@ test("the rule's boundary: fields that CAN mean lost content stay non-cosmetic",
   }
 });
 
-test("an UNKNOWN field is not cosmetic — the set stays a denylist", () => {
-  // A pack the panel has never seen makes the disclosure cautious rather than
-  // confidently wrong. Inverting to an allowlist would make every unfamiliar field
-  // cosmetic, i.e. claim "nothing was lost" about a surface never heard of.
-  const node = (over) => ({ id: 1, type: "T", widgets_values: ["a"], ...over });
-  const out = classifyNodeDifference({
-    expectedNodes: [node({ someFuturePackFlag: 1 })],
-    actualNodes: [node({ someFuturePackFlag: 2 })],
-  });
-  assert.equal(out.cosmeticOnly, false);
-});
-
-test("showAdvanced alongside a REAL change is still not cosmetic", () => {
-  // Widening the set must not let a genuine difference ride along with a display
-  // toggle — the all-clear is per-difference-set, not per-field.
-  const node = (over) => ({
-    id: 1, type: "T", widgets_values: ["a"], showAdvanced: false, ...over,
-  });
-  const out = classifyNodeDifference({
-    expectedNodes: [node({})],
-    actualNodes: [node({ showAdvanced: true, widgets_values: ["CHANGED"] })],
-  });
-  assert.deepEqual(out.fields, ["showAdvanced", "widgets_values"]);
-  assert.equal(out.cosmeticOnly, false);
-});
-
-test("showAdvanced is trusted only when it is a BOOLEAN", () => {
-  // codex — a field NAME is not a contract. `showAdvanced` is a boolean display
-  // toggle in the packs that prompted this, but the classifier sees every node type
-  // there will ever be, and a pack storing real state under that name would
-  // otherwise collect an all-clear it never earned. A boolean cannot carry a lost
-  // widget value; anything richer is unknown and fails closed.
-  const node = (v) => ({ id: 1, type: "T", widgets_values: ["a"], showAdvanced: v });
-  const classify = (a, b) =>
-    classifyNodeDifference({ expectedNodes: [node(a)], actualNodes: [node(b)] });
-
-  assert.equal(classify(false, true).cosmeticOnly, true, "boolean toggle is cosmetic");
-
-  for (const [a, b, why] of [
-    [{ lora_1: "x" }, { lora_1: "y" }, "an object could be real state"],
-    [["a"], ["b"], "so could an array"],
-    ["basic", "advanced", "and a string"],
-    [0, 1, "numbers are not the toggle this trusts"],
-    [false, { on: true }, "a mixed pair is still unknown on one side"],
-  ]) {
-    const out = classify(a, b);
-    assert.deepEqual(out.fields, ["showAdvanced"], why);
-    assert.equal(out.cosmeticOnly, false, why);
-  }
-});
-
-test("a guard failure still REPORTS the field, it just refuses the all-clear", () => {
-  // The caller needs to know what differed either way; the guard decides only
-  // whether the reassuring sentence may be used.
-  const node = (v) => ({ id: 1, type: "T", widgets_values: ["a"], showAdvanced: v });
-  const out = classifyNodeDifference({
-    expectedNodes: [node({ deep: 1 })],
-    actualNodes: [node({ deep: 2 })],
-  });
-  assert.deepEqual(out.fields, ["showAdvanced"]);
-  assert.equal(out.sameNodeSet, true);
-  assert.equal(out.cosmeticOnly, false);
-});
-
-test("the reassuring sentence claims only what was compared", () => {
-  // #696 (codex) — `color`/`bgcolor` are cosmetic AND user-authored, and the
-  // frontend does not recompute them, so the old "which the ComfyUI frontend
-  // recomputes on load" was false whenever a colour differed. What the comparison
-  // establishes is same nodes, same values, same links.
+test("a cosmetic-only difference still earns the stronger, narrower claim", () => {
+  // And it claims only what the comparison establishes. `color`/`bgcolor` are
+  // cosmetic AND user-authored, so "no value is missing" would overclaim; "same
+  // widget values and links" is what the allowlist actually proves.
   const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
     targetLabel: "origami.json",
     contentComparable: true,
     contentSurfaces: ["nodes"],
     contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["color"] },
   });
-  assert.match(msg, /no node and no value is missing/i);
-  assert.match(msg, /color/, "the field is named rather than described as 'presentation'");
-  assert.doesNotMatch(msg, /recomputes on load/i);
+  assert.match(msg, /same widget values and links/i);
+  assert.match(msg, /color/, "the field is named rather than described only as 'presentation'");
+  assert.doesNotMatch(msg, /recomputes on load/i, "the frontend does not recompute a colour");
+  assert.doesNotMatch(msg, /no value is missing/i, "colour IS a value, and it differed");
 });
