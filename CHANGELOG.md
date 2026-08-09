@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.47] - 2026-08-09
+
+> Covers changes since 0.11.46.
+
+### Added
+- Large images and videos can be collapsed **in place** in the chat transcript. Every media
+  card gets a disclosure chevron; collapsed, it becomes a one-line stub naming the file that
+  is itself the way back (click, Enter or Space). This is the opposite of the existing `⛶`
+  button, which opens the lightbox — one goes smaller, one goes bigger. Collapse state is
+  remembered in `sessionStorage`, so it survives a reload and a thread switch inside the tab
+  and clears when the tab closes. Collapsing a video releases its decoded `<video>`
+  immediately instead of leaving it decoding behind a hidden box, and expanding an
+  off-screen card does not resurrect one (#818, #823)
+
 ## [0.11.46] - 2026-08-08
 
 > Covers changes since 0.11.45.
