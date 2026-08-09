@@ -6,9 +6,13 @@
 // blocked muted autoplay is not a failure — so the error listener is the only place the
 // difference can surface.
 //
-// Pinned at source because the lazy holder is a closure inside the panel and needs a
-// live DOM; the teardown half is asserted behaviourally in
-// browser_tests/video-decode-failure-is-visible.spec.ts.
+// Pinned at SOURCE, and only at source. An earlier version of this change shipped an
+// e2e alongside it that manipulated a plain div and never invoked mountHolderVideo, the
+// production error listener, or the observer — it proved that an empty div stays empty
+// (codex). It was removed rather than kept as decoration: a test that never reaches the
+// code it names cannot catch that code breaking, and claiming otherwise is worse than
+// having no test at all. `show_media` is a server->panel push whose lazy holder this
+// harness could not get to paint; making it drivable is its own piece of work.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -43,4 +47,26 @@ test("#909: a TEARDOWN must not be reported as a failure", () => {
   // as soon as it scrolled out of view — a false failure in place of a silent one.
   assert.match(mount, /if \(holder\._video !== v\) return;/, "a holder that moved on explains nothing");
   assert.match(mount, /if \(!v\.getAttribute\("src"\)\) return;/, "a cleared source is a teardown");
+});
+
+test("#909: a failed source is TERMINAL — the observer must not remount it", () => {
+  // `data-src` survives the error paint, so without this the lazy observer remounts the
+  // same known-bad media on the next scroll-in: the message vanishes, the decode fails
+  // again, and the card blinks back to blank (codex).
+  assert.match(
+    mount,
+    /holder\._mediaFailedSrc && holder\._mediaFailedSrc === holder\.dataset\.src/,
+    "a remount of the SAME failed source must be refused",
+  );
+  // Keyed on the source, not a bare flag, so a later card with a different source still
+  // gets a real attempt.
+  assert.match(mount, /holder\._mediaFailedSrc = holder\.dataset\.src;/, "the failure records its source");
+});
+
+test("#909: the dead element releases its decode buffers", () => {
+  // Detaching alone is not deterministic release, and unmountHolderVideo skips the
+  // element once `_video` is null — so the error path is the last chance to do it.
+  const handler = mount.slice(mount.indexOf('addEventListener("error"'));
+  assert.match(handler, /v\.removeAttribute\("src"\)/, "the source must be cleared");
+  assert.match(handler, /v\.load\(\)/, "and load() called, the way unmount does it");
 });

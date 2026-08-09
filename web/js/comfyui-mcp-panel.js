@@ -21433,6 +21433,12 @@ function buildPanel() {
   }
   function mountHolderVideo(holder) {
     if (holder._video) return; // already live
+    // #909 — a failure is TERMINAL for this source (codex). `data-src` survives the error
+    // paint, so without this the lazy observer remounts the same known-bad media on the
+    // next scroll-in: the message vanishes, the decode fails again, and the card blinks
+    // back to blank. Cleared only by a new source, which is the only thing that could
+    // change the answer.
+    if (holder._mediaFailedSrc && holder._mediaFailedSrc === holder.dataset.src) return;
     const v = document.createElement("video");
     v.muted = true;
     v.setAttribute("muted", ""); // required for muted autoplay on some browsers
@@ -21471,10 +21477,20 @@ function buildPanel() {
       holder.style.cssText +=
         ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
         "color:var(--p-text-muted-color,#a1a1aa);font-size:0.75rem;";
-      // The dead element goes, so the holder is not left with an invisible video on top
-      // of the message and unmount has nothing to tear down twice.
+      // Release the decode buffers the way unmountHolderVideo does — detaching alone is
+      // not deterministic release, and unmount will skip this element once `_video` is
+      // null, so this is the last chance to do it (codex).
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        // best-effort, exactly as the unmount path treats it
+      }
       v.remove();
       holder._video = null;
+      // Remember WHICH source failed, so a later card with a different source still gets
+      // a real attempt.
+      holder._mediaFailedSrc = holder.dataset.src;
     });
     holder.textContent = "";
     holder.appendChild(v);
