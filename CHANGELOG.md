@@ -6,6 +6,35 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.67] - 2026-08-09
+
+> Covers changes since 0.11.66.
+
+### Fixed
+
+- **Adding a node no longer refuses a type your install can clearly handle (#636).**
+  Asking the agent to add `SaveVideo` failed with *"Required custom widget VIDEO have not
+  registered"* — on a canvas where a working `SaveVideo` was already sitting. Retrying
+  never helped, because nothing about the check could change.
+
+  The check asks whether a datatype could still be a widget that hasn't finished loading.
+  It answers that by looking at whether any installed node *produces* that type. On an
+  install where nothing happens to produce it, the answer is permanently "can't tell", and
+  the node becomes unaddable forever — even though ComfyUI builds it perfectly well.
+
+  The panel now also looks at the canvas. If a node of that same type is already there,
+  how ComfyUI actually built it is visible: an input wired as a connection is a
+  connection, and one shown as a widget already has what it needs. That is exactly the
+  evidence the reporter was staring at while being told the node couldn't be added.
+
+  This only ever lets an attempt proceed — the newly added node is still checked before
+  you're told it worked, so a genuinely missing widget still fails, and a still-loading
+  one still gets its full wait first. Nothing changes for a type the canvas can't vouch
+  for.
+
+  The other half of that report — `SaveVideo`'s `codec` input — was already fixed in
+  0.11.61. Verified here against a live ComfyUI: `SaveVideo` now adds cleanly.
+
 ## [0.11.66] - 2026-08-09
 
 > Covers changes since 0.11.65.
