@@ -96,6 +96,15 @@ export function createRunCompletionTracker({
   // frame silently dropped by sendFrame), the run stays pending and can be
   // recovered on reconnect by reconciling its prompt_id against `/history`.
   const pending = new Map(); // key -> { promptId, at }  (real prompt_ids only)
+  // #356 Bug 2 — keys the PANEL queued, populated ONLY by onQueued.
+  //
+  // Deliberately NOT `pending`: that is populated by the lifecycle too
+  // (onExecutionStart and onExecuted both call trackPending), so it holds every run
+  // observed on the socket, including ones the user started on the canvas. The
+  // media-less completion below exists to honour panel_run's "end your turn and
+  // wait" promise, and only a run the panel queued was ever given that promise —
+  // so only those may wake the agent when they finish empty.
+  const panelQueued = new Set();
   // Two SEPARATE fences, deliberately distinct (codex P1):
   //
   //  • `terminal` — the LIFECYCLE REPLAY fence. A key is here once the prompt has
@@ -220,6 +229,7 @@ export function createRunCompletionTracker({
     markTerminal(id);
     touchFence(delivered, k);
     pending.delete(k);
+    panelQueued.delete(k); // #356 Bug 2 — bounded with the ledger it shadows
     clearReconcileRetry(k); // a delivery (any path) cancels a scheduled /history retry
     // NB: this deliberately does NOT clear the delivery hold below. It is called
     // from the tracker's own lifecycle (flush, execution_success, reconcile) where
@@ -366,6 +376,18 @@ export function createRunCompletionTracker({
     });
   }
 
+  /**
+   * #356 Bug 2 — does this key hold any image/video the flush would deliver?
+   *
+   * Asks about CONTENT, not buffer existence: an `executed` carrying only text
+   * never reaches ensureBuffer, but a buffer can also exist and be empty, and both
+   * mean the same thing to the agent — nothing is coming.
+   */
+  function hasBufferedMedia(k) {
+    const buf = buffers.get(k);
+    return !!buf && (buf.images.length > 0 || buf.videos.length > 0);
+  }
+
   function ensureBuffer(k) {
     let buf = buffers.get(k);
     if (!buf) {
@@ -469,7 +491,13 @@ export function createRunCompletionTracker({
       return { promptId, status: "interrupted" };
     }
     const hasBatch = parsed.images.length > 0 || parsed.videos.length > 0;
-    if (hasBatch) {
+    // #356 Bug 2 — the /history safety net has to cover a media-less run too, or the
+    // one mechanism built to recover a missed completion (#370/#468) structurally
+    // cannot recover the very case that goes missing most quietly. Same scope as the
+    // live path: only a run the PANEL queued carried the "end your turn and wait"
+    // promise, so only that one is worth waking the agent for when it finished empty.
+    const mediaLessQueued = !hasBatch && panelQueued.has(k);
+    if (hasBatch || mediaLessQueued) {
       const durationMs = startTs != null ? now() - startTs : null;
       // Same async-delivery hold as flush(): the reconciled batch is composed and
       // sent by the caller, so it is not "delivered" until the caller says so.
@@ -482,9 +510,10 @@ export function createRunCompletionTracker({
         durationMs,
         finishedAt: now(),
         reconciled: true,
+        ...(mediaLessQueued ? { noMedia: true } : {}),
       });
     }
-    return { promptId, status: "success", delivered: hasBatch };
+    return { promptId, status: "success", delivered: hasBatch || mediaLessQueued };
   }
 
   // GIVE UP on a prompt confirmed absent from BOTH /history AND /queue after the
@@ -517,6 +546,7 @@ export function createRunCompletionTracker({
     active.delete(k);
     starts.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
+    panelQueued.delete(k); // #356 Bug 2 — evicted with it
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
     if (typeof onReconcileGiveUp === "function") {
       try {
@@ -645,7 +675,38 @@ export function createRunCompletionTracker({
         starts.delete(k);
         return;
       }
+      // #356 Bug 2 — a run that produced NO image and NO video buffers nothing
+      // (onExecuted discards a media-less `executed`), so flush() returns at its
+      // `!buf` guard and the agent is never told the run finished. For a canvas run
+      // the user started, that silence is harmless. For a run the PANEL queued it is
+      // an indefinite stall, because panel_run told the agent "you will be notified
+      // automatically — do NOT poll — end your turn now and wait". The PROMISE is
+      // what turns a silent completion into a wedged agent, which is why this is
+      // scoped to the runs that carried it: `pending` holds exactly the panel-queued
+      // ones (onQueued populates it), so a user's own UI run stays silent and no new
+      // wakeups are introduced.
+      //
+      // Both reads happen BEFORE flush(): a flush that delivers calls markDelivered
+      // (removing the key from `pending`) and retires the duration start.
+      const mediaLess = !hasBufferedMedia(k) && panelQueued.has(k);
+      const mediaLessStart = mediaLess ? starts.get(k) : null;
       flush(k);
+      if (mediaLess) {
+        // Same ordering as flush(): retire from pending first so a reconnect
+        // reconcile racing this cannot deliver the same run twice, then hold it as
+        // delivery-in-flight until the caller confirms (#585).
+        markDelivered(k);
+        markDispatched(k);
+        onFlush({
+          key: k,
+          promptId: promptIdOf(k),
+          images: [],
+          videos: [],
+          durationMs: mediaLessStart != null ? now() - mediaLessStart : null,
+          finishedAt: now(),
+          noMedia: true,
+        });
+      }
       // Retire start for runs that buffered nothing (flush early-returns then).
       starts.delete(k);
       // A terminal success we OBSERVED live needs no /history reconcile — clear it
@@ -719,6 +780,8 @@ export function createRunCompletionTracker({
      */
     onQueued(id) {
       trackPending(id);
+      // #356 Bug 2 — records that THIS run carried panel_run's wait-for-it promise.
+      if (id != null) panelQueued.add(key(id));
     },
 
     /**
