@@ -381,7 +381,7 @@ test("WIRING #882: the shared capture reports WHY it could not capture", () => {
   // change transaction, graph loading), so claiming success from a bare return would
   // authorise a close on a stale flag — this bug exactly (codex).
   assert.ok(
-    fn.includes("tracker.activeState !== before"),
+    /after\.value !== before\.value\) return "captured"/.test(fn),
     "a replaced snapshot object must be accepted as proof the capture landed",
   );
   assert.ok(
@@ -389,8 +389,44 @@ test("WIRING #882: the shared capture reports WHY it could not capture", () => {
     "an unproven capture must be checked against the documented no-op windows",
   );
   assert.ok(
-    /!suppressed \? "captured" : "unverified"/.test(fn),
+    /suppressed \|\| captureWasSuppressed\(tracker\) \? "unverified" : "captured"/.test(fn),
     "a possibly-suppressed capture must report unverified, not captured",
+  );
+  // Suppression is sampled TWICE — at call time and again when the verdict is taken —
+  // because an asynchronous capture does its work later, so the window that matters
+  // may open after the first sample (codex).
+  assert.equal(
+    (fn.match(/captureWasSuppressed\(tracker\)/g) || []).length,
+    2,
+    "suppression must be sampled at call time and again at verdict time",
+  );
+  // `activeState` is a plain field today, but a version making it a throwing accessor
+  // must not blow past these callers — every read goes through the guarded reader.
+  assert.ok(
+    /const readState = \(\) => \{\s*try \{/.test(fn),
+    "the snapshot must be read through a guard",
+  );
+  // Exactly one read of the raw field, and it is the one inside the guard.
+  assert.equal(
+    (fn.match(/tracker\.activeState/g) || []).length,
+    1,
+    "no unguarded activeState read may remain",
+  );
+  assert.ok(
+    /try \{\s*return \{ ok: true, value: tracker\.activeState \};/.test(fn),
+    "the single raw read must be the guarded one",
+  );
+  // A read that THREW must report failure, not a successful read of `undefined` —
+  // otherwise every verdict silently compares undefined to undefined and claims proof.
+  assert.ok(
+    /catch \{\s*return \{ ok: false, value: undefined \};/.test(fn),
+    "a throwing snapshot read must report ok:false",
+  );
+  // And an unreadable snapshot BEFORE the call means no evidence can be established
+  // at all, so the verdict must be unverified rather than proceeding blind.
+  assert.ok(
+    /if \(!before\.ok\) return \{ verdict: "unverified" \};/.test(fn),
+    "an unreadable snapshot must short-circuit to unverified",
   );
   // Written as an early return for the non-thenable case, so accept either polarity —
   // what matters is that thenability is what separates "captured" from "pending".
@@ -404,8 +440,15 @@ test("WIRING #882: the shared capture reports WHY it could not capture", () => {
   // early for a non-active tracker, so asking would report a capture that never
   // happened — and an inactive tab was already frozen by ComfyUI's `deactivate()`.
   assert.ok(
-    fn.includes("wf !== activeWorkflowRef()"),
+    fn.includes("wf !== active) return { verdict: \"inactive\" }"),
     "a non-active workflow must be reported inactive rather than flushed",
+  );
+  // But "inactive" may only be claimed on a READABLE identity. `activeWorkflowRef()`
+  // answers null both when nothing is active and when the lookup threw, and reading
+  // null as inactive would trust a stale flag on the very target needing capture.
+  assert.ok(
+    /if \(!active\) return \{ verdict: "unverified" \};/.test(fn),
+    "an unreadable active-workflow identity must not be dismissed as inactive",
   );
   // `checkState` is deprecated upstream (it warns, then delegates), so the current
   // name must be preferred and the old one kept only as the fallback.
@@ -416,9 +459,17 @@ test("WIRING #882: the shared capture reports WHY it could not capture", () => {
   // `settled` must derive from the capture's OWN promise. Calling the capture a
   // second time to await would run it twice — and a capture that sees a change is not
   // a read: it pushes an undo entry and clears redo.
+  // `settled` must be a REAL promise. A callable thenable can return a non-promise from
+  // `.then()`, and awaiting that yields undefined — matching no verdict, so it would
+  // slip past the refusal into the stale flag.
   assert.ok(
-    /settled:\s*result\.then\(/.test(fn),
-    "the pending verdict must settle the capture's own promise",
+    /settled = Promise\.resolve\(result\)\.then\(landed, \(\) => "failed"\)/.test(fn),
+    "the pending verdict must normalise the capture's own promise",
+  );
+  // Even ASKING whether the result is thenable can throw, if `then` is an accessor.
+  assert.ok(
+    /isThenable = !!result && typeof result\.then === "function";/.test(fn),
+    "thenability must be probed inside a guard",
   );
   assert.equal(
     (fn.match(/capture\.call\(tracker\)/g) || []).length,
@@ -441,6 +492,11 @@ test("WIRING #882: closing awaits a pending capture and refuses a failed one", (
   // swallowed its rejection, so a rejected capture still read as "pending" and the
   // close went ahead on a stale flag — the very failure this guard exists to stop.
   assert.ok(site.includes("await captured.settled"), "a pending capture must be awaited");
+  // An empty verdict must land on the refusal side, never slip through to the flag.
+  assert.ok(
+    (site.match(/\?\? "unverified"/g) || []).length >= 2,
+    "an absent verdict must default to unverified on both branches",
+  );
   assert.ok(
     !site.includes("changeTracker.checkState()"),
     "it must not start a second capture to await",

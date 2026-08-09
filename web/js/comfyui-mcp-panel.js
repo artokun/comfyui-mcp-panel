@@ -1570,9 +1570,28 @@ let currentWorkflowRef = null;
  * EVIDENCE: either the snapshot object was replaced (proof it landed), or none of the
  * documented suppression conditions holds. Otherwise the verdict is "unverified" and
  * the destructive callers refuse, with `force` as the escape hatch.
+ *
+ * Why unchanged identity is not by itself a refusal: a capture that finds the canvas
+ * ALREADY equal to the snapshot legitimately leaves `activeState` untouched, and that
+ * is the ordinary state of every clean workflow. Refusing there would refuse every
+ * close of an unmodified tab and demand `force:true` for routine work — trading a
+ * data-loss bug for a cannot-close bug. So the no-change case is admitted, and the
+ * suppression windows are what separates it from a swallowed call.
+ *
+ * The residual: a future frontend could rename one of those fields AND take a silent
+ * no-op in the renamed window AND be asked to close a canvas holding node-written
+ * edits. That conjunction lands on today's behaviour — trusting `isModified` — so it
+ * is bounded by the status quo, which is the trade taken here deliberately.
  */
 function captureCanvasIntoTracker(wf) {
-  if (!wf || wf !== activeWorkflowRef()) return { verdict: "inactive" };
+  if (!wf) return { verdict: "unverified" };
+  // A target may only be DISMISSED as inactive on a readable identity. `activeWorkflowRef()`
+  // answers null both when nothing is active and when the lookup itself threw, so null
+  // cannot be read as "inactive" — that would trust a stale flag on exactly the target
+  // that needed capturing (codex).
+  const active = activeWorkflowRef();
+  if (!active) return { verdict: "unverified" };
+  if (wf !== active) return { verdict: "inactive" };
   const tracker = wf.changeTracker;
   // `checkState` is DEPRECATED upstream — it warns, then delegates to this — so prefer
   // the current name and keep the old one as the fallback for older frontends.
@@ -1580,22 +1599,58 @@ function captureCanvasIntoTracker(wf) {
   if (typeof capture !== "function") return { verdict: "unavailable" };
   // A capture that SEES a change assigns a brand-new state object. Identity change is
   // therefore positive proof the snapshot landed, and needs no knowledge of internals.
-  const before = tracker.activeState;
+  // Read through a guard: `activeState` is a plain field today, but a version that
+  // makes it a throwing accessor must not blow past these callers (codex).
+  const readState = () => {
+    try {
+      return { ok: true, value: tracker.activeState };
+    } catch {
+      return { ok: false, value: undefined };
+    }
+  };
+  const before = readState();
+  if (!before.ok) return { verdict: "unverified" };
   let result;
   try {
     result = capture.call(tracker);
   } catch {
     return { verdict: "failed" };
   }
-  // Read the suppression flags in the SAME tick as the call, before anything can move.
+  // Sample the suppression flags in the SAME tick as the call, before anything moves.
   const suppressed = captureWasSuppressed(tracker);
-  const landed = () =>
-    tracker.activeState !== before || !suppressed ? "captured" : "unverified";
-  if (!result || typeof result.then !== "function") return { verdict: landed() };
+  const landed = () => {
+    const after = readState();
+    if (!after.ok) return "unverified";
+    if (after.value !== before.value) return "captured"; // proof: the snapshot landed
+    // Unchanged identity is the NO-CHANGE case — the snapshot already matches the
+    // canvas — unless a no-op window swallowed the call. Re-sample here as well as at
+    // call time: an asynchronous capture does its work later, so the window that
+    // matters may open after the first sample (codex).
+    return suppressed || captureWasSuppressed(tracker) ? "unverified" : "captured";
+  };
+  // Even asking whether the result is thenable can throw, if `then` is an accessor.
+  let isThenable = false;
+  try {
+    isThenable = !!result && typeof result.then === "function";
+  } catch {
+    return { verdict: "failed" };
+  }
+  if (!isThenable) return { verdict: landed() };
   // Settle the capture's OWN promise. Starting a SECOND capture to await instead would
   // run it twice — and a capture that sees a change is not a read: it pushes an undo
   // entry and clears the redo queue. It would also leave this first promise unobserved.
-  return { verdict: "pending", settled: result.then(landed, () => "failed") };
+  //
+  // Normalised through `Promise.resolve` so `settled` is always a REAL promise: a
+  // callable thenable may return a non-promise from `.then()`, and awaiting that yields
+  // `undefined`, which matches no verdict and would slip past the refusal into the
+  // stale flag (codex). Assimilation failure rejects, and rejection means "failed".
+  let settled;
+  try {
+    settled = Promise.resolve(result).then(landed, () => "failed");
+  } catch {
+    return { verdict: "failed" };
+  }
+  return { verdict: "pending", settled };
 }
 
 /**
@@ -12265,8 +12320,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // a rejection becomes "failed" here rather than being swallowed into a verdict
     // that still permits the close (codex).
     const captured = captureCanvasIntoTracker(target);
+    // `?? "unverified"`: a verdict that somehow arrives empty must land on the refusal
+    // side, never slip through to the stale flag below.
     const verdict =
-      captured.verdict === "pending" ? await captured.settled : captured.verdict;
+      captured.verdict === "pending"
+        ? ((await captured.settled) ?? "unverified")
+        : (captured.verdict ?? "unverified");
     // A capture that FAILED — or that cannot be shown to have HAPPENED — leaves the
     // tracker possibly behind the canvas, so the flag proves nothing. Refuse rather
     // than close; `force` still discards, which is the caller saying they meant it.
