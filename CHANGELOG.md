@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.70] - 2026-08-09
+
+> Covers changes since 0.11.69.
+
+### Fixed
+
+- **A video your browser can't play now says so instead of showing a blank card (#909).**
+  Asking the agent to show a video reported success and displayed nothing, because the
+  tool answers for handing the video to the page — not for whether the browser could
+  actually decode it. An MP4 in an older format (MPEG-4 Part 2) is the reported case.
+
+  The card now says the format can't be played and suggests re-encoding as H.264 or
+  WebM, instead of leaving you to guess whether the video is broken, still loading, or
+  never arrived.
+
+  Two things it deliberately does not do: it does not report a failure when a working
+  video is simply scrolled out of view (tearing one down looks identical to a decode
+  error from the outside), and it does not keep retrying media it has already failed on,
+  which would make the message flicker away each time you scrolled back.
+
 ## [0.11.69] - 2026-08-09
 
 > Covers changes since 0.11.68.
