@@ -6,6 +6,24 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.55] - 2026-08-09
+
+> Covers changes since 0.11.54.
+
+### Fixed
+
+- **A deferred tool is no longer read as an absent one (#857).** The live-canvas
+  disclosure asked one binary question — is `panel_graph_outline` in your toolset
+  or not — and on a backend that defers tool schemas, neither answer is true. A
+  Codex session found nothing in its initially advertised tools, found
+  `mcp__panel__panel_graph_outline` in the lazy registry, called it, and got the
+  live 41-node graph; it had still been told to report the canvas unreachable and
+  hand the user three remedies for a healthy install. The lookup now comes first
+  and covers both surfaces — a tool you can call is present wherever it came from
+  — and it stops after one check, so a session that genuinely has no canvas tools
+  still reaches its remedies instead of searching forever.
+
+
 ## [0.11.54] - 2026-08-09
 
 > Covers changes since 0.11.53.
