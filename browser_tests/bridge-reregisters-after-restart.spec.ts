@@ -84,6 +84,16 @@ test('the tab re-registers after the bridge dies and respawns', async ({
         /^wf:[^:]+:workflows\//
       )
       expect(route, 'and it must name the workflow that is actually open').toContain(savedName)
+
+      // The hello is only the ANNOUNCEMENT. #654's symptom is that graph tools stay
+      // unusable afterwards, so drive one through the revived bridge: that proves the
+      // new bridge accepted the registration and can route on it (codex).
+      const outline = await revived.command('graph_outline', {})
+      expect(
+        outline.ok,
+        'a graph command must route through the revived bridge — announcing the ' +
+          'registration is not the same as being usable again'
+      ).toBe(true)
     } finally {
       await revived.close()
     }

@@ -406,27 +406,6 @@ export class MockBridge {
     const uuid = await this.activeWorkflowUuid()
     return this.sendCommand(cmd, uuid ? { ...args, workflow_uuid: uuid } : args, timeoutMs)
   }
-  /**
-   * Drop every client socket but KEEP LISTENING — what a ComfyUI/orchestrator restart
-   * looks like from the panel's side (#654). `close()` stops the server too, so the
-   * panel's re-dial has nothing to reach and cannot show whether re-registration works.
-   *
-   * Returns how many sockets were dropped, so a spec can assert it actually severed a
-   * live connection rather than passing because there was none.
-   */
-  dropConnections(code = 1006): number {
-    const live = [...this.sockets]
-    for (const s of live) {
-      try {
-        s.terminate?.() ?? s.close(code)
-      } catch {
-        // a socket already gone is already dropped
-      }
-    }
-    this.sockets.clear()
-    return live.length
-  }
-
   /** Close all sockets and the server. */
   async close(): Promise<void> {
     for (const s of this.sockets) {
