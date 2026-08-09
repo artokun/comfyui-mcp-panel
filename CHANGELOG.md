@@ -20,6 +20,19 @@ All notable changes to this project are documented here. This project adheres to
   recovered by the `/history` reconcile, including when the bridge was down at the moment
   it first fired. Only runs the panel itself queued are affected — a render you start on
   the canvas yourself is still silent (#831, #356)
+- `panel_open_workflow` reported a repaint the ComfyUI frontend had performed FAITHFULLY as a
+  possible partial load. The content check names the graph SURFACES that disagreed, and `nodes`
+  is one surface holding the whole serialized node array — so "the graph differs on: nodes" came
+  out identically whether a node had vanished or the frontend had merely re-measured every box on
+  load, which it routinely does. A reporter read that after a healthy open and went looking for
+  work to redo that was never gone. The disclosure now says which of the two it observed: when
+  every loaded node is on the canvas with the same id and type and only presentation differs, it
+  says so and names the fields. A changed widget value, title, flag or mode is NOT presentation
+  and still gets the full warning, and the verdict itself is unchanged — the open still reports
+  the content as unconfirmed (#825, #830)
+- A stray NUL byte in `layout-engine.js` made git treat the file as binary, so it had no
+  reviewable diff; the edge-dedup key it separated is also now collision-proof, which it was not
+  (#825, #830)
 
 ## [0.11.47] - 2026-08-09
 
