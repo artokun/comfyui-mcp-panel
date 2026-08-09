@@ -553,3 +553,60 @@ export function missingRequiredWidgetMaterializations(node, widgetConstructors, 
   }
   return missing;
 }
+
+/**
+ * Which unavailable entries a node of the SAME CLASS, already live on the canvas,
+ * does NOT explain (#636).
+ *
+ * The type reasoning above asks what SHOULD happen: does some node output this
+ * datatype, does this input declare itself socket-shaped. On a backend where nothing
+ * outputs the type, a socket-shaped input has no proof and fails closed forever — no
+ * retry can change it, because every input to the decision is a snapshot. That is the
+ * reported case: `SaveVideo` refused for `VIDEO` on an install whose node set never
+ * outputs one.
+ *
+ * A live node of that class answers a different question: what DID happen. ComfyUI
+ * already built this class on THIS backend — an input that came out as a link SLOT is a
+ * socket, one that came out as a WIDGET had its constructor.
+ *
+ * It is a WITNESS, not a proof (codex). A widget can survive from an earlier
+ * registration, or have been converted to a slot, so it does not guarantee a fresh node
+ * materialises identically — and the argument must NOT rest on "extensions never
+ * unregister". What makes admitting it safe is that it only permits an ATTEMPT: the
+ * newly created node still goes through missingRequiredWidgetMaterializations before any
+ * success is reported, and that post-creation check is the real soundness boundary. The
+ * worst case here is a creation attempt that then fails closed.
+ *
+ * So this is deliberately NOT a relaxation of the type rules. It adds evidence rather
+ * than lowering a bar: an input the live node does not account for stays unavailable, so
+ * #580's protection is untouched for every case this cannot observe.
+ *
+ * Requires EVERY input carrying the type to be accounted for. A def can require the same
+ * datatype twice, and explaining one occurrence says nothing about the other — the same
+ * "every, not some" rule the socket/widget split above is built on.
+ */
+export function unavailableEntriesLiveNodeCannotExplain(report, liveNode) {
+  if (!Array.isArray(report) || !report.length) return [];
+  if (!liveNode || typeof liveNode !== "object") return report;
+  let widgetNames;
+  let slotNames;
+  try {
+    widgetNames = new Set(
+      (Array.isArray(liveNode.widgets) ? liveNode.widgets : [])
+        .map((w) => (w && typeof w.name === "string" ? w.name : null))
+        .filter(Boolean),
+    );
+    slotNames = new Set(
+      (Array.isArray(liveNode.inputs) ? liveNode.inputs : [])
+        .map((i) => (i && typeof i.name === "string" ? i.name : null))
+        .filter(Boolean),
+    );
+  } catch {
+    return report; // an unreadable node explains nothing
+  }
+  return report.filter((entry) => {
+    const inputs = Array.isArray(entry?.inputs) ? entry.inputs : [];
+    if (!inputs.length) return true; // nothing to check against ⇒ unexplained
+    return !inputs.every((name) => widgetNames.has(name) || slotNames.has(name));
+  });
+}
