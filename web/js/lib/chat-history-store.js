@@ -2176,6 +2176,19 @@ export class ChatHistoryStore {
           // `_legacyDeletesDone` keeps that to once per id per session.
           .filter((id) => !this._legacyDeletesDone.has(id));
         if (tombstoned.length) {
+          // INTENT FIRST, then the delete (codex r7). A delete that succeeds on its
+          // first attempt would otherwise never have been in `pending`, leaving an
+          // unfenced interval between the record going away and the post-success
+          // write recording it as deleted — a stale tab writing into that gap has
+          // nothing to refuse it. Recording the intent up front makes the gap
+          // impossible rather than short: the fence exists before the record does
+          // not.
+          try {
+            await idbMergeDeleteRecord(this.indexedDb, { pending: tombstoned });
+          } catch {
+            // Best effort. The delete below still runs; the in-memory set still
+            // drives retries in this tab.
+          }
           let deleted = false;
           try {
             deleted = await idbDeleteLegacy(this.indexedDb, tombstoned);

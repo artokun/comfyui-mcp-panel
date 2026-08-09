@@ -1054,3 +1054,36 @@ test("a record that got past the writer is still not restored once deleted for g
     "a transcript deleted for good must not return as live history",
   );
 });
+
+test("the fence exists BEFORE the record stops existing", async () => {
+  // codex r7. A delete that succeeds on its first attempt was never in `pending`, so
+  // between the record going away and the post-success write recording it as deleted
+  // there was an interval with nothing to refuse a stale write. The intent is recorded
+  // up front, which makes the gap impossible rather than short.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await store._writePromise;
+
+  // Fail ONLY the record delete, so the run stops with the intent recorded and the
+  // record still present — the state that must already be fenced.
+  indexedDb._state.failDelete = true;
+  store.persist([legacyThread("L1", 2)], {
+    deletedThreads: { L0: { updatedAt: 500, writerId: "a", sequence: 1 } },
+  });
+  await store._writePromise;
+  indexedDb._state.failDelete = false;
+  const record = indexedDb._store("snapshots").get("__cmcp_legacy_pending_deletes");
+  assert.deepEqual(record?.pending, ["L0"], "the intent is durable before the delete lands");
+
+  // A stale tab writing in exactly that window is already refused.
+  const stale = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const rewritten = { ...legacyThread("L0", 1), title: "stale" };
+  stale.persist([rewritten, legacyThread("L1", 2)], {});
+  await stale._writePromise;
+  assert.notEqual(
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("L0")?.title,
+    "stale",
+    "the pre-delete window must already be fenced",
+  );
+});
