@@ -461,6 +461,11 @@ export function createRunCompletionTracker({
     active.delete(k);
     const startTs = starts.get(k);
     starts.delete(k);
+    // #356 Bug 2 — read BEFORE markDelivered, which retires the key from BOTH
+    // `pending` and `panelQueued`. Checking after would always see false, so the
+    // media-less recovery below would never fire — the mistake this line exists to
+    // prevent, and the one the reconcile test caught.
+    const wasPanelQueued = panelQueued.has(k);
     markDelivered(k); // also clears any scheduled retry for this key
     if (parsed.status === "error") {
       // Deliver the terminal error through the SAME hook whether we're in the
@@ -496,7 +501,7 @@ export function createRunCompletionTracker({
     // cannot recover the very case that goes missing most quietly. Same scope as the
     // live path: only a run the PANEL queued carried the "end your turn and wait"
     // promise, so only that one is worth waking the agent for when it finished empty.
-    const mediaLessQueued = !hasBatch && panelQueued.has(k);
+    const mediaLessQueued = !hasBatch && wasPanelQueued;
     if (hasBatch || mediaLessQueued) {
       const durationMs = startTs != null ? now() - startTs : null;
       // Same async-delivery hold as flush(): the reconciled batch is composed and

@@ -206,3 +206,63 @@ test("#356 a run with no duration recorded omits the timing rather than inventin
   assert.doesNotMatch(note, /0\.0s/);
   assert.match(note, /finished successfully, and produced no image or video/i);
 });
+
+// ---------------------------------------------------------------------------
+// 3. The /history recovery path — the safety net that could not catch this case.
+// ---------------------------------------------------------------------------
+
+const historyOf = (entry) => async () => entry;
+const noQueue = async () => false;
+
+test("#356 the /history reconcile recovers a media-less panel-queued run", async () => {
+  // The live completion was missed (bridge down, WS drop). Before this fix
+  // reconcileOne gated its flush on `hasBatch` and returned `delivered: false`, so
+  // the mechanism built for #370/#468 to recover a lost completion structurally
+  // could not recover the quietest kind of loss.
+  const h = makeTracker();
+  const P = "prompt-reconcile-textonly";
+
+  h.tracker.onQueued(P);
+  const res = await h.tracker.reconcile({
+    fetchHistory: historyOf({ status: { status_str: "success", completed: true }, outputs: {} }),
+    fetchQueued: noQueue,
+  });
+
+  assert.equal(h.flushes.length, 1, "the lost completion is recovered");
+  assert.equal(h.flushes[0].noMedia, true);
+  assert.equal(h.flushes[0].reconciled, true);
+  assert.equal(res?.[0]?.delivered ?? res?.delivered, true, "and reported as delivered");
+});
+
+test("#356 an INTERRUPTED run is never reported as a successful completion", async () => {
+  // ComfyUI records a manually stopped render as status_str:"error" plus an
+  // execution_interrupted message. Telling the agent "finished successfully" for a
+  // render the user cancelled would be a worse lie than the silence this fixes.
+  const h = makeTracker();
+  const P = "prompt-cancelled";
+
+  h.tracker.onQueued(P);
+  await h.tracker.reconcile({
+    fetchHistory: historyOf({
+      status: { status_str: "error", completed: true, messages: [["execution_interrupted", {}]] },
+      outputs: {},
+    }),
+    fetchQueued: noQueue,
+  });
+
+  assert.equal(h.flushes.length, 0);
+});
+
+test("#356 a run still RUNNING in /history is not given a premature completion", async () => {
+  // A non-terminal record must stay pending, not be reported as finished-with-no-media.
+  const h = makeTracker();
+  const P = "prompt-running";
+
+  h.tracker.onQueued(P);
+  await h.tracker.reconcile({
+    fetchHistory: historyOf({ status: { status_str: "running" }, outputs: {} }),
+    fetchQueued: noQueue,
+  });
+
+  assert.equal(h.flushes.length, 0);
+});
