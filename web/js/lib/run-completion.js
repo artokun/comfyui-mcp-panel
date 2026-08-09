@@ -229,7 +229,14 @@ export function createRunCompletionTracker({
     markTerminal(id);
     touchFence(delivered, k);
     pending.delete(k);
-    panelQueued.delete(k); // #356 Bug 2 — bounded with the ledger it shadows
+    // #356 Bug 2 — panelQueued deliberately SURVIVES this. `markDelivered` here is
+    // OPTIMISTIC (flush/execution_success/reconcile all call it before the caller has
+    // confirmed the frame reached the agent), and markUndelivered can re-pend the run.
+    // Retiring the panel-queued mark here would make that re-pend unrecoverable for a
+    // media-less run: the recovery re-checks panelQueued and would find it already
+    // gone, so a bridge-down completion could never be redelivered — the exact stall
+    // this issue is about, reintroduced one layer down. It is retired instead on
+    // CONFIRMED delivery (the public markDelivered) and on eviction, which bound it.
     clearReconcileRetry(k); // a delivery (any path) cancels a scheduled /history retry
     // NB: this deliberately does NOT clear the delivery hold below. It is called
     // from the tracker's own lifecycle (flush, execution_success, reconcile) where
@@ -798,6 +805,9 @@ export function createRunCompletionTracker({
       // this — not the tracker's own optimistic retire — is what releases the
       // delivery hold isSettled() reports on (#585).
       clearAwaitingDelivery(key(id));
+      // #356 Bug 2 — and it is the only point at which the panel-queued mark can be
+      // retired safely, for the same reason: before this, a re-pend is still possible.
+      panelQueued.delete(key(id));
       markDelivered(id);
     },
 

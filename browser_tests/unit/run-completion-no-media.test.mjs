@@ -3,8 +3,11 @@
 // THE REPORTED FAILURE, in the reporter's own words: panel_run returns
 //
 //   [IMPORTANT] You will be notified automatically with the output image(s)/video when
-//   the render finishes — do NOT poll get_queue, get_history, or list_output_images.
+//   the render finishes — do NOT poll the queue, the history, or the output listing.
 //   Just end your turn now and wait for the result to be delivered to you.
+//
+// (Paraphrased: the reporter's verbatim text named tools that have since been retired,
+// and the vocabulary gate correctly refuses a dead tool name even inside a quotation.)
 //
 // …and then nothing arrives. They called it corrosive *because* the tool tells the agent
 // to trust it and not poll: a dropped notification becomes an indefinite silent stall,
@@ -265,4 +268,55 @@ test("#356 a run still RUNNING in /history is not given a premature completion",
   });
 
   assert.equal(h.flushes.length, 0);
+});
+
+test("#356 a media-less completion the bridge DROPPED is redelivered on reconcile", async () => {
+  // Codex review finding. The tracker's own markDelivered is OPTIMISTIC — flush and
+  // execution_success both call it before the caller has confirmed the frame reached
+  // the agent — and markUndelivered re-pends the run when sendFrame reports the bridge
+  // was down. If the panel-queued mark were retired by that optimistic call, the
+  // re-pended run would look like an ordinary canvas run on the way back and stay
+  // silent forever: the exact stall this issue is about, reintroduced one layer down.
+  const h = makeTracker();
+  const P = "prompt-bridge-down";
+
+  h.tracker.onQueued(P);
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 1, "the live completion was composed");
+  assert.equal(h.flushes[0].noMedia, true);
+
+  h.tracker.markUndelivered(P); // sendFrame said the bridge was down
+
+  const res = await h.tracker.reconcile({
+    fetchHistory: historyOf({ status: { status_str: "success", completed: true }, outputs: {} }),
+    fetchQueued: noQueue,
+  });
+
+  assert.equal(h.flushes.length, 2, "the dropped completion is recovered, not lost");
+  assert.equal(h.flushes[1].noMedia, true);
+  assert.equal(h.flushes[1].reconciled, true);
+  assert.equal(res?.[0]?.delivered, true);
+});
+
+test("#356 a replayed success after a CONFIRMED delivery makes no second completion", () => {
+  // The counterpart to the re-pend case: once the caller confirms the agent was told,
+  // a replayed lifecycle event must not manufacture a duplicate.
+  //
+  // Honest note on what this does and does not prove. Mutation testing showed the
+  // guarantee here comes from the `terminal` fence, NOT from retiring the panel-queued
+  // mark on confirmation — deleting that line leaves this test green. The retire is a
+  // MEMORY-BOUNDING measure (the set would otherwise keep confirmed keys for the
+  // session), and its absence is not observable through the public API, so it is
+  // deliberately left unpinned rather than guarded by a test that would pass either way.
+  const h = makeTracker();
+  const P = "prompt-confirmed";
+
+  h.tracker.onQueued(P);
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecutionSuccess(P);
+  h.tracker.markDelivered(P); // caller confirms
+  h.tracker.onExecutionSuccess(P); // replayed
+
+  assert.equal(h.flushes.length, 1);
 });
