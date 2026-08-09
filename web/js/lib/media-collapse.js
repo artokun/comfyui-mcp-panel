@@ -41,37 +41,44 @@ export const MEDIA_COLLAPSE_KEY = "comfyui-mcp.panel.collapsedMedia";
  *  they collapsed a very long time ago comes back expanded. */
 export const MAX_COLLAPSED_ENTRIES = 300;
 
-/** How much of a url is fed to the hash from each sampled position. A ComfyUI
- *  /view link is under ~1.5 kB and lands here whole; a `data:` URI is sampled
- *  instead of read in full, so painting a card costs O(1) in the url's length
- *  rather than O(n) over several megabytes — and a thread replay paints every
- *  card at once. */
+/** Read a url of AT MOST this length in FULL. Set above the panel’s own ceiling
+ *  on a persistable media url (MAX_MEDIA_URL_LENGTH, 4096 — lib/chat-media.js),
+ *  which is what makes the sampling below unreachable for every url whose
+ *  collapse state can actually outlive the page. A ComfyUI /view link is a
+ *  couple of hundred characters; only a `data:` or `blob:` url gets anywhere
+ *  near this, and neither is persisted as a media record at all. */
+const HASH_FULL_LIMIT = 8192;
+
+/** How much of an OVER-LIMIT url is fed to the hash from each sampled position.
+ *  Reading a multi-megabyte `data:` URI in full would cost O(n) per painted
+ *  card, and a thread replay paints every card at once. */
 const HASH_SAMPLE = 512;
 
-/** Fractions of the url the sampler reads from, besides the head and the tail.
- *  Head + tail + length alone aliases DETERMINISTICALLY for two urls that share
- *  their ends and their length (codex, #818) — which for a `data:` URI is not
- *  the far-fetched case it sounds like: two renders of the same size from the
- *  same encoder share a long header and can share a trailing chunk. Interior
- *  samples make that require agreement in five separate places. */
+/** Fractions of an over-limit url the sampler reads from, besides the head and
+ *  the tail. Head + tail + length alone aliases DETERMINISTICALLY for two urls
+ *  that share their ends and their length (codex, #818) — which for a `data:`
+ *  URI is not the far-fetched case it sounds like: two renders of the same size
+ *  from the same encoder share a long header and can share a trailing chunk. */
 const HASH_INTERIOR = [0.25, 0.5, 0.75];
 
 /**
- * The bounded slice of a url the hash actually reads: the whole thing when it is
- * small, otherwise fixed windows at the head, at each HASH_INTERIOR fraction, and
- * at the tail.
+ * The slice of a url the hash actually reads.
  *
- * THIS IS A SAMPLING HASH, AND THE LIMIT IS DELIBERATE. Two urls that agree in
- * LENGTH and in every sampled window get the same id. That is accepted because of
- * what the id decides: at worst one card starts collapsed when its neighbour was
- * the one collapsed. What is NOT accepted is aliasing that a realistic pair of
- * urls hits systematically, which head + tail + length alone did (codex, #818) —
- * two renders of one size from one encoder share a long header and can share a
- * trailing chunk, so the interior windows are what separate them.
+ * Up to HASH_FULL_LIMIT that is the WHOLE url, so every url the panel can
+ * persist a collapse for is hashed exactly — no aliasing, at a cost bounded by a
+ * constant. Past it, fixed windows at the head, at each HASH_INTERIOR fraction,
+ * and at the tail.
+ *
+ * ABOVE THE LIMIT THIS IS A SAMPLING HASH, AND THAT LIMIT IS DELIBERATE. Two
+ * over-limit urls agreeing in length and in every sampled window get one id. What
+ * that can cost is bounded twice over: such a url is a `data:`/`blob:` source,
+ * which is never written to a media record, so the mixup cannot survive a reload
+ * — and within one page the worst outcome is a card starting collapsed when its
+ * neighbour was the one collapsed. Reading megabytes per painted card to remove
+ * that is the worse deal.
  */
 function hashSample(s) {
-  const windows = 2 + HASH_INTERIOR.length;
-  if (s.length <= HASH_SAMPLE * windows) return s;
+  if (s.length <= HASH_FULL_LIMIT) return s;
   const parts = [s.slice(0, HASH_SAMPLE)];
   for (const at of HASH_INTERIOR) {
     const from = Math.floor(s.length * at);

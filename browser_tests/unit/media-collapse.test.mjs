@@ -8,6 +8,7 @@ import {
   mediaCollapseId,
   createMediaCollapseStore,
 } from "../../web/js/lib/media-collapse.js";
+import { MAX_MEDIA_URL_LENGTH } from "../../web/js/lib/chat-media.js";
 
 // Per-item collapse state for chat media cards (#818). A run that produces a 4K
 // still or a 15-second clip renders at full card width in the transcript
@@ -65,10 +66,28 @@ test("same length, same head and tail, different MIDDLE ⇒ different ids (codex
   assert.notEqual(mediaCollapseId(a), mediaCollapseId(b));
 });
 
+test("every PERSISTABLE url is hashed exactly — no sampling gap can alias one", () => {
+  // The gap only matters for urls whose collapse state can outlive the page,
+  // and the panel refuses to persist a media record over MAX_MEDIA_URL_LENGTH.
+  // Hashing in full up to a limit above that ceiling is what makes the sampler
+  // unreachable for every url that counts (codex round 2).
+  assert.ok(
+    MAX_MEDIA_URL_LENGTH <= 8192,
+    "the full-read limit must stay above the durable-url ceiling",
+  );
+  const pad = "z".repeat(MAX_MEDIA_URL_LENGTH);
+  for (const at of [1, 700, 1300, 2500, MAX_MEDIA_URL_LENGTH - 2]) {
+    const a = `${pad.slice(0, at)}A${pad.slice(at + 1)}`;
+    const b = `${pad.slice(0, at)}B${pad.slice(at + 1)}`;
+    assert.equal(a.length, MAX_MEDIA_URL_LENGTH);
+    assert.notEqual(mediaCollapseId(a), mediaCollapseId(b), `differ at index ${at}`);
+  }
+});
+
 test("a difference at ANY sampled position separates the ids", () => {
-  // head, 25%, 50%, 75%, tail — one window each. A change landing in any of
-  // them must be visible to the hash.
-  const base = "z".repeat(20_000);
+  // Over the full-read limit: head, 25%, 50%, 75%, tail — one window each. A
+  // change landing in any of them must still be visible to the hash.
+  const base = "z".repeat(200_000);
   const ids = new Set([mediaCollapseId(base)]);
   for (const at of [0, 0.25, 0.5, 0.75, 1]) {
     const i = Math.min(Math.floor(base.length * at), base.length - 1);
@@ -77,17 +96,15 @@ test("a difference at ANY sampled position separates the ids", () => {
   assert.equal(ids.size, 6, "every sampled position must be load-bearing");
 });
 
-test("the sampling limit is real and documented, not accidental", () => {
-  // Two urls of equal length agreeing in every sampled window DO collide. This
-  // is the accepted trade: the consequence is one card starting collapsed when
-  // its neighbour was the one collapsed, and reading megabytes per painted card
-  // to avoid it is the worse deal. Pinned so it stays a decision, not a surprise.
-  // For a 20k string the windows sit at 0, 5000, 10000, 15000 and 19488, each
-  // 512 wide. Offset 8000 falls in the gap between the 25% and 50% windows, so
-  // the hash never reads it.
-  const pad = "z".repeat(20_000);
-  const a = `${pad.slice(0, 8000)}AAAA${pad.slice(8004)}`;
-  const b = `${pad.slice(0, 8000)}BBBB${pad.slice(8004)}`;
+test("above the limit it samples, and that residual limit is documented", () => {
+  // A 200k string is a data:/blob: url — never written to a media record, so an
+  // aliased id here cannot survive a reload, and within one page the worst case
+  // is a card starting collapsed when its neighbour was the one collapsed.
+  // Pinned so the trade stays a decision rather than a surprise.
+  const pad = "z".repeat(200_000);
+  const gap = 80_000; // between the 25% (50k) and 50% (100k) windows
+  const a = `${pad.slice(0, gap)}AAAA${pad.slice(gap + 4)}`;
+  const b = `${pad.slice(0, gap)}BBBB${pad.slice(gap + 4)}`;
   assert.equal(a.length, b.length);
   assert.equal(mediaCollapseId(a), mediaCollapseId(b));
 });
