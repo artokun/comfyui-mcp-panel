@@ -257,9 +257,19 @@ test("a re-measured graph says nothing was lost, and drops the data-loss framing
     contentSurfaces: ["nodes"],
     contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["size"] },
   });
-  assert.match(msg, /nothing was lost/i);
+  // #696 (codex) — the claim is narrower than it was, and the assertion follows it.
+  // The old wording promised "the only difference is presentation, which the ComfyUI
+  // frontend recomputes on load"; the frontend does NOT recompute a node's colour,
+  // and colour is in the cosmetic set, so that was false whenever one differed. What
+  // the comparison actually proves is same nodes, same values, same links.
+  assert.match(msg, /same widget values and links/i);
   assert.match(msg, /no missing work to redo/i);
-  assert.match(msg, /size/);
+  assert.match(msg, /size/, "the differing fields are named so a reader can judge for themselves");
+  assert.doesNotMatch(
+    msg,
+    /frontend recomputes on load/i,
+    "the panel must not claim a recompute it cannot know happened",
+  );
   assert.doesNotMatch(
     msg,
     /the load only\s+partly applied/i,
@@ -276,7 +286,10 @@ test("a MISSING node keeps the full warning and says the set itself differs", ()
   });
   assert.match(msg, /the node SET itself differs/);
   assert.match(msg, /partly applied/i, "a real content loss must keep the unresolved wording");
-  assert.doesNotMatch(msg, /nothing was lost/i);
+  // Pin the CURRENT reassurance, not a phrase the code no longer uses — a negative
+  // assertion against dead wording passes for free and guards nothing.
+  assert.doesNotMatch(msg, /same widget values and links/i);
+  assert.doesNotMatch(msg, /no missing work to redo/i);
 });
 
 test("a widget-value difference is same-set but gets no reassurance", () => {
@@ -430,4 +443,139 @@ test("layout edge keys are injective — a delimiter collision cannot drop an ed
   assert.ok(col instanceof Map, "computeLayout must expose columnOf");
   assert.ok(col.get("c") > col.get("a|b"), "edge a|b -> c must order them");
   assert.ok(col.get("b|c") > col.get("a"), "edge a -> b|c must survive dedup");
+});
+
+// ── #696: an unrecognised field must not read as lost work ────────────────
+
+test("the reporter's trio still reassures, WITHOUT the panel guessing what a field means", () => {
+  // The 0.11.50 regression: `panel_open_workflow` reported a mismatch on a flat
+  // workflow differing only in `order`, `showAdvanced`, and `size`, every node id
+  // and type present. `showAdvanced` is not on the cosmetic allowlist and — per
+  // codex — must not be: a field NAME is not a contract, a boolean IS a value, and
+  // this classifier sees every node type there will ever be.
+  //
+  // So the fix is not to bless the name. The node SET is what was actually proven,
+  // and that is what the headline rests on now.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: false,
+      fields: ["order", "showAdvanced", "size"],
+    },
+  });
+  assert.match(msg, /no node was lost/i, "the set was compared; say so");
+  assert.match(msg, /showAdvanced/, "and name what differed so the reader can judge");
+  assert.doesNotMatch(
+    msg,
+    /the load only\s+partly applied/i,
+    "an intact node set must not read as possible data loss",
+  );
+});
+
+test("an unrecognised field does NOT earn the values claim", () => {
+  // The reassurance is tiered. An intact set gets "no node was lost"; only a
+  // cosmetic-only difference additionally gets "same widget values and links",
+  // because those fields are off the allowlist and therefore known to have matched.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true, sameNodeSet: true, cosmeticOnly: false, fields: ["showAdvanced"],
+    },
+  });
+  assert.doesNotMatch(msg, /same widget values and links/i);
+  assert.doesNotMatch(msg, /no missing work to redo/i, "unknown fields cannot promise that");
+});
+
+test("showAdvanced is NOT on the cosmetic allowlist", () => {
+  // Pinned as a decision, not an oversight: adding it would have the panel assert a
+  // meaning it cannot know for an arbitrary node pack.
+  const node = (v) => ({ id: 1, type: "T", widgets_values: ["a"], showAdvanced: v });
+  const out = classifyNodeDifference({ expectedNodes: [node(false)], actualNodes: [node(true)] });
+  assert.deepEqual(out.fields, ["showAdvanced"]);
+  assert.equal(out.sameNodeSet, true, "the set is still intact, which is what carries the reassurance");
+  assert.equal(out.cosmeticOnly, false, "a field name is not a contract");
+});
+
+test("the rule's boundary: fields that CAN mean lost content stay non-cosmetic", () => {
+  const node = (over) => ({
+    id: 1, type: "T", pos: [0, 0], size: [10, 10], flags: {}, order: 0, mode: 0,
+    inputs: [], outputs: [], properties: {}, widgets_values: ["a"], title: "mine", ...over,
+  });
+  for (const [field, changed] of [
+    ["widgets_values", { widgets_values: ["CHANGED"] }],
+    ["mode", { mode: 4 }],
+    ["title", { title: "renamed" }],
+    ["properties", { properties: { k: 1 } }],
+    ["inputs", { inputs: [{ name: "x" }] }],
+  ]) {
+    const out = classifyNodeDifference({ expectedNodes: [node({})], actualNodes: [node(changed)] });
+    assert.deepEqual(out.fields, [field], `expected only ${field} to differ`);
+    assert.equal(out.cosmeticOnly, false, `${field} must not be treated as cosmetic`);
+  }
+});
+
+test("a cosmetic-only difference still earns the stronger, narrower claim", () => {
+  // And it claims only what the comparison establishes. `color`/`bgcolor` are
+  // cosmetic AND user-authored, so "no value is missing" would overclaim; "same
+  // widget values and links" is what the allowlist actually proves.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["color"] },
+  });
+  assert.match(msg, /same widget values and links/i);
+  assert.match(msg, /color/, "the field is named rather than described only as 'presentation'");
+  assert.doesNotMatch(msg, /recomputes on load/i, "the frontend does not recompute a colour");
+  assert.doesNotMatch(msg, /no value is missing/i, "colour IS a value, and it differed");
+});
+
+test("codex r3's duplicate-identity case fails closed, so the set claim holds", () => {
+  // The reassurance now rests on `sameNodeSet` alone, so it matters that the set
+  // comparison cannot be fooled by repeated identities. Codex's exact example:
+  //
+  //   expected: [1,A] [1,A] [2,B]      actual: [1,A] [2,B] [2,B]
+  //
+  // Both SETS are {[1,A],[2,B]} while an A was lost and a B appeared. Comparing
+  // sets rather than multiplicities would call that intact.
+  //
+  // It does not, and the guard predates this change: `byKey` refuses a duplicate
+  // identity outright ("cannot pair them up honestly"), which yields
+  // `comparable: false` — and `nodeSetIntact` requires `comparable === true`, so
+  // the cautious message stands.
+  const n = (id, type) => ({ id, type, widgets_values: ["v"] });
+  const out = classifyNodeDifference({
+    expectedNodes: [n(1, "A"), n(1, "A"), n(2, "B")],
+    actualNodes: [n(1, "A"), n(2, "B"), n(2, "B")],
+  });
+  assert.equal(out.comparable, false, "duplicate identities are not comparable");
+  assert.equal(out.sameNodeSet, false, "…so no set claim is made either");
+
+  // And the message that consumes it stays on the cautious path.
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: out,
+  });
+  assert.doesNotMatch(msg, /no node was lost/i);
+  assert.match(msg, /partly applied/i);
+});
+
+test("a duplicate on EITHER side alone is enough to refuse the comparison", () => {
+  const n = (id, type) => ({ id, type });
+  for (const [expectedNodes, actualNodes] of [
+    [[n(1, "A"), n(1, "A")], [n(1, "A")]],
+    [[n(1, "A")], [n(1, "A"), n(1, "A")]],
+  ]) {
+    const out = classifyNodeDifference({ expectedNodes, actualNodes });
+    assert.equal(out.comparable, false);
+    assert.equal(out.sameNodeSet, false);
+  }
 });
