@@ -16453,6 +16453,12 @@ const PANEL_CSS = `
    the picture. Only the buttons in it do. */
 .cmcp-media-tools { pointer-events: none; }
 .cmcp-media-tools > button { pointer-events: auto; }
+/* A media card's img takes its display FROM HERE and not from an inline style,
+   because an inline "display:block" outranks any stylesheet rule — the collapsed
+   rule below would then be silently ignored and the picture would stay on screen
+   under its own "hidden" stub (codex, #818). The video holder sets no inline
+   display, so it needs no equivalent. */
+.cmcp-imgcard > img { display: block; }
 /* Collapsed (#818). The media element is display:none rather than height-0 —
    that is what makes the video observer unmount the live <video> instead of
    leaving a decoding, looping element behind an invisible box. The stub is the
@@ -20685,7 +20691,9 @@ function buildPanel() {
     img.src = url;
     img.alt = name || "output";
     img.loading = "lazy";
-    img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
+    // NO inline `display` — it would outrank the collapsed rule in the stylesheet
+    // and the card would never actually hide (#818). `.cmcp-imgcard > img` sets it.
+    img.style.cssText = "max-width:100%;border-radius:6px;cursor:zoom-in;";
     img.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
     card.appendChild(img);
     attachMediaCollapse(card, { url, kind: "image", name, tools });

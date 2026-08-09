@@ -41,12 +41,45 @@ export const MEDIA_COLLAPSE_KEY = "comfyui-mcp.panel.collapsedMedia";
  *  they collapsed a very long time ago comes back expanded. */
 export const MAX_COLLAPSED_ENTRIES = 300;
 
-/** How much of a url is fed to the hash from each end. A ComfyUI /view link is
- *  under 200 chars and lands here whole; a `data:` URI is sampled instead of
- *  read in full, so painting a card is O(1) in the url's length rather than O(n)
- *  over several megabytes. Head + tail + length is enough to separate any two
- *  urls the panel actually paints. */
+/** How much of a url is fed to the hash from each sampled position. A ComfyUI
+ *  /view link is under ~1.5 kB and lands here whole; a `data:` URI is sampled
+ *  instead of read in full, so painting a card costs O(1) in the url's length
+ *  rather than O(n) over several megabytes — and a thread replay paints every
+ *  card at once. */
 const HASH_SAMPLE = 512;
+
+/** Fractions of the url the sampler reads from, besides the head and the tail.
+ *  Head + tail + length alone aliases DETERMINISTICALLY for two urls that share
+ *  their ends and their length (codex, #818) — which for a `data:` URI is not
+ *  the far-fetched case it sounds like: two renders of the same size from the
+ *  same encoder share a long header and can share a trailing chunk. Interior
+ *  samples make that require agreement in five separate places. */
+const HASH_INTERIOR = [0.25, 0.5, 0.75];
+
+/**
+ * The bounded slice of a url the hash actually reads: the whole thing when it is
+ * small, otherwise fixed windows at the head, at each HASH_INTERIOR fraction, and
+ * at the tail.
+ *
+ * THIS IS A SAMPLING HASH, AND THE LIMIT IS DELIBERATE. Two urls that agree in
+ * LENGTH and in every sampled window get the same id. That is accepted because of
+ * what the id decides: at worst one card starts collapsed when its neighbour was
+ * the one collapsed. What is NOT accepted is aliasing that a realistic pair of
+ * urls hits systematically, which head + tail + length alone did (codex, #818) —
+ * two renders of one size from one encoder share a long header and can share a
+ * trailing chunk, so the interior windows are what separate them.
+ */
+function hashSample(s) {
+  const windows = 2 + HASH_INTERIOR.length;
+  if (s.length <= HASH_SAMPLE * windows) return s;
+  const parts = [s.slice(0, HASH_SAMPLE)];
+  for (const at of HASH_INTERIOR) {
+    const from = Math.floor(s.length * at);
+    parts.push(s.slice(from, from + HASH_SAMPLE));
+  }
+  parts.push(s.slice(-HASH_SAMPLE));
+  return parts.join("~");
+}
 
 /** FNV-1a, 32-bit, as an unsigned integer. */
 function fnv1a(str, seed) {
@@ -67,18 +100,15 @@ function fnv1a(str, seed) {
  * neighbour was the one collapsed, which is why a cryptographic digest (async,
  * and unavailable in a non-secure context) would be the wrong tool here.
  *
- * The sampled input carries the url's LENGTH, so two urls sharing a long head
- * and tail — the shape query-string variants actually take — still differ.
+ * The sampled input carries the url's LENGTH plus interior windows, so two urls
+ * that agree on a long head and tail — the shape query-string variants and
+ * same-encoder `data:` URIs actually take — still differ.
  */
 export function mediaCollapseId(url) {
   if (typeof url !== "string") return null;
   const trimmed = url.trim();
   if (!trimmed) return null;
-  const sample =
-    trimmed.length <= HASH_SAMPLE * 2
-      ? trimmed
-      : `${trimmed.slice(0, HASH_SAMPLE)} ${trimmed.slice(-HASH_SAMPLE)}`;
-  const keyed = `${trimmed.length} ${sample}`;
+  const keyed = `${trimmed.length} ${hashSample(trimmed)}`;
   const a = fnv1a(keyed, 0x811c9dc5);
   const b = fnv1a(keyed, 0x01000193);
   return a.toString(16).padStart(8, "0") + b.toString(16).padStart(8, "0");

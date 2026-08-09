@@ -42,14 +42,64 @@ test("the id is fixed width regardless of url size — a data: URI cannot bloat 
 });
 
 test("two long urls sharing a head and tail still differ — the length is keyed in", () => {
-  // The sampled hash reads only the ends, which is exactly the shape a query
-  // string variant takes. Without the length in the key these would collide.
+  // The sampled hash reads only fixed windows, which is exactly the shape a
+  // query-string variant takes. Without the length in the key these collide.
   const head = "x".repeat(600);
   const tail = "y".repeat(600);
   assert.notEqual(
     mediaCollapseId(`${head}AAAA${tail}`),
     mediaCollapseId(`${head}AAAAA${tail}`),
   );
+});
+
+test("same length, same head and tail, different MIDDLE ⇒ different ids (codex)", () => {
+  // Head + tail + length alone aliases deterministically here, which for a
+  // `data:` URI is not far-fetched: two renders of one size from one encoder
+  // share a long header and can share a trailing chunk. Interior windows are
+  // what make this case separate.
+  const head = "h".repeat(5000);
+  const tail = "t".repeat(5000);
+  const a = `${head}${"a".repeat(5000)}${tail}`;
+  const b = `${head}${"b".repeat(5000)}${tail}`;
+  assert.equal(a.length, b.length);
+  assert.notEqual(mediaCollapseId(a), mediaCollapseId(b));
+});
+
+test("a difference at ANY sampled position separates the ids", () => {
+  // head, 25%, 50%, 75%, tail — one window each. A change landing in any of
+  // them must be visible to the hash.
+  const base = "z".repeat(20_000);
+  const ids = new Set([mediaCollapseId(base)]);
+  for (const at of [0, 0.25, 0.5, 0.75, 1]) {
+    const i = Math.min(Math.floor(base.length * at), base.length - 1);
+    ids.add(mediaCollapseId(`${base.slice(0, i)}Q${base.slice(i + 1)}`));
+  }
+  assert.equal(ids.size, 6, "every sampled position must be load-bearing");
+});
+
+test("the sampling limit is real and documented, not accidental", () => {
+  // Two urls of equal length agreeing in every sampled window DO collide. This
+  // is the accepted trade: the consequence is one card starting collapsed when
+  // its neighbour was the one collapsed, and reading megabytes per painted card
+  // to avoid it is the worse deal. Pinned so it stays a decision, not a surprise.
+  // For a 20k string the windows sit at 0, 5000, 10000, 15000 and 19488, each
+  // 512 wide. Offset 8000 falls in the gap between the 25% and 50% windows, so
+  // the hash never reads it.
+  const pad = "z".repeat(20_000);
+  const a = `${pad.slice(0, 8000)}AAAA${pad.slice(8004)}`;
+  const b = `${pad.slice(0, 8000)}BBBB${pad.slice(8004)}`;
+  assert.equal(a.length, b.length);
+  assert.equal(mediaCollapseId(a), mediaCollapseId(b));
+});
+
+test("hashing a multi-megabyte data URI stays cheap", () => {
+  // Sampling, not reading. A thread replay paints every card at once, so an
+  // O(n) hash over several megabytes per card would be felt.
+  const huge = `data:image/png;base64,${"A".repeat(8_000_000)}`;
+  const started = process.hrtime.bigint();
+  mediaCollapseId(huge);
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(ms < 50, `expected a bounded hash, took ${ms.toFixed(1)}ms`);
 });
 
 test("nothing keyable is null, not a shared bucket every card falls into", () => {
@@ -276,6 +326,41 @@ test("a collapsed card's toggle is not hover-gated — the way back must be visi
     /\.cmcp-imgcard\.cmcp-media-collapsed \.cmcp-media-collapse \{ opacity: 1; \}/,
   );
   assert.match(PANEL, /\.cmcp-imgcard\.cmcp-media-collapsed \.cmcp-media-stub \{ display: flex; \}/);
+});
+
+test("the image carries NO inline display — it would outrank the collapsed rule", () => {
+  // codex, #818: an inline `display:block` beats any stylesheet selector, so
+  // `.cmcp-media-collapsed > img { display: none }` was silently ignored and a
+  // collapsed image stayed on screen under its own "hidden" stub. The <img>
+  // must take `display` from the stylesheet, where the collapsed rule can win
+  // on specificity.
+  const painter = PANEL.slice(PANEL.indexOf("function paintImage"), PANEL.indexOf("function videoObserver"));
+  const inline = /img\.style\.cssText = "([^"]*)"/.exec(painter);
+  assert.ok(inline, "paintImage must still set the image's inline style");
+  assert.doesNotMatch(inline[1], /display\s*:/);
+  assert.match(PANEL, /\.cmcp-imgcard > img \{ display: block; \}/);
+});
+
+test("the video holder carries no inline display either", () => {
+  const painter = PANEL.slice(PANEL.indexOf("function paintVideo"), PANEL.indexOf("function paintAudio"));
+  const inline = /holder\.style\.cssText =\s*"([^"]*)"/.exec(painter);
+  assert.ok(inline, "paintVideo must still set the holder's inline style");
+  assert.doesNotMatch(inline[1], /display\s*:/);
+});
+
+test("no stray control characters reached the shipped sources", () => {
+  // A NUL and a U+0001 both landed inside string literals in this feature's
+  // sources during authoring — one of them made git treat the module as binary.
+  // They parse, they mostly even behave, and they are invisible in review.
+  const files = ["../../web/js/lib/media-collapse.js", "../../web/js/comfyui-mcp-panel.js"];
+  for (const rel of files) {
+    const s = readFileSync(new URL(rel, import.meta.url), "utf8");
+    const at = [...s].findIndex((ch) => {
+      const c = ch.charCodeAt(0);
+      return c < 9 || (c > 10 && c < 13) || (c > 13 && c < 32);
+    });
+    assert.equal(at, -1, `${rel} has a control character at index ${at}`);
+  }
 });
 
 test("a collapsed card does not print its filename twice", () => {
