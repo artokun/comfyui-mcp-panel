@@ -9,6 +9,8 @@ import {
   sealProvenRootBinding,
   graphRootMatchesState,
   resolveGraphBindingVerdict,
+  emptyCanvasBindingProven,
+  rootContentProvesActiveWorkflow,
 } from "../../web/js/lib/graph-binding.js";
 
 // #833 — with an EMPTY workflow active, every panel_* graph tool was refused and
@@ -171,22 +173,25 @@ test("TWO blank tabs no longer wedge every graph tool (#833)", () => {
   const uuid = "48e8cdaa-f399-4ba8-a76d-45dafc43d859";
   const root = emptyRoot();
 
+  // The CONTENT exclusivity probe is not satisfied — two blank tabs genuinely are
+  // ambiguous about which one an empty root belongs to.
+  assert.equal(proofExclusive(root, active, [active, other]), false);
+
   // The seal is still refused — two blank tabs genuinely are ambiguous, and this
   // change does not pretend otherwise.
-  const exclusive = proofExclusive(root, active, [active, other]);
-  assert.equal(exclusive, false, "a second blank tab still blocks the seal");
   assert.equal(
-    sealProvenRootBinding({ rootGraph: root, activeWorkflow: active, activeWorkflowUuid: uuid, proofExclusive: exclusive }),
+    sealProvenRootBinding({
+      rootGraph: root, activeWorkflow: active, activeWorkflowUuid: uuid, proofExclusive: false,
+    }),
     false,
   );
 
-  // …and the tools work anyway, because the canvas is now PROVABLY empty, which
-  // is the first escape and never needed the seal.
+  // …and the tools work, which is the point of the whole issue.
   assert.equal(graphEmptyBindingUnproven({ graph: root, rootGraph: root, activeWorkflow: active, activeWorkflowUuid: uuid }), false);
   assert.equal(
     resolveGraphBindingVerdict({
       graph: root, rootGraph: root, activeWorkflow: active, activeWorkflowUuid: uuid,
-      nodeCount: 0, includeBaselineReadGuard: true, requireDirtyMutationBinding: true,
+      liveNodeCount: 0, includeBaselineReadGuard: true, requireDirtyMutationBinding: true,
     }),
     null,
     "no refusal — a blank canvas is a legitimate state to read and build on",
@@ -292,3 +297,84 @@ test("the same two routes are blocked on the STAMPING side", () => {
   assert.equal(graphRootProvenEmpty(rootWith({ frontendVersion: '{"nodes":[{"id":1}]}' })), false);
   assert.equal(graphRootProvenEmpty(rootWith({ frontendVersion: "1.47.12" })), true);
 });
+
+// ── The DIRTY blank tab — the half 0.11.49 could not reach (#833 regression) ──
+//
+// Reported again on panel 0.11.62 after the 0.11.49 fix shipped. The escapes above
+// all require a CLEAN tab, and a blank tab is never clean: creating or clearing it
+// is what dirties it. So on the reported path both proofs are structurally
+// unavailable, and the regression report adds that it survives a hard refresh AND a
+// ComfyUI restart — there was no exit at all.
+//
+// Reproduced end-to-end before changing anything (browser_tests/blank-canvas-not-wedged.spec.ts):
+//     graph_outline  -> [empty-binding-unproven]
+//     graph_add_node -> [dirty-mutation-binding-unproven]
+
+const dirtyBlankTab = (name) => ({ ...blankTab(name), isModified: true });
+
+test("#833 regression: a DIRTY blank canvas is readable", () => {
+  const active = dirtyBlankTab("Untitled");
+  const root = emptyRoot();
+  // The old escapes genuinely cannot fire here — this is what makes it a wedge.
+  assert.equal(activeWorkflowProvenEmpty(active), false, "cleanliness proof is unavailable");
+  assert.equal(
+    rootContentProvesActiveWorkflow({ rootGraph: root, activeWorkflow: active, proofExclusive: true }),
+    false,
+    "content proof is unavailable — an empty canvas has nothing to match",
+  );
+  // …and the read is admitted anyway, because BOTH sides are provably content-free.
+  assert.equal(emptyCanvasBindingProven({ rootGraph: root, activeWorkflow: active }), true);
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: root, rootGraph: root, activeWorkflow: active, activeWorkflowUuid: null }),
+    false,
+  );
+});
+
+test("#833: emptiness is not a skeleton key", () => {
+  const uuid = "48e8cdaa-f399-4ba8-a76d-45dafc43d859";
+
+  // A workflow that claims NODES against an empty canvas is the FALSE-EMPTY read
+  // (#389/#604) and must stay fenced — this is the shape the guard exists for.
+  const claimsNodes = dirtyBlankTab("Has content");
+  claimsNodes.changeTracker.activeState = { ...emptyState(), nodes: [{ id: 1, type: "KSampler" }] };
+  assert.equal(emptyCanvasBindingProven({ rootGraph: emptyRoot(), activeWorkflow: claimsNodes }), false);
+
+  // A root holding content is not empty, whatever the workflow says.
+  const populatedRoot = {
+    _nodes: [{ id: 1 }],
+    extra: {},
+    serialize: () => ({ ...emptyState(), nodes: [{ id: 1, type: "KSampler" }] }),
+  };
+  assert.equal(
+    emptyCanvasBindingProven({ rootGraph: populatedRoot, activeWorkflow: dirtyBlankTab("A") }),
+    false,
+  );
+
+  // MID-LOAD is the one false-empty emptiness cannot exclude on its own: the canvas
+  // reads genuinely empty at that instant and is about to be populated.
+  assert.equal(
+    emptyCanvasBindingProven({ rootGraph: emptyRoot(), activeWorkflow: dirtyBlankTab("A"), graphLoading: true }),
+    false,
+  );
+  assert.equal(
+    sealProvenRootBinding({
+      rootGraph: emptyRoot(), activeWorkflow: dirtyBlankTab("A"),
+      activeWorkflowUuid: uuid, proofExclusive: true, emptyProofExclusive: true, graphLoading: true,
+    }),
+    false,
+    "a mid-load canvas must never be sealed",
+  );
+
+  // An unserializable root proves nothing (a bare empty _nodes array is not proof).
+  assert.equal(
+    emptyCanvasBindingProven({
+      rootGraph: { _nodes: [], extra: {} },
+      activeWorkflow: dirtyBlankTab("A"),
+    }),
+    false,
+  );
+
+  // No workflow service at all: the legacy availability path, not a new proof.
+  assert.equal(emptyCanvasBindingProven({ rootGraph: emptyRoot(), activeWorkflow: null }), false);
+});
+

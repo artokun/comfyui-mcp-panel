@@ -368,6 +368,7 @@ import {
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
+  emptyCanvasBindingProven,
   rootContentProvesActiveWorkflow,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -5359,7 +5360,27 @@ function assertGraphBoundToActiveWorkflow(
   // decisions below need it: the stale-tag rebind and the unstamped-root seal ask
   // the same question (is this canvas provably the active workflow's?) and must not
   // answer it differently.
+  // #833 — ComfyUI's OWN mid-load flag, not a proxy for it. A canvas mid-load reads
+  // genuinely empty at that instant and is about to be populated, which is the only
+  // FALSE-EMPTY reading a both-sides-empty proof cannot exclude by itself. Unreadable
+  // ⇒ true, so an unknown frontend proves nothing and the empty gate stays closed.
+  let graphLoading = true;
+  try {
+    const flag = activeWorkflow?.changeTracker?.constructor?.isLoadingGraph;
+    graphLoading = typeof flag === "boolean" ? flag : true;
+  } catch {
+    graphLoading = true;
+  }
   let sealProofExclusive = false;
+  // #833 — the EMPTY case needs its OWN exclusivity, because the rule below inverts
+  // here. Skipping a DIRTY twin is right for a CONTENT match (a lagging tracker cannot
+  // prove its state equals the root), but an empty root needs no proof to match a blank
+  // tab: a dirty blank twin is exactly as plausible an owner as the active tab. Sealing
+  // on the content rule would stamp the active identity onto a root that may be the
+  // other blank tab's, wedging THAT tab on the foreign tag the moment the user switched
+  // to it — this bug's mirror image, and the #349 tag protections rightly refuse to
+  // re-stamp it back. So: every OTHER open workflow must be READABLY non-empty.
+  // Unreadable or absent enumeration proves nothing and blocks the seal.
   try {
     const others = app?.extensionManager?.workflow?.openWorkflows;
     if (Array.isArray(others)) {
@@ -5401,6 +5422,11 @@ function assertGraphBoundToActiveWorkflow(
     // Anything unprovable fails closed, and the #389 case (empty root while
     // the workflow reports N>0 nodes) still fires via the baseline read
     // guard below.
+    // #833 deliberately does NOT relax this. A DIRTY blank tab cannot clear the clean-tab
+    // proof, so a blank canvas still cannot re-stamp a tag here — extending it was tried
+    // and withdrawn: it broke all 19 fence-protection tests, because re-stamping a tag on
+    // an empty root is a claim about WHOSE canvas it is, which emptiness cannot support.
+    // The #833 read relaxation is confined to `graphEmptyBindingUnproven`.
     const staleTagOnEmptyCanvas =
       graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
     // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused
@@ -5474,6 +5500,7 @@ function assertGraphBoundToActiveWorkflow(
     includeBaselineReadGuard,
     requireDirtyMutationBinding,
     postReconnectWindow: postReconnectSettleWindow(),
+    graphLoading,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }

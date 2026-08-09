@@ -169,13 +169,23 @@ export function graphRootMidPopulation({
  *   - with NO active workflow service at all, the legacy availability path
  *     stands (that frontend never had binding fences).
  */
-export function graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid } = {}) {
+export function graphEmptyBindingUnproven({
+  graph,
+  rootGraph,
+  activeWorkflow,
+  activeWorkflowUuid,
+  graphLoading = false,
+} = {}) {
   if (!!rootGraph && graph && graph !== rootGraph) return false; // subgraph scope
   const live = rootGraph?._nodes;
   if (!Array.isArray(live) || live.length !== 0) return false; // populated or unobservable
   if (!activeWorkflow) return false; // no workflow service — legacy availability
   if (activeWorkflowProvenEmpty(activeWorkflow)) return false; // PROVEN empty — truthful 0
   if (graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false; // positively bound
+  // #833 — both sides provably content-free. The clause above cannot fire on a blank
+  // tab (always dirty), which left the ordinary "about to build a workflow" state
+  // permanently refused.
+  if (emptyCanvasBindingProven({ rootGraph, activeWorkflow, graphLoading })) return false;
   return true; // empty + unproven + unbound ⇒ inconclusive, never authoritative-empty
 }
 
@@ -352,6 +362,54 @@ export function serializedStateProvenEmpty(state) {
 export function activeWorkflowProvenEmpty(activeWorkflow) {
   try {
     if (activeWorkflow?.isModified === true) return false;
+    return serializedStateProvenEmpty(activeWorkflowCurrentState(activeWorkflow));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * BOTH SIDES PROVABLY CONTENT-FREE — the one thing that can bind an EMPTY canvas
+ * (#833).
+ *
+ * Content cannot identify an empty canvas: every blank canvas serializes alike, so
+ * `rootContentProvesActiveWorkflow` has nothing to compare and the seal never fires.
+ * And a blank tab is ALWAYS dirty — creating or clearing it is what dirties it — so
+ * `activeWorkflowProvenEmpty` short-circuits on `isModified` and can never succeed
+ * either. Both proofs are therefore permanently unavailable in exactly the state a
+ * user is in right before asking an agent to build a workflow: reads refused as
+ * `empty-binding-unproven`, mutations as `dirty-mutation-binding-unproven`, with no
+ * recovery that clears it.
+ *
+ * This is #565's own rule, applied where it was never reached. That gate already
+ * re-stamps a MISMATCHED tag when both sides are proven content-free, on the stated
+ * grounds that **the #349 fence protects CONTENT** and there is none. The same holds
+ * for an UNTAGGED root, and it does not stop holding because the tab is dirty:
+ *
+ *   - the lag `isModified` guards against (#545) is neutralised by the CONJUNCTION,
+ *     not by cleanliness. A lagging tracker's state is merely OLD; if either the
+ *     stale snapshot or the live root held content, that side fails its proof and
+ *     this returns false. Both sides can only agree on empty when neither has any.
+ *   - what cleanliness genuinely proves elsewhere is IDENTITY by content match, and
+ *     that is not what is claimed here. Nothing is being matched — the claim is only
+ *     that there is no content anywhere to mis-attribute.
+ *
+ * `graphLoading` is the one case emptiness alone cannot exclude: a canvas mid-load
+ * reads genuinely empty at that instant and is about to be populated, which is the
+ * FALSE-EMPTY reading the refusal text names. The caller passes ComfyUI's own
+ * `ChangeTracker.isLoadingGraph` rather than a proxy for it; unreadable ⇒ pass true
+ * and prove nothing.
+ *
+ * Deliberately NOT weakened to "the root is empty": an empty ROOT with a workflow
+ * that reports content is #389, and it must keep failing.
+ */
+export function emptyCanvasBindingProven({ rootGraph, activeWorkflow, graphLoading = false } = {}) {
+  try {
+    if (graphLoading === true) return false; // mid-load ⇒ a 0 read may be FALSE-empty
+    if (!activeWorkflow) return false; // no workflow service — legacy availability path
+    if (!graphRootProvenEmpty(rootGraph)) return false; // the live canvas holds content
+    // The workflow's OWN current state, WITHOUT the cleanliness short-circuit — see
+    // above for why dirtiness does not weaken a both-sides-empty claim.
     return serializedStateProvenEmpty(activeWorkflowCurrentState(activeWorkflow));
   } catch {
     return false;
@@ -1466,6 +1524,13 @@ export function sealProvenRootBinding({
     // A CONFLICTING stamp is the rebind path's decision, never overwritten here.
     const existing = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
     if (typeof existing === "string" && existing) return false;
+    // #833 — an EMPTY canvas can never clear this proof: every blank canvas serialises
+    // alike, so there is nothing to match, and a blank tab is always dirty besides. That
+    // is why mutations stay refused on one. Sealing on emptiness was tried and withdrawn:
+    // it would stamp the ACTIVE identity onto a root that a reconnect tab restore may
+    // have left holding a DIFFERENT blank workflow (the #708 mismatch), putting the first
+    // node on the wrong canvas. Emptiness proves there is nothing to mis-attribute; a
+    // seal claims WHOSE canvas this is, and only the read gate needs the weaker fact.
     if (!rootContentProvesActiveWorkflow({ rootGraph, activeWorkflow, inSubgraph, proofExclusive })) {
       return false;
     }
@@ -1539,6 +1604,7 @@ export function resolveGraphBindingVerdict({
   includeBaselineReadGuard = true,
   requireDirtyMutationBinding = false,
   postReconnectWindow = false,
+  graphLoading = false,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -1616,7 +1682,7 @@ export function resolveGraphBindingVerdict({
       ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
-  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
+  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid, graphLoading })) {
     return { reason: "empty-binding-unproven", expected: activeWorkflowNodeCount(activeWorkflow) };
   }
   return null;
