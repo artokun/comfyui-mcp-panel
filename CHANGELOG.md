@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.53] - 2026-08-09
+
+> Covers changes since 0.11.52.
+
+### Fixed
+- `panel_add_node`'s schema-drift refusal pointed at the wrong recovery. When a node class's
+  required inputs changed since the page loaded its schema — moving a model file between
+  folders is enough — the panel correctly refuses to build the stale shape, but it told you to
+  reload the whole ComfyUI tab. `panel_refresh_nodes` clears the same condition in place and
+  costs no canvas state: it re-fetches `/object_info` and re-registers the class, which is
+  exactly what the refusal is waiting for. The message now leads with that, keeps the tab reload
+  as the fallback, and says what the refresh does NOT fix — nodes already on the canvas keep the
+  shape they were created with (#852)
+
 ## [0.11.52] - 2026-08-09
 
 > Covers changes since 0.11.51.
