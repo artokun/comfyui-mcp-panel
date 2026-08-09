@@ -123,6 +123,30 @@ test("mode (bypass/mute) is execution semantics, not presentation", () => {
   assert.ok(d.fields.includes("mode"));
 });
 
+test("node `shape` is not cosmetic — it is not one of the ignored recolors", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { shape: 2 })],
+    actualNodes: [node(1, "KSampler", { shape: 1, size: [9, 9] })],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, false);
+  assert.ok(d.fields.includes("shape"));
+});
+
+test("color and bgcolor ARE cosmetic — a deliberate policy, pinned here", () => {
+  // The panel's own diff ignores "pure moves/resizes/recolors", and this set is
+  // borrowed from it so the two cannot disagree. If user colour-coding should
+  // ever count as work the all-clear must not cover, THIS is the decision to
+  // change — and the sentence in COSMETIC_NODE_FIELDS with it.
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { color: "#333", bgcolor: "#444" })],
+    actualNodes: [node(1, "KSampler", { color: "#a00", bgcolor: "#b00" })],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, true);
+  assert.deepEqual(d.fields, ["bgcolor", "color"]);
+});
+
 test("the identity key is injective — a delimiter collision is not a matched node", () => {
   // With `id + "|" + type`, these two pair up as the same node.
   const d = classifyNodeDifference({
