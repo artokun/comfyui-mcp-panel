@@ -228,7 +228,7 @@ test("a thread from ANOTHER workflow still does not match", () => {
   );
 });
 
-// ── #847: the route stamp must survive a first SAVE within the session ────
+// ── #847: what a first SAVE does to history, and what the panel may infer ──
 //
 // The durable half — rewriting the stamps on disk — is deliberately NOT here. It
 // needs positive proof that an old id was this tab's, and the panel does not have
@@ -324,7 +324,7 @@ test("WIRING #847: the panel decides through that function, not its own copy", (
   );
   const site = src.slice(
     src.indexOf("const stillOpenRouteIds = (() => {"),
-    src.indexOf("let migratedRouteStamp = false;"),
+    src.indexOf("let savedThisTick = false;"),
   );
   assert.ok(site.includes("migratableRouteIds({"), "…and called at the migration site");
   assert.ok(site.includes("openRouteIds: stillOpenRouteIds"), "…with the OPEN set it computed");
@@ -344,31 +344,10 @@ test("WIRING #847: an open history pane is repainted after a migration", () => {
   assert.ok(src.includes("let repaintHistoryList = null;"), "a module-level handle must exist");
   assert.ok(src.includes("repaintHistoryList = paintList;"), "the pane must publish its repaint");
   const site = src.slice(
-    src.indexOf("const migratedRouteStamp = priorRouteIds.size > 0;"),
+    src.indexOf("const savedThisTick = priorRouteIds.size > 0;"),
     src.indexOf("      if (thread) {"),
   );
   assert.ok(site.includes("repaintHistoryList?.()"), "a migration must repaint an open pane");
   assert.ok(site.includes("try {") && site.includes("} catch {"), "and a stale handle must not break the poll");
 });
 
-test("WIRING #847: the tab's id lineage is recorded and consulted", () => {
-  // The durable rewrite lands on the poll. Until it does, the filter still has to
-  // be right — so the ids this tab used to carry are remembered under the id it has
-  // now, in a plain Map that survives the workflow OBJECT being replaced (which is
-  // what defeats `_priorTempWorkflowIds`).
-  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.ok(src.includes("const _routeIdLineage = new Map();"), "the lineage map must exist");
-  const record = src.slice(
-    src.indexOf("const priorRouteIds = migratableRouteIds({"),
-    src.indexOf("let migratedRouteStamp = false;"),
-  );
-  assert.ok(record.includes("_routeIdLineage.set(wfid, held)"), "it must be recorded, keyed by the NEW id");
-  const filter = src.slice(
-    src.indexOf("const liveRouteId = workflowTabId();"),
-    src.indexOf("threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys)"),
-  );
-  assert.ok(
-    filter.includes("_routeIdLineage.get(liveRouteId)"),
-    "…and consulted by the filter, or it buys nothing",
-  );
-});

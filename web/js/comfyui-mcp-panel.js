@@ -1469,20 +1469,7 @@ const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 // migration (the orchestrator moves the pin unchanged), so the guard must still
 // recognize it as naming this same instance (#186).
 const _priorTempWorkflowIds = new WeakMap();
-/**
- * Route ids this tab USED TO have, keyed by the id it has now (#847).
- *
- * `_priorTempWorkflowIds` above is keyed on the live workflow OBJECT, and ComfyUI
- * replaces that object across a save — verified while fixing this: a thread stamped
- * `tmp:` on a tab that was already saved could not be matched back to it, because by
- * the time anything asked, the WeakMap's key was gone.
- *
- * A plain Map keyed by the NEW id survives that. It only ever holds ids this panel
- * minted for this tab, so it cannot name another workflow's threads, and it is
- * in-memory by design: the durable half is the stamp rewrite in
- * `onWorkflowMaybeChanged`, which this exists to cover until that lands.
- */
-const _routeIdLineage = new Map();
+
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 
@@ -22263,22 +22250,25 @@ function buildPanel() {
         candidateRouteIds: [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null],
         openRouteIds: stillOpenRouteIds,
       });
-      if (priorRouteIds.size) {
-        const held = _routeIdLineage.get(wfid) ?? new Set();
-        for (const id of priorRouteIds) held.add(id);
-        _routeIdLineage.set(wfid, held);
-      }
-      // NO DURABLE REWRITE HERE, deliberately — see the note on `_routeIdLineage`.
-      // Rewriting the stamps on disk needs POSITIVE proof that an old id was this
-      // tab's, and the panel does not have it: `openWorkflows` not claiming an id is
-      // absence of a competing claimant, not ownership (codex). Close A, switch to
-      // B, and A's conversations would migrate to B permanently. Measured that the
-      // in-memory match below fixes the reported case on its own, so the persisted
-      // write buys nothing here and risks the one thing this area must never do.
-      const migratedRouteStamp = priorRouteIds.size > 0;
+
+      // NOTHING IS MIGRATED HERE, and that is the finding rather than an omission.
+      //
+      // Threads stamped before a first save hold an id nothing answers to afterwards,
+      // and both ways of fixing that need to know the old id was THIS tab's past.
+      // The panel cannot prove it: the workflow OBJECT is replaced across the save
+      // (instrumented — the WeakMap that would vouch has nothing under its key by
+      // then), and `openWorkflows` not claiming an id is absence of a competing
+      // claimant, not ownership (codex). Close A, switch to B, and A's conversations
+      // would be attributed to B.
+      //
+      // So `priorRouteIds` is used for ONE thing: knowing that a genuine first save
+      // just happened, which is when an open history pane is showing a stale answer.
+      // No stamp is rewritten and no identity is inferred. #847 stays open for the
+      // rest, with the ownership gap written down rather than guessed at.
+      const savedThisTick = priorRouteIds.size > 0;
       // A pane that is already open painted the pre-migration answer and will not
       // repaint itself; nothing else changes its rows.
-      if (migratedRouteStamp) {
+      if (savedThisTick) {
         try {
           repaintHistoryList?.();
         } catch {
@@ -22464,10 +22454,7 @@ function buildPanel() {
         routeId: liveRouteId,
         priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
       });
-      // …plus every id this tab is known to have carried before (#847). The WeakMap
-      // above misses whenever ComfyUI replaced the workflow object across the save,
-      // which is most of the time.
-      for (const id of _routeIdLineage.get(liveRouteId) ?? []) currentWorkflowKeys.add(id);
+
       const visible = threads
         .filter((candidate) =>
           !currentOnly.checked || threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys))
