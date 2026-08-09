@@ -92,6 +92,43 @@ test("the busy refusal names the server it declined to restart", () => {
   assert.ok(branch.includes("rebootTargetFields()"));
 });
 
+// ── it has to be safe where it is called ───────────────────────────────────
+
+test("resolving the target cannot throw — one branch runs inside a catch", () => {
+  // The dropped-connection branch is a `catch`. If reading the identity could
+  // throw there, a reboot that FIRED would be reported as a failure — the exact
+  // inversion those branches exist to prevent. The whole chain swallows:
+  // getSetting catches, remoteUrlSetting type-guards, comfyuiUrlForAgent catches.
+  const url = PANEL.slice(
+    PANEL.indexOf("function comfyuiUrlForAgent() {"),
+    PANEL.indexOf("// #296/#291 — Local ComfyUI workspace path"),
+  );
+  assert.ok(url.includes("} catch {"), "the origin read must be guarded");
+  assert.ok(url.includes('return "";'), "…and fall back to an empty string");
+  const setting = PANEL.slice(
+    PANEL.indexOf("function remoteUrlSetting() {"),
+    PANEL.indexOf("function externalOrchestratorMode() {"),
+  );
+  assert.ok(setting.includes('typeof v === "string" ? v.trim() : ""'), "a non-string setting must not blow up");
+  const get = PANEL.slice(PANEL.indexOf("\nfunction getSetting(id) {"), PANEL.indexOf("function chatScopeMode() {"));
+  assert.ok(get.includes("} catch {"), "the settings read must be guarded");
+});
+
+test("a remote-URL override IS the target — not window.location.origin", () => {
+  // This is the reported case: the panel driving a ComfyUI that is not the one
+  // the headless tool targets. If the reply named the browser's own origin while
+  // the panel was actually operating on the override, the field would be a
+  // confident wrong answer — worse than the missing one it replaces.
+  const url = PANEL.slice(
+    PANEL.indexOf("function comfyuiUrlForAgent() {"),
+    PANEL.indexOf("// #296/#291 — Local ComfyUI workspace path"),
+  );
+  const overrideAt = url.indexOf("if (override) return override;");
+  const originAt = url.indexOf("window.location.origin");
+  assert.ok(overrideAt > 0 && originAt > 0, "both sources must be present");
+  assert.ok(overrideAt < originAt, "the override must win over the page origin");
+});
+
 // ── the prose a human actually reads ───────────────────────────────────────
 
 test("the failure messages name the server, not only the structured field", () => {
