@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.52] - 2026-08-09
+
+> Covers changes since 0.11.51.
+
+### Added
+- **Panel UI scale.** A new setting in ComfyUI Settings (Comfy MCP Agent → General → "Panel UI
+  scale (%)") scales the whole Agent sidebar — text, icons and spacing together — from 100% to
+  250%. Reported by a user on Windows 11 for whom the panel text was barely readable.
+
+  Worth knowing if you tried to fix this yourself: overriding `.cmcp-root { font-size }` in a
+  user stylesheet does **not** work, and that is not your mistake. The panel's inner sizes are
+  `rem`, which resolve against the page root rather than against the panel, so most text ignores
+  the override. This setting is the supported way to scale the panel (#753)
+
 ## [0.11.51] - 2026-08-09
 
 > Covers changes since 0.11.50.
