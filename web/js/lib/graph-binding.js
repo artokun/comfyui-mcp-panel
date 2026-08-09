@@ -241,21 +241,46 @@ const SERIALIZED_FORMAT_METADATA_KEYS = new Set([
  * where a second blank tab makes the exclusivity probe ambiguous, so nothing
  * sealed and every graph tool refused with no way out.
  *
- * A SCALAR cannot be graph content. Nodes, links, groups, reroutes and subgraph
- * definitions are structured; a string, number or boolean in `extra` is a stamp
- * or a setting, and neither is a graph. So scalars no longer defeat the proof,
- * while a non-empty ARRAY or OBJECT still does — which is what keeps the keys
- * that ARE content-bearing (`groupNodes`, `ue_links`, `linkExtensions`, a
- * stashed `reroutes`) defeating it exactly as before.
+ * THE RULE IS BY TYPE, NOT BY TRUST (codex). The first cut said "a scalar cannot
+ * be graph content" and admitted every scalar, present and future, from any
+ * extension. That is an accept-all-unknown policy on a fence that also gates root
+ * UUID stamping, and it has a real counterexample: an extension may stash a
+ * serialized graph as a JSON STRING. So:
+ *
+ *  - a BOOLEAN or a NUMBER is admitted, because a graph cannot be encoded in one.
+ *    That is a property of the type, not a judgement about who wrote it, so it
+ *    needs no allowlist and cannot be invalidated by a future extension;
+ *  - a STRING must be NAMED. `extra.frontendVersion` and its siblings are the
+ *    stamps that made every real workflow unprovable, and they are a short,
+ *    knowable list. Anything else stays content until someone establishes
+ *    otherwise — a workflow that keeps refusing is recoverable, a canvas stamped
+ *    with the wrong identity is not;
+ *  - an ARRAY or OBJECT is structured and stays content, which is what keeps
+ *    `groupNodes`, `ue_links`, `linkExtensions` and a stashed `reroutes`
+ *    defeating the proof exactly as before.
  *
  * This does not weaken the #560 protection it was written for. A tab that is
  * MID-RESTORE has the full graph in its tracker state — that is the restore
  * source — so it fails the `nodes.length !== 0` check above and never reaches
- * this rule. The strictness on scalars was protecting nothing and costing the
- * empty-canvas case its only exit.
+ * this rule. The strictness on version stamps was protecting nothing and costing
+ * the empty-canvas case its only exit.
  */
-const extraValueMayBeGraphContent = (value) =>
-  !isEmptySurfaceValue(value) && typeof value === "object";
+const EXTRA_METADATA_STRING_KEYS = new Set([
+  "frontendVersion",
+  "workflowRendererVersion",
+  "workflowHash",
+  "version",
+  "revision",
+]);
+
+const extraValueMayBeGraphContent = (key, value) => {
+  if (isEmptySurfaceValue(value)) return false;
+  if (typeof value === "boolean" || typeof value === "number") return false;
+  if (typeof value === "string") return !EXTRA_METADATA_STRING_KEYS.has(key);
+  // Arrays, objects, and anything exotic (bigint, symbol, function) stay content:
+  // an unrecognized shape is not evidence of emptiness.
+  return true;
+};
 
 /**
  * POSITIVE proof that a serialized graph state holds NO workflow content at
@@ -280,8 +305,8 @@ export function serializedStateProvenEmpty(state) {
         if (value == null) continue;
         if (typeof value !== "object" || Array.isArray(value)) return false;
         const { ds: viewport, comfyui_mcp: panelTag, ...workflowExtra } = value;
-        for (const extraValue of Object.values(workflowExtra)) {
-          if (extraValueMayBeGraphContent(extraValue)) return false;
+        for (const [extraKey, extraValue] of Object.entries(workflowExtra)) {
+          if (extraValueMayBeGraphContent(extraKey, extraValue)) return false;
         }
         continue;
       }

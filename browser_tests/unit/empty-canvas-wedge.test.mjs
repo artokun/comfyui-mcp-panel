@@ -70,17 +70,48 @@ test("a REAL empty workflow is provably empty — version stamps are not content
   assert.equal(activeWorkflowProvenEmpty(blankTab("Untitled")), true);
 });
 
-test("a scalar in `extra` cannot be graph content, whatever the extension called it", () => {
+test("a BOOLEAN or NUMBER in `extra` is admitted — a graph cannot be encoded in one", () => {
+  // Admitted by TYPE, so no allowlist is needed and no future extension can
+  // invalidate it. These are the per-workflow flags extensions actually write.
   for (const extra of [
-    { frontendVersion: "1.47.12" },
-    { workflowRendererVersion: 2 },
     { VHS_latentpreview: false },
-    { workflowHash: "abc123" },
-    { some_future_extension_setting: "on" },
+    { VHS_KeepIntermediate: true },
+    { qgn_locked: false },
+    { workflowRendererVersion: 2 },
+    { some_future_extension_flag: true },
     { aNumber: 0.5 },
   ]) {
     assert.equal(serializedStateProvenEmpty(emptyState(extra)), true, JSON.stringify(extra));
   }
+});
+
+test("a NAMED version string is admitted — these are what made every workflow unprovable", () => {
+  for (const extra of [
+    { frontendVersion: "1.47.12" },
+    { workflowHash: "abc123" },
+    { version: "1" },
+    { revision: "7" },
+  ]) {
+    assert.equal(serializedStateProvenEmpty(emptyState(extra)), true, JSON.stringify(extra));
+  }
+});
+
+test("an UNNAMED string stays content — a graph can be stashed as JSON text (codex)", () => {
+  // The counterexample that killed "any scalar is safe": accepting unknown
+  // strings is an accept-all-unknown policy on a fence that also gates root
+  // UUID stamping. A workflow that keeps refusing is recoverable; a canvas
+  // stamped with the wrong identity is not.
+  assert.equal(
+    serializedStateProvenEmpty(emptyState({ extension_graph: '{"nodes":[{"id":1}],"links":[]}' })),
+    false,
+  );
+  assert.equal(serializedStateProvenEmpty(emptyState({ some_future_extension_setting: "on" })), false);
+});
+
+test("exotic types are not evidence of emptiness either", () => {
+  assert.equal(serializedStateProvenEmpty(emptyState({ weird: 10n })), false);
+  assert.equal(serializedStateProvenEmpty(emptyState({ weird: Symbol("x") })), false);
+  assert.equal(serializedStateProvenEmpty(emptyState({ weird: () => {} })), false);
 });
 
 test("a STRUCTURED extra value still defeats the proof — that is where content hides", () => {
@@ -205,4 +236,33 @@ test("an empty root whose workflow is UNREADABLE still refuses — proof, not as
     true,
     "an unreadable workflow state is not evidence the canvas is genuinely empty",
   );
+});
+
+// ── The same bar gates root STAMPING, not just command authorization ────────
+// graphRootProvenEmpty runs this predicate on the LIVE root, and the panel uses
+// `graphRootProvenEmpty(root) && activeWorkflowProvenEmpty(wf)` to rebind a stale
+// root uuid and to stamp a newly created workflow. A false "proven empty" there
+// authorizes an identity write, so the tightened rule has to hold on this side
+// too (codex).
+
+test("graphRootProvenEmpty admits a real blank root", () => {
+  assert.equal(graphRootProvenEmpty(emptyRoot()), true);
+});
+
+test("graphRootProvenEmpty refuses a root stashing a graph as JSON text", () => {
+  const root = {
+    _nodes: [],
+    extra: {},
+    serialize: () => ({ ...emptyState(), extra: { extension_graph: '{"nodes":[{"id":1}]}' } }),
+  };
+  assert.equal(graphRootProvenEmpty(root), false, "an identity stamp must not be authorized here");
+});
+
+test("graphRootProvenEmpty refuses a root with structured extra content", () => {
+  const root = {
+    _nodes: [],
+    extra: {},
+    serialize: () => ({ ...emptyState(), extra: { groupNodes: { g: { nodes: [{ id: 1 }] } } } }),
+  };
+  assert.equal(graphRootProvenEmpty(root), false);
 });
