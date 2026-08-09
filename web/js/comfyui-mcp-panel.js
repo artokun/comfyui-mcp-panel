@@ -14524,7 +14524,9 @@ const GRAPH_TOOL_EXECUTORS = {
           //
           // The legacy rung is not lost, it is reordered behind this one: the v2-batch
           // branch below falls to legacy on its own 405, so the ladder is
-          // v2 → v2-batch → legacy, each step taken only on a proven method rejection.
+          // v2 → v2-batch → legacy, each TRANSITION triggered only by a method rejection
+          // (the rejection is proven; what it proves is that THIS route refuses, never
+          // that the next dialect works — that is settled by the next enqueue landing).
           // Monotonic, so it cannot cycle. #424's eventual legacy landing still
           // happens for a backend that really is legacy — it just gets there second.
           if (!enqueued && isMethodNotAllowed(err)) {

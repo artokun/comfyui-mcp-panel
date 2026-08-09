@@ -526,8 +526,8 @@ function graphUpdateDeps(overrides) {
     isManagerUnreachable,
     isManagerRouteMissing,
     dialectRetryTarget,
-    // #367 — the panel records a dialect the LIVE backend proved by rejecting the
-    // method. Harmless here; asserted directly in its own test below.
+    // #367 — the panel records a dialect the LIVE backend demonstrated by completing an
+    // enqueue on it. Harmless here; asserted directly in its own test below.
     noteManagerDialectDowngrade: () => {},
     reProbeManagerDialect: async () => "v2",
     waitForUpdateResult: async () => ({
@@ -668,9 +668,10 @@ test("#605: graph_update_node legacy-on-legacy unreachable surfaces the original
 
 test("#424: a 405 on the /v2 envelope still lands on the legacy self-update route (via marker)", async () => {
   // #367 reordered the ladder to v2 → v2-batch → legacy. The legacy landing this test
-  // exists for is unchanged; it is now reached after the batch route is tried, because
-  // a 405 on `queue/task` is the DEFINITION of v2-batch and this backend serves /v2.
-  // Here managerV2 405s every route, so the batch rung is refused too and legacy wins.
+  // exists for is unchanged; it is now reached after the batch route is TRIED, because a
+  // 405 on `queue/task` makes v2-batch the candidate worth one POST on a backend whose
+  // /v2 routes answer. It is only a candidate: here managerV2 405s every route, so the
+  // batch rung is refused too, legacy wins, and nothing is cached.
   const calls = [];
   const update = buildGraphUpdateNode(
     graphUpdateDeps({
