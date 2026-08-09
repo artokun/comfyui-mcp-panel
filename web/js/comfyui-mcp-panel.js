@@ -20111,10 +20111,28 @@ function buildPanel() {
   const MAX_WORKFLOW_VERSIONS = 20;
   const MAX_THREAD_MSGS = 5000;
   let historyPersistenceWarningCode = null;
+  // #861 — one note per panel, not one per persist.
+  let shadowEvictionNoted = false;
   const historyStore = new ChatHistoryStore({
     threadsKey: THREADS_KEY,
     maxThreads: MAX_THREADS,
     maxMessages: MAX_THREAD_MSGS,
+    // #861 — say it in the log, ONCE, and not in the transcript. Shedding cached
+    // chats to stay inside a byte budget is normal and lossless (nothing is evicted
+    // that is not durable elsewhere), so a system message would be nagging the user
+    // about correct behaviour. But it must not be invisible either: the bug being
+    // fixed here was the panel silently occupying a shared origin budget until
+    // ComfyUI failed and got the blame.
+    onShadowEvict: (ids, bytes) => {
+      if (shadowEvictionNoted) return;
+      shadowEvictionNoted = true;
+      console.info(
+        "[comfyui-mcp-panel] trimmed " + ids.length + " cached chat(s) from localStorage to stay " +
+          "under the panel's share of this origin's storage (now ~" + Math.round(bytes / 1024) + "KB). " +
+          "Nothing was lost — every trimmed chat is in IndexedDB and still listed in Chat history. " +
+          "localStorage is shared with ComfyUI, which needs it for workflow drafts and tab restore.",
+      );
+    },
     onPersistenceError: (failure) => {
       if (failure?.code === historyPersistenceWarningCode) return;
       historyPersistenceWarningCode = failure?.code || "history-persistence-unavailable";

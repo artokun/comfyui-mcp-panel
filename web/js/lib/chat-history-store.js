@@ -7,8 +7,25 @@ import { isThreadInScope } from "./workflow-chat-identity.js";
 export { isThreadInScope };
 
 export const CHAT_HISTORY_SCHEMA = 3;
+
+/**
+ * The IndexedDB version, DELIBERATELY SEPARATE from the record schema (#861).
+ *
+ * These were one constant, and the coupling was a trap: the fence at
+ * `mergeUnderCanonicalCheckpoint` is `snapshot.schemaVersion >= CHAT_HISTORY_SCHEMA`,
+ * so bumping the number to add an object store would have made every already-stored
+ * `schemaVersion: 3` snapshot read as UNFENCED — reopening the pre-v3 merge path the
+ * fence exists to close, on every existing install, as a side effect of a structural
+ * migration that has nothing to do with record shape.
+ *
+ * A store migration and a record-shape migration are different events. They now have
+ * different numbers, and only this one may be bumped to create or alter a store.
+ */
+export const CHAT_HISTORY_DB_VERSION = 4;
 export const CHAT_HISTORY_DB = "comfyui-mcp-panel-history";
 export const CHAT_HISTORY_STATE_KEY = "state";
+/** Object store holding quarantined pre-v3 transcripts — see LEGACY_STORE below. */
+export const CHAT_HISTORY_LEGACY_STORE = "legacy";
 export const CHAT_HISTORY_LOCAL_SNAPSHOT_KEY = "comfyui-mcp.panel.historySnapshot";
 export const CHAT_HISTORY_MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 export const CHAT_HISTORY_EXPORT_FORMAT = "comfyui-agent-panel-chat-history";
@@ -19,6 +36,22 @@ const DEFAULT_MAX_THREADS = 500;
 const DEFAULT_MAX_MESSAGES = 5000;
 const LOCAL_SHADOW_THREADS = 20;
 const LOCAL_SHADOW_MESSAGES = 200;
+/**
+ * A ceiling on what the panel may occupy in localStorage (#861).
+ *
+ * `localStorage` is per-ORIGIN, and the panel shares `http://localhost:8188` with
+ * ComfyUI. There is no per-extension budget: bytes the panel takes are bytes
+ * ComfyUI's own `saveDraft()` cannot have. When it loses that race the user sees
+ * "Failed to save workflow draft", `Comfy.Workflow.DraftIndex.v2` stops persisting,
+ * and every open workflow tab is gone on browser restart — with a clean backend log
+ * and nothing pointing at the panel.
+ *
+ * ~1.5MB of a typical 5MB origin budget. Not tuned to a measurement, because the
+ * budget is a browser-and-origin variable we cannot read: it is chosen to leave
+ * ComfyUI the clear majority of the origin, on the principle that a guest should
+ * not be the reason the host fails.
+ */
+const LOCAL_SHADOW_MAX_BYTES = 1_500_000;
 const IDB_OPEN_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_TOMBSTONES = 512;
 const DEFAULT_MAX_METADATA_OPS = 512;
@@ -1088,19 +1121,58 @@ function openDb(indexedDb) {
       resolve(db);
     };
     try {
-      request = indexedDb.open(CHAT_HISTORY_DB, CHAT_HISTORY_SCHEMA);
+      request = indexedDb.open(CHAT_HISTORY_DB, CHAT_HISTORY_DB_VERSION);
     } catch {
       finish(null);
       return;
     }
-    // The schema number is also the IndexedDB version: every future bump fires
-    // this callback. Structural store/index migrations belong here; record-shape
-    // migration remains app-layer normalization in mergeHistorySnapshots().
+    // CHAT_HISTORY_DB_VERSION — NOT the record schema (#861). Structural
+    // store/index migrations belong here; record-shape migration remains app-layer
+    // normalization in mergeHistorySnapshots().
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots");
+      // #861 — LEGACY_STORE. Quarantined pre-v3 transcripts had no durable home:
+      // the schema-3 fence keeps them out of the canonical snapshot, so the
+      // localStorage shadow was their ONLY copy and had to retain them in full,
+      // forever, in a budget shared with ComfyUI.
+      //
+      // The fence's reason does not reach here. It exists because legacy messages
+      // carry no ids and a stale pre-v3 writer re-hashes shifted ordinals, so
+      // nothing flagged can be DEDUPED INTO CANONICAL safely. This store is not
+      // canonical and nothing merges it — records go in keyed by thread id and come
+      // back out as the same quarantined threads. Storing them durably reopens none
+      // of that reasoning, and it is what lets the shadow finally be bounded.
+      if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) {
+        db.createObjectStore(CHAT_HISTORY_LEGACY_STORE);
+      }
     };
-    request.onsuccess = () => finish(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      // #861 — GET OUT OF THE WAY OF AN UPGRADE. Adding the legacy store made this
+      // the first version bump the panel has ever shipped, and a bump is the moment
+      // multiple tabs stop being free: an open connection at the old version BLOCKS
+      // another tab's upgrade until it closes. Without this the second ComfyUI tab
+      // waits out the open timeout, gets null, and reports IndexedDB unavailable —
+      // on a database that is merely busy. Caught by conversation-persistence, which
+      // opens a second tab on the same origin: green serially, red in parallel.
+      //
+      // Connections here are short-lived (every caller closes in a finally), so
+      // closing on demand costs at most one in-flight read, which the caller already
+      // treats as "unavailable" and retries.
+      try {
+        db.onversionchange = () => {
+          try {
+            db.close();
+          } catch {
+            // Already closing; the upgrade proceeds either way.
+          }
+        };
+      } catch {
+        // A connection that will not take the handler still works for this read.
+      }
+      finish(db);
+    };
     request.onerror = () => finish(null);
     // A blocked upgrade may still succeed after another tab closes its older
     // connection. Keep waiting; if it outlives the bound below, late success is
@@ -1120,6 +1192,169 @@ async function idbRead(indexedDb) {
       req.onsuccess = () => resolve(req.result || null);
       req.onerror = () => resolve(null);
     });
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Evict threads from the localStorage shadow until it fits a byte budget (#861).
+ *
+ * Count limits alone could not bound this: `LOCAL_SHADOW_THREADS`/`_MESSAGES` never
+ * applied to legacy threads, and even for ordinary ones 20 threads x 200 messages is
+ * a count, not a size — one transcript full of pasted workflow JSON outweighs
+ * hundreds of short ones. The quota that actually broke ComfyUI is measured in bytes,
+ * so the bound has to be too.
+ *
+ * ONLY `evictableIds` may be dropped. Everything in the shadow that is not durable
+ * somewhere else is off limits, because this is an eviction from a CACHE for
+ * everything that has a canonical copy and a DELETION for everything that does not.
+ * `protectedIds` (the live thread, and anything the caller is mid-write on) is never
+ * evicted even when durable — losing the transcript on screen to save space is not a
+ * trade a user would recognise as help.
+ *
+ * Oldest first, because a shadow exists for instant startup and the newest chats are
+ * the ones a user comes back to.
+ *
+ * Returns the snapshot unchanged when it already fits, so the common case pays one
+ * serialization and nothing else.
+ *
+ * @param {{threads?: Array}} localSnapshot
+ * @param {{maxBytes?: number, evictableIds?: Set<string>, protectedIds?: Set<string>}} opts
+ * @returns {{snapshot: object, serialized: string, evicted: string[]}}
+ */
+export function boundShadowBytes(localSnapshot, { maxBytes, evictableIds, protectedIds } = {}) {
+  const serialize = (snap) => JSON.stringify(snap);
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : Infinity;
+  let serialized = serialize(localSnapshot);
+  if (serialized.length <= limit) return { snapshot: localSnapshot, serialized, evicted: [] };
+
+  // Array OR Set. `protectedThreadIds` travels this file as an ARRAY (see
+  // retainBoundedThreads), and a `?.has` on it is silently `undefined` — which would
+  // have made every protected thread evictable rather than throwing anywhere a test
+  // could see it. Normalize instead of trusting the caller's shape.
+  const asSet = (value) => (value instanceof Set
+    ? value
+    : new Set(Array.isArray(value) ? value : []));
+  const protectedSet = asSet(protectedIds);
+  const evictableSet = asSet(evictableIds);
+
+  const threads = Array.isArray(localSnapshot.threads) ? localSnapshot.threads : [];
+  const canEvict = (thread) => {
+    const id = thread?.id;
+    if (typeof id !== "string" || !id) return false;
+    if (protectedSet.has(id)) return false;
+    // An empty evictable set means nothing has been PROVEN durable. Fail closed: an
+    // unbounded shadow is a quota bug, and deleting an only-copy transcript to fix
+    // it is a worse one.
+    return evictableSet.has(id);
+  };
+
+  // Cost each thread once. Re-serializing the whole snapshot per eviction is
+  // quadratic exactly when it matters — the reported install had a legacy set large
+  // enough to exhaust the origin — so evict against the estimate, then verify.
+  const order = threads
+    .filter(canEvict)
+    .map((thread) => ({ id: thread.id, ts: finiteTs(thread.updatedAt || thread.ts), cost: serialize(thread).length }))
+    .sort((a, b) => a.ts - b.ts);
+
+  const evicted = [];
+  let projected = serialized.length;
+  for (const candidate of order) {
+    if (projected <= limit) break;
+    evicted.push(candidate.id);
+    projected -= candidate.cost;
+  }
+  if (!evicted.length) return { snapshot: localSnapshot, serialized, evicted: [] };
+
+  const dropped = new Set(evicted);
+  const snapshot = { ...localSnapshot, threads: threads.filter((thread) => !dropped.has(thread.id)) };
+  serialized = serialize(snapshot);
+  // No verify-and-evict-more pass, and that is a claim rather than an omission:
+  // dropping a thread removes its own serialization AND the comma separating it, so
+  // the real saving is always at least `cost`. The estimate therefore UNDER-counts
+  // what each eviction buys — it can overshoot the budget downward, never leave it
+  // exceeded. An earlier draft carried a "finish the job exactly" loop here; no
+  // input could reach it, and a guard nothing can trigger reads as protection to the
+  // next person while protecting nothing. The invariant is pinned by test instead.
+  return { snapshot, serialized, evicted };
+}
+
+/**
+ * Read every quarantined pre-v3 transcript out of the legacy store (#861).
+ *
+ * Returns `null` — NOT `[]` — when the store cannot be reached. The difference is
+ * load-bearing: an empty store means "there are none", and an unreachable one means
+ * "unknown". Only the first licenses bounding the localStorage shadow; treating the
+ * second as empty would drop transcripts whose durable copy we merely failed to read.
+ */
+async function idbReadLegacy(indexedDb) {
+  const db = await openDb(indexedDb);
+  if (!db) return null;
+  try {
+    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return null;
+    return await new Promise((resolve) => {
+      let tx;
+      try {
+        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readonly");
+      } catch {
+        resolve(null);
+        return;
+      }
+      const req = tx.objectStore(CHAT_HISTORY_LEGACY_STORE).getAll();
+      req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : null);
+      req.onerror = () => resolve(null);
+      tx.onerror = () => resolve(null);
+      tx.onabort = () => resolve(null);
+    });
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Put every legacy thread into the legacy store, keyed by thread id (#861).
+ *
+ * ONE record per thread rather than one blob: a single oversized transcript then
+ * cannot block the rest from becoming durable, and a re-run overwrites in place
+ * instead of appending — so the migration is idempotent and can safely run on every
+ * read until it succeeds.
+ *
+ * Returns true only if the transaction COMPLETED. `oncomplete`, not the last
+ * `onsuccess`: individual puts succeed against a transaction that later aborts on
+ * quota, and reporting that as durable is what would license deleting the only other
+ * copy.
+ */
+async function idbWriteLegacy(indexedDb, threads) {
+  const list = Array.isArray(threads) ? threads.filter((t) => t && typeof t.id === "string" && t.id) : [];
+  if (!list.length) return true;
+  const db = await openDb(indexedDb);
+  if (!db) return false;
+  try {
+    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return false;
+    return await new Promise((resolve) => {
+      let tx;
+      try {
+        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readwrite");
+      } catch {
+        resolve(false);
+        return;
+      }
+      const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
+      try {
+        for (const thread of list) store.put(thread, thread.id);
+      } catch {
+        resolve(false);
+        return;
+      }
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    });
+  } catch {
+    return false;
   } finally {
     db.close();
   }
@@ -1200,6 +1435,24 @@ export class ChatHistoryStore {
     this.onPersistenceError = typeof options.onPersistenceError === "function"
       ? options.onPersistenceError
       : null;
+    // #861 — observability for the byte bound. Evicting from the shadow is normal
+    // and lossless once a thread is durable, but it is not nothing, and a store that
+    // silently shrinks what it shows is how the panel got into this in the first
+    // place: usage nobody could see, failing somewhere else.
+    this.onShadowEvict = typeof options.onShadowEvict === "function" ? options.onShadowEvict : null;
+    this.maxShadowBytes = Number.isFinite(options.maxShadowBytes)
+      ? options.maxShadowBytes
+      : LOCAL_SHADOW_MAX_BYTES;
+    /**
+     * Thread ids the legacy store has ACCEPTED (#861).
+     *
+     * The receipt that licenses evicting a legacy thread from the shadow. Empty
+     * until a legacy write completes, which is the fail-closed default: with no
+     * durable copy proven, nothing legacy is evictable and the shadow behaves
+     * exactly as it does today. A quota bug is worth fixing; it is not worth
+     * deleting the only copy of someone's transcripts to fix.
+     */
+    this._durableLegacyIds = new Set();
     this.lastShadowWriteOk = null;
     this.lastShadowError = null;
     this.writerId = options.writerId || globalThis.crypto?.randomUUID?.() || `writer-${Math.random().toString(16).slice(2)}`;
@@ -1358,11 +1611,59 @@ export class ChatHistoryStore {
       indexed,
       this.readLocal({ quarantineCheckpoint: indexed != null }),
     );
-    this._observeSnapshot(merged);
-    return merged;
+    const withLegacy = await this._restoreLegacyShadow(merged);
+    this._observeSnapshot(withLegacy);
+    return withLegacy;
   }
 
-  _writeLocalSnapshot(snapshot, protectedThreadIds) {
+  /**
+   * Re-attach durably-stored legacy transcripts, and migrate any that are still
+   * shadow-only (#861).
+   *
+   * Runs on every canonical read, deliberately. The migration is a `put` per thread
+   * keyed by id, so re-running it overwrites in place and costs nothing once
+   * everything is durable — which means a browser that was in private mode, or out
+   * of quota, or mid-upgrade on the first attempt simply succeeds on a later one
+   * rather than needing a one-shot migration flag that can be wrong.
+   *
+   * Reading returns `null` when the store is UNREACHABLE and `[]` when it is empty.
+   * Only the empty case may clear the durable receipts; treating unreachable as
+   * empty would revoke the licence to evict — harmless — but treating it as
+   * authoritative would let a later write believe threads were already durable when
+   * they were not.
+   */
+  async _restoreLegacyShadow(snapshot) {
+    const stored = await idbReadLegacy(this.indexedDb);
+    const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
+    if (stored === null) {
+      // Unreachable. Keep whatever the shadow gave us and prove nothing durable.
+      this._durableLegacyIds = new Set();
+      return snapshot;
+    }
+    this._durableLegacyIds = new Set(
+      stored.map((thread) => thread?.id).filter((id) => typeof id === "string" && id),
+    );
+    // The stored copy is additive: a thread the shadow already lost to a byte
+    // eviction comes back here, which is the whole point of giving it a home.
+    const known = new Set(threads.map((thread) => thread?.id).filter(Boolean));
+    const restored = stored
+      .filter((thread) => thread && typeof thread.id === "string" && !known.has(thread.id))
+      .map((thread) => ({ ...thread, legacyShadow: true }));
+    // Anything flagged in the shadow but not yet durable gets its home now.
+    const pending = threads.filter(
+      (thread) => thread?.legacyShadow === true && thread?.id && !this._durableLegacyIds.has(thread.id),
+    );
+    if (pending.length && await idbWriteLegacy(this.indexedDb, pending)) {
+      for (const thread of pending) this._durableLegacyIds.add(thread.id);
+    }
+    if (!restored.length) return snapshot;
+    const all = [...threads, ...restored].sort(
+      (a, b) => finiteTs(a.updatedAt || a.ts) - finiteTs(b.updatedAt || b.ts),
+    );
+    return { ...snapshot, threads: all };
+  }
+
+  _writeLocalSnapshot(snapshot, protectedThreadIds, { canonicalDurable = false } = {}) {
     // legacyShadow threads are excluded from IndexedDB by the schema fence, so
     // the local shadow is their only copy. Preserve every such thread and all
     // of its messages. A storage-quota failure is surfaced instead of claiming
@@ -1380,13 +1681,42 @@ export class ChatHistoryStore {
     }));
     const shadow = [...boundedOrdinary, ...legacyThreads]
       .sort((a, b) => finiteTs(a.updatedAt || a.ts) - finiteTs(b.updatedAt || b.ts));
-    const localSnapshot = { ...snapshot, threads: shadow };
-    const shadowById = new Map(shadow.map((thread) => [thread.id, thread]));
-    const complete = snapshot.threads.length === shadow.length &&
+    // #861 — the byte bound. Everything here is a CACHE of something durable except
+    // legacy threads, which are durable only once the legacy store has accepted
+    // them. `_durableLegacyIds` is that receipt, and it is the entire licence to
+    // evict: with no receipt the set is empty, nothing legacy is evictable, and the
+    // shadow keeps today's unbounded behaviour rather than deleting an only copy.
+    const evictableIds = new Set();
+    // Ordinary threads are a cache of CANONICAL — but only once canonical has
+    // actually accepted them. Before the IndexedDB merge lands (and on any install
+    // where IndexedDB is unavailable) the shadow is their only copy too, so the same
+    // rule applies to them as to legacy ones: no durable copy, no eviction.
+    if (canonicalDurable) {
+      for (const thread of boundedOrdinary) if (thread?.id) evictableIds.add(thread.id);
+    }
+    for (const thread of legacyThreads) {
+      if (thread?.id && this._durableLegacyIds?.has(thread.id)) evictableIds.add(thread.id);
+    }
+    const bounded = boundShadowBytes(
+      { ...snapshot, threads: shadow },
+      { maxBytes: this.maxShadowBytes, evictableIds, protectedIds: protectedThreadIds },
+    );
+    const localSnapshot = bounded.snapshot;
+    const keptThreads = Array.isArray(localSnapshot.threads) ? localSnapshot.threads : [];
+    if (bounded.evicted.length) this.onShadowEvict?.(bounded.evicted, bounded.serialized.length);
+    const shadowById = new Map(keptThreads.map((thread) => [thread.id, thread]));
+    const complete = snapshot.threads.length === keptThreads.length &&
       snapshot.threads.every((thread) =>
         shadowById.get(thread.id)?.msgs?.length === thread.msgs.length);
+    // A legacy thread missing from the shadow is only acceptable if the legacy store
+    // holds it. This is what keeps `legacyComplete` honest — and it is the reason a
+    // byte cap alone would have been wrong: without the receipt this reports false,
+    // `result.ok` stays false, `_dirtyWrite` is retained, and every later persist
+    // fires onPersistenceError forever against a state that can never fit.
+    const legacyComplete = legacyThreads.every((thread) =>
+      shadowById.has(thread.id) || this._durableLegacyIds?.has(thread.id));
     try {
-      this.storage?.setItem(this.snapshotKey, JSON.stringify(localSnapshot));
+      this.storage?.setItem(this.snapshotKey, bounded.serialized);
       this.lastShadowWriteOk = true;
       this.lastShadowError = null;
     } catch (error) {
@@ -1396,7 +1726,7 @@ export class ChatHistoryStore {
       return { committed: false, complete: false, legacyComplete: false };
     }
     try {
-      this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
+      this.storage?.setItem(this.threadsKey, JSON.stringify(keptThreads));
     } catch {
       // The atomic shadow is already committed.
     }
@@ -1405,7 +1735,7 @@ export class ChatHistoryStore {
     } catch {
       // The atomic shadow is already committed.
     }
-    return { committed: true, complete, legacyComplete: true };
+    return { committed: true, complete, legacyComplete };
   }
 
   persist(threads, meta = {}, options = {}) {
@@ -1441,12 +1771,35 @@ export class ChatHistoryStore {
     this._writePromise = this._writePromise
       .catch(() => null)
       .then(() => idbMergeWrite(this.indexedDb, snapshot, limits))
+      // #861 — give the quarantined transcripts their durable home BEFORE the
+      // shadow is rewritten. Order is the safety property: the receipt earned here
+      // is what `_writeLocalSnapshot` consults to decide whether a legacy thread may
+      // be evicted, so a write that fails simply leaves it unevictable rather than
+      // dropping the only copy. Never rejects — a legacy store that cannot be
+      // reached must not take the canonical write down with it.
+      .then(async (merged) => {
+        const legacy = (Array.isArray(merged?.threads) ? merged.threads : snapshot.threads || [])
+          .filter((thread) => thread?.legacyShadow === true && thread?.id);
+        const undurable = legacy.filter((thread) => !this._durableLegacyIds.has(thread.id));
+        if (undurable.length) {
+          try {
+            if (await idbWriteLegacy(this.indexedDb, undurable)) {
+              for (const thread of undurable) this._durableLegacyIds.add(thread.id);
+            }
+          } catch {
+            // Unreachable legacy store: nothing becomes evictable. Fail closed.
+          }
+        }
+        return merged;
+      })
       .then((merged) => {
         let postMergeShadowWrite = null;
         if (merged) {
           this._lastCommitted = merged;
           this._observeSnapshot(merged);
-          postMergeShadowWrite = this._writeLocalSnapshot(merged, protectedThreadIds);
+          postMergeShadowWrite = this._writeLocalSnapshot(merged, protectedThreadIds, {
+            canonicalDurable: true,
+          });
           try {
             this._broadcastChannel?.postMessage({ type: "history-changed", writerId: this.writerId });
           } catch {
