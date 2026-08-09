@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.56] - 2026-08-09
+
+> Covers changes since 0.11.55.
+
+### Fixed
+
+- **A first save no longer hides the chat you had before it (#847).** "Current
+  workflow only" showed one of two conversations held on the same tab and the
+  same canvas, minutes apart. Saving a workflow migrates its route id
+  (`tmp:<uuid>` to `wf:<path>`) and re-mints its storage uuid at the same
+  moment, so a chat recorded before the save shared no identity with the live
+  workflow and dropped out of a filter named for the workflow it was actually
+  held on. The filter now also accepts the workflow's pre-save id, which the
+  panel already records — nothing about lineage is guessed, so another
+  workflow's conversation still cannot be pulled in. Threads written before a
+  save are matched within the session; carrying that across a reload needs the
+  stamps rewritten at the save boundary and is still open.
+
+
 ## [0.11.55] - 2026-08-09
 
 > Covers changes since 0.11.54.
