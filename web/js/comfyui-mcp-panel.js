@@ -2780,13 +2780,12 @@ function effortComboOptions(backend) {
  * scaled panel would keep its original box and overflow or clip. zoom scales the
  * box too, which is what makes the sidebar's own scrolling keep working.
  *
- * THE HEIGHT COMPENSATION IS NOT OPTIONAL (#753, raised by the reporter).
- * `.cmcp-root` is `height: 100%`, and a zoomed element resolves its percentage
- * height in the ZOOMED coordinate space — at 150% it becomes half again taller
- * than the space it has, and the bottom of the composer goes off-screen. The
- * root's height is `calc(100% / var(--cmcp-ui-scale))`, so the variable set here
- * cancels exactly that. Scale and variable are written together for that reason;
- * setting one without the other is a broken panel.
+ * NO HEIGHT COMPENSATION IS NEEDED, and adding one is actively wrong. The
+ * reporter flagged that a zoomed element MIGHT overflow a percentage-height
+ * parent; measured in Chrome, it does not — `height: 100%` inside a zoomed
+ * element already resolves against the parent in the zoomed coordinate space.
+ * The `calc(100% / scale)` that shipped first applied that correction a SECOND
+ * time and left the panel at 1/scale of its slot.
  * `target` — the specific root to style, for a panel that has been BUILT but not
  * yet ATTACHED (codex). `buildPanel` creates its root with `createElement` and
  * mounts it later, so a document query at that moment finds every panel except
@@ -2800,7 +2799,6 @@ function applyPanelUiScale(raw, target) {
   try {
     const roots = target ? [target] : document.querySelectorAll(".cmcp-root");
     for (const root of roots) {
-      root.style.setProperty("--cmcp-ui-scale", String(scale));
       // 1 is the default everywhere; clearing it keeps the DOM free of a no-op
       // zoom that would otherwise show up in every inspection of the panel.
       if (scale === 1) root.style.removeProperty("zoom");
@@ -16309,10 +16307,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 
 const PANEL_CSS = `
 .cmcp-root {
-  display: flex; flex-direction: column; min-height: 0;
-  /* #753 — divided by the UI scale so a zoomed panel still fits its parent;
-     see applyPanelUiScale. Defaults to 1, i.e. plain 100%. */
-  height: calc(100% / var(--cmcp-ui-scale, 1));
+  display: flex; flex-direction: column; height: 100%; min-height: 0;
+  /* #753 — a plain 100% is CORRECT under the UI-scale zoom, and dividing by the
+     scale is not. A percentage height inside a zoomed element ALREADY resolves
+     against the parent in the zoomed coordinate space, so the compensation that
+     shipped applied it twice (at 175%: 619px parent -> 202px root) and left the
+     composer stranded mid-panel above a band of empty space. Measured in Chrome,
+     both ways. Do not re-add it. */
   position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   font-size: 0.8125rem; line-height: 1.5;

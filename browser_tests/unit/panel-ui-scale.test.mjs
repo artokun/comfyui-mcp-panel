@@ -52,31 +52,41 @@ test("an unreadable value reads as 100%, not as zero", () => {
   }
 });
 
-// ── the height compensation ────────────────────────────────────────────────
+// ── the height, which needs NO compensation ───────────────────────
 
-test("the root height is divided by the scale, or a zoomed panel overflows", () => {
-  // Raised by the reporter and it is real: a zoomed element resolves a
-  // percentage height in the ZOOMED coordinate space, so `height: 100%` at 150%
-  // is half again taller than the space available and the composer goes
-  // off-screen. This is the line that cancels it.
-  assert.match(PANEL, /height: calc\(100% \/ var\(--cmcp-ui-scale, 1\)\)/);
-  // …and the plain `height: 100%` it replaces must be gone from that rule.
-  const rule = PANEL.slice(PANEL.indexOf(".cmcp-root {"), PANEL.indexOf("}", PANEL.indexOf(".cmcp-root {")));
-  assert.doesNotMatch(rule, /height: 100%/);
+test("the root keeps a plain 100% height — dividing by the scale is the bug", () => {
+  // Measured in Chrome, both ways: a percentage height inside a zoomed element
+  // ALREADY resolves against the parent in the zoomed coordinate space. The
+  // `calc(100% / scale)` that shipped first applied that correction a second
+  // time — at 175% a 619px parent gave a 202px root — and left the composer
+  // stranded mid-panel above a band of empty space.
+  // No slicing and no escapes: assert on the exact rule text. Anchoring by
+  // indexOf found the COMMENT that quotes this selector, and an escaped newline
+  // did not survive being generated.
+  assert.ok(
+    PANEL.includes("display: flex; flex-direction: column; height: 100%; min-height: 0;"),
+    "the root must keep a plain 100% height",
+  );
+  assert.ok(
+    !PANEL.includes("calc(100% / var(--cmcp-ui-scale"),
+    "the scale division must not come back",
+  );
 });
 
-test("the variable and the zoom are written together", () => {
-  // Either one alone is a broken panel: the variable without zoom shrinks the
-  // root for no reason, zoom without the variable overflows it.
+test("nothing writes the --cmcp-ui-scale variable any more", () => {
+  // It existed only to feed that calc. Leaving it behind would invite someone to
+  // reintroduce the division it was for.
+  assert.ok(!PANEL.includes("--cmcp-ui-scale"), "the variable and its calc go together");
+});
+
+test("the zoom is still what does the scaling", () => {
   const fn = PANEL.slice(
     PANEL.indexOf("function applyPanelUiScale(raw, target) {"),
     PANEL.indexOf("function getSetting(id)"),
   );
   assert.ok(fn.length > 0);
-  assert.match(fn, /setProperty\("--cmcp-ui-scale", String\(scale\)\)/);
-  assert.match(fn, /root\.style\.zoom = String\(scale\)/);
+  assert.ok(fn.includes("root.style.zoom = String(scale)"), "zoom is what scales the panel");
 });
-
 test("a scale of exactly 1 clears the zoom rather than writing a no-op", () => {
   const fn = PANEL.slice(
     PANEL.indexOf("function applyPanelUiScale(raw, target) {"),
