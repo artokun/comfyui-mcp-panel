@@ -21036,8 +21036,14 @@ function buildPanel() {
   function appendA2UICard(spec) {
     clearEmpty();
     const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
-    const handle = mountLiveA2UICard(rec);
+    // RECORD BEFORE MOUNTING, deliberately — this preserves the original ordering and
+    // it is load-bearing: record() can reach detachInvalidCurrentThread(), which calls
+    // resetFeed() and repaints. A card placed in the DOM and in `liveA2uiCards` BEFORE
+    // that would be wiped by the repaint it triggered, and — not yet being in any
+    // thread — would not come back. Recording first means the repaint happens while the
+    // card is still an unplaced value, and the mount below lands on the settled feed.
     record(rec);
+    const handle = mountLiveA2UICard(rec);
     scrollLog();
     return handle.cardId;
   }

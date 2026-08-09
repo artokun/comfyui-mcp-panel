@@ -121,3 +121,15 @@ test("#832 first paint and repaint mount through the SAME function", () => {
 test("#832 the live registry is written on both paths, via that shared function", () => {
   assert.match(fn(panelSrc, "mountLiveA2UICard"), /liveA2uiCards\.set\(handle\.cardId, \{ handle, rec \}\)/);
 });
+
+test("#832 the card is RECORDED before it is mounted — record() can repaint", () => {
+  // record() can reach detachInvalidCurrentThread(), which calls resetFeed() (clearing
+  // liveA2uiCards) and repaints. Mounting first would place the card into a feed that
+  // the very next statement can wipe, and the card is not yet in any thread, so the
+  // repaint would not bring it back. This is the ordering the pre-refactor code had.
+  const append = fn(panelSrc, "appendA2UICard");
+  assert.ok(
+    append.indexOf("record(rec)") < append.indexOf("mountLiveA2UICard(rec)"),
+    "record(rec) must precede the mount",
+  );
+});
