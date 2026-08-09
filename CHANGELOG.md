@@ -6,6 +6,37 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.64] - 2026-08-09
+
+> Covers changes since 0.11.63.
+
+### Fixed
+
+- **A blank canvas no longer refuses every graph tool (#833).** An empty canvas is the
+  ordinary state you are in right before asking the agent to build a workflow — and it
+  was the one state where the agent could not read the graph at all. Nothing cleared it:
+  re-targeting, creating a new workflow, and re-opening the tab all failed, and the
+  latest report adds that it survived both a hard refresh and a ComfyUI restart.
+
+  The guard was not treating "0 nodes" as a wrong canvas, as it appeared. It was
+  treating it as *unproven*, and on a blank canvas neither available proof can ever
+  succeed: identifying a canvas by its contents is impossible when there are none — every
+  blank canvas looks alike — and the other proof requires an unmodified tab, which a
+  blank one never is, because creating or clearing it is what marks it modified.
+
+  An empty canvas is now accepted as genuinely empty when both the canvas and the
+  workflow are independently shown to hold nothing. There is no content to attribute to
+  the wrong workflow, which is the same reasoning the panel already used elsewhere; it
+  simply could not be reached here. A canvas that merely *looks* empty because a
+  workflow is still loading is still refused, using ComfyUI's own loading signal.
+
+  **Reading works; building does not yet.** Adding nodes to a blank canvas is still
+  refused. Proving there is nothing to lose is enough to trust what a read returns, but
+  not enough to say *which* workflow an empty canvas belongs to — and a reconnect can
+  leave the canvas belonging to one blank tab while the panel is pointed at another, so
+  the first node could land on the wrong one. That half is tracked on #833 and needs a
+  real identity proof rather than a relaxation.
+
 ## [0.11.63] - 2026-08-09
 
 > Covers changes since 0.11.62.
