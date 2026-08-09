@@ -21,12 +21,18 @@ All notable changes to this project are documented here. This project adheres to
   off-screen card does not resurrect one (#818, #823)
 
 ### Fixed
-- An UNREACHABLE ComfyUI-Manager catalogue no longer renders as an empty node list. A
-  `getmappings` cache that was never populated — because Manager itself could not reach the
-  registry — answers HTTP 200 with `{}`, which came back as `count: 0` and read as “nothing
-  matched”, so a user behind a filter kept trying variations of a search that could never
-  succeed. A zero-entry catalogue is now reported as its own state: nothing was searched
-  (#808, #826)
+- An EMPTY ComfyUI-Manager catalogue no longer renders as “no matches”. A `getmappings`
+  response with no packs in it came back as `count: 0` — exactly what a healthy catalogue
+  returns when a query matches nothing — so the two were indistinguishable, and a user
+  whose Manager had no catalogue at all concluded the pack did not exist and kept trying
+  variations of a search that could never succeed. A zero-pack catalogue is now reported as
+  its own state: nothing was searched, so nothing follows about whether the pack exists.
+  The message names the host the catalogue actually comes from (Manager’s default channel,
+  not the pack-install registry) and the causes ComfyUI-Manager really produces an empty
+  one from — offline mode with no cache yet, or missing/unreadable Manager data files.
+  Note that a network failure does NOT empty the catalogue: Manager falls back to the copy
+  bundled in its own package, so a blocked channel surfaces as a STALE list rather than an
+  empty one, and telling stale from current is a gap this does not close (#808, #826)
 
 ## [0.11.46] - 2026-08-08
 
