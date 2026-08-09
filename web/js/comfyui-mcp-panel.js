@@ -11998,10 +11998,23 @@ const GRAPH_TOOL_EXECUTORS = {
                 const contentDiff = contentMatches
                   ? { comparable: true, surfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
+                // #887 — RE-READ the active pointer here rather than reusing `activeNow`.
+                // That one was measured inside the load's synchronous window; this message
+                // claims the target IS active in the present tense, and re-opening an
+                // already-open MODIFIED workflow lets the frontend's tab machinery settle
+                // after the await. A null pointer is deliberately passed as null, not false:
+                // "no active tab" and "could not read it" are the same observation here, and
+                // neither licenses asserting drift the panel did not actually see.
+                const activeAtCompose = activeWorkflowRef();
+                const activeStillTargetNow = activeAtCompose ? sameWorkflowObject(activeAtCompose, target) : null;
                 rebindFailed = new Error(
                   describeOpenRebindOutcome(verdict, {
                     targetLabel: target.filename || target.path || "the requested workflow",
                     activeLabel: activeNow ? activeNow.filename || activeNow.path || "another tab" : "no active tab",
+                    activeStillTargetNow,
+                    activeNowLabel: activeAtCompose
+                      ? activeAtCompose.filename || activeAtCompose.path || "another workflow"
+                      : null,
                     expectedMarker: openProofMarker,
                     observedMarker: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[OPEN_PROOF_FIELD] ?? null,
                     expectedUuid: targetUuid,

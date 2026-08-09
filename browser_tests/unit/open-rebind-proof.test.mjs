@@ -124,6 +124,13 @@ test("#604/#603/#616: the reported failure — a faithful repaint the frontend N
     targetLabel: "a.json",
     contentComparable: true,
     contentSurfaces: describeGraphStateDifference({ rootGraph, state: loaded }).surfaces,
+    // #887 — this scenario is a faithful repaint of the workflow that IS still active,
+    // so it now says so explicitly. The reassurance asserted below is re-earned at
+    // composition time from a SECOND read of the active pointer, rather than inherited
+    // from the one taken in the load window; an ABSENT re-read deliberately withholds
+    // it, because the sentence is in the present tense and absent evidence must not
+    // buy one. Passing `true` states the condition this test was always assuming.
+    activeStillTargetNow: true,
   });
   assert.match(text, /canvas IS bound to a\.json/, "the settled half must be stated as settled");
   assert.match(text, /You are NOT on the wrong workflow/, "the old message's worst implication is retracted");

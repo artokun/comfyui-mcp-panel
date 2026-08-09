@@ -256,6 +256,12 @@ test("a re-measured graph says nothing was lost, and drops the data-loss framing
     contentComparable: true,
     contentSurfaces: ["nodes"],
     contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["size"] },
+    // #887 — the "no missing work to redo" reassurance asserted below is only emitted
+    // while the target is STILL the active workflow at composition time, re-read rather
+    // than inherited from the load window. This test's scenario is a re-measured graph
+    // on the workflow that is still active, so it states that; an absent re-read
+    // withholds the reassurance by design rather than presuming it.
+    activeStillTargetNow: true,
   });
   // #696 (codex) — the claim is narrower than it was, and the assertion follows it.
   // The old wording promised "the only difference is presentation, which the ComfyUI

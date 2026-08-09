@@ -1127,6 +1127,51 @@ export function resolveOpenRebindVerdict({
 }
 
 /**
+ * #887 — whether workflow_open may still SAY the target is active.
+ *
+ * Every proof in `resolveOpenRebindVerdict` is captured in one synchronous window
+ * immediately after `loadGraphData` resolves. That is the right place to take them:
+ * it is the only moment this attempt's marker is known to be on the root. But
+ * `instanceStillTarget` is the one proof whose subject KEEPS MOVING afterwards — the
+ * active pointer is frontend state, and re-opening an already-open MODIFIED workflow
+ * lets ComfyUI's own tab machinery settle after the await returns.
+ *
+ * The disclosure then states that one observation in the PRESENT tense ("X IS the
+ * active one"). A past observation asserted as a standing fact is exactly what #887
+ * reports: true when measured, false when read — and the caller's next act is a
+ * Save-As onto whatever is actually active.
+ *
+ * So the reassurance is re-earned at composition time rather than inherited:
+ *
+ *   held       — re-read, still the target. The claim is current; say it.
+ *   drifted    — re-read, something ELSE is active now. The open did not stick, and
+ *                this is the case that makes Save-As unsafe. Say so plainly.
+ *   unreadable — could not re-read. NOT evidence of drift, and not licence to
+ *                reassure either: an unproven present-tense claim degrades to
+ *                unknown, never to the negative and never to the positive.
+ *   not-proven — the instance was never proven at load time; the existing "could not
+ *                confirm which workflow is active" wording already covers that and is
+ *                not weakened here.
+ *
+ * Kept as a pure exported decision because the wording branches on it: asserting on
+ * the message TEXT cannot tell this logic from its own inversion, which is how two
+ * earlier fences shipped with tests that survived the mutation.
+ */
+export const OPEN_ACTIVE_DRIFT = Object.freeze({
+  HELD: "held",
+  DRIFTED: "drifted",
+  UNREADABLE: "unreadable",
+  NOT_PROVEN: "not-proven",
+});
+
+export function openActiveDriftVerdict({ instanceProvenAtLoad, activeStillTargetNow } = {}) {
+  if (instanceProvenAtLoad !== true) return OPEN_ACTIVE_DRIFT.NOT_PROVEN;
+  if (activeStillTargetNow === true) return OPEN_ACTIVE_DRIFT.HELD;
+  if (activeStillTargetNow === false) return OPEN_ACTIVE_DRIFT.DRIFTED;
+  return OPEN_ACTIVE_DRIFT.UNREADABLE;
+}
+
+/**
  * What a CONTENT_UNVERIFIED open must ALSO say (#702).
  *
  * That branch has already PROVEN the binding — instance, marker and identity all match —
@@ -1276,6 +1321,32 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
   // unreadable pointer produces just as a real switch does, so that direction can only
   // say the panel could not confirm which workflow is active.
   const activeIsTarget = !(verdict?.unproven ?? []).includes("instance");
+  // #887 — the instance proof was taken in the load's synchronous window; the pointer
+  // can move afterwards. Re-earn the present-tense reassurance instead of inheriting it.
+  const drift = openActiveDriftVerdict({
+    instanceProvenAtLoad: activeIsTarget,
+    activeStillTargetNow: observed.activeStillTargetNow,
+  });
+  const activeNowLabel = observed.activeNowLabel || "another workflow";
+  // `reassurance` is the sentence each branch WOULD have ended with. It survives only
+  // while the claim is still true; drift replaces it with the warning the caller needs
+  // BEFORE a Save-As, and an unreadable re-read replaces it with neither.
+  const stillActive = (reassurance) => {
+    if (drift === OPEN_ACTIVE_DRIFT.DRIFTED) {
+      return (
+        ` ${activeNowLabel} is active NOW, not ${workflow} — the active workflow moved after the ` +
+        `open completed, so this canvas is NOT the one a save would write. Do NOT save or edit ` +
+        `expecting ${workflow}: re-open it and confirm with panel_list_workflows first.`
+      );
+    }
+    if (drift === OPEN_ACTIVE_DRIFT.UNREADABLE) {
+      return (
+        ` Which workflow is active NOW could not be re-read, so this reply cannot say that ` +
+        `${workflow} still is — confirm with panel_list_workflows before saving or editing.`
+      );
+    }
+    return reassurance;
+  };
   if (verdict?.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED) {
     // The precise answer, and precisely as far as it goes: the canvas IS this
     // workflow's, and what is unknown is narrower than "which workflow is this".
@@ -1343,17 +1414,22 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
         return (
           `${head}, carrying the same widget values and links. What differs is per-node ` +
           `presentation only, which the panel cannot call byte-identical, so the content ` +
-          `is reported UNCONFIRMED rather than failed.${because} You are on the right workflow ` +
-          `and there is no missing work to redo; if you need the exact graph, read it with ` +
-          `panel_graph_outline.` + FENCE_NOT_REFRESHED
+          `is reported UNCONFIRMED rather than failed.${because}` +
+          stillActive(
+            ` You are on the right workflow and there is no missing work to redo; if you need ` +
+              `the exact graph, read it with panel_graph_outline.`,
+          ) + FENCE_NOT_REFRESHED
         );
       }
       return (
         `${head}, and nothing extra appeared — no node was lost. What differs is ` +
         `per-node fields; the panel cannot tell from here whether the ComfyUI frontend ` +
         `normalized those or the load applied them differently, so the content is reported ` +
-        `UNCONFIRMED rather than failed.${because} You are on the right workflow; if you need ` +
-        `the exact graph, read it with panel_graph_outline.` + FENCE_NOT_REFRESHED
+        `UNCONFIRMED rather than failed.${because}` +
+        stillActive(
+          ` You are on the right workflow; if you need the exact graph, read it with ` +
+            `panel_graph_outline.`,
+        ) + FENCE_NOT_REFRESHED
       );
     }
     return (
@@ -1364,8 +1440,9 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
           `partly applied. `
         : `the panel could not READ the graph on it to compare against the state that was loaded, so ` +
           `whether the whole graph landed is unestablished — NOT established as wrong. `) +
-      `Treat the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} ` +
-      `You are NOT on the wrong workflow: ${workflow} IS the active one.` + FENCE_NOT_REFRESHED
+      `Treat the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because}` +
+      stillActive(` You are NOT on the wrong workflow: ${workflow} IS the active one.`) +
+      FENCE_NOT_REFRESHED
     );
   }
   if (verdict?.status === OPEN_REBIND_STATUS.UNPROVEN) {
