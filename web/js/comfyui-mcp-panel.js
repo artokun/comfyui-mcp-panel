@@ -21439,6 +21439,17 @@ function buildPanel() {
     // back to blank. Cleared only by a new source, which is the only thing that could
     // change the answer.
     if (holder._mediaFailedSrc && holder._mediaFailedSrc === holder.dataset.src) return;
+    // A DIFFERENT source gets a real attempt — and must not inherit the previous
+    // failure's styling (codex). The error paint appends inline declarations
+    // (display:grid, padding, muted colour); without restoring, a later valid video
+    // renders inside them and repeated failures keep appending. Restore the exact
+    // cssText from before the failure rather than clearing, which would also discard the
+    // learned aspect-ratio and any unrelated inline state.
+    if (holder._preFailCss != null) {
+      holder.style.cssText = holder._preFailCss;
+      holder._preFailCss = null;
+      holder._mediaFailedSrc = null;
+    }
     const v = document.createElement("video");
     v.muted = true;
     v.setAttribute("muted", ""); // required for muted autoplay on some browsers
@@ -21470,10 +21481,15 @@ function buildPanel() {
       // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is the codec/container case and is the only one
       // with an actionable remedy. A network or decode error gets a truthful, narrower
       // sentence rather than advice that would not help.
+      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is "unsupported source or type" — not
+      // exclusively a codec/container verdict, and some decode failures arrive as 3
+      // instead (codex). So the message offers re-encoding as a useful remedy rather
+      // than asserting it is the only one.
       const unsupported = v.error?.code === 4;
       holder.textContent = unsupported
         ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
         : "This video could not be loaded.";
+      holder._preFailCss = holder.style.cssText;
       holder.style.cssText +=
         ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
         "color:var(--p-text-muted-color,#a1a1aa);font-size:0.75rem;";

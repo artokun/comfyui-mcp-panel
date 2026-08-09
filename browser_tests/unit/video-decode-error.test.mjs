@@ -70,3 +70,14 @@ test("#909: the dead element releases its decode buffers", () => {
   assert.match(handler, /v\.removeAttribute\("src"\)/, "the source must be cleared");
   assert.match(handler, /v\.load\(\)/, "and load() called, the way unmount does it");
 });
+
+test("#909: a DIFFERENT source does not inherit the failure's styling", () => {
+  // The terminal guard is keyed on the source, so a new one bypasses it and mounts —
+  // and `textContent = ""` does not undo the appended inline declarations, so a valid
+  // video would render inside the error layout and repeated failures would keep
+  // appending (codex). Restoring the saved cssText is reversible; clearing it would
+  // also discard the learned aspect-ratio.
+  assert.match(mount, /holder\._preFailCss = holder\.style\.cssText;/, "the pre-failure styling is saved");
+  assert.match(mount, /holder\.style\.cssText = holder\._preFailCss;/, "and restored for a new source");
+  assert.match(mount, /holder\._mediaFailedSrc = null;/, "the terminal mark clears with it");
+});
