@@ -33,10 +33,11 @@ test("#909: the video mount reports a decode failure", () => {
   );
 });
 
-test("#909: MEDIA_ERR_SRC_NOT_SUPPORTED gets the actionable message, others do not", () => {
-  // Code 4 is the codec/container case and the only one with a remedy. A network or
-  // decode error gets a narrower, truthful sentence instead of advice that would not
-  // help — the same rule the rest of this file follows about not asserting a cause.
+test("#909: MEDIA_ERR_SRC_NOT_SUPPORTED gets the re-encode hint, others do not", () => {
+  // Code 4 is "unsupported source or type" — not exclusively codec/container, and some
+  // decode failures arrive as code 3 (codex). So re-encoding is OFFERED on 4 and never
+  // asserted as the only remedy, while other codes get a sentence that claims no cause
+  // at all — the same rule the rest of this file follows.
   assert.match(mount, /v\.error\?\.code === 4/, "the codec case must be distinguished");
   assert.match(mount, /could not be loaded/, "other failures need their own wording");
 });

@@ -21478,13 +21478,10 @@ function buildPanel() {
       // owning this element, and the element no longer having a source.
       if (holder._video !== v) return;
       if (!v.getAttribute("src")) return;
-      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is the codec/container case and is the only one
-      // with an actionable remedy. A network or decode error gets a truthful, narrower
-      // sentence rather than advice that would not help.
-      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is "unsupported source or type" — not
-      // exclusively a codec/container verdict, and some decode failures arrive as 3
-      // instead (codex). So the message offers re-encoding as a useful remedy rather
-      // than asserting it is the only one.
+      // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is "unsupported source or type" — NOT
+      // exclusively a codec/container verdict, and some decode failures arrive as code 3
+      // instead (codex). So re-encoding is offered as a useful remedy, never asserted as
+      // the only one, and the other codes get a narrower sentence that claims no cause.
       const unsupported = v.error?.code === 4;
       holder.textContent = unsupported
         ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
