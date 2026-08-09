@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.62] - 2026-08-09
+
+> Covers changes since 0.11.61.
+
+### Fixed
+
+- **Saving a workflow no longer writes stale values over your file (#878).** Saving
+  in place persisted ComfyUI's change snapshot rather than the live canvas, and that
+  snapshot only records what a *user* typed or clicked. So anything a node had set
+  for you was written out at its old value: an ImpactWildcardEncode populate, a
+  `control_after_generate` roll, a subgraph's promoted widgets.
+
+  Measured: with 1337 on the canvas, the file on disk received the node's default of
+  512. Nothing errored, and the canvas still showed 1337 — a save does not repaint —
+  so the file quietly disagreed with the screen until the next reopen.
+
+  Saving under a *new* name already refreshed the canvas first; the route that
+  overwrites an existing file was the one that did not. It now does, and refuses the
+  save outright if that refresh fails rather than writing something it knows is
+  behind.
+
+
 ## [0.11.61] - 2026-08-09
 
 > Covers changes since 0.11.60.
