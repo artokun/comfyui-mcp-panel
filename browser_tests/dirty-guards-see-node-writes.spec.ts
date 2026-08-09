@@ -80,8 +80,14 @@ test('closing a workflow refuses when a NODE left unsaved work', async ({
   expect(looksClean, 'precondition: isModified must still read false').toBe(true)
 
   // The guard must now refuse. Before #882 this closed the tab and the value was gone.
+  //
+  // Assert the ORIGINAL guard's sentence, not a loose /unsaved changes/: the refusal
+  // for an UNPROVEN capture reads "could not be checked for unsaved changes", so a
+  // loose match would be satisfied by a capture that never landed — passing while the
+  // flag this spec is about stayed stale. This wording is reached only when the
+  // capture succeeded AND flipped `isModified` to true, which is the whole fix.
   const closed = await mockBridge.command('workflow_close', { path: target, workflow_uuid: stamp })
-  expect(JSON.stringify(closed)).toMatch(/unsaved changes/i)
+  expect(JSON.stringify(closed)).toContain('has unsaved changes')
 
   // …and the workflow must still be open with the value on it.
   const stillThere = await page.evaluate(() => {

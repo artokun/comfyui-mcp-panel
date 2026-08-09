@@ -348,8 +348,8 @@ test("WIRING #882: graphIsDirty captures the canvas before reading isModified", 
   // Synchronous caller: a capture it cannot wait for, or one that threw, leaves the
   // flag not known to be current — the same position as unreadable, so confirm.
   assert.ok(
-    site.includes('captured === "pending" || captured === "failed"'),
-    "an unwaitable or failed capture must fall back to confirming",
+    /captured === "pending" \|\| captured === "failed" \|\| captured === "unverified"/.test(site),
+    "an unwaitable, failed or unverified capture must fall back to confirming",
   );
   const captureAt = site.indexOf("captureCanvasIntoTracker(wf)");
   const readAt = site.lastIndexOf("return wf.isModified;");
@@ -363,12 +363,35 @@ test("WIRING #882: the shared capture reports WHY it could not capture", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const fn = src.slice(
     src.indexOf("function captureCanvasIntoTracker(wf) {"),
-    src.indexOf("function activeWorkflowRef() {"),
+    src.indexOf("function captureWasSuppressed(tracker) {"),
   );
   assert.ok(fn.length > 0, "the helper must exist");
-  for (const verdict of ['"unavailable"', '"captured"', '"pending"', '"failed"', '"inactive"']) {
+  for (const verdict of [
+    '"unavailable"',
+    '"captured"',
+    '"pending"',
+    '"failed"',
+    '"inactive"',
+    '"unverified"',
+  ]) {
     assert.ok(fn.includes(verdict), `it must be able to report ${verdict}`);
   }
+  // "captured" must rest on EVIDENCE, not on the call returning. Upstream returns the
+  // same `undefined` for a real snapshot and for every silent no-op (mid-undo, open
+  // change transaction, graph loading), so claiming success from a bare return would
+  // authorise a close on a stale flag — this bug exactly (codex).
+  assert.ok(
+    fn.includes("tracker.activeState !== before"),
+    "a replaced snapshot object must be accepted as proof the capture landed",
+  );
+  assert.ok(
+    fn.includes("captureWasSuppressed(tracker)"),
+    "an unproven capture must be checked against the documented no-op windows",
+  );
+  assert.ok(
+    /!suppressed \? "captured" : "unverified"/.test(fn),
+    "a possibly-suppressed capture must report unverified, not captured",
+  );
   // Written as an early return for the non-thenable case, so accept either polarity —
   // what matters is that thenability is what separates "captured" from "pending".
   assert.ok(
@@ -424,6 +447,28 @@ test("WIRING #882: closing awaits a pending capture and refuses a failed one", (
   );
   // The refusal must key off the SETTLED verdict, not the provisional one, or a
   // capture that rejects after being awaited is still treated as merely pending.
-  assert.ok(site.includes('verdict === "failed" && !force'), "a failed capture must refuse");
+  assert.ok(
+    /verdict === "failed" \|\| verdict === "unverified"/.test(site),
+    "a failed OR unproven capture must refuse",
+  );
   assert.ok(site.includes("target.isModified && !force"), "the original guard must remain");
+  // The refusal must stay escapable, or a data-loss bug becomes a cannot-close bug.
+  assert.ok(site.includes("!force"), "force:true must still be able to close");
+});
+
+test("WIRING #882: the no-op windows are read defensively", () => {
+  // Upstream returns early — no throw, no signal — while a graph loads, while an
+  // undo restores, and inside an open change transaction. These are the documented
+  // conditions; an unreadable tracker must answer "suppressed" so the destructive
+  // callers confirm instead of assuming.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const fn = src.slice(
+    src.indexOf("function captureWasSuppressed(tracker) {"),
+    src.indexOf("function activeWorkflowRef() {"),
+  );
+  assert.ok(fn.length > 0, "the helper must exist");
+  for (const flag of ["_restoringState", "changeCount", "isLoadingGraph"]) {
+    assert.ok(fn.includes(flag), `it must account for ${flag}`);
+  }
+  assert.ok(/catch\s*{\s*\n?\s*return true;/.test(fn), "an unreadable tracker must not claim a capture");
 });

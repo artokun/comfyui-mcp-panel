@@ -1546,7 +1546,9 @@ let currentWorkflowRef = null;
  * this bug reads in the first place. `settled` is present only for "pending", and is
  * THE capture's own promise resolved to a final verdict:
  *
- *   "captured"    the tracker was asked to snapshot and did not fail
+ *   "captured"    a snapshot demonstrably landed; the flag is now truthful
+ *   "unverified"  the call returned normally but may have been a silent NO-OP, so the
+ *                 flag is not known to be current. See `captureWasSuppressed`.
  *   "pending"     the capture is asynchronous. `settled` resolves to the real verdict;
  *                 a synchronous caller cannot wait, so its flag is still stale.
  *   "failed"      it threw. The tracker is knowably behind the canvas.
@@ -1561,10 +1563,13 @@ let currentWorkflowRef = null;
  * ComfyUI's own `deactivate()` captures a tracker's state before its workflow goes
  * inactive.
  *
- * "captured" is a claim about the CALL, not a guarantee about the snapshot — upstream
- * also returns early mid-undo, inside a change transaction, and while a graph is
- * loading. In those windows this lands exactly where the code already was, trusting
- * `isModified`, so the guards are never worse than before then; only better.
+ * A capture that returns normally has NOT necessarily snapshotted: upstream returns
+ * early — silently, with the same `undefined` — mid-undo, inside a change transaction,
+ * and while a graph is loading. Reporting those as "captured" would authorise a close
+ * on a stale flag, which is this very bug (codex). So "captured" is only claimed on
+ * EVIDENCE: either the snapshot object was replaced (proof it landed), or none of the
+ * documented suppression conditions holds. Otherwise the verdict is "unverified" and
+ * the destructive callers refuse, with `force` as the escape hatch.
  */
 function captureCanvasIntoTracker(wf) {
   if (!wf || wf !== activeWorkflowRef()) return { verdict: "inactive" };
@@ -1573,23 +1578,52 @@ function captureCanvasIntoTracker(wf) {
   // the current name and keep the old one as the fallback for older frontends.
   const capture = tracker?.captureCanvasState ?? tracker?.checkState;
   if (typeof capture !== "function") return { verdict: "unavailable" };
+  // A capture that SEES a change assigns a brand-new state object. Identity change is
+  // therefore positive proof the snapshot landed, and needs no knowledge of internals.
+  const before = tracker.activeState;
   let result;
   try {
     result = capture.call(tracker);
   } catch {
     return { verdict: "failed" };
   }
-  if (!result || typeof result.then !== "function") return { verdict: "captured" };
+  // Read the suppression flags in the SAME tick as the call, before anything can move.
+  const suppressed = captureWasSuppressed(tracker);
+  const landed = () =>
+    tracker.activeState !== before || !suppressed ? "captured" : "unverified";
+  if (!result || typeof result.then !== "function") return { verdict: landed() };
   // Settle the capture's OWN promise. Starting a SECOND capture to await instead would
   // run it twice — and a capture that sees a change is not a read: it pushes an undo
   // entry and clears the redo queue. It would also leave this first promise unobserved.
-  return {
-    verdict: "pending",
-    settled: result.then(
-      () => "captured",
-      () => "failed",
-    ),
-  };
+  return { verdict: "pending", settled: result.then(landed, () => "failed") };
+}
+
+/**
+ * Could the capture we just asked for have been a silent no-op? (#882)
+ *
+ * Upstream `captureCanvasState()` returns early — no throw, no return value, no signal
+ * of any kind — when a graph is loading, when an undo/redo is restoring, when a change
+ * transaction is open, or when there is no graph. A caller that reads `isModified`
+ * after one of those has a stale flag and cannot tell.
+ *
+ * These are the documented conditions, read defensively: a version that renames one
+ * simply stops contributing, and an unreadable tracker answers "suppressed" so the
+ * destructive callers confirm rather than assume. It is deliberately CONSERVATIVE —
+ * every condition here is transient (mid-undo, mid-load, mid-transaction), so the
+ * refusal it can cause is rare and clears on retry, which is the right side to err on
+ * for a guard that would otherwise discard a canvas.
+ */
+function captureWasSuppressed(tracker) {
+  try {
+    if (tracker._restoringState) return true; // an undo/redo is restoring
+    if (Number(tracker.changeCount) > 0) return true; // inside a change transaction
+    if (tracker.constructor?.isLoadingGraph) return true; // a graph is loading
+    const graph =
+      window.comfyAPI?.app?.app?.graph ?? (typeof app !== "undefined" ? app?.graph : null);
+    return !graph;
+  } catch {
+    return true; // cannot tell → do not claim a capture
+  }
 }
 
 function activeWorkflowRef() {
@@ -12233,15 +12267,21 @@ const GRAPH_TOOL_EXECUTORS = {
     const captured = captureCanvasIntoTracker(target);
     const verdict =
       captured.verdict === "pending" ? await captured.settled : captured.verdict;
-    // A capture that FAILED leaves the tracker knowably behind the canvas, so the
-    // flag proves nothing. Refuse rather than close — `force` still discards, which
-    // is the caller saying they meant it. "inactive" is NOT a failure: a non-active
-    // tab was already frozen by ComfyUI's `deactivate()`, so its flag is trustworthy.
-    if (verdict === "failed" && !force) {
+    // A capture that FAILED — or that cannot be shown to have HAPPENED — leaves the
+    // tracker possibly behind the canvas, so the flag proves nothing. Refuse rather
+    // than close; `force` still discards, which is the caller saying they meant it.
+    // "inactive" is NOT a failure: a non-active tab was already frozen by ComfyUI's
+    // `deactivate()`, so its flag is trustworthy without any capture here.
+    if ((verdict === "failed" || verdict === "unverified") && !force) {
       throw new Error(
         `"${target.filename || target.path}" could not be checked for unsaved changes ` +
-          `(capturing the live canvas failed), so closing it might discard work. Save it ` +
-          `first (panel_save_workflow), or pass force:true to close anyway.`,
+          `(${
+            verdict === "failed"
+              ? "capturing the live canvas failed"
+              : "the live canvas could not be captured right now — an undo, a load, or a " +
+                "change already in flight suppresses it; this clears on its own"
+          }), so closing it might discard work. Save it first (panel_save_workflow), ` +
+          `retry, or pass force:true to close anyway.`,
       );
     }
     if (target.isModified && !force) {
@@ -20040,7 +20080,8 @@ function buildPanel() {
           // for — and neither can one that threw. Both mean the flag below is not
           // known to be current, which is the same position as unreadable: confirm.
           const captured = captureCanvasIntoTracker(wf).verdict;
-          if (captured === "pending" || captured === "failed") return true;
+          if (captured === "pending" || captured === "failed" || captured === "unverified")
+            return true;
           return wf.isModified;
         } catch { return true; }
       },
