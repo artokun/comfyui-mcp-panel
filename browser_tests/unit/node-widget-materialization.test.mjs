@@ -781,7 +781,7 @@ test("#695: graph_add_node consumes the report and message, and names the class"
   );
   assert.match(
     src,
-    /unavailableRequiredWidgetReport\(nodeData, comfyApp\?\.widgets, knownSocketTypes, currentDef\)/,
+    /unavailableRequiredWidgetReport\(nodeData, comfyApp\?\.widgets, socketTypes, currentDef\)/,
     "the poll checks the report",
   );
   assert.match(
@@ -791,8 +791,8 @@ test("#695: graph_add_node consumes the report and message, and names the class"
   );
   assert.match(
     src,
-    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*\)/,
-    "the class_type reaches the message",
+    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*widenSocketProof,\s*\)/,
+    "the class_type reaches the message, and #821's widen reaches the guard",
   );
 });
 
