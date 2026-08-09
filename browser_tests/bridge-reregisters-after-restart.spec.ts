@@ -2,7 +2,8 @@
  * #654 — after the orchestrator dies and comes back, the tab must re-register itself.
  *
  * The report: `panel_restart_comfyui` confirms `server_ready:true`, and the panel tab
- * never becomes usable again — `panel_tab_reconnected:false`, `graph_tools_ready:false`,
+ * never becomes usable again — the restart reply's tab-reconnected and
+ * graph-tools-ready flags both stay false,
  * `panel_set_workflow_target({mode:"current"})` deferred with no connected tab. Only a
  * manual browser refresh recovers it.
  *
