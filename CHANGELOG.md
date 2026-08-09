@@ -6,6 +6,39 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.63] - 2026-08-09
+
+> Covers changes since 0.11.62.
+
+### Fixed
+
+- **Closing a workflow no longer discards changes a node made (#882).** ComfyUI decides
+  whether a tab has unsaved work from a snapshot it takes when *you* type or click.
+  Anything a node set for you is invisible to it — an ImpactWildcardEncode populate, a
+  `control_after_generate` roll, a subgraph's promoted widgets — so the tab kept
+  reporting itself as clean while the canvas already differed from the file.
+
+  Two guards exist precisely to stop work being thrown away, and both believed that
+  report. Closing a workflow refuses when there are unsaved changes, because closing
+  bypasses ComfyUI's own save prompt — it saw "clean" and closed, and the values were
+  gone. The confirmation before an operation overwrites the canvas was skipped the same
+  way, so the canvas was replaced without anyone being asked.
+
+  Measured: after a save the tab reads clean, correctly. After a node writes a value it
+  still reads clean — wrong. Refreshing the snapshot flips it to modified, which is the
+  truth.
+
+  Both guards now refresh the snapshot before trusting it, and — this is the part that
+  matters — they only trust the answer when the refresh can be shown to have actually
+  happened. ComfyUI silently skips it while a graph is loading, while an undo is
+  replaying, and in a few other moments, in a way that is indistinguishable from success
+  from the outside. When it cannot be established that the refresh landed, the close
+  refuses and the confirmation is shown, rather than assuming. `force: true` still
+  closes, so nothing becomes unclosable.
+
+  Fourth and last of a family: #696, #874 and #878 were the same stale snapshot read in
+  other places — this one was the guards meant to protect you from it.
+
 ## [0.11.62] - 2026-08-09
 
 > Covers changes since 0.11.61.
