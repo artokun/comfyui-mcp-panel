@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.48] - 2026-08-09
+
+> Covers changes since 0.11.47.
+
+### Fixed
+- A run that finished without producing an image or a video now tells the agent it
+  finished, instead of leaving it waiting forever. `panel_run` promises the agent it will
+  be notified automatically and instructs it not to poll — so for a run whose outputs are
+  text, or a cache hit that saves no file, that notification could never arrive and the
+  agent stalled silently until the user prompted again. The promise is what turned a quiet
+  completion into a wedged session. The completion is now delivered on the live path and
+  recovered by the `/history` reconcile, including when the bridge was down at the moment
+  it first fired. Only runs the panel itself queued are affected — a render you start on
+  the canvas yourself is still silent (#831, #356)
+
 ## [0.11.47] - 2026-08-09
 
 > Covers changes since 0.11.46.
