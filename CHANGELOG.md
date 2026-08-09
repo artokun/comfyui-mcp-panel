@@ -6,6 +6,31 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.49] - 2026-08-09
+
+> Covers changes since 0.11.48.
+
+### Fixed
+- An EMPTY (0-node) workflow no longer wedges every `panel_*` graph tool. A blank canvas is
+  exactly the state a user is in right before asking the agent to build something, and it was
+  the one state in which nothing could be read or edited — with no recovery: re-targeting
+  reported success without changing anything, `panel_new_workflow` made it worse, and
+  `panel_open_workflow` could not prove its rebind. A browser refresh was the only exit.
+
+  The panel proves a canvas genuinely empty before trusting a 0-node read, and that proof
+  required every value in the workflow's `extra` to be empty — which nothing on a real install
+  satisfies, because ComfyUI stamps `extra.frontendVersion` into every workflow it writes and
+  installed extensions add their own per-workflow flags. So no blank workflow was ever provably
+  empty, and the fallback (stamping the canvas with the workflow's identity) is refused when
+  another blank tab could equally explain the empty canvas. Two blank tabs therefore had no exit
+  at all — and `panel_new_workflow` creates the second one, which is why that step escalated it.
+
+  A version stamp is not a graph. Booleans and numbers in `extra` are now admitted (a graph
+  cannot be encoded in one), and named version strings are admitted when they look like version
+  strings. Anything structured — or any text carrying JSON delimiters, wherever it appears — is
+  still treated as content, so a canvas that actually holds something is never proven empty
+  (#833)
+
 ## [0.11.48] - 2026-08-09
 
 > Covers changes since 0.11.47.
