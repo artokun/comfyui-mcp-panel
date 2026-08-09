@@ -1372,6 +1372,87 @@ function legacyFingerprint(thread) {
   return a.toString(16).padStart(8, "0") + b.toString(16).padStart(8, "0");
 }
 
+/**
+ * A reserved key inside the legacy store holding ids whose delete has not landed
+ * (#861, codex r3).
+ *
+ * The retry intent used to live only in memory, and codex was right that a reload
+ * loses it: `meta.deletedThreads` is capped, so if the tombstone ages out before any
+ * retry the record is absent from both tombstone sources AND from the new tab's empty
+ * pending set — never retried, and free to restore.
+ *
+ * Recording it in the legacy store puts the intent in the same place as the thing it
+ * is about, where nothing caps or expires it. The key is namespaced so it cannot
+ * collide with a thread id, and every reader here already requires a string `id` on a
+ * record, so this marker is skipped by the restore and receipt passes for free.
+ */
+const LEGACY_PENDING_DELETES_KEY = "__cmcp_pending_deletes";
+
+/** Read the durable pending-delete list. `[]` when absent or unreadable — a missing
+ *  list means nothing is known to be owed, which the in-memory set then adds to. */
+async function idbReadPendingDeletes(indexedDb) {
+  const db = await openDb(indexedDb);
+  if (!db) return [];
+  try {
+    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return [];
+    return await new Promise((resolve) => {
+      let tx;
+      try {
+        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readonly");
+      } catch {
+        resolve([]);
+        return;
+      }
+      const req = tx.objectStore(CHAT_HISTORY_LEGACY_STORE).get(LEGACY_PENDING_DELETES_KEY);
+      req.onsuccess = () => {
+        const ids = req.result?.ids;
+        resolve(Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id) : []);
+      };
+      req.onerror = () => resolve([]);
+      tx.onabort = () => resolve([]);
+    });
+  } catch {
+    return [];
+  } finally {
+    db.close();
+  }
+}
+
+/** Persist the pending-delete list. Best effort: a store that will not take it is a
+ *  store that cannot be growing either, and the in-memory set still drives retries
+ *  for the life of this tab. */
+async function idbWritePendingDeletes(indexedDb, ids) {
+  const db = await openDb(indexedDb);
+  if (!db) return false;
+  try {
+    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return false;
+    return await new Promise((resolve) => {
+      let tx;
+      try {
+        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readwrite");
+      } catch {
+        resolve(false);
+        return;
+      }
+      const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
+      try {
+        if (ids.length) store.put({ ids }, LEGACY_PENDING_DELETES_KEY);
+        else store.delete(LEGACY_PENDING_DELETES_KEY);
+      } catch {
+        resolve(false);
+        return;
+      }
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    });
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
+}
+
 /** Delete legacy records by key — used for tombstoned threads (#861, codex P1). */
 async function idbDeleteLegacy(indexedDb, ids) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => typeof id === "string" && id))];
@@ -1765,6 +1846,12 @@ export class ChatHistoryStore {
    */
   async _restoreLegacyShadow(snapshot) {
     const stored = await idbReadLegacy(this.indexedDb);
+    // Durable retry intent first (codex r3): a delete that failed in a PREVIOUS tab
+    // must keep being retried and must keep being suppressed, even after its
+    // tombstone has aged out of the capped map.
+    for (const id of await idbReadPendingDeletes(this.indexedDb)) {
+      this._pendingLegacyDeletes.add(id);
+    }
     const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
     if (stored === null) {
       // Unreachable. Keep whatever the shadow gave us and prove nothing durable.
@@ -1981,6 +2068,7 @@ export class ChatHistoryStore {
           } catch {
             deleted = false;
           }
+          const before = this._pendingLegacyDeletes.size;
           if (deleted) {
             for (const id of tombstoned) {
               this._durableLegacy.delete(id);
@@ -1994,6 +2082,17 @@ export class ChatHistoryStore {
             // leaving the record to be restored on the next load. A delete the user
             // asked for is retried until it lands.
             for (const id of tombstoned) this._pendingLegacyDeletes.add(id);
+          }
+          // Mirror the intent into the store so it survives a reload (codex r3).
+          // In-memory alone loses the retry when the tab closes, and if the capped
+          // tombstone map has aged the id out by the time a new tab looks, nothing
+          // ever retries and the record can restore.
+          if (this._pendingLegacyDeletes.size !== before) {
+            try {
+              await idbWritePendingDeletes(this.indexedDb, [...this._pendingLegacyDeletes]);
+            } catch {
+              // Best effort: the in-memory set still drives retries in this tab.
+            }
           }
         }
         return merged;
@@ -2093,6 +2192,8 @@ export class ChatHistoryStore {
           legacyCleared = false;
         }
         if (legacyCleared) {
+          // The clear removed the pending-delete marker along with everything else,
+          // which is correct: there is nothing left to owe a delete to.
           this._durableLegacy = new Map();
           this._pendingLegacyDeletes = new Set();
         }

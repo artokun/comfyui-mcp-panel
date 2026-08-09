@@ -25,7 +25,7 @@ import {
 // ── a fake IndexedDB, because the failure lives in the durable path ────────
 
 function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } = {}) {
-  const state = { failWrites, failStore: null };
+  const state = { failWrites, failStore: null, failDelete: false };
   const stores = new Map([["snapshots", new Map()]]);
   if (!missingLegacyStore) stores.set(CHAT_HISTORY_LEGACY_STORE, new Map());
   const db = {
@@ -35,9 +35,10 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
       const data = stores.get(name);
       if (!data) throw new Error(`no store ${name}`);
       const tx = { oncomplete: null, onerror: null, onabort: null };
+      let doomed = false;
       const settle = () => {
         queueMicrotask(() => {
-          if ((state.failWrites || state.failStore === name) && mode === "readwrite") tx.onabort?.();
+          if ((state.failWrites || state.failStore === name || doomed) && mode === "readwrite") tx.onabort?.();
           else tx.oncomplete?.();
         });
       };
@@ -53,7 +54,10 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
           return req;
         },
         delete(key) {
-          if (!state.failWrites && state.failStore !== name) data.delete(key);
+          // A delete can fail where a small put still lands — a bulk delete and a
+          // one-key marker are not the same transaction cost.
+          if (state.failDelete) doomed = true;
+          else if (!state.failWrites && state.failStore !== name) data.delete(key);
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
@@ -656,4 +660,64 @@ test("clearAll reports success when the legacy store really was cleared", () => 
       assert.equal(result.code, null);
       assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 0);
     });
+});
+
+test("a failed delete survives a RELOAD and is retried by the next tab", async () => {
+  // codex r3. The retry intent used to live only in memory: close the tab and it was
+  // gone. If `meta.deletedThreads` (capped at 512) had aged the id out by the time a
+  // new tab looked, the record was absent from both tombstone sources AND from the
+  // new tab's empty pending set — never retried, and free to restore. The intent now
+  // lives in the legacy store, where nothing caps it.
+  const indexedDb = createFakeIndexedDb();
+  const first = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  first.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await first._writePromise;
+
+  // The DELETE fails; the small marker put still lands. That is the window this
+  // exists for — a tab that closes before its retry.
+  indexedDb._state.failDelete = true;
+  first.persist([legacyThread("L1", 2)], {
+    deletedThreads: { L0: { updatedAt: 5, writerId: "t", sequence: 1 } },
+  });
+  await first._writePromise;
+  assert.ok(first._pendingLegacyDeletes.has("L0"), "precondition: the delete did not land");
+  assert.ok(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    "precondition: the record is still there",
+  );
+
+  // A NEW tab: fresh store object, empty in-memory state, and NO tombstone in meta.
+  const next = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await next._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.equal(
+    (restored.threads || []).some((t) => t.id === "L0"),
+    false,
+    "the reloaded tab must still suppress a delete it never saw a tombstone for",
+  );
+  assert.ok(next._pendingLegacyDeletes.has("L0"), "…and must inherit the retry intent");
+});
+
+test("the pending-delete marker is never mistaken for a transcript", async () => {
+  // It lives in the same store as the threads. Every reader here requires a string
+  // `id` on a record, so the marker is skipped — but that is a property worth pinning
+  // rather than a coincidence to rediscover.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await store._writePromise;
+  indexedDb._state.failDelete = true;
+  store.persist([legacyThread("L1", 2)], {
+    deletedThreads: { L0: { updatedAt: 5, writerId: "t", sequence: 1 } },
+  });
+  await store._writePromise;
+  indexedDb._state.failDelete = false;
+
+  const reader = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await reader._restoreLegacyShadow({ threads: [], meta: {} });
+  for (const thread of restored.threads || []) {
+    assert.equal(typeof thread.id, "string");
+    assert.ok(thread.id, "no record without an id may reach the transcript list");
+    assert.ok(Array.isArray(thread.msgs), "…and every restored record must be a thread");
+  }
+  assert.equal(reader._durableLegacy.has("__cmcp_pending_deletes"), false, "the marker is not a receipt");
 });
