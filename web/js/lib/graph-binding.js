@@ -227,16 +227,48 @@ const SERIALIZED_FORMAT_METADATA_KEYS = new Set([
 ]);
 
 /**
+ * Can a value inside `extra` be GRAPH CONTENT — nodes, links, groups, subgraph
+ * definitions, anything whose loss would mean a canvas is not really empty?
+ *
+ * #833 — the rule used to be "any non-empty value in `extra` defeats the proof",
+ * and on a real install that meant NO empty workflow was ever provably empty.
+ * Every workflow ComfyUI writes carries `extra.frontendVersion` (a version
+ * string), and installed extensions add their own per-workflow settings —
+ * `VHS_latentpreview: false`, `workflowRendererVersion`, `workflowHash`. All
+ * verified against this repo owner's own `user/default/workflows`. A blank
+ * canvas therefore failed `activeWorkflowProvenEmpty`, which is the FIRST escape
+ * out of `graphEmptyBindingUnproven`, and the panel fell through to the seal —
+ * where a second blank tab makes the exclusivity probe ambiguous, so nothing
+ * sealed and every graph tool refused with no way out.
+ *
+ * A SCALAR cannot be graph content. Nodes, links, groups, reroutes and subgraph
+ * definitions are structured; a string, number or boolean in `extra` is a stamp
+ * or a setting, and neither is a graph. So scalars no longer defeat the proof,
+ * while a non-empty ARRAY or OBJECT still does — which is what keeps the keys
+ * that ARE content-bearing (`groupNodes`, `ue_links`, `linkExtensions`, a
+ * stashed `reroutes`) defeating it exactly as before.
+ *
+ * This does not weaken the #560 protection it was written for. A tab that is
+ * MID-RESTORE has the full graph in its tracker state — that is the restore
+ * source — so it fails the `nodes.length !== 0` check above and never reaches
+ * this rule. The strictness on scalars was protecting nothing and costing the
+ * empty-canvas case its only exit.
+ */
+const extraValueMayBeGraphContent = (value) =>
+  !isEmptySurfaceValue(value) && typeof value === "object";
+
+/**
  * POSITIVE proof that a serialized graph state holds NO workflow content at
  * all — the empty-canvas relaxation's evidence bar (#565 gate). True only
  * when `state` is a well-formed serialized graph whose `nodes` is a PRESENT
  * empty array (a missing/malformed read proves nothing) AND every own
  * surface outside the format-metadata allowlist is absent-or-empty. Inside
  * `extra`, `ds` (viewport) and `comfyui_mcp` (the panel's own identity tag)
- * are not content; any other key must hold an empty value. A single
- * non-empty subgraphs/groups/reroutes/links surface — or any unknown
- * non-empty surface — defeats the proof, so a foreign content-bearing canvas
- * can never be re-stamped through the relaxation.
+ * are not content, and neither is a scalar (see above, #833); any other key
+ * must hold an empty value. A single non-empty subgraphs/groups/reroutes/links
+ * surface — or any unknown non-empty STRUCTURED surface — defeats the proof, so
+ * a foreign content-bearing canvas can never be re-stamped through the
+ * relaxation.
  */
 export function serializedStateProvenEmpty(state) {
   try {
@@ -249,10 +281,13 @@ export function serializedStateProvenEmpty(state) {
         if (typeof value !== "object" || Array.isArray(value)) return false;
         const { ds: viewport, comfyui_mcp: panelTag, ...workflowExtra } = value;
         for (const extraValue of Object.values(workflowExtra)) {
-          if (!isEmptySurfaceValue(extraValue)) return false;
+          if (extraValueMayBeGraphContent(extraValue)) return false;
         }
         continue;
       }
+      // OUTSIDE `extra` the surfaces are the graph's own (nodes, links, groups,
+      // reroutes, subgraphs, definitions), so the strict rule stands: anything
+      // non-empty here is content by construction.
       if (!isEmptySurfaceValue(value)) return false;
     }
     return true;
