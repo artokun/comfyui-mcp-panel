@@ -1392,12 +1392,15 @@ function legacyFingerprint(thread) {
  * retry the record is absent from both tombstone sources AND from the new tab's empty
  * pending set — never retried, and free to restore.
  *
- * Recording it in the legacy store puts the intent in the same place as the thing it
- * is about, where nothing caps or expires it. The key is namespaced so it cannot
- * collide with a thread id, and every reader here already requires a string `id` on a
- * record, so this marker is skipped by the restore and receipt passes for free.
+ * It lives in the `snapshots` store, NOT beside the transcripts (codex r5). Sharing a
+ * key space with records keyed by THREAD ID is only safe while no thread id can equal
+ * the marker key, and ids are normally minted by crypto.randomUUID() but an IMPORTED
+ * history can carry anything. Refusing to store such a thread guards new writes and
+ * does nothing about a database that already holds one. `snapshots` is keyed by fixed
+ * names, so the collision cannot arise in either direction — a better answer than a
+ * guard that only covers one of them.
  */
-const LEGACY_PENDING_DELETES_KEY = "__cmcp_pending_deletes";
+const LEGACY_PENDING_DELETES_KEY = "__cmcp_legacy_pending_deletes";
 
 /** Read the durable pending-delete list. `[]` when absent or unreadable — a missing
  *  list means nothing is known to be owed, which the in-memory set then adds to. */
@@ -1405,16 +1408,16 @@ async function idbReadPendingDeletes(indexedDb) {
   const db = await openDb(indexedDb);
   if (!db) return [];
   try {
-    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return [];
+    if (!db.objectStoreNames.contains("snapshots")) return [];
     return await new Promise((resolve) => {
       let tx;
       try {
-        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readonly");
+        tx = db.transaction("snapshots", "readonly");
       } catch {
         resolve([]);
         return;
       }
-      const req = tx.objectStore(CHAT_HISTORY_LEGACY_STORE).get(LEGACY_PENDING_DELETES_KEY);
+      const req = tx.objectStore("snapshots").get(LEGACY_PENDING_DELETES_KEY);
       req.onsuccess = () => {
         const ids = req.result?.ids;
         resolve(Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id) : []);
@@ -1448,16 +1451,16 @@ async function idbMergePendingDeletes(indexedDb, { add = [], remove = [] } = {})
   const db = await openDb(indexedDb);
   if (!db) return false;
   try {
-    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return false;
+    if (!db.objectStoreNames.contains("snapshots")) return false;
     return await new Promise((resolve) => {
       let tx;
       try {
-        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readwrite");
+        tx = db.transaction("snapshots", "readwrite");
       } catch {
         resolve(false);
         return;
       }
-      const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
+      const store = tx.objectStore("snapshots");
       let req;
       try {
         req = store.get(LEGACY_PENDING_DELETES_KEY);
@@ -1561,13 +1564,7 @@ async function idbClearLegacy(indexedDb) {
 
 async function idbWriteLegacy(indexedDb, threads) {
   const list = Array.isArray(threads)
-    ? threads.filter((t) => t && typeof t.id === "string" && t.id
-        // A thread whose id IS the reserved key cannot share a key space with the
-        // marker (codex r4). Ids are normally minted by crypto.randomUUID(), but an
-        // IMPORTED history can carry anything. Refusing to store it keeps the thread
-        // unevictable — it stays whole in the shadow — which is the fail-closed
-        // outcome, not a silent overwrite of either record by the other.
-        && t.id !== LEGACY_PENDING_DELETES_KEY)
+    ? threads.filter((t) => t && typeof t.id === "string" && t.id)
     : [];
   // `[]`, not `true` (codex r5). Callers do `new Set(written || [])`, and
   // `new Set(true)` THROWS — so a history whose only legacy thread was refused for
@@ -1578,22 +1575,43 @@ async function idbWriteLegacy(indexedDb, threads) {
   if (!db) return null;
   try {
     if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return null;
+    if (!db.objectStoreNames.contains("snapshots")) return null;
     return await new Promise((resolve) => {
       let tx;
       try {
-        tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readwrite");
+        // BOTH stores, ONE transaction (codex r5). Another tab can be mid-delete:
+        // B records a pending delete of L1, A completes it, and a third tab still
+        // holding L1 as live writes it straight back — leaving a record with no
+        // outstanding intent to remove it again. Reading the marker inside the same
+        // transaction as the put makes that interleaving unobservable.
+        tx = db.transaction([CHAT_HISTORY_LEGACY_STORE, "snapshots"], "readwrite");
       } catch {
         resolve(null);
         return;
       }
-      const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
+      let written = [];
+      let req;
       try {
-        for (const thread of list) store.put(thread, thread.id);
+        req = tx.objectStore("snapshots").get(LEGACY_PENDING_DELETES_KEY);
       } catch {
         resolve(null);
         return;
       }
-      tx.oncomplete = () => resolve(list.map((thread) => thread.id));
+      req.onsuccess = () => {
+        const owed = new Set(Array.isArray(req.result?.ids) ? req.result.ids : []);
+        // A thread someone is still trying to delete is not resurrected here. It
+        // stays whole in the shadow and unevictable — fail closed, as everywhere
+        // else in this file.
+        const allowed = list.filter((thread) => !owed.has(thread.id));
+        try {
+          const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
+          for (const thread of allowed) store.put(thread, thread.id);
+          written = allowed.map((thread) => thread.id);
+        } catch {
+          written = [];
+        }
+      };
+      tx.oncomplete = () => resolve(written);
       tx.onerror = () => resolve(null);
       tx.onabort = () => resolve(null);
     });

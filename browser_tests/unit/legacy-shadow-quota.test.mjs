@@ -25,53 +25,86 @@ import {
 // ── a fake IndexedDB, because the failure lives in the durable path ────────
 
 function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } = {}) {
+  // Keyed by store + key, and multi-store transactions, because the real one is both.
+  // `idbWriteLegacy` spans `legacy` and `snapshots` in ONE transaction so it can see
+  // the pending-delete marker while it writes; a fake that only understood a single
+  // store name made that read as a bug in the change.
   const state = { failWrites, failStore: null, failDelete: false };
-  const stores = new Map([["snapshots", new Map()]]);
-  if (!missingLegacyStore) stores.set(CHAT_HISTORY_LEGACY_STORE, new Map());
+  const names = ["snapshots"];
+  if (!missingLegacyStore) names.push(CHAT_HISTORY_LEGACY_STORE);
+  const data = new Map();
+  const at = (store, key) => store + " :: " + String(key);
+
   const db = {
-    objectStoreNames: { contains: (name) => stores.has(name) },
+    objectStoreNames: { contains: (name) => names.includes(name) },
     close() {},
-    transaction(name, mode) {
-      const data = stores.get(name);
-      if (!data) throw new Error(`no store ${name}`);
+    transaction(requested, mode) {
+      const wanted = Array.isArray(requested) ? requested : [requested];
+      for (const name of wanted) {
+        if (!names.includes(name)) throw new Error("no object store " + name);
+      }
       const tx = { oncomplete: null, onerror: null, onabort: null };
       let doomed = false;
+      let settled = false;
+      // Real IDB completes a transaction once its request queue drains, whether or not
+      // anything was WRITTEN. The legacy write opens readwrite over two stores and can
+      // legitimately issue only a get (every id was refused), so a fake that settled
+      // solely on put/delete/clear hung forever instead of failing.
       const settle = () => {
+        if (settled) return;
+        settled = true;
         queueMicrotask(() => {
-          if ((state.failWrites || state.failStore === name || doomed) && mode === "readwrite") tx.onabort?.();
+          const failing = state.failWrites ||
+            wanted.some((name) => state.failStore === name) ||
+            doomed;
+          if (failing && mode === "readwrite") tx.onabort?.();
           else tx.oncomplete?.();
         });
       };
-      tx.objectStore = () => ({
+      const blocked = (name) => state.failWrites || state.failStore === name;
+      tx.objectStore = (name = wanted[0]) => ({
         get(key) {
           const req = {};
-          queueMicrotask(() => { req.result = data.get(key); req.onsuccess?.(); });
+          queueMicrotask(() => { req.result = data.get(at(name, key)); req.onsuccess?.(); });
+          // Drain after the handler runs, so a readwrite transaction whose only
+          // request is this get still completes — and so a put issued from inside
+          // onsuccess is applied before the completion fires.
+          queueMicrotask(() => queueMicrotask(settle));
           return req;
         },
         getAll() {
           const req = {};
-          queueMicrotask(() => { req.result = [...data.values()]; req.onsuccess?.(); });
+          queueMicrotask(() => {
+            req.result = [...data.entries()]
+              .filter(([held]) => held.startsWith(name + " :: "))
+              .map(([, value]) => value);
+            req.onsuccess?.();
+          });
+          return req;
+        },
+        put(value, key) {
+          if (!blocked(name)) data.set(at(name, key), value);
+          const req = {};
+          queueMicrotask(() => req.onsuccess?.());
+          settle();
           return req;
         },
         delete(key) {
           // A delete can fail where a small put still lands — a bulk delete and a
           // one-key marker are not the same transaction cost.
           if (state.failDelete) doomed = true;
-          else if (!state.failWrites && state.failStore !== name) data.delete(key);
+          else if (!blocked(name)) data.delete(at(name, key));
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
           return req;
         },
         clear() {
-          if (!state.failWrites && state.failStore !== name) data.clear();
-          const req = {};
-          queueMicrotask(() => req.onsuccess?.());
-          settle();
-          return req;
-        },
-        put(value, key) {
-          if (!state.failWrites && state.failStore !== name) data.set(key, value);
+          if (!blocked(name)) {
+            for (const held of [...data.keys()]) {
+              if (held.startsWith(name + " :: ")) data.delete(held);
+            }
+          }
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
@@ -82,9 +115,17 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
       return tx;
     },
   };
+
   return {
-    _stores: stores,
     _state: state,
+    /** Records in one store, as a Map of key -> value, for assertions. */
+    _store(name) {
+      const out = new Map();
+      for (const [held, value] of data.entries()) {
+        if (held.startsWith(name + " :: ")) out.set(held.slice((name + " :: ").length), value);
+      }
+      return out;
+    },
     open() {
       const req = {};
       queueMicrotask(() => { req.result = db; req.onsuccess?.(); });
@@ -234,7 +275,7 @@ test("legacy threads get a durable home, and the shadow can then be bounded", as
   store.persist(threads, {});
   await store._writePromise;
 
-  const durable = [...indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).keys()];
+  const durable = [...indexedDb._store(CHAT_HISTORY_LEGACY_STORE).keys()];
   assert.equal(durable.length, 12, "every legacy thread must reach the legacy store");
 
   // Second persist: the receipts now exist, so the shadow may shed bytes.
@@ -348,7 +389,7 @@ test("the migration is idempotent — re-running it overwrites in place", async 
     await store.readCanonical();
   }
   assert.equal(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size,
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).size,
     2,
     "repeated migration must not duplicate records",
   );
@@ -388,13 +429,13 @@ test("an EDITED legacy thread is rewritten, and is not evictable until it is", a
   const original = legacyThread("L0", 1, 40);
   store.persist([original], {});
   await store._writePromise;
-  const storedFirst = indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0");
+  const storedFirst = indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("L0");
   assert.equal(storedFirst.msgs[0].text.length, 40);
 
   const edited = { ...original, updatedAt: 99, title: "renamed", msgs: [{ id: "L0-m", role: "user", text: "z".repeat(900) }] };
   store.persist([edited], {});
   await store._writePromise;
-  const storedSecond = indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0");
+  const storedSecond = indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("L0");
   assert.equal(storedSecond.msgs[0].text.length, 900, "the edit must reach the durable copy");
   assert.equal(storedSecond.title, "renamed");
 });
@@ -417,7 +458,7 @@ test("a stale receipt does not license eviction", async () => {
   // L0 was rewritten (its fingerprint did not match) and so becomes legitimately
   // durable again — the point is that it was never evicted on the forged receipt.
   assert.ok(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"),
     "a mismatched fingerprint must trigger a rewrite, not an eviction",
   );
   assert.ok(written, "the shadow must still have been written");
@@ -431,12 +472,12 @@ test("a TOMBSTONED legacy thread is deleted from the store", async () => {
   const threads = [legacyThread("L0", 1), legacyThread("L1", 2)];
   store.persist(threads, {});
   await store._writePromise;
-  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 2);
+  assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).size, 2);
 
   store.persist([threads[1]], { deletedThreads: { L0: { updatedAt: 500, writerId: 'tab-x', sequence: 1 } } });
   await store._writePromise;
   assert.equal(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"),
     false,
     "a deleted transcript must leave the durable store too",
   );
@@ -449,7 +490,7 @@ test("a tombstoned thread is not restored, even if the delete has not landed", a
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
   store.persist([legacyThread("L0", 1)], {});
   await store._writePromise;
-  assert.ok(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"));
+  assert.ok(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"));
 
   const reader = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
   const restored = await reader._restoreLegacyShadow({
@@ -483,12 +524,12 @@ test("clearAll empties the legacy store", async () => {
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
   store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
   await store._writePromise;
-  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 2);
+  assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).size, 2);
 
   await store.clearAll([], {});
   await store._writePromise;
   assert.equal(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size,
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).size,
     0,
     "cleared transcripts must not survive in the legacy store",
   );
@@ -533,7 +574,7 @@ test('a same-length, same-timestamp edit ("foo" -> "bar") is still detected', as
   const before = { ...legacyThread("L0", 7), msgs: [{ id: "m", role: "user", text: "foo" }] };
   store.persist([before], {});
   await store._writePromise;
-  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0").msgs[0].text, "foo");
+  assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("L0").msgs[0].text, "foo");
 
   const after = { ...before, msgs: [{ id: "m", role: "user", text: "bar" }] };
   assert.equal(JSON.stringify(before).length, JSON.stringify(after).length, "precondition: same length");
@@ -541,7 +582,7 @@ test('a same-length, same-timestamp edit ("foo" -> "bar") is still detected', as
   store.persist([after], {});
   await store._writePromise;
   assert.equal(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0").msgs[0].text,
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("L0").msgs[0].text,
     "bar",
     "the durable copy must follow a same-size edit",
   );
@@ -557,13 +598,13 @@ test("a tombstone deletes ONLY its own record, never a neighbour's", async () =>
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
   store.persist([legacyThread("L0", 1), legacyThread("L1", 2), legacyThread("L2", 3)], {});
   await store._writePromise;
-  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 3);
+  assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).size, 3);
 
   store.persist([legacyThread("L0", 1), legacyThread("L2", 3)], {
     deletedThreads: { L1: { updatedAt: 500, writerId: "t", sequence: 1 } },
   });
   await store._writePromise;
-  const keys = [...indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).keys()].sort();
+  const keys = [...indexedDb._store(CHAT_HISTORY_LEGACY_STORE).keys()].sort();
   assert.deepEqual(keys, ["L0", "L2"], "only the tombstoned record may go");
 });
 
@@ -581,7 +622,7 @@ test("the delete pass skips any id still present as a live thread", async () => 
   store.persist([legacyThread("L0", 90)], {});
   await store._writePromise;
   assert.ok(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"),
     "a live thread's record must survive an outstanding delete for the same id",
   );
 });
@@ -601,14 +642,14 @@ test("a FAILED delete is retried, even after its tombstone ages out", async () =
   });
   await store._writePromise;
   assert.ok(store._pendingLegacyDeletes.has("L0"), "a failed delete must be remembered");
-  assert.ok(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"), "precondition: still there");
+  assert.ok(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"), "precondition: still there");
 
   // The tombstone is GONE from meta now — aged out of the capped map.
   indexedDb._state.failWrites = false;
   store.persist([legacyThread("L1", 2)], {});
   await store._writePromise;
   assert.equal(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"),
     false,
     "the retry must land without the tombstone still being present",
   );
@@ -658,7 +699,7 @@ test("clearAll reports success when the legacy store really was cleared", () => 
     .then((result) => {
       assert.equal(result.ok, true);
       assert.equal(result.code, null);
-      assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 0);
+      assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).size, 0);
     });
 });
 
@@ -682,7 +723,7 @@ test("a failed delete survives a RELOAD and is retried by the next tab", async (
   await first._writePromise;
   assert.ok(first._pendingLegacyDeletes.has("L0"), "precondition: the delete did not land");
   assert.ok(
-    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"),
     "precondition: the record is still there",
   );
 
@@ -749,7 +790,7 @@ test("one tab finishing its delete does not erase another tab's pending intent",
     deletedThreads: { L0: { updatedAt: 9, writerId: "a", sequence: 1 } },
   });
   await tabA._writePromise;
-  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"), false, "A's delete landed");
+  assert.equal(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L0"), false, "A's delete landed");
 
   // A third tab must still inherit B's intent.
   const tabC = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
@@ -760,21 +801,77 @@ test("one tab finishing its delete does not erase another tab's pending intent",
   );
 });
 
-test("a thread whose id IS the reserved marker key is never stored", async () => {
-  // Ids are normally crypto.randomUUID(), but an IMPORTED history can carry anything.
-  // Storing it would have the thread and the marker overwrite each other.
+test("a thread id can never collide with the pending-delete marker", async () => {
+  // The marker used to sit beside the transcripts, in a key space addressed by THREAD
+  // ID. Refusing to store a colliding thread guarded new writes and did nothing about
+  // a database that already held one (codex r5). The marker now lives in `snapshots`,
+  // keyed by fixed names, so the collision cannot arise in either direction — which is
+  // a better answer than a guard covering one of them.
   const indexedDb = createFakeIndexedDb();
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
-  const collide = { ...legacyThread("x", 1), id: "__cmcp_pending_deletes" };
+  const collide = { ...legacyThread("x", 1), id: "__cmcp_legacy_pending_deletes" };
   store.persist([collide, legacyThread("L1", 2)], {});
   await store._writePromise;
-  const marker = indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("__cmcp_pending_deletes");
-  assert.ok(!marker || !Array.isArray(marker.msgs), "a transcript must not occupy the marker key");
-  assert.equal(
-    store._durableLegacy.has("__cmcp_pending_deletes"),
-    false,
-    "…and it must not be granted a receipt, so it stays unevictable",
+
+  // It is just a transcript now, stored under its own id, with nothing to clobber.
+  const legacy = indexedDb._store(CHAT_HISTORY_LEGACY_STORE);
+  assert.ok(Array.isArray(legacy.get("__cmcp_legacy_pending_deletes")?.msgs));
+  assert.ok(store._durableLegacy.has("__cmcp_legacy_pending_deletes"), "and it is durable like any other");
+
+  // A marker write cannot reach it: different store.
+  indexedDb._state.failDelete = true;
+  store.persist([legacyThread("L1", 2)], {
+    deletedThreads: { gone: { updatedAt: 5, writerId: "t", sequence: 1 } },
+  });
+  await store._writePromise;
+  indexedDb._state.failDelete = false;
+  assert.ok(
+    Array.isArray(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("__cmcp_legacy_pending_deletes")?.msgs),
+    "a marker write must not be able to overwrite a transcript",
   );
+});
+
+test("the marker never appears in the transcript store", () => {
+  // The property the relocation buys, stated directly.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  return store._writePromise
+    .then(() => {
+      indexedDb._state.failDelete = true;
+      store.persist([legacyThread("L1", 2)], {
+        deletedThreads: { L0: { updatedAt: 5, writerId: "t", sequence: 1 } },
+      });
+      return store._writePromise;
+    })
+    .then(() => {
+      indexedDb._state.failDelete = false;
+      assert.ok(store._pendingLegacyDeletes.has("L0"), "precondition: an intent was recorded");
+      assert.equal(
+        indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("__cmcp_legacy_pending_deletes"),
+        false,
+        "the marker must not be in the transcript store",
+      );
+      assert.ok(
+        indexedDb._store("snapshots").has("__cmcp_legacy_pending_deletes"),
+        "…it must be in snapshots, whose keys are fixed names",
+      );
+    });
+});
+
+test("a legacy write with nothing to store returns [] — never true", async () => {
+  // Callers do `new Set(written || [])`, and `new Set(true)` THROWS — in the UNCAUGHT
+  // restore path. A list that filters down to nothing has to come back as an empty
+  // list, not as a bare success.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  // A legacyShadow thread with no usable id is filtered out by the writer, leaving it
+  // with nothing to write.
+  const unusable = { ...legacyThread("u", 1), id: 42 };
+  store.persist([unusable], {});
+  await store._writePromise;
+  const read = await store.readCanonical();
+  assert.ok(read, "restoration must survive a write list that filtered down to nothing");
 });
 
 test("the marker is filtered structurally, not by key name", async () => {
@@ -784,23 +881,64 @@ test("the marker is filtered structurally, not by key name", async () => {
   store.persist([legacyThread("L0", 1)], {});
   await store._writePromise;
   // Any non-thread record, whatever its key, must not surface as history.
-  indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).set("some-other-meta", { ids: ["z"] });
+  indexedDb._store(CHAT_HISTORY_LEGACY_STORE).set("some-other-meta", { ids: ["z"] });
   const reader = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
   const restored = await reader._restoreLegacyShadow({ threads: [], meta: {} });
   assert.deepEqual((restored.threads || []).map((t) => t.id), ["L0"]);
 });
 
-test("a legacy write with nothing to store returns [] — never true", async () => {
-  // codex r5. Callers do `new Set(written || [])`, and `new Set(true)` THROWS. A
-  // history whose only legacy thread was refused for colliding with the reserved key
-  // would have broken restoration outright, in the uncaught restore path — turning a
-  // fail-closed input into a hard failure.
+test("a stale write cannot cancel another tab's outstanding delete", async () => {
+  // codex r5. Tab B records a pending delete of L1 that has not landed. A third tab,
+  // still holding L1 as live from before, writes it back — and the harm is not that
+  // the record exists (B's delete never removed it) but that the write would refresh
+  // it and hand out a receipt, leaving a record nobody is still trying to remove.
+  // The legacy write reads the marker inside the SAME transaction as the put, so an
+  // id with an outstanding delete is refused.
   const indexedDb = createFakeIndexedDb();
-  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
-  const onlyCollide = { ...legacyThread("x", 1), id: "__cmcp_pending_deletes" };
-  store.persist([onlyCollide], {});
-  await store._writePromise;
-  const read = await store.readCanonical();
-  assert.ok(read, "restoration must survive a write list that filtered down to nothing");
-  assert.equal(store._durableLegacy.has("__cmcp_pending_deletes"), false, "and grant no receipt");
+  const owing = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  owing.persist([legacyThread("L1", 1, 30), legacyThread("L2", 2)], {});
+  await owing._writePromise;
+
+  indexedDb._state.failDelete = true;
+  owing.persist([legacyThread("L2", 2)], {
+    deletedThreads: { L1: { updatedAt: 5, writerId: "b", sequence: 1 } },
+  });
+  await owing._writePromise;
+  indexedDb._state.failDelete = false;
+  assert.ok(owing._pendingLegacyDeletes.has("L1"), "precondition: a delete is owed");
+  assert.ok(indexedDb._store("snapshots").has("__cmcp_legacy_pending_deletes"), "…recorded durably");
+
+  // A stale tab writes an UPDATED L1 back.
+  const stale = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const updated = { ...legacyThread("L1", 1, 900), title: "stale rewrite" };
+  stale.persist([updated, legacyThread("L2", 2)], {});
+  await stale._writePromise;
+
+  const stored = indexedDb._store(CHAT_HISTORY_LEGACY_STORE).get("L1");
+  assert.notEqual(stored?.title, "stale rewrite", "the refused write must not land");
+  assert.equal(stale._durableLegacy.has("L1"), false, "…and must not earn a receipt");
+  assert.ok(indexedDb._store(CHAT_HISTORY_LEGACY_STORE).has("L2"), "the refusal must be per-id");
+  // The intent survives, so the delete is still owed and still retried.
+  const next = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  await next._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.ok(next._pendingLegacyDeletes.has("L1"), "a stale write must not cancel the delete");
+});
+
+test("a refused write grants no receipt for the refused id", async () => {
+  // Receipts come from what the writer actually stored. Granting one for a thread it
+  // declined would license evicting it from the shadow — the licence-to-delete this
+  // whole change exists to withhold.
+  const indexedDb = createFakeIndexedDb();
+  const owing = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  owing.persist([legacyThread("L1", 1)], {});
+  await owing._writePromise;
+  indexedDb._state.failDelete = true;
+  owing.persist([], { deletedThreads: { L1: { updatedAt: 5, writerId: "b", sequence: 1 } } });
+  await owing._writePromise;
+  indexedDb._state.failDelete = false;
+
+  const stale = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  stale.persist([legacyThread("L1", 1)], {});
+  await stale._writePromise;
+  assert.equal(stale._durableLegacy.has("L1"), false, "no receipt for a refused write");
 });
