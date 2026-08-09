@@ -20,6 +20,13 @@
  * Driven on a SAVED workflow deliberately: its route is `wf:<tabRouteId>:<path>`, not a
  * per-object `tmp:<uuid>`, so this also pins that the composed route survives the round
  * trip — an unsaved tab would pass on a simpler code path and prove less.
+ *
+ * BOUNDARY: the fixture shuts its sockets down CLEANLY. A killed child process would
+ * terminate them abruptly, so this is a different close shape, not a milder one — it
+ * covers reconnect and re-registration across a bridge replacement and a dead-port
+ * interval, but would miss a regression that branched on the close code or `wasClean`.
+ * Engineering an abrupt kill is only worth it if the reconnect path starts telling those
+ * apart, or if #654 evidence points there (codex).
  */
 import { test, expect } from './fixtures/panelTest'
 import { MockBridge } from './fixtures/MockBridge'
