@@ -69,7 +69,7 @@ test("the variable and the zoom are written together", () => {
   // Either one alone is a broken panel: the variable without zoom shrinks the
   // root for no reason, zoom without the variable overflows it.
   const fn = PANEL.slice(
-    PANEL.indexOf("function applyPanelUiScale(raw) {"),
+    PANEL.indexOf("function applyPanelUiScale(raw, target) {"),
     PANEL.indexOf("function getSetting(id)"),
   );
   assert.ok(fn.length > 0);
@@ -79,7 +79,7 @@ test("the variable and the zoom are written together", () => {
 
 test("a scale of exactly 1 clears the zoom rather than writing a no-op", () => {
   const fn = PANEL.slice(
-    PANEL.indexOf("function applyPanelUiScale(raw) {"),
+    PANEL.indexOf("function applyPanelUiScale(raw, target) {"),
     PANEL.indexOf("function getSetting(id)"),
   );
   assert.match(fn, /if \(scale === 1\) root\.style\.removeProperty\("zoom"\)/);
@@ -87,7 +87,7 @@ test("a scale of exactly 1 clears the zoom rather than writing a no-op", () => {
 
 test("a frontend that refuses the style write does not break the panel", () => {
   const fn = PANEL.slice(
-    PANEL.indexOf("function applyPanelUiScale(raw) {"),
+    PANEL.indexOf("function applyPanelUiScale(raw, target) {"),
     PANEL.indexOf("function getSetting(id)"),
   );
   assert.match(fn, /try \{[\s\S]*\} catch \{/);
@@ -100,7 +100,13 @@ test("the scale is applied when a panel MOUNTS, not only when the slider moves",
   // workflow switch that re-mounts the sidebar. Applying it only in onChange
   // would make the setting appear to forget itself on every reload.
   const build = PANEL.slice(PANEL.indexOf("function buildPanel() {"), PANEL.indexOf("function buildPanel() {") + 1200);
-  assert.match(build, /applyPanelUiScale\(getSetting\(SETTING_UI_SCALE\)\)/);
+  // …and it must pass the ROOT (codex): buildPanel creates the element and mounts
+  // it later, so a document query at that moment finds every panel except the one
+  // being built, and the saved scale would apply to nothing.
+  assert.ok(
+    build.includes("applyPanelUiScale(getSetting(SETTING_UI_SCALE), root)"),
+    "the mount-time apply must target the freshly built, still-detached root",
+  );
 });
 
 test("the panel uses the shared clamp rather than its own arithmetic", () => {

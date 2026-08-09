@@ -2787,11 +2787,19 @@ function effortComboOptions(backend) {
  * root's height is `calc(100% / var(--cmcp-ui-scale))`, so the variable set here
  * cancels exactly that. Scale and variable are written together for that reason;
  * setting one without the other is a broken panel.
+ * `target` — the specific root to style, for a panel that has been BUILT but not
+ * yet ATTACHED (codex). `buildPanel` creates its root with `createElement` and
+ * mounts it later, so a document query at that moment finds every panel except
+ * the one being built: the saved scale would then apply to nothing until the user
+ * touched the slider, i.e. the setting would look like it forgot itself on every
+ * reload — exactly the bug the mount-time call exists to prevent. Omitted, it
+ * styles every mounted root, which is what the settings handler wants.
  */
-function applyPanelUiScale(raw) {
+function applyPanelUiScale(raw, target) {
   const scale = panelUiScaleFraction(raw);
   try {
-    for (const root of document.querySelectorAll(".cmcp-root")) {
+    const roots = target ? [target] : document.querySelectorAll(".cmcp-root");
+    for (const root of roots) {
       root.style.setProperty("--cmcp-ui-scale", String(scale));
       // 1 is the default everywhere; clearing it keeps the DOM free of a no-op
       // zoom that would otherwise show up in every inspection of the panel.
@@ -17651,7 +17659,7 @@ function buildPanel() {
   // #753 — a saved scale has to apply to a panel that mounts LATER (a reload, a
   // workflow switch that re-mounts the sidebar), not only to one that is open
   // when the slider moves. Read it here, at the one place a root is created.
-  applyPanelUiScale(getSetting(SETTING_UI_SCALE));
+  applyPanelUiScale(getSetting(SETTING_UI_SCALE), root);
   // A2UI seam (forward-compat, see spec): the chat surface width is a SINGLE piece
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.
