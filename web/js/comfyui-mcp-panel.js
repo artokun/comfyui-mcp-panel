@@ -21803,7 +21803,16 @@ function buildPanel() {
     // a ui_update against a card from a previous view would silently repaint a
     // DETACHED element (and mutate+persist the background thread's record) while
     // claiming success; and a stale unresolved surface:"wide" entry would keep
-    // the sidebar wide forever. Cards replay INERT from the thread instead.
+    // the sidebar wide forever.
+    //
+    // #832 — this used to end "Cards replay INERT from the thread instead", which
+    // is no longer true and was the whole bug: an UNRESOLVED card now replays LIVE
+    // under its original card_id (see paintA2UIRecord), because clearing here and
+    // replaying inert killed a card the agent had just been handed, mid-turn, with
+    // no user action. The protection above is unaffected: only the thread being
+    // painted is replayed, and every element was just removed, so nothing from a
+    // previous view can come back and no card can end up with two DOM nodes. A
+    // RESOLVED card still replays inert.
     liveA2uiCards.clear();
     // The thinking indicator lived in `log` and was just detached along with
     // everything else. Drop the stale refs — otherwise a later showThinking()
