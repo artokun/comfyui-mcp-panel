@@ -108,12 +108,17 @@ test("WIRING: threads are STAMPED with the route key and the picker matches on i
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
-  // The IMPORT, not its formatting. An earlier version pinned the exact one-line
-  // form and failed the moment a second named export was added — a wiring test that
-  // breaks on a line wrap is a tax on every future change, not a guard.
-  assert.ok(src.includes("threadMatchesCurrentWorkflow"), "the matcher must be imported");
-  assert.ok(src.includes("currentWorkflowIdentityKeys"), "the identity-set builder must be imported");
-  assert.ok(src.includes('from "./lib/thread-workflow-match.js";'), "…from this module");
+  // The IMPORT BINDING, tolerant of formatting. Pinning the exact one-line form
+  // broke the moment a second named export was added; but relaxing it to three
+  // separate `includes` was worse (codex) — both identifiers appear elsewhere in
+  // this file, and the module path could belong to an import of something else
+  // entirely, so all three could pass with neither symbol bound. Parse the
+  // declaration instead: line wrapping is free, an unbound symbol is not.
+  const decl = src.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/lib\/thread-workflow-match\.js";/);
+  assert.ok(decl, "the panel must import from the matcher module");
+  const named = decl[1].split(",").map((s) => s.trim()).filter(Boolean);
+  assert.ok(named.includes("threadMatchesCurrentWorkflow"), "the matcher must be bound");
+  assert.ok(named.includes("currentWorkflowIdentityKeys"), "the identity-set builder must be bound");
   // Stamped at thread creation AND on the revise that follows it.
   const stamps = src.match(/workflowRouteKey: workflowTabId\(\),/g) ?? [];
   assert.ok(stamps.length >= 2, `expected the route stamp at creation and revise, saw ${stamps.length}`);
