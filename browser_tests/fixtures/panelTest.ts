@@ -136,14 +136,31 @@ export const test = base.extend<PanelFixtures & PanelOptions>({
  * `finally`, so a failing test does not leave litter either.
  */
 export async function deleteSavedWorkflow(page: Page, workflowName: string): Promise<void> {
+  const name = String(workflowName ?? '').trim()
+  // An empty name would DELETE `workflows/.json` — a request about a file this spec never
+  // created. Nothing to clean, and asking is worse than not asking.
+  if (!name) {
+    console.warn('[e2e cleanup] no workflow name to delete — a setup save likely failed')
+    return
+  }
+  let outcome: string
   try {
-    await page.evaluate(async (path) => {
+    outcome = await page.evaluate(async (path) => {
       const api = (window as any).comfyAPI?.api?.api
-      await api?.fetchApi?.(`/userdata/${encodeURIComponent(path)}`, { method: 'DELETE' })
-    }, `workflows/${workflowName}.json`)
-  } catch {
-    // The page may already be closed, or the API unreachable — neither is worth failing
-    // a test over, and the next run's cleanup will not be blocked by it.
+      if (typeof api?.fetchApi !== 'function') return 'no api'
+      // fetchApi RESOLVES on an HTTP error, so the status has to be read (codex) —
+      // otherwise a 500 leaves litter and looks exactly like success.
+      const res = await api.fetchApi(`/userdata/${encodeURIComponent(path)}`, { method: 'DELETE' })
+      return res?.ok ? 'ok' : `HTTP ${res?.status ?? '?'}`
+    }, `workflows/${name}.json`)
+  } catch (err) {
+    outcome = `threw: ${String(err)}`
+  }
+  // NON-MASKING but not SILENT. Throwing would replace a real assertion failure with a
+  // cleanup failure, which is strictly worse for diagnosis — but a cleanup that quietly
+  // fails forever is how 1221 files accumulated in the first place, so it must say so.
+  if (outcome !== 'ok') {
+    console.warn(`[e2e cleanup] failed to delete workflows/${name}.json — ${outcome}`)
   }
 }
 

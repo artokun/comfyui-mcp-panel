@@ -58,13 +58,15 @@ test('an in-place save persists a value the tracker never saw', async ({
 
   // First save gives the tab a real path. A never-saved tab takes the COPY route,
   // which already flushed — this spec is about the in-place overwrite.
+  // #907 — the try opens BEFORE the save, so a save that lands but then fails an
+  // assertion is still cleaned up (codex). `name` is assigned inside and read by the
+  // finally, which no-ops on an empty one.
+  let name = ''
+  try {
   const first = await mockBridge.command('workflow_save', {})
   expect(first.ok, 'the first save must succeed so the tab has a path').toBe(true)
-  const name = String(first.result?.workflow || '')
+  name = String(first.result?.workflow || '')
   expect(name, 'the save must report the workflow name').toBeTruthy()
-  // #907 — this spec writes a REAL file into the developer's workflow library. Remove it
-  // however the test ends; an assertion failure must not leave litter either.
-  try {
 
     // Change a value the way a NODE does: directly, no user input event — and issue no
     // panel command afterwards, because the dispatch captures after every completed

@@ -55,12 +55,14 @@ test('closing a workflow refuses when a NODE left unsaved work', async ({
   // Save so the tab is genuinely clean, and resolve the close target BEFORE the write.
   // Order is load-bearing: the command dispatch captures after every completed command,
   // so any panel command issued after the write refreshes the tracker and hides the lag.
+  // #907 — the try opens BEFORE the save, so a save that lands and then fails an
+  // assertion is still cleaned up (codex).
+  let savedName = ''
+  try {
   const saved = await mockBridge.command('workflow_save', {})
   expect(saved.ok, 'the save must succeed so the tab starts clean').toBe(true)
-  // #907 — a REAL file lands in the developer's workflow library; remove it whatever
-  // happens below.
-  const savedName = String(saved.result?.workflow || '')
-  try {
+  savedName = String(saved.result?.workflow || '')
+  expect(savedName, 'the save must report a name, or cleanup has nothing to remove').toBeTruthy()
   const listed = await mockBridge.command('workflow_list', {})
   const target =
     listed.result?.active?.routing_key || listed.result?.active?.key || listed.result?.active?.path
@@ -128,9 +130,14 @@ test('force:true still discards — the guard refuses, it does not trap', async 
     ;(app?.canvas?.graph ?? app?.graph).add(LG.createNode('EmptyLatentImage'))
   })
   await settleCanvas(page)
-  const saved2 = await mockBridge.command('workflow_save', {})
-  const savedName2 = String(saved2.result?.workflow || '')
+  let savedName2 = ''
   try {
+  const saved2 = await mockBridge.command('workflow_save', {})
+  // Asserted, not assumed (codex): without this the setup save could fail, the test
+  // still pass, and cleanup ask to delete `workflows/.json`.
+  expect(saved2.ok, 'the setup save must succeed').toBe(true)
+  savedName2 = String(saved2.result?.workflow || '')
+  expect(savedName2, 'the setup save must report a name').toBeTruthy()
   const listed = await mockBridge.command('workflow_list', {})
   const target =
     listed.result?.active?.routing_key || listed.result?.active?.key || listed.result?.active?.path
