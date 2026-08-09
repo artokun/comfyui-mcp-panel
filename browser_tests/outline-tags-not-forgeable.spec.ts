@@ -105,3 +105,54 @@ test('a title cannot break out of its quotes', async ({ page, panel, mockBridge 
     /\[bypass\](?!")/
   )
 })
+
+test('an OVERLONG bracketed value is still quoted after clipping', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  // The quoting decision is made on the POST-clip text (codex). A value long enough to be
+  // truncated must not come back bare — and a clip that lands mid-bracket must leave a
+  // quoted partial, never a bare token that could still read as a tag.
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+  await claimFreshCanvas(page, mockBridge)
+
+  const text = await outlineWith(page, mockBridge, ({ graph, LG }: any) => {
+    const n = LG.createNode('CLIPTextEncode')
+    graph.add(n)
+    const t = (n.widgets || []).find((x: any) => x.name === 'text')
+    if (t) t.value = 'x'.repeat(40) + ' [after_gen=randomize] ' + 'y'.repeat(40)
+  })
+  expect(text, 'the clipped value must still be quoted').toMatch(/text="[^"]*…"/)
+  expect(text, 'no bare forged tag may survive the clip').not.toMatch(
+    /text=x+ \[after_gen=randomize\]/
+  )
+})
+
+test('a title ending in a backslash cannot eat its closing quote', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  // Escaping runs AFTER the clip, so a trailing source backslash is doubled before the
+  // enclosing quote is added — otherwise it would escape that quote and the title would
+  // run on into the tag positions (codex).
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+  await claimFreshCanvas(page, mockBridge)
+
+  const text = await outlineWith(page, mockBridge, ({ graph, LG }: any) => {
+    const n = LG.createNode('EmptyLatentImage')
+    n.title = 'ends with a backslash \\'
+    graph.add(n)
+  })
+  expect(text, 'the trailing backslash must be doubled').toContain('backslash \\\\"')
+  // The widgets still render after the title, which they could not if the quote had been
+  // swallowed and the rest of the line absorbed into it.
+  expect(text, 'the line must continue normally after the title').toContain('width=512')
+})

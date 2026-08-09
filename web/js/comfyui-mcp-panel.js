@@ -8049,6 +8049,12 @@ const GRAPH_TOOL_EXECUTORS = {
      * The invariant instead: a BARE token never contains a bracket, and anything that
      * does is QUOTED. So a tag outside quotes is always the panel's own, content is
      * preserved exactly, and only the rare bracketed value pays the two quote characters.
+     *
+     * The quoting decision is made on the POST-clip text, so a clip that removes the
+     * bracket leaves nothing to impersonate a tag and one that lands mid-bracket leaves a
+     * quoted partial — never a bare token. Escaping runs after the 60-char budget, so a
+     * quote/backslash-dense value can render slightly longer than 60; that costs a few
+     * characters against max_chars and cannot reintroduce a forgeable tag (codex).
      */
     const fmtVal = (v) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
