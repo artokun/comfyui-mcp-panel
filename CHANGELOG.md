@@ -6,6 +6,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.66] - 2026-08-09
+
+> Covers changes since 0.11.65.
+
+### Fixed
+
+- **Updating a node pack no longer dead-ends on some Manager builds (#367).** On certain
+  built-in Manager v4 installs, asking the agent to update a pack failed instantly with
+  `HTTP 405` — the Manager refuses that particular request on that build, even though
+  listing and installing work fine.
+
+  The panel already knows how to talk to those builds; it has a second route for exactly
+  this case. It just never tried it. There *was* a fallback, but it dropped to the old
+  3.x-style routes, which a modern Manager doesn't serve either — so the retry failed
+  too, and update was unusable while a perfectly good route sat unused.
+
+  Now it tries that route before giving up, and remembers which one worked so later
+  updates go straight there. On a build where the original request is fine, nothing
+  changes — verified against a live Manager here, which accepts it and doesn't serve the
+  alternative at all.
+
+  One honest caveat: on the builds this unblocks, the Manager reports no per-task
+  result, so the update is reported as *queued* rather than confirmed. Check
+  `panel_node_queue_status` and restart ComfyUI to load the updated pack. That is the
+  best answer that Manager can give — the bug was getting no answer at all.
+
 ## [0.11.65] - 2026-08-09
 
 > Covers changes since 0.11.64.
