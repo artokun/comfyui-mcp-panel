@@ -1141,13 +1141,17 @@ export function resolveOpenRebindVerdict({
  * `workflow_list` is deliberately fence-EXEMPT (#759/#932) precisely to be the recovery
  * probe, and it republishes the active identity — measured: after this outcome it
  * returns the same uuid and a stamped graph read then succeeds.
+ *
+ * The note promises a fence refresh and nothing more (codex). On the fourth wording the
+ * panel could not READ the graph at all, and a refreshed fence cannot make that read
+ * succeed — it only stops the mismatch from being the reason it fails.
  */
 const FENCE_NOT_REFRESHED =
   " This reply carries NO fence refresh — an open that could not verify its content" +
   " publishes no workflow_uuid, so a command stamped from an older one is still refused" +
   " as a workflow instance mismatch. Call panel_list_workflows first: it is exempt from" +
-  " the fence and republishes the active identity, and the graph read then works." +
-  " Reloading the panel is NOT required for this (#702).";
+  " the fence and republishes the active identity, which permits a freshly stamped graph" +
+  " read. Reloading the panel is NOT required to refresh the fence (#702).";
 
 /** Did a content comparison actually HAPPEN? The single rule every sentence about
  *  content asks, so the headline and the per-part clause cannot disagree with each

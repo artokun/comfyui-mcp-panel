@@ -698,8 +698,16 @@ test("#702: a content-unverified open discloses that no fence refresh rode with 
     assert.match(text, /panel_list_workflows/, "it must name the fence-exempt recovery probe");
     assert.match(
       text,
-      /Reloading the panel is NOT required/,
+      /Reloading the panel is NOT required to refresh the fence/,
       "it must retract the panel_reload advice both reporters followed",
+    );
+    // It must promise a fence refresh and NOTHING more. On the wording where the panel
+    // could not read the graph at all, a refreshed fence cannot make that read succeed —
+    // it only stops the mismatch from being the reason it fails (codex).
+    assert.doesNotMatch(
+      text,
+      /the graph read then works/,
+      "the note must not promise a graph read will succeed",
     );
   }
 });
@@ -713,4 +721,10 @@ test("#702: the fence note is ONLY on the content-unverified outcome", () => {
     { targetLabel: "My Workflow", expectedUuid: "a", observedUuid: "b" },
   );
   assert.doesNotMatch(unproven, /carries NO fence refresh/);
+  // It may still say to CHECK panel_list_workflows — it does, and that is right: with
+  // the binding unproven you look at what is actually active. What it must NOT do is
+  // retract the reload, because there the reload is the remedy. Re-stamping from the
+  // probe would otherwise be invited against a binding that was never proven.
+  assert.doesNotMatch(unproven, /Reloading the panel is NOT required/);
+  assert.match(unproven, /reload the panel before graph edits/);
 });
