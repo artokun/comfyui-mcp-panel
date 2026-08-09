@@ -7,20 +7,34 @@
 // rounds of advice were spent sending them at a door that could not open, and neither
 // side could see it from the symptom, because EMPTY AND UNREACHABLE LOOK IDENTICAL.
 //
-// THE MECHANISM. `searchNodesVia` requests `customnode/getmappings?mode=cache`, so
-// Manager serves from its own local cache. A cache Manager never managed to populate —
-// because Manager itself could not reach the registry — answers HTTP 200 with `{}`.
-// `parseNodeMappings` filters zero entries and returns `count: 0`, which is exactly what
-// a healthy catalogue returns when the query matches nothing. The reader takes the first
-// for the second, concludes the pack does not exist, and keeps trying variations.
+// THE MECHANISM. `searchNodesVia` requests `customnode/getmappings?mode=cache`. When that
+// answers HTTP 200 with `{}`, `parseNodeMappings` filters zero entries and returns
+// `count: 0` — exactly what a healthy catalogue returns when the query matches nothing.
+// The reader takes the first for the second, concludes the pack does not exist, and keeps
+// trying variations of a search that cannot succeed.
+//
+// WHEN `{}` ACTUALLY HAPPENS — read out of ComfyUI-Manager's own source
+// (glob/manager_core.py, `get_data_by_mode`) rather than assumed, because the first cut of
+// this fix assumed wrong:
+//
+//   • A NETWORK failure does NOT empty the catalogue. The `except` branch falls back to
+//     the bundled `extension-node-map.json` inside the Manager package — 2.2 MB and
+//     populated on a stock install — so a blocked channel yields a full, if stale, list.
+//   • `{}` comes from the `network_mode == 'offline'` path with neither a cache file nor
+//     a local file, or from a data file that is itself empty/unreadable.
+//
+// So zero packs means Manager assembled a catalogue from NONE of its three sources, which
+// is genuinely anomalous and is what keeps this branch free of false positives.
 //
 // THE DISCRIMINATOR is local and needs no new signal from Manager: how many packs the
-// payload CONTAINED, before the query filter. Zero is sound evidence — a working install
-// has thousands.
+// payload CONTAINED, before the query filter.
 //
-// WHAT IS DELIBERATELY NOT CLAIMED. The panel does not make the registry request, so it
-// never observed DNS/timeout/TLS and must not report one. These tests pin that the
-// message states only what was observed.
+// WHAT IS DELIBERATELY NOT CLAIMED. The panel does not make the channel request, so it
+// never observed DNS/timeout/TLS and must not report one — and it names Manager's actual
+// DEFAULT_CHANNEL host, not api.comfy.org, which serves a different thing. These tests pin
+// both. The related gap they do NOT close: because Manager degrades to the bundled copy, a
+// genuinely blocked channel surfaces as a STALE catalogue, and the panel cannot yet tell
+// stale from current.
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -162,24 +176,44 @@ test("#808 the message says nothing was searched, and that no conclusion follows
   assert.match(m, /not "no matches"/i);
 });
 
-test("#808 the message NAMES the hosts, so a filtered user recognises their situation", () => {
-  // The report's core ask. Without a host, a user behind a national or corporate filter
+test("#808 the message names the host THIS catalogue comes from — and not the wrong one", () => {
+  // The report's core ask: without a host, a user behind a national or corporate filter
   // has no way to connect "empty list" to "my network blocks this".
+  //
+  // The host has to be the RIGHT one. Verified against ComfyUI-Manager's own source:
+  // DEFAULT_CHANNEL = "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main".
+  // api.comfy.org serves pack INSTALLS, not this mapping — naming it would send a
+  // filtered user to check something irrelevant, which fails the report's ask as surely
+  // as naming no host at all.
   const m = emptyCatalogueResult("seedvr2").message;
-  assert.match(m, /api\.comfy\.org/);
-  assert.match(m, /raw\.githubusercontent\.com/);
+  assert.match(m, /raw\.githubusercontent\.com\/ltdrdata\/ComfyUI-Manager/);
+  assert.doesNotMatch(m, /api\.comfy\.org/);
   assert.match(m, /filtering/i);
 });
 
-test("#808 the cheap remedy comes BEFORE the network conclusion", () => {
-  // A cache that simply never populated is the commoner cause, and sending that user to
-  // a VPN is the same class of wrong answer as sending a blocked user to a retry.
+test("#808 the message states the causes Manager's source actually produces", () => {
+  // Read out of glob/manager_core.py `get_data_by_mode`: a NETWORK error falls back to
+  // the bundled extension-node-map.json (populated), so it does NOT empty the list.
+  // `{}` comes from network_mode 'offline' with no cache and no local file. Leading with
+  // "your network is filtered" would therefore assert a cause the code contradicts.
   const m = emptyCatalogueResult("seedvr2").message;
-  const refresh = m.search(/refresh the .*cache|refresh the\s+cache/i);
-  const network = m.search(/not reachable from this machine/i);
+  assert.match(m, /network_mode 'offline'/);
+  assert.match(m, /missing or unreadable/);
+  // All three sources are named, because "empty" means all three produced nothing.
+  assert.match(m, /channel/i);
+  assert.match(m, /cache/i);
+  assert.match(m, /bundled/i);
+});
+
+test("#808 the cheap remedy comes BEFORE the network conclusion", () => {
+  // A cache that never populated is the likelier cause, and sending that user to a VPN
+  // is the same class of wrong answer as sending a blocked user to a retry.
+  const m = emptyCatalogueResult("seedvr2").message;
+  const refresh = m.search(/refresh the cache/i);
+  const network = m.search(/behind corporate, campus or national network/i);
   assert.ok(refresh >= 0, "the cache-refresh remedy is offered");
   assert.ok(network >= 0, "the network cause is named");
-  assert.ok(refresh < network, "cheap-and-common first, network conclusion second");
+  assert.ok(refresh < network, "cheap-and-likely first, network conclusion second");
 });
 
 test("#808 the message does NOT claim a transport failure the panel never observed", () => {

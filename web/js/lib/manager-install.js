@@ -611,15 +611,37 @@ export function managerUnavailableResult(query, err) {
  *
  * Zero packs is sound evidence: any working install has thousands.
  *
- * WHAT THIS DOES NOT CLAIM. The panel does not make the registry request — Manager does —
+ * WHAT AN EMPTY CATALOGUE ACTUALLY MEANS — read out of ComfyUI-Manager's own source
+ * (`glob/manager_core.py`, `get_data_by_mode`), not assumed:
+ *
+ *   • A NETWORK failure does NOT produce `{}`. The `except` branch falls back to the
+ *     copy of `extension-node-map.json` BUNDLED in the Manager package (2.2 MB and
+ *     populated on a stock install), so a blocked channel still yields a full — if
+ *     stale — catalogue. This is why the message below does NOT lead with "your
+ *     network is filtered": Manager masks that case rather than emptying the list.
+ *   • `{}` comes from the `network_mode == 'offline'` path when NEITHER the cache file
+ *     NOR the local bundled file exists, or when the file that is found is itself empty
+ *     or unreadable.
+ *
+ * So zero packs means Manager assembled a catalogue from NONE of its three sources —
+ * channel, cache, bundled copy. That is genuinely anomalous (a working install has
+ * thousands), which is what makes the branch safe from false positives.
+ *
+ * WHAT THIS DOES NOT CLAIM. The panel does not make the channel request — Manager does —
  * so it never observed a DNS failure, a timeout or a TLS error and must not report one.
  * It says what it saw: Manager answered, the catalogue is empty, so NOTHING WAS SEARCHED
- * and nothing follows about whether the pack exists. Naming the hosts the catalogue comes
- * from is what lets a filtered user recognise their own situation, which no amount of
- * "no results" ever will. The remedy that costs nothing (refresh the cache) is offered
- * BEFORE the network conclusion, because a stale-but-reachable install is the commoner
- * case and sending that user to a VPN is the same class of wrong answer pointing the
- * other way.
+ * and nothing follows about whether the pack exists. The host it names is the one this
+ * catalogue actually comes from — Manager's `DEFAULT_CHANNEL`,
+ * `raw.githubusercontent.com/ltdrdata/ComfyUI-Manager` — and NOT `api.comfy.org`, which
+ * serves pack installs rather than this mapping. Naming the wrong host would send a
+ * filtered user to check something irrelevant, which is the same failure as saying
+ * nothing.
+ *
+ * KNOWN LIMITATION, deliberately not solved here: because Manager degrades to the bundled
+ * copy, a genuinely blocked channel surfaces as a STALE catalogue rather than an empty
+ * one, and the panel cannot currently tell stale from current. That is a separate gap
+ * needing a signal Manager does not expose today; inventing a staleness claim here would
+ * repeat the very fault #808 reports.
  */
 export function emptyCatalogueResult(query) {
   const q = query == null ? "" : String(query);
@@ -633,17 +655,19 @@ export function emptyCatalogueResult(query) {
     results: [],
     query: q,
     message:
-      "ComfyUI-Manager answered, but its cached node catalogue contains ZERO packs — so " +
+      "ComfyUI-Manager answered, but its node catalogue contains ZERO packs — so " +
       `nothing was actually searched, and this result says NOTHING about whether ${
         q ? `"${q}"` : "a pack"
       } exists. (This is not "no matches": a populated catalogue has thousands of packs.) ` +
-      "Manager builds that cache by fetching the node registry — api.comfy.org, and " +
-      "raw.githubusercontent.com / github.com on channel-based builds. First refresh the " +
-      "cache from the Manager UI and retry, since a cache that simply never populated is " +
-      "the commonest cause. If it comes back empty again, those hosts are not reachable " +
-      "from this machine — corporate, campus or national network filtering blocks them " +
-      "routinely, and an empty list is not something you could have inferred that from. " +
-      "Nodes already installed are unaffected: list them with panel_list_nodes.",
+      "Manager assembles this list from its channel (by default " +
+      "raw.githubusercontent.com/ltdrdata/ComfyUI-Manager), falling back to its on-disk " +
+      "cache and then to the copy bundled in the Manager package — so an empty list " +
+      "means NONE of those three produced data. The usual causes are Manager running " +
+      "with network_mode 'offline' and no cache yet, or a Manager install whose data " +
+      "files are missing or unreadable. Refresh the cache from the Manager UI and " +
+      "retry; if this machine is behind corporate, campus or national network " +
+      "filtering, that channel host is the one to check. Nodes already installed are " +
+      "unaffected: list them with panel_list_nodes.",
   };
 }
 
