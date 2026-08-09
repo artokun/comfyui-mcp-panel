@@ -25,6 +25,7 @@ import {
 // ── a fake IndexedDB, because the failure lives in the durable path ────────
 
 function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } = {}) {
+  const state = { failWrites };
   const stores = new Map([["snapshots", new Map()]]);
   if (!missingLegacyStore) stores.set(CHAT_HISTORY_LEGACY_STORE, new Map());
   const db = {
@@ -36,7 +37,7 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
       const tx = { oncomplete: null, onerror: null, onabort: null };
       const settle = () => {
         queueMicrotask(() => {
-          if (failWrites && mode === "readwrite") tx.onabort?.();
+          if (state.failWrites && mode === "readwrite") tx.onabort?.();
           else tx.oncomplete?.();
         });
       };
@@ -51,8 +52,22 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
           queueMicrotask(() => { req.result = [...data.values()]; req.onsuccess?.(); });
           return req;
         },
+        delete(key) {
+          if (!state.failWrites) data.delete(key);
+          const req = {};
+          queueMicrotask(() => req.onsuccess?.());
+          settle();
+          return req;
+        },
+        clear() {
+          if (!state.failWrites) data.clear();
+          const req = {};
+          queueMicrotask(() => req.onsuccess?.());
+          settle();
+          return req;
+        },
         put(value, key) {
-          if (!failWrites) data.set(key, value);
+          if (!state.failWrites) data.set(key, value);
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
@@ -65,6 +80,7 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
   };
   return {
     _stores: stores,
+    _state: state,
     open() {
       const req = {};
       queueMicrotask(() => { req.result = db; req.onsuccess?.(); });
@@ -246,7 +262,7 @@ test("a legacy store that ABORTS the write grants no receipt", async () => {
   const threads = Array.from({ length: 8 }, (_, i) => legacyThread(`L${i}`, i + 1, 400));
   store.persist(threads, {});
   await store._writePromise;
-  assert.equal(store._durableLegacyIds.size, 0, "an aborted transaction is not a receipt");
+  assert.equal(store._durableLegacy.size, 0, "an aborted transaction is not a receipt");
   const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
   assert.equal(written.threads.length, 8, "…so nothing may be evicted");
 });
@@ -257,7 +273,7 @@ test("a database without the legacy store grants no receipt either", async () =>
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb, maxShadowBytes: 500 });
   store.persist([legacyThread("L0", 1, 900)], {});
   await store._writePromise;
-  assert.equal(store._durableLegacyIds.size, 0);
+  assert.equal(store._durableLegacy.size, 0);
 });
 
 test("a thread evicted from the shadow comes BACK from the legacy store", async () => {
@@ -300,12 +316,12 @@ test("an unreachable store on READ revokes the receipts rather than assuming emp
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
   store.persist([legacyThread("L0", 1)], {});
   await store._writePromise;
-  assert.equal(store._durableLegacyIds.size, 1, "precondition: a receipt exists");
+  assert.equal(store._durableLegacy.size, 1, "precondition: a receipt exists");
 
   store.indexedDb = null; // the store goes away mid-session (tab upgrade, private mode)
   const read = await store.readCanonical();
   assert.ok(read, "an unreachable legacy store must not fail the whole read");
-  assert.equal(store._durableLegacyIds.size, 0, "unknown is not proof of durability");
+  assert.equal(store._durableLegacy.size, 0, "unknown is not proof of durability");
 });
 
 test("an EMPTY legacy store is not the same as an unreachable one", async () => {
@@ -313,9 +329,9 @@ test("an EMPTY legacy store is not the same as an unreachable one", async () => 
   // not be mistaken for a failure that would keep stale receipts alive.
   const indexedDb = createFakeIndexedDb();
   const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
-  store._durableLegacyIds = new Set(["stale"]);
+  store._durableLegacy = new Map([["stale", "x"]]);
   await store.readCanonical();
-  assert.equal(store._durableLegacyIds.has("stale"), false, "an empty store proves 'stale' is not durable");
+  assert.equal(store._durableLegacy.has("stale"), false, "an empty store proves 'stale' is not durable");
 });
 
 test("the migration is idempotent — re-running it overwrites in place", async () => {
@@ -352,4 +368,151 @@ test("ordinary threads are not evictable until CANONICAL has accepted them", asy
   await store._writePromise;
   const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
   assert.equal(written.threads.length, 6, "no ordinary thread may be dropped with no canonical copy");
+});
+
+// ── codex P1: an id is not a receipt for CONTENT ───────────────────────────
+
+test("an EDITED legacy thread is rewritten, and is not evictable until it is", async () => {
+  // The receipt was a set of ids. A legacy thread written once and then edited —
+  // renamed, pinned, a message tombstoned — was filtered out of every later write as
+  // "already durable" while the stored copy stayed at the old version. The shadow
+  // would then evict the NEW version against a receipt for the OLD one, report
+  // legacyComplete: true, and clear the dirty flag. That is this whole change's own
+  // failure mode, one level down.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const original = legacyThread("L0", 1, 40);
+  store.persist([original], {});
+  await store._writePromise;
+  const storedFirst = indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0");
+  assert.equal(storedFirst.msgs[0].text.length, 40);
+
+  const edited = { ...original, updatedAt: 99, title: "renamed", msgs: [{ id: "L0-m", role: "user", text: "z".repeat(900) }] };
+  store.persist([edited], {});
+  await store._writePromise;
+  const storedSecond = indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0");
+  assert.equal(storedSecond.msgs[0].text.length, 900, "the edit must reach the durable copy");
+  assert.equal(storedSecond.title, "renamed");
+});
+
+test("a stale receipt does not license eviction", async () => {
+  // The receipt must be checked against the thread ABOUT to be evicted, not against
+  // the name of a thread stored at some point in the past.
+  const indexedDb = createFakeIndexedDb();
+  const storage = createMemoryStorage();
+  const store = new ChatHistoryStore({ storage, indexedDb, maxShadowBytes: 300 });
+  const threads = [legacyThread("L0", 1, 400), legacyThread("L1", 2, 400)];
+  store.persist(threads, {});
+  await store._writePromise;
+  // Forge a receipt whose fingerprint cannot match, exactly as a post-write edit
+  // would leave it.
+  store._durableLegacy.set("L0", "not-the-current-content");
+  store.persist(threads, {});
+  await store._writePromise;
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  // L0 was rewritten (its fingerprint did not match) and so becomes legitimately
+  // durable again — the point is that it was never evicted on the forged receipt.
+  assert.ok(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    "a mismatched fingerprint must trigger a rewrite, not an eviction",
+  );
+  assert.ok(written, "the shadow must still have been written");
+});
+
+// ── codex P1: deletes must not undo themselves ─────────────────────────────
+
+test("a TOMBSTONED legacy thread is deleted from the store", async () => {
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const threads = [legacyThread("L0", 1), legacyThread("L1", 2)];
+  store.persist(threads, {});
+  await store._writePromise;
+  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 2);
+
+  store.persist([threads[1]], { deletedThreads: { L0: { updatedAt: 500, writerId: 'tab-x', sequence: 1 } } });
+  await store._writePromise;
+  assert.equal(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    false,
+    "a deleted transcript must leave the durable store too",
+  );
+});
+
+test("a tombstoned thread is not restored, even if the delete has not landed", async () => {
+  // The durable delete can fail (unreachable store, quota). The restore path must
+  // hold the line on its own, or an unreachable store resurrects a delete.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  await store._writePromise;
+  assert.ok(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"));
+
+  const reader = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await reader._restoreLegacyShadow({
+    threads: [],
+    meta: { deletedThreads: { L0: { updatedAt: 500, writerId: 'tab-x', sequence: 1 } } },
+  });
+  assert.equal(
+    (restored.threads || []).some((t) => t.id === "L0"),
+    false,
+    "a tombstoned transcript must not come back",
+  );
+});
+
+test("an EVICTED (not deleted) thread still comes back", async () => {
+  // The other side of that rule. Absent-from-snapshot is what an eviction looks like
+  // too, so honouring tombstones must not turn into deleting on absence.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  await store._writePromise;
+
+  const reader = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await reader._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.equal((restored.threads || []).some((t) => t.id === "L0"), true);
+});
+
+test("clearAll empties the legacy store", async () => {
+  // clearAll is the user saying delete everything. A legacy store that survives it
+  // hands every cleared transcript back on the next load.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await store._writePromise;
+  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 2);
+
+  await store.clearAll([], {});
+  await store._writePromise;
+  assert.equal(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size,
+    0,
+    "cleared transcripts must not survive in the legacy store",
+  );
+  assert.equal(store._durableLegacy.size, 0, "…nor may their receipts");
+});
+
+test("an edit whose durable rewrite FAILS leaves the thread unevictable", async () => {
+  // The case that separates an id receipt from a content receipt. A receipt exists
+  // (the thread was stored once), the thread is then edited, and the rewrite cannot
+  // land. An id-only gate would evict the new version against the old copy — which
+  // is precisely the loss the fingerprint exists to prevent. Nothing else in the
+  // suite reaches this, because the rewrite normally refreshes the receipt first.
+  const indexedDb = createFakeIndexedDb();
+  const storage = createMemoryStorage();
+  const store = new ChatHistoryStore({ storage, indexedDb, maxShadowBytes: 400 });
+  const original = legacyThread("L0", 1, 30);
+  const filler = legacyThread("L1", 2, 30);
+  store.persist([original, filler], {});
+  await store._writePromise;
+  assert.equal(store._durableLegacy.size, 2, "precondition: both are durable");
+
+  indexedDb._state.failWrites = true; // quota, or a store that went away
+  const edited = { ...original, updatedAt: 99, msgs: [{ id: "L0-m", role: "user", text: "z".repeat(900) }] };
+  store.persist([edited, filler], {});
+  await store._writePromise;
+
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  const kept = (written.threads || []).find((t) => t.id === "L0");
+  assert.ok(kept, "the edited thread must stay in the shadow — its durable copy is stale");
+  assert.equal(kept.msgs[0].text.length, 900, "…and it must be the EDITED version that stayed");
 });
