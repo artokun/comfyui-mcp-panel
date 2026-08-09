@@ -249,6 +249,7 @@ import {
   registeredSocketTypes,
   unavailableRequiredWidgetMessage,
   unavailableRequiredWidgetReport,
+  unavailableEntriesLiveNodeCannotExplain,
 } from "./lib/node-widget-materialization.js";
 import {
   describeUnmaterializedRequiredWidgets,
@@ -7595,6 +7596,7 @@ async function awaitRequiredCustomWidgetRegistration(
   currentDef,
   classType,
   widenSocketProof,
+  liveNodeOfClass,
 ) {
   const startedAt = Date.now();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
@@ -7627,6 +7629,29 @@ async function awaitRequiredCustomWidgetRegistration(
     unavailable = check();
   }
   if (!unavailable.length) return;
+  // #636 — LAST, and only once the wait has already failed: ask what this ComfyUI
+  // actually DID. Everything above reasons about what SHOULD happen, and on a backend
+  // where nothing outputs the datatype a socket-shaped input has no proof and fails
+  // closed forever — no retry can change it, because every input to that decision is a
+  // snapshot. The reporter had a WORKING node of this very class on the canvas while
+  // being told the class could not be built.
+  //
+  // Placed after the poll on purpose: a genuinely still-loading widget must get its full
+  // 5 s first, so this can only ever convert a permanent refusal into a success, never
+  // shorten a legitimate wait.
+  if (typeof liveNodeOfClass === "function") {
+    let live = null;
+    try {
+      live = liveNodeOfClass(classType);
+    } catch {
+      live = null; // an unreadable canvas explains nothing; fall through and refuse
+    }
+    if (live) {
+      const stillUnexplained = unavailableEntriesLiveNodeCannotExplain(unavailable, live);
+      if (!stillUnexplained.length) return;
+      unavailable = stillUnexplained;
+    }
+  }
   // #695: the poll is the ONLY thing here a retry can change (nodeData, currentDef and
   // knownSocketTypes are all snapshots), so a type that is structurally a socket must be
   // waived by the check rather than waited out — and whatever is left after the wait gets
@@ -9095,6 +9120,19 @@ const GRAPH_TOOL_EXECUTORS = {
       currentDef,
       class_type,
       widenSocketProof,
+      // #636 — the canvas as evidence of last resort. A node of this class that ComfyUI
+      // ALREADY built here shows how each input actually materialised, which no amount of
+      // schema reasoning can establish on a backend that never outputs the datatype.
+      // Read lazily: only the refusal path calls it, so a healthy add pays nothing.
+      (cls) => {
+        try {
+          const graph = getGraphCtx()?.graph ?? app?.graph ?? null;
+          const nodes = graph?._nodes ?? graph?.nodes ?? [];
+          return nodes.find((n) => n?.type === cls) ?? null;
+        } catch {
+          return null;
+        }
+      },
     );
     const node = LG.createNode(class_type);
     if (!node) {

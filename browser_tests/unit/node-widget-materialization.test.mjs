@@ -12,6 +12,7 @@ import {
   unavailableRequiredCustomWidgetTypes,
   unavailableRequiredWidgetMessage,
   unavailableRequiredWidgetReport,
+  unavailableEntriesLiveNodeCannotExplain,
 } from "../../web/js/lib/node-widget-materialization.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -791,8 +792,21 @@ test("#695: graph_add_node consumes the report and message, and names the class"
   );
   assert.match(
     src,
-    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*widenSocketProof,\s*\)/,
+    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*widenSocketProof,/,
     "the class_type reaches the message, and #821's widen reaches the guard",
+  );
+  // #636 — the live-canvas evidence must reach it too, or the refusal it exists to
+  // convert stays permanent on a backend that never outputs the datatype.
+  assert.match(src, /unavailableEntriesLiveNodeCannotExplain,/, "imported");
+  assert.match(
+    src,
+    /unavailableEntriesLiveNodeCannotExplain\(unavailable, live\)/,
+    "the guard consults the live node before refusing",
+  );
+  assert.match(
+    src,
+    /nodes\.find\(\(n\) => n\?\.type === cls\)/,
+    "and the caller supplies a resolver that finds a node of the SAME class",
   );
 });
 
@@ -973,4 +987,98 @@ test("#686 a registered constructor still wins — the waiver never shadows a re
     unavailableRequiredCustomWidgetTypes(def, { ...REGISTERED, [AUTOGROW]: () => {} }, undefined, def),
     [],
   );
+});
+
+// ── #636: the canvas as evidence of last resort ────────────────────────────
+//
+// `SaveVideo` was refused with 'Required custom widget "VIDEO" have not registered' on a
+// canvas that already held a WORKING SaveVideo. Reproduced exactly, at this level: with
+// nothing in the backend outputting VIDEO, `video: ["VIDEO"]` is socket-shaped but not
+// link-proven, so it fails closed — and no retry can clear it, because every input to
+// that decision is a snapshot.
+//
+// (The OTHER half of that node, `codec: COMFY_DYNAMICCOMBO_V3`, was already waived by
+// #686. Verified against a live ComfyUI: SaveVideo adds fine where something outputs
+// VIDEO, which is why this only reproduces on the reporter's shape.)
+
+const SAVE_VIDEO_DEF = {
+  input: {
+    required: {
+      video: ["VIDEO"],
+      filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+      format: ["COMBO", { options: ["auto"] }],
+      codec: ["COMFY_DYNAMICCOMBO_V3", { options: [] }],
+    },
+  },
+};
+const BASIC_WIDGETS = { STRING: () => {}, COMBO: () => {} };
+
+test("#636: VIDEO fails closed only where nothing outputs it", () => {
+  const report = (known) =>
+    unavailableRequiredWidgetReport(null, BASIC_WIDGETS, known, SAVE_VIDEO_DEF);
+  assert.deepEqual(report(new Set(["VIDEO"])), [], "output-proven ⇒ addable (a normal install)");
+  const refused = report(new Set());
+  assert.equal(refused.length, 1, "the reporter's backend refuses");
+  assert.equal(refused[0].type, "VIDEO");
+  assert.deepEqual(refused[0].inputs, ["video"]);
+});
+
+test("#636: a live node of the class explains an input that materialised as a SLOT", () => {
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), SAVE_VIDEO_DEF);
+  // What ComfyUI actually built here: `video` came out as a link slot, so it is a socket
+  // and there is no constructor to wait for — observed, not inferred.
+  const live = { type: "SaveVideo", inputs: [{ name: "video" }], widgets: [{ name: "filename_prefix" }] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, live), []);
+});
+
+test("#636: a widget on the live node explains it too", () => {
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), SAVE_VIDEO_DEF);
+  const live = { type: "SaveVideo", inputs: [], widgets: [{ name: "video" }] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, live), []);
+});
+
+test("#636: it ADDS evidence — it never lowers the bar", () => {
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), SAVE_VIDEO_DEF);
+  // No live node at all: unchanged, still refused. This is the #580 case.
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, null), refused);
+  // A live node that does NOT account for the input explains nothing.
+  const unrelated = { type: "SaveVideo", inputs: [{ name: "audio" }], widgets: [{ name: "format" }] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, unrelated), refused);
+  // An unreadable node explains nothing.
+  assert.deepEqual(
+    unavailableEntriesLiveNodeCannotExplain(refused, { get widgets() { throw new Error("boom"); } }),
+    refused,
+  );
+});
+
+test("#636: an entry naming NO inputs can never be explained away", () => {
+  // Nothing to check the live node against, so there is nothing it could have observed.
+  // Treating that as explained would waive a type on the mere PRESENCE of a same-class
+  // node, which is the accept-all-unknown shape #580 exists to prevent.
+  const live = { type: "X", inputs: [{ name: "video" }], widgets: [{ name: "video" }] };
+  for (const entry of [{ type: "VIDEO" }, { type: "VIDEO", inputs: [] }, { type: "VIDEO", inputs: null }]) {
+    assert.deepEqual(
+      unavailableEntriesLiveNodeCannotExplain([entry], live),
+      [entry],
+      JSON.stringify(entry),
+    );
+  }
+});
+
+test("#636: EVERY input carrying the type must be accounted for, not just one", () => {
+  // A def can require the same datatype twice. Explaining one occurrence says nothing
+  // about the other — the same rule the socket/widget split is built on.
+  const twice = {
+    input: { required: { video: ["VIDEO"], video_b: ["VIDEO"] } },
+  };
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), twice);
+  assert.deepEqual(refused[0].inputs, ["video", "video_b"]);
+  const half = { type: "X", inputs: [{ name: "video" }], widgets: [] };
+  assert.deepEqual(
+    unavailableEntriesLiveNodeCannotExplain(refused, half),
+    refused,
+    "half an explanation is not an explanation",
+  );
+  const both = { type: "X", inputs: [{ name: "video" }, { name: "video_b" }], widgets: [] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, both), []);
 });
