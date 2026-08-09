@@ -29,32 +29,72 @@ function createMemoryStorage({ throwOnSet = null } = {}) {
   }
 }
 
-function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false } = {}) {
-  let state = initialState == null ? null : structuredClone(initialState)
+function createFakeIndexedDb(
+  initialState = null,
+  { blockedThenSuccess = false, stores = ['snapshots'] } = {}
+) {
+  // KEYED, like the real thing. This used to be a single slot: get() ignored the key
+  // and put() replaced everything, so a SECOND key in a store silently destroyed the
+  // canonical snapshot. That is exactly how #861's pending-delete marker behaved when
+  // it was first tried here, and the failure looked like a bug in the change rather
+  // than in the fake. A fake that cannot tell two keys apart cannot test two keys.
+  const data = new Map()
+  const at = (store, key) => store + ' :: ' + String(key)
+  if (initialState != null) data.set(at('snapshots', 'state'), structuredClone(initialState))
   let closeCount = 0
 
   const createDb = () => ({
-    objectStoreNames: { contains: (name) => name === 'snapshots' },
+    objectStoreNames: { contains: (name) => stores.includes(name) },
     createObjectStore() {},
     close: () => { closeCount += 1 },
-    transaction: (_name, mode) => {
+    transaction: (names, mode) => {
+      const wanted = Array.isArray(names) ? names : [names]
+      for (const name of wanted) {
+        if (!stores.includes(name)) throw new Error('no object store ' + name)
+      }
       const tx = {
         oncomplete: null,
         onerror: null,
         onabort: null,
-        objectStore: () => ({
-          get: () => {
+        objectStore: (name = wanted[0]) => ({
+          get: (key) => {
             const request = { result: undefined, onsuccess: null, onerror: null }
             queueMicrotask(() => {
-              request.result = state == null ? undefined : structuredClone(state)
+              const held = data.get(at(name, key))
+              request.result = held === undefined ? undefined : structuredClone(held)
               request.onsuccess?.()
             })
             return request
           },
-          put: (value) => {
+          getAll: () => {
+            const request = { result: [], onsuccess: null, onerror: null }
+            queueMicrotask(() => {
+              request.result = [...data.entries()]
+                .filter(([held]) => held.startsWith(name + ' :: '))
+                .map(([, value]) => structuredClone(value))
+              request.onsuccess?.()
+            })
+            return request
+          },
+          put: (value, key) => {
             assert.equal(mode, 'readwrite')
-            state = structuredClone(value)
+            data.set(at(name, key === undefined ? 'state' : key), structuredClone(value))
             queueMicrotask(() => tx.oncomplete?.())
+            return { onsuccess: null, onerror: null }
+          },
+          delete: (key) => {
+            assert.equal(mode, 'readwrite')
+            data.delete(at(name, key))
+            queueMicrotask(() => tx.oncomplete?.())
+            return { onsuccess: null, onerror: null }
+          },
+          clear: () => {
+            assert.equal(mode, 'readwrite')
+            for (const held of [...data.keys()]) {
+              if (held.startsWith(name + ' :: ')) data.delete(held)
+            }
+            queueMicrotask(() => tx.oncomplete?.())
+            return { onsuccess: null, onerror: null }
           }
         })
       }
@@ -80,7 +120,17 @@ function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false }
       })
       return request
     },
-    readState: () => state == null ? null : structuredClone(state),
+    // Still the CANONICAL snapshot specifically, which is what every caller means
+    // by readState — now addressed by its key rather than by being the only thing
+    // the fake could hold.
+    readState: () => {
+      const held = data.get(at('snapshots', 'state'))
+      return held === undefined ? null : structuredClone(held)
+    },
+    readAt: (store, key) => {
+      const held = data.get(at(store, key))
+      return held === undefined ? null : structuredClone(held)
+    },
     closeCount: () => closeCount
   }
 }
