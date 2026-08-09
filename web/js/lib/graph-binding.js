@@ -227,16 +227,90 @@ const SERIALIZED_FORMAT_METADATA_KEYS = new Set([
 ]);
 
 /**
+ * Can a value inside `extra` be GRAPH CONTENT — nodes, links, groups, subgraph
+ * definitions, anything whose loss would mean a canvas is not really empty?
+ *
+ * #833 — the rule used to be "any non-empty value in `extra` defeats the proof",
+ * and on a real install that meant NO empty workflow was ever provably empty.
+ * Every workflow ComfyUI writes carries `extra.frontendVersion` (a version
+ * string), and installed extensions add their own per-workflow settings —
+ * `VHS_latentpreview: false`, `workflowRendererVersion`, `workflowHash`. All
+ * verified against this repo owner's own `user/default/workflows`. A blank
+ * canvas therefore failed `activeWorkflowProvenEmpty`, which is the FIRST escape
+ * out of `graphEmptyBindingUnproven`, and the panel fell through to the seal —
+ * where a second blank tab makes the exclusivity probe ambiguous, so nothing
+ * sealed and every graph tool refused with no way out.
+ *
+ * THE RULE IS BY TYPE, NOT BY TRUST (codex). The first cut said "a scalar cannot
+ * be graph content" and admitted every scalar, present and future, from any
+ * extension. That is an accept-all-unknown policy on a fence that also gates root
+ * UUID stamping, and it has a real counterexample: an extension may stash a
+ * serialized graph as a JSON STRING. So:
+ *
+ *  - a BOOLEAN or a NUMBER is admitted, because a graph cannot be encoded in one.
+ *    That is a property of the type, not a judgement about who wrote it, so it
+ *    needs no allowlist and cannot be invalidated by a future extension;
+ *  - a STRING must be NAMED. `extra.frontendVersion` and its siblings are the
+ *    stamps that made every real workflow unprovable, and they are a short,
+ *    knowable list. Anything else stays content until someone establishes
+ *    otherwise — a workflow that keeps refusing is recoverable, a canvas stamped
+ *    with the wrong identity is not;
+ *  - an ARRAY or OBJECT is structured and stays content, which is what keeps
+ *    `groupNodes`, `ue_links`, `linkExtensions` and a stashed `reroutes`
+ *    defeating the proof exactly as before.
+ *
+ * This does not weaken the #560 protection it was written for. A tab that is
+ * MID-RESTORE has the full graph in its tracker state — that is the restore
+ * source — so it fails the `nodes.length !== 0` check above and never reaches
+ * this rule. The strictness on version stamps was protecting nothing and costing
+ * the empty-canvas case its only exit.
+ */
+const EXTRA_METADATA_STRING_KEYS = new Set([
+  "frontendVersion",
+  "workflowRendererVersion",
+  "workflowHash",
+  "version",
+  "revision",
+]);
+
+/** Could this text be carrying STRUCTURED data rather than naming or stamping
+ *  something? A version, a hash and an extension's setting name are all short and
+ *  free of JSON delimiters; a stashed graph is neither. Applied to admitted string
+ *  VALUES and to the KEY itself, because a graph can be encoded in an object key
+ *  with a boolean value just as easily as in a string value (codex round 2). */
+const STRUCTURAL_TEXT_CHARS = ["{", "}", "[", "]"];
+const looksStructured = (text) =>
+  text.length > 64 || STRUCTURAL_TEXT_CHARS.some((ch) => text.includes(ch));
+
+const extraValueMayBeGraphContent = (key, value) => {
+  // The KEY first: a name carrying JSON delimiters is not a setting name, and the
+  // value's type says nothing about what the key is smuggling.
+  if (typeof key === "string" && looksStructured(key)) return true;
+  if (isEmptySurfaceValue(value)) return false;
+  if (typeof value === "boolean" || typeof value === "number") return false;
+  if (typeof value === "string") {
+    // A named stamp still has to LOOK like one. Trusting the key alone would let
+    // `frontendVersion: '{"nodes":[…]}'` through on the strength of its name.
+    return !EXTRA_METADATA_STRING_KEYS.has(key) || looksStructured(value);
+  }
+  // Arrays, objects, and anything exotic (bigint, symbol, function) stay content:
+  // an unrecognized shape is not evidence of emptiness.
+  return true;
+};
+
+/**
  * POSITIVE proof that a serialized graph state holds NO workflow content at
  * all — the empty-canvas relaxation's evidence bar (#565 gate). True only
  * when `state` is a well-formed serialized graph whose `nodes` is a PRESENT
  * empty array (a missing/malformed read proves nothing) AND every own
  * surface outside the format-metadata allowlist is absent-or-empty. Inside
  * `extra`, `ds` (viewport) and `comfyui_mcp` (the panel's own identity tag)
- * are not content; any other key must hold an empty value. A single
- * non-empty subgraphs/groups/reroutes/links surface — or any unknown
- * non-empty surface — defeats the proof, so a foreign content-bearing canvas
- * can never be re-stamped through the relaxation.
+ * are not content, and neither is a boolean, a number or a NAMED version stamp
+ * (see above, #833); any other key
+ * must hold an empty value. A single non-empty subgraphs/groups/reroutes/links
+ * surface — or any unknown non-empty STRUCTURED surface — defeats the proof, so
+ * a foreign content-bearing canvas can never be re-stamped through the
+ * relaxation.
  */
 export function serializedStateProvenEmpty(state) {
   try {
@@ -248,11 +322,14 @@ export function serializedStateProvenEmpty(state) {
         if (value == null) continue;
         if (typeof value !== "object" || Array.isArray(value)) return false;
         const { ds: viewport, comfyui_mcp: panelTag, ...workflowExtra } = value;
-        for (const extraValue of Object.values(workflowExtra)) {
-          if (!isEmptySurfaceValue(extraValue)) return false;
+        for (const [extraKey, extraValue] of Object.entries(workflowExtra)) {
+          if (extraValueMayBeGraphContent(extraKey, extraValue)) return false;
         }
         continue;
       }
+      // OUTSIDE `extra` the surfaces are the graph's own (nodes, links, groups,
+      // reroutes, subgraphs, definitions), so the strict rule stands: anything
+      // non-empty here is content by construction.
       if (!isEmptySurfaceValue(value)) return false;
     }
     return true;
