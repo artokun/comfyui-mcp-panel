@@ -395,6 +395,125 @@ function graphShape(state) {
 }
 
 /**
+ * Per-node fields that carry no workflow CONTENT — the ones the ComfyUI frontend
+ * is free to rewrite while loading a graph it reproduced faithfully.
+ *
+ * THE LIST IS BORROWED, NOT INVENTED. `diffGraphsForAgent` — the panel's own
+ * user-facing graph diff — already draws this line, and states it: it reports
+ * adds, removes, mode, widget values, titles and connections, and "ignores pure
+ * moves/resizes/recolors (noise)". This set is exactly that noise, so the two
+ * places that decide what counts as a real edit cannot disagree.
+ *
+ * `size` is the reported case (#825): a node's box is recomputed from live
+ * widget/DOM metrics on load, so a workflow saved by one frontend build and
+ * loaded by another routinely comes back resized with an identical graph.
+ * `order` is LiteGraph's recomputed execution index, not user state.
+ *
+ * DELIBERATELY ABSENT, each one a way this could have lied (codex):
+ *  - `widgets_values` — the difference between two runs. Content.
+ *  - `title` — user-editable and persisted by `graph_edit_node`; the panel's own
+ *    diff reports a title change as a real edit. A load that reset a custom title
+ *    HAS lost something, and must not be waved through as a resize.
+ *  - `flags` — not just `collapsed`: `graph_edit_node` persists `pinned` here too.
+ *  - `mode` — bypass/mute is execution semantics.
+ */
+const COSMETIC_NODE_FIELDS = new Set(["size", "pos", "order", "color", "bgcolor"]);
+
+/** The node's identity for set comparison: what makes it THIS node rather than
+ *  another one. Type included, because an id reused for a different type is a
+ *  different node however the count reads.
+ *
+ *  JSON-encoded rather than joined on a delimiter, because a join is not
+ *  injective (codex): with `id + "|" + type`, `{id:"a|b",type:"c"}` and
+ *  `{id:"a",type:"b|c"}` produce the SAME key, and two different nodes reading as
+ *  one is precisely the mis-pairing `sameNodeSet` must never make. Any delimiter
+ *  has this problem for some input; encoding the boundary removes it. */
+function nodeIdentityKey(node) {
+  return JSON.stringify([String(node?.id ?? ""), String(node?.type ?? "")]);
+}
+
+/**
+ * WHY two node arrays differ — specifically, whether anything was LOST.
+ *
+ * THE DEFECT THIS ANSWERS (#825). `nodes` is a single surface holding the whole
+ * serialized array, so "the graph on the canvas differs from what was loaded on:
+ * nodes" is emitted identically for a node that vanished and for a node whose box
+ * the frontend re-measured. A reporter read that after a perfectly good open and
+ * was pushed toward redoing work that was fine.
+ *
+ * This does NOT soften the verdict — see `resolveOpenRebindVerdict`, which stays
+ * `unknown` either way, deliberately. It makes the DISCLOSURE say which of the two
+ * it observed, because they send a reader to opposite places.
+ *
+ * Returns `{ comparable, sameNodeSet, cosmeticOnly, fields }`:
+ *  - `sameNodeSet` — every loaded node is present with the same id AND type, and
+ *    no extra ones appeared. Nothing was dropped, added or retyped.
+ *  - `cosmeticOnly` — sameNodeSet AND every per-node difference is confined to
+ *    COSMETIC_NODE_FIELDS. This is the "the frontend re-measured it" case.
+ *  - `fields` — the per-node keys that actually differed, so the disclosure can
+ *    name them instead of asking the reader to guess.
+ * Anything unreadable is `comparable:false` and asserts nothing.
+ */
+export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
+  const NOT_COMPARABLE = { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [] };
+  if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return NOT_COMPARABLE;
+  try {
+    const byKey = (list) => {
+      const map = new Map();
+      for (const node of list) {
+        if (!node || typeof node !== "object") return null; // a junk entry makes the set unreadable
+        const key = nodeIdentityKey(node);
+        if (map.has(key)) return null; // duplicate identity — cannot pair them up honestly
+        map.set(key, node);
+      }
+      return map;
+    };
+    const expected = byKey(expectedNodes);
+    const actual = byKey(actualNodes);
+    if (!expected || !actual) return NOT_COMPARABLE;
+
+    if (expected.size !== actual.size) return { ...NOT_COMPARABLE, comparable: true };
+    for (const key of expected.keys()) {
+      if (!actual.has(key)) return { ...NOT_COMPARABLE, comparable: true };
+    }
+
+    // Same set. Now: which per-node keys disagree?
+    //
+    // PRESENCE IS COMPARED BEFORE VALUE (codex). An earlier cut wrote
+    // `canonicalizeShapeValue(v) ?? null`, which made an ABSENT field equal to one
+    // explicitly set to `null` — so a node that lost its `widgets_values`
+    // (present-as-null on one side, gone on the other) dropped out of `fields`
+    // entirely, and a size change alongside it passed the cosmetic gate. A
+    // classifier that erases the very field that would have blocked the all-clear
+    // is the worst possible failure here.
+    const has = (node, field) => Object.prototype.hasOwnProperty.call(node, field);
+    const fields = new Set();
+    for (const [key, expectedNode] of expected) {
+      const actualNode = actual.get(key);
+      const keys = new Set([...Object.keys(expectedNode), ...Object.keys(actualNode)]);
+      for (const field of keys) {
+        if (has(expectedNode, field) !== has(actualNode, field)) {
+          fields.add(field);
+          continue;
+        }
+        const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]));
+        const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]));
+        if (a !== b) fields.add(field);
+      }
+    }
+    const list = [...fields].sort();
+    return {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: list.length > 0 && list.every((field) => COSMETIC_NODE_FIELDS.has(field)),
+      fields: list,
+    };
+  } catch {
+    return NOT_COMPARABLE;
+  }
+}
+
+/**
  * WHICH surfaces of a just-loaded state the live root does not reproduce.
  *
  * This exists for the DISCLOSURE only — it names what disagreed so the answer is
@@ -403,18 +522,24 @@ function graphShape(state) {
  * `resolveOpenRebindVerdict` for why no classification of a content mismatch is
  * currently trustworthy enough to soften a verdict.
  *
+ * `nodeDifference` (#825) is the one refinement, and it refines the SENTENCE, not
+ * the verdict: within the `nodes` surface it separates "a node is missing" from
+ * "the frontend re-measured the boxes", which the surface name alone cannot.
+ *
  * "The panel could not compare" and "the panel compared and they differ" are
  * different answers, and collapsing the first into the second is the defect this
  * whole cluster is about. `comparable:false` means exactly that no comparison
  * happened — it is never evidence of a mismatch.
  */
 export function describeGraphStateDifference({ rootGraph, state } = {}) {
-  const NOT_COMPARABLE = { comparable: false, surfaces: [] };
+  const NOT_COMPARABLE = { comparable: false, surfaces: [], nodeDifference: null };
   try {
     const expectedShape = buildGraphShape(state);
     let actualShape = null;
+    let actualState = null;
     try {
-      actualShape = buildGraphShape(rootGraph?.serialize?.());
+      actualState = rootGraph?.serialize?.();
+      actualShape = buildGraphShape(actualState);
     } catch {
       actualShape = null;
     }
@@ -426,7 +551,17 @@ export function describeGraphStateDifference({ rootGraph, state } = {}) {
     };
     const expected = canon(expectedShape);
     const actual = canon(actualShape);
-    return { comparable: true, surfaces: Object.keys(expected).filter((key) => expected[key] !== actual[key]) };
+    const surfaces = Object.keys(expected).filter((key) => expected[key] !== actual[key]);
+    return {
+      comparable: true,
+      surfaces,
+      // Only when `nodes` is one of the disagreeing surfaces: otherwise there is
+      // nothing about the nodes to explain, and an all-clear here would read as
+      // one about the difference that actually fired.
+      nodeDifference: surfaces.includes("nodes")
+        ? classifyNodeDifference({ expectedNodes: state?.nodes, actualNodes: actualState?.nodes })
+        : null,
+    };
   } catch {
     return NOT_COMPARABLE;
   }
@@ -833,6 +968,48 @@ function contentWasCompared(observed) {
   return observed?.contentComparable === true;
 }
 
+/**
+ * The sentence that says whether anything was LOST from the node set (#825).
+ *
+ * "nodes differ" is the same three words whether a node vanished or the frontend
+ * re-measured every box, and the reporter read it after a perfectly good open as
+ * possible data loss. So when the node set is intact, say so — plainly, in the
+ * same breath, because a warning the reader cannot size is one they must assume
+ * the worst about.
+ *
+ * It states an OBSERVATION and stops. `cosmeticOnly` names the fields that moved
+ * and says the frontend rewrites them; a widget-value difference is NOT cosmetic
+ * and gets the plain same-set sentence with no reassurance attached. Nothing here
+ * touches the verdict, which stays `unknown` either way.
+ */
+function nodeSurfaceClause(observed = {}) {
+  const diff = observed.contentNodeDifference;
+  if (!diff || diff.comparable !== true) return "";
+  if (!diff.sameNodeSet) {
+    return (
+      ` — and the node SET itself differs (a node is missing, extra, or has a different type), ` +
+      `which is not something the frontend does while loading a graph faithfully`
+    );
+  }
+  const fields = (diff.fields ?? []).join(", ") || "no readable field";
+  if (diff.cosmeticOnly) {
+    // States the NODE observation and stops. The overall "nothing to redo"
+    // conclusion is the headline's to draw, and only when `nodes` is the sole
+    // surface that differed — a group or a link lost alongside the re-measured
+    // boxes is work the node set cannot vouch for.
+    return (
+      ` — but every node that was loaded IS on the canvas with the same id and type, and nothing ` +
+      `extra appeared, so NO node was lost. What differs is per-node presentation (${fields}), ` +
+      `which the ComfyUI frontend recomputes on load`
+    );
+  }
+  return (
+    ` — every node that was loaded IS on the canvas with the same id and type and nothing extra ` +
+    `appeared, so no node was lost; what differs is per-node (${fields}). A widget value is real ` +
+    `content, so read it (panel_graph_outline) before assuming either way`
+  );
+}
+
 /** One clause per failed part, naming the TWO VALUES that disagreed. A refusal
  *  that says only "the fence rejected" is not actionable; one that says which
  *  observation failed and what was seen instead is. */
@@ -868,7 +1045,8 @@ function openRebindPartClause(part, observed = {}) {
       // the burden sits on the CLAIM: only a positive "yes, compared" licenses it.
       return contentWasCompared(observed)
         ? `the graph on the canvas differs from what was loaded on: ` +
-            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}`
+            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}` +
+            nodeSurfaceClause(observed)
         : `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
             `not established — whether the whole graph landed`;
     default:
@@ -912,6 +1090,30 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // apart and the caller passes that through as `contentComparable`; anything but
     // an explicit `true` takes the non-asserting wording.
     const compared = contentWasCompared(observed);
+    // #825 — the headline may only claim "the panel cannot tell" while that is
+    // still true. When the ONLY surface that differs is `nodes` and the node set
+    // came through intact with just presentation rewritten, the panel CAN tell:
+    // it compared the sets and nothing was lost. Leaving the generic sentence
+    // there is what made a healthy open read as possible data loss, and sent a
+    // reporter looking for work to redo that was never gone. Narrow on purpose —
+    // any second differing surface is unexplained by a node-set observation, so
+    // it falls back to the honest "cannot tell".
+    const nodesOnly =
+      (observed.contentSurfaces ?? []).length === 1 && (observed.contentSurfaces ?? [])[0] === "nodes";
+    const nodeSetIntact =
+      observed.contentNodeDifference?.comparable === true &&
+      observed.contentNodeDifference?.sameNodeSet === true &&
+      observed.contentNodeDifference?.cosmeticOnly === true;
+    if (compared && nodesOnly && nodeSetIntact) {
+      return (
+        `workflow_open RAN, the canvas IS bound to ${workflow}, and every node that was loaded is on ` +
+        `it with the same id and type — nothing was lost. The only difference is per-node ` +
+        `presentation, which the ComfyUI frontend recomputes on load, so the panel cannot call the ` +
+        `repaint byte-identical and reports the content as UNCONFIRMED rather than failed.${because} ` +
+        `You are on the right workflow and there is no missing work to redo; if you need the exact ` +
+        `graph, read it with panel_graph_outline.`
+      );
+    }
     return (
       `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but ` +
       (compared

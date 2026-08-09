@@ -327,6 +327,7 @@ test("describeGraphStateDifference: an unshapeable side reports NOT COMPARABLE, 
   assert.deepEqual(describeGraphStateDifference({ rootGraph: { serialize: () => null }, state }), {
     comparable: false,
     surfaces: [],
+    nodeDifference: null,
   });
   assert.deepEqual(
     describeGraphStateDifference({
@@ -337,26 +338,29 @@ test("describeGraphStateDifference: an unshapeable side reports NOT COMPARABLE, 
       },
       state,
     }),
-    { comparable: false, surfaces: [] },
+    { comparable: false, surfaces: [], nodeDifference: null },
     "a THROWING serializer is an absent observation, not evidence of a mismatch",
   );
   assert.deepEqual(describeGraphStateDifference({ rootGraph: liveRoot(structuredClone(state)) }), {
     comparable: false,
     surfaces: [],
+    nodeDifference: null,
   });
-  assert.deepEqual(describeGraphStateDifference(), { comparable: false, surfaces: [] });
+  assert.deepEqual(describeGraphStateDifference(), { comparable: false, surfaces: [], nodeDifference: null });
 });
 
 test("describeGraphStateDifference: names the surfaces that disagreed, and only those", () => {
   const state = payload(NODES);
   const equal = describeGraphStateDifference({ rootGraph: liveRoot(structuredClone(state)), state });
-  assert.deepEqual(equal, { comparable: true, surfaces: [] });
+  assert.deepEqual(equal, { comparable: true, surfaces: [], nodeDifference: null });
 
   const nodesDiffer = structuredClone(state);
   nodesDiffer.nodes = [nodesDiffer.nodes[0]];
   assert.deepEqual(describeGraphStateDifference({ rootGraph: liveRoot(nodesDiffer), state }), {
     comparable: true,
     surfaces: ["nodes"],
+    // #825 — a DROPPED node: same-set must be false, and never "cosmetic".
+    nodeDifference: { comparable: true, sameNodeSet: false, cosmeticOnly: false, fields: [] },
   });
 
   const groupsDiffer = structuredClone(state);
@@ -364,6 +368,8 @@ test("describeGraphStateDifference: names the surfaces that disagreed, and only 
   assert.deepEqual(describeGraphStateDifference({ rootGraph: liveRoot(groupsDiffer), state }), {
     comparable: true,
     surfaces: ["groups"],
+    // nodes agreed, so there is no node difference to explain.
+    nodeDifference: null,
   });
 
   // Serializer DIALECT must not be named as a difference — it is not one (#560).
@@ -374,6 +380,7 @@ test("describeGraphStateDifference: names the surfaces that disagreed, and only 
   assert.deepEqual(describeGraphStateDifference({ rootGraph: liveRoot(dialect), state }), {
     comparable: true,
     surfaces: [],
+    nodeDifference: null,
     // A present-but-empty surface and a viewport are dialect, and this must agree
     // with graphRootMatchesState exactly — one normalization, two readings of it.
   });
