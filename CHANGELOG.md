@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.50] - 2026-08-09
+
+> Covers changes since 0.11.49.
+
+### Fixed
+- An interactive card the agent had just created could stop responding to it mid-turn.
+  `panel_ui_render` returned a card_id and an immediate `panel_ui_update` failed with
+  "no live card" — no click, no dismissal, no view switch. Any repaint of the chat feed
+  between the two calls (which happens on its own) replayed the card as a finished, inert
+  one and dropped the handle the update needs. An unanswered card now comes back live
+  under the same id the agent was given; an answered or dismissed one still comes back
+  inert, so a question you already answered is never re-offered. Card ids are also now
+  collision-resistant across a page reload, and the provisional paint that runs before the
+  panel has decided which conversation is authoritative stays inert deliberately, so a
+  card can never come back live in a conversation that is about to be replaced
+  (#837, #832)
+
 ## [0.11.49] - 2026-08-09
 
 > Covers changes since 0.11.48.
