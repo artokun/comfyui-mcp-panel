@@ -432,6 +432,100 @@ test("#821: a type the WHOLE schema also cannot prove is still refused", async (
   assert.equal(comfy.graph._nodes.length, 0, "nothing reached the graph");
 });
 
+// A node with TWO custom required socket types: one it produces ITSELF (so the
+// single-class payload already proves it) and one produced by a SIBLING (so it does not).
+// Only this combination reaches the interesting state — a report that is non-empty, and
+// therefore widens, while the narrow proof still holds real evidence worth not losing.
+function chainSchema() {
+  return {
+    ...backendObjectInfo(),
+    SeedVR2Chain: {
+      name: "SeedVR2Chain",
+      input: {
+        required: {
+          dit: ["SEEDVR2_DIT", {}], // produced by SeedVR2Chain itself
+          vae: ["SEEDVR2_VAE", {}], // produced only by SeedVR2LoadVAEModel
+        },
+      },
+      output: ["SEEDVR2_DIT"],
+    },
+  };
+}
+
+/** An api whose per-class route works but whose whole-schema route answers `bad`. */
+function apiWithBrokenWholeSchema(bad, schema = chainSchema) {
+  return {
+    async getNodeDefs() {
+      return typeof bad === "function" ? bad() : bad;
+    },
+    async fetchApi(route) {
+      const cls = decodeURIComponent(String(route).replace("/object_info/", ""));
+      const all = schema();
+      const body = Object.prototype.hasOwnProperty.call(all, cls) ? { [cls]: all[cls] } : {};
+      return { status: 200, json: async () => body };
+    },
+  };
+}
+
+for (const [label, bad] of [
+  ["returns null", null],
+  ["returns an empty object", {}],
+  ["returns a non-object", "<html>proxy sign-in</html>"],
+  [
+    "throws",
+    () => {
+      throw new Error("backend went away mid-add");
+    },
+  ],
+]) {
+  test(`#821 (codex): a widen that ${label} must not WEAKEN the proof it already had`, async () => {
+    // The single-class payload proves SEEDVR2_DIT (SeedVR2Chain outputs it). Only
+    // SEEDVR2_VAE is unproven, so the node is refused either way — that is not the bug.
+    // The bug is the MESSAGE: registeredSocketTypes maps an unusable payload to an EMPTY
+    // set, and adopting it would make the refusal also claim nothing outputs SEEDVR2_DIT,
+    // which the panel had already disproved moments earlier in the same call.
+    const comfy = makeComfy();
+    void comfy.app.registerNodesFromDefs(chainSchema());
+    const { graph_add_node } = realGraphAddNode(comfy, { api: apiWithBrokenWholeSchema(bad) });
+
+    const err = await graph_add_node({ class_type: "SeedVR2Chain" }).then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err, "still fails closed — an unproven sibling type is not waived");
+    assert.match(err.message, /no installed node outputs "SEEDVR2_VAE"/);
+    assert.doesNotMatch(
+      err.message,
+      /SEEDVR2_DIT/,
+      "the proof already in hand must survive a widen that found nothing out",
+    );
+    assert.equal(comfy.graph._nodes.length, 0);
+  });
+}
+
+test("#821 (codex): a widen with no getNodeDefs at all is treated as doubt, not as empty", async () => {
+  const comfy = makeComfy();
+  void comfy.app.registerNodesFromDefs(chainSchema());
+  const { graph_add_node } = realGraphAddNode(comfy, {
+    api: {
+      // No getNodeDefs — an older/reduced api surface.
+      async fetchApi(route) {
+        const cls = decodeURIComponent(String(route).replace("/object_info/", ""));
+        const all = chainSchema();
+        const body = Object.prototype.hasOwnProperty.call(all, cls) ? { [cls]: all[cls] } : {};
+        return { status: 200, json: async () => body };
+      },
+    },
+  });
+
+  const err = await graph_add_node({ class_type: "SeedVR2Chain" }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err);
+  assert.doesNotMatch(err.message, /SEEDVR2_DIT/);
+});
+
 test("#821: a failed widen leaves the guard exactly as it fails closed today", async () => {
   // The widen is best-effort. If the whole-schema fetch throws, the original (narrow)
   // proof stands and the add is refused — never admitted on the strength of a fetch

@@ -8697,12 +8697,20 @@ const GRAPH_TOOL_EXECUTORS = {
     // refuse: same idiom as #775's readImportFailures, so a healthy add still pays nothing
     // and #780's 1,667x saving is kept for every add that does not need it.
     const widenSocketProof = freshDefsAreSingleClass
-      ? async () =>
-          registeredSocketTypes(
-            recordObjectInfoTypes(
-              typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-            ),
-          )
+      ? async () => {
+          const whole = typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null;
+          // "I did not find out" is not "nothing outputs anything", and the difference
+          // matters because the caller REPLACES its proof with whatever comes back.
+          // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is
+          // strictly weaker than the single-class proof already in hand: the refusal would
+          // then name types that payload had already proven — the class's OWN outputs —
+          // and say no installed node produces them. That is the false-cause message #695
+          // and #700 were about. Any doubt returns null and leaves the proof we have,
+          // which is the same answer-shape fetchSingleNodeDef gives for the same reason.
+          if (!whole || typeof whole !== "object" || Array.isArray(whole)) return null;
+          if (Object.keys(whole).length === 0) return null;
+          return registeredSocketTypes(recordObjectInfoTypes(whole));
+        }
       : null;
     // registerNodesFromDefs can expose a newly installed V3 class before its
     // extension's asynchronous custom-widget registry settles. Resolve the
