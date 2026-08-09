@@ -63,13 +63,6 @@ const THREAD_FIELDS = [
   "sessionId",
   "todos",
   "workflowKey",
-  // #847 — REVISABLE, not write-once. The route stamp was set at thread creation
-  // and never again, so a first save (which migrates the tab from `tmp:<uuid>` to
-  // `wf:<path>`) left every thread on that workflow holding an id nothing answers
-  // to any more. Being in this list is what lets it travel the same causal
-  // field-op path as the other stamps — revisions, tombstones, cross-tab merge —
-  // instead of being poked directly and losing to a stale tab's write.
-  "workflowRouteKey",
   "workflowTitle",
   "provider",
   "model",
@@ -81,9 +74,6 @@ const INVALID_FIELD_VALUE = Symbol("invalid-thread-field-value");
 const THREAD_STRING_LIMITS = {
   sessionId: 512,
   workflowKey: 512,
-  // A `wf:` route id carries a workflow PATH, so it needs the same headroom as
-  // workflowKey rather than a title-sized cap.
-  workflowRouteKey: 512,
   workflowTitle: 240,
   provider: 80,
   model: 200,

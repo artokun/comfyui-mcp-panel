@@ -228,75 +228,15 @@ test("a thread from ANOTHER workflow still does not match", () => {
   );
 });
 
-// ── #847: the route stamp must survive a reload, not just the session ──────
-
-test("workflowRouteKey is a REVISABLE thread field", async () => {
-  // It was write-once: stamped at thread creation and never again, which is why a
-  // first save left every thread on that workflow holding a `tmp:` id nothing
-  // answers to. Being revisable is what lets it travel the causal field-op path —
-  // revisions, tombstones, cross-tab merge — instead of being poked directly and
-  // losing to a stale tab's write.
-  const { ChatHistoryStore } = await import("../../web/js/lib/chat-history-store.js");
-  const store = new ChatHistoryStore({ storage: memoryStorage(), indexedDb: null });
-  const thread = {
-    id: "t1",
-    ts: 1,
-    updatedAt: 1,
-    msgs: [],
-    workflowKey: "workflow:old",
-    workflowRouteKey: "tmp:before-the-save",
-  };
-  store.reviseThread(thread, { workflowRouteKey: "wf:workflows/Saved.json" });
-  assert.equal(
-    thread.workflowRouteKey,
-    "wf:workflows/Saved.json",
-    "a revise must be able to carry the route stamp",
-  );
-});
-
-test("a route id long enough to hold a path is not truncated", () => {
-  // `wf:` ids carry a workflow PATH, so the cap has to match workflowKey's rather
-  // than a title-sized one — a silently trimmed id matches nothing at all.
-  const src = readFileSync(new URL("../../web/js/lib/chat-history-store.js", import.meta.url), "utf8");
-  const limits = src.slice(src.indexOf("const THREAD_STRING_LIMITS = {"), src.indexOf("const MAX_TODOS"));
-  assert.match(limits, /workflowRouteKey:\s*512/);
-});
-
-test("WIRING #847: the save migration revises EVERY thread holding the old id", () => {
-  // Revising only the active thread is what left the reported case broken: chat,
-  // save, start a new chat, filter — and the FIRST chat is the one missing, because
-  // it was not active when the save landed.
-  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  const site = src.slice(
-    src.indexOf("const stillOpenRouteIds = (() => {"),
-    src.indexOf("setActiveThread(\"panel:global\", thread.id);"),
-  );
-  assert.ok(site.length > 0, "the migration must live in the workflow-change path");
-  assert.ok(site.includes("for (const candidate of threads)"), "it must sweep every thread");
-  assert.ok(
-    site.includes("!priorRouteIds.has(candidate?.workflowRouteKey)"),
-    "…matching on the PRE-SAVE ids, so it cannot touch another workflow's threads",
-  );
-  assert.ok(
-    site.includes("reviseThread(candidate, { workflowRouteKey: wfid })"),
-    "…and revise rather than assign, so it merges causally",
-  );
-  // Both sources, because the WeakMap alone misses when ComfyUI replaces the
-  // workflow object across the save — which is what it does.
-  assert.ok(site.includes("candidateRouteIds: [currentWorkflowId"), "the tracked id must be one candidate");
-  assert.ok(site.includes("_priorTempWorkflowIds.get(wf)"), "the WeakMap must be the other");
-  // The active thread's own stamp follows too.
-  assert.ok(site.includes("workflowRouteKey: workflowTabId()"), "the active thread must follow as well");
-});
-
-test("WIRING #847: a migration with no active thread is still persisted", () => {
-  // `persistThreads()` lives inside `if (thread)`, and the whole point of the sweep
-  // is the threads that are NOT active — on a save with the composer empty, that is
-  // all of them. Without this the migration happens in memory and dies on reload,
-  // which is the bug.
-  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.ok(src.includes("if (migratedRouteStamp && !thread) persistThreads();"));
-});
+// ── #847: the route stamp must survive a first SAVE within the session ────
+//
+// The durable half — rewriting the stamps on disk — is deliberately NOT here. It
+// needs positive proof that an old id was this tab's, and the panel does not have
+// it: `openWorkflows` not claiming an id is absence of a competing claimant, not
+// ownership (codex). Close A, switch to B, and A's conversations would migrate to
+// B permanently. Measured that the in-memory match fixes the reported case on its
+// own, so the persisted write buys nothing and risks the one thing this area must
+// never do.
 
 test("codex P0: a switch from unsaved A to saved B migrates NOTHING", () => {
   // The blocker on the first cut. `tmp:` -> `wf:` is the shape of a first save AND of
@@ -404,7 +344,7 @@ test("WIRING #847: an open history pane is repainted after a migration", () => {
   assert.ok(src.includes("let repaintHistoryList = null;"), "a module-level handle must exist");
   assert.ok(src.includes("repaintHistoryList = paintList;"), "the pane must publish its repaint");
   const site = src.slice(
-    src.indexOf("if (migratedRouteStamp && !thread) persistThreads();"),
+    src.indexOf("const migratedRouteStamp = priorRouteIds.size > 0;"),
     src.indexOf("      if (thread) {"),
   );
   assert.ok(site.includes("repaintHistoryList?.()"), "a migration must repaint an open pane");

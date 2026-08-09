@@ -22268,20 +22268,14 @@ function buildPanel() {
         for (const id of priorRouteIds) held.add(id);
         _routeIdLineage.set(wfid, held);
       }
-      let migratedRouteStamp = false;
-      if (priorRouteIds.size) {
-        for (const candidate of threads) {
-          if (!priorRouteIds.has(candidate?.workflowRouteKey)) continue;
-          historyStore.reviseThread(candidate, { workflowRouteKey: wfid });
-          migratedRouteStamp = true;
-        }
-      }
-      // Persist it even with no active thread. The revise below carries its own
-      // `persistThreads()`, but it is inside `if (thread)` — and the whole point of
-      // the loop above is the threads that are NOT active, which on a save with the
-      // composer empty is all of them. Leaving it to that branch would migrate them
-      // in memory and lose it on reload, which is the bug being fixed.
-      if (migratedRouteStamp && !thread) persistThreads();
+      // NO DURABLE REWRITE HERE, deliberately — see the note on `_routeIdLineage`.
+      // Rewriting the stamps on disk needs POSITIVE proof that an old id was this
+      // tab's, and the panel does not have it: `openWorkflows` not claiming an id is
+      // absence of a competing claimant, not ownership (codex). Close A, switch to
+      // B, and A's conversations would migrate to B permanently. Measured that the
+      // in-memory match below fixes the reported case on its own, so the persisted
+      // write buys nothing here and risks the one thing this area must never do.
+      const migratedRouteStamp = priorRouteIds.size > 0;
       // A pane that is already open painted the pre-migration answer and will not
       // repaint itself; nothing else changes its rows.
       if (migratedRouteStamp) {
@@ -22294,10 +22288,6 @@ function buildPanel() {
       if (thread) {
         historyStore.reviseThread(thread, {
           workflowKey: workflowStorageKey(),
-          // The active thread's route stamp follows too. It was absent here because
-          // `workflowRouteKey` was not a revisable field at all (#847) — set once at
-          // creation, then stale forever.
-          workflowRouteKey: workflowTabId(),
           workflowTitle: getWorkflowTitle(),
         }); // archive provenance
         setActiveThread("panel:global", thread.id);
