@@ -5422,12 +5422,11 @@ function assertGraphBoundToActiveWorkflow(
     // Anything unprovable fails closed, and the #389 case (empty root while
     // the workflow reports N>0 nodes) still fires via the baseline read
     // guard below.
-    // #833 — the DIRTY blank tab reaches the same conclusion by the same rule. A blank
-    // tab is never clean, so `activeWorkflowProvenEmpty` cannot fire here either, and
-    // without this a root stamped by one blank tab would WEDGE the next blank tab the
-    // user switched to — this bug's mirror image, and the reason the seal can hand out
-    // an empty root's stamp at all: in the both-empty case a stamp is freely
-    // re-assignable, because there is no content for it to protect.
+    // #833 deliberately does NOT relax this. A DIRTY blank tab cannot clear the clean-tab
+    // proof, so a blank canvas still cannot re-stamp a tag here — extending it was tried
+    // and withdrawn: it broke all 19 fence-protection tests, because re-stamping a tag on
+    // an empty root is a claim about WHOSE canvas it is, which emptiness cannot support.
+    // The #833 read relaxation is confined to `graphEmptyBindingUnproven`.
     const staleTagOnEmptyCanvas =
       graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
     // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused

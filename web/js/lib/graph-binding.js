@@ -1524,18 +1524,13 @@ export function sealProvenRootBinding({
     // A CONFLICTING stamp is the rebind path's decision, never overwritten here.
     const existing = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
     if (typeof existing === "string" && existing) return false;
-    // #833 — an EMPTY canvas can never clear the content proof (nothing to match) and
-    // is always dirty, so without this the seal never fires and every mutation stays
-    // refused as dirty-mutation-binding-unproven with no recovery. Sealing here is what
-    // converts the wedge into an ordinary bound canvas. Subgraph scope still excluded:
-    // a descended empty subgraph is not the workflow's root canvas.
-    //
-    // EXCLUSIVITY STILL REQUIRED, and it is not implied by emptiness. Emptiness says
-    // there is no content to mis-attribute; exclusivity says WHICH tab this canvas is.
-    // With a second blank tab open the root could be its canvas, and stamping the
-    // ACTIVE identity onto it would wedge that tab the moment the user switches to it —
-    // trading this bug for its mirror image. Two blank tabs stay honestly ambiguous:
-    // reads are admitted by the empty proof above, the seal is not.
+    // #833 — an EMPTY canvas can never clear this proof: every blank canvas serialises
+    // alike, so there is nothing to match, and a blank tab is always dirty besides. That
+    // is why mutations stay refused on one. Sealing on emptiness was tried and withdrawn:
+    // it would stamp the ACTIVE identity onto a root that a reconnect tab restore may
+    // have left holding a DIFFERENT blank workflow (the #708 mismatch), putting the first
+    // node on the wrong canvas. Emptiness proves there is nothing to mis-attribute; a
+    // seal claims WHOSE canvas this is, and only the read gate needs the weaker fact.
     if (!rootContentProvesActiveWorkflow({ rootGraph, activeWorkflow, inSubgraph, proofExclusive })) {
       return false;
     }
