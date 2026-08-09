@@ -11668,7 +11668,12 @@ const GRAPH_TOOL_EXECUTORS = {
           // Best-effort. A frontend without `checkState` behaves exactly as before —
           // this must never be the thing that fails an open.
           try {
-            target.changeTracker?.checkState?.();
+            // AWAITED (codex). A frontend whose tracker captures asynchronously would
+            // otherwise have `activeState` read before the capture landed — the silent
+            // revert intact, and a late rejection escaping this try/catch to become an
+            // unhandled rejection. Awaiting a non-promise is free, so the synchronous
+            // trackers this ships against are unaffected.
+            await target.changeTracker?.checkState?.();
           } catch {
             // A tracker that refuses to capture leaves the stale snapshot in place,
             // which is today's behaviour, not a new failure.

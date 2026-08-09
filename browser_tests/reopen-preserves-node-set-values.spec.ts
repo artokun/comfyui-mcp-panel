@@ -114,10 +114,33 @@ test('reopening the active workflow keeps a value the tracker never saw', async 
   // CONTENT_UNVERIFIED — the panel cannot call a repaint byte-identical — and that
   // verdict is `ok: false` by design. What this spec is about is whether the repaint
   // DESTROYED anything, so assert the open actually ran and then check the value.
+  //
+  // This sentence is emitted ONLY by the CONTENT_UNVERIFIED branch, which is reached
+  // only after the repaint has run and its rebind marker has been checked. A loose
+  // match here (codex) would accept an error raised BEFORE the repaint — and then the
+  // final assertion below passes vacuously, because the widget write was never
+  // touched by anything.
   const ran = JSON.stringify(reopened)
-  expect(ran, 'the open must have run and bound the canvas').toMatch(/workflow_open RAN|opened/i)
+  expect(ran, 'the reply must be the post-repaint verdict, not an earlier failure').toContain(
+    'workflow_open RAN, the canvas IS bound to'
+  )
 
-  // The value must still be there. Before #874 the repaint reloaded the stale
-  // snapshot and this came back as the default.
+  // Two independent signals, because either alone can be satisfied for the wrong
+  // reason.
+  //
+  // 1. The tracker snapshot must now carry the value — that is the capture this fix
+  //    adds, and it is false without it.
+  const trackerCaughtUp = await page.evaluate(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    const wf = app?.extensionManager?.workflow?.activeWorkflow
+    const tracked = wf?.changeTracker?.activeState
+    const node = (tracked?.nodes || []).find((n: any) => n.type === 'EmptyLatentImage')
+    return ((node?.widgets_values || []) as unknown[]).includes(1337)
+  })
+  expect(trackerCaughtUp, 'the repaint must capture the live canvas before reading it').toBe(true)
+
+  // 2. And the canvas must still hold it. Before #874 the repaint reloaded the stale
+  //    snapshot and this came back as the node's DEFAULT.
   await expect.poll(() => readWidget(page, 'EmptyLatentImage', 'width')).toBe(1337)
 })
