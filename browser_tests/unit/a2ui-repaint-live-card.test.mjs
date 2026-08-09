@@ -1,26 +1,123 @@
-// panel#832 — placeholder pinning the CURRENT behaviour; the fix follows.
+// panel#832 — `panel_ui_render` returned a card_id, and an immediate `panel_ui_update`
+// in the SAME agent turn failed with:
+//
+//   no live card "a2ui-mslhgcem-8" (already resolved, dismissed, or from a previous view)
+//
+// with no click, no dismissal, and no workflow/tab switch in between.
+//
+// THE MECHANISM. `appendA2UICard` registers a live card in `liveA2uiCards`;
+// `resetFeed()` unconditionally does `liveA2uiCards.clear()`; `paintA2UIRecord()` replays
+// every persisted record INERT and re-registers nothing; `onUiUpdate` requires
+// `liveA2uiCards.get(card_id)`. So any same-thread repaint between two tool calls turns
+// an unresolved card inert and drops its handle.
+//
+// THE HALF THE REPORT COULD NOT SEE. Re-rendering the record live on repaint would NOT
+// have been enough: the record never stored its card_id —
+//
+//   const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
+//
+// — and `renderA2UICard` minted a fresh id on every call. A repaint would therefore have
+// re-registered the card under a NEW id while the agent still held the old one, so
+// panel_ui_update would keep failing, for a new reason instead of the old one. Restoring
+// liveness required restoring IDENTITY.
+//
+// WHY THESE ARE SOURCE-STRUCTURE ASSERTIONS. This suite has no DOM, and the sibling A2UI
+// tests (a2ui-validate, secret-card-sizing, interactive-card-fence) are written the same
+// way for the same reason: `renderA2UICard` builds real elements. These pin the wiring
+// that decides the bug — which render path a record takes, whether the id is persisted,
+// and whether the id survives a repaint — each of which is individually mutable and is
+// mutation-tested. A DOM-driven render → repaint → update test would be stronger and is
+// not possible until this suite grows a DOM harness.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const panelSrc = readFileSync(
-  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
-const a2uiSrc = readFileSync(
-  fileURLToPath(new URL("../../web/js/cmcp-a2ui.js", import.meta.url)), "utf8");
+const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+const panelSrc = read("../../web/js/comfyui-mcp-panel.js");
+const a2uiSrc = read("../../web/js/cmcp-a2ui.js");
 
-test("#832 today: a repainted record is rendered INERT and never re-registered", () => {
-  const paint = panelSrc.match(/function paintA2UIRecord\(m\) \{[\s\S]*?\n  \}/)[0];
-  assert.match(paint, /renderA2UIInert/, "the replay is inert");
-  assert.doesNotMatch(paint, /liveA2uiCards\.set/, "and nothing is put back in the live registry");
+const fn = (src, name) => {
+  const m = src.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n  \\}`));
+  assert.ok(m, `could not locate ${name}`);
+  return m[0];
+};
+
+// ---------------------------------------------------------------------------
+// 1. Identity — the half that was missing.
+// ---------------------------------------------------------------------------
+
+test("#832 renderA2UICard can be given an id instead of always minting one", () => {
+  assert.match(
+    a2uiSrc,
+    /export function renderA2UICard\(spec, \{ onAction, onDismiss, cardId: reuseId \} = \{\}\)/,
+    "the renderer accepts a caller-supplied id",
+  );
+  // Minting remains the DEFAULT, so every ordinary render is unchanged.
+  assert.match(a2uiSrc, /: `a2ui-\$\{Date\.now\(\)\.toString\(36\)\}-\$\{\+\+_cardSeq\}`/);
+  assert.match(
+    a2uiSrc,
+    /typeof reuseId === "string" && reuseId\s*\?\s*reuseId/,
+    "a supplied id wins; an empty or non-string one falls back to minting",
+  );
 });
 
-test("#832 today: the record carries no card_id, so a repaint could not restore one", () => {
-  const append = panelSrc.match(/function appendA2UICard\(spec\) \{[\s\S]*?\n  \}/)[0];
-  assert.match(append, /const rec = \{ role: "card", kind: "a2ui", spec, resolved: false, choice: null \}/);
-  assert.doesNotMatch(append, /rec\.cardId/, "the id the agent holds is never persisted on the record");
+test("#832 the record persists the card_id the agent was handed", () => {
+  // Without this the id lives only on the transient handle, and a repaint cannot
+  // reconstruct the identity the agent is holding.
+  assert.match(fn(panelSrc, "mountLiveA2UICard"), /rec\.cardId = handle\.cardId;/);
 });
 
-test("#832 today: renderA2UICard always mints a fresh id, with no way to supply one", () => {
-  assert.match(a2uiSrc, /export function renderA2UICard\(spec, \{ onAction, onDismiss \} = \{\}\) \{/);
+// ---------------------------------------------------------------------------
+// 2. Liveness — an unresolved record comes back live, a resolved one does not.
+// ---------------------------------------------------------------------------
+
+test("#832 an UNRESOLVED record is repainted LIVE, under its original id", () => {
+  const paint = fn(panelSrc, "paintA2UIRecord");
+  assert.match(paint, /m\.resolved !== true/, "the branch turns on resolved-ness");
+  assert.match(
+    paint,
+    /mountLiveA2UICard\(m, typeof m\.cardId === "string" \? m\.cardId : undefined\)/,
+    "it re-mounts live and hands back the ORIGINAL id",
+  );
+});
+
+test("#832 a RESOLVED record stays inert — an answered question is not re-offered", () => {
+  const paint = fn(panelSrc, "paintA2UIRecord");
+  assert.match(paint, /renderA2UIInert\(m\.spec, m\.choice\)/);
+  // The inert path must remain reachable: it is the whole non-regression here.
+  assert.ok(
+    paint.indexOf("renderA2UIInert") > paint.indexOf("m.resolved !== true"),
+    "inert is the fall-through for a resolved record, not dead code",
+  );
+});
+
+test("#832 dismissal still retires the card — resurrection must not undo it", () => {
+  // onDismiss sets resolved = true, which is exactly what routes a dismissed card down
+  // the inert path above. If dismissal stopped marking the record, a repaint would bring
+  // a dismissed card back to life.
+  const mount = fn(panelSrc, "mountLiveA2UICard");
+  assert.match(mount, /onDismiss\(\) \{\s*rec\.resolved = true;/);
+  assert.match(mount, /onAction\(text\) \{\s*rec\.resolved = true;/);
+});
+
+// ---------------------------------------------------------------------------
+// 3. The handlers are shared, so the two paths cannot drift apart.
+// ---------------------------------------------------------------------------
+
+test("#832 first paint and repaint mount through the SAME function", () => {
+  // Two copies of the resolve/dismiss handlers would be two chances for a repainted
+  // card to behave differently from a freshly rendered one — the class of bug this
+  // issue already is.
+  assert.match(fn(panelSrc, "appendA2UICard"), /mountLiveA2UICard\(rec\)/);
+  assert.match(fn(panelSrc, "paintA2UIRecord"), /mountLiveA2UICard\(m, /);
+  assert.equal(
+    (panelSrc.match(/renderA2UICard\(/g) || []).length,
+    1,
+    "exactly one live-render call site in the panel",
+  );
+});
+
+test("#832 the live registry is written on both paths, via that shared function", () => {
+  assert.match(fn(panelSrc, "mountLiveA2UICard"), /liveA2uiCards\.set\(handle\.cardId, \{ handle, rec \}\)/);
 });

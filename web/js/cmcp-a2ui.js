@@ -541,8 +541,16 @@ let _cardSeq = 0;
  * onAction(text): user clicked a button / submitted — send `text` as a visible
  * chat message and mark the card resolved. onDismiss(): user hit ✕.
  */
-export function renderA2UICard(spec, { onAction, onDismiss } = {}) {
-  const cardId = `a2ui-${Date.now().toString(36)}-${++_cardSeq}`;
+export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = {}) {
+  // panel#832 — a caller may supply the id instead of minting one. A repaint that
+  // re-renders an UNRESOLVED record has to come back as the SAME card: the agent is
+  // holding the id it was given at render time, and a fresh id would leave
+  // panel_ui_update failing for a new reason rather than the old one. Minting stays
+  // the default, so every ordinary render is unchanged.
+  const cardId =
+    typeof reuseId === "string" && reuseId
+      ? reuseId
+      : `a2ui-${Date.now().toString(36)}-${++_cardSeq}`;
   const el = document.createElement("div");
   el.className = "cmcp-a2ui";
   el.dataset.cardId = cardId;

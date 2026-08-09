@@ -20993,11 +20993,17 @@ function buildPanel() {
     if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
   }
 
-  /** Paint + record + register one live A2UI card. Returns its card_id. */
-  function appendA2UICard(spec) {
-    clearEmpty();
-    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
-    const handle = renderA2UICard(spec, {
+  /**
+   * Render one A2UI record as a LIVE card and put it in the live registry.
+   *
+   * panel#832 — shared by the first paint and by a repaint of an unresolved record,
+   * deliberately: the resolve/dismiss handlers retire the card from `liveA2uiCards`
+   * and persist the choice, and two copies of that would be two chances to drift.
+   * `reuseId` is what makes a repaint the SAME card rather than a new one.
+   */
+  function mountLiveA2UICard(rec, reuseId) {
+    const handle = renderA2UICard(rec.spec, {
+      ...(reuseId ? { cardId: reuseId } : {}),
       onAction(text) {
         rec.resolved = true;
         rec.choice = text;
@@ -21015,21 +21021,52 @@ function buildPanel() {
         setChatSurfaceForCards();
       },
     });
-    record(rec);
+    // panel#832 — the id the AGENT holds now lives on the record, not only on the
+    // transient handle. Without it a repaint could re-render the card live and still
+    // register it under a freshly minted id, so panel_ui_update would keep failing —
+    // for a new reason instead of the old one. Identity is the half that was missing.
+    rec.cardId = handle.cardId;
     liveA2uiCards.set(handle.cardId, { handle, rec });
     log.appendChild(handle.el);
+    if (rec.spec?.surface === "wide") setChatSurfaceForCards();
+    return handle;
+  }
+
+  /** Paint + record + register one live A2UI card. Returns its card_id. */
+  function appendA2UICard(spec) {
+    clearEmpty();
+    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
+    const handle = mountLiveA2UICard(rec);
+    record(rec);
     scrollLog();
-    if (spec.surface === "wide") setChatSurfaceForCards();
     return handle.cardId;
   }
 
-  /** Replay one persisted a2ui record inert (reload / thread switch). */
+  /**
+   * Replay one persisted a2ui record (reload / thread switch / same-thread repaint).
+   *
+   * panel#832 — an UNRESOLVED record comes back LIVE, under its original card_id.
+   * It used to be replayed inert unconditionally, and `resetFeed()` clears
+   * `liveA2uiCards`, so a repaint landing between `panel_ui_render` and
+   * `panel_ui_update` silently killed a card the agent had just been handed — no
+   * click, no dismissal, no view switch, just `no live card "…"`.
+   *
+   * A RESOLVED record (answered or dismissed) stays inert exactly as before: it is
+   * finished, and bringing it back would offer the user buttons for a question that
+   * has already been answered. The thread/view guard is untouched — repaint only ever
+   * replays the records of the thread being painted, so this cannot resurrect a card
+   * into a view it does not belong to.
+   */
   function paintA2UIRecord(m) {
     clearEmpty();
     try {
+      if (m && m.resolved !== true) {
+        mountLiveA2UICard(m, typeof m.cardId === "string" ? m.cardId : undefined);
+        return;
+      }
       log.appendChild(renderA2UIInert(m.spec, m.choice));
     } catch {
-      log.appendChild(renderA2UIFailCard(m.spec, ["stored card failed to render"]));
+      log.appendChild(renderA2UIFailCard(m?.spec, ["stored card failed to render"]));
     }
   }
 
