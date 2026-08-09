@@ -36,7 +36,6 @@ import {
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
   sealProvenRootBinding,
-  emptySealStampReassignable,
   rootContentProvesActiveWorkflow,
   serializedStateProvenEmpty,
 } from "../../web/js/lib/graph-binding.js";
@@ -277,7 +276,6 @@ function buildDirtyStaleRouteHarness({
     "resolveGraphRootUuidRebind",
     "postReconnectSettleWindow",
     "sealProvenRootBinding",
-    "emptySealStampReassignable",
     "rootContentProvesActiveWorkflow",
     "graphRootMatchesState",
     "sameWorkflowObject",
@@ -301,7 +299,6 @@ function buildDirtyStaleRouteHarness({
     // harnesses default to OUTSIDE the window and opt in explicitly.
     () => postReconnectWindow === true,
     sealProvenRootBinding,
-    emptySealStampReassignable,
     rootContentProvesActiveWorkflow,
     graphRootMatchesState,
     sameWorkflowObject,

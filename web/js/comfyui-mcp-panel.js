@@ -369,7 +369,6 @@ import {
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
   emptyCanvasBindingProven,
-  emptySealStampReassignable,
   rootContentProvesActiveWorkflow,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -5429,14 +5428,8 @@ function assertGraphBoundToActiveWorkflow(
     // user switched to — this bug's mirror image, and the reason the seal can hand out
     // an empty root's stamp at all: in the both-empty case a stamp is freely
     // re-assignable, because there is no content for it to protect.
-    // #833 — plus the empty seal's OWN leftover. A blank tab is never clean, so the
-    // clause above cannot fire for one; without this the stamp the seal writes for tab A
-    // wedges tab B the moment the user switches to it. Narrow on purpose: ONLY a tag
-    // this mechanism wrote on a provably empty canvas is re-pointable, so every #349
-    // protection (a foreign tab's claim, a tag nobody claims) is untouched.
     const staleTagOnEmptyCanvas =
-      (graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow)) ||
-      emptySealStampReassignable({ rootGraph, activeWorkflow, graphLoading });
+      graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
     // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused
     // app.graph, so a canvas that IS the active workflow's was refused where an
     // untagged copy of it was allowed, and nothing self-healed it: the seal below
@@ -5489,7 +5482,6 @@ function assertGraphBoundToActiveWorkflow(
     activeWorkflowUuid,
     inSubgraph,
     proofExclusive: sealProofExclusive,
-    graphLoading,
   });
   // The verdict itself is a PURE function of the resolved evidence, lifted into
   // lib/graph-binding.js (#604) so the read-vs-mutation evidence bar is observable

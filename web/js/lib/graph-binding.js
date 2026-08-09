@@ -1512,41 +1512,12 @@ export function rootContentProvesActiveWorkflow({
   }
 }
 
-/** Marks a stamp written by the empty-canvas seal, which alone is re-assignable. */
-export const EMPTY_SEAL_FIELD = "empty_seal";
-
-/**
- * May the tag already on this root be re-pointed at the ACTIVE workflow? (#833)
- *
- * Only for a tag THIS mechanism wrote on a provably empty canvas, and only while the
- * canvas is still provably empty. That keeps the #349 protections exactly as they were
- * — a tag a foreign tab claims, or that nobody claims, is still never re-stamped — while
- * stopping the empty seal from wedging the next blank tab with its own leftover.
- *
- * The asymmetry is the point: a stamp on an empty canvas asserts only "this blank canvas
- * is currently that tab's". It cannot be evidence about content, because there is none,
- * so re-pointing it discards nothing. A stamp written over CONTENT asserts something
- * much stronger, and stays immovable.
- */
-export function emptySealStampReassignable({ rootGraph, activeWorkflow, graphLoading = false } = {}) {
-  try {
-    const tag = rootGraph?.extra?.[PANEL_GRAPH_META_KEY];
-    if (!tag || typeof tag !== "object") return false;
-    if (tag[EMPTY_SEAL_FIELD] !== true) return false; // not ours ⇒ never re-stamp
-    return emptyCanvasBindingProven({ rootGraph, activeWorkflow, graphLoading });
-  } catch {
-    return false;
-  }
-}
-
 export function sealProvenRootBinding({
   rootGraph,
   activeWorkflow,
   activeWorkflowUuid,
   inSubgraph = false,
   proofExclusive = true,
-  emptyProofExclusive = false,
-  graphLoading = false,
 } = {}) {
   try {
     if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
@@ -1565,18 +1536,7 @@ export function sealProvenRootBinding({
     // ACTIVE identity onto it would wedge that tab the moment the user switches to it —
     // trading this bug for its mirror image. Two blank tabs stay honestly ambiguous:
     // reads are admitted by the empty proof above, the seal is not.
-    // NO exclusivity requirement, deliberately. Requiring it made the seal essentially
-    // unreachable — any open tab never activated this session has no tracker state, so
-    // it reads as "could also be blank" and blocked everything. Ambiguity is handled by
-    // making this stamp RE-ASSIGNABLE (below) rather than by withholding it: a stamp
-    // this path writes is marked as its own, and only such a stamp may later be
-    // re-pointed at another blank tab. A tag from anywhere else still fails closed.
-    const emptyBindingProven =
-      !inSubgraph && emptyCanvasBindingProven({ rootGraph, activeWorkflow, graphLoading });
-    if (
-      !emptyBindingProven &&
-      !rootContentProvesActiveWorkflow({ rootGraph, activeWorkflow, inSubgraph, proofExclusive })
-    ) {
+    if (!rootContentProvesActiveWorkflow({ rootGraph, activeWorkflow, inSubgraph, proofExclusive })) {
       return false;
     }
     const extra =
@@ -1585,11 +1545,6 @@ export function sealProvenRootBinding({
     extra.comfyui_mcp = {
       ...(prior && typeof prior === "object" ? prior : {}),
       workflow_uuid: activeWorkflowUuid,
-      // #833 — a stamp written on a PROVABLY EMPTY canvas records that it was, because
-      // that is the one stamp that may later be re-pointed at a different blank tab
-      // (emptySealStampReassignable). Without the marker the next blank tab inherits
-      // this tag as a FOREIGN one and is wedged by it — this bug's mirror image.
-      ...(emptyBindingProven ? { [EMPTY_SEAL_FIELD]: true } : {}),
     };
     return true;
   } catch {
