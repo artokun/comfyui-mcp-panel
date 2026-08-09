@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.60] - 2026-08-09
+
+> Covers changes since 0.11.59.
+
+### Fixed
+
+- **Reopening a workflow no longer silently reverts values a node set for you
+  (#874).** Reopening an already-open workflow repaints the canvas from ComfyUI's
+  change snapshot rather than from the file — and that snapshot only records what
+  a *user* typed or clicked. So anything a node wrote by itself was quietly rolled
+  back: an ImpactWildcardEncode populate, a `control_after_generate` roll, a
+  subgraph's promoted widgets. Nothing errored, and the graph looked right
+  afterwards, which is why it read as "my edits didn't stick" rather than as a bug.
+
+  Measured: a value of 1337 on the canvas came back as the node's default of 512.
+  The panel now asks ComfyUI to capture the live canvas before it repaints, so what
+  is on screen is what gets restored.
+
+
 ## [0.11.59] - 2026-08-09
 
 > Covers changes since 0.11.58.
