@@ -118,7 +118,11 @@ export class PanelPage {
     )
     await tabButton
       .first()
-      .waitFor({ state: 'visible', timeout: 30_000 })
+    // 8s, not 30s (#847): the per-test timeout is also 30_000, so a 30s wait here
+    // consumes the entire budget and the programmatic fallback below can never
+    // run — it is dead code by construction, and the spec dies with an opaque
+    // 'Test timeout of 30000ms exceeded' instead of saying what never appeared.
+      .waitFor({ state: 'visible', timeout: 8_000 })
       .catch(() => {})
 
     if (await tabButton.count()) {
@@ -132,7 +136,23 @@ export class PanelPage {
       await this.root.waitFor({ state: 'visible', timeout: 8_000 })
     } catch {
       await this.activateSidebarProgrammatically()
-      await this.root.waitFor({ state: 'visible', timeout: 8_000 })
+      try {
+        await this.root.waitFor({ state: 'visible', timeout: 8_000 })
+      } catch (err) {
+        // #847 — the panel not mounting AT ALL has one cause that costs hours to
+        // find, because the symptom is a bare timeout: a spec that routes
+        // `comfyui-mcp-panel.js` from the checked-out tree while ComfyUI still
+        // serves its `./lib/*` imports from a DIFFERENT checkout. The panel then
+        // fails to import and nothing renders. Common when running from a git
+        // worktree. Say so rather than let the next person bisect it.
+        throw new Error(
+          'The Agent panel never mounted (.cmcp-root not visible). Check the browser ' +
+            'console for a module-load error: if this spec routes the panel source from ' +
+            'this checkout, ComfyUI must be serving the SAME commit — its custom_nodes ' +
+            'copy provides the ./lib/* imports, and a version mismatch there fails the ' +
+            'import silently. Original: ' + (err instanceof Error ? err.message : String(err))
+        )
+      }
     }
   }
 
