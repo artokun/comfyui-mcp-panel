@@ -30,6 +30,44 @@
  */
 
 /**
+ * #847 — the two mitigations above each cover ONE axis, and a SAVE moves both at once.
+ *
+ * A first save migrates the tab's route id from `tmp:<uuid>` to `wf:<path>`, and the
+ * same boundary re-mints the storage uuid. A thread recorded before the save is then
+ * left holding neither of the live workflow's identity forms, and "Current workflow
+ * only" hides a conversation the user had on the workflow they are looking at — same
+ * tab, same canvas, minutes earlier. It reads as history loss, which is the one thing
+ * a history pane must never appear to do.
+ *
+ * The panel does not have to GUESS that lineage: it already records it.
+ * `_priorTempWorkflowIds` retains the first tmp: id ever minted for a live workflow
+ * object, for that object's whole life, precisely "so a create-time pin survives the
+ * tab's first save" — and `workflowRecordMatchesSelector` has always honoured it when
+ * resolving a selector. This makes the history filter consult the same evidence
+ * instead of being the one reader that ignores it. Nothing is inferred: the prior id
+ * is keyed on the live object, and a copy never shares the object.
+ *
+ * LIMIT, stated rather than left to be discovered: `_priorTempWorkflowIds` is an
+ * in-memory WeakMap, so this match does not survive a reload. A thread written before
+ * a save and read after a refresh still falls back to today's behaviour. Closing that
+ * needs the stamps REWRITTEN at the save boundary — a change to persisted history —
+ * which is a bigger and separately reviewable step, not something to smuggle in here.
+ *
+ * @param {{storageKey?: string, routeId?: string, priorRouteId?: string}} forms
+ * @returns {Set<string>} the identity forms a thread may legitimately match on
+ */
+export function currentWorkflowIdentityKeys({ storageKey, routeId, priorRouteId } = {}) {
+  const keys = new Set();
+  // Only real, non-empty strings. An `undefined` in the set can never match a
+  // thread's stamp anyway, but a set that silently carries holes invites a later
+  // reader to treat membership as meaningful when it is not.
+  for (const form of [storageKey, routeId, priorRouteId]) {
+    if (typeof form === "string" && form) keys.add(form);
+  }
+  return keys;
+}
+
+/**
  * Does `thread` belong to the workflow whose current identity forms are `currentKeys`?
  *
  * @param {{workflowKey?: string, workflowRouteKey?: string}} thread
