@@ -119,4 +119,32 @@ export const test = base.extend<PanelFixtures & PanelOptions>({
   }
 })
 
+/**
+ * Delete a workflow this spec persisted, through ComfyUI's own userdata API (#907).
+ *
+ * Specs that call `workflow_save` write a REAL file into the developer's workflow
+ * library. Nothing removed them, and it compounded: 1221 of 1240 files on this machine
+ * were `Untitled 2026-08-*` test output, burying the ~19 real workflows and inflating
+ * every `workflows` store read the panel does.
+ *
+ * It lives HERE because the three specs that did clean up each hand-rolled their own
+ * copy, and that is exactly how the two that did not came to be missed. One helper, so
+ * forgetting is a shorter path than remembering.
+ *
+ * Best-effort by construction: a cleanup that throws must never mask the assertion that
+ * actually failed, and a file that is already gone is already clean. Call it from a
+ * `finally`, so a failing test does not leave litter either.
+ */
+export async function deleteSavedWorkflow(page: Page, workflowName: string): Promise<void> {
+  try {
+    await page.evaluate(async (path) => {
+      const api = (window as any).comfyAPI?.api?.api
+      await api?.fetchApi?.(`/userdata/${encodeURIComponent(path)}`, { method: 'DELETE' })
+    }, `workflows/${workflowName}.json`)
+  } catch {
+    // The page may already be closed, or the API unreachable — neither is worth failing
+    // a test over, and the next run's cleanup will not be blocked by it.
+  }
+}
+
 export { expect } from '@playwright/test'

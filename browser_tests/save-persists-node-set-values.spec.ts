@@ -14,7 +14,7 @@
  * anything the panel reports. A save that returns `saved: true` while the file disagrees
  * with the screen is exactly the failure, so the panel's own account of it proves nothing.
  */
-import { test, expect } from './fixtures/panelTest'
+import { test, expect, deleteSavedWorkflow } from './fixtures/panelTest'
 import { claimFreshCanvas, settleCanvas } from './fixtures/canvasIdentity'
 
 /** Read a saved workflow back off disk through ComfyUI's userdata API. */
@@ -62,39 +62,45 @@ test('an in-place save persists a value the tracker never saw', async ({
   expect(first.ok, 'the first save must succeed so the tab has a path').toBe(true)
   const name = String(first.result?.workflow || '')
   expect(name, 'the save must report the workflow name').toBeTruthy()
+  // #907 — this spec writes a REAL file into the developer's workflow library. Remove it
+  // however the test ends; an assertion failure must not leave litter either.
+  try {
 
-  // Change a value the way a NODE does: directly, no user input event — and issue no
-  // panel command afterwards, because the dispatch captures after every completed
-  // command and would refresh the tracker, hiding the very lag this is about.
-  await page.evaluate(() => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const graph = app?.canvas?.graph ?? app?.graph
-    const node = (graph?.nodes || []).find((n: any) => n.type === 'EmptyLatentImage')
-    const widget = (node.widgets || []).find((x: any) => x.name === 'width')
-    widget.value = 1337
-  })
+    // Change a value the way a NODE does: directly, no user input event — and issue no
+    // panel command afterwards, because the dispatch captures after every completed
+    // command and would refresh the tracker, hiding the very lag this is about.
+    await page.evaluate(() => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      const graph = app?.canvas?.graph ?? app?.graph
+      const node = (graph?.nodes || []).find((n: any) => n.type === 'EmptyLatentImage')
+      const widget = (node.widgets || []).find((x: any) => x.name === 'width')
+      widget.value = 1337
+    })
 
-  // Precondition: the tracker must NOT have seen it, or this passes for the wrong reason.
-  const trackerLagged = await page.evaluate(() => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const wf = app?.extensionManager?.workflow?.activeWorkflow
-    const node = (wf?.changeTracker?.activeState?.nodes || []).find(
-      (n: any) => n.type === 'EmptyLatentImage'
+    // Precondition: the tracker must NOT have seen it, or this passes for the wrong reason.
+    const trackerLagged = await page.evaluate(() => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      const wf = app?.extensionManager?.workflow?.activeWorkflow
+      const node = (wf?.changeTracker?.activeState?.nodes || []).find(
+        (n: any) => n.type === 'EmptyLatentImage'
+      )
+      return !((node?.widgets_values || []) as unknown[]).includes(1337)
+    })
+    expect(trackerLagged, 'precondition: the tracker must not have seen the change').toBe(true)
+
+    const saved = await mockBridge.command('workflow_save', {})
+    expect(saved.ok, 'the in-place save must succeed').toBe(true)
+
+    // THE BYTES, not the panel's account of them. Before #878 this was the node's
+    // default — the file quietly disagreeing with the screen.
+    const onDisk = await readWidgetsFromDisk(page, name, 'EmptyLatentImage')
+    expect(onDisk.error, 'the saved workflow must be readable from disk').toBeUndefined()
+    expect(onDisk.widgets, 'the saved file must carry the live value, not the tracker default').toContain(
+      1337
     )
-    return !((node?.widgets_values || []) as unknown[]).includes(1337)
-  })
-  expect(trackerLagged, 'precondition: the tracker must not have seen the change').toBe(true)
-
-  const saved = await mockBridge.command('workflow_save', {})
-  expect(saved.ok, 'the in-place save must succeed').toBe(true)
-
-  // THE BYTES, not the panel's account of them. Before #878 this was the node's
-  // default — the file quietly disagreeing with the screen.
-  const onDisk = await readWidgetsFromDisk(page, name, 'EmptyLatentImage')
-  expect(onDisk.error, 'the saved workflow must be readable from disk').toBeUndefined()
-  expect(onDisk.widgets, 'the saved file must carry the live value, not the tracker default').toContain(
-    1337
-  )
+  } finally {
+    await deleteSavedWorkflow(page, name)
+  }
 })

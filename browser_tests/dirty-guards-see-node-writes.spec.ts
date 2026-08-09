@@ -17,7 +17,7 @@
  * Driven over the bridge rather than asserted at source, because the bug is an interaction
  * between ComfyUI's tracker and the panel's guard and only appears when both run.
  */
-import { test, expect } from './fixtures/panelTest'
+import { test, expect, deleteSavedWorkflow } from './fixtures/panelTest'
 import { claimFreshCanvas, settleCanvas } from './fixtures/canvasIdentity'
 
 /** Change a widget the way a NODE does: directly, no user input event. */
@@ -57,6 +57,10 @@ test('closing a workflow refuses when a NODE left unsaved work', async ({
   // so any panel command issued after the write refreshes the tracker and hides the lag.
   const saved = await mockBridge.command('workflow_save', {})
   expect(saved.ok, 'the save must succeed so the tab starts clean').toBe(true)
+  // #907 — a REAL file lands in the developer's workflow library; remove it whatever
+  // happens below.
+  const savedName = String(saved.result?.workflow || '')
+  try {
   const listed = await mockBridge.command('workflow_list', {})
   const target =
     listed.result?.active?.routing_key || listed.result?.active?.key || listed.result?.active?.path
@@ -99,6 +103,9 @@ test('closing a workflow refuses when a NODE left unsaved work', async ({
     return widget ? widget.value : null
   })
   expect(stillThere, 'the refused close must leave the work on the canvas').toBe(1337)
+  } finally {
+    await deleteSavedWorkflow(page, savedName)
+  }
 })
 
 test('force:true still discards — the guard refuses, it does not trap', async ({
@@ -121,7 +128,9 @@ test('force:true still discards — the guard refuses, it does not trap', async 
     ;(app?.canvas?.graph ?? app?.graph).add(LG.createNode('EmptyLatentImage'))
   })
   await settleCanvas(page)
-  await mockBridge.command('workflow_save', {})
+  const saved2 = await mockBridge.command('workflow_save', {})
+  const savedName2 = String(saved2.result?.workflow || '')
+  try {
   const listed = await mockBridge.command('workflow_list', {})
   const target =
     listed.result?.active?.routing_key || listed.result?.active?.key || listed.result?.active?.path
@@ -135,4 +144,7 @@ test('force:true still discards — the guard refuses, it does not trap', async 
     force: true
   })
   expect(closed.ok, 'force:true must still close').toBe(true)
+  } finally {
+    await deleteSavedWorkflow(page, savedName2)
+  }
 })
