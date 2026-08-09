@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.46] - 2026-08-08
+
+> Covers changes since 0.11.45.
+
+### Fixed
+- `panel_add_node` refused a node whose input types ARE produced by nodes already on the
+  canvas. The socket proof — "which datatypes does some installed node output?" — was being
+  read off the single-class `/object_info` payload introduced in 0.11.45 for the cheap
+  per-class existence check, so any custom link datatype produced by a SIBLING node read as
+  unproven and the refusal claimed "no installed node outputs X" while the node producing X
+  sat on the canvas. Nothing could clear it: `panel_refresh_nodes` re-registers the class,
+  which is exactly what armed the fast path. The proof is now widened against the whole
+  schema on the path that is about to refuse, so the cheap path is kept for every add that
+  does not need it (#822, #821)
+- `panel_move_group` treated a restored node position as an unrestorable node, so a
+  rollback reported failure after it had in fact succeeded (#819)
+- `panel_update_node` sent extra fields that made Manager v4's untagged Pydantic union
+  match `InstallPackParams` instead of `UpdatePackParams` and crash (#816)
+
 ## [0.11.45] - 2026-08-08
 
 > Covers changes since 0.11.44. Versions 0.11.42-0.11.44 shipped without CHANGELOG sections;
