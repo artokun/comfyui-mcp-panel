@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.65] - 2026-08-09
+
+> Covers changes since 0.11.64.
+
+### Fixed
+
+- **Re-opening the current workflow no longer sends the agent in a circle (#702).**
+  Re-opening the tab that is already open answers "the canvas IS this workflow's, but I
+  can't call the contents byte-identical" — normal, and not a failure. What that answer
+  did not say is that it carries no refreshed workflow stamp, so the agent's *next*
+  command was rejected as belonging to a different workflow. And the answer ended by
+  recommending exactly that next command.
+
+  Two people followed that advice into the rejection and concluded the only way out was
+  reloading the whole panel. It wasn't: listing workflows re-publishes the current
+  identity and the read then goes through — one call, no reload. The reply now says so.
+
+  Nothing about how the panel decides which canvas it is bound to changed; the answer
+  was right and only its advice was wrong. All four phrasings of that outcome carry the
+  correction, and it stays off the case where the workflow genuinely *cannot* be
+  confirmed, because there reloading really is the remedy.
+
 ## [0.11.64] - 2026-08-09
 
 > Covers changes since 0.11.63.
