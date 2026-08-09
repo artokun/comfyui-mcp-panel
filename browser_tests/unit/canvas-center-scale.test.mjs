@@ -1,5 +1,8 @@
-// panel#754 part (3) — `panel_center_on_node` accepted `scale` and silently ignored it,
-// so "centre on node 42 at 1.5x" centred at whatever zoom happened to be set.
+// panel#754 part (3) — `panel_canvas` with action:"center_on_node" accepted `scale` and
+// silently ignored it, so "centre on node 42 at 1.5x" centred at whatever zoom happened to
+// be set. (There is no `panel_center_on_node` tool. Writing that name here is what the
+// vocabulary gate caught, and it was right to: a wrong tool name in a comment becomes a
+// tool-not-found the model cannot diagnose.)
 //
 // ORDER IS THE FIX. The centring math divides by `ds.scale` (and litegraph's own
 // centerOnNode reads it too), so applying the zoom AFTER centring slides the node back
