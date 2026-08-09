@@ -96,7 +96,12 @@ test('opening a workflow does not dirty it and first record embeds silently', as
   // Save through the panel's own command so the workflow is genuinely persisted,
   // then re-zero the counters: saving legitimately touches the graph, and the
   // claim under test is that the EMBED is silent, not that saving is.
-  const savedAs = `cmcp-e2e-identity-${Date.now().toString(36)}`
+  // Timestamp AND a nonce: two workers can start in the same millisecond, and
+  // each test's cleanup deletes by name — a collision would have one test
+  // delete the other's workflow out from under it (codex).
+  const savedAs = `cmcp-e2e-identity-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`
   const saveReply = await mockBridge.command('workflow_save_as', { name: savedAs })
   expect(saveReply.ok, JSON.stringify(saveReply).slice(0, 300)).toBe(true)
   await expect
@@ -117,6 +122,9 @@ test('opening a workflow does not dirty it and first record embeds silently', as
 
   // The embed rides the next RECORD, so give it one.
   await panel.sendMessage('first record after save')
+  // Wait for a WELL-FORMED uuid, not merely something non-null: the assertion
+  // below checks the shape, and a gate that accepts any truthy value would let a
+  // malformed write satisfy the wait and then fail confusingly (codex).
   await expect
     .poll(() =>
       page.evaluate(
@@ -125,7 +133,7 @@ test('opening a workflow does not dirty it and first record embeds silently', as
             ?.workflow_uuid ?? null
       )
     )
-    .not.toBeNull()
+    .toMatch(/^[0-9a-f-]{36}$/i)
 
   const recorded = await page.evaluate(() => {
     const w = window as any
