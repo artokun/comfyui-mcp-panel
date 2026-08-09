@@ -6,6 +6,31 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.69] - 2026-08-09
+
+> Covers changes since 0.11.68.
+
+### Security
+
+- **A workflow you open can no longer lie to the agent about your graph (#904).** The
+  graph outline the agent reads marks nodes with short status tags — `[bypass]` and
+  `[mute]` mean a node isn't running, `[after_gen=randomize]` means ComfyUI quietly
+  changes that value on every run. Node titles and widget values were written into that
+  same text as-is, so text containing one of those tags was indistinguishable from a tag
+  the panel had actually emitted.
+
+  This is reachable by **workflows you download**, not just by what you type: a prompt in
+  a shared JSON could make the agent believe a node was disabled, or that a value was
+  being rewritten behind its back, and act on it.
+
+  Values are not censored to fix it — bracket syntax like `[cat|dog]` is ordinary prompt
+  content, and deleting it would corrupt what you asked to see. Instead a value
+  containing brackets is now quoted, so a tag outside quotes is always the panel's own.
+  Ordinary values are unchanged. Titles, which were already quoted, can no longer end
+  their own quoting early.
+
+  Found while fixing #636 and verified against a live ComfyUI before and after.
+
 ## [0.11.68] - 2026-08-09
 
 > Covers changes since 0.11.67.
