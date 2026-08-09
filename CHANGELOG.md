@@ -33,7 +33,7 @@ All notable changes to this project are documented here. This project adheres to
   for.
 
   The other half of that report — `SaveVideo`'s `codec` input — was already fixed in
-  0.11.61. Verified here against a live ComfyUI: `SaveVideo` now adds cleanly.
+  0.11.44. Verified here against a live ComfyUI: `SaveVideo` now adds cleanly.
 
 ## [0.11.66] - 2026-08-09
 
