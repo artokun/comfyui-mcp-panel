@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deflateRawSync } from "node:zlib";
+import { readFileSync } from "node:fs";
 import { CivitaiClient } from "../../web/js/cmcp-civitai.js";
 import { graphDirtyForConfirm } from "../../web/js/cmcp-civitai-ui.js";
 
@@ -324,4 +325,105 @@ test("downloadVersionFile surfaces the HTTP status for the sign-in hint", async 
     () => client.downloadVersionFile(1),
     (e) => e.status === 401 && /401/.test(e.message),
   );
+});
+
+// ── #882: the confirm gate must not trust a flag a node cannot set ─────────
+
+test("WIRING #882: graphIsDirty captures the canvas before reading isModified", () => {
+  // `isModified` comes from a snapshot ComfyUI takes on USER INPUT events only, so a
+  // value a NODE wrote leaves it false while the canvas already differs from the
+  // file. This gate fails closed for an UNREADABLE flag — it said so — but a STALE
+  // flag is readable and wrong, so the overwrite confirmation was skipped and an
+  // unsaved canvas clobbered without asking.
+  //
+  // The provider is a closure inside the panel needing a live DOM, so it is pinned
+  // at source; the behaviour it feeds (`graphDirtyForConfirm`) is unit-tested above.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const site = src.slice(src.indexOf("graphIsDirty: () => {"), src.indexOf("loadGraph: async (graph)"));
+  assert.ok(site.length > 0, "the provider must exist");
+  assert.ok(
+    site.includes("captureCanvasIntoTracker(wf)"),
+    "it must capture before reading the flag",
+  );
+  // Synchronous caller: a capture it cannot wait for, or one that threw, leaves the
+  // flag not known to be current — the same position as unreadable, so confirm.
+  assert.ok(
+    site.includes('captured === "pending" || captured === "failed"'),
+    "an unwaitable or failed capture must fall back to confirming",
+  );
+  const captureAt = site.indexOf("captureCanvasIntoTracker(wf)");
+  const readAt = site.lastIndexOf("return wf.isModified;");
+  assert.ok(captureAt < readAt, "the capture must precede the read");
+});
+
+test("WIRING #882: the shared capture reports WHY it could not capture", () => {
+  // A boolean would force both callers to guess, which is the shape of the bug: the
+  // close guard can await a pending capture, the synchronous confirm gate cannot,
+  // and neither may treat "could not capture" as "not dirty".
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const fn = src.slice(
+    src.indexOf("function captureCanvasIntoTracker(wf) {"),
+    src.indexOf("function activeWorkflowRef() {"),
+  );
+  assert.ok(fn.length > 0, "the helper must exist");
+  for (const verdict of ['"unavailable"', '"captured"', '"pending"', '"failed"', '"inactive"']) {
+    assert.ok(fn.includes(verdict), `it must be able to report ${verdict}`);
+  }
+  // Written as an early return for the non-thenable case, so accept either polarity —
+  // what matters is that thenability is what separates "captured" from "pending".
+  assert.ok(
+    /typeof result\.then [!=]== "function"/.test(fn),
+    "a thenable must be reported as pending",
+  );
+  assert.ok(fn.includes("} catch {"), "a throwing capture must not propagate");
+
+  // Only the ACTIVE workflow may be flushed. Upstream `captureCanvasState()` returns
+  // early for a non-active tracker, so asking would report a capture that never
+  // happened — and an inactive tab was already frozen by ComfyUI's `deactivate()`.
+  assert.ok(
+    fn.includes("wf !== activeWorkflowRef()"),
+    "a non-active workflow must be reported inactive rather than flushed",
+  );
+  // `checkState` is deprecated upstream (it warns, then delegates), so the current
+  // name must be preferred and the old one kept only as the fallback.
+  assert.ok(
+    /capture\s*=\s*tracker\?\.captureCanvasState\s*\?\?\s*tracker\?\.checkState/.test(fn),
+    "the non-deprecated capture must be preferred over checkState",
+  );
+  // `settled` must derive from the capture's OWN promise. Calling the capture a
+  // second time to await would run it twice — and a capture that sees a change is not
+  // a read: it pushes an undo entry and clears redo.
+  assert.ok(
+    /settled:\s*result\.then\(/.test(fn),
+    "the pending verdict must settle the capture's own promise",
+  );
+  assert.equal(
+    (fn.match(/capture\.call\(tracker\)/g) || []).length,
+    1,
+    "the capture must be invoked exactly once",
+  );
+});
+
+test("WIRING #882: closing awaits a pending capture and refuses a failed one", () => {
+  // The close executor is async, so unlike the confirm gate it CAN wait — and a
+  // capture that failed leaves the tracker knowably behind, so the flag proves
+  // nothing and the close must refuse rather than discard.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const site = src.slice(
+    src.indexOf("const captured = captureCanvasIntoTracker(target);"),
+    src.indexOf("await s.closeWorkflow(target);"),
+  );
+  assert.ok(site.length > 0, "the close guard must capture");
+  // Await the capture's OWN promise. An earlier draft started a SECOND capture and
+  // swallowed its rejection, so a rejected capture still read as "pending" and the
+  // close went ahead on a stale flag — the very failure this guard exists to stop.
+  assert.ok(site.includes("await captured.settled"), "a pending capture must be awaited");
+  assert.ok(
+    !site.includes("changeTracker.checkState()"),
+    "it must not start a second capture to await",
+  );
+  // The refusal must key off the SETTLED verdict, not the provisional one, or a
+  // capture that rejects after being awaited is still treated as merely pending.
+  assert.ok(site.includes('verdict === "failed" && !force'), "a failed capture must refuse");
+  assert.ok(site.includes("target.isModified && !force"), "the original guard must remain");
 });
