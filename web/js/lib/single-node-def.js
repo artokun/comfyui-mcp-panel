@@ -21,8 +21,6 @@
  * `hasOwnProperty(defs, class_type)` — the authority test #458 performs — behaves
  * identically on the single-class response.
  *
- * THIS CANNOT CHANGE A VERDICT, ONLY THE COST OF REACHING ONE.
- *
  * The fast path is taken only when it can CONFIRM the type: a live response that
  * actually contains the class. Every other outcome — an empty `{}`, a non-200, a
  * body that will not parse, an older ComfyUI without the route, a network failure
@@ -30,6 +28,22 @@
  * unchanged. A confirmation is the one answer that cannot be wrong in the
  * dangerous direction: refusals, removal verdicts and history checks are all
  * still decided by the existing code on the existing payload.
+ *
+ * THIS ANSWERS ONE QUESTION, NOT EVERY QUESTION THE FULL PAYLOAD ANSWERS.
+ *
+ * That heading used to read "this cannot change a verdict, only the cost of reaching
+ * one", and #821 is the bug that sentence licensed. It is true of the question this
+ * route is FOR — `hasOwnProperty(defs, class_type)`, which is about one class and reads
+ * identically either way. It is false of every question that quantifies over the whole
+ * install, and the caller was asking one: `registeredSocketTypes(freshDefs)` collects the
+ * output datatypes of ALL installed nodes to prove an input is a link socket. Fed a
+ * single-class map it can only see this class's own outputs, so a custom datatype produced
+ * by a SIBLING (SeedVR2LoadDiTModel -> `SEEDVR2_DIT`) reads as unproven and the node is
+ * refused with "no installed node outputs SEEDVR2_DIT" — while that very node sits on the
+ * canvas. The reply is not wrong; the question asked of it was.
+ *
+ * So: reuse this payload for per-class facts. Anything that ranges over the install needs
+ * the whole schema, and the caller must know which one it is holding.
  *
  * The caller additionally gates this on the type ALREADY BEING REGISTERED in
  * LiteGraph, which matters for a reason that is not about speed:

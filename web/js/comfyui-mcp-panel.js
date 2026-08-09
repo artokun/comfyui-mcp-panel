@@ -7289,12 +7289,33 @@ async function awaitRequiredCustomWidgetRegistration(
   knownSocketTypes,
   currentDef,
   classType,
+  widenSocketProof,
 ) {
   const startedAt = Date.now();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  let socketTypes = knownSocketTypes;
   const check = () =>
-    unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, knownSocketTypes, currentDef);
+    unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, socketTypes, currentDef);
   let unavailable = check();
+  // #821 — the socket proof may have been read off a single-class /object_info, which is
+  // silent about every type a SIBLING node outputs. Widen it once against the whole
+  // schema, BEFORE the wait rather than after it: a link-proven input has nothing to wait
+  // FOR (no constructor is ever registered for a link datatype), so waiting first would
+  // spend the full 5 s on every such add and still reach the same answer. A widen that
+  // throws or yields nothing leaves the original proof in place and the guard fails closed
+  // exactly as it does today — #580's protection does not depend on this succeeding.
+  if (unavailable.length && typeof widenSocketProof === "function") {
+    let widened = null;
+    try {
+      widened = await widenSocketProof();
+    } catch {
+      widened = null;
+    }
+    if (widened && typeof widened.has === "function") {
+      socketTypes = widened;
+      unavailable = check();
+    }
+  }
   while (Date.now() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
@@ -8598,6 +8619,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // upload loader whose class the refresh had just registered.
     let freshDefs = null;
     let currentDef;
+    // #821 — freshDefs answers TWO different questions, and the #767/#780 fast path
+    // below can only answer one of them. "Does the live backend still provide
+    // `class_type`?" needs exactly ONE entry. "Which datatypes does some installed node
+    // declare as an OUTPUT?" (registeredSocketTypes, the socket proof) needs the WHOLE
+    // schema — a sibling class is where a custom link datatype is produced. Remember
+    // which payload we got, because a single-class map is not evidence about siblings.
+    let freshDefsAreSingleClass = false;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
         // #767 — ask about ONE type instead of re-downloading the whole schema.
@@ -8622,6 +8650,7 @@ const GRAPH_TOOL_EXECUTORS = {
           const one = await fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route));
           if (one) {
             freshDefs = recordObjectInfoTypes(one);
+            freshDefsAreSingleClass = true;
             currentDef = snapshotBackendDef(freshDefs, class_type);
             return freshDefs;
           }
@@ -8629,6 +8658,7 @@ const GRAPH_TOOL_EXECUTORS = {
         freshDefs = recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
         );
+        freshDefsAreSingleClass = false;
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
       },
@@ -8659,6 +8689,21 @@ const GRAPH_TOOL_EXECUTORS = {
     // registry, whose nodeData.output keeps stale positives for removed or
     // schema-changed packs and would wrongly waive the guard.
     const knownSocketTypes = registeredSocketTypes(freshDefs);
+    // #821 — when the proof above came from a SINGLE-CLASS payload it can only see this
+    // class's own outputs, so every custom link datatype produced by a SIBLING node reads
+    // as unproven. That is how `SeedVR2VideoUpscaler` was refused with "no installed node
+    // outputs SEEDVR2_DIT" while `SeedVR2LoadDiTModel` — which outputs exactly that — sat
+    // on the canvas. Widen against the whole schema, but ONLY on the path that is about to
+    // refuse: same idiom as #775's readImportFailures, so a healthy add still pays nothing
+    // and #780's 1,667x saving is kept for every add that does not need it.
+    const widenSocketProof = freshDefsAreSingleClass
+      ? async () =>
+          registeredSocketTypes(
+            recordObjectInfoTypes(
+              typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
+            ),
+          )
+      : null;
     // registerNodesFromDefs can expose a newly installed V3 class before its
     // extension's asynchronous custom-widget registry settles. Resolve the
     // required constructors before creating anything, or fail retryably before
@@ -8669,6 +8714,7 @@ const GRAPH_TOOL_EXECUTORS = {
       knownSocketTypes,
       currentDef,
       class_type,
+      widenSocketProof,
     );
     const node = LG.createNode(class_type);
     if (!node) {
