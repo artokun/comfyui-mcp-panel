@@ -20979,6 +20979,13 @@ function buildPanel() {
   // the registry is mount-local on purpose — a workflow switch re-mounts and
   // replays cards INERT from the thread (live handles don't survive, by design).
   const liveA2uiCards = new Map(); // cardId -> { handle, rec }
+  // panel#832 (codex) — TRUE only during the synchronous pre-hydration restore paint.
+  // That pass declares itself "paint-only": settings are not hydrated yet, so the thread
+  // it paints comes from a tab pointer and may not be the authoritative one. Replaying a
+  // card INERT there was harmless; mounting it LIVE would register a card belonging to a
+  // thread that is about to be replaced, and an update could then land on it. Liveness
+  // waits until the real thread has been chosen.
+  let a2uiPaintProvisional = false;
 
   /** Round-trip: a card interaction becomes a normal, visible user message. */
   function sendCardReply(text) {
@@ -20993,11 +21000,17 @@ function buildPanel() {
     if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
   }
 
-  /** Paint + record + register one live A2UI card. Returns its card_id. */
-  function appendA2UICard(spec) {
-    clearEmpty();
-    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
-    const handle = renderA2UICard(spec, {
+  /**
+   * Render one A2UI record as a LIVE card and put it in the live registry.
+   *
+   * panel#832 — shared by the first paint and by a repaint of an unresolved record,
+   * deliberately: the resolve/dismiss handlers retire the card from `liveA2uiCards`
+   * and persist the choice, and two copies of that would be two chances to drift.
+   * `reuseId` is what makes a repaint the SAME card rather than a new one.
+   */
+  function mountLiveA2UICard(rec, reuseId) {
+    const handle = renderA2UICard(rec.spec, {
+      ...(reuseId ? { cardId: reuseId } : {}),
       onAction(text) {
         rec.resolved = true;
         rec.choice = text;
@@ -21015,21 +21028,58 @@ function buildPanel() {
         setChatSurfaceForCards();
       },
     });
-    record(rec);
+    // panel#832 — the id the AGENT holds now lives on the record, not only on the
+    // transient handle. Without it a repaint could re-render the card live and still
+    // register it under a freshly minted id, so panel_ui_update would keep failing —
+    // for a new reason instead of the old one. Identity is the half that was missing.
+    rec.cardId = handle.cardId;
     liveA2uiCards.set(handle.cardId, { handle, rec });
     log.appendChild(handle.el);
+    if (rec.spec?.surface === "wide") setChatSurfaceForCards();
+    return handle;
+  }
+
+  /** Paint + record + register one live A2UI card. Returns its card_id. */
+  function appendA2UICard(spec) {
+    clearEmpty();
+    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
+    // RECORD BEFORE MOUNTING, deliberately — this preserves the original ordering and
+    // it is load-bearing: record() can reach detachInvalidCurrentThread(), which calls
+    // resetFeed() and repaints. A card placed in the DOM and in `liveA2uiCards` BEFORE
+    // that would be wiped by the repaint it triggered, and — not yet being in any
+    // thread — would not come back. Recording first means the repaint happens while the
+    // card is still an unplaced value, and the mount below lands on the settled feed.
+    record(rec);
+    const handle = mountLiveA2UICard(rec);
     scrollLog();
-    if (spec.surface === "wide") setChatSurfaceForCards();
     return handle.cardId;
   }
 
-  /** Replay one persisted a2ui record inert (reload / thread switch). */
+  /**
+   * Replay one persisted a2ui record (reload / thread switch / same-thread repaint).
+   *
+   * panel#832 — an UNRESOLVED record comes back LIVE, under its original card_id.
+   * It used to be replayed inert unconditionally, and `resetFeed()` clears
+   * `liveA2uiCards`, so a repaint landing between `panel_ui_render` and
+   * `panel_ui_update` silently killed a card the agent had just been handed — no
+   * click, no dismissal, no view switch, just `no live card "…"`.
+   *
+   * A RESOLVED record (answered or dismissed) stays inert exactly as before: it is
+   * finished, and bringing it back would offer the user buttons for a question that
+   * has already been answered. The thread/view guard is untouched — repaint only ever
+   * replays the records of the thread being painted, so this cannot resurrect a card
+   * into a view it does not belong to.
+   */
   function paintA2UIRecord(m) {
     clearEmpty();
     try {
+      if (m && m.resolved !== true && !a2uiPaintProvisional) {
+        mountLiveA2UICard(m, typeof m.cardId === "string" ? m.cardId : undefined);
+        return;
+      }
       log.appendChild(renderA2UIInert(m.spec, m.choice));
     } catch {
-      log.appendChild(renderA2UIFailCard(m.spec, ["stored card failed to render"]));
+      log.appendChild(renderA2UIFailCard(m?.spec, ["stored card failed to render"]));
     }
   }
 
@@ -21760,7 +21810,16 @@ function buildPanel() {
     // a ui_update against a card from a previous view would silently repaint a
     // DETACHED element (and mutate+persist the background thread's record) while
     // claiming success; and a stale unresolved surface:"wide" entry would keep
-    // the sidebar wide forever. Cards replay INERT from the thread instead.
+    // the sidebar wide forever.
+    //
+    // #832 — this used to end "Cards replay INERT from the thread instead", which
+    // is no longer true and was the whole bug: an UNRESOLVED card now replays LIVE
+    // under its original card_id (see paintA2UIRecord), because clearing here and
+    // replaying inert killed a card the agent had just been handed, mid-turn, with
+    // no user action. The protection above is unaffected: only the thread being
+    // painted is replayed, and every element was just removed, so nothing from a
+    // previous view can come back and no card can end up with two DOM nodes. A
+    // RESOLVED card still replays inert.
     liveA2uiCards.clear();
     // The thinking indicator lived in `log` and was just detached along with
     // everything else. Drop the stale refs — otherwise a later showThinking()
@@ -27043,7 +27102,16 @@ function buildPanel() {
       const pointed = reloadThreadId
         ? threads.find((candidate) => candidate.id === reloadThreadId)
         : null;
-      if (pointed?.msgs?.length) paintThread(pointed);
+      if (pointed?.msgs?.length) {
+        // #832 — paint-only, as the comment above requires: cards replay inert here
+        // because the authoritative thread has not been selected yet.
+        a2uiPaintProvisional = true;
+        try {
+          paintThread(pointed);
+        } finally {
+          a2uiPaintProvisional = false;
+        }
+      }
     } catch {
       // Corrupt/absent state — start clean.
     }

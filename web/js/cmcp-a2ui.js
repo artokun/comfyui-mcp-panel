@@ -541,8 +541,23 @@ let _cardSeq = 0;
  * onAction(text): user clicked a button / submitted — send `text` as a visible
  * chat message and mark the card resolved. onDismiss(): user hit ✕.
  */
-export function renderA2UICard(spec, { onAction, onDismiss } = {}) {
-  const cardId = `a2ui-${Date.now().toString(36)}-${++_cardSeq}`;
+export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = {}) {
+  // panel#832 — a caller may supply the id instead of minting one. A repaint that
+  // re-renders an UNRESOLVED record has to come back as the SAME card: the agent is
+  // holding the id it was given at render time, and a fresh id would leave
+  // panel_ui_update failing for a new reason rather than the old one. Minting stays
+  // the default, so every ordinary render is unchanged.
+  const cardId =
+    typeof reuseId === "string" && reuseId
+      ? reuseId
+      : // panel#832 (codex) — `_cardSeq` restarts at 0 on every module load, and an id
+        // REUSED from a persisted record does not advance it. Minting from
+        // Date.now()+counter alone therefore has a path where a fresh id equals one a
+        // repaint has already put back in `liveA2uiCards`, silently overwriting that
+        // entry so an update lands on the wrong card. A random nonce removes the class
+        // rather than narrowing it — the id is an opaque handle, so nothing depends on
+        // it being sequential or on encoding a time.
+        `a2ui-${Date.now().toString(36)}-${++_cardSeq}-${Math.random().toString(36).slice(2, 8)}`;
   const el = document.createElement("div");
   el.className = "cmcp-a2ui";
   el.dataset.cardId = cardId;
