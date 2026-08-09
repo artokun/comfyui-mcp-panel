@@ -81,11 +81,22 @@ export class MockBridge {
   private readonly frameCbs = new Set<FrameCb>()
   private readonly userMessages: UserMessage[] = []
   private readonly userMessageWaiters: Array<(m: UserMessage) => void> = []
+  /** Commands that change WHICH workflow is active, so a cached identity for the
+   *  outgoing one must not survive them. All are exempt from the workflow fence,
+   *  so they need no stamp of their own. */
+  private static readonly WORKFLOW_REPOINTING_COMMANDS = new Set([
+    'workflow_new',
+    'workflow_open',
+    'workflow_close'
+  ])
   private streamSeq = 0
   /** #793 — the active canvas's workflow-instance uuid, learned once per page
    *  and reused. Cleared by `forgetWorkflowUuid()` when a spec deliberately
    *  changes which workflow is active. */
   private workflowUuid: string | null = null
+  /** In-flight identity lookup, so two commands racing the first send do not
+   *  each probe (codex). */
+  private workflowUuidInFlight: Promise<string | null> | null = null
 
   constructor(options: MockBridgeOptions = {}) {
     this.opts = {
@@ -329,15 +340,30 @@ export class MockBridge {
    */
   async activeWorkflowUuid(): Promise<string | null> {
     if (this.workflowUuid) return this.workflowUuid
-    const reply = await this.sendCommand('workflow_list', {})
-    const uuid = reply?.result?.active?.workflow_uuid
-    this.workflowUuid = typeof uuid === 'string' && uuid ? uuid : null
-    return this.workflowUuid
+    // SINGLE-FLIGHT (codex): `command()` is async before it sends, so two
+    // commands issued together both reach here with an empty cache. Sharing the
+    // probe keeps it to one round trip and, more importantly, keeps them from
+    // resolving against two different reads.
+    if (!this.workflowUuidInFlight) {
+      this.workflowUuidInFlight = this.sendCommand('workflow_list', {})
+        .then((reply) => {
+          const uuid = (reply as any)?.result?.active?.workflow_uuid
+          this.workflowUuid = typeof uuid === 'string' && uuid ? uuid : null
+          return this.workflowUuid
+        })
+        .finally(() => {
+          this.workflowUuidInFlight = null
+        })
+    }
+    return this.workflowUuidInFlight
   }
 
-  /** Drop the cached uuid — call after a spec switches or creates a workflow. */
+  /** Drop the cached uuid — call after a spec switches or creates a workflow.
+   *  Rarely needed by hand: the commands that re-point the active workflow
+   *  invalidate it themselves (see WORKFLOW_REPOINTING_COMMANDS). */
   forgetWorkflowUuid(): void {
     this.workflowUuid = null
+    this.workflowUuidInFlight = null
   }
 
   /**
@@ -365,6 +391,17 @@ export class MockBridge {
     if (Object.prototype.hasOwnProperty.call(args, 'workflow_uuid')) {
       const { workflow_uuid: explicit, ...rest } = args
       return this.sendCommand(cmd, explicit == null ? rest : args, timeoutMs)
+    }
+    // A command that RE-POINTS the active workflow invalidates the cache before
+    // it runs, not after (codex): otherwise it stamps itself with the identity of
+    // the workflow it is about to leave, and the next command inherits a uuid for
+    // a canvas that is no longer active. These are all fence-exempt, so sending
+    // them unstamped is exactly what the orchestrator does.
+    if (MockBridge.WORKFLOW_REPOINTING_COMMANDS.has(cmd)) {
+      this.forgetWorkflowUuid()
+      const reply = await this.sendCommand(cmd, args, timeoutMs)
+      this.forgetWorkflowUuid()
+      return reply
     }
     const uuid = await this.activeWorkflowUuid()
     return this.sendCommand(cmd, uuid ? { ...args, workflow_uuid: uuid } : args, timeoutMs)

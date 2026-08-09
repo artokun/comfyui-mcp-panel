@@ -50,9 +50,8 @@ export async function claimFreshCanvas(page: Page, bridge: MockBridge): Promise<
   if (!created.ok) {
     throw new Error(`claimFreshCanvas: workflow_new failed — ${created.error ?? 'no reason given'}`)
   }
-  // The new tab is a new INSTANCE, so anything the bridge cached for the previous
-  // one is stale; the next stamped command must re-read.
-  bridge.forgetWorkflowUuid()
+  // No manual invalidation needed: `workflow_new` is one of the commands
+  // MockBridge treats as re-pointing, so it drops the cache around the call.
   return bridge.activeWorkflowUuid()
 }
 
@@ -75,12 +74,22 @@ export async function claimFreshCanvas(page: Page, bridge: MockBridge): Promise<
  * Call it after building, before the first command.
  */
 export async function settleCanvas(page: Page): Promise<void> {
-  await page.evaluate(() => {
+  const settled = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
     const tracker = app?.extensionManager?.workflow?.activeWorkflow?.changeTracker
-    // Best-effort by design: a frontend without this hook leaves the spec to
-    // fail on its own assertion rather than on a confusing helper error.
-    tracker?.checkState?.()
+    if (typeof tracker?.checkState !== 'function') return false
+    tracker.checkState()
+    return true
   })
+  // NOT best-effort (codex). A silent no-op here surfaces later as a binding
+  // refusal in the middle of an assertion, which is precisely the misdirection
+  // that left this suite's real cause unread for months. If the harness cannot
+  // set the fixture up, it says so where it happened.
+  if (!settled) {
+    throw new Error(
+      'settleCanvas: no ChangeTracker on the active workflow — the panel cannot be ' +
+        'told about nodes this spec added, so every mutation would be refused as a desync'
+    )
+  }
 }
