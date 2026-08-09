@@ -23,7 +23,7 @@
  * `wf:<one-shared-id>:<path>` for every tab matches the form and recreates #693 exactly
  * (codex). Uniqueness is the invariant; the form is only how it is carried.
  */
-import { test, expect } from './fixtures/panelTest'
+import { test, expect, isolatePanelPage } from './fixtures/panelTest'
 import { PanelPage } from './fixtures/PanelPage'
 
 /** Record the `tab_id` of every hello this page sends, from before it connects. */
@@ -71,62 +71,83 @@ test('two tabs on one saved workflow never share a bridge route', async ({
   mockBridge,
   context
 }) => {
-  await captureHellos(page)
-  await panel.goto()
-  await panel.setBridgeUrl(mockBridge.url)
-  await panel.openSidebar()
-  await panel.connect()
+  const cleanup: Array<() => Promise<void>> = []
+  try {
+    await captureHellos(page)
+    await panel.goto()
+    await panel.setBridgeUrl(mockBridge.url)
+    await panel.openSidebar()
+    await panel.connect()
 
-  // A SAVED workflow specifically. An unsaved tab routes on a per-object `tmp:<uuid>`
-  // and could never collide, so using one would pass for the wrong reason.
-  const saved = await mockBridge.command('workflow_save', {})
-  expect(saved.ok, 'the workflow must save so both tabs share a FILE').toBe(true)
-  const savedName = String(saved.result?.workflow || '')
-  expect(savedName, 'the save must report a name').toBeTruthy()
-  const savedPath = `workflows/${savedName}.json`
-  await page.waitForTimeout(2500)
+    // A SAVED workflow specifically. An unsaved tab routes on a per-object `tmp:<uuid>`
+    // and could never collide, so using one would pass for the wrong reason.
+    const saved = await mockBridge.command('workflow_save', {})
+    expect(saved.ok, 'the workflow must save so both tabs share a FILE').toBe(true)
+    const savedName = String(saved.result?.workflow || '')
+    expect(savedName, 'the save must report a name').toBeTruthy()
+    const savedPath = `workflows/${savedName}.json`
+    // This spec PERSISTS a file on the developer's real ComfyUI. Remove it however the
+    // test ends — an assertion failure must not leave litter behind (codex).
+    cleanup.push(async () => {
+      await page.evaluate(async (p) => {
+        const api = (window as any).comfyAPI?.api?.api
+        await api?.fetchApi?.(`/userdata/${encodeURIComponent(p)}`, { method: 'DELETE' })
+      }, savedPath)
+    })
+    await page.waitForTimeout(2500)
 
-  // Tab B: a second real browser tab in the same context, opening that same file.
-  const pageB = await context.newPage()
-  await captureHellos(pageB)
-  await pageB.route('**/comfyui_mcp_panel/status*', (r) => r.fulfill({ json: { running: false } }))
-  await pageB.route('**/comfyui_mcp_panel/backends*', (r) => r.fulfill({ json: { backends: [] } }))
-  const panelB = new PanelPage(pageB)
-  await panelB.goto()
-  await panelB.setBridgeUrl(mockBridge.url)
-  await panelB.openSidebar()
-  await panelB.connect()
+    // Tab B: a second real browser tab in the same context, opening that same file.
+    const pageB = await context.newPage()
+    await captureHellos(pageB)
+    // The fixture only isolates the test's OWN page. Page B needs the identical stub set
+    // or its Reconnect writes this throwaway mock bridge URL into the developer's REAL
+    // ComfyUI settings, leaving a dead port behind after the suite exits (codex).
+    await isolatePanelPage(pageB)
+    const panelB = new PanelPage(pageB)
+    await panelB.goto()
+    await panelB.setBridgeUrl(mockBridge.url)
+    await panelB.openSidebar()
+    await panelB.connect()
 
-  const openedB = await openSavedWorkflow(pageB, savedPath)
-  expect(openedB.opened, `tab B must open ${savedPath}`).toBe(true)
-  await pageB.waitForTimeout(3000)
+    const openedB = await openSavedWorkflow(pageB, savedPath)
+    expect(openedB.opened, `tab B must open ${savedPath}`).toBe(true)
+    await pageB.waitForTimeout(3000)
 
-  const hellosA = savedHellos(await page.evaluate(() => (window as any).__hellos ?? []))
-  const hellosB = savedHellos(await pageB.evaluate(() => (window as any).__hellos ?? []))
-  expect(hellosA.length, 'tab A must have helloed on the saved workflow').toBeGreaterThan(0)
-  expect(hellosB.length, 'tab B must have helloed on the saved workflow').toBeGreaterThan(0)
+    const hellosA = savedHellos(await page.evaluate(() => (window as any).__hellos ?? []))
+    const hellosB = savedHellos(await pageB.evaluate(() => (window as any).__hellos ?? []))
+    expect(hellosA.length, 'tab A must have helloed on the saved workflow').toBeGreaterThan(0)
+    expect(hellosB.length, 'tab B must have helloed on the saved workflow').toBeGreaterThan(0)
 
-  // Both must be routing for the SAME file, or they were never in a position to
-  // collide and this proves nothing.
-  expect(hellosA.some((id) => id.endsWith(`:${savedPath}`)), 'tab A must route for the saved file').toBe(true)
-  expect(hellosB.some((id) => id.endsWith(`:${savedPath}`)), 'tab B must route for the saved file').toBe(true)
+    // Both must be routing for the SAME file, or they were never in a position to
+    // collide and this proves nothing.
+    expect(hellosA.some((id) => id.endsWith(`:${savedPath}`)), 'tab A must route for the saved file').toBe(true)
+    expect(hellosB.some((id) => id.endsWith(`:${savedPath}`)), 'tab B must route for the saved file').toBe(true)
 
-  // The bare handle names the FILE, so every tab showing it produces the same string.
-  for (const [label, ids] of [['A', hellosA], ['B', hellosB]] as const) {
-    for (const id of ids) {
-      expect(id, `tab ${label} must not route on the bare file handle`).not.toBe(`wf:${savedPath}`)
+    // The bare handle names the FILE, so every tab showing it produces the same string.
+    for (const [label, ids] of [['A', hellosA], ['B', hellosB]] as const) {
+      for (const id of ids) {
+        expect(id, `tab ${label} must not route on the bare file handle`).not.toBe(`wf:${savedPath}`)
+      }
+    }
+
+    // THE INVARIANT: no route may be shared. This is what the bridge keys on, and a
+    // shared value is what makes two clients evict each other forever.
+    const shared = hellosA.filter((id) => hellosB.includes(id))
+    expect(
+      shared,
+      `both tabs helloed with the same route — the bridge keeps one connection per ` +
+        `tab_id, so these two would close each other's sockets indefinitely ` +
+        `(A=${JSON.stringify(hellosA)} B=${JSON.stringify(hellosB)})`
+    ).toEqual([])
+
+    await pageB.close()
+  } finally {
+    for (const fn of cleanup.reverse()) {
+      try {
+        await fn()
+      } catch {
+        // Best-effort: a failed cleanup must not mask the assertion that failed.
+      }
     }
   }
-
-  // THE INVARIANT: no route may be shared. This is what the bridge keys on, and a
-  // shared value is what makes two clients evict each other forever.
-  const shared = hellosA.filter((id) => hellosB.includes(id))
-  expect(
-    shared,
-    `both tabs helloed with the same route — the bridge keeps one connection per ` +
-      `tab_id, so these two would close each other's sockets indefinitely ` +
-      `(A=${JSON.stringify(hellosA)} B=${JSON.stringify(hellosB)})`
-  ).toEqual([])
-
-  await pageB.close()
 })

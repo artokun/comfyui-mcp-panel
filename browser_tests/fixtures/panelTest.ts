@@ -9,6 +9,7 @@
  * A typical spec: point the panel at `mockBridge.url`, open the sidebar, connect,
  * then drive the conversation via the MockBridge helpers.
  */
+import type { Page } from '@playwright/test'
 import { test as base } from '@playwright/test'
 
 import { MockBridge } from './MockBridge'
@@ -38,6 +39,72 @@ interface PanelOptions {
   panelFlags: string[]
 }
 
+/** The stub set itself, kept in one place so the fixture and a spec's second page
+ *  can never drift apart. */
+async function applyPanelRouteStubs(page: Page, panelFlags: string[]) {
+  // Hermetic runs on a dev box with a REAL orchestrator listening on :9180:
+  // the panel's mount probe (GET /comfyui_mcp_panel/status → { running: true })
+  // would auto-connect it to the live agent before the spec's setBridgeUrl()
+  // override applies — the real greeting then pollutes the transcript and the
+  // MockBridge never sees the session. Stub the discovery routes so every spec
+  // sees "no orchestrator"; connection goes only where the spec points it.
+  await page.route('**/comfyui_mcp_panel/status*', (route) =>
+    route.fulfill({ json: { running: false } })
+  )
+  await page.route('**/comfyui_mcp_panel/backends*', (route) =>
+    route.fulfill({ json: { backends: [] } })
+  )
+  await page.route('**/comfyui_mcp_panel/bridge_url*', (route) =>
+    route.fulfill({ json: { url: null } })
+  )
+  // Panel-setting WRITES must never reach the real server: Reconnect mirrors
+  // the (per-test, throwaway) mock URL into `comfyui-mcp.bridgeUrl.single`,
+  // which would poison the developer's live panel with a dead port after the
+  // suite exits. Swallow them; the panel treats the write as fire-and-forget.
+  await page.route(
+    (url) => /\/(api\/)?settings\/comfyui-mcp\./.test(url.pathname),
+    (route) =>
+      route.request().method() === 'GET'
+        ? route.continue()
+        : route.fulfill({ status: 200, json: {} })
+  )
+  // Same hermeticity for SERVER-STORED user settings: a dev box that uses the
+  // panel daily has `comfyui-mcp.autoConnect: true` (+ a saved bridge URL) in
+  // ComfyUI's /settings store, which auto-connects the panel to the live
+  // orchestrator on mount even in a fresh browser profile. Strip the panel's
+  // keys from the settings payload; everything else passes through untouched.
+  await page.route(
+    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
+      const res = await route.fetch()
+      let body: Record<string, unknown>
+      try {
+        body = await res.json()
+      } catch {
+        return route.fulfill({ response: res })
+      }
+      for (const key of Object.keys(body)) {
+        if (key.startsWith('comfyui-mcp.')) delete body[key]
+      }
+      // Put back only what this spec explicitly asked for, AFTER the strip, so
+      // the flag value comes from the spec and never from the dev box.
+      for (const flag of panelFlags) body[flag] = true
+      return route.fulfill({ response: res, json: body })
+    }
+  )
+}
+
+/**
+ * Apply every hermeticity stub to a page. Exported because the fixture only covers the
+ * test's OWN `page`: a spec that opens a SECOND page must apply the identical set, or
+ * that page's Reconnect writes the throwaway mock bridge URL into the developer's REAL
+ * ComfyUI settings and leaves a dead port behind after the suite exits (codex, #693).
+ */
+export async function isolatePanelPage(page: Page, panelFlags: string[] = []) {
+  await applyPanelRouteStubs(page, panelFlags)
+}
+
 export const test = base.extend<PanelFixtures & PanelOptions>({
   panelFlags: [[], { option: true }],
   mockBridge: async ({}, use) => {
@@ -47,57 +114,7 @@ export const test = base.extend<PanelFixtures & PanelOptions>({
     await bridge.close()
   },
   panel: async ({ page, panelFlags }, use) => {
-    // Hermetic runs on a dev box with a REAL orchestrator listening on :9180:
-    // the panel's mount probe (GET /comfyui_mcp_panel/status → { running: true })
-    // would auto-connect it to the live agent before the spec's setBridgeUrl()
-    // override applies — the real greeting then pollutes the transcript and the
-    // MockBridge never sees the session. Stub the discovery routes so every spec
-    // sees "no orchestrator"; connection goes only where the spec points it.
-    await page.route('**/comfyui_mcp_panel/status*', (route) =>
-      route.fulfill({ json: { running: false } })
-    )
-    await page.route('**/comfyui_mcp_panel/backends*', (route) =>
-      route.fulfill({ json: { backends: [] } })
-    )
-    await page.route('**/comfyui_mcp_panel/bridge_url*', (route) =>
-      route.fulfill({ json: { url: null } })
-    )
-    // Panel-setting WRITES must never reach the real server: Reconnect mirrors
-    // the (per-test, throwaway) mock URL into `comfyui-mcp.bridgeUrl.single`,
-    // which would poison the developer's live panel with a dead port after the
-    // suite exits. Swallow them; the panel treats the write as fire-and-forget.
-    await page.route(
-      (url) => /\/(api\/)?settings\/comfyui-mcp\./.test(url.pathname),
-      (route) =>
-        route.request().method() === 'GET'
-          ? route.continue()
-          : route.fulfill({ status: 200, json: {} })
-    )
-    // Same hermeticity for SERVER-STORED user settings: a dev box that uses the
-    // panel daily has `comfyui-mcp.autoConnect: true` (+ a saved bridge URL) in
-    // ComfyUI's /settings store, which auto-connects the panel to the live
-    // orchestrator on mount even in a fresh browser profile. Strip the panel's
-    // keys from the settings payload; everything else passes through untouched.
-    await page.route(
-      (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-      async (route) => {
-        if (route.request().method() !== 'GET') return route.continue()
-        const res = await route.fetch()
-        let body: Record<string, unknown>
-        try {
-          body = await res.json()
-        } catch {
-          return route.fulfill({ response: res })
-        }
-        for (const key of Object.keys(body)) {
-          if (key.startsWith('comfyui-mcp.')) delete body[key]
-        }
-        // Put back only what this spec explicitly asked for, AFTER the strip, so
-        // the flag value comes from the spec and never from the dev box.
-        for (const flag of panelFlags) body[flag] = true
-        return route.fulfill({ response: res, json: body })
-      }
-    )
+    await applyPanelRouteStubs(page, panelFlags)
     await use(new PanelPage(page))
   }
 })
