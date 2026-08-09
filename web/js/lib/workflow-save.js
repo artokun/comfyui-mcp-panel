@@ -758,6 +758,46 @@ export async function saveActiveWorkflow(
   // with nothing awaited between it and saveInPlace (see the guard's own note on the
   // residual microtask gap inside ComfyUI's save()).
   assertCanvasNotForeign();
+  // #878 — REFRESH BEFORE OVERWRITING, exactly as the copy route does at its own
+  // write (see the `prepareForSave` note in the save-as adapter below).
+  //
+  // This route persists `wf.activeState` through `saveWorkflow`, and ComfyUI fills
+  // that on USER INPUT events. So a value written by a NODE — an
+  // ImpactWildcardEncode populate, a control_after_generate roll, a subgraph's
+  // promoted widgets — was absent from it, and an in-place save wrote the STALE
+  // bytes over the user's real file. Measured: live canvas 1337, tracker
+  // [512,512,1], on disk after the save [512,512,1]. Silent, because a save does
+  // not repaint: the screen still showed 1337 while the file disagreed.
+  //
+  // The copy routes have had this flush since #708; in-place — the one route that
+  // overwrites an EXISTING file — did not. The panel's own command dispatch
+  // captures after each completed command, which is why a panel edit then a save
+  // was fine and only node-written values were exposed.
+  //
+  // Same three properties as the copy route, and for the same reasons:
+  //   · ONLY when the canvas is PROVEN this tab's. `prepareForSave` serializes the
+  //     one shared root into whichever tracker is active, so capturing an unproven
+  //     canvas is how #708 wrote a foreign graph into the wrong file.
+  //   · A THROWING capture REFUSES the save. It leaves the tracker knowably behind
+  //     the canvas, and writing anyway would silently drop the newest edit — the
+  //     precise failure this fix exists to remove, reintroduced one line later.
+  //   · An ABSENT tracker/method is not a throw. Optional chaining takes no capture,
+  //     which is the same position as an unproven binding and stays allowed.
+  //
+  // Synchronous, immediately after the re-assert and with nothing awaited before the
+  // write, so it cannot open a window the assert just closed.
+  if (normalizeCanvasBinding(canvasBinding, wf) === "bound") {
+    try {
+      wf?.changeTracker?.prepareForSave?.();
+    } catch (err) {
+      throw new Error(
+        `refusing to save "${currentName || finalTargetPath}" in place: the live canvas is this ` +
+          `workflow's, but capturing it failed (${describeThrown(err)}), so the overwrite could ` +
+          `silently drop the newest edits. Nothing was written — retry, or reload the ComfyUI tab ` +
+          `if it persists (#878).`,
+      );
+    }
+  }
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
   const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath });
