@@ -204,6 +204,7 @@ import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
+  migratableRouteIds,
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode } from "./lib/node-scope-locator.js";
@@ -1468,6 +1469,7 @@ const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 // migration (the orchestrator moves the pin unchanged), so the guard must still
 // recognize it as naming this same instance (#186).
 const _priorTempWorkflowIds = new WeakMap();
+
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 
@@ -7462,6 +7464,22 @@ function revalidateGraphMutationContext(captured) {
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
 // measure how much of the canvas the open sidebar panel overlays.
 let activePanelRoot = null;
+/**
+ * Repaint the open Chat-history list, if one is open (#847).
+ *
+ * The list paints once when the pane opens. A route-stamp migration lands on the
+ * 600 ms workflow poll, so a pane opened just before a first save shows the
+ * pre-migration answer and never corrects itself — the rows do not change, so
+ * Playwright's auto-retry cannot save it either, and neither can a user staring
+ * at it.
+ *
+ * Reassigned on every render of the pane rather than nulled on close: the pane is
+ * a popover that is re-rendered in place (`histPop.textContent = ""`) and has no
+ * teardown to hang a null on. A handle left over from a closed popover repaints a
+ * hidden node, which costs nothing and shows nobody anything — and it closes over
+ * the same `threads` BINDING, not a copy, so it cannot paint a stale list.
+ */
+let repaintHistoryList = null;
 
 /**
  * #851 — WHICH ComfyUI a reboot reply is about.
@@ -22173,6 +22191,90 @@ function buildPanel() {
     if (followsPanel) {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf) _tempWorkflowInstanceIds.delete(wf);
+      // #847 — CARRY THE ROUTE STAMP ACROSS THE SAVE, on every thread that holds it.
+      //
+      // A first save moves the tab from `tmp:<uuid>` to `wf:<path>` and re-mints the
+      // storage uuid at the same moment, so a conversation recorded before it holds
+      // neither of the live workflow's identity forms and drops out of "Current
+      // workflow only" — the workflow it was actually held on. 0.11.56 matched those
+      // threads in memory via `_priorTempWorkflowIds`; that is a WeakMap, so the
+      // match died on reload and this is the durable half.
+      //
+      // EVERY thread, not just the active one. Revising only `thread` is what left
+      // the reported case broken: chat, save, start a new chat, filter — and the
+      // FIRST chat is the one missing, because it was not the active thread when the
+      // save landed.
+      //
+      // Rewrites a routing stamp and nothing else. No transcript is touched, and it
+      // goes through `reviseThread` so it travels the same causal field-op path as
+      // the other stamps rather than losing to a stale tab's write.
+      // The ids to migrate FROM — and the hard part is PROVING one belongs to this
+      // tab rather than to a workflow the user merely switched away from (codex P0).
+      //
+      // `tmp:` -> `wf:` is the shape of a first save. It is ALSO the shape of a
+      // switch from an unsaved workflow A to an already-saved workflow B, and an
+      // earlier cut could not tell them apart: it read `currentWorkflowId` starting
+      // with `tmp:` as "this tab's pre-save id" and rewrote every one of A's threads
+      // to B's path — permanently attributing one workflow's conversations to
+      // another. That is the cross-attribution this whole area exists to prevent,
+      // and it is worse than the bug being fixed.
+      //
+      // The discriminator is whether the old id STILL NAMES AN OPEN TAB. A save
+      // consumes the tmp: identity — nothing answers to it afterwards. A switch
+      // leaves A open and answering. So an id is only a pre-save identity of THIS
+      // tab if no open workflow still claims it.
+      //
+      // Fails closed: if the open list cannot be read, nothing is migrated and the
+      // in-memory match (0.11.56) still covers the session.
+      const stillOpenRouteIds = (() => {
+        try {
+          const svc = app?.extensionManager?.workflow;
+          const open = svc?.openWorkflows;
+          if (!Array.isArray(open)) return null; // unknown — refuse to migrate
+          const ids = new Set();
+          for (const candidate of open) {
+            if (candidate === wf) continue; // the tab we are migrating TO
+            const id = workflowTabId(candidate);
+            if (typeof id === "string" && id) ids.add(id);
+          }
+          return ids;
+        } catch {
+          return null;
+        }
+      })();
+      // The decision itself lives in lib/ so it can be tested against the real
+      // function rather than asserted about at source — including the switch case
+      // that made an earlier cut re-attribute one workflow's chats to another.
+      const priorRouteIds = migratableRouteIds({
+        newRouteId: wfid,
+        candidateRouteIds: [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null],
+        openRouteIds: stillOpenRouteIds,
+      });
+
+      // NOTHING IS MIGRATED HERE, and that is the finding rather than an omission.
+      //
+      // Threads stamped before a first save hold an id nothing answers to afterwards,
+      // and both ways of fixing that need to know the old id was THIS tab's past.
+      // The panel cannot prove it: the workflow OBJECT is replaced across the save
+      // (instrumented — the WeakMap that would vouch has nothing under its key by
+      // then), and `openWorkflows` not claiming an id is absence of a competing
+      // claimant, not ownership (codex). Close A, switch to B, and A's conversations
+      // would be attributed to B.
+      //
+      // So `priorRouteIds` is used for ONE thing: knowing that a genuine first save
+      // just happened, which is when an open history pane is showing a stale answer.
+      // No stamp is rewritten and no identity is inferred. #847 stays open for the
+      // rest, with the ownership gap written down rather than guessed at.
+      const savedThisTick = priorRouteIds.size > 0;
+      // A pane that is already open painted the pre-migration answer and will not
+      // repaint itself; nothing else changes its rows.
+      if (savedThisTick) {
+        try {
+          repaintHistoryList?.();
+        } catch {
+          // A stale handle must never break the workflow poll.
+        }
+      }
       if (thread) {
         historyStore.reviseThread(thread, {
           workflowKey: workflowStorageKey(),
@@ -22346,11 +22448,13 @@ function buildPanel() {
       // object's lifetime, and `workflowRecordMatchesSelector` already honours it — this
       // was the one reader that did not.
       const activeWf = activeWorkflowRef();
+      const liveRouteId = workflowTabId();
       const currentWorkflowKeys = currentWorkflowIdentityKeys({
         storageKey: workflowStorageKey(),
-        routeId: workflowTabId(),
+        routeId: liveRouteId,
         priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
       });
+
       const visible = threads
         .filter((candidate) =>
           !currentOnly.checked || threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys))
@@ -22536,6 +22640,9 @@ function buildPanel() {
       picker.click();
     });
     paintList();
+    // Publish the repaint so a migration landing while this pane is open can
+    // correct it (#847).
+    repaintHistoryList = paintList;
 
     const footer = document.createElement("div");
     footer.className = "cmcp-hist-footer";

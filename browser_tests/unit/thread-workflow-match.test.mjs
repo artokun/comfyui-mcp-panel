@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
+  migratableRouteIds,
 } from "../../web/js/lib/thread-workflow-match.js";
 
 /**
@@ -21,6 +22,16 @@ import {
  */
 
 const keys = (...k) => new Set(k);
+
+/** A localStorage stand-in for the store tests below. */
+function memoryStorage() {
+  const map = new Map();
+  return {
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => map.set(k, String(v)),
+    removeItem: (k) => map.delete(k),
+  };
+}
 
 test("the reporter's case: two threads, different uuids, same live canvas — both match", () => {
   const current = keys("workflow:uuid-B", "tmp:live-object-1");
@@ -216,3 +227,127 @@ test("a thread from ANOTHER workflow still does not match", () => {
     false,
   );
 });
+
+// ── #847: what a first SAVE does to history, and what the panel may infer ──
+//
+// The durable half — rewriting the stamps on disk — is deliberately NOT here. It
+// needs positive proof that an old id was this tab's, and the panel does not have
+// it: `openWorkflows` not claiming an id is absence of a competing claimant, not
+// ownership (codex). Close A, switch to B, and A's conversations would migrate to
+// B permanently. Measured that the in-memory match fixes the reported case on its
+// own, so the persisted write buys nothing and risks the one thing this area must
+// never do.
+
+test("codex P0: a switch from unsaved A to saved B migrates NOTHING", () => {
+  // The blocker on the first cut. `tmp:` -> `wf:` is the shape of a first save AND of
+  // a switch from an unsaved workflow A to an already-saved workflow B. Reading the
+  // tracked id as "this tab's pre-save identity" rewrote every one of A's threads to
+  // B's path — permanently attributing one workflow's conversations to another, which
+  // is worse than the bug being fixed.
+  //
+  // A is still OPEN and still answers to `tmp:A`, so it is not this tab's past.
+  const out = migratableRouteIds({
+    newRouteId: "wf:workflows/B.json",
+    candidateRouteIds: ["tmp:A"],
+    openRouteIds: new Set(["tmp:A"]),
+  });
+  assert.deepEqual([...out], [], "A's threads must not follow the switch to B");
+});
+
+test("a genuine first save DOES migrate — the tmp: identity is consumed", () => {
+  // The other side, so the guard above cannot be satisfied by refusing everything.
+  const out = migratableRouteIds({
+    newRouteId: "wf:workflows/Saved.json",
+    candidateRouteIds: ["tmp:this-tab"],
+    openRouteIds: new Set(), // nothing answers to it any more
+  });
+  assert.deepEqual([...out], ["tmp:this-tab"]);
+});
+
+test("an unreadable open list migrates nothing — fail closed", () => {
+  // Migrating on a guess is exactly how the cross-attribution happens, and the
+  // in-memory match still covers the session.
+  for (const openRouteIds of [null, undefined, [], "nope", new Map()]) {
+    const out = migratableRouteIds({
+      newRouteId: "wf:workflows/Saved.json",
+      candidateRouteIds: ["tmp:this-tab"],
+      openRouteIds,
+    });
+    assert.deepEqual([...out], [], `openRouteIds ${String(openRouteIds)} must refuse`);
+  }
+});
+
+test("only a SAVE is a migration, and only an UNSAVED id can be migrated from", () => {
+  const open = new Set();
+  // Not a save: the new id is still unsaved.
+  assert.deepEqual(
+    [...migratableRouteIds({ newRouteId: "tmp:other", candidateRouteIds: ["tmp:a"], openRouteIds: open })],
+    [],
+  );
+  // A `wf:` candidate is a saved workflow's id, never a pre-save identity — a rename
+  // is a different event and must not be swept up here.
+  assert.deepEqual(
+    [...migratableRouteIds({
+      newRouteId: "wf:workflows/New.json",
+      candidateRouteIds: ["wf:workflows/Old.json"],
+      openRouteIds: open,
+    })],
+    [],
+  );
+  // And an id identical to the new one is a no-op, not a migration.
+  assert.deepEqual(
+    [...migratableRouteIds({
+      newRouteId: "wf:workflows/Same.json",
+      candidateRouteIds: ["wf:workflows/Same.json"],
+      openRouteIds: open,
+    })],
+    [],
+  );
+});
+
+test("junk candidates are ignored rather than migrated", () => {
+  const out = migratableRouteIds({
+    newRouteId: "wf:workflows/S.json",
+    candidateRouteIds: [null, undefined, "", 42, {}, "tmp:real"],
+    openRouteIds: new Set(),
+  });
+  assert.deepEqual([...out], ["tmp:real"]);
+});
+
+test("WIRING #847: the panel decides through that function, not its own copy", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const decl = src.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/lib\/thread-workflow-match\.js";/);
+  assert.ok(decl, "the panel must import from the matcher module");
+  assert.ok(
+    decl[1].split(",").map((x) => x.trim()).includes("migratableRouteIds"),
+    "the decision must be bound, not reimplemented",
+  );
+  const site = src.slice(
+    src.indexOf("const stillOpenRouteIds = (() => {"),
+    src.indexOf("let savedThisTick = false;"),
+  );
+  assert.ok(site.includes("migratableRouteIds({"), "…and called at the migration site");
+  assert.ok(site.includes("openRouteIds: stillOpenRouteIds"), "…with the OPEN set it computed");
+  assert.ok(
+    src.includes("if (!Array.isArray(open)) return null; // unknown — refuse to migrate"),
+    "an unreadable open list must produce null, which the function refuses on",
+  );
+});
+
+test("WIRING #847: an open history pane is repainted after a migration", () => {
+  // The list paints once when the pane opens; the migration lands on the 600 ms
+  // workflow poll, and nothing else changes its rows. A pane opened just before a
+  // first save therefore showed the pre-migration answer and never corrected
+  // itself — which is why the spec stayed red through two otherwise-correct fixes,
+  // and why Playwright's auto-retry could not rescue it either.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.ok(src.includes("let repaintHistoryList = null;"), "a module-level handle must exist");
+  assert.ok(src.includes("repaintHistoryList = paintList;"), "the pane must publish its repaint");
+  const site = src.slice(
+    src.indexOf("const savedThisTick = priorRouteIds.size > 0;"),
+    src.indexOf("      if (thread) {"),
+  );
+  assert.ok(site.includes("repaintHistoryList?.()"), "a migration must repaint an open pane");
+  assert.ok(site.includes("try {") && site.includes("} catch {"), "and a stale handle must not break the poll");
+});
+
