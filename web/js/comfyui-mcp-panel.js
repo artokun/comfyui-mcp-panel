@@ -11576,7 +11576,7 @@ const GRAPH_TOOL_EXECUTORS = {
                 // which is the expensive part of the whole proof. It feeds the MESSAGE
                 // only — it decides nothing.
                 const contentDiff = contentMatches
-                  ? { comparable: true, surfaces: [] }
+                  ? { comparable: true, surfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
                 rebindFailed = new Error(
                   describeOpenRebindOutcome(verdict, {
@@ -11588,6 +11588,10 @@ const GRAPH_TOOL_EXECUTORS = {
                     observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
                     contentComparable: contentDiff.comparable,
                     contentSurfaces: contentDiff.surfaces,
+                    // #825 — within the `nodes` surface, whether anything was LOST
+                    // or the frontend merely re-measured the boxes. Same three
+                    // words otherwise, opposite meanings for the reader.
+                    contentNodeDifference: contentDiff.nodeDifference,
                   }),
                 );
               }

@@ -1,0 +1,329 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+
+import {
+  classifyNodeDifference,
+  describeGraphStateDifference,
+  describeOpenRebindOutcome,
+  resolveOpenRebindVerdict,
+  OPEN_REBIND_STATUS,
+} from "../../web/js/lib/graph-binding.js";
+import {
+  activeWorkflowFenceApplies,
+  commandIsCanvasTargetless,
+  commandTargetsActiveWorkflow,
+} from "../../web/js/lib/workflow-chat-identity.js";
+
+// #825 ask 3 — "the graph on the canvas differs from what was loaded on: nodes"
+// was emitted identically for a node that VANISHED and for a node whose box the
+// ComfyUI frontend re-measured on load. A reporter read it after a perfectly good
+// open and was pushed toward redoing work that was never lost.
+//
+// The verdict is deliberately NOT softened (see resolveOpenRebindVerdict): these
+// pin that the DISCLOSURE now separates the two, and that it still refuses to
+// reassure when the node set actually changed.
+
+const node = (id, type, extra = {}) => ({ id, type, pos: [0, 0], size: [100, 50], ...extra });
+const rootOf = (nodes, rest = {}) => ({ serialize: () => ({ nodes, ...rest }) });
+
+// ── classifyNodeDifference ─────────────────────────────────────────────────
+
+test("a re-measured box is the same node set, and cosmetic", () => {
+  const expectedNodes = [node(1, "KSampler"), node(2, "VAEDecode")];
+  const actualNodes = [node(1, "KSampler", { size: [140, 74] }), node(2, "VAEDecode", { size: [90, 40] })];
+  const d = classifyNodeDifference({ expectedNodes, actualNodes });
+  assert.equal(d.comparable, true);
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, true);
+  assert.deepEqual(d.fields, ["size"]);
+});
+
+test("a MISSING node is not the same set — and never reported as cosmetic", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler"), node(2, "VAEDecode")],
+    actualNodes: [node(1, "KSampler")],
+  });
+  assert.equal(d.comparable, true);
+  assert.equal(d.sameNodeSet, false);
+  assert.equal(d.cosmeticOnly, false);
+});
+
+test("an EXTRA node is not the same set", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler")],
+    actualNodes: [node(1, "KSampler"), node(9, "SaveImage")],
+  });
+  assert.equal(d.sameNodeSet, false);
+});
+
+test("an id reused for a DIFFERENT type is a different node, however the count reads", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler")],
+    actualNodes: [node(1, "SaveImage")],
+  });
+  assert.equal(d.comparable, true);
+  assert.equal(d.sameNodeSet, false);
+});
+
+test("a changed WIDGET VALUE is same-set but NOT cosmetic — it is real content", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { widgets_values: [42, "euler"] })],
+    actualNodes: [node(1, "KSampler", { widgets_values: [43, "euler"] })],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, false, "a widget value must never be called cosmetic");
+  assert.deepEqual(d.fields, ["widgets_values"]);
+});
+
+test("cosmetic requires EVERY differing field to be cosmetic", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { widgets_values: [1] })],
+    actualNodes: [node(1, "KSampler", { size: [9, 9], widgets_values: [2] })],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, false);
+  assert.deepEqual(d.fields, ["size", "widgets_values"]);
+});
+
+test("an identical set with no differing field is not 'cosmeticOnly'", () => {
+  // Nothing differed, so there is no cosmetic explanation to offer either.
+  const nodes = [node(1, "KSampler")];
+  const d = classifyNodeDifference({ expectedNodes: nodes, actualNodes: [{ ...nodes[0] }] });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, false);
+  assert.deepEqual(d.fields, []);
+});
+
+test("node order does not make a set differ", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "A"), node(2, "B")],
+    actualNodes: [node(2, "B"), node(1, "A")],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.deepEqual(d.fields, []);
+});
+
+test("unreadable input asserts nothing", () => {
+  for (const args of [
+    {},
+    { expectedNodes: null, actualNodes: [] },
+    { expectedNodes: [], actualNodes: "nope" },
+    { expectedNodes: [null], actualNodes: [node(1, "A")] },
+    { expectedNodes: [7], actualNodes: [node(1, "A")] },
+  ]) {
+    const d = classifyNodeDifference(args);
+    assert.equal(d.comparable, false, JSON.stringify(args));
+    assert.equal(d.sameNodeSet, false);
+    assert.equal(d.cosmeticOnly, false);
+  }
+});
+
+test("duplicate node identities make the set unreadable rather than mispaired", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "A"), node(1, "A")],
+    actualNodes: [node(1, "A"), node(1, "A")],
+  });
+  assert.equal(d.comparable, false);
+});
+
+// ── describeGraphStateDifference plumbing ──────────────────────────────────
+
+test("the node classification rides along ONLY when `nodes` actually differs", () => {
+  const state = { nodes: [node(1, "KSampler")], groups: [{ title: "g" }] };
+  // groups differ, nodes identical -> no node explanation to give
+  const onlyGroups = describeGraphStateDifference({
+    rootGraph: rootOf([node(1, "KSampler")], { groups: [{ title: "OTHER" }] }),
+    state,
+  });
+  assert.equal(onlyGroups.comparable, true);
+  assert.ok(onlyGroups.surfaces.includes("groups"));
+  assert.equal(onlyGroups.surfaces.includes("nodes"), false);
+  assert.equal(onlyGroups.nodeDifference, null, "an all-clear here would read as one about groups");
+
+  const nodesToo = describeGraphStateDifference({
+    rootGraph: rootOf([node(1, "KSampler", { size: [1, 1] })], { groups: [{ title: "g" }] }),
+    state,
+  });
+  assert.ok(nodesToo.surfaces.includes("nodes"));
+  assert.equal(nodesToo.nodeDifference?.cosmeticOnly, true);
+});
+
+test("an uncomparable state carries a null classification, never a false all-clear", () => {
+  const d = describeGraphStateDifference({ rootGraph: { serialize: () => null }, state: { nodes: [] } });
+  assert.equal(d.comparable, false);
+  assert.equal(d.nodeDifference, null);
+});
+
+// ── The sentence the reporter actually reads ───────────────────────────────
+
+const CONTENT_ONLY = resolveOpenRebindVerdict({
+  instanceStillTarget: true,
+  markerMatches: true,
+  identityMatches: true,
+  contentMatches: false,
+});
+
+test("the verdict is NOT softened — only the wording is", () => {
+  assert.equal(CONTENT_ONLY.status, OPEN_REBIND_STATUS.CONTENT_UNVERIFIED);
+  assert.equal(CONTENT_ONLY.bindingProven, true);
+});
+
+test("a re-measured graph says nothing was lost, and drops the data-loss framing", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["size"] },
+  });
+  assert.match(msg, /nothing was lost/i);
+  assert.match(msg, /no missing work to redo/i);
+  assert.match(msg, /size/);
+  assert.doesNotMatch(
+    msg,
+    /the load only\s+partly applied/i,
+    "the panel CAN tell in this case, so it must not say it cannot",
+  );
+});
+
+test("a MISSING node keeps the full warning and says the set itself differs", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: { comparable: true, sameNodeSet: false, cosmeticOnly: false, fields: [] },
+  });
+  assert.match(msg, /the node SET itself differs/);
+  assert.match(msg, /partly applied/i, "a real content loss must keep the unresolved wording");
+  assert.doesNotMatch(msg, /nothing was lost/i);
+});
+
+test("a widget-value difference is same-set but gets no reassurance", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: false,
+      fields: ["widgets_values"],
+    },
+  });
+  assert.match(msg, /no node was lost/i);
+  assert.match(msg, /widget value is real\s+content/i);
+  assert.doesNotMatch(msg, /no missing work to redo/i);
+});
+
+test("a SECOND differing surface blocks the reassurance — nodes explain only nodes", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes", "groups"],
+    contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["size"] },
+  });
+  assert.doesNotMatch(msg, /no missing work to redo/i);
+  assert.match(msg, /partly applied/i);
+});
+
+test("an unreadable node classification changes nothing about the old wording", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [] },
+  });
+  assert.match(msg, /partly applied/i);
+  assert.doesNotMatch(msg, /nothing was lost/i);
+});
+
+test("a canvas the panel could not read is still never called a mismatch", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: false,
+    contentSurfaces: [],
+    contentNodeDifference: null,
+  });
+  assert.match(msg, /could not READ the graph/);
+  assert.doesNotMatch(msg, /does not match/);
+});
+
+// ── #825 ask 2 — regression pin, NOT a new fix ─────────────────────────────
+// The recovery probe was exempted from both target guards by #759 (first shipped
+// in 0.11.45; the reporter was on 0.11.44). The wedge those reports describe is
+// circular — a stale stamp refusing the only read that could refresh it — so if
+// this exemption is ever removed the whole class comes back with no in-protocol
+// exit. Pinned here because #825 asked for it and the answer is "already true".
+
+test("the recovery probe workflow_list is exempt from the uuid fence", () => {
+  assert.equal(commandIsCanvasTargetless("workflow_list"), true);
+  assert.equal(activeWorkflowFenceApplies({ cmd: "workflow_list" }), false);
+  // Even with a stale stamp that mismatches the live canvas, it must still run.
+  assert.equal(
+    commandTargetsActiveWorkflow({
+      cmd: "workflow_list",
+      commandUuid: "stale-uuid",
+      activeUuid: "live-uuid",
+    }),
+    true,
+  );
+  // And with NO stamp at all, which is the other way a rebind arrives.
+  assert.equal(
+    commandTargetsActiveWorkflow({ cmd: "workflow_list", commandUuid: "", activeUuid: "live-uuid" }),
+    true,
+  );
+});
+
+test("the pin guard also skips the recovery probe, or the wedge just moves", () => {
+  const PANEL = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(
+    PANEL,
+    /pinnedPath\.trim\(\) && !commandIsCanvasTargetless\(msg\.cmd\)/,
+    "both guards must consult the same predicate",
+  );
+});
+
+test("an ordinary graph read stays fenced — the exemption is not a hole", () => {
+  assert.equal(activeWorkflowFenceApplies({ cmd: "graph_get_state" }), true);
+  assert.equal(
+    commandTargetsActiveWorkflow({
+      cmd: "graph_get_state",
+      commandUuid: "stale-uuid",
+      activeUuid: "live-uuid",
+    }),
+    false,
+  );
+});
+
+// ── Shipped-source hygiene ─────────────────────────────────────────────────
+
+test("no shipped web/js source carries a stray control character", () => {
+  // Authoring tooling has twice now written a NUL (and once a U+0001) into a
+  // string literal in this repo — inside `${a} ${b}` template interpolations
+  // both times. They parse, they mostly behave, and one made git treat a module
+  // as binary so it had no reviewable diff. Cheap to check across the whole
+  // shipped tree; impossible to spot by eye in review.
+  const root = new URL("../../web/js/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        if (entry !== "vendor") walk(full); // vendor is third-party, not ours to police
+        continue;
+      }
+      if (!entry.endsWith(".js")) continue;
+      const s = readFileSync(full, "utf8");
+      for (let i = 0; i < s.length; i += 1) {
+        const c = s.charCodeAt(i);
+        if (c < 9 || (c > 10 && c < 13) || (c > 13 && c < 32)) {
+          offenders.push(`${full} @${i} = 0x${c.toString(16)}`);
+          break;
+        }
+      }
+    }
+  };
+  walk(root);
+  assert.deepEqual(offenders, []);
+});
