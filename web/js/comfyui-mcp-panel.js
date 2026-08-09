@@ -7460,6 +7460,44 @@ function revalidateGraphMutationContext(captured) {
 // measure how much of the canvas the open sidebar panel overlays.
 let activePanelRoot = null;
 
+/**
+ * #851 — WHICH ComfyUI a reboot reply is about.
+ *
+ * The reply named the ROUTE (`/v2/manager/reboot`) and never the HOST, so a caller
+ * could not tell which server had just gone down. That is not cosmetic: when the
+ * panel is driving a ComfyUI that is NOT the orchestrator's headless COMFYUI_URL, a
+ * confirmation timeout sends the user to `restart_comfyui`, which targets the OTHER
+ * machine and answers "No ComfyUI process found on port 8188" — while the panel had
+ * been operating happily on the live one all along. Nothing in any reply revealed the
+ * two were different.
+ *
+ * The panel is the one component that knows this for certain: it runs INSIDE the
+ * ComfyUI it reboots. `comfyuiUrlForAgent()` is deliberately the SAME value handed to
+ * the orchestrator in `hello`, so the identity a caller compares against its own
+ * target cannot drift from the one it was told to target.
+ *
+ * A plain function, NOT a method on the executors table: dispatch invokes
+ * `executor(msg)` with no receiver, so `this` is undefined in a module and a method
+ * call here would throw instead of rebooting.
+ */
+/**
+ * The same identity, for prose (#851).
+ *
+ * `target` is for a caller comparing hosts; these strings are what a HUMAN reads,
+ * and "could not reach any reboot endpoint" that cannot say WHICH server it failed
+ * to reach is the reported failure in miniature. Appends nothing when the target is
+ * unknown, rather than naming a blank one.
+ */
+function rebootTargetLabel(prefix) {
+  const target = comfyuiUrlForAgent();
+  return target ? prefix + " on " + target : prefix;
+}
+
+function rebootTargetFields() {
+  const target = comfyuiUrlForAgent();
+  return target ? { target } : {};
+}
+
 const GRAPH_TOOL_EXECUTORS = {
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
   // appeared server-side AFTER page-load — an upload_image action:"stage" input, a freshly
@@ -14244,6 +14282,8 @@ const GRAPH_TOOL_EXECUTORS = {
     return { status };
   },
 
+  // #851 — every branch below names the TARGET as well as the route, via
+  // `rebootTargetFields()`. See that function for why the host matters.
   async comfy_reboot({ force } = {}) {
     // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
     // orchestrator go down briefly; the panel auto-reconnects + resumes after.
@@ -14260,6 +14300,7 @@ const GRAPH_TOOL_EXECUTORS = {
           return {
             rebooting: false,
             blocked_busy: true,
+            ...rebootTargetFields(),
             queue_running: running,
             queue_pending: pending,
             message:
@@ -14307,12 +14348,14 @@ const GRAPH_TOOL_EXECUTORS = {
     for (const { route, method } of candidates) {
       try {
         const res = await api.fetchApi(route, { method });
-        if (res && res.ok) return { rebooting: true, endpoint: route, method };
+        if (res && res.ok) return { rebooting: true, endpoint: route, method, ...rebootTargetFields() };
         if (res && res.status === 403) {
           return {
             rebooting: false,
+            ...rebootTargetFields(),
             error:
-              "ComfyUI-Manager refused the reboot (HTTP 403): rebooting requires the Manager " +
+              rebootTargetLabel("ComfyUI-Manager refused the reboot (HTTP 403)") +
+              ": rebooting requires the Manager " +
               "security level to be 'middle' or below. Ask the user to lower it in ComfyUI-Manager " +
               "settings, then retry. ComfyUI was NOT restarted.",
           };
@@ -14328,6 +14371,7 @@ const GRAPH_TOOL_EXECUTORS = {
             rebooting: true,
             endpoint: route,
             method,
+            ...rebootTargetFields(),
             note: `proxy returned ${res.status} (origin going down) — reboot initiated`,
           };
         }
@@ -14339,14 +14383,17 @@ const GRAPH_TOOL_EXECUTORS = {
           rebooting: true,
           endpoint: route,
           method,
+          ...rebootTargetFields(),
           note: "connection dropped (server going down) — reboot initiated",
         };
       }
     }
     return {
       rebooting: false,
+      ...rebootTargetFields(),
       error:
-        "Could not reach any ComfyUI-Manager reboot endpoint — ComfyUI was NOT restarted " +
+        rebootTargetLabel("Could not reach any ComfyUI-Manager reboot endpoint") +
+        " — ComfyUI was NOT restarted " +
         "(is the built-in Manager enabled?). Tried: " +
         errors.join("; "),
     };
