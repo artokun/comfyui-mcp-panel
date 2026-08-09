@@ -526,6 +526,9 @@ function graphUpdateDeps(overrides) {
     isManagerUnreachable,
     isManagerRouteMissing,
     dialectRetryTarget,
+    // #367 — the panel records a dialect the LIVE backend demonstrated by completing an
+    // enqueue on it. Harmless here; asserted directly in its own test below.
+    noteManagerDialectDowngrade: () => {},
     reProbeManagerDialect: async () => "v2",
     waitForUpdateResult: async () => ({
       item: { ui_id: "u-1", status: { status_str: "success", completed: true, messages: [] } },
@@ -664,6 +667,11 @@ test("#605: graph_update_node legacy-on-legacy unreachable surfaces the original
 });
 
 test("#424: a 405 on the /v2 envelope still lands on the legacy self-update route (via marker)", async () => {
+  // #367 reordered the ladder to v2 → v2-batch → legacy. The legacy landing this test
+  // exists for is unchanged; it is now reached after the batch route is TRIED, because a
+  // 405 on `queue/task` makes v2-batch the candidate worth one POST on a backend whose
+  // /v2 routes answer. It is only a candidate: here managerV2 405s every route, so the
+  // batch rung is refused too, legacy wins, and nothing is cached.
   const calls = [];
   const update = buildGraphUpdateNode(
     graphUpdateDeps({
@@ -686,6 +694,7 @@ test("#424: a 405 on the /v2 envelope still lands on the legacy self-update rout
     calls,
     [
       ["v2", "manager/queue/task"], // method-rejected — nothing landed
+      ["v2", "manager/queue/batch"], // #367 rung: also method-rejected here
       ["legacy", "manager/queue/update"],
       ["legacy", "manager/queue/start"],
     ],
@@ -721,12 +730,129 @@ test("codex r2: a route-404 from the 405-fallback's legacy POST heals through th
     calls,
     [
       ["v2", "manager/queue/task"], // 405 — nothing landed
+      ["v2", "manager/queue/batch"], // #367 rung — 405 too on this build
       ["legacy", "manager/queue/update"], // 404 after the restart — nothing landed
       ["v2", "manager/queue/task"], // healed re-enqueue on the live v4
       ["v2", "manager/queue/start"],
     ],
     "exactly one update lands, on the live dialect",
   );
+});
+
+test("#367: a v4 that 405s queue/task updates through BATCH, not legacy", async () => {
+  // The reported backend: built-in Manager v4 whose /v2 GETs (installed/list/status)
+  // all answer, but POST /v2/manager/queue/task returns 405. Detection reads
+  // /v2/manager/is_legacy_manager_ui to split v2 from v2-batch, and this build does not
+  // report a legacy UI — so it is classified "v2" and every attempt re-POSTs the one
+  // route it refuses. Update was unusable with a working batch route sitting unused.
+  const calls = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        return {}; // batch and start are served
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        throw routeMissing(); // a pip v4 does not serve the un-prefixed 3.x routes
+      },
+    }),
+  );
+  const res = await update({ id: "ComfyUI-LTXVideo", version: "nightly" });
+  assert.equal(res.queued, true, "the update must be queued instead of erroring");
+  assert.equal(res.dialect, "v2-batch", "and name the dialect it actually used");
+  assert.equal(res.via, undefined, "this is not a legacy self-update");
+  // Honest, and unchanged by this fix: the batch dialect exposes no per-task result,
+  // so the outcome cannot be auto-verified. Queued-and-pending is the correct answer
+  // for this backend — the bug was that it returned HTTP 405 instead of an answer.
+  assert.equal(res.pending, true, "a batch update reports honest pending");
+  assert.equal(res.verified, false);
+  assert.deepEqual(
+    calls,
+    [
+      ["v2", "manager/queue/task"], // 405 — method-rejected, nothing landed
+      ["v2", "manager/queue/batch"], // the rung #367 adds
+      ["v2", "manager/queue/start"],
+    ],
+    "it must never reach the legacy routes a pip v4 does not serve",
+  );
+});
+
+test("#367: a dialect that WORKED is recorded so the refused route is not re-POSTed", async () => {
+  // Detection got it wrong from the probe. What corrects it is not the 405 — that is
+  // only a candidate — but the batch enqueue LANDING, which is what this fixture does.
+  // Without recording that, every later call pays the refused POST again, which is what
+  // "the tool immediately errors" looked like.
+  const noted = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        return {};
+      },
+    }),
+  );
+  await update({ id: "ComfyUI-LTXVideo" });
+  assert.deepEqual(noted, ["v2-batch"], "a batch enqueue that LANDED must update the cached dialect");
+});
+
+test("#367: a build that refuses BOTH /v2 mutations caches nothing and lands on legacy", async () => {
+  // The case that makes the cache write dangerous (codex): `queue/task` 405s, and so
+  // does `batch`. Recording v2-batch on the first 405 would leave this backend — which
+  // updates FINE on legacy — permanently cached at a route it refuses, re-paying that
+  // POST on every later call. The heal only runs on a route-MISSING verdict, not a 405,
+  // so nothing would clear it.
+  const noted = [];
+  const calls = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        throw new Error(`Manager ${route}: HTTP 405`);
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        return {};
+      },
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.dialect, "legacy", "legacy is where this backend actually works");
+  assert.deepEqual(noted, [], "a dialect that never worked must not be cached");
+  assert.deepEqual(calls, [
+    ["v2", "manager/queue/task"],
+    ["v2", "manager/queue/batch"],
+    ["legacy", "manager/queue/update"],
+    ["legacy", "manager/queue/start"],
+  ]);
+});
+
+test("#367: task 405 then batch 404 heals through the ladder rather than caching", async () => {
+  // A 404 on batch is a route-level rejection, not a method one, so it takes the
+  // existing re-probe ladder instead of the legacy rung. Either way nothing is cached
+  // from a route that never ran an enqueue.
+  const noted = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      reProbeManagerDialect: async () => "legacy",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        throw routeMissing();
+      },
+      managerCall: async () => ({}),
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.dialect, "legacy");
+  assert.deepEqual(noted, [], "an enqueue that never landed must not be cached");
 });
 
 // ---------------------------------------------------------------------------

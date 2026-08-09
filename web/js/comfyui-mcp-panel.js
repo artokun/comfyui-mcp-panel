@@ -84,6 +84,7 @@ import {
   isManagerRouteMissing,
   isManagerUnreachable,
   isMethodNotAllowed,
+  assertBatchOk,
   legacyUpdateBody,
   parseTaskHistoryItem,
   queueDrained,
@@ -4439,6 +4440,28 @@ function invalidateManagerDialectCache() {
   managerDialectCache = null;
 }
 
+/**
+ * Record a dialect the LIVE backend has DEMONSTRATED by completing an enqueue on it
+ * (#367).
+ *
+ * Detection picks `v2` vs `v2-batch` from `/v2/manager/is_legacy_manager_ui`, and a
+ * build that 405s `queue/task` without reporting a legacy UI is classified `v2` — so
+ * every later call re-POSTs the same refused route.
+ *
+ * A 405 on that route is only a CANDIDATE signal, never the proof (codex). It says the
+ * task route refuses this method; it says nothing about whether `batch` is served, and
+ * a generic frontend catchall can refuse both. Caching on the 405 would leave a backend
+ * that refuses BOTH — and updates fine on legacy — pinned to a route it will never
+ * accept, with nothing to clear it: the heal runs on a route-MISSING verdict, not a
+ * method rejection.
+ *
+ * So this is called only where an enqueue actually landed. It does not invalidate: the
+ * answer is now known, and clearing would just re-run the probe that got it wrong.
+ */
+function noteManagerDialectDowngrade(dialect) {
+  managerDialectCache = dialect;
+}
+
 /** #605 — drop the cached dialect and re-probe the LIVE backend once. Returns
  *  the fresh dialect, or null when the Manager currently answers no dialect at
  *  all (mid-restart / disabled) — the caller then surfaces its ORIGINAL error,
@@ -4656,20 +4679,6 @@ async function managerQueueControl(call, route, { signal } = {}) {
     // (not ComfyUI's frontend catchall, which only serves UNREGISTERED GETs).
     if (!isMethodNotAllowed(err)) throw err;
     await call(route, { signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]) });
-  }
-}
-
-/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
- *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
- *  silent success on a failed op is exactly the #184 no-op bug. */
-function assertBatchOk(res, id, op) {
-  const failed = Array.isArray(res?.failed) ? res.failed : [];
-  if (failed.length && (id === undefined || failed.includes(id))) {
-    throw new Error(
-      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
-        "(check the ComfyUI server log for the underlying error — security_level " +
-        "gating is a common cause). The pack was NOT installed.",
-    );
   }
 }
 
@@ -14499,11 +14508,35 @@ const GRAPH_TOOL_EXECUTORS = {
           enqueued = true;
           await managerV2("manager/queue/start", { method: "POST" });
         } catch (err) {
-          // The 405 legacy self-update fallback wraps ONLY the enqueue: once the
-          // task POST landed, a legacyUpdate would queue a SECOND update.
+          // The 405 fallback wraps ONLY the enqueue: once the task POST landed, a
+          // retry on another dialect would queue a SECOND update.
+          //
+          // #367 — a 405 HERE tries v2-batch before legacy. It is a CANDIDATE, not a
+          // verdict (codex): `queue/task` 405ing is the SHAPE this file has described
+          // as v2-batch since #187/#182/#184 ("POST /v2/manager/queue/task 405s
+          // (frontend catchall). Mutations go through POST /v2/manager/queue/batch"),
+          // and the backend that produced it is a pip v4 whose /v2 GETs all answer — so
+          // the legacy routes, which carry no /v2 prefix, are the one thing it is LEAST
+          // likely to serve. But a generic catchall can refuse batch too, which is why
+          // this costs one POST, keeps the legacy rung behind it, and caches nothing.
+          // The reporter's Manager v4 405'd here and the legacy fallback failed too,
+          // leaving update unusable with a fully working batch route sitting unused.
+          //
+          // The legacy rung is not lost, it is reordered behind this one: the v2-batch
+          // branch below falls to legacy on its own 405, so the ladder is
+          // v2 → v2-batch → legacy, each TRANSITION triggered only by a method rejection
+          // (the rejection is proven; what it proves is that THIS route refuses, never
+          // that the next dialect works — that is settled by the next enqueue landing).
+          // Monotonic, so it cannot cycle. #424's eventual legacy landing still
+          // happens for a backend that really is legacy — it just gets there second.
           if (!enqueued && isMethodNotAllowed(err)) {
-            methodRejected = true;
-            dialect = "legacy";
+            // NOTHING is cached here (codex): a 405 proves only that `queue/task` was
+            // refused, never that `batch` is usable. Recording it before the batch POST
+            // lands would leave a build that refuses BOTH — and updates fine on legacy —
+            // permanently cached as v2-batch, re-paying the refused batch POST on every
+            // later call, and the heal only runs on a route-MISSING verdict, not a 405.
+            // The cache is written below, once batch actually works.
+            dialect = "v2-batch";
             continue;
           }
           // codex P0: the heal retries ONLY a PROVEN route-level rejection (the
@@ -14529,6 +14562,11 @@ const GRAPH_TOOL_EXECUTORS = {
           });
           enqueued = true;
           assertBatchOk(res, id, "update");
+          // #367 — PROVEN, so record it. Detection reads /v2/manager/is_legacy_manager_ui
+          // and a build that refuses `queue/task` without reporting a legacy UI is
+          // classified `v2`, so every later call re-POSTs the refused route. This says
+          // what the backend just demonstrated: batch is the route that works here.
+          noteManagerDialectDowngrade("v2-batch");
           await managerV2("manager/queue/start", { method: "POST" });
         } catch (err) {
           // The 405 legacy self-update fallback wraps ONLY the enqueue (as above).
