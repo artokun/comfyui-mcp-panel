@@ -53,8 +53,11 @@ test("#832 renderA2UICard can be given an id instead of always minting one", () 
     /export function renderA2UICard\(spec, \{ onAction, onDismiss, cardId: reuseId \} = \{\}\)/,
     "the renderer accepts a caller-supplied id",
   );
-  // Minting remains the DEFAULT, so every ordinary render is unchanged.
-  assert.match(a2uiSrc, /: `a2ui-\$\{Date\.now\(\)\.toString\(36\)\}-\$\{\+\+_cardSeq\}`/);
+  // Minting remains the DEFAULT, so every ordinary render is unchanged — and it now
+  // carries a random nonce. `_cardSeq` restarts at 0 on module load and a REUSED id does
+  // not advance it, so Date.now()+counter alone could mint an id equal to one a repaint
+  // had already registered, silently overwriting that map entry (codex review finding).
+  assert.match(a2uiSrc, /a2ui-\$\{Date\.now\(\)\.toString\(36\)\}-\$\{\+\+_cardSeq\}-\$\{Math\.random\(\)/);
   assert.match(
     a2uiSrc,
     /typeof reuseId === "string" && reuseId\s*\?\s*reuseId/,
