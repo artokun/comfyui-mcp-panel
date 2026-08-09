@@ -779,11 +779,11 @@ test("#367: a v4 that 405s queue/task updates through BATCH, not legacy", async 
   );
 });
 
-test("#367: the proven dialect is recorded so the dead route is not re-POSTed", async () => {
-  // Detection got it wrong from the probe; the 405 is stronger evidence than the probe,
-  // because it proves the route is REGISTERED and refuses this method — which is exactly
-  // what separates the two pip dialects. Without recording it, every later call pays the
-  // failed POST again, which is what "the tool immediately errors" looked like.
+test("#367: a dialect that WORKED is recorded so the refused route is not re-POSTed", async () => {
+  // Detection got it wrong from the probe. What corrects it is not the 405 — that is
+  // only a candidate — but the batch enqueue LANDING, which is what this fixture does.
+  // Without recording that, every later call pays the refused POST again, which is what
+  // "the tool immediately errors" looked like.
   const noted = [];
   const update = buildGraphUpdateNode(
     graphUpdateDeps({
@@ -796,7 +796,7 @@ test("#367: the proven dialect is recorded so the dead route is not re-POSTed", 
     }),
   );
   await update({ id: "ComfyUI-LTXVideo" });
-  assert.deepEqual(noted, ["v2-batch"], "the method rejection must update the cached dialect");
+  assert.deepEqual(noted, ["v2-batch"], "a batch enqueue that LANDED must update the cached dialect");
 });
 
 test("#367: a build that refuses BOTH /v2 mutations caches nothing and lands on legacy", async () => {

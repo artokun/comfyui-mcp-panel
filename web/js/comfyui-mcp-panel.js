@@ -4441,19 +4441,22 @@ function invalidateManagerDialectCache() {
 }
 
 /**
- * Record a dialect the LIVE backend just proved, by rejecting the method the cached
- * dialect routes to (#367).
+ * Record a dialect the LIVE backend has DEMONSTRATED by completing an enqueue on it
+ * (#367).
  *
  * Detection picks `v2` vs `v2-batch` from `/v2/manager/is_legacy_manager_ui`, and a
  * build that 405s `queue/task` without reporting a legacy UI is classified `v2` — so
- * every later call re-POSTs the same dead route and 405s again. A 405 is not an
- * ambiguous failure: it means the route is REGISTERED and refuses this method, which
- * is exactly what separates the two pip dialects. So it is stronger evidence than the
- * probe that produced the cache, and it replaces it.
+ * every later call re-POSTs the same refused route.
  *
- * Only ever called after a method rejection on a route the cached dialect chose. It
- * does not invalidate: the answer is known, and clearing would just make the next call
- * re-run the probe that got it wrong.
+ * A 405 on that route is only a CANDIDATE signal, never the proof (codex). It says the
+ * task route refuses this method; it says nothing about whether `batch` is served, and
+ * a generic frontend catchall can refuse both. Caching on the 405 would leave a backend
+ * that refuses BOTH — and updates fine on legacy — pinned to a route it will never
+ * accept, with nothing to clear it: the heal runs on a route-MISSING verdict, not a
+ * method rejection.
+ *
+ * So this is called only where an enqueue actually landed. It does not invalidate: the
+ * answer is now known, and clearing would just re-run the probe that got it wrong.
  */
 function noteManagerDialectDowngrade(dialect) {
   managerDialectCache = dialect;
@@ -14508,11 +14511,14 @@ const GRAPH_TOOL_EXECUTORS = {
           // The 405 fallback wraps ONLY the enqueue: once the task POST landed, a
           // retry on another dialect would queue a SECOND update.
           //
-          // #367 — a 405 HERE goes to v2-batch, not straight to legacy. A 405 on
-          // `queue/task` is the DEFINITION of the v2-batch dialect ("POST
-          // /v2/manager/queue/task 405s (frontend catchall)"), and the backend that
-          // produced it is a pip v4 whose /v2 GETs all answer — so the legacy routes,
-          // which carry no /v2 prefix, are the one thing it is LEAST likely to serve.
+          // #367 — a 405 HERE tries v2-batch before legacy. It is a CANDIDATE, not a
+          // verdict (codex): `queue/task` 405ing is the SHAPE this file has described
+          // as v2-batch since #187/#182/#184 ("POST /v2/manager/queue/task 405s
+          // (frontend catchall). Mutations go through POST /v2/manager/queue/batch"),
+          // and the backend that produced it is a pip v4 whose /v2 GETs all answer — so
+          // the legacy routes, which carry no /v2 prefix, are the one thing it is LEAST
+          // likely to serve. But a generic catchall can refuse batch too, which is why
+          // this costs one POST, keeps the legacy rung behind it, and caches nothing.
           // The reporter's Manager v4 405'd here and the legacy fallback failed too,
           // leaving update unusable with a fully working batch route sitting unused.
           //
