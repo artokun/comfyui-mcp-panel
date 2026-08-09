@@ -8769,13 +8769,26 @@ const GRAPH_TOOL_EXECUTORS = {
     // createNode would build the OLD shape — a new link input would not even
     // get a slot and the node could never validate. Refuse before creating
     // anything, with the remedy that actually updates the schema.
+    //
+    // #852 — and that remedy is panel_refresh_nodes, not a tab reload. This text
+    // named the reload alone, so a user whose loader options had merely drifted
+    // (a model file moved between folders) was told to throw away their canvas
+    // state for a condition the panel can clear in place: refresh_nodes re-fetches
+    // /object_info and calls registerNodesFromDefs, which is precisely what updates
+    // the nodeData this check reads. Same class of defect as #663 — a refusal that
+    // sends the caller to the wrong recovery costs more than the refusal itself.
     const drifted = driftedRequiredInputNames(currentDef, nodeData);
     if (drifted.length) {
       throw new Error(
         `"${class_type}" required input${drifted.length === 1 ? "" : "s"} ` +
           `${drifted.map((name) => `"${name}"`).join(", ")} ${drifted.length === 1 ? "was" : "were"} ` +
-          "added or retyped since this page loaded its node schema. Reload the ComfyUI tab so " +
-          "the frontend picks up the updated node definition, then retry.",
+          "added or retyped since this page loaded its node schema, so creating it now would " +
+          "build the OLD shape. Call panel_refresh_nodes and retry — it re-fetches /object_info " +
+          "and re-registers the class in place, which is exactly what this refusal is waiting " +
+          "for, and it costs you no canvas state. Reloading the ComfyUI tab also works and is " +
+          "the fallback if the refresh reports it did not complete. NOTE: the refresh updates " +
+          "the CLASS, so the node you add next is correct; nodes ALREADY on the canvas keep the " +
+          "shape they were created with.",
       );
     }
     // Socket proof comes from the SAME fresh defs — NOT the LiteGraph
