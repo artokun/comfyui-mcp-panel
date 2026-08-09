@@ -15,18 +15,18 @@
  * #640 replaced the route with `wf:<tabRouteId>:<path>`, composing the tab's own
  * established identity in front of the path, and `savedWorkflowRoute` REFUSES (returns
  * null) rather than falling back to the bare path — the fallback being the collision
- * itself. The composition is unit-tested, but nothing checked what a real panel
- * actually PUTS ON THE WIRE, which is where the reported collision was observed.
+ * itself. The composition is unit-tested, but nothing exercised the property that
+ * actually matters through two real pages, real Web Locks, and real wire serialisation.
  *
- * So this asserts the wire form directly: on a saved workflow the hello must carry the
- * composed route and must never be the bare file handle. A tab-specific route cannot
- * collide with another tab's by construction, so pinning the form is what pins the
- * property — and it fails on any change that reintroduces a file-derived route,
- * including a "helpful" fallback when the tab identity is not yet established.
+ * So this opens the same saved workflow in TWO pages and asserts their routes DIFFER.
+ * Asserting the wire FORM alone would not do: an implementation that emitted
+ * `wf:<one-shared-id>:<path>` for every tab matches the form and recreates #693 exactly
+ * (codex). Uniqueness is the invariant; the form is only how it is carried.
  */
 import { test, expect } from './fixtures/panelTest'
+import { PanelPage } from './fixtures/PanelPage'
 
-/** Record the `tab_id` of every hello this page sends. */
+/** Record the `tab_id` of every hello this page sends, from before it connects. */
 async function captureHellos(page: import('@playwright/test').Page) {
   await page.addInitScript(() => {
     const w = window as any
@@ -50,41 +50,83 @@ async function captureHellos(page: import('@playwright/test').Page) {
   })
 }
 
-test('a saved workflow never routes on its file path', async ({ page, panel, mockBridge }) => {
+/** Open an already-saved workflow by path, the way switching to its tab would. */
+async function openSavedWorkflow(page: import('@playwright/test').Page, path: string) {
+  return page.evaluate(async (p) => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    const store = app?.extensionManager?.workflow
+    const wf = (store?.workflows || []).find((x: any) => x?.path === p)
+    if (!wf) return { opened: false, reason: 'not in store' }
+    await store.openWorkflow(wf)
+    return { opened: true, active: store?.activeWorkflow?.path ?? null }
+  }, path)
+}
+
+const savedHellos = (ids: string[]) => ids.filter((id) => id.startsWith('wf:'))
+
+test('two tabs on one saved workflow never share a bridge route', async ({
+  page,
+  panel,
+  mockBridge,
+  context
+}) => {
   await captureHellos(page)
   await panel.goto()
   await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
   await panel.connect()
 
-  // Give tab A a SAVED workflow. The collision is specific to saved workflows: an
-  // unsaved tab already routes on a per-object `tmp:<uuid>`, so it could never collide
-  // and would make this pass for the wrong reason.
+  // A SAVED workflow specifically. An unsaved tab routes on a per-object `tmp:<uuid>`
+  // and could never collide, so using one would pass for the wrong reason.
   const saved = await mockBridge.command('workflow_save', {})
   expect(saved.ok, 'the workflow must save so both tabs share a FILE').toBe(true)
   const savedName = String(saved.result?.workflow || '')
   expect(savedName, 'the save must report a name').toBeTruthy()
-
-  // Re-hello on the SAVED workflow, then read what went on the wire.
+  const savedPath = `workflows/${savedName}.json`
   await page.waitForTimeout(2500)
-  const hellos: string[] = await page.evaluate(() => (window as any).__hellos ?? [])
-  expect(hellos.length, 'the panel must have helloed').toBeGreaterThan(0)
 
-  const bareHandle = `wf:workflows/${savedName}.json`
-  const saved_hellos = hellos.filter((id) => id.startsWith('wf:'))
-  expect(
-    saved_hellos.length,
-    `the saved workflow must produce a wf: route (got ${JSON.stringify(hellos)})`
-  ).toBeGreaterThan(0)
+  // Tab B: a second real browser tab in the same context, opening that same file.
+  const pageB = await context.newPage()
+  await captureHellos(pageB)
+  await pageB.route('**/comfyui_mcp_panel/status*', (r) => r.fulfill({ json: { running: false } }))
+  await pageB.route('**/comfyui_mcp_panel/backends*', (r) => r.fulfill({ json: { backends: [] } }))
+  const panelB = new PanelPage(pageB)
+  await panelB.goto()
+  await panelB.setBridgeUrl(mockBridge.url)
+  await panelB.openSidebar()
+  await panelB.connect()
 
-  for (const id of saved_hellos) {
-    // The bare handle names the FILE, so every browser tab showing it produces the
-    // same string. That is the collision, and it must never reach the wire.
-    expect(id, 'a route must never be the bare file handle').not.toBe(bareHandle)
-    // The composed form is `wf:<tabRouteId>:<path>` — the tab's own identity in
-    // front of the path, which is what makes two tabs on one file route separately.
-    expect(id, 'the route must compose the tab identity in front of the path').toMatch(
-      /^wf:[^:]+:workflows\//
-    )
+  const openedB = await openSavedWorkflow(pageB, savedPath)
+  expect(openedB.opened, `tab B must open ${savedPath}`).toBe(true)
+  await pageB.waitForTimeout(3000)
+
+  const hellosA = savedHellos(await page.evaluate(() => (window as any).__hellos ?? []))
+  const hellosB = savedHellos(await pageB.evaluate(() => (window as any).__hellos ?? []))
+  expect(hellosA.length, 'tab A must have helloed on the saved workflow').toBeGreaterThan(0)
+  expect(hellosB.length, 'tab B must have helloed on the saved workflow').toBeGreaterThan(0)
+
+  // Both must be routing for the SAME file, or they were never in a position to
+  // collide and this proves nothing.
+  expect(hellosA.some((id) => id.endsWith(`:${savedPath}`)), 'tab A must route for the saved file').toBe(true)
+  expect(hellosB.some((id) => id.endsWith(`:${savedPath}`)), 'tab B must route for the saved file').toBe(true)
+
+  // The bare handle names the FILE, so every tab showing it produces the same string.
+  for (const [label, ids] of [['A', hellosA], ['B', hellosB]] as const) {
+    for (const id of ids) {
+      expect(id, `tab ${label} must not route on the bare file handle`).not.toBe(`wf:${savedPath}`)
+    }
   }
+
+  // THE INVARIANT: no route may be shared. This is what the bridge keys on, and a
+  // shared value is what makes two clients evict each other forever.
+  const shared = hellosA.filter((id) => hellosB.includes(id))
+  expect(
+    shared,
+    `both tabs helloed with the same route — the bridge keeps one connection per ` +
+      `tab_id, so these two would close each other's sockets indefinitely ` +
+      `(A=${JSON.stringify(hellosA)} B=${JSON.stringify(hellosB)})`
+  ).toEqual([])
+
+  await pageB.close()
 })
