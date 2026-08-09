@@ -34,7 +34,21 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
+  // #847 — BOUND, not `undefined`. Playwright's default is roughly half the cores,
+  // which on a 16-worker machine puts sixteen browsers through ONE ComfyUI and one
+  // origin's storage. Measured on the same suite, same machine, back to back:
+  //
+  //     16 workers (the default here) ...  3 of 49 passed, 2.1 min
+  //      2 workers ....................... 48 of 49 passed, 2.1 min
+  //
+  // The parallelism costs 45 specs and buys no wall-clock at all — the run is
+  // bounded by ComfyUI, not by the browsers. Worse, it cost the suite its meaning:
+  // anyone running `npm run test:e2e` locally met a wall of red and learned to
+  // ignore it, which is how a genuine regression gets waved through.
+  //
+  // Two rather than one because the difference is not measurable here and a single
+  // worker has no headroom if a spec hangs. 4 was also tried: 2-4 specs fail.
+  workers: process.env.CI ? 1 : 2,
   reporter: 'html',
   timeout: 30_000,
   expect: { timeout: 10_000 },
