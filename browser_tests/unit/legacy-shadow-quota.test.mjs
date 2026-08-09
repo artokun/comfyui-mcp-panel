@@ -25,7 +25,7 @@ import {
 // ── a fake IndexedDB, because the failure lives in the durable path ────────
 
 function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } = {}) {
-  const state = { failWrites };
+  const state = { failWrites, failStore: null };
   const stores = new Map([["snapshots", new Map()]]);
   if (!missingLegacyStore) stores.set(CHAT_HISTORY_LEGACY_STORE, new Map());
   const db = {
@@ -37,7 +37,7 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
       const tx = { oncomplete: null, onerror: null, onabort: null };
       const settle = () => {
         queueMicrotask(() => {
-          if (state.failWrites && mode === "readwrite") tx.onabort?.();
+          if ((state.failWrites || state.failStore === name) && mode === "readwrite") tx.onabort?.();
           else tx.oncomplete?.();
         });
       };
@@ -53,21 +53,21 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
           return req;
         },
         delete(key) {
-          if (!state.failWrites) data.delete(key);
+          if (!state.failWrites && state.failStore !== name) data.delete(key);
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
           return req;
         },
         clear() {
-          if (!state.failWrites) data.clear();
+          if (!state.failWrites && state.failStore !== name) data.clear();
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
           return req;
         },
         put(value, key) {
-          if (!state.failWrites) data.set(key, value);
+          if (!state.failWrites && state.failStore !== name) data.set(key, value);
           const req = {};
           queueMicrotask(() => req.onsuccess?.());
           settle();
@@ -515,4 +515,145 @@ test("an edit whose durable rewrite FAILS leaves the thread unevictable", async 
   const kept = (written.threads || []).find((t) => t.id === "L0");
   assert.ok(kept, "the edited thread must stay in the shadow — its durable copy is stale");
   assert.equal(kept.msgs[0].text.length, 900, "…and it must be the EDITED version that stayed");
+});
+
+// ── codex round 2 ──────────────────────────────────────────────────────────
+
+test('a same-length, same-timestamp edit ("foo" -> "bar") is still detected', async () => {
+  // The exact collision codex named. updatedAt + message count + serialized length
+  // are all identical across this edit, so the earlier fingerprint passed it as
+  // unchanged and the shadow would evict the new text against the old copy. For a
+  // durability gate "probably unchanged" is not a category.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const before = { ...legacyThread("L0", 7), msgs: [{ id: "m", role: "user", text: "foo" }] };
+  store.persist([before], {});
+  await store._writePromise;
+  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0").msgs[0].text, "foo");
+
+  const after = { ...before, msgs: [{ id: "m", role: "user", text: "bar" }] };
+  assert.equal(JSON.stringify(before).length, JSON.stringify(after).length, "precondition: same length");
+  assert.equal(before.updatedAt, after.updatedAt, "precondition: same timestamp");
+  store.persist([after], {});
+  await store._writePromise;
+  assert.equal(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("L0").msgs[0].text,
+    "bar",
+    "the durable copy must follow a same-size edit",
+  );
+});
+
+test("a tombstone deletes ONLY its own record, never a neighbour's", async () => {
+  // The guard's real job. `mergeHistorySnapshots` already resolves tombstone-vs-live
+  // before this pass runs — a tombstoned id is dropped from the snapshot, so it is
+  // never simultaneously "live" here — which makes the id-not-in-liveIds check
+  // defence in depth rather than the primary decision. What must hold regardless is
+  // that a delete driven by one tombstone cannot reach past it.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2), legacyThread("L2", 3)], {});
+  await store._writePromise;
+  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 3);
+
+  store.persist([legacyThread("L0", 1), legacyThread("L2", 3)], {
+    deletedThreads: { L1: { updatedAt: 500, writerId: "t", sequence: 1 } },
+  });
+  await store._writePromise;
+  const keys = [...indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).keys()].sort();
+  assert.deepEqual(keys, ["L0", "L2"], "only the tombstoned record may go");
+});
+
+test("the delete pass skips any id still present as a live thread", async () => {
+  // The guard itself, exercised directly: ids can be reused and a tombstone can lose
+  // a causal merge, and deleting by id alone would take the live record with it.
+  // Driven through _restoreLegacyShadow-independent state so the merge cannot quietly
+  // resolve the conflict first.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  await store._writePromise;
+  store._pendingLegacyDeletes.add("L0"); // a delete that never landed
+  // …but L0 is live again in this write.
+  store.persist([legacyThread("L0", 90)], {});
+  await store._writePromise;
+  assert.ok(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    "a live thread's record must survive an outstanding delete for the same id",
+  );
+});
+
+test("a FAILED delete is retried, even after its tombstone ages out", async () => {
+  // meta.deletedThreads is capped, so a tombstone expires. A delete that failed while
+  // its tombstone was live would otherwise stop being retried and the record would be
+  // restored on the next load.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1), legacyThread("L1", 2)], {});
+  await store._writePromise;
+
+  indexedDb._state.failWrites = true;
+  store.persist([legacyThread("L1", 2)], {
+    deletedThreads: { L0: { updatedAt: 5, writerId: "t", sequence: 1 } },
+  });
+  await store._writePromise;
+  assert.ok(store._pendingLegacyDeletes.has("L0"), "a failed delete must be remembered");
+  assert.ok(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"), "precondition: still there");
+
+  // The tombstone is GONE from meta now — aged out of the capped map.
+  indexedDb._state.failWrites = false;
+  store.persist([legacyThread("L1", 2)], {});
+  await store._writePromise;
+  assert.equal(
+    indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"),
+    false,
+    "the retry must land without the tombstone still being present",
+  );
+  assert.equal(store._pendingLegacyDeletes.has("L0"), false, "…and stop being pending");
+});
+
+test("a pending delete also suppresses the RESTORE while it is outstanding", async () => {
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  await store._writePromise;
+  store._pendingLegacyDeletes.add("L0");
+  const restored = await store._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.equal(
+    (restored.threads || []).some((t) => t.id === "L0"),
+    false,
+    "a delete that has not landed must not be undone by a restore",
+  );
+});
+
+test("clearAll REPORTS a legacy store it could not clear", async () => {
+  // The canonical reset has already happened by then, so a failed legacy clear cannot
+  // be undone — but reporting it as a completed clear tells the user their transcripts
+  // are gone and then hands them back after a reload.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  await store._writePromise;
+
+  // Fail ONLY the legacy store: a global failure would take the canonical reset
+  // down first and we would be testing a different branch.
+  indexedDb._state.failStore = CHAT_HISTORY_LEGACY_STORE;
+  const result = await store.clearAll([], {});
+  assert.equal(result.ok, false, "an incomplete clear must not report success");
+  assert.equal(result.code, "history-clear-legacy-unavailable");
+  assert.equal(result.retryable, true, "a later clear can finish the job");
+  assert.equal(result.canonicalCommitted, true, "…while still reporting what DID happen");
+});
+
+test("clearAll reports success when the legacy store really was cleared", () => {
+  // The other side, so the failure branch cannot be satisfied by always reporting bad.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  return store._writePromise
+    .then(() => store.clearAll([], {}))
+    .then((result) => {
+      assert.equal(result.ok, true);
+      assert.equal(result.code, null);
+      assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).size, 0);
+    });
 });
