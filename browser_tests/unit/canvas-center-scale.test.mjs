@@ -89,3 +89,38 @@ test("#754 an out-of-range scale is REFUSED, matching action:'zoom'", () => {
     assert.equal(c.ds.scale, 1, "a refused scale must not be applied");
   }
 });
+
+test("#754 center_on_node and zoom accept EXACTLY the same scale range", () => {
+  // The range literal is duplicated between the two branches rather than shared, so this
+  // pins the invariant the duplication risks: one tool must never accept a scale its
+  // sibling refuses. If someone widens one branch, this fails rather than the drift
+  // shipping silently.
+  const probe = (action, scale) => {
+    const c = makeCanvas({ scale: 1 });
+    try {
+      run(c, { action, node_id: 42, scale });
+      return "accepted";
+    } catch (e) {
+      return /scale must be in/.test(e.message) ? "refused" : `other:${e.message}`;
+    }
+  };
+  for (const s of [0.05, 0.06, 1, 4, 4.01, 0, -1, Number.NaN]) {
+    assert.equal(
+      probe("center_on_node", s),
+      probe("zoom", s),
+      `center_on_node and zoom disagree on scale ${s}`,
+    );
+  }
+});
+
+test("#754 coercion matches action:'zoom' — null and NaN refused, numeric string accepted", () => {
+  // Both branches use the identical `Number(scale)` idiom, so behaviour on non-numbers is
+  // shared rather than newly invented here. null -> 0 -> refused; "1.5" -> 1.5 -> applied.
+  const c1 = makeCanvas({ scale: 1 });
+  assert.throws(() => run(c1, { action: "center_on_node", node_id: 42, scale: null }), /scale must be in/);
+  assert.equal(c1.ds.scale, 1, "a refused scale is not applied");
+
+  const c2 = makeCanvas({ scale: 1 });
+  run(c2, { action: "center_on_node", node_id: 42, scale: "1.5" });
+  assert.equal(c2.ds.scale, 1.5);
+});
