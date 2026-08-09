@@ -174,3 +174,29 @@ test("the card surface is recomputed AFTER the replay, not only before it", () =
   const fn = PANEL.slice(PANEL.indexOf("function paintThread"), PANEL.indexOf("function resumableSessionId"));
   assert.match(fn, /setChatSurfaceForCards\(\);/);
 });
+
+// ── the safety properties a reviewer asks about ────────────────────────────
+
+test("a repaint can only ever register the VIEWED thread's cards", () => {
+  // The worry: repaint thread B while viewing A, and a ui_update now resolves
+  // B's card and persists that into a background thread. It cannot happen —
+  // paintThread's FIRST statement makes the thread it paints the viewed one, so
+  // "the thread being painted" and "the thread being viewed" are the same thing
+  // by construction, not by a guard that could be forgotten.
+  const fn = PANEL.slice(PANEL.indexOf("function paintThread(t) {"), PANEL.indexOf("function resumableSessionId"));
+  assert.match(fn, /function paintThread\(t\) \{\s*\n\s*thread = t;\s*\n\s*resetFeed\(\);/);
+});
+
+test("the replay loop is the ONLY thing that repaints a card", () => {
+  // A second caller could mount a card without an intervening resetFeed and
+  // strand the previous handle. There is exactly one, inside that loop.
+  const callers = [...PANEL.matchAll(/paintA2UIRecord\(/g)].length;
+  assert.equal(callers, 2, "one definition + one call site");
+});
+
+test("a card reply that cannot be sent SAYS so", () => {
+  // An unresolved card is live again after a reload, so it can be clicked when
+  // the agent session is gone. That path must not drop the reply silently.
+  const fn = PANEL.slice(PANEL.indexOf("function sendCardReply"), PANEL.indexOf("function mountLiveA2UICard"));
+  assert.match(fn, /if \(!ok\) appendSystem\(/);
+});
