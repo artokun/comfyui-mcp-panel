@@ -269,6 +269,11 @@ import {
 } from "./lib/clipboard-store.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { createMediaCollapseStore } from "./lib/media-collapse.js";
+import {
+  PANEL_UI_SCALE_MIN,
+  PANEL_UI_SCALE_MAX,
+  panelUiScaleFraction,
+} from "./lib/ui-scale.js";
 import { createLightboxModel } from "./lib/lightbox-gallery.js";
 import {
   vueNodesActive,
@@ -2570,6 +2575,13 @@ const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
+// #753 — the sidebar had no way to make its text bigger, and the obvious user
+// workaround does not work: `.cmcp-root` sets `font-size: 0.8125rem`, but the
+// inner rules are `rem`, which resolve against the PAGE root rather than the
+// panel. Overriding `.cmcp-root { font-size }` therefore scales only the few
+// elements that inherit, and every rem-sized label stays exactly as it was.
+// A scale transform is the one lever that moves the whole panel at once.
+const SETTING_UI_SCALE = "comfyui-mcp.uiScale";
 const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
 // Mobile app (beta) feature flag: gates the header "Remote control" QR button and
 // surfaces the tester-channel download links in Settings. The links are the
@@ -2759,6 +2771,37 @@ function effortComboOptions(backend) {
     { value: "", text: "Model default" },
     ...scale.map((id) => ({ value: id, text: effortMeta(id).label })),
   ];
+}
+
+/**
+ * Apply the UI scale to every mounted panel root.
+ *
+ * `zoom` rather than `transform: scale()`: transform does not affect LAYOUT, so a
+ * scaled panel would keep its original box and overflow or clip. zoom scales the
+ * box too, which is what makes the sidebar's own scrolling keep working.
+ *
+ * THE HEIGHT COMPENSATION IS NOT OPTIONAL (#753, raised by the reporter).
+ * `.cmcp-root` is `height: 100%`, and a zoomed element resolves its percentage
+ * height in the ZOOMED coordinate space — at 150% it becomes half again taller
+ * than the space it has, and the bottom of the composer goes off-screen. The
+ * root's height is `calc(100% / var(--cmcp-ui-scale))`, so the variable set here
+ * cancels exactly that. Scale and variable are written together for that reason;
+ * setting one without the other is a broken panel.
+ */
+function applyPanelUiScale(raw) {
+  const scale = panelUiScaleFraction(raw);
+  try {
+    for (const root of document.querySelectorAll(".cmcp-root")) {
+      root.style.setProperty("--cmcp-ui-scale", String(scale));
+      // 1 is the default everywhere; clearing it keeps the DOM free of a no-op
+      // zoom that would otherwise show up in every inspection of the panel.
+      if (scale === 1) root.style.removeProperty("zoom");
+      else root.style.zoom = String(scale);
+    }
+  } catch {
+    // A frontend that refuses the style write keeps the default size; a panel
+    // that is merely not scaled is still a usable panel.
+  }
 }
 
 function getSetting(id) {
@@ -3352,6 +3395,28 @@ function panelSettingsList() {
         );
         wrap.append(note, row);
         return wrap;
+      },
+    },
+    {
+      id: SETTING_UI_SCALE,
+      name: "Panel UI scale (%)",
+      category: cat("General", "Panel UI scale (%)"),
+      sortOrder: 143,
+      tooltip:
+        "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
+        "to read on a high-DPI or large display. 100% is the default; 100-250. Applies immediately, to " +
+        "every open panel. Note that overriding `.cmcp-root { font-size }` in a user stylesheet does NOT " +
+        "work: the panel's inner sizes are `rem`, which resolve against the page root rather than the " +
+        "panel, so most text ignores it. This setting is the supported way to scale the panel.",
+      type: "slider",
+      attrs: { min: PANEL_UI_SCALE_MIN, max: PANEL_UI_SCALE_MAX, step: 5 },
+      defaultValue: 100,
+      onChange: (value) => {
+        // NOT gated on settingsArmed, unlike the settings that seed the panel's
+        // runtime: this one writes nothing but CSS, has no default to re-seed,
+        // and a user dragging the slider expects the panel to move while they
+        // drag — including before the panel has finished arming.
+        applyPanelUiScale(value);
       },
     },
     {
@@ -16236,7 +16301,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 
 const PANEL_CSS = `
 .cmcp-root {
-  display: flex; flex-direction: column; height: 100%; min-height: 0;
+  display: flex; flex-direction: column; min-height: 0;
+  /* #753 — divided by the UI scale so a zoomed panel still fits its parent;
+     see applyPanelUiScale. Defaults to 1, i.e. plain 100%. */
+  height: calc(100% / var(--cmcp-ui-scale, 1));
   position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   font-size: 0.8125rem; line-height: 1.5;
@@ -17580,6 +17648,10 @@ function buildPanel() {
 
   const root = document.createElement("div");
   root.className = "cmcp-root";
+  // #753 — a saved scale has to apply to a panel that mounts LATER (a reload, a
+  // workflow switch that re-mounts the sidebar), not only to one that is open
+  // when the slider moves. Read it here, at the one place a root is created.
+  applyPanelUiScale(getSetting(SETTING_UI_SCALE));
   // A2UI seam (forward-compat, see spec): the chat surface width is a SINGLE piece
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.
