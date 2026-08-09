@@ -368,6 +368,8 @@ import {
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
+  emptyCanvasBindingProven,
+  emptySealStampReassignable,
   rootContentProvesActiveWorkflow,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -5359,7 +5361,27 @@ function assertGraphBoundToActiveWorkflow(
   // decisions below need it: the stale-tag rebind and the unstamped-root seal ask
   // the same question (is this canvas provably the active workflow's?) and must not
   // answer it differently.
+  // #833 — ComfyUI's OWN mid-load flag, not a proxy for it. A canvas mid-load reads
+  // genuinely empty at that instant and is about to be populated, which is the only
+  // FALSE-EMPTY reading a both-sides-empty proof cannot exclude by itself. Unreadable
+  // ⇒ true, so an unknown frontend proves nothing and the empty gate stays closed.
+  let graphLoading = true;
+  try {
+    const flag = activeWorkflow?.changeTracker?.constructor?.isLoadingGraph;
+    graphLoading = typeof flag === "boolean" ? flag : true;
+  } catch {
+    graphLoading = true;
+  }
   let sealProofExclusive = false;
+  // #833 — the EMPTY case needs its OWN exclusivity, because the rule below inverts
+  // here. Skipping a DIRTY twin is right for a CONTENT match (a lagging tracker cannot
+  // prove its state equals the root), but an empty root needs no proof to match a blank
+  // tab: a dirty blank twin is exactly as plausible an owner as the active tab. Sealing
+  // on the content rule would stamp the active identity onto a root that may be the
+  // other blank tab's, wedging THAT tab on the foreign tag the moment the user switched
+  // to it — this bug's mirror image, and the #349 tag protections rightly refuse to
+  // re-stamp it back. So: every OTHER open workflow must be READABLY non-empty.
+  // Unreadable or absent enumeration proves nothing and blocks the seal.
   try {
     const others = app?.extensionManager?.workflow?.openWorkflows;
     if (Array.isArray(others)) {
@@ -5401,8 +5423,20 @@ function assertGraphBoundToActiveWorkflow(
     // Anything unprovable fails closed, and the #389 case (empty root while
     // the workflow reports N>0 nodes) still fires via the baseline read
     // guard below.
+    // #833 — the DIRTY blank tab reaches the same conclusion by the same rule. A blank
+    // tab is never clean, so `activeWorkflowProvenEmpty` cannot fire here either, and
+    // without this a root stamped by one blank tab would WEDGE the next blank tab the
+    // user switched to — this bug's mirror image, and the reason the seal can hand out
+    // an empty root's stamp at all: in the both-empty case a stamp is freely
+    // re-assignable, because there is no content for it to protect.
+    // #833 — plus the empty seal's OWN leftover. A blank tab is never clean, so the
+    // clause above cannot fire for one; without this the stamp the seal writes for tab A
+    // wedges tab B the moment the user switches to it. Narrow on purpose: ONLY a tag
+    // this mechanism wrote on a provably empty canvas is re-pointable, so every #349
+    // protection (a foreign tab's claim, a tag nobody claims) is untouched.
     const staleTagOnEmptyCanvas =
-      graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
+      (graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow)) ||
+      emptySealStampReassignable({ rootGraph, activeWorkflow, graphLoading });
     // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused
     // app.graph, so a canvas that IS the active workflow's was refused where an
     // untagged copy of it was allowed, and nothing self-healed it: the seal below
@@ -5455,6 +5489,7 @@ function assertGraphBoundToActiveWorkflow(
     activeWorkflowUuid,
     inSubgraph,
     proofExclusive: sealProofExclusive,
+    graphLoading,
   });
   // The verdict itself is a PURE function of the resolved evidence, lifted into
   // lib/graph-binding.js (#604) so the read-vs-mutation evidence bar is observable
@@ -5474,6 +5509,7 @@ function assertGraphBoundToActiveWorkflow(
     includeBaselineReadGuard,
     requireDirtyMutationBinding,
     postReconnectWindow: postReconnectSettleWindow(),
+    graphLoading,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
