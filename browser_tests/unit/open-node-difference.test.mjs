@@ -431,3 +431,72 @@ test("layout edge keys are injective — a delimiter collision cannot drop an ed
   assert.ok(col.get("c") > col.get("a|b"), "edge a|b -> c must order them");
   assert.ok(col.get("b|c") > col.get("a"), "edge a -> b|c must survive dedup");
 });
+
+// ── #696: a display-only flag is not lost content ──────────────────────────
+
+test("the reporter's trio — order + size + showAdvanced — is cosmetic", () => {
+  // The 0.11.50 regression on #696: `panel_open_workflow` reported a mismatch on a
+  // flat workflow that differed only in these three, with every node id and type
+  // present. Two were already cosmetic; `showAdvanced` alone was enough to send a
+  // healthy open down the "the panel cannot tell whether the load only partly
+  // applied" path, which reads as possible data loss.
+  const node = (over) => ({
+    id: 1, type: "ImpactWildcardEncode", pos: [10, 20], size: [300, 100],
+    flags: {}, order: 0, mode: 0, inputs: [], outputs: [],
+    properties: {}, widgets_values: ["a", "b"], showAdvanced: false, ...over,
+  });
+  const out = classifyNodeDifference({
+    expectedNodes: [node({})],
+    actualNodes: [node({ order: 2, size: [310, 120], showAdvanced: true })],
+  });
+  assert.equal(out.comparable, true);
+  assert.equal(out.sameNodeSet, true);
+  assert.deepEqual(out.fields, ["order", "showAdvanced", "size"]);
+  assert.equal(out.cosmeticOnly, true, "a display toggle cannot mean a node or a value was lost");
+});
+
+test("the rule's boundary: fields that CAN mean lost content stay non-cosmetic", () => {
+  // The point of stating a rule rather than keeping a list. Each of these fails the
+  // test "a difference here is compatible with 'nothing was lost'".
+  const node = (over) => ({
+    id: 1, type: "T", pos: [0, 0], size: [10, 10], flags: {}, order: 0, mode: 0,
+    inputs: [], outputs: [], properties: {}, widgets_values: ["a"], title: "mine", ...over,
+  });
+  for (const [field, changed] of [
+    ["widgets_values", { widgets_values: ["CHANGED"] }],
+    ["mode", { mode: 4 }],                    // bypass — changes what executes
+    ["title", { title: "renamed" }],          // authored, and losing it IS loss
+    ["properties", { properties: { k: 1 } }], // pack-specific; unknowable from here
+    ["inputs", { inputs: [{ name: "x" }] }],  // links
+  ]) {
+    const out = classifyNodeDifference({ expectedNodes: [node({})], actualNodes: [node(changed)] });
+    assert.deepEqual(out.fields, [field], `expected only ${field} to differ`);
+    assert.equal(out.cosmeticOnly, false, `${field} must not be treated as cosmetic`);
+  }
+});
+
+test("an UNKNOWN field is not cosmetic — the set stays a denylist", () => {
+  // A pack the panel has never seen makes the disclosure cautious rather than
+  // confidently wrong. Inverting to an allowlist would make every unfamiliar field
+  // cosmetic, i.e. claim "nothing was lost" about a surface never heard of.
+  const node = (over) => ({ id: 1, type: "T", widgets_values: ["a"], ...over });
+  const out = classifyNodeDifference({
+    expectedNodes: [node({ someFuturePackFlag: 1 })],
+    actualNodes: [node({ someFuturePackFlag: 2 })],
+  });
+  assert.equal(out.cosmeticOnly, false);
+});
+
+test("showAdvanced alongside a REAL change is still not cosmetic", () => {
+  // Widening the set must not let a genuine difference ride along with a display
+  // toggle — the all-clear is per-difference-set, not per-field.
+  const node = (over) => ({
+    id: 1, type: "T", widgets_values: ["a"], showAdvanced: false, ...over,
+  });
+  const out = classifyNodeDifference({
+    expectedNodes: [node({})],
+    actualNodes: [node({ showAdvanced: true, widgets_values: ["CHANGED"] })],
+  });
+  assert.deepEqual(out.fields, ["showAdvanced", "widgets_values"]);
+  assert.equal(out.cosmeticOnly, false);
+});

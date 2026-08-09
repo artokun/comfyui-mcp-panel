@@ -494,7 +494,39 @@ function graphShape(state) {
  *  - `flags` — not just `collapsed`: `graph_edit_node` persists `pinned` here too.
  *  - `mode` — bypass/mute is execution semantics.
  */
-const COSMETIC_NODE_FIELDS = new Set(["size", "pos", "order", "color", "bgcolor"]);
+/**
+ * Node fields whose difference cannot mean AUTHORED CONTENT WAS LOST (#696).
+ *
+ * The rule, because a bare list grows by whoever filed last. `cosmeticOnly` licenses
+ * exactly one sentence downstream — "every node that was loaded is on it with the
+ * same id and type, nothing was lost" — so a field belongs here only when a
+ * difference in it is compatible with that sentence being TRUE. Not "does not affect
+ * execution": a node `title` does not affect execution either, and a title that
+ * changed IS lost authoring, so it stays out.
+ *
+ * By that test:
+ *   size, pos     the frontend re-measures and re-places on load
+ *   order         recomputed topologically, never authored directly
+ *   color/bgcolor authored, but a difference cannot hide a missing node or value
+ *   showAdvanced  a display toggle: it changes which widgets are VISIBLE, never
+ *                 their values, which stay in `widgets_values` and are compared
+ *                 separately
+ *
+ * DENYLIST, deliberately, and it must stay one. An unknown field reads as
+ * non-cosmetic, so a pack the panel has never seen makes the disclosure cautious —
+ * noisy, and safe. Inverting to an allowlist of execution-relevant fields would make
+ * every unknown field cosmetic, i.e. the panel would tell a user "nothing was lost"
+ * about a surface it has never heard of. That is the fabricated all-clear this whole
+ * module exists to avoid, and it is worth more than the noise.
+ */
+const COSMETIC_NODE_FIELDS = new Set([
+  "size",
+  "pos",
+  "order",
+  "color",
+  "bgcolor",
+  "showAdvanced",
+]);
 
 /** The node's identity for set comparison: what makes it THIS node rather than
  *  another one. Type included, because an id reused for a different type is a
