@@ -565,14 +565,20 @@ export function missingRequiredWidgetMaterializations(node, widgetConstructors, 
  * reported case: `SaveVideo` refused for `VIDEO` on an install whose node set never
  * outputs one.
  *
- * A live node of that class answers a different and better question: what DID happen.
- * ComfyUI already built this class on THIS backend, so how it materialised each input
- * is observed fact rather than inference — an input that came out as a link SLOT is a
- * socket, and one that came out as a WIDGET has its constructor. Either way there is
- * nothing left for the guard to wait for.
+ * A live node of that class answers a different question: what DID happen. ComfyUI
+ * already built this class on THIS backend — an input that came out as a link SLOT is a
+ * socket, one that came out as a WIDGET had its constructor.
  *
- * This is deliberately NOT a relaxation of the type rules. It adds evidence rather than
- * lowering a bar: an input the live node does not account for stays unavailable, so
+ * It is a WITNESS, not a proof (codex). A widget can survive from an earlier
+ * registration, or have been converted to a slot, so it does not guarantee a fresh node
+ * materialises identically — and the argument must NOT rest on "extensions never
+ * unregister". What makes admitting it safe is that it only permits an ATTEMPT: the
+ * newly created node still goes through missingRequiredWidgetMaterializations before any
+ * success is reported, and that post-creation check is the real soundness boundary. The
+ * worst case here is a creation attempt that then fails closed.
+ *
+ * So this is deliberately NOT a relaxation of the type rules. It adds evidence rather
+ * than lowering a bar: an input the live node does not account for stays unavailable, so
  * #580's protection is untouched for every case this cannot observe.
  *
  * Requires EVERY input carrying the type to be accounted for. A def can require the same
