@@ -13959,16 +13959,24 @@ const GRAPH_TOOL_EXECUTORS = {
     let methodRejected = false;
     for (;;) {
       if (dialect === "v2") {
-        const params = {
-          // The Manager's update task keys off node_name; include id too for
-          // correlation parity with install (harmless if the server ignores it).
-          node_name: id,
-          id,
-          selected_version: sel,
-          version: sel,
-          mode: mode || "remote",
-          channel: channel || "default",
-        };
+        // panel#809 — those "harmless for correlation" extras are not harmless.
+        // Manager v4's QueueTaskItem.params is an UNTAGGED Pydantic union with
+        // InstallPackParams listed FIRST. InstallPackParams needs exactly
+        // {id, selected_version, mode, channel} — every field this used to send
+        // alongside node_name — so it validated as an INSTALL, Pydantic silently
+        // dropped node_name as an unknown field, and `kind: "update"` was never
+        // consulted for which model to pick. do_update then read
+        // params.node_name off an InstallPackParams object and crashed:
+        //
+        //   AttributeError: 'InstallPackParams' object has no attribute 'node_name'
+        //
+        // UpdatePackParams is exactly {node_name, node_ver?} and nothing else —
+        // sending ONLY those two is what makes it the sole match. If `id` is
+        // ever needed for correlation, `ui_id` already carries it at the
+        // envelope level, outside the union — verified against a local Manager
+        // 4.2.2 install. The orchestrator's own update path already sends
+        // {node_name} alone and was never affected.
+        const params = { node_name: id, node_ver: sel };
         let enqueued = false;
         try {
           await managerV2("manager/queue/task", {
