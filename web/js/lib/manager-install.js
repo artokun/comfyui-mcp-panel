@@ -484,7 +484,28 @@ export function parseNodeMappings(data, query, limit) {
     }
   }
   const max = Math.min(Number(limit) || 15, 40);
-  return { count: out.length, results: out.slice(0, max) };
+  // #808 — `catalogue_size` is how many packs the payload CONTAINED, before the query
+  // filter. Without it, "the catalogue is empty" and "the catalogue is fine, your query
+  // matched nothing" both arrive as `count: 0` — and the reader takes the first for the
+  // second, concludes the pack does not exist, and goes on trying variations of a search
+  // that cannot succeed. That conflation is the whole of #808.
+  return { count: out.length, results: out.slice(0, max), catalogue_size: catalogueSize(data) };
+}
+
+/**
+ * #808 — how many packs a `/customnode/getmappings` payload actually carries, counted
+ * RAW: before id extraction, and before the query filter.
+ *
+ * Raw deliberately. The question is "did Manager return any packs at all", and counting
+ * only the entries that yielded an installable id would fold a PARSE fault into the
+ * EMPTY-CATALOGUE answer — a different problem with a different remedy. A body that is
+ * not a catalogue at all (null, a string, a proxy's sign-in HTML) contains no packs
+ * either, so 0 is the correct answer for it too.
+ */
+export function catalogueSize(data) {
+  if (Array.isArray(data)) return data.length;
+  if (data && typeof data === "object") return Object.keys(data).length;
+  return 0;
 }
 
 /**
@@ -577,6 +598,56 @@ export function managerUnavailableResult(query, err) {
 }
 
 /**
+ * #808 — Manager ANSWERED, and its node catalogue is EMPTY.
+ *
+ * `searchNodesVia` asks for `customnode/getmappings?mode=cache`, so Manager serves from
+ * its own local cache. A cache it never managed to populate — because Manager itself
+ * could not reach the node registry — answers HTTP 200 with `{}`. Filtered against a
+ * query that produces `count: 0`, which is the SAME answer a healthy catalogue gives when
+ * nothing matches. Empty and unreachable look identical, so the reader concludes their
+ * query was wrong and keeps trying variations of an action that can never succeed. A
+ * Chinese-speaking user reported exactly that — "我这边搜不到任何内容" — and three rounds
+ * of advice were spent sending them at a door that could not open.
+ *
+ * Zero packs is sound evidence: any working install has thousands.
+ *
+ * WHAT THIS DOES NOT CLAIM. The panel does not make the registry request — Manager does —
+ * so it never observed a DNS failure, a timeout or a TLS error and must not report one.
+ * It says what it saw: Manager answered, the catalogue is empty, so NOTHING WAS SEARCHED
+ * and nothing follows about whether the pack exists. Naming the hosts the catalogue comes
+ * from is what lets a filtered user recognise their own situation, which no amount of
+ * "no results" ever will. The remedy that costs nothing (refresh the cache) is offered
+ * BEFORE the network conclusion, because a stale-but-reachable install is the commoner
+ * case and sending that user to a VPN is the same class of wrong answer pointing the
+ * other way.
+ */
+export function emptyCatalogueResult(query) {
+  const q = query == null ? "" : String(query);
+  return {
+    supported: true,
+    managerReachable: true,
+    catalogue_empty: true,
+    catalogue_size: 0,
+    searched: false,
+    count: 0,
+    results: [],
+    query: q,
+    message:
+      "ComfyUI-Manager answered, but its cached node catalogue contains ZERO packs — so " +
+      `nothing was actually searched, and this result says NOTHING about whether ${
+        q ? `"${q}"` : "a pack"
+      } exists. (This is not "no matches": a populated catalogue has thousands of packs.) ` +
+      "Manager builds that cache by fetching the node registry — api.comfy.org, and " +
+      "raw.githubusercontent.com / github.com on channel-based builds. First refresh the " +
+      "cache from the Manager UI and retry, since a cache that simply never populated is " +
+      "the commonest cause. If it comes back empty again, those hosts are not reachable " +
+      "from this machine — corporate, campus or national network filtering blocks them " +
+      "routinely, and an empty list is not something you could have inferred that from. " +
+      "Nodes already installed are unaffected: list them with panel_list_nodes.",
+  };
+}
+
+/**
  * Run the nodes_search flow with graceful degradation against an unreachable /
  * legacy ComfyUI-Manager (#251/#255). Dependency-injected `managerGet` (dialect-
  * routed; adds /v2 for pip builds, strips it for legacy) and `managerCall`
@@ -611,7 +682,13 @@ export async function searchNodesVia(
       throw err2;
     }
   }
-  return parseNodeMappings(data, query, limit);
+  const parsed = parseNodeMappings(data, query, limit);
+  // #808 — an EMPTY catalogue is not a no-match, and only this branch can tell the
+  // caller so. Checked on `catalogue_size` (packs the payload carried) rather than
+  // `count` (packs that matched), because a healthy catalogue legitimately returns
+  // count 0 all the time and must keep reading as the ordinary no-match it is.
+  if (parsed.catalogue_size === 0) return emptyCatalogueResult(query);
+  return parsed;
 }
 
 /** #425 — ordered reboot {route, method} candidates for the detected dialect.
