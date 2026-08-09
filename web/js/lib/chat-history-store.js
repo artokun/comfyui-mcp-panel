@@ -1302,7 +1302,14 @@ async function idbReadLegacy(indexedDb) {
         return;
       }
       const req = tx.objectStore(CHAT_HISTORY_LEGACY_STORE).getAll();
-      req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : null);
+      req.onsuccess = () => resolve(
+        // Structural, not by key: the marker is the record that carries an `ids` list
+        // and no thread `id`. Callers already require a string id, but saying so here
+        // means one place decides what is a transcript.
+        Array.isArray(req.result)
+          ? req.result.filter((record) => record && typeof record.id === "string" && record.id)
+          : null,
+      );
       req.onerror = () => resolve(null);
       tx.onerror = () => resolve(null);
       tx.onabort = () => resolve(null);
@@ -1322,10 +1329,14 @@ async function idbReadLegacy(indexedDb) {
  * instead of appending — so the migration is idempotent and can safely run on every
  * read until it succeeds.
  *
- * Returns true only if the transaction COMPLETED. `oncomplete`, not the last
- * `onsuccess`: individual puts succeed against a transaction that later aborts on
- * quota, and reporting that as durable is what would license deleting the only other
- * copy.
+ * Returns THE IDS IT STORED, or null if the transaction did not complete — not a
+ * bare boolean. The caller grants receipts from this, and a boolean let it grant one
+ * for a thread this function had filtered out (a colliding reserved key), i.e. a
+ * receipt for something that was never written.
+ *
+ * `oncomplete`, not the last `onsuccess`: individual puts succeed against a
+ * transaction that later aborts on quota, and reporting that as durable is what would
+ * license deleting the only other copy.
  */
 /**
  * What a legacy record must match for its stored copy to stand in for the live one
@@ -1418,10 +1429,22 @@ async function idbReadPendingDeletes(indexedDb) {
   }
 }
 
-/** Persist the pending-delete list. Best effort: a store that will not take it is a
- *  store that cannot be growing either, and the in-memory set still drives retries
- *  for the life of this tab. */
-async function idbWritePendingDeletes(indexedDb, ids) {
+/**
+ * Merge into the pending-delete list, in ONE transaction (codex r4).
+ *
+ * NOT a whole-list overwrite. Two tabs both retrying is ordinary: tab A finishes
+ * `L0` and writes `[]` while tab B's delete of `L1` fails and writes `[L1]`. If A's
+ * stale `[]` lands last it erases B's durable intent, B closes, `L1`'s capped
+ * tombstone ages out, and the whole reload hole is back. Reading and writing inside
+ * the same readwrite transaction makes the merge atomic against the other tab.
+ *
+ * Best effort: a store that will not take the marker is a store that will not be
+ * taking new records either, and the in-memory set still drives retries here.
+ */
+async function idbMergePendingDeletes(indexedDb, { add = [], remove = [] } = {}) {
+  const toAdd = add.filter((id) => typeof id === "string" && id);
+  const toRemove = new Set(remove.filter((id) => typeof id === "string" && id));
+  if (!toAdd.length && !toRemove.size) return true;
   const db = await openDb(indexedDb);
   if (!db) return false;
   try {
@@ -1435,13 +1458,24 @@ async function idbWritePendingDeletes(indexedDb, ids) {
         return;
       }
       const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
+      let req;
       try {
-        if (ids.length) store.put({ ids }, LEGACY_PENDING_DELETES_KEY);
-        else store.delete(LEGACY_PENDING_DELETES_KEY);
+        req = store.get(LEGACY_PENDING_DELETES_KEY);
       } catch {
         resolve(false);
         return;
       }
+      req.onsuccess = () => {
+        const existing = Array.isArray(req.result?.ids) ? req.result.ids : [];
+        const merged = [...new Set([...existing, ...toAdd])]
+          .filter((id) => typeof id === "string" && id && !toRemove.has(id));
+        try {
+          if (merged.length) store.put({ ids: merged }, LEGACY_PENDING_DELETES_KEY);
+          else store.delete(LEGACY_PENDING_DELETES_KEY);
+        } catch {
+          // The transaction settles below either way.
+        }
+      };
       tx.oncomplete = () => resolve(true);
       tx.onerror = () => resolve(false);
       tx.onabort = () => resolve(false);
@@ -1456,11 +1490,11 @@ async function idbWritePendingDeletes(indexedDb, ids) {
 /** Delete legacy records by key — used for tombstoned threads (#861, codex P1). */
 async function idbDeleteLegacy(indexedDb, ids) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => typeof id === "string" && id))];
-  if (!list.length) return true;
+  if (!list.length) return [];
   const db = await openDb(indexedDb);
-  if (!db) return false;
+  if (!db) return null;
   try {
-    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return false;
+    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return null;
     return await new Promise((resolve) => {
       let tx;
       try {
@@ -1526,7 +1560,15 @@ async function idbClearLegacy(indexedDb) {
 }
 
 async function idbWriteLegacy(indexedDb, threads) {
-  const list = Array.isArray(threads) ? threads.filter((t) => t && typeof t.id === "string" && t.id) : [];
+  const list = Array.isArray(threads)
+    ? threads.filter((t) => t && typeof t.id === "string" && t.id
+        // A thread whose id IS the reserved key cannot share a key space with the
+        // marker (codex r4). Ids are normally minted by crypto.randomUUID(), but an
+        // IMPORTED history can carry anything. Refusing to store it keeps the thread
+        // unevictable — it stays whole in the shadow — which is the fail-closed
+        // outcome, not a silent overwrite of either record by the other.
+        && t.id !== LEGACY_PENDING_DELETES_KEY)
+    : [];
   if (!list.length) return true;
   const db = await openDb(indexedDb);
   if (!db) return false;
@@ -1537,22 +1579,22 @@ async function idbWriteLegacy(indexedDb, threads) {
       try {
         tx = db.transaction(CHAT_HISTORY_LEGACY_STORE, "readwrite");
       } catch {
-        resolve(false);
+        resolve(null);
         return;
       }
       const store = tx.objectStore(CHAT_HISTORY_LEGACY_STORE);
       try {
         for (const thread of list) store.put(thread, thread.id);
       } catch {
-        resolve(false);
+        resolve(null);
         return;
       }
-      tx.oncomplete = () => resolve(true);
-      tx.onerror = () => resolve(false);
-      tx.onabort = () => resolve(false);
+      tx.oncomplete = () => resolve(list.map((thread) => thread.id));
+      tx.onerror = () => resolve(null);
+      tx.onabort = () => resolve(null);
     });
   } catch {
-    return false;
+    return null;
   } finally {
     db.close();
   }
@@ -1665,6 +1707,9 @@ export class ChatHistoryStore {
      * the map that expires, and also suppresses the restore in the meantime.
      */
     this._pendingLegacyDeletes = new Set();
+    /** Legacy ids this session has already deleted, so a still-live tombstone does
+     *  not re-issue the same no-op delete on every persist. */
+    this._legacyDeletesDone = new Set();
     this.lastShadowWriteOk = null;
     this.lastShadowError = null;
     this.writerId = options.writerId || globalThis.crypto?.randomUUID?.() || `writer-${Math.random().toString(16).slice(2)}`;
@@ -1858,10 +1903,12 @@ export class ChatHistoryStore {
       this._durableLegacy = new Map();
       return snapshot;
     }
+    // `idbReadLegacy` is the one place that decides what counts as a transcript, so
+    // nothing here re-checks for a string id. Duplicating that test would make the
+    // real guard untestable — remove it and every assertion still passes — which is
+    // how a decorative check ends up reading as protection.
     this._durableLegacy = new Map(
-      stored
-        .filter((thread) => thread && typeof thread.id === "string" && thread.id)
-        .map((thread) => [thread.id, legacyFingerprint(thread)]),
+      stored.map((thread) => [thread.id, legacyFingerprint(thread)]),
     );
     // The stored copy is additive: a thread the shadow already lost to a byte
     // eviction comes back here, which is the whole point of giving it a home.
@@ -1876,7 +1923,7 @@ export class ChatHistoryStore {
       ...this._pendingLegacyDeletes,
     ]);
     const restored = stored
-      .filter((thread) => thread && typeof thread.id === "string" && !known.has(thread.id))
+      .filter((thread) => !known.has(thread.id))
       .filter((thread) => !tombstoned.has(thread.id))
       .map((thread) => ({ ...thread, legacyShadow: true }));
     // Anything flagged in the shadow but not yet durable gets its home now.
@@ -1884,8 +1931,12 @@ export class ChatHistoryStore {
       (thread) => thread?.legacyShadow === true && thread?.id
         && this._durableLegacy.get(thread.id) !== legacyFingerprint(thread),
     );
-    if (pending.length && await idbWriteLegacy(this.indexedDb, pending)) {
-      for (const thread of pending) this._durableLegacy.set(thread.id, legacyFingerprint(thread));
+    if (pending.length) {
+      const written = await idbWriteLegacy(this.indexedDb, pending);
+      const stored = new Set(written || []);
+      for (const thread of pending) {
+        if (stored.has(thread.id)) this._durableLegacy.set(thread.id, legacyFingerprint(thread));
+      }
     }
     if (!restored.length) return snapshot;
     const all = [...threads, ...restored].sort(
@@ -2021,8 +2072,16 @@ export class ChatHistoryStore {
         );
         if (stale.length) {
           try {
-            if (await idbWriteLegacy(this.indexedDb, stale)) {
-              for (const thread of stale) this._durableLegacy.set(thread.id, legacyFingerprint(thread));
+            const written = await idbWriteLegacy(this.indexedDb, stale);
+            if (written) {
+              // Only what it actually stored. A thread it refused (a colliding
+              // reserved key) must not collect a receipt it cannot honour.
+              const stored = new Set(written);
+              for (const thread of stale) {
+                if (stored.has(thread.id)) {
+                  this._durableLegacy.set(thread.id, legacyFingerprint(thread));
+                }
+              }
             }
           } catch {
             // Unreachable legacy store: nothing becomes evictable. Fail closed.
@@ -2060,7 +2119,12 @@ export class ChatHistoryStore {
           // tombstone can lose a causal merge to a newer live version. Deleting by id
           // alone would take the live record with it.
           .filter((id) => !liveIds.has(id))
-          .filter((id) => this._durableLegacy.has(id) || this._pendingLegacyDeletes.has(id));
+          // NOT gated on holding a receipt. A freshly opened tab has no receipts
+          // until it reads, and gating on them meant it would skip a delete another
+          // tab had left owing — the correctness gap an optimization bought. Deleting
+          // an absent key is a no-op, so the only cost is a wasted key, and
+          // `_legacyDeletesDone` keeps that to once per id per session.
+          .filter((id) => !this._legacyDeletesDone.has(id));
         if (tombstoned.length) {
           let deleted = false;
           try {
@@ -2068,11 +2132,11 @@ export class ChatHistoryStore {
           } catch {
             deleted = false;
           }
-          const before = this._pendingLegacyDeletes.size;
           if (deleted) {
             for (const id of tombstoned) {
               this._durableLegacy.delete(id);
               this._pendingLegacyDeletes.delete(id);
+              this._legacyDeletesDone.add(id);
             }
           } else {
             // Remember it OURSELVES rather than trusting the tombstone to still be
@@ -2087,12 +2151,16 @@ export class ChatHistoryStore {
           // In-memory alone loses the retry when the tab closes, and if the capped
           // tombstone map has aged the id out by the time a new tab looks, nothing
           // ever retries and the record can restore.
-          if (this._pendingLegacyDeletes.size !== before) {
-            try {
-              await idbWritePendingDeletes(this.indexedDb, [...this._pendingLegacyDeletes]);
-            } catch {
-              // Best effort: the in-memory set still drives retries in this tab.
-            }
+          //
+          // The DELTA, never the whole set (codex r4): another tab's outstanding
+          // delete must not be erased by this tab writing a list that predates it.
+          try {
+            await idbMergePendingDeletes(this.indexedDb, {
+              add: deleted ? [] : tombstoned,
+              remove: deleted ? tombstoned : [],
+            });
+          } catch {
+            // Best effort: the in-memory set still drives retries in this tab.
           }
         }
         return merged;
@@ -2196,6 +2264,7 @@ export class ChatHistoryStore {
           // which is correct: there is nothing left to owe a delete to.
           this._durableLegacy = new Map();
           this._pendingLegacyDeletes = new Set();
+          this._legacyDeletesDone = new Set();
         }
         return { reset, legacyCleared };
       })

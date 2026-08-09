@@ -721,3 +721,71 @@ test("the pending-delete marker is never mistaken for a transcript", async () =>
   }
   assert.equal(reader._durableLegacy.has("__cmcp_pending_deletes"), false, "the marker is not a receipt");
 });
+
+// ── codex r4 ───────────────────────────────────────────────────────────────
+
+test("one tab finishing its delete does not erase another tab's pending intent", async () => {
+  // The lost update codex named. Tab A finishes L0 and would write []; tab B's delete
+  // of L1 failed and wrote [L1]. A whole-list overwrite from A erases B's durable
+  // intent — then B closes, L1's capped tombstone ages out, and the reload hole is
+  // back. The write is a merge inside one transaction, so A only removes what A
+  // finished.
+  const indexedDb = createFakeIndexedDb();
+  const tabB = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  tabB.persist([legacyThread("L0", 1), legacyThread("L1", 2), legacyThread("L2", 3)], {});
+  await tabB._writePromise;
+
+  indexedDb._state.failDelete = true;
+  tabB.persist([legacyThread("L0", 1), legacyThread("L2", 3)], {
+    deletedThreads: { L1: { updatedAt: 5, writerId: "b", sequence: 1 } },
+  });
+  await tabB._writePromise;
+  indexedDb._state.failDelete = false;
+  assert.ok(tabB._pendingLegacyDeletes.has("L1"), "precondition: B owes a delete");
+
+  // Tab A: never saw L1's tombstone, and finishes its OWN delete of L0.
+  const tabA = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  tabA.persist([legacyThread("L2", 3)], {
+    deletedThreads: { L0: { updatedAt: 9, writerId: "a", sequence: 1 } },
+  });
+  await tabA._writePromise;
+  assert.equal(indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).has("L0"), false, "A's delete landed");
+
+  // A third tab must still inherit B's intent.
+  const tabC = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  await tabC._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.ok(
+    tabC._pendingLegacyDeletes.has("L1"),
+    "another tab's outstanding delete must survive an unrelated tab's completion",
+  );
+});
+
+test("a thread whose id IS the reserved marker key is never stored", async () => {
+  // Ids are normally crypto.randomUUID(), but an IMPORTED history can carry anything.
+  // Storing it would have the thread and the marker overwrite each other.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const collide = { ...legacyThread("x", 1), id: "__cmcp_pending_deletes" };
+  store.persist([collide, legacyThread("L1", 2)], {});
+  await store._writePromise;
+  const marker = indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).get("__cmcp_pending_deletes");
+  assert.ok(!marker || !Array.isArray(marker.msgs), "a transcript must not occupy the marker key");
+  assert.equal(
+    store._durableLegacy.has("__cmcp_pending_deletes"),
+    false,
+    "…and it must not be granted a receipt, so it stays unevictable",
+  );
+});
+
+test("the marker is filtered structurally, not by key name", async () => {
+  // One place decides what a transcript is: a record with a string `id`.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  store.persist([legacyThread("L0", 1)], {});
+  await store._writePromise;
+  // Any non-thread record, whatever its key, must not surface as history.
+  indexedDb._stores.get(CHAT_HISTORY_LEGACY_STORE).set("some-other-meta", { ids: ["z"] });
+  const reader = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const restored = await reader._restoreLegacyShadow({ threads: [], meta: {} });
+  assert.deepEqual((restored.threads || []).map((t) => t.id), ["L0"]);
+});
