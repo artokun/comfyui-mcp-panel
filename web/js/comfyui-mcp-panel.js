@@ -359,6 +359,7 @@ import {
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
+  rootContentProvesActiveWorkflow,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
@@ -5107,6 +5108,28 @@ function assertGraphBoundToActiveWorkflow(
   // drifted binding the tracker cannot prove is panel_open_workflow's proven
   // repaint re-stamp. The ONE exception is the both-empty stale tag below
   // (#565): with zero nodes on either side there is no content to protect.
+  // #817 — the exclusivity proof is computed HERE, above the rebind, because BOTH
+  // decisions below need it: the stale-tag rebind and the unstamped-root seal ask
+  // the same question (is this canvas provably the active workflow's?) and must not
+  // answer it differently.
+  let sealProofExclusive = false;
+  try {
+    const others = app?.extensionManager?.workflow?.openWorkflows;
+    if (Array.isArray(others)) {
+      sealProofExclusive = true;
+      for (const other of others) {
+        if (!other || sameWorkflowObject(other, activeWorkflow)) continue;
+        if (other.isModified === true) continue; // unprovable — not evidence of ambiguity
+        const otherState = other.changeTracker?.activeState ?? other.activeState;
+        if (graphRootMatchesState({ rootGraph, state: otherState })) {
+          sealProofExclusive = false; // a proven identical twin — binding is ambiguous
+          break;
+        }
+      }
+    }
+  } catch {
+    sealProofExclusive = false; // enumeration failed → exclusivity unproven → no seal
+  }
   let rootUuidMismatch = graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid });
   if (rootUuidMismatch) {
     const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
@@ -5133,8 +5156,24 @@ function assertGraphBoundToActiveWorkflow(
     // guard below.
     const staleTagOnEmptyCanvas =
       graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
+    // #817 — a tab switch leaves the PREVIOUS workflow's tag on the reused
+    // app.graph, so a canvas that IS the active workflow's was refused where an
+    // untagged copy of it was allowed, and nothing self-healed it: the seal below
+    // declines a root that already carries a tag. Same proof the seal accepts.
+    const contentProvesActiveWorkflow = rootContentProvesActiveWorkflow({
+      rootGraph,
+      activeWorkflow,
+      inSubgraph,
+      proofExclusive: sealProofExclusive,
+    });
     if (
-      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow, staleTagOnEmptyCanvas }) === "rebind"
+      resolveGraphRootUuidRebind({
+        rootGraph,
+        activeWorkflowUuid,
+        rootTagClaimedByActiveWorkflow,
+        staleTagOnEmptyCanvas,
+        contentProvesActiveWorkflow,
+      }) === "rebind"
     ) {
       try {
         stampGraphRootWorkflowUuid(rootGraph, activeWorkflowUuid, activeWorkflow);
@@ -5163,24 +5202,6 @@ function assertGraphBoundToActiveWorkflow(
   // exclusivity check itself cannot run — the seal stays off and the command
   // keeps the pre-seal fail-closed behaviour. A DIRTY twin cannot prove a match
   // (its tracker may lag) and does not block the seal.
-  let sealProofExclusive = false;
-  try {
-    const others = app?.extensionManager?.workflow?.openWorkflows;
-    if (Array.isArray(others)) {
-      sealProofExclusive = true;
-      for (const other of others) {
-        if (!other || sameWorkflowObject(other, activeWorkflow)) continue;
-        if (other.isModified === true) continue; // unprovable — not evidence of ambiguity
-        const otherState = other.changeTracker?.activeState ?? other.activeState;
-        if (graphRootMatchesState({ rootGraph, state: otherState })) {
-          sealProofExclusive = false; // a proven identical twin — binding is ambiguous
-          break;
-        }
-      }
-    }
-  } catch {
-    sealProofExclusive = false; // enumeration failed → exclusivity unproven → no seal
-  }
   sealProvenRootBinding({
     rootGraph,
     activeWorkflow,

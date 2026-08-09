@@ -1241,6 +1241,20 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
  *                zero nodes on BOTH sides there is no workflow content that
  *                could be confused — the #349 fence protects CONTENT — so the
  *                leftover tag is stale metadata: re-stamp and proceed;
+ *                Also when `contentProvesActiveWorkflow` is set (#817): the live
+ *                root serializes EQUAL to the active workflow's own current
+ *                state, on a clean tab, with no other open workflow able to
+ *                claim the same canvas. That is the same proof
+ *                `sealProvenRootBinding` accepts to stamp an UNTAGGED root, and
+ *                the evidence does not get weaker because a stale tag happens to
+ *                be sitting on the object. The asymmetry it removes was the #817
+ *                report: switching tabs leaves the PREVIOUS workflow's tag on the
+ *                reused app.graph (configure does not reset graph.extra — the
+ *                same mechanism the empty-canvas clause above records), so a
+ *                canvas that IS the active workflow's, byte for byte, was refused
+ *                where an untagged copy of it was allowed. Nothing self-healed
+ *                it: the seal declines a root that already carries a tag, so a
+ *                WRONG tag was stickier than no tag at all;
  *   "conflict" — anything else. A tag claimed by a FOREIGN open workflow is the
  *                #349 wrong-canvas case, and a tag NOBODY claims may be a
  *                closed tab's stale canvas — re-stamping either would authorize
@@ -1253,9 +1267,12 @@ export function resolveGraphRootUuidRebind({
   activeWorkflowUuid,
   rootTagClaimedByActiveWorkflow = false,
   staleTagOnEmptyCanvas = false,
+  contentProvesActiveWorkflow = false,
 } = {}) {
   if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "none";
-  return rootTagClaimedByActiveWorkflow || staleTagOnEmptyCanvas ? "rebind" : "conflict";
+  return rootTagClaimedByActiveWorkflow || staleTagOnEmptyCanvas || contentProvesActiveWorkflow
+    ? "rebind"
+    : "conflict";
 }
 
 /**
@@ -1322,6 +1339,41 @@ export function graphCommandMayMutateWorkflow(command) {
  *     keeps the pre-seal fail-closed behaviour.
  * Returns true only when it actually wrote the stamp.
  */
+/**
+ * POSITIVE proof that the live root graph IS the active workflow's own canvas,
+ * from its CONTENT alone — independent of whatever identity tag it happens to
+ * carry.
+ *
+ * This is the bar `sealProvenRootBinding` has always used; #817 lifted it out so
+ * a second caller could ask the same question without the two drifting. Every
+ * clause is load-bearing:
+ *   - ROOT scope: a descended subgraph is not the workflow's root canvas;
+ *   - CLEAN tab: a dirty tracker's state can lag the real canvas (#545), so it
+ *     cannot prove anything about it;
+ *   - the root must serialize EQUAL to the workflow's own CURRENT state — not
+ *     its load baseline, which legitimately differs from an edited canvas;
+ *   - EXCLUSIVE: two clean, separately open DUPLICATE tabs can carry
+ *     byte-identical state, and equality alone cannot tell the active tab's
+ *     canvas from its twin's. The caller establishes this by enumerating the
+ *     other open workflows; an enumeration that cannot run is NOT exclusive.
+ */
+export function rootContentProvesActiveWorkflow({
+  rootGraph,
+  activeWorkflow,
+  inSubgraph = false,
+  proofExclusive = false,
+} = {}) {
+  try {
+    if (inSubgraph) return false;
+    if (proofExclusive !== true) return false;
+    if (!rootGraph || !activeWorkflow) return false;
+    if (activeWorkflow.isModified === true) return false;
+    return graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) });
+  } catch {
+    return false;
+  }
+}
+
 export function sealProvenRootBinding({
   rootGraph,
   activeWorkflow,
@@ -1330,14 +1382,11 @@ export function sealProvenRootBinding({
   proofExclusive = true,
 } = {}) {
   try {
-    if (inSubgraph) return false;
-    if (proofExclusive !== true) return false;
-    if (!rootGraph || !activeWorkflow) return false;
     if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
-    if (activeWorkflow.isModified === true) return false;
+    // A CONFLICTING stamp is the rebind path's decision, never overwritten here.
     const existing = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
     if (typeof existing === "string" && existing) return false;
-    if (!graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) })) {
+    if (!rootContentProvesActiveWorkflow({ rootGraph, activeWorkflow, inSubgraph, proofExclusive })) {
       return false;
     }
     const extra =
