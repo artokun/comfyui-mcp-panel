@@ -789,3 +789,18 @@ test("the marker is filtered structurally, not by key name", async () => {
   const restored = await reader._restoreLegacyShadow({ threads: [], meta: {} });
   assert.deepEqual((restored.threads || []).map((t) => t.id), ["L0"]);
 });
+
+test("a legacy write with nothing to store returns [] — never true", async () => {
+  // codex r5. Callers do `new Set(written || [])`, and `new Set(true)` THROWS. A
+  // history whose only legacy thread was refused for colliding with the reserved key
+  // would have broken restoration outright, in the uncaught restore path — turning a
+  // fail-closed input into a hard failure.
+  const indexedDb = createFakeIndexedDb();
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb });
+  const onlyCollide = { ...legacyThread("x", 1), id: "__cmcp_pending_deletes" };
+  store.persist([onlyCollide], {});
+  await store._writePromise;
+  const read = await store.readCanonical();
+  assert.ok(read, "restoration must survive a write list that filtered down to nothing");
+  assert.equal(store._durableLegacy.has("__cmcp_pending_deletes"), false, "and grant no receipt");
+});

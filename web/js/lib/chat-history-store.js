@@ -1490,9 +1490,9 @@ async function idbMergePendingDeletes(indexedDb, { add = [], remove = [] } = {})
 /** Delete legacy records by key — used for tombstoned threads (#861, codex P1). */
 async function idbDeleteLegacy(indexedDb, ids) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => typeof id === "string" && id))];
-  if (!list.length) return [];
+  if (!list.length) return true;
   const db = await openDb(indexedDb);
-  if (!db) return null;
+  if (!db) return false;
   try {
     if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return null;
     return await new Promise((resolve) => {
@@ -1569,11 +1569,15 @@ async function idbWriteLegacy(indexedDb, threads) {
         // outcome, not a silent overwrite of either record by the other.
         && t.id !== LEGACY_PENDING_DELETES_KEY)
     : [];
-  if (!list.length) return true;
+  // `[]`, not `true` (codex r5). Callers do `new Set(written || [])`, and
+  // `new Set(true)` THROWS — so a history whose only legacy thread was refused for
+  // colliding with the reserved key would have broken restoration outright, in the
+  // uncaught restore path. A fail-closed input has to fail closed all the way down.
+  if (!list.length) return [];
   const db = await openDb(indexedDb);
-  if (!db) return false;
+  if (!db) return null;
   try {
-    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return false;
+    if (!db.objectStoreNames.contains(CHAT_HISTORY_LEGACY_STORE)) return null;
     return await new Promise((resolve) => {
       let tx;
       try {
