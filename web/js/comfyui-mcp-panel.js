@@ -11645,6 +11645,34 @@ const GRAPH_TOOL_EXECUTORS = {
       // LiteGraph canvas flag, not a workflow-service member.
         beginWorkflowReloadStep(reloadGuardToken);
         try {
+          // #874 — CAPTURE THE LIVE CANVAS, not the last thing a user touched.
+          //
+          // This repaint reloads the graph from `activeState`, and ComfyUI's
+          // ChangeTracker captures on USER INPUT events only. So every value a NODE
+          // wrote without user input — an ImpactWildcardEncode populate, a
+          // control_after_generate roll, a subgraph proxy the frontend filled in — is
+          // absent from that snapshot, and reloading it REVERTED them. Silently:
+          // nothing errored and the graph looked right afterwards. Measured in a live
+          // browser: live width 775, snapshot [768, 768, 1].
+          //
+          // `checkState()` is the tracker's own capture — the same call the command
+          // dispatch already makes after every successful command, for exactly this
+          // reason. Taking it here makes the snapshot mean what this repaint has always
+          // assumed it means.
+          //
+          // It DIFFS FIRST, so an unchanged canvas stays a no-op and no undo entry
+          // appears. Where it does find a change it records one, which is the honest
+          // outcome rather than a side effect: the change really happened, and until
+          // now it was silently discarded instead of being undoable.
+          //
+          // Best-effort. A frontend without `checkState` behaves exactly as before —
+          // this must never be the thing that fails an open.
+          try {
+            target.changeTracker?.checkState?.();
+          } catch {
+            // A tracker that refuses to capture leaves the stale snapshot in place,
+            // which is today's behaviour, not a new failure.
+          }
           // `activeWorkflowNodeCount` deliberately accepts both tracker-owned and flat
           // activeState shapes. Use that SAME state source here: otherwise a frontend
           // that reports the active workflow's 15 nodes through flat `target.activeState`
