@@ -20,6 +20,14 @@ All notable changes to this project are documented here. This project adheres to
   immediately instead of leaving it decoding behind a hidden box, and expanding an
   off-screen card does not resurrect one (#818, #823)
 
+### Fixed
+- An UNREACHABLE ComfyUI-Manager catalogue no longer renders as an empty node list. A
+  `getmappings` cache that was never populated — because Manager itself could not reach the
+  registry — answers HTTP 200 with `{}`, which came back as `count: 0` and read as “nothing
+  matched”, so a user behind a filter kept trying variations of a search that could never
+  succeed. A zero-entry catalogue is now reported as its own state: nothing was searched
+  (#808, #826)
+
 ## [0.11.46] - 2026-08-08
 
 > Covers changes since 0.11.45.
