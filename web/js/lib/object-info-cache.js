@@ -51,6 +51,17 @@
  * ≤1.5s for out-of-panel removals", and someone weighing the TTL later needs that sentence.
  */
 
+/**
+ * The tag that marks a loader's return value as an OUTCOME WRAPPER rather than the
+ * schema itself.
+ *
+ * A structural `"defs" in value` test would collide with a real node type named
+ * `defs` (codex): a bare schema containing one would be misread as a wrapper, and that
+ * single definition would become the cached schema. A Symbol cannot appear in JSON, so
+ * only a producer that deliberately tagged its result can be mistaken for one.
+ */
+export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
+
 /** How long a fetched payload may be reused. */
 export const OBJECT_INFO_CACHE_TTL_MS = 1500;
 
@@ -106,11 +117,19 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
           // Store only a USABLE payload from a still-current generation. Caching a
           // null/empty would pin the fence's fail-closed state for the whole TTL, turning
           // one transient failure into a second and a half of refused writes.
+          // #982 — the loader may return either the schema map itself or an OUTCOME
+          // wrapper `{ defs, failures }`, so a caller that JOINS an in-flight failed
+          // read still receives the diagnostics of the attempt that actually ran. The
+          // usability test therefore looks at the payload the fence will rule on, not at
+          // the wrapper around it — a wrapper carrying `defs: null` has two keys and
+          // would otherwise be cached as a success, pinning fail-closed for the TTL,
+          // which is exactly what this file exists to prevent (codex).
+          const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
           if (
             issuedAt === generation &&
-            defs &&
-            typeof defs === "object" &&
-            Object.keys(defs).length > 0
+            payload &&
+            typeof payload === "object" &&
+            Object.keys(payload).length > 0
           ) {
             // SHARED IDENTITY IS NEW (codex): every write used to get its own object, and
             // now they share one. A consumer that mutated the map would contaminate every
