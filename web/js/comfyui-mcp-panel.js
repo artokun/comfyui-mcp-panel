@@ -1821,6 +1821,41 @@ function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) 
 // tab-switch/reconnect race it can still be the prior tab's graph, so letting it
 // establish a previously-unseen workflow object's UUID would adopt that prior
 // tab before the graph-binding fence can reject it (#545 P1).
+/**
+ * #945 — RETURNS NULL ON EVERY FRONTEND OBSERVED HERE, and that is a finding
+ * rather than a bug in this function.
+ *
+ * The ComfyWorkflow class (0.31.1 / frontend 1.44.19) carries `changeTracker`,
+ * `_isModified`, `pendingWarnings`, `initialMode`, `activeMode`, `shareId` and
+ * getters for `activeState`/`initialState`. It has no `extra`, no `workflow` and
+ * no `data`, so no rung of this chain can match. The uuid IS on the object — via
+ * `activeState.extra` — one field away from where this looks.
+ *
+ * The chain has never been observed working HERE: it arrived in 525116a (#101)
+ * as a fallback "used by older builds", and no fixture in this repo has ever
+ * given a workflow OBJECT an `extra` to exercise it. That is not proof it was
+ * never real on some older release — nobody has one in hand to check (codex) —
+ * but no supported path currently reaches it.
+ *
+ * CONSEQUENCE, because the callers read as though they handle a real value:
+ * `embeddedWorkflowUuid(wf, { allowGraph: false })` is null on the observed
+ * frontend, so `shouldForkEmbeddedWorkflowUuid` and
+ * `shouldForkEmbeddedUuidForLiveOwner` short-circuit on their first line. They
+ * are UNREACHED THERE, not broken — given a value they still decide correctly,
+ * which is pinned in browser_tests/unit/embedded-uuid-carrier.test.mjs.
+ *
+ * THE SAME CHAIN APPEARS TWICE. It is also the fallback tail of
+ * `activeWorkflowExtra`, reached only if the ROOT graph's `extra` cannot be
+ * taken — which on this frontend always succeeds. That is precisely why
+ * `allowGraph: true` works and `allowGraph: false` does not: the graph carrier
+ * answers first, and the workflow-owned tail behind it has never had to.
+ *
+ * WHAT IS NOT BROKEN, and why this has stayed invisible: identity persistence
+ * does NOT depend on this chain. The loadGraphData wrapper stamps the uuid into
+ * `graphData.extra`, and `rootGraph.extra` carries it on the live canvas — which
+ * is what a save serializes into the file. The durable carrier works; it is this
+ * workflow-OBJECT-local one that does not (codex).
+ */
 function workflowOwnedExtra(wf = activeWorkflowRef()) {
   const candidate = wf?.extra || wf?.workflow?.extra || wf?.data?.extra;
   return candidate && typeof candidate === "object" ? candidate : null;
@@ -2100,6 +2135,33 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
       // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
       // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
+      // #945 — THIS WRITE DOES NOT LAND ON THE OBSERVED COMFYUI, though the
+      // guarantee above it is still met by another path. `workflowOwnedExtra` reads
+      // `wf.extra || wf.workflow.extra || wf.data.extra`, and the ComfyWorkflow
+      // class (0.31.1 / frontend 1.44.19) has none of them — it carries
+      // `changeTracker`, `_isModified`, `pendingWarnings`, `initialMode`,
+      // `activeMode`, `shareId`, and getters for `activeState`/`initialState`.
+      // So `extra` is null, the guard below is false, and nothing is written HERE.
+      //
+      // BUT THE IDENTITY IS STILL PERSISTED, by the loadGraphData wrapper stamping
+      // `graphData.extra` and by `rootGraph.extra` on the live canvas — which is
+      // what a save serializes. The promise above is kept by that path, not by
+      // this one. An earlier version of this comment said neither guarantee held;
+      // that was wrong, and the difference is exactly why #945 has no user-visible
+      // symptom (codex).
+      //
+      // The chain was never observed working: it arrived in 525116a (#101) as a
+      // fallback "used by older builds" — a guess about frontends nobody had in
+      // hand — and no fixture in this repo has ever given a workflow OBJECT an
+      // `extra` to exercise it.
+      //
+      // Left in place deliberately rather than deleted or repointed:
+      // `activeState.extra` is the field that actually holds the uuid, but
+      // writing there MOVES where identity persists (it stops reaching
+      // `app.graph.extra`), which is a real behaviour change and was reverted
+      // once already for exactly that reason. The carrier decision belongs with
+      // whoever owns #945; this comment exists so the next reader is not told a
+      // guarantee that does not happen.
       try {
         const extra = workflowOwnedExtra(wf);
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
