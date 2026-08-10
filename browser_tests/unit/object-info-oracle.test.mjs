@@ -293,3 +293,12 @@ test("#982 (codex r3) a node type literally named `defs` is not mistaken for an 
   assert.deepEqual(await tagged.read(async () => outcome), outcome);
   assert.equal(tagged.peek().cached, true);
 });
+
+test("#982 (codex r4) blank entries: the slice-first order is documented, not accidental", () => {
+  // Slicing before sanitizing is what bounds the work, and for the inputs this module
+  // produces (every recorded attempt is non-empty) the two orders agree. They do NOT
+  // agree for arbitrary caller input, and this pins the behaviour that follows from the
+  // order actually chosen, so nobody reads the surviving mutant as "it makes no difference".
+  assert.equal(objectInfoOracleFailureNote(["", "", "", "", "x"]), "", "four blanks consume the window");
+  assert.match(objectInfoOracleFailureNote(["x", "", "", "", ""]), /Tried 5 routes: x \(and 1 more not shown\)\./);
+});

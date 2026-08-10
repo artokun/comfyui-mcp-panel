@@ -165,10 +165,15 @@ export function objectInfoOracleFailureNote(failures) {
   // unbounded work even though the string it produces is bounded. The dropped count
   // comes from the ORIGINAL length, so truncation is still reported honestly.
   //
-  // NO TEST PINS THIS ORDER, and that is stated rather than papered over: swapping the
-  // slice and the map produces an identical string, so it is a cost property with no
-  // observable output. Mutation testing confirms the swap survives. It is written this
-  // way deliberately; a later edit that reverses it will not be caught by the suite.
+  // NO TEST PINS THIS ORDER, and that is stated rather than papered over. For the inputs
+  // this module produces the two orders are output-identical — every attempt it records
+  // is non-empty — so mutation testing shows the swap surviving, and a later edit that
+  // reverses it will not be caught by the suite.
+  //
+  // They are NOT identical for arbitrary caller input (codex): a list whose first four
+  // entries are blank yields no note this way, and a note naming the fifth the other way.
+  // Slicing first is still the right order — it is what bounds the work — and this is the
+  // one case where the two differ, recorded so nobody has to rediscover it.
   const shown = failures.slice(0, MAX_FAILURES_REPORTED).map((f) => sanitizeDetail(f)).filter(Boolean);
   if (!shown.length) return "";
   const dropped = failures.length - Math.min(failures.length, MAX_FAILURES_REPORTED);
