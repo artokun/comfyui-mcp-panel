@@ -157,6 +157,7 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
+import { materializePromotedValues, materializedValuesNote } from "./lib/unpack-promoted-values.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -13177,6 +13178,26 @@ const GRAPH_TOOL_EXECUTORS = {
       rollback = null; // couldn't snapshot — we'll still surface a clean error below
     }
     const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    // #979 — carry PROMOTED values inward BEFORE the unpack. `unpackSubgraph` inlines
+    // the INNER widget's value and drops the parent rail's, so a promoted widget the
+    // user set on the parent came back as whatever the inner node was created with —
+    // measured, and the reporter lost a long custom prompt to a pack's template
+    // default that way. #366 makes the rail authoritative (it is what serializes at
+    // queue time), so rail → inner is the direction that preserves what the graph
+    // would actually have rendered.
+    //
+    // Before, not after: unpack is DESTRUCTIVE, and once the subgraph is gone the
+    // rail is gone with it — there is nothing left to recover the value from.
+    // Never allowed to block the unpack the caller asked for; a failure here reduces
+    // what is carried and is reported.
+    let materialized = null;
+    try {
+      materialized = materializePromotedValues(node, (sgNode, widgetName) =>
+        resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
+      );
+    } catch {
+      materialized = null;
+    }
     // unpackSubgraph wraps its own beforeChange/afterChange for undo, so don't
     // nest another pair here.
     try {
@@ -13209,6 +13230,12 @@ const GRAPH_TOOL_EXECUTORS = {
         node_id,
         new_node_ids: newNodeIds,
         node_count: newNodeIds.length,
+        // #979 — disclose what was carried inward. An unpack cannot be undone from
+        // this result, so a caller checking values afterwards needs to know which
+        // ones this moved, and which widgets it could not match.
+        ...(materialized?.applied?.length ? { promoted_values_carried: materialized.applied } : {}),
+        ...(materialized?.unresolved?.length ? { promoted_values_unresolved: materialized.unresolved } : {}),
+        ...(materializedValuesNote(materialized) ? { promoted_values_note: materializedValuesNote(materialized) } : {}),
       },
     };
   },
