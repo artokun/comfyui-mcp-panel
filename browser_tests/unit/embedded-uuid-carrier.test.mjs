@@ -5,7 +5,10 @@
 // `wf.extra` / `wf.workflow.extra` / `wf.data.extra` EVER populated by a ComfyUI
 // this pack supports, or has the chain been aspirational from the start?
 //
-// ANSWER: aspirational, on all the evidence available here.
+// ANSWER: no supported path reaches it. Three pieces of evidence, and one limit
+// on how far they generalise (codex: they cannot establish a historical
+// universal across every release this pack claims to support — nobody has an
+// old frontend in hand to check).
 //
 //  1. THE CLASS DOES NOT HAVE THOSE FIELDS. ComfyUI 0.31.1 / frontend 1.44.19,
 //     read off the shipped bundle:
@@ -30,11 +33,21 @@
 //     in this repo gives a workflow OBJECT an `extra` — the ones that do are
 //     serialized graphs, which is a different thing.
 //
-// So this file pins the CONTRACT rather than the bug. It asserts the helper
-// behaves correctly when a carrier is present, and separately records that the
-// real frontend shape yields nothing — the second half deliberately as a
-// documented observation, not as a requirement, so that the day someone gives
-// these functions a real carrier the suite does not fight them.
+// WHAT IS NOT BROKEN, and why this has no user-visible symptom: identity
+// persistence does not depend on this chain at all. The loadGraphData wrapper
+// stamps the uuid into `graphData.extra` and `rootGraph.extra` carries it on the
+// live canvas, which is what a save serializes. An earlier draft of this file
+// said the persistence guarantee was unmet; that was wrong (codex).
+//
+// So this pins the CONTRACT rather than the bug: the helper behaves when a
+// carrier is present, the real class shape yields nothing, and the source still
+// reads the fields this file models. The "yields nothing" half is deliberately a
+// documented observation, not a requirement, so the day someone supplies a real
+// carrier the suite does not fight them.
+//
+// The helpers under test are module-private, so the shapes below are MODELLED
+// (codex): the source assertion at the bottom is what ties this file to the
+// production chain, and it fails if the chain changes.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -138,7 +151,7 @@ test("so both fork guards are handed null, and decide nothing", () => {
   );
 });
 
-test("…and they DO decide, the moment a carrier exists — they are unreachable, not broken", () => {
+test("…and they DO decide the moment a carrier exists: unreached here, not broken", () => {
   // The distinction that matters to whoever restores the carrier: give these the
   // value the call site cannot, and they behave. So fixing the carrier restores
   // real behaviour rather than uncovering a second defect.
@@ -165,16 +178,19 @@ test("…and they DO decide, the moment a carrier exists — they are unreachabl
   );
 });
 
-test("the WRITE is a no-op too — a documented guarantee that never happens", () => {
+test("the object-local WRITE is a no-op — but the graph stamp still persists identity", () => {
   // The embed at the same site goes through the same null carrier:
   //
   //   const extra = workflowOwnedExtra(wf);   // null on this frontend
   //   if (extra) { extra[NS] = { workflow_uuid: id } }   // never runs
   //
   // The comment above it promises the identity persists "so a reload of the SAME
-  // content keeps it, AND a later SAVE carries it into the saved file across the
-  // tmp:->wf: transition". On the real class that write cannot land, so neither
-  // guarantee holds. This is the half of #945 with a user-visible consequence.
+  // content keeps it, AND a later SAVE carries it into the saved file". On the
+  // real class THIS write cannot land — but the guarantee is still met, by the
+  // loadGraphData wrapper stamping `graphData.extra` and by `rootGraph.extra` on
+  // the live canvas, which is what a save serializes. An earlier draft claimed
+  // neither guarantee held; that was wrong (codex), and the difference is exactly
+  // why #945 has no user-visible symptom.
   const wf = realComfyWorkflow();
   const extra = workflowOwnedExtra(wf);
   assert.equal(extra, null, "there is nothing to write into");
@@ -185,4 +201,39 @@ test("the WRITE is a no-op too — a documented guarantee that never happens", (
   assert.ok(target, "a real carrier is writable");
   target.comfyui_mcp = { workflow_uuid: "abc" };
   assert.equal(withCarrier.extra.comfyui_mcp.workflow_uuid, "abc");
+});
+
+// ── SOURCE ────────────────────────────────────────────────────────────────
+// `workflowOwnedExtra` and `embeddedWorkflowUuid` are module-private inside the
+// panel bundle, so the checks above necessarily model them. That model is only
+// worth anything while it MATCHES, and a copy silently drifting from its
+// original is its own defect — so the chain is asserted against the real source.
+test("SOURCE: the modelled chain is the one production actually reads", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+
+  // The exact candidate chain this file reimplements.
+  assert.match(
+    src,
+    /const candidate = wf\?\.extra \|\| wf\?\.workflow\?\.extra \|\| wf\?\.data\?\.extra;/,
+    "the carrier chain changed — update the model above, and re-check #945's conclusion",
+  );
+  // The call site that feeds the fork guards a permanently-null value.
+  assert.match(
+    src,
+    /const embedded = embeddedWorkflowUuid\(wf, \{ allowGraph: false \}\);/,
+    "the guards are no longer fed from the workflow-owned carrier",
+  );
+  // Both guards still read the value under the name the tests use, so a rename
+  // cannot make these assertions pass by not applying.
+  assert.match(src, /shouldForkEmbeddedWorkflowUuid\(\{[\s\S]{0,200}embeddedUuid: embedded,/);
+  assert.match(src, /shouldForkEmbeddedUuidForLiveOwner\(\{[\s\S]{0,200}embeddedUuid: embedded,/);
+
+  // And the OTHER carrier — the one that actually works — is still there, so the
+  // "no user-visible symptom" reasoning above stays true.
+  assert.match(
+    src,
+    /graphData\.extra && typeof graphData\.extra === "object"/,
+    "the graph-extra stamp is gone — identity persistence may now genuinely be broken",
+  );
 });
