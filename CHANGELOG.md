@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.75] - 2026-08-10
+
+> Covers changes since 0.11.74.
+
+### Fixed
+
+- **Installing a custom node from a GitHub URL actually clones it now (#920).** Passing a
+  repository URL queued a search of the node registry instead, and failed with
+  *"Node 'ComfyUI-SolAttn_triton@nightly' not found"* — because the panel reduced your URL
+  to just the repo's name and threw the rest away, leaving ComfyUI-Manager nothing to
+  clone from.
+
+  The URL is now passed through. Manager's own install parameters require it for a
+  nightly install, which is the case this was reported against.
+
+  The workaround of putting the URL in `id` instead still works and is unchanged.
+
 ## [0.11.74] - 2026-08-09
 
 > Covers changes since 0.11.73.
