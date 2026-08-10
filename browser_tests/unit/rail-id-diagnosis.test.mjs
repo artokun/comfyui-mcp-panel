@@ -45,27 +45,40 @@ test("the reporter's id resolves as a rail — so 'no such node' was never true"
   assert.equal(found.rail, "output");
 });
 
-test("says what the id IS, and that it exists", () => {
+test("says what the id IS, and where it resolved", () => {
   const msg = describeRailNodeTarget(-20, "output");
   assert.match(msg, /OUTPUT BOUNDARY RAIL/);
   assert.match(msg, /rails\.output\.rail_node_id/);
-  assert.match(msg, /not a stale or foreign id/);
+  assert.match(msg, /in the graph you are viewing/);
 });
 
-test("drops all three false claims", () => {
+test("drops the false claims — WITHOUT replacing them with a new one", () => {
   const msg = describeRailNodeTarget(-20, "output");
-  assert.ok(!/different workflow/.test(msg), "the id came from this graph");
-  assert.ok(!/was removed/.test(msg), "nothing was removed");
-  assert.ok(
-    !/Re-read with panel_graph_outline/.test(msg),
-    "re-reading returns the same id — that is the loop the reporter ran",
-  );
+  assert.ok(!/may be from a different workflow/.test(msg), "the id came from this graph");
+  assert.ok(!/the node was removed/.test(msg), "nothing was removed");
+  // The first draft asserted "this is not a stale or foreign id". It cannot know
+  // that (codex review): node ids are arbitrary integers, so an ordinary node may
+  // once have held this id and been deleted. The message reports what RESOLVED and
+  // leaves the one case it cannot rule out standing.
+  assert.ok(!/not a stale or foreign id/.test(msg), "an unprovable claim");
 });
 
-test("names what DOES accept a rail id, rather than only refusing", () => {
+test("keeps the re-read remedy available for the case it IS right for", () => {
   const msg = describeRailNodeTarget(-20, "output");
-  assert.match(msg, /panel_move_node/);
-  assert.match(msg, /move_rail/);
+  // Not as the headline — prescribing it for a rail_node_id is the loop the
+  // reporter ran — but a stale ordinary id that collides with a rail is real, and
+  // for that caller re-reading is exactly right.
+  assert.match(msg, /If you meant an ORDINARY node with this id/);
+  assert.match(msg, /re-read\s+panel_graph_outline if that is your case/);
+});
+
+test("names what accepts a rail id — and how each one actually takes it", () => {
+  const msg = describeRailNodeTarget(-20, "output");
+  // panel_move_node takes the ID (pos only); panel_move_rail takes the SIDE. Saying
+  // "both accept rail ids" would send a caller to pass -20 to a tool whose schema is
+  // rail:"input"|"output" — verified against the registration, not assumed.
+  assert.match(msg, /panel_move_node DOES accept a rail id, but only to reposition it/);
+  assert.match(msg, /panel_move_rail addresses the same rail by SIDE/);
 });
 
 test("does NOT invent an unexpose tool — that half is parked", () => {

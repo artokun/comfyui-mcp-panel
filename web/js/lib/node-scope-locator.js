@@ -188,14 +188,24 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot) {
 export function describeRailNodeTarget(nodeId, rail) {
   const side = rail === "input" ? "INPUT" : "OUTPUT";
   return (
-    `Id ${nodeId} is this subgraph's ${side} BOUNDARY RAIL, not an ordinary node — ` +
-    `it is the pseudo-node panel_query_graph reports as rails.${rail}.rail_node_id, ` +
-    `and it exists (so this is not a stale or foreign id). This operation acts on ` +
-    `ordinary graph nodes and their links, which is why it cannot take it. ` +
-    `Rail ids ARE accepted by panel_move_node and move_rail, if you meant to move it. ` +
-    `There is currently NO unexpose/remove-boundary operation: ` +
-    `expose_subgraph_input, expose_subgraph_output and move_rail are the whole ` +
-    `boundary surface. To REMOVE an exposed slot today, remove or replace the ` +
-    `interior node feeding it and the boundary slot is cleaned up automatically.`
+    `Id ${nodeId} resolves to this subgraph's ${side} BOUNDARY RAIL in the graph you ` +
+    `are viewing — the pseudo-node panel_query_graph reports as ` +
+    `rails.${rail}.rail_node_id. It is not an ordinary node, and this operation acts ` +
+    `on ordinary graph nodes and their links, which is why it cannot take it. ` +
+    `panel_move_node DOES accept a rail id, but only to reposition it (pos only — a ` +
+    `rail has nothing else to set); panel_move_rail addresses the same rail by SIDE ` +
+    `("${rail}") rather than by id. ` +
+    `There is currently NO unexpose/remove-boundary operation: expose_subgraph_input, ` +
+    `expose_subgraph_output and panel_move_rail are the whole boundary surface. To ` +
+    `REMOVE an exposed slot today, remove or replace the interior node feeding it and ` +
+    `the boundary slot is cleaned up automatically. ` +
+    // The one thing this CANNOT rule out, stated rather than glossed over: node ids
+    // are arbitrary integers, so an ordinary node may once have held this id and been
+    // removed. Then the id really is stale and re-reading is right — which is why the
+    // message says what resolved, not "your id is fine".
+    `(If you meant an ORDINARY node with this id, there is none in the graph you are ` +
+    `viewing. A removed node's id can collide with a rail's, so re-read ` +
+    `panel_graph_outline if that is your case — but an id taken from ` +
+    `rails.${rail}.rail_node_id is not.)`
   );
 }
