@@ -78,3 +78,38 @@ test("#636: the panel actually uses the display-name test", () => {
     "and compare it against the requested name",
   );
 });
+
+// ── Adding a saved blueprint by the name the library shows ──────────────────
+//
+// Same root cause as the preflight above: `graph_add_subgraph` built the type as
+// prefix + name and called getBlueprint(type). On a hash-keyed store that resolves to
+// nothing for the ONE name a user or agent would use — the one the library shows — while
+// the opaque hash worked.
+
+const addSite = src.slice(
+  src.indexOf("const asType = name.startsWith(prefix)"),
+  src.indexOf("const position = placementFor(graph, pos);"),
+);
+
+test("#636: the add path resolves a blueprint by display_name", () => {
+  assert.ok(addSite.length > 0, "the resolution must exist");
+  assert.match(addSite, /d\.display_name === name/, "the library name must be consulted");
+  assert.match(addSite, /store\.getBlueprint\(type\)/, "and resolved through the store");
+});
+
+test("#636: the caller's string is tried AS A TYPE first", () => {
+  // So an exact type or a hash resolves exactly as it did before, and this can only ever
+  // add a resolution that previously failed — never change one that already worked.
+  const typeFirst = addSite.indexOf("let type = asType;");
+  const displayAfter = addSite.indexOf("byDisplayName()");
+  assert.ok(typeFirst >= 0 && displayAfter > typeFirst, "display_name is the FALLBACK, not the first try");
+});
+
+test("#636: the refusal names both things the caller could pass", () => {
+  // The old message said only "No saved subgraph blueprint X", which on a hash-keyed
+  // store was true of the name the user could actually see — unhelpful precisely when it
+  // fired most.
+  const msg = src.slice(src.indexOf("No saved subgraph blueprint"), src.indexOf("const position = placementFor"));
+  assert.match(msg, /display_name/, "the library name is an accepted input and must be named");
+  assert.match(msg, /type/, "so is the type");
+});

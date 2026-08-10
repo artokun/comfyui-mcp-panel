@@ -13114,16 +13114,49 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!name || typeof name !== "string") throw new Error("name (blueprint name or type) is required");
     const store = getSubgraphStore();
     const prefix = store.typePrefix ?? "SubgraphBlueprint.";
-    const type = name.startsWith(prefix) ? name : `${prefix}${name}`;
     if (typeof store.getBlueprint !== "function") {
       throw new Error("subgraph store does not expose getBlueprint on this frontend");
     }
+    // #636 — RESOLVE THE NAME THE USER CAN SEE. Blueprints are keyed by a content hash on
+    // current ComfyUI (measured: 89 of 91 named `SubgraphBlueprint.<hash>`, the typed name
+    // in `display_name`, and `typePrefix` absent so the literal fallback above is what is
+    // used). Building the type as prefix+name therefore resolved to nothing for the ONLY
+    // name a user or agent would think to use — the one the library shows — while the
+    // opaque hash worked. Same root cause as the collision preflight fixed in 0.11.71.
+    //
+    // Order matters: the caller's string is tried AS a type first, so an exact type or a
+    // hash keeps resolving exactly as before and this can only ever add a resolution that
+    // previously failed. Only if that finds nothing is `display_name` consulted.
+    const asType = name.startsWith(prefix) ? name : `${prefix}${name}`;
+    const byDisplayName = () => {
+      const match = (store.subgraphBlueprints ?? []).find(
+        (d) => typeof d?.display_name === "string" && d.display_name === name,
+      );
+      return typeof match?.name === "string" ? match.name : null;
+    };
+    let type = asType;
     let bp;
     try {
       bp = store.getBlueprint(type);
-    } catch (err) {
+    } catch {
+      bp = null;
+    }
+    if (!bp) {
+      const viaDisplay = byDisplayName();
+      if (viaDisplay) {
+        type = viaDisplay;
+        try {
+          bp = store.getBlueprint(type);
+        } catch {
+          bp = null;
+        }
+      }
+    }
+    if (!bp) {
       throw new Error(
-        `No saved subgraph blueprint "${name}" (${coerceMessageText(err?.message ?? err)}). List them with panel_list_subgraphs.`,
+        `No saved subgraph blueprint "${name}" — neither as a blueprint type nor as the ` +
+          `name shown in the library. List them with panel_list_subgraphs and use either ` +
+          `the \`type\` or the \`display_name\` it reports.`,
       );
     }
     const position = placementFor(graph, pos);
