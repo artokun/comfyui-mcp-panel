@@ -69,9 +69,13 @@ export function installGitUrl({ id, repository } = {}) {
  *
  * A git URL (via `id` OR `repository`, any recognized protocol) always routes to
  * the repo-name-as-id payload: v4 installs by {id: repoName, selected_version:
- * ref||"nightly", channel:"dev"} (no files — v4 resolves by CNR/repo name);
- * v2-batch + legacy install the URL natively via {id: repoName, version:
- * "unknown", files:[url]}. A registry id keeps the versioned body. `id` is
+ * ref||"nightly", channel:"dev", repository: url}. The `repository` half was missing
+ * and is #920 — without it v4 has only the NAME and resolves it against the registry,
+ * which is a lookup rather than a clone; Manager's own InstallPackParams documents the
+ * field as "required if selected_version is nightly". v2-batch + legacy install the URL
+ * natively via {id: repoName, version: "unknown", files:[url]} — a different shape whose
+ * handler reads files[0], so they were never missing it. A registry id keeps the
+ * versioned body and carries no `repository` at all. `id` is
  * NEVER a full URL (a full URL matches nothing on v4 → silent "done"; on 3.x it
  * fails LATER while resolving, past the immediate `failed` array).
  */
