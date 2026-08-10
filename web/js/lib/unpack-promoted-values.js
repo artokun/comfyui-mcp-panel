@@ -135,10 +135,25 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
     const innerNode = resolved?.target?.node ?? null;
     if (!innerWidget) {
-      // A rail widget that does not resolve to an inner one is NOT assumed to be a
-      // promotion — the subgraph node's own widgets can include non-promoted ones.
-      // Reported so a caller can say the coverage was partial rather than complete.
-      unresolved.push({ widget: name });
+      // Two DIFFERENT outcomes, and collapsing them was the last hole (codex final).
+      //
+      //   promoted === false  -> definitively NOT a promotion. The subgraph node's own
+      //                          widgets can include ordinary ones, and refusing over
+      //                          those would block healthy unpacks. Merely disclosed.
+      //   promoted === true, no usable target -> a promotion we could not resolve.
+      //                          That is UNKNOWN, not "not a promotion", and an unknown
+      //                          on a destructive path must refuse: its value may be
+      //                          diverged and would be destroyed with nothing to
+      //                          recover from.
+      if (resolved?.promoted) {
+        unrecoverable.push({
+          widget: name,
+          reason: "resolves as promoted but its inner widget could not be identified, so it cannot be carried",
+          value_restored: true, // nothing was written; the graph is as it was found
+        });
+      } else {
+        unresolved.push({ widget: name });
+      }
       return;
     }
     let railValue;

@@ -175,6 +175,24 @@ test("#979 (codex): one hostile widget costs its own entry, not every rail after
   assert.deepEqual(res.unresolved, [], "no longer filed as merely unresolved");
 });
 
+test("#979 (codex final): promoted-but-unresolvable REFUSES; definitively-not-promoted does not", () => {
+  // Collapsing these was the last hole. `promoted: false` is proof the rail is an
+  // ordinary widget — refusing over those would block healthy unpacks. `promoted: true`
+  // with no usable target is an UNKNOWN, and its value may be diverged.
+  const unknown = materializePromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => ({
+    promoted: true,
+    target: null,
+  }));
+  assert.deepEqual(unknown.unresolved, []);
+  assert.equal(unknown.unrecoverable.length, 1, "an unresolvable promotion must stop the unpack");
+  assert.match(unknown.unrecoverable[0].reason, /could not be identified/);
+  assert.equal(unknown.unrecoverable[0].value_restored, true, "nothing was written, so the graph is as found");
+
+  const ordinary = materializePromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => ({ promoted: false }));
+  assert.deepEqual(ordinary.unrecoverable, [], "an ordinary widget is not a reason to refuse");
+  assert.equal(ordinary.unresolved.length, 1);
+});
+
 test("#979 (codex final): an ITERATION-level throw is reported as aborted, not as no-work-done", () => {
   // Per-rail isolation does not cover the loop itself. An indexed getter that throws
   // after an earlier rail was carried used to escape the function, so the executor
