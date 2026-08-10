@@ -84,7 +84,16 @@ const DEAD = new Map(vocab.dead.map((d) => [d.name, d]));
  * Narrow on purpose: README is NOT here, because a tool table is a claim about
  * what exists now, and that is precisely where panel_get_graph was a lie.
  */
-const HISTORICAL = [/^CHANGELOG\.md$/, /^docs\/changelog\//];
+const HISTORICAL = [
+  /^CHANGELOG\.md$/,
+  /^docs\/changelog\//,
+  // #758 — generated VERBATIM from CHANGELOG.md so the panel can show release notes in
+  // product. It is the same historical record in another encoding: exempting the source
+  // while flagging the copy would just mean the copy can never be regenerated. Safe to
+  // widen here specifically because it is generated and never hand-edited, so it cannot
+  // become a place where someone writes a fresh claim about what exists now.
+  /^web\/changelog\.json$/,
+];
 
 /**
  * Specific OCCURRENCES where naming a removed tool is correct.

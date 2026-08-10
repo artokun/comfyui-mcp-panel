@@ -148,6 +148,7 @@ import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/n
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
+import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
@@ -2818,6 +2819,14 @@ function lsSet(key, val) {
 // (never plaintext in comfy.settings.json) — their settings are BUTTONS that drive
 // the existing secure request_secret flow into the orchestrator's secure store.
 // ---------------------------------------------------------------------------
+// #758 — the panel version this browser last ANNOUNCED to the user.
+//
+// localStorage, not a ComfyUI setting, for two reasons. It is genuinely per-browser —
+// "what this browser has already been told" — and a ComfyUI setting is per-user across
+// devices, which would silence the notice on a second machine that has not seen it. And
+// a setting has to be REGISTERED to be readable, which would put a bookkeeping value in
+// the settings UI where a user could only break it.
+const LAST_SEEN_VERSION_KEY = "comfyui-mcp.panel.lastSeenVersion";
 const SETTING_BACKEND = "comfyui-mcp.defaultBackend";
 // Default model/effort are now PER-BACKEND (one independent setting each per
 // provider), so the Claude group never resets/repopulates the Codex group on a
@@ -3453,6 +3462,44 @@ function panelSettingsList() {
       // A link row — "📖 Read the docs". Sits ABOVE Discord deliberately: asking a
       // human was previously the ONLY exit from the panel, so the community carried
       // questions the docs already answered (#111).
+      // #758 — an in-product route to the release notes, not "go read a file on GitHub".
+      id: "comfyui-mcp.whatsNew",
+      name: "What's new",
+      category: cat("About", "What's new"),
+      sortOrder: 199,
+      tooltip:
+        "Show recent changes in the panel transcript — what shipped in this version and the ones before it. " +
+        "The panel can update from the Comfy Registry without you asking, so this is where to check when " +
+        "something behaves differently than you remember.",
+      type: () => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = `📋 Show what's new in ${PANEL_VERSION}`;
+        b.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+          "color:var(--p-text-color,#e4e4e7);cursor:pointer;font-size:0.8rem;white-space:nowrap;";
+        b.addEventListener("click", () => {
+          // Open the panel first — painting into a transcript the user cannot see is the
+          // same failure as not painting at all. openSidebarTab() is the same activate the
+          // Model Explorer "Ask AI" path uses, including its retry for a tab store that is
+          // not ready on the first call.
+          try {
+            openSidebarTab();
+          } catch {
+            /* the notes still land in the transcript for whenever they do open it */
+          }
+          setTimeout(() => {
+            try {
+              openSidebarTab();
+            } catch {}
+            panelHooks.showWhatsNew?.();
+          }, 140);
+        });
+        return b;
+      },
+    },
+    {
       id: "comfyui-mcp.readDocs",
       name: "Documentation",
       category: cat("About", "Documentation"),
@@ -17863,6 +17910,15 @@ const PANEL_CSS = `
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
 .cmcp-iconbtn .pi { font-size: 0.875rem; }
+/* #758 — the update notice. Sits in the transcript as a system line, so it inherits
+   the panel's scale and scroll rather than becoming a modal the user must dismiss. */
+.cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+.cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
+.cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
+.cmcp-whatsnew-list li { line-height: 1.45; }
+.cmcp-whatsnew-tag { display: inline-block; font-size: 0.58rem; text-transform: uppercase;
+  letter-spacing: 0.04em; opacity: 0.75; border: 1px solid currentColor; border-radius: 3px;
+  padding: 0 0.22rem; margin-right: 0.15rem; vertical-align: baseline; }
 .cmcp-workflow-version { margin-top: 0.35rem; font-size: 0.58rem; opacity: 0.62;
   display: flex; gap: 0.3rem; align-items: center; }
 .cmcp-workflow-version .pi { font-size: 0.58rem; }
@@ -22842,6 +22898,95 @@ function buildPanel() {
     scrollLog();
   }
 
+  /**
+   * #758 — say what changed, once, after the install moved under the user.
+   *
+   * The panel updates from the Comfy Registry and the orchestrator runs
+   * `npx comfyui-mcp@latest`, so the version moves without the user asking. Their first
+   * signal is behaviour they did not expect, which reads as a bug rather than a release.
+   *
+   * Silent on a FIRST run. An unrecorded last-seen version means a fresh install or a
+   * user who predates this feature, and opening with a wall of history nobody asked for
+   * is the opposite of the point — it records the version and announces the NEXT change,
+   * which is the first one it can honestly call a change.
+   *
+   * The changelog is fetched ONLY when there is something to announce. It is ~140KB and
+   * the overwhelmingly common case is no version change at all.
+   */
+  async function announcePanelUpdate({ force = false } = {}) {
+    try {
+      const lastSeen = lsGet(LAST_SEEN_VERSION_KEY);
+      const level = updateAnnouncement({ lastSeen, current: PANEL_VERSION });
+      if (!force && level === 'none') {
+        // Nothing to say — but a DOWNGRADE must not overwrite a newer recorded version
+        // (codex): doing so makes a later re-upgrade re-announce releases already seen,
+        // which breaks the one promise this feature makes. Only ever move it forward.
+        if (lastSeen && compareVersions(PANEL_VERSION, lastSeen) > 0) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+        else if (!lastSeen) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+        return;
+      }
+
+      const res = await fetch('/extensions/comfyui-mcp-panel/changelog.json', { cache: 'no-cache' });
+      if (!res.ok) return; // offline / 404: say nothing, record nothing, try again next mount
+      const data = await res.json();
+      const picked = releasesSince(data?.releases, { lastSeen, current: PANEL_VERSION });
+      // Re-decide the level with the release COUNT, which is only known now (codex). The
+      // first pass could not pass it, so a same-minor jump across a dozen releases always
+      // came out 'patch' and the pile-of-releases half of the policy never fired.
+      const shownLevel = updateAnnouncement({ lastSeen, current: PANEL_VERSION, releaseCount: picked.length });
+      // A patch is a quiet line; a minor bump or a pile of releases is the case the report
+      // is really about (a tool surface consolidating, a default flipping) and gets more.
+      const maxEntries = (force ? 'major' : shownLevel) === 'major' ? 10 : 3;
+      const entries = summarizeReleases(picked, { maxEntries });
+      if (!entries.length) return;
+
+      // MOUNT IDENTITY, checked after every await (codex). The sidebar can re-mount while
+      // this fetch is in flight; this closure captured the OLD `log`, so appending now
+      // would paint into a detached transcript nobody can see — and because the version
+      // used to be recorded before the fetch, the new mount would decide there was nothing
+      // to announce. The note was then lost for good, on an ordinary remount.
+      // UNCONDITIONAL (codex). `force` may skip the already-seen gate — that is its whole
+      // job — but never mount ownership. A Settings click whose fetch resolves after its
+      // panel unmounted would otherwise paint into a dead transcript, and the user's
+      // explicit "Show what's new" would visibly do nothing.
+      if (client !== liveBridgeClient || !log.isConnected) return;
+
+      const box = document.createElement('div');
+      box.className = 'cmcp-sys cmcp-whatsnew';
+      box.dataset.testid = 'panel-whats-new';
+      const head = document.createElement('div');
+      head.className = 'cmcp-whatsnew-head';
+      head.textContent = lastSeen
+        ? `Updated to ${PANEL_VERSION} (you were on ${lastSeen}) — what changed:`
+        : `ComfyUI Agent Panel ${PANEL_VERSION} — recent changes:`;
+      box.appendChild(head);
+      const list = document.createElement('ul');
+      list.className = 'cmcp-whatsnew-list';
+      for (const entry of entries) {
+        const li = document.createElement('li');
+        const tag = document.createElement('span');
+        tag.className = 'cmcp-whatsnew-tag';
+        // Fixed vs Changed is the distinction the report asks for: "this used to work
+        // differently on purpose" is a different message from "this was broken".
+        tag.textContent = entry.section;
+        li.appendChild(tag);
+        // textContent, never innerHTML. The JSON is served content, not a compile-time
+        // constant, so it is rendered as text regardless of who authored it.
+        li.appendChild(document.createTextNode(' ' + entry.text));
+        list.appendChild(li);
+      }
+      box.appendChild(list);
+      log.appendChild(box);
+      scrollLog();
+      // COMMIT LAST. `lastSeen` now means "this browser was shown these notes", not
+      // "we tried" — so an offline update, a 404, a stale asset or a remount race leaves
+      // the notes pending instead of silently swallowing them (codex).
+      if (!force) lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+    } catch {
+      // A release note is never worth breaking the panel over.
+    }
+  }
+
   function appendActivity(cmd, msg, reply) {
     const { icon, text, detail } = describeCommand(cmd, msg, reply);
     const card = { icon, text, detail, error: !reply.ok };
@@ -24647,6 +24792,15 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+
+  // #758 — announce an update once the transcript exists to receive it. Deliberately
+  // NOT awaited: a release note must never sit in front of the panel becoming usable.
+  announcePanelUpdate();
+  // #758 — and keep it REACHABLE. The Discord ask was for somewhere to reference what
+  // changed; a line in the transcript scrolls away, is cleared with the chat, and is
+  // gone entirely if the user was not looking (codex). Settings → About re-paints it on
+  // demand, with `force` so it ignores the already-seen record.
+  panelHooks.showWhatsNew = () => announcePanelUpdate({ force: true });
 
   // Per-workflow auto-follow. Sync to the current workflow's thread NOW (initial
   // bind), then poll: under keep-alive the panel does NOT re-mount on a ComfyUI
