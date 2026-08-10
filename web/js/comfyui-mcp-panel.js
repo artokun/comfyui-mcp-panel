@@ -152,6 +152,11 @@ import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
+import {
+  collectDisabledAncestorOutputs,
+  disabledOutputsInPrompt,
+  disabledOutputsNote,
+} from "./lib/muted-subgraph-outputs.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -11352,6 +11357,40 @@ const GRAPH_TOOL_EXECUTORS = {
       accept.extra_dispatch_blocked = runScopeResult.overrunBlocked;
       accept.extra_dispatch_note = runScopeResult.overrunNote;
     }
+    // #985 — a WHOLE-GRAPH run hands prompt construction to ComfyUI, and ComfyUI
+    // applies a subgraph wrapper's mute/bypass only at the TOP level: a wrapper
+    // nested inside another subgraph is ignored, so outputs under it execute.
+    // Measured on 0.31.1 / frontend 1.48.7, the reporter's exact versions. They
+    // paid 18m44s and three unwanted videos for it, and the run reported success.
+    //
+    // The panel does not build this prompt and will not silently rewrite what the
+    // caller asked to run — but it can stop being silent, which is the actual
+    // harm here. Reported at QUEUE time, so an agent can interrupt rather than
+    // learn about it when the renders land.
+    //
+    // Scoped runs are exempt: partial_execution_targets already names the roots,
+    // and the reporter verified that path scopes correctly.
+    if (!partialTargets) {
+      try {
+        const disabled = collectDisabledAncestorOutputs(
+          rootGraph,
+          (n) => !!n?.constructor?.nodeData?.output_node,
+        );
+        if (disabled.length) {
+          // Ask the frontend what it ACTUALLY compiled rather than reimplementing
+          // its rules — an output it correctly excluded must not be reported, and
+          // a build that fixes this silences the warning with no change here.
+          const compiled = await app.graphToPrompt();
+          const offenders = disabledOutputsInPrompt(compiled?.output, disabled);
+          if (offenders.length) {
+            accept.disabled_outputs_queued = offenders;
+            accept.disabled_outputs_note = disabledOutputsNote(offenders);
+          }
+        }
+      } catch {
+        /* a diagnostic must never take down the run it describes */
+      }
+    }
     return accept;
   },
 
@@ -18353,10 +18392,18 @@ function describeCommand(cmd, msg, reply) {
     case "graph_run":
       return r.queued
         ? {
-            icon: "pi-play",
+            // #985 — a run that queues outputs from muted/bypassed subgraphs is not
+            // a plain success, and the user is the one paying for the renders. The
+            // count goes in the LABEL: this warning is worthless if it only exists
+            // in a payload field, since the whole failure was being silent about it.
+            icon: r.disabled_outputs_queued?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
               `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
-              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : ""),
+              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : "") +
+              (r.disabled_outputs_queued?.length
+                ? ` — WARNING: ${r.disabled_outputs_queued.length} output${r.disabled_outputs_queued.length === 1 ? "" : "s"} inside muted/bypassed subgraphs will run anyway`
+                : ""),
+            ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }
         : {
             icon: "pi-exclamation-triangle",
