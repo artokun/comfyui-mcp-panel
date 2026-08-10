@@ -13190,13 +13190,22 @@ const GRAPH_TOOL_EXECUTORS = {
     // rail is gone with it — there is nothing left to recover the value from.
     // Never allowed to block the unpack the caller asked for; a failure here reduces
     // what is carried and is reported.
+    //
+    // NO SNAPSHOT, NO CARRY (codex round 3). The carry is only safe because a failed
+    // one can be erased by reloading the pre-carry workflow. Without that snapshot
+    // there is nothing to reload, so attempting it would risk leaving a widget in a
+    // state nothing can undo. Skipping it restores the OLD behaviour — the promoted
+    // value may be lost to the inner default — which is a known, recoverable-by-hand
+    // loss rather than an unrepairable one, and it is disclosed below.
     let materialized = null;
-    try {
-      materialized = materializePromotedValues(node, (sgNode, widgetName) =>
-        resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
-      );
-    } catch {
-      materialized = null;
+    if (rollback) {
+      try {
+        materialized = materializePromotedValues(node, (sgNode, widgetName) =>
+          resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
+        );
+      } catch {
+        materialized = null;
+      }
     }
     // #979 (codex round 2) — REFUSE to unpack when a carry could not be rolled back.
     // A setter that normalizes the write and then also normalizes the restore leaves

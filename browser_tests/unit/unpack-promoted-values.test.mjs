@@ -103,8 +103,8 @@ test("#979 an inner widget that REJECTS or ignores the write is reported, never 
     const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
     const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
     assert.deepEqual(res.applied, [], "a value that did not land is never reported as preserved");
-    assert.equal(res.unresolved.length, 1);
-    assert.match(res.unresolved[0].reason, /rejected the write|did not retain the value/);
+    assert.equal(res.unrecoverable.length, 1);
+    assert.match(res.unrecoverable[0].reason, /rejected the write|did not retain the value/);
   }
 });
 
@@ -127,7 +127,7 @@ test("#979 (codex): a setter that MUTATES then THROWS is rolled back, not left h
   const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
   assert.equal(inner._v, "ORIGINAL", "the widget is left exactly as it was found");
   assert.deepEqual(res.applied, []);
-  assert.equal(res.unresolved[0].reason, "inner widget rejected the write");
+  assert.match(res.unrecoverable[0].reason, /inner widget rejected the write/);
 });
 
 test("#979 (codex): a COERCING setter is rolled back — a third value never reaches the graph", () => {
@@ -147,7 +147,7 @@ test("#979 (codex): a COERCING setter is rolled back — a third value never rea
   const res = materializePromotedValues(sgNode, resolverFor({ steps: { node: { id: 9 }, widget: inner } }));
   assert.equal(inner._v, 20, "restored to what was found, not left at the clamped 30");
   assert.deepEqual(res.applied, []);
-  assert.equal(res.unresolved[0].reason, "inner widget did not retain the value");
+  assert.match(res.unrecoverable[0].reason, /inner widget did not retain the value/);
 });
 
 test("#979 (codex): one hostile widget costs its own entry, not every rail after it", () => {
@@ -165,6 +165,7 @@ test("#979 (codex): one hostile widget costs its own entry, not every rail after
   assert.equal(good.value, "NEW", "the rail AFTER the hostile one was still carried");
   assert.deepEqual(res.applied.map((a) => a.widget), ["text"]);
   assert.equal(res.unresolved.length, 1, "and the hostile one is disclosed, not swallowed");
+  assert.deepEqual(res.unrecoverable, [], "a widget never written to is not a reason to refuse the unpack");
   assert.match(res.unresolved[0].reason, /could not be inspected/);
 });
 
@@ -184,7 +185,11 @@ test("#979 (codex): a throwing accessor on the REPORT metadata does not lose the
   const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
   const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
   assert.equal(inner._v, "NEW", "the value WAS carried — that must not be undone by a reporting failure");
-  assert.equal(res.applied.length + res.unresolved.length, 1, "and it is accounted for exactly once");
+  assert.equal(
+    res.applied.length + res.unresolved.length + res.unrecoverable.length,
+    1,
+    "and it is accounted for exactly once, in whichever bucket",
+  );
 });
 
 test("#979 (codex r2): a restore that ALSO normalizes is UNRECOVERABLE, not merely unresolved", () => {
@@ -225,8 +230,8 @@ test("#979 (codex r2): a recoverable failure stays unresolved and does NOT stop 
   const sgNode = { id: 5, widgets: [widget("steps", 45)] };
   const res = materializePromotedValues(sgNode, resolverFor({ steps: { node: { id: 9 }, widget: inner } }));
   assert.equal(inner._v, 20, "put back exactly");
-  assert.equal(res.unresolved.length, 1);
-  assert.deepEqual(res.unrecoverable, [], "nothing to refuse over");
+  assert.equal(res.unrecoverable.length, 1);
+  assert.equal(res.unrecoverable.length, 1, "codex r3: a clean scalar restore is still not proof the widget is recovered");
 });
 
 test("#979 (codex r2) source guard: the unpack REFUSES when a carry could not be rolled back", () => {

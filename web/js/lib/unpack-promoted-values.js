@@ -153,11 +153,23 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
         return false; // cannot even confirm — treat as unrecoverable
       }
     };
+    // ANY attempted transfer that did not cleanly land goes here, whether or not the
+    // scalar could be put back (codex round 3). Restoring the value is not proof the
+    // widget is recovered: a setter is free to mutate node properties, sibling
+    // widgets, options or a callback-owned cache on its way, and both the carry and
+    // the restore ran. The scalar being right again says nothing about those, and
+    // nothing observable can. So the caller reloads its pre-carry snapshot — the only
+    // generic way to erase effects that cannot be inspected — rather than unpacking
+    // over a state that is neither the rail's nor the inner's.
     const failed = (reason) => {
-      if (restore()) unresolved.push({ widget: name, reason });
-      // UNRECOVERABLE: the value we found is not back. Reported separately because it
-      // is the one condition that must stop the unpack rather than merely annotate it.
-      else unrecoverable.push({ widget: name, reason: `${reason}, and the previous value could not be restored` });
+      const scalarBack = restore();
+      unrecoverable.push({
+        widget: name,
+        reason: scalarBack
+          ? `${reason} (its previous value was put back, but a setter that ran twice may have changed more than the value)`
+          : `${reason}, and the previous value could not be restored`,
+        value_restored: scalarBack,
+      });
     };
     try {
       innerWidget.value = railValue;
