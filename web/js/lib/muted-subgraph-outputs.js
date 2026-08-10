@@ -95,7 +95,14 @@ export function collectDisabledAncestorOutputs(rootGraph) {
         walk(
           sub,
           nodePath,
-          name ? [...disabledAncestors, { id: String(node.id), mode: node.mode, state: name }] : disabledAncestors,
+          // `depth` is this wrapper's INDEX IN THE PATH, recorded because node ids are
+          // graph-LOCAL and therefore not unique across levels (codex: root wrapper 7
+          // containing muted wrapper 7 gives path "7:7:9", and comparing bare ids
+          // mistook the inner one for the top-level wrapper and suppressed a real
+          // offender). Position is unambiguous where an id is not.
+          name
+            ? [...disabledAncestors, { id: String(node.id), mode: node.mode, state: name, depth: path.length }]
+            : disabledAncestors,
           nextSeen,
         );
         continue;
@@ -116,14 +123,18 @@ export function collectDisabledAncestorOutputs(rootGraph) {
       if (!node?.constructor?.nodeData?.output_node) continue;
       // A disabled TOP-LEVEL wrapper is honoured — measured, and it is the ordinary
       // way people switch a branch off. Warning about it would fire on healthy
-      // everyday workflows, which is how a warning gets ignored. `path[0]` is the
-      // root-level node of this chain, so when IT is the disabled one ComfyUI has
-      // already excluded everything below and there is nothing to report.
+      // everyday workflows, which is how a warning gets ignored. When the wrapper at
+      // path position 0 is the disabled one, ComfyUI has already excluded everything
+      // below it and there is nothing to report.
+      //
+      // Tested by DEPTH, never by id: ids are graph-local, so an inner wrapper can
+      // legitimately share an id with the root-level one and a bare comparison would
+      // suppress a genuine offender (codex).
       //
       // This is the one place upstream's behaviour is encoded rather than observed,
       // and it is encoded in the SUPPRESSING direction: if a future build stops
       // honouring the top level too, this under-reports rather than cries wolf.
-      if (disabledAncestors.some((a) => a.id === nodePath[0])) continue;
+      if (disabledAncestors.some((a) => a.depth === 0)) continue;
       // The NEAREST disabled ancestor is the one a reader acts on — the wrapper
       // whose switch they flipped.
       const nearest = disabledAncestors[disabledAncestors.length - 1];
@@ -179,12 +190,12 @@ export function disabledOutputsNote(offenders) {
   // — or could have — is false). The remedy is therefore interruption, and the
   // scoped re-run, not a promise.
   return (
-    `${n} OUTPUT node${n === 1 ? "" : "s"} inside a ${states.join("/")} subgraph ${n === 1 ? "is" : "are"} ` +
-      `an execution root in this workflow — ${which}${more}. On the build measured for this ` +
+    `This workflow has ${n} OUTPUT node${n === 1 ? "" : "s"} inside a NESTED ${states.join("/")} ` +
+      `subgraph — ${which}${more}. On the build measured for this ` +
       `(ComfyUI 0.31.1 / frontend 1.48.7) a subgraph wrapper’s mute/bypass is applied only at the ` +
-      `TOP level of a workflow: a wrapper nested inside another subgraph is IGNORED, so these ` +
-      `rendered anyway. That is what #985 reports — one active source subgraph and two muted, ` +
-      `all three rendered, 18m44s.` +
+      `TOP level of a workflow: a wrapper nested inside another subgraph is IGNORED, so outputs ` +
+      `under one render anyway. That is what #985 reports — one active source subgraph and two ` +
+      `muted, all three rendered, 18m44s.` +
       ` This is read from the GRAPH, not from the prompt that was queued, and it says so because ` +
       `the difference matters: on a build that applies nested wrapper modes correctly, this ` +
       `warns about a run that was fine. It is deliberately biased that way — a whole-graph run ` +

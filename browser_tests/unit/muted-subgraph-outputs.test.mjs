@@ -244,3 +244,22 @@ test("#985 the note caps its list but says how many it left out", () => {
   assert.match(note, /9 OUTPUT nodes/);
   assert.match(note, /and 4 more/, "a truncated list must not read as the whole list");
 });
+
+test("#985 (codex final): a nested wrapper SHARING the root wrapper's id is still reported", () => {
+  // Node ids are graph-LOCAL, so an inner wrapper can legitimately carry the same id
+  // as the root-level one. Suppressing the top-level case by comparing bare ids
+  // therefore silenced a genuine nested offender — the exact defect this issue is
+  // about. Path POSITION is the only unambiguous test.
+  const g = graphOf([wrapper(7, 0, [wrapper(7, MODE_MUTE, [outputNode(9, "SaveVideo")])])]);
+  const found = collectDisabledAncestorOutputs(g);
+  assert.deepEqual(found.map((f) => f.exec_id), ["7:7:9"], "the inner 7 is not the top-level 7");
+  assert.equal(found[0].disabled_ancestor_state, "muted");
+});
+
+test("#985 (codex final): the top-level suppression still holds when ids collide the other way", () => {
+  // Root-level wrapper 7 MUTED, containing an active wrapper also numbered 7. ComfyUI
+  // honours the top-level mute, so nothing is reported — the depth test must not be
+  // fooled by the matching ids either.
+  const g = graphOf([wrapper(7, MODE_MUTE, [wrapper(7, 0, [outputNode(9, "SaveVideo")])])]);
+  assert.deepEqual(collectDisabledAncestorOutputs(g), []);
+});
