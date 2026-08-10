@@ -6,6 +6,37 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.97] - 2026-08-10
+
+> A workflow with unsaved edits could have every graph tool refused after a tab switch,
+> including read-only ones, while the panel's own tab list confirmed the intended
+> workflow active. ComfyUI reuses one canvas object across tabs and leaves the previous
+> workflow's identity tag on it; the escape that handles that was written for a CLEAN tab
+> only, and the report was filed on a modified one. Reproduced live through UI clicks:
+> the canvas provably matched the active workflow and the panel refused anyway.
+
+### Fixed
+- a READ on a canvas whose content matches the active workflow's own state is no longer
+  refused because the canvas carries the previous tab's identity tag, even when the
+  workflow has unsaved edits (#995). Nothing is written: the tag is left exactly as it
+  was, and the refusal is lifted for that one call.
+- mutations are deliberately NOT included. Content equality against an edited tab's
+  snapshot cannot say WHOSE canvas is mounted — two tabs can hold the same graph — and a
+  write on that evidence could land on the wrong one. The bypass is opt-in, set in a
+  single place for the commands classified read-only, so nothing else can acquire it by
+  omission.
+- an open workflow holding the same content as the canvas now blocks the bypass rather
+  than being skipped as unprovable, since with edits allowed on both sides a twin would
+  otherwise be invisible. Verified on the live install: a real twin blocked it, and with
+  no twin present the read went through.
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.11.96] - 2026-08-10
 
 > A report said the post-load compare in `workflow_open` was racing the frontend's
