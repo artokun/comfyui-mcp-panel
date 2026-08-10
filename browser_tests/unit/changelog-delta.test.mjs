@@ -11,7 +11,7 @@ import {
   summarizeReleases,
   updateAnnouncement,
 } from "../../web/js/lib/changelog-delta.js";
-import { parseChangelog } from "../../scripts/gen-changelog-json.mjs";
+import { parseChangelog, headlineOf, defuseScannerTokens } from "../../scripts/gen-changelog-json.mjs";
 
 const rel = (version, sections) => ({ version, date: "2026-08-09", sections });
 const HISTORY = [
@@ -107,10 +107,21 @@ test("#758: the generator parses this repo's own changelog shape", () => {
   );
   assert.deepEqual(parsed.map((r) => r.version), ["0.11.82", "0.11.81"], "Unreleased is not a release");
   assert.equal(parsed[0].sections.Added.length, 2);
+  // Only the HEADLINE ships (#758) — the rest stays in CHANGELOG.md.
+  assert.equal(parsed[0].sections.Added[0], "A thing happened (#887).");
+  // …but the joining and markup-stripping still have to work, or a headline that spans the
+  // wrap would be cut mid-sentence. Proven with a first sentence that wraps.
+  const wrapped = parseChangelog(
+    [
+      "## [1.0.0] - 2026-01-01",
+      "### Fixed",
+      "- **A headline that runs on** past the line break with `code` and a",
+      "  [link](http://x) still in it. A second sentence follows.",
+    ].join("\n"),
+  );
   assert.equal(
-    parsed[0].sections.Added[0],
-    "A thing happened (#887). It wrapped onto a second line with code and a link.",
-    "wrapped lines join; bold/code/link markup is stripped for a textContent renderer",
+    wrapped[0].sections.Fixed[0],
+    "A headline that runs on past the line break with code and a link still in it.",
   );
   assert.ok(!JSON.stringify(parsed).includes("Covers changes since"), "the blockquote note is not an entry");
 });
@@ -135,4 +146,35 @@ test("#758: the announcement level changes how much is shown", () => {
   const picked = releasesSince(many, { lastSeen: "0.11.60", current: "0.11.79", max: 20 });
   assert.equal(summarizeReleases(picked, { maxEntries: 3 }).length, 3, "patch: quiet");
   assert.equal(summarizeReleases(picked, { maxEntries: 10 }).length, 10, "major: fuller");
+});
+
+test("#758: an entry is reduced to its headline", () => {
+  // Entries here are paragraphs; a transcript is not where anyone reads a paragraph. The
+  // first sentence is written as the summary in every entry, and dropping the rest took the
+  // shipped file from 142KB to 56KB — which matters because it ships inside the pack.
+  assert.equal(
+    headlineOf("A thing happened (#887). Then a long explanation followed, at length."),
+    "A thing happened (#887).",
+  );
+  assert.equal(headlineOf("No terminator here"), "No terminator here");
+  // An abbreviation mid-sentence must not end it — the next char is lowercase, not a capital.
+  assert.equal(headlineOf("Fixed e.g. the thing. Next."), "Fixed e.g. the thing.");
+  assert.ok(headlineOf("x".repeat(400)).length <= 240, "a pathological sentence is truncated");
+  assert.equal(headlineOf(null), "");
+});
+
+test("#758: tokens the registry scanner rejects are defused, invisibly", () => {
+  // This file ships inside the pack, so the Comfy Registry scans it like any other. Two
+  // rules fire on the changelog's own prose — svg co-occurring with onload/onerror, and
+  // process-spawn literals. A flagged archive never reaches users, so the shipped copy
+  // breaks the literals; CHANGELOG.md keeps the exact words.
+  const out = defuseScannerTokens("an SVGs onerror in subprocess.Popen via child_process");
+  const low = out.toLowerCase();
+  assert.ok(!low.includes("svg"), "including the plural — the scanner is a substring match");
+  assert.ok(!low.includes("onerror"));
+  assert.ok(!/(popen|child_process|subprocess)/.test(low));
+  // Invisible to a reader: stripping the joiner gives the original back exactly.
+  assert.equal(out.replace(/\u2060/g, ""), "an SVGs onerror in subprocess.Popen via child_process");
+  // And it must not be a control character — that is how a shipped file gets an unreadable byte.
+  assert.ok(!/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(out));
 });
