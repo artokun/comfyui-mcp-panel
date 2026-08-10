@@ -135,6 +135,7 @@ import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
   refreshComboOptionsFromDefs,
+  collectAllGraphs,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
@@ -157,6 +158,7 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
+import { findRepeatingControlWidgets, scopedBatchSeedNote } from "./lib/scoped-batch-seed.js";
 import {
   materializePromotedValues,
   materializedValuesNote,
@@ -11140,6 +11142,30 @@ const GRAPH_TOOL_EXECUTORS = {
     // the deferred serialization queuePrompt runs when its processor is already
     // busy) without permanently altering the live workflow.
     installGraphToPromptNullSafety(app);
+    // #988 — computed BEFORE dispatch (codex). Measuring it afterwards described a
+    // run that had already been submitted, while the note claimed it let the caller
+    // cancel — a remedy it could not offer. Reading the graph first means the finding
+    // is about the state these prompts were built from, not whatever the queue-time
+    // hooks left behind.
+    //
+    // MEASURED: an unscoped batch of 3 sent three different seeds; a scoped batch of 3
+    // sent the same seed three times. ComfyUI does not advance control_after_generate
+    // between the items of a PARTIAL execution, so every item after the first is an
+    // identical prompt it answers from cache.
+    //
+    // Reported, not repaired: rewriting the values would mean re-deriving the
+    // frontend’s widget semantics on the one path where the panel already has to
+    // patch the request body.
+    let repeatingControls = [];
+    if (partialTargets && batch > 1) {
+      try {
+        repeatingControls = findRepeatingControlWidgets(
+          collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
+        );
+      } catch {
+        repeatingControls = []; /* a warning must never take down the run */
+      }
+    }
     if (!partialTargets) {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
@@ -11286,6 +11312,12 @@ const GRAPH_TOOL_EXECUTORS = {
       promptIds: queuedPromptIds,
       ranToNode: partialTargets ? Number(to_node_id) : null,
     });
+    // #988 — attach the PRE-dispatch finding.
+    const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
+    if (repeatingNote) {
+      accept.repeating_controls = repeatingControls;
+      accept.repeating_controls_note = repeatingNote;
+    }
     // #572 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
     // excluded queue-time hook inputs (beforeQueued carriers + their linked,
     // serialized targets — e.g. a control_after_generate seed reroll). A user
