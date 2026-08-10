@@ -49,7 +49,10 @@ test("a healthy page reads all-network — and must not warn", () => {
   assert.equal(s.verdict, "all-network");
   assert.equal(s.total, 2);
   assert.equal(s.cached, 0);
-  assert.match(describeModuleCache(s), /staleness here is NOT the HTTP cache/);
+  // The claim is bounded to what the buffer can support (codex review): "every
+  // module STILL IN THE BUFFER", never "every module".
+  assert.match(describeModuleCache(s), /STILL IN THE BUFFER was fetched/);
+  assert.ok(!/Every module was fetched/.test(describeModuleCache(s)), "an unbounded claim");
 });
 
 test("MIXED is the finding this issue is missing — some modules stale, version healthy", () => {
@@ -63,8 +66,14 @@ test("MIXED is the finding this issue is missing — some modules stale, version
   assert.equal(s.verdict, "mixed");
   assert.equal(s.cached, 2);
   const msg = describeModuleCache(s);
-  assert.match(msg, /MIXTURE of versions/);
-  // …and it names WHICH ones, because that is what separates skew from an old page.
+  // States what it OBSERVED and what that makes possible — not the conclusion.
+  // Cache provenance is not content equality: a cached module can be identical to
+  // the served one, so "this page is running a MIXTURE of versions" asserted more
+  // than the evidence carries (codex review).
+  assert.match(msg, /makes version skew POSSIBLE/);
+  assert.match(msg, /not proof of it/);
+  assert.ok(!/is running a MIXTURE of versions/.test(msg), "overstated conclusion");
+  // …and it names WHICH ones, because that is what a follow-up needs.
   assert.match(msg, /js\/lib\/graph-write-fence\.js/);
 });
 
@@ -168,4 +177,70 @@ test("WIRING: user-copied diagnostics carry the measurement", async () => {
     block.includes("describeModuleCache(readModuleCacheSummary())"),
     "the diagnostics a user pastes into an issue must include it",
   );
+});
+
+// ── CODEX REVIEW FINDINGS ─────────────────────────────────────────────────
+// Each of these was a way the diagnostic could report a FALSE ALL-CLEAR, which
+// is the only failure mode that matters here: it would send a sixth attempt back
+// down the path this module exists to close.
+
+test("a 304 is a CACHE HIT — the exact mechanism this issue is about", () => {
+  // A revalidation transfers headers, so transferSize is NONZERO while the body
+  // comes from cache. Classifying by bytes alone called this "network" and would
+  // have reported "not the HTTP cache" for a page built entirely of stale 304s —
+  // which is the mechanism ComfyUI's own e0982a71 describes (aiohttp ETag from
+  // mtime+size matches, 304, stale content served).
+  const revalidated = entry("js/a.js", { transferSize: 380, decodedBodySize: 12000, responseStatus: 304 });
+  assert.equal(classifyEntry(revalidated), "revalidated");
+
+  const s = summarizeModuleCache([revalidated, entry("js/b.js", { responseStatus: 304, transferSize: 300 })]);
+  assert.equal(s.verdict, "all-cached", "a page of 304s is cache-served, not fresh");
+  assert.equal(s.revalidated, 2);
+  assert.match(describeModuleCache(s), /304 revalidations, where an ETag matched/);
+});
+
+test("one 304 among fetches is MIXED, not all-network", () => {
+  const s = summarizeModuleCache([
+    entry("js/a.js"),
+    entry("js/b.js", { responseStatus: 304, transferSize: 300 }),
+  ]);
+  assert.equal(s.verdict, "mixed");
+});
+
+test("a full timing buffer cannot be reported as completeness", () => {
+  // The spec's floor is 250 entries and this page loads 112 panel modules on top
+  // of ComfyUI's own. If the cached ones were evicted and the fetched ones
+  // survived, the naive read is "everything was fetched".
+  const many = Array.from({ length: 300 }, (_, i) => entry(`js/lib/m${i}.js`));
+  const s = summarizeModuleCache(many);
+  assert.equal(s.bufferMaybeFull, true);
+  assert.equal(s.verdict, "all-network");
+  assert.match(describeModuleCache(s), /may have been dropped and this list may be incomplete/);
+});
+
+test("a small buffer carries no truncation caveat", () => {
+  const s = summarizeModuleCache([entry("js/a.js")]);
+  assert.equal(s.bufferMaybeFull, false);
+  assert.ok(!/may be incomplete/.test(describeModuleCache(s)));
+});
+
+test("a cached STYLESHEET must not manufacture a finding", () => {
+  // Resource Timing reports a stylesheet and a `link rel=modulepreload` both as
+  // "link", so filtering by initiatorType admitted CSS. Every module ComfyUI
+  // auto-imports is a .js, so the URL decides.
+  const css = {
+    name: url("css/panel.css"),
+    transferSize: 0,
+    decodedBodySize: 4000,
+    initiatorType: "link",
+  };
+  const s = summarizeModuleCache([entry("js/comfyui-mcp-panel.js"), css]);
+  assert.equal(s.total, 1, "a cached CSS file is not a cached module");
+  assert.equal(s.verdict, "all-network");
+});
+
+test("a query string does not hide a .js module", () => {
+  const s = summarizeModuleCache([{ ...fromCache("js/a.js"), name: url("js/a.js?v=0.11.76") }]);
+  assert.equal(s.total, 1);
+  assert.equal(s.verdict, "all-cached");
 });

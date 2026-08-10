@@ -41,11 +41,13 @@
 function isOurModule(entry, base) {
   const name = typeof entry?.name === "string" ? entry.name : "";
   if (!name.includes(base)) return false;
-  // `initiatorType` is "script" for a module fetch; a `link rel=modulepreload`
-  // shows as "link". Both are real fetches of our code. Anything else with this
-  // prefix (an image, a fetch() of the version probe) is not a module.
-  const kind = entry?.initiatorType;
-  return kind === undefined || kind === "script" || kind === "link" || kind === "other";
+  // MUST BE A .js URL, not merely one of ours (codex review). Filtering by
+  // `initiatorType` does not work: Resource Timing reports a stylesheet and a
+  // `link rel=modulepreload` both as "link", so a cached panel CSS file would
+  // have manufactured a "some modules are cached" finding out of nothing.
+  // Every module ComfyUI auto-imports is a .js, so the URL decides.
+  const path = name.split("?")[0].split("#")[0];
+  return path.endsWith(".js");
 }
 
 /**
@@ -54,6 +56,14 @@ function isOurModule(entry, base) {
  * @returns {"cached"|"network"|"unknown"}
  */
 export function classifyEntry(entry) {
+  // A 304 IS A CACHE HIT, AND IT IS *THE* ONE THIS ISSUE IS ABOUT (codex review).
+  // A revalidation transfers headers — so transferSize is NONZERO — while the
+  // body comes from the cache. Classifying it by bytes alone called it "network"
+  // and would have reported "staleness here is NOT the HTTP cache" for a page
+  // built entirely of stale 304s. That is precisely the mechanism ComfyUI's own
+  // e0982a71 describes: an aiohttp ETag from mtime+size matching, 304, stale
+  // content served. A false all-clear on the exact case under investigation.
+  if (entry?.responseStatus === 304) return "revalidated";
   const transfer = entry?.transferSize;
   const decoded = entry?.decodedBodySize;
   // The API is not required to expose sizes. Absent numbers are not evidence.
@@ -76,20 +86,37 @@ export function classifyEntry(entry) {
  */
 export function summarizeModuleCache(entries, opts = {}) {
   const base = typeof opts.base === "string" && opts.base ? opts.base : "/extensions/comfyui-mcp-panel/";
-  const empty = { total: 0, cached: 0, network: 0, unknown: 0, verdict: "unknown", cachedUrls: [], statuses: {} };
+  const empty = {
+    total: 0,
+    cached: 0,
+    revalidated: 0,
+    network: 0,
+    unknown: 0,
+    verdict: "unknown",
+    cachedUrls: [],
+    statuses: {},
+    bufferMaybeFull: false,
+  };
   if (!entries || typeof entries.length !== "number") return empty;
 
   const out = { ...empty, cachedUrls: [], statuses: {} };
+  // THE BUFFER DROPS ENTRIES ONCE FULL, and the spec's floor is 250 while this
+  // page alone loads 112 panel modules on top of ComfyUI's own (codex review).
+  // A page whose cached modules were evicted and whose fetched ones survived
+  // reads as "everything was fetched" — the false all-clear this module exists
+  // to prevent. We cannot know what was dropped, so we record that we might be
+  // looking at a partial list and never let the summary claim completeness.
+  out.bufferMaybeFull = entries.length >= 250;
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     if (!isOurModule(entry, base)) continue;
     out.total++;
     const verdict = classifyEntry(entry);
     out[verdict]++;
-    if (verdict === "cached") {
-      // The URL is the actionable half — WHICH modules are stale tells skew
-      // apart from a uniformly old page. Bounded: a wedged page has 112 of
-      // these and an unbounded list helps nobody read the first ten.
+    if (verdict === "cached" || verdict === "revalidated") {
+      // The URL is the actionable half — WHICH modules came from cache tells a
+      // partial page apart from a uniformly old one. Bounded: a wedged page has
+      // 112 of these and an unbounded list helps nobody read the first ten.
       if (out.cachedUrls.length < 12) out.cachedUrls.push(shortName(entry.name, base));
     }
     const status = entry?.responseStatus;
@@ -98,10 +125,15 @@ export function summarizeModuleCache(entries, opts = {}) {
     }
   }
 
+  // A revalidated body came out of the cache exactly as a `cached` one did; only
+  // the round trip differs. They are counted apart because the REMEDY differs (a
+  // 304 means an ETag matched and the server participated), but for "did the
+  // cache serve this page", they are the same answer.
+  const fromCache = out.cached + out.revalidated;
   if (out.total === 0) out.verdict = "unknown";
-  else if (out.cached === 0 && out.unknown === 0) out.verdict = "all-network";
-  else if (out.cached === out.total) out.verdict = "all-cached";
-  else if (out.cached > 0) out.verdict = "mixed";
+  else if (fromCache === out.total) out.verdict = "all-cached";
+  else if (fromCache > 0) out.verdict = "mixed";
+  else if (out.unknown === 0) out.verdict = "all-network";
   else out.verdict = "unknown";
   return out;
 }
@@ -130,28 +162,48 @@ export function describeModuleCache(summary) {
       "this is not evidence that they were fresh."
     );
   }
-  const head = `module cache: ${total} panel module(s) — ${s.network || 0} from the network, ${s.cached || 0} from cache, ${s.unknown || 0} undetermined`;
+  const fromCache = (s.cached || 0) + (s.revalidated || 0);
+  const head =
+    `module cache: ${total} panel module(s) in the timing buffer — ${s.network || 0} fetched, ` +
+    `${s.cached || 0} from cache, ${s.revalidated || 0} revalidated (304), ${s.unknown || 0} undetermined`;
   const statuses = Object.keys(s.statuses || {}).length
     ? ` [status ${Object.entries(s.statuses).map(([k, v]) => `${k}×${v}`).join(", ")}]`
     : "";
+  // Never claim completeness the buffer cannot support (codex review).
+  const partial = s.bufferMaybeFull
+    ? " NOTE: the Resource Timing buffer was at or over its default limit, so entries may have been" +
+      " dropped and this list may be incomplete."
+    : "";
+
   if (s.verdict === "all-network") {
-    return `${head}${statuses}. Every module was fetched — staleness here is NOT the HTTP cache.`;
+    return (
+      `${head}${statuses}. Every panel module STILL IN THE BUFFER was fetched from the server, so` +
+      ` nothing here shows the cache serving stale code.${partial}`
+    );
   }
   if (s.verdict === "all-cached") {
     return (
-      `${head}${statuses}. The whole pack came from cache, which ComfyUI's own cache middleware ` +
-      `(no-store on every .js) should prevent — so something between this browser and ComfyUI is ` +
-      `not passing that header: a proxy, tunnel, or Desktop's server. Sample: ${(s.cachedUrls || []).join(", ")}`
+      `${head}${statuses}. The whole pack came from cache${s.revalidated ? " (including 304 revalidations, where an ETag matched and the cached body was reused)" : ""}` +
+      `, which ComfyUI's own cache middleware (no-store on every .js) should prevent — so something` +
+      ` between this browser and ComfyUI is not passing that header: a proxy, tunnel, or Desktop's` +
+      ` server. Sample: ${(s.cachedUrls || []).join(", ")}${partial}`
     );
   }
   if (s.verdict === "mixed") {
     return (
-      `${head}${statuses}. SOME modules are cached and some are not, so this page is running a ` +
-      `MIXTURE of versions — which is why a single version check can look healthy while writes ` +
-      `stay broken. Cached: ${(s.cachedUrls || []).join(", ")}`
+      `${head}${statuses}. ${fromCache} module(s) came from cache while others were fetched.` +
+      // WHAT THIS DOES AND DOES NOT ESTABLISH (codex review). Cache provenance is
+      // not content equality: a cached module can be byte-identical to the served
+      // one. Saying "this page is running a MIXTURE of versions" asserted the
+      // conclusion this evidence only makes POSSIBLE — and version skew is
+      // precisely what a single version check cannot see, so overstating it would
+      // send the next investigation off on a finding that was never established.
+      ` That makes version skew POSSIBLE — cached and fetched modules can still be identical, so` +
+      ` this is not proof of it — and skew is invisible to the single-version check that just` +
+      ` reported healthy. Cached: ${(s.cachedUrls || []).join(", ")}${partial}`
     );
   }
-  return `${head}${statuses}. Too little was reported to tell cache from network.`;
+  return `${head}${statuses}. Too little was reported to tell cache from network.${partial}`;
 }
 
 /** Read the live document's timings; safe to call anywhere (returns the empty
