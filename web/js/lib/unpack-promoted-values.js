@@ -53,9 +53,22 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
   // nor the inner, and the caller must refuse to unpack over that.
   const unrecoverable = [];
   let skipped = 0;
-  if (!subgraphNode || typeof resolvePromoted !== "function") return { applied, unresolved, unrecoverable, skipped };
-  const rails = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
-  for (const rail of rails) {
+  // Set when the ITERATION itself failed — an indexed getter on the widgets array, a
+  // poisoned iterator (codex final). Per-rail isolation does not cover that: earlier
+  // rails may already have been carried, and without this the caller saw only a thrown
+  // function, discarded the whole record, and unpacked anyway — destroying exactly the
+  // divergent values this exists to protect.
+  let aborted = false;
+  if (!subgraphNode || typeof resolvePromoted !== "function")
+    return { applied, unresolved, unrecoverable, skipped, aborted };
+  let rails = [];
+  try {
+    rails = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
+  } catch {
+    return { applied, unresolved, unrecoverable, skipped, aborted: true };
+  }
+  try {
+    for (const rail of rails) {
     // PER-RAIL isolation (codex NO-SHIP): a hostile or merely unusual accessor on ONE
     // widget — `rail.name`, `innerNode.id`, `innerWidget.name` are all reads that can
     // throw — used to abort the whole loop. That lost every remaining rail's value AND
@@ -75,17 +88,28 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
       } catch {
         label = null;
       }
-      const entry = {
+      // ANY throw here is unrecoverable, not just a post-write one (codex final).
+      // The latch proves a write happened; its absence proves nothing — the resolver
+      // and the value getters all run before it, and this module's own threat model
+      // is accessors that misbehave. One that MUTATES and then throws would otherwise
+      // be filed as benign and unpacked over. On a destructive path an exception
+      // means the state cannot be proven, and unprovable is the same as unsafe.
+      unrecoverable.push({
         widget: label ?? "(unreadable)",
         reason: state.attempted
           ? "the write was attempted and then something threw — the widget may hold a value from neither side"
-          : "widget could not be inspected",
-      };
-      if (state.attempted) unrecoverable.push({ ...entry, value_restored: false });
-      else unresolved.push(entry);
+          : "inspecting this widget threw, so its state before the unpack cannot be established",
+        value_restored: false,
+      });
     }
+    }
+  } catch {
+    // The loop itself came apart. Whatever was carried before that point stands,
+    // which is precisely why this must reach the caller as a refusal rather than as
+    // a thrown function whose partial work is invisible.
+    aborted = true;
   }
-  return { applied, unresolved, unrecoverable, skipped };
+  return { applied, unresolved, unrecoverable, skipped, aborted };
 }
 
 /**
@@ -241,7 +265,12 @@ export function findDivergentPromotedValues(subgraphNode, resolvePromoted) {
       try {
         resolved = resolvePromoted(subgraphNode, name);
       } catch {
-        continue; // not shown to be a promotion ⇒ not a divergence to refuse over
+        // NOT "not a promotion" (codex final): a resolver that throws leaves this
+        // widget's promotion status unknown, and with no snapshot to undo with, an
+        // unknown is exactly what must stop the unpack. Skipping here would let a
+        // divergent-but-unresolvable value be destroyed with nothing to recover from.
+        divergent.push({ widget: name, reason: "its promotion could not be resolved" });
+        continue;
       }
       const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
       if (!innerWidget) continue;

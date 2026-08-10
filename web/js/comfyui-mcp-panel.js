@@ -13218,13 +13218,22 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     }
     let materialized = null;
+    let carryFailed = false;
     if (rollback) {
       try {
         materialized = materializePromotedValues(node, (sgNode, widgetName) =>
           resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
         );
+        // `aborted` means the ITERATION came apart — earlier rails may already have
+        // been carried, so this is not a "no work done" outcome (codex final).
+        carryFailed = !!materialized?.aborted;
       } catch {
+        // A throw ESCAPING the carry is the same situation and used to be the worst
+        // case: the record was discarded, so partial work became invisible, and the
+        // unpack proceeded anyway and destroyed the divergent values this exists to
+        // protect. It is now a refusal like any other unprovable state.
         materialized = null;
+        carryFailed = true;
       }
     }
     // #979 (codex round 2) — REFUSE to unpack when a carry could not be rolled back.
@@ -13233,8 +13242,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // over that would make a third, invented value permanent, which is worse than the
     // data loss this whole change exists to stop. Restore the pre-carry workflow and
     // report instead — the subgraph is still there, so nothing is lost.
-    if (materialized?.unrecoverable?.length) {
-      const names = materialized.unrecoverable.map((u) => u.widget).join(", ");
+    if (carryFailed || materialized?.unrecoverable?.length) {
+      const names = materialized?.unrecoverable?.length
+        ? materialized.unrecoverable.map((u) => u.widget).join(", ")
+        : "(the carry failed before it could name them)";
       let restored = false;
       if (rollback && typeof app?.loadGraphData === "function") {
         try {

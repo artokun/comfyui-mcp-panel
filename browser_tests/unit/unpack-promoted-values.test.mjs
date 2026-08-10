@@ -165,9 +165,44 @@ test("#979 (codex): one hostile widget costs its own entry, not every rail after
   const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: good } }));
   assert.equal(good.value, "NEW", "the rail AFTER the hostile one was still carried");
   assert.deepEqual(res.applied.map((a) => a.widget), ["text"]);
-  assert.equal(res.unresolved.length, 1, "and the hostile one is disclosed, not swallowed");
-  assert.deepEqual(res.unrecoverable, [], "a widget never written to is not a reason to refuse the unpack");
-  assert.match(res.unresolved[0].reason, /could not be inspected/);
+  // codex final: a throwing accessor is UNRECOVERABLE, not a benign annotation. The
+  // latch proves a write happened; its absence proves nothing, because the resolver
+  // and the value getters all run before it — and an accessor that MUTATES and then
+  // throws is precisely this module's stated threat model. On a destructive path an
+  // exception means the state cannot be proven, and unprovable is treated as unsafe.
+  assert.equal(res.unrecoverable.length, 1, "the hostile widget refuses the unpack");
+  assert.match(res.unrecoverable[0].reason, /cannot be established|value from neither side/);
+  assert.deepEqual(res.unresolved, [], "no longer filed as merely unresolved");
+});
+
+test("#979 (codex final): an ITERATION-level throw is reported as aborted, not as no-work-done", () => {
+  // Per-rail isolation does not cover the loop itself. An indexed getter that throws
+  // after an earlier rail was carried used to escape the function, so the executor
+  // discarded the whole record and unpacked anyway — destroying the very values this
+  // protects. The partial carry must reach the caller as a refusal.
+  const good = widget("text", "OLD");
+  const rails = [widget("text", "NEW"), widget("other", 1)];
+  const hostileList = new Proxy(rails, {
+    get(target, key) {
+      if (key === "1") throw new Error("index boom");
+      return target[key];
+    },
+  });
+  const sgNode = { id: 5, widgets: hostileList };
+  const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: good } }));
+  assert.equal(res.aborted, true, "the caller must learn the loop came apart");
+  assert.equal(good.value, "NEW", "and that work HAD already been done, which is why it matters");
+});
+
+test("#979 (codex final): a resolver that throws in the read-only preflight refuses, not skips", () => {
+  // With no snapshot there is nothing to undo with, so an unknown promotion status is
+  // exactly what must stop the unpack — skipping would destroy a divergent value with
+  // no copy anywhere.
+  const divergent = findDivergentPromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => {
+    throw new Error("resolver boom");
+  });
+  assert.equal(divergent.length, 1);
+  assert.match(divergent[0].reason, /could not be resolved/);
 });
 
 test("#979 (codex): a throwing accessor on the REPORT metadata does not lose the transfer", () => {
@@ -296,6 +331,19 @@ test("#979 (codex r4): no divergence ⇒ nothing to refuse over", () => {
   // A rail that is not a promotion is not a divergence either.
   assert.deepEqual(findDivergentPromotedValues({ id: 5, widgets: [widget("x", 1)] }, resolverFor({})), []);
   assert.deepEqual(findDivergentPromotedValues(null, resolverFor({})), []);
+});
+
+test("#979 (codex final) source guard: an aborted or thrown carry refuses instead of unpacking", () => {
+  // The worst case codex found: the carry throws at iteration level AFTER carrying a
+  // rail, the executor discards the record, and unpacks anyway. The refusal must key
+  // on the carry having FAILED, not only on it having produced findings.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(src, /carryFailed = !!materialized\?\.aborted/, "an aborted iteration is a failure");
+  assert.match(src, /carryFailed = true/, "and so is a throw escaping the carry");
+  const guard = src.indexOf("if (carryFailed || materialized?.unrecoverable?.length)");
+  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  assert.ok(guard > 0, "the refusal must key on carryFailed, not only on findings");
+  assert.ok(guard < unpack, "and precede the destructive call");
 });
 
 test("#979 (codex r4) source guard: no snapshot ⇒ preflight refuses rather than losing values", () => {
