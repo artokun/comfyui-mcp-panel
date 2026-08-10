@@ -138,3 +138,35 @@ test("#636: a real store failure is not reported as 'never saved'", () => {
   assert.match(site, /lookupError = err;/, "the thrown error must be kept");
   assert.match(site, /the lookup also failed/, "and surfaced when nothing resolves");
 });
+
+// ── is_global was false for every blueprint ────────────────────────────────
+
+const listStart = src.indexOf("const blueprints = [...defs].map((d) => {");
+const listSite = src.slice(listStart, src.indexOf("});", src.indexOf("is_global: isGlobal")) + 3);
+
+test("#636: is_global asks the STORE, not a property that does not exist", () => {
+  // It read `d?.isGlobal === true`. A blueprint's keys are name, display_name, category,
+  // main_category, python_module, description, help, deprecated — no isGlobal — so the
+  // field was always false, asserting "user blueprint" for every bundled one.
+  assert.ok(listSite.length > 0, "the list mapper must exist");
+  // The dead READ, not any mention of it — the comment above the fix quotes the old
+  // expression on purpose, so the assertion has to name the assignment.
+  assert.doesNotMatch(listSite, /is_global: d\?\.isGlobal/, "the dead property read must be gone");
+  assert.match(listSite, /store\.isGlobalBlueprint\(bare\)/, "the store predicate must be asked");
+});
+
+test("#636: it passes the PREFIX-STRIPPED name, as ComfyUI itself does", () => {
+  // subgraphStore.isGlobalBlueprint(name.slice(BLUEPRINT_TYPE_PREFIX.length)) — passing
+  // the object instead is what made an earlier probe answer false for everything and
+  // look correct.
+  assert.match(listSite, /const bare = type\.startsWith\(prefix\)/, "the name must be stripped");
+  assert.match(listSite, /isGlobalBlueprint\(bare\)/, "and the stripped form passed");
+});
+
+test("#636: an unavailable predicate reports null, never false", () => {
+  // "This frontend cannot tell me" and "this is a user blueprint" are different answers,
+  // and asserting the second in place of the first IS the defect being fixed.
+  assert.match(listSite, /let isGlobal = null;/, "unknown starts as null");
+  assert.match(listSite, /isGlobal = null;/, "and a throw returns to null");
+  assert.doesNotMatch(listSite, /isGlobal = false/, "absence must never be reported as user-owned");
+});

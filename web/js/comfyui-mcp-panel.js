@@ -13088,12 +13088,35 @@ const GRAPH_TOOL_EXECUTORS = {
     const defs = store.subgraphBlueprints ?? [];
     const blueprints = [...defs].map((d) => {
       const type = d?.name ?? "";
+      const bare = type.startsWith(prefix) ? type.slice(prefix.length) : type;
+      // #636 — ASK THE STORE. This read `d?.isGlobal === true`, and a blueprint carries no
+      // such property (its keys are name, display_name, category, main_category,
+      // python_module, description, help, deprecated), so the field was ALWAYS false —
+      // reporting a confident "user blueprint" for every bundled one. The store answers it
+      // with a predicate, and ComfyUI's own call site shows what it wants:
+      //
+      //     subgraphStore.isGlobalBlueprint(name.slice(BLUEPRINT_TYPE_PREFIX.length))
+      //
+      // the PREFIX-STRIPPED name, not the object. Passing the object is what made an
+      // earlier probe of mine answer false for everything and look correct.
+      //
+      // `null` when the predicate is absent or throws, NOT false: "this frontend cannot
+      // tell me" and "this is a user blueprint" are different answers, and the whole
+      // defect here was the second being asserted in place of the first.
+      let isGlobal = null;
+      try {
+        if (typeof store.isGlobalBlueprint === "function") {
+          isGlobal = store.isGlobalBlueprint(bare) === true;
+        }
+      } catch {
+        isGlobal = null;
+      }
       return {
-        name: type.startsWith(prefix) ? type.slice(prefix.length) : type,
+        name: bare,
         type,
         display_name: d?.display_name ?? null,
         description: d?.description ?? null,
-        is_global: d?.isGlobal === true,
+        is_global: isGlobal,
       };
     });
     // #690(5) — bounded like every other panel read. `count` stays the LIBRARY
