@@ -6,6 +6,40 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.90] - 2026-08-10
+
+> Covers changes since 0.11.89.
+
+### Added
+
+- **`panel_run` now warns when your workflow has outputs inside a muted subgraph that
+  will render anyway (#985).** Someone ran a workflow with one active source subgraph
+  and two muted ones. All three rendered — Wan, LTXV and MiniMax H3 loaded in turn,
+  three videos saved, 18 minutes 44 seconds — and the run reported plain success.
+
+  The cause is not in this panel, and the fix cannot be either. ComfyUI applies a
+  subgraph's mute/bypass **only at the top level of a workflow**. Mute a subgraph
+  that sits inside another subgraph and it is ignored: everything in it still runs.
+  A whole-workflow run hands prompt building to ComfyUI, so pressing ComfyUI's own
+  Queue button does exactly the same thing. Measured on ComfyUI 0.31.1 with frontend
+  1.48.7, for mute and bypass alike.
+
+  What the panel can stop doing is being quiet about it. A whole-workflow run now
+  names the output nodes that sit inside a nested muted or bypassed subgraph, in the
+  one-line summary as well as the full result, so you can interrupt instead of
+  finding out when the renders land. Running to a specific output node
+  (`to_node_id`) scopes execution correctly and is the way to render just the branch
+  you want.
+
+  Two things it deliberately does **not** do. It does not change what executes —
+  quietly dropping nodes from a run you asked for would be its own kind of wrong. And
+  it does not claim to know your ComfyUI version: the warning is read from your
+  workflow's structure, so on a build that handles nested subgraphs properly it will
+  warn about a run that was fine. The message says so, and tells you how to check.
+  Muting a **top-level** subgraph — the ordinary way to switch a branch off — is
+  silent, because that one genuinely works.
+
+
 ## [0.11.89] - 2026-08-10
 
 > Covers changes since 0.11.88.
