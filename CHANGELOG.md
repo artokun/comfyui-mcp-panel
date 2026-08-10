@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.74] - 2026-08-09
+
+> Covers changes since 0.11.73.
+
+### Fixed
+
+- **Saving a subgraph over a built-in name no longer sends you looking for a delete
+  button that isn't there (#636).** When the name clashes, the panel refuses and suggests
+  deleting the existing one from ComfyUI's library. But ComfyUI won't delete the
+  subgraphs it ships with — and on a stock install nearly all of them are its own, so the
+  clash you're most likely to hit is the one where that advice can't be followed.
+
+  It now recognises a built-in and says the name can't be freed, so the only thing left is
+  to pick a different one. Clashes with a subgraph you saved yourself still suggest
+  deleting it, and so does any case where the panel can't tell — withholding an option
+  that might work is worse than offering one you'd rule out in seconds.
+
 ## [0.11.73] - 2026-08-09
 
 > Covers changes since 0.11.72.
