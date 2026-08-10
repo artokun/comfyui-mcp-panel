@@ -45,6 +45,7 @@
 // `onFlush` callback, which receives the full, correctly-scoped batch — plus the
 // prompt_id `key` for machine-readable attribution — exactly once per completion.
 
+import { mediaSignature, createCompletionDeduper } from "./completion-dedupe.js";
 import { parseHistoryEntry } from "./history-reconcile.js";
 
 export const NO_PROMPT_KEY = "__no_prompt__";
@@ -73,6 +74,10 @@ export function createRunCompletionTracker({
   maxRearms = 40,
   reconcileRetryMs = 3000,
   maxReconcileRetries = 5,
+  // #986 — injected so the dedupe window is testable and the tracker keeps no
+  // second source of truth for time.
+  onDuplicateSuppressed = null,
+  duplicateWindowMs = 5 * 60 * 1000,
 } = {}) {
   if (typeof onFlush !== "function") {
     throw new TypeError("createRunCompletionTracker requires an onFlush callback");
@@ -87,6 +92,7 @@ export function createRunCompletionTracker({
   // (no real prompt) collapses to the shared NO_PROMPT_KEY.
   const key = (id) => (id == null ? NO_PROMPT_KEY : String(id));
   const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
+  const deduper = createCompletionDeduper({ ttlMs: duplicateWindowMs, now });
   const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
   const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
@@ -363,6 +369,36 @@ export function createRunCompletionTracker({
     starts.delete(k);
     const durationMs = startTs != null ? now() - startTs : null;
     if (!buf.images.length && !buf.videos.length) return;
+    // #986 — the same finished output was re-announced six times in ~30s, each under
+    // a DIFFERENT prompt id, because the user re-queued from the canvas and ComfyUI
+    // served it from cache (hence the 0.1s "renders"). The `delivered` fence above is
+    // keyed by prompt id, so it cannot collapse genuinely different prompts; what is
+    // the same is the OUTPUT, so that is what this compares.
+    //
+    // Only for runs the panel did NOT queue. `panel_run` promises the agent it will
+    // be notified and tells it to end its turn — suppressing one of those would wedge
+    // it waiting for a message that never comes, which is worse than the duplicates.
+    const signature = mediaSignature(buf.images, buf.videos);
+    const verdict = deduper.consider({
+      signature,
+      panelQueued: panelQueued.has(k),
+      promptId: promptIdOf(k),
+    });
+    if (!verdict.deliver) {
+      // Retire it exactly as a delivered run would be: it IS accounted for, and
+      // leaving it pending would have a later reconcile deliver the duplicate anyway.
+      markDelivered(k);
+      onDuplicateSuppressed?.({
+        key: k,
+        promptId: promptIdOf(k),
+        duplicateOf: verdict.duplicateOf,
+        durationMs,
+      });
+      return;
+    }
+    // A panel-queued delivery still records its signature, so a canvas re-queue of
+    // the SAME output afterwards is recognised rather than getting one free pass.
+    if (panelQueued.has(k)) deduper.record({ signature, promptId: promptIdOf(k) });
     // Optimistically mark delivered so a reconnect-triggered reconcile racing
     // this flush can't double-deliver the same prompt. If the caller reports the
     // send FAILED (bridge down), it calls markUndelivered() to re-pend it (#370).

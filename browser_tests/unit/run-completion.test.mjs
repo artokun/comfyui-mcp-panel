@@ -633,3 +633,88 @@ test("#609 wiring: the panel call site feeds the composer the gate's own blind p
     "the note's review request must be conditioned on the SAME blind flag the sendFrame gate strips by",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #986 — the SAME finished output re-announced as separate completions. Six in
+// ~30s, each under a different prompt id with a sub-second "render" time, because
+// the user re-queued from the canvas and ComfyUI served it from cache. The
+// prompt-id fence cannot collapse genuinely different prompts; the OUTPUT is what
+// repeats. These drive the real tracker, so the wiring is what is under test.
+// ---------------------------------------------------------------------------
+
+/** A harness that also captures suppressions and lets the dedupe window be set. */
+function makeDedupeHarness({ duplicateWindowMs = 5 * 60 * 1000 } = {}) {
+  let clock = 0;
+  let seq = 0;
+  const timers = new Map();
+  const flushes = [];
+  const suppressed = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: (p) => flushes.push(p),
+    onDuplicateSuppressed: (p) => suppressed.push(p),
+    duplicateWindowMs,
+    now: () => clock,
+    setTimer: (fn, ms) => {
+      const id = ++seq;
+      timers.set(id, { at: clock + ms, fn });
+      return id;
+    },
+    clearTimer: (id) => timers.delete(id),
+  });
+  return { tracker, flushes, suppressed, advance: (ms) => (clock += ms) };
+}
+
+/** One canvas run that produces the given video and finishes. */
+const canvasRun = (h, promptId, filename) => {
+  h.tracker.onExecutionStart(promptId);
+  h.tracker.onExecuted(promptId, { images: [], videos: [{ filename, subfolder: "", type: "output" }] });
+  h.tracker.onExecutionSuccess(promptId);
+};
+
+test("#986: six cached canvas re-queues of one clip deliver ONE completion", () => {
+  const h = makeDedupeHarness();
+  for (const id of ["2d9d64f5", "c3e90187", "c5184f9e", "4ce0a352", "740ff0f5", "aa11bb22"]) {
+    canvasRun(h, id, "Video_00144.mp4");
+    h.advance(5000); // the reported burst was ~30s across six
+  }
+  assert.equal(h.flushes.length, 1, "the agent is told once");
+  assert.equal(h.flushes[0].promptId, "2d9d64f5");
+  assert.equal(h.suppressed.length, 5, "and the rest are accounted for, not silently dropped");
+  assert.equal(h.suppressed[0].duplicateOf, "2d9d64f5", "naming what they duplicate");
+});
+
+test("#986: a PANEL-QUEUED run is delivered even when its output was already seen", () => {
+  // panel_run promised the agent a notification and told it to end its turn.
+  // Suppressing that wedges it forever — strictly worse than the duplicates.
+  const h = makeDedupeHarness();
+  canvasRun(h, "canvas-1", "same.mp4");
+  assert.equal(h.flushes.length, 1);
+  h.tracker.onQueued("panel-1");
+  canvasRun(h, "panel-1", "same.mp4");
+  assert.equal(h.flushes.length, 2, "the run the agent is waiting for always arrives");
+  assert.deepEqual(h.suppressed, []);
+});
+
+test("#986: a DIFFERENT output is never collapsed into a previous one", () => {
+  const h = makeDedupeHarness();
+  canvasRun(h, "p1", "Video_00144.mp4");
+  canvasRun(h, "p2", "Video_00145.mp4");
+  assert.equal(h.flushes.length, 2);
+  assert.deepEqual(h.suppressed, []);
+});
+
+test("#986: past the window, a deliberate re-render of the same file is a real event again", () => {
+  const h = makeDedupeHarness({ duplicateWindowMs: 1000 });
+  canvasRun(h, "p1", "same.mp4");
+  h.advance(5000);
+  canvasRun(h, "p2", "same.mp4");
+  assert.equal(h.flushes.length, 2, "an hour-later re-render is not a duplicate");
+});
+
+test("#986: a suppressed duplicate is RETIRED, so a later reconcile cannot re-deliver it", () => {
+  const h = makeDedupeHarness();
+  canvasRun(h, "p1", "same.mp4");
+  canvasRun(h, "p2", "same.mp4");
+  assert.equal(h.suppressed.length, 1);
+  assert.equal(h.tracker.isSettled("p2"), true, "not left pending for a sweep to pick up");
+});
