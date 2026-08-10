@@ -6,6 +6,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.85] - 2026-08-09
+
+> Covers changes since 0.11.84.
+
+### Fixed
+
+- **A refresh that lands while ComfyUI is reconnecting no longer reports a dead server
+  (#954).** Calling `panel_refresh_nodes` just after a restart-related operation could come
+  back `object_info_fetch_failed` — "Failed to fetch" — while other reads succeeded moments
+  later against the same server. Worse than the false failure was its advice: it told you to
+  check that the ComfyUI process was still running, sending you after something that was
+  never down.
+
+  The fetch now retries three times over about half a second before giving up, which is
+  enough to cross a reconnect blip. The panel already did this at startup, so the same
+  hiccup was survivable when the page loaded and fatal to an agent tool call a minute later.
+  A backend that really is gone still reports exactly what it reported before, with the same
+  detail — a retry that turned a real outage into a vaguer message would trade one wrong
+  answer for another.
+
+
 ## [0.11.84] - 2026-08-09
 
 _No user-facing changes._
