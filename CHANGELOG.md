@@ -6,6 +6,33 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.95] - 2026-08-10
+
+> `panel_refresh_nodes` said `{ok:true, refreshed:true}` while `panel_get_errors` kept
+> listing the same classes as missing, after the packs were installed and ComfyUI was
+> restarted. Both answers were right, which is why neither helped: the definitions really
+> were re-fetched, and the nodes really were still broken. Measured on the running
+> install — registering a class does not rehydrate a node that was placed while the class
+> was unknown. It keeps no definition, and the frontend's missing-node record is a
+> load-time snapshot nothing ever clears. Clearing that snapshot would have been the
+> obvious fix and the wrong one: `get_errors` would report clean while the canvas still
+> held a dead node. The refresh now reports what it actually left behind.
+
+### Fixed
+- a refresh that leaves placeholders behind now says so, instead of reporting a clean
+  result the canvas contradicts (#981). The reply carries `requires_reload`, the affected
+  nodes, and a note that names the remedy — save the workflow, then reopen that saved
+  workflow — and is explicit that this is an attempt rather than a guarantee, since a
+  class present in the registry can still fail to construct. Verified live, on a canvas
+  where exactly that happened.
+- the first version of this check reported four false positives — `Note`, `Reroute`,
+  `PrimitiveNode` and `MarkdownNote` all lack a backend definition, so a canvas with a
+  single Note on it would have demanded a workflow reload after every refresh. The scan
+  is now confined to types the frontend itself recorded as missing when the workflow
+  loaded, and asks the client registry rather than `/object_info`: the server having a
+  definition is not the same as this page being able to build the node.
+
+
 ## [0.11.94] - 2026-08-10
 
 > Covers changes since 0.11.93.
