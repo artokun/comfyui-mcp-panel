@@ -138,7 +138,10 @@ function recordWorkflowWrites(context: BrowserContext, state: WriteRecord) {
   // permits overwriting, a failed write, or a request to some other instance are all cases
   // where deleting the path could destroy a file this test did not create.
   const owns = (url: string, method: string) => {
-    if (method !== 'POST' && method !== 'PUT') return null
+    // POST only. That is the contract actually observed for the workflow save; accepting
+    // PUT as well would widen the trusted surface on an assumption rather than evidence
+    // (codex).
+    if (method !== 'POST') return null
     let parsed: URL
     try {
       parsed = new URL(url)
@@ -172,16 +175,31 @@ function recordWorkflowWrites(context: BrowserContext, state: WriteRecord) {
   const settle = (request: import('@playwright/test').Request) => state.pending.delete(request)
   context.on('requestfailed', settle)
   context.on('requestfinished', (request) => {
-    settle(request)
+    let path: string | null = null
+    try {
+      path = owns(request.url(), request.method().toUpperCase())
+    } catch {
+      path = null
+    }
+    if (!path) {
+      settle(request)
+      return
+    }
+    // STAY PENDING UNTIL CLASSIFIED (codex). Settling first and classifying in a detached
+    // promise let teardown observe zero pending, delete the `created` set it had, and only
+    // then receive the path — recreating the missed-cleanup bug without needing a hung
+    // request at all. The drain below is only meaningful if "pending" covers the
+    // bookkeeping too, not just the wire.
+    const owned = path
     void (async () => {
       try {
-        const path = owns(request.url(), request.method().toUpperCase())
-        if (!path) return
         const response = await request.response()
         // Only a SUCCEEDED create is ours to remove.
-        if (response?.ok()) state.created.add(path)
+        if (response?.ok()) state.created.add(owned)
       } catch {
         /* unreadable response ⇒ claim nothing */
+      } finally {
+        settle(request)
       }
     })()
   })
@@ -197,8 +215,13 @@ async function cleanupRecordedWorkflowWrites(state: WriteRecord) {
   // WAIT FOR IN-FLIGHT WRITES FIRST (codex). Deleting while a save is still on the wire
   // gets a 404 and then the write lands afterwards — recreating the very file this is
   // supposed to remove, and doing it invisibly because the delete "succeeded". Bounded, so
-  // a wedged request delays teardown by a second rather than hanging the suite; anything
-  // still pending after that is left to the suite-level sweep, which reports it.
+  // a wedged request delays teardown by a second rather than hanging the suite.
+  //
+  // WHAT THIS DOES NOT PROMISE, stated rather than implied: it drains writes it has already
+  // OBSERVED. A save kicked off by a pending timer after the drain reads zero is recorded
+  // too late for this pass. Closing that needs quiescence the fixture cannot establish
+  // without closing the context first; the suite-level sweep still REPORTS anything left,
+  // which is how these were found in the first place.
   const deadline = Date.now() + 1000
   while (state.pending.size > 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25))
