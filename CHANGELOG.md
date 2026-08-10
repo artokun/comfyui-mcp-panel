@@ -26,6 +26,20 @@ All notable changes to this project are documented here. This project adheres to
   Settings → Comfy MCP Agent → About → **Show what is new** re-opens it whenever you want,
   since a line in a transcript scrolls away and the request was for somewhere to look.
 
+### Fixed
+
+- **A failed install by git URL now says what is actually wrong (#920).** Passing a
+  repository URL for a pack that is not in the node registry failed with
+  *"Node '<name>@<version>' not found in [...]"* — a registry lookup naming an id you never
+  supplied, which reads like a lookup bug and sends you to re-check spelling and channels.
+  It now explains that this is a registry lookup, that ComfyUI-Manager's `repository`
+  parameter is accepted and then ignored by its install handler, and what does work: clone
+  into `custom_nodes/` and restart, ask the author to publish, or — two steps, not one —
+  run with `--enable-manager-legacy-ui` (which *replaces* the v2 Manager API) **and** set
+  `allow_git_url_install = true` in `config.ini`, without which that route answers 404.
+
+  Also **corrects the 0.11.75 entry**, which claimed installing from a GitHub URL "actually
+  clones it now". It does not, and that entry now says so.
 
 ## [0.11.82] - 2026-08-09
 
