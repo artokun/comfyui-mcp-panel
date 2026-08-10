@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.87] - 2026-08-09
+
+### Fixed
+- **A failed install by git URL now points at the tool that can actually do it (#920).**
+  When you install a pack that is not in the node registry, ComfyUI-Manager cannot clone
+  your URL — it resolves installs from its own database, and the parameter that would
+  carry a URL is accepted and then ignored. The failure now tells you to use
+  `install_custom_node` instead: that one runs on the machine rather than in the browser,
+  so it clones the repository into `custom_nodes/` itself.
+
+  Worth saying explicitly because `panel_install_node`'s own description tells you to
+  prefer it over `install_custom_node` — which is backwards for this case, and following
+  it leaves you stuck. The message now says the preference does not apply here, and notes
+  where the fallback cannot help either: a remote ComfyUI has no local tree to clone into.
+
+
 ## [0.11.86] - 2026-08-09
 
 > Covers changes since 0.11.85.
