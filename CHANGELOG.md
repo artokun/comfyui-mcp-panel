@@ -6,6 +6,36 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.86] - 2026-08-09
+
+> Covers changes since 0.11.85.
+
+### Changed
+
+- **Editing many widgets in a row is no longer slow (#716).** Every `panel_set_widget`
+  re-downloaded ComfyUI's entire node schema before writing — on an install with 63 custom
+  node packs that is 5.4 MB and roughly 170 ms, every single time. A prompt-editing task
+  that touched 29 widgets paid for it 29 times.
+
+  A burst of writes now shares one download instead of taking one each. Measured on the
+  test rig: 12 widget writes went from 12 downloads to 1.
+
+  The safety check those downloads exist for is unchanged. A write is still authorised
+  against the live backend's node list, and that list is re-read the moment anything the
+  panel can see could have changed it — a node refresh, an install, a completed download,
+  or a reconnect. The one case it cannot see is a pack uninstalled through ComfyUI's own
+  Manager while an agent is mid-edit, which leaves a window of up to 1.5 seconds; that is
+  written down in the code rather than left for someone to discover.
+
+### Fixed
+
+- **A changelog entry no longer repeats a release that already shipped.** Version tags here
+  lag the releases themselves, and the generator preferred the newest tag over the newest
+  release commit — so with `v0.11.84` tagged and 0.11.85 untagged, this entry initially
+  re-listed a fix 0.11.85 had already announced. It now takes whichever of the two is
+  actually newer, decided by ancestry rather than by date.
+
+
 ## [0.11.85] - 2026-08-09
 
 > Covers changes since 0.11.84.
