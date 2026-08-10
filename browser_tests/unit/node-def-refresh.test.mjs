@@ -554,3 +554,43 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
   assert.equal(verdict.reason, "register_failed");
   assert.equal(getConfirmed(), false, "the shared trust flag must not latch true after a falsy throw");
 });
+
+test("#954: the shipping run survives a transient getNodeDefs throw", async () => {
+  // The WIRING SEAM (codex). The retry helper has its own tests and the browser run proved
+  // the whole path, but neither pins that registerComfyNodeDefs itself turns
+  // first-throw/second-success into a refresh — which is the exact regression #954 reports.
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError("Failed to fetch");
+        return { SomeNode: {} };
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true, "a blip inside a reconnect window must not fail the refresh");
+  assert.equal(calls, 2, "it re-attempted rather than swallowing the throw");
+});
+
+test("#954: a persistent getNodeDefs throw still reports the fetch failure it always did", async () => {
+  // The other direction, and the one a retry can silently break: a genuine outage must keep
+  // producing `object_info_fetch_failed` with a real detail, not a vaguer verdict.
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        throw new TypeError("Failed to fetch");
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(String(verdict.detail ?? ""), /Failed to fetch/);
+  assert.equal(calls, 3, "bounded — it does not retry forever");
+});

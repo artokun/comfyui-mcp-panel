@@ -12,8 +12,9 @@
  * refresh path did not, so the same flake was survivable at page load and fatal to a tool
  * call.
  *
- * BOUNDED, because this blocks a tool call: three attempts, ~800ms of added waiting in the
- * worst case. Long enough to cross a reconnect blip, short enough that a genuinely dead
+ * BOUNDED, because this blocks a tool call: three attempts, 800ms of added WAITING at most.
+ * That bounds the backoff, not the total — the three requests can each take as long as the
+ * network makes them (codex). What it buys is that a blip costs under a second of sleeping. Long enough to cross a reconnect blip, short enough that a genuinely dead
  * backend still answers quickly with the honest failure rather than hanging the agent.
  */
 

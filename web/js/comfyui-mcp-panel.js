@@ -743,6 +743,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // for this reason; this path did not, so the same blip was survivable at page load
       // and fatal to a tool call. Bounded (~800ms worst case) because this blocks the call,
       // and the LAST error is rethrown so a genuine outage still reports what it always did.
+      // (~800ms is the added WAITING; the three requests themselves are unbounded — codex.)
       defs = await fetchNodeDefsWithRetry(() => api.getNodeDefs());
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced

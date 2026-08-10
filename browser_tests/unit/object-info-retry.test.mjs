@@ -109,6 +109,8 @@ test("#954: the wait is bounded and ordered", async () => {
     /x/,
   );
   assert.deepEqual(slept, OBJECT_INFO_RETRY_DELAYS_MS);
-  assert.ok(slept.reduce((a, b) => a + b, 0) <= 1000, "worst case must stay under a second");
+  // Bounds the SLEEPING, not the tool call: the three requests themselves are unbounded
+  // (codex). What this guarantees is that a blip costs under a second of waiting.
+  assert.ok(slept.reduce((a, b) => a + b, 0) <= 1000, "total backoff must stay under a second");
   assert.deepEqual([...slept].sort((a, b) => a - b), slept, "backoff, not a fixed interval");
 });
