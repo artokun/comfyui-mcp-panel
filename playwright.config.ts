@@ -31,6 +31,13 @@ export default defineConfig({
   // `node --test` (npm run test:unit), NOT Playwright — Playwright's default
   // testMatch would otherwise import them (node:test auto-runs on import).
   testIgnore: '**/unit/**',
+  // #907 — the suite persists real workflows through ComfyUI's userdata API, and
+  // was leaving them in the developer's own library (1269 of 1286 files were test
+  // output when this was measured). Per-spec cleanup could not fix it: it sits at
+  // the end of a test body, so it does not run when the test FAILS. Only these
+  // two see the whole run.
+  globalSetup: './browser_tests/global-setup.ts',
+  globalTeardown: './browser_tests/global-teardown.ts',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
