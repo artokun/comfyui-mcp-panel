@@ -62,6 +62,10 @@ export async function runSetWidget(
     getRegistry,
     getFreshObjectInfo,
     wasTypeEverDefined,
+    // #982 — what the /object_info oracle observed on its last attempt, so an
+    // unavailable-schema refusal can name the routes it tried instead of asserting a
+    // cause it never established.
+    describeObjectInfoFailure,
     resolveSource,
     canvas,
     beforeChange,
@@ -268,6 +272,7 @@ export async function runSetWidget(
       // but absent from the current /object_info is a REMOVED backend node — refuse
       // (the non-forgeable trust root; client shape/name/markers cannot prove this).
       wasTypeEverDefined,
+      describeObjectInfoFailure,
     });
   }
 

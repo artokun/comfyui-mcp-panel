@@ -175,6 +175,7 @@ import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
 import { createObjectInfoCache } from "./lib/object-info-cache.js";
+import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -668,6 +669,8 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // #716 — one /object_info per BURST of widget writes, instead of one per write.
 const objectInfoCache = createObjectInfoCache();
+/** #982 — what the last /object_info oracle attempt observed, for the refusal text. */
+let lastObjectInfoOracleFailures = [];
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -10285,16 +10288,30 @@ const GRAPH_TOOL_EXECUTORS = {
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function"
-            ? // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
-              // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
-              // Still the WHOLE payload, so no question this fence asks changes scope —
-              // only how often it is re-fetched. Dropped by anything that knows the schema
-              // moved. See lib/object-info-cache.js for why the per-class route #767 used
-              // for add_node is NOT safe here.
-              await objectInfoCache.read(() => api.getNodeDefs())
-            : null,
+          // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
+          // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
+          // Still the WHOLE payload, so no question this fence asks changes scope —
+          // only how often it is re-fetched. Dropped by anything that knows the schema
+          // moved. See lib/object-info-cache.js for why the per-class route #767 used
+          // for add_node is NOT safe here.
+          await objectInfoCache.read(async () => {
+            // #982 — TWO TRANSPORTS for the same question. The reporter's fence refused
+            // for "object_info is unavailable" while `/object_info/VAELoader` answered on
+            // the same machine, so the frontend client can fail where the HTTP route does
+            // not. Whatever each attempt actually did is recorded and reaches the refusal,
+            // because "unreachable or the fetch failed" named two causes and established
+            // neither.
+            const { defs, failures } = await fetchWholeObjectInfo({
+              getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+              fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+            });
+            lastObjectInfoOracleFailures = defs ? [] : failures;
+            return defs;
+          }),
         ),
+      // What the last oracle attempt observed, so a refusal can say which routes were
+      // tried and what each one did instead of asserting an unreachable backend.
+      describeObjectInfoFailure: () => objectInfoOracleFailureNote(lastObjectInfoOracleFailures),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
       // node — refuse (non-forgeable; client shape/name/provenance can't prove this).
