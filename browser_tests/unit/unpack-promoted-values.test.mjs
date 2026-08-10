@@ -258,6 +258,28 @@ test("#979 (codex final): the preflight refuses a promoted rail whose target can
   );
 });
 
+test("#979 (codex final): an INDETERMINATE resolver result refuses — only `promoted === false` is proof", () => {
+  // Truthiness was too weak: `undefined`, `null`, `{}` and `{promoted: undefined}` are
+  // all "I do not know", and treating them as ordinary widgets let a divergent value be
+  // destroyed in BOTH modes — carried-with-snapshot and preflight-without.
+  for (const result of [undefined, null, {}, { promoted: undefined }, { promoted: true, target: {} }]) {
+    const res = materializePromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => result);
+    assert.deepEqual(res.unresolved, [], `snapshot mode: ${JSON.stringify(result)} must not be benign`);
+    assert.equal(res.unrecoverable.length, 1, `snapshot mode: ${JSON.stringify(result)} must refuse`);
+
+    const div = findDivergentPromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => result);
+    assert.equal(div.length, 1, `preflight mode: ${JSON.stringify(result)} must refuse`);
+  }
+  // The one benign shape, in both modes.
+  const ok = materializePromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => ({ promoted: false }));
+  assert.equal(ok.unresolved.length, 1);
+  assert.deepEqual(ok.unrecoverable, []);
+  assert.deepEqual(
+    findDivergentPromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => ({ promoted: false })),
+    [],
+  );
+});
+
 test("#979 (codex final): an ITERATION-level throw is reported as aborted, not as no-work-done", () => {
   // Per-rail isolation does not cover the loop itself. An indexed getter that throws
   // after an earlier rail was carried used to escape the function, so the executor

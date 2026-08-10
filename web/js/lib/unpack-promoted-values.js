@@ -154,7 +154,7 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
       //                          on a destructive path must refuse: its value may be
       //                          diverged and would be destroyed with nothing to
       //                          recover from.
-      if (resolved?.promoted) {
+      if (resolved?.promoted !== false) {
         unrecoverable.push({
           widget: name,
           reason: "resolves as promoted but its inner widget could not be identified, so it cannot be carried",
@@ -312,7 +312,7 @@ export function findDivergentPromotedValues(subgraphNode, resolvePromoted) {
         // that resolves as promoted but yields no usable target is an UNKNOWN — its
         // value may be diverged, and with no snapshot there would be nothing to
         // recover it from once the unpack destroys the rail.
-        if (resolved?.promoted) divergent.push({ widget: name, reason: "its inner widget could not be identified" });
+        if (resolved?.promoted !== false) divergent.push({ widget: name, reason: "its inner widget could not be identified" });
         continue;
       }
       if (!Object.is(rail.value, innerWidget.value)) divergent.push({ widget: name });
