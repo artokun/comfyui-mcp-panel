@@ -37,8 +37,12 @@ test("#887: a different active workflow is reported, and named", () => {
   // The save warning is the point of the issue: the reporter's concern was that a Save-As
   // at this moment writes the wrong canvas.
   assert.match(r.active_mismatch_hint, /do NOT save/i);
-  assert.match(r.active_mismatch_hint, /wf:workflows\/B\.json/);
-  assert.match(r.active_mismatch_hint, /wf:workflows\/A\.json/);
+  // FIXED WORDING — the routing keys must NOT be interpolated into it (codex). They are
+  // workflow-derived (a user names their own files), and splicing them into
+  // instruction-shaped prose puts attacker-influenced text inside a sentence a model reads
+  // as trusted. They belong in the structured fields, presented as data.
+  assert.doesNotMatch(r.active_mismatch_hint, /wf:workflows/);
+  assert.match(r.active_mismatch_hint, /active_routing_key/, "it points at the fields instead");
 });
 
 test("#887: an unreadable active slot is UNKNOWN, never a mismatch", () => {

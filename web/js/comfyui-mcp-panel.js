@@ -2470,7 +2470,7 @@ function establishedWorkflowReplyIdentity(wf) {
   return routingKey ? { routingKey, uuid } : null;
 }
 
-function activeWorkflowUuidForOpenReply(target) {
+function activeWorkflowUuidForOpenReply(target, activeSnapshot) {
   // Do not accept a workflow-service reference captured before workflow_open's
   // awaits: a reconnect can replace/rebind that service while the old instance
   // still reports `target` as active. Read the panel's CURRENT binding at reply
@@ -12544,7 +12544,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // after another tab wins the active slot during any await above; publishing
     // its UUID then would let the MCP stamp a command for a different canvas.
     // Omission is deliberate: the MCP keeps its existing fence fail-closed.
-    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target);
+    // ONE observation, shared by the uuid decision and the binding report (codex).
+    // Reading the active workflow twice let a reply pair a uuid decided against one
+    // observation with binding fields decided against a later one — internally
+    // contradictory diagnostics, which is what this issue is about.
+    const liveActiveAtReply = (() => {
+      try {
+        return activeWorkflowRef();
+      } catch {
+        return null;
+      }
+    })();
+    const targetRoutingKeyAtReply = workflowTabId(target);
+    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target, liveActiveAtReply);
     // #887 — report WHAT WAS OBSERVED to be active, beside what was requested.
     //
     // `opened` and `routing_key` both name the TARGET, and nothing in the reply said what
@@ -12559,11 +12571,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // target really WAS active). It makes the moment REPORTABLE, so a caller can compare
     // rather than trust.
     const openActiveBinding = describeOpenActiveBinding({
-      targetRoutingKey: workflowTabId(target),
+      targetRoutingKey: targetRoutingKeyAtReply,
       activeRoutingKey: (() => {
         try {
-          const live = activeWorkflowRef();
-          return live ? workflowTabId(live) : null;
+          return liveActiveAtReply ? workflowTabId(liveActiveAtReply) : null;
         } catch {
           return null; // unreadable -> `active_matches_target: null`, never a false mismatch
         }
@@ -12571,7 +12582,7 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     return {
       opened: { path: target.path, filename: target.filename },
-      routing_key: workflowTabId(target),
+      routing_key: targetRoutingKeyAtReply,
       ...openActiveBinding,
       ...(activeWorkflowUuid ? { workflow_uuid: activeWorkflowUuid } : {}),
       modified: !!target.isModified,

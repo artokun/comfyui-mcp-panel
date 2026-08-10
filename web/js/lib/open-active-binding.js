@@ -28,6 +28,11 @@
  * @param {{targetRoutingKey?: string|null, activeRoutingKey?: string|null}} observed
  *   routing keys read from the TARGET and from the live active workflow, both at reply
  *   emission. `activeRoutingKey` null means the panel could not read one.
+ * The hint is FIXED WORDING. Routing keys are workflow-derived — a user names their own
+ * files — and interpolating them into instruction-shaped prose puts attacker-influenced
+ * text inside a sentence a model reads as trusted (codex). The values stay in the
+ * structured fields, where a consumer presents them as data.
+ *
  * @returns {{active_routing_key: string|null, active_matches_target: boolean|null,
  *   active_mismatch_hint?: string}}
  */
@@ -47,9 +52,10 @@ export function describeOpenActiveBinding({ targetRoutingKey, activeRoutingKey }
     active_routing_key: active,
     active_matches_target: false,
     active_mismatch_hint:
-      `The open ran, but at the moment this reply was composed the ACTIVE workflow was ` +
-      `"${active}", not the requested "${target}". Do not treat the requested workflow as ` +
-      `bound: re-read panel_list_workflows, and do NOT save — a save targets the live ` +
-      `canvas, which is a different workflow than the one you asked for.`,
+      "The open ran, but at the moment this reply was composed the ACTIVE workflow was not " +
+      "the requested one. Do not treat the requested workflow as bound: re-read " +
+      "panel_list_workflows, and do NOT save — a save targets the live canvas, which is a " +
+      "different workflow than the one you asked for. The two routing keys are reported in " +
+      "`active_routing_key` and `routing_key`.",
   };
 }

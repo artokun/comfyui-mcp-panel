@@ -914,8 +914,20 @@ test("#716 wiring: post-open and active workflow responses carry the live instan
   assert.match(list, /const \{ active, activeIdentity \} = liveWorkflowListActive\(\);/);
   assert.doesNotMatch(list, /const active = s\.activeWorkflow;/, "workflow_list must not publish a pre-reconnect service binding");
   assert.match(list, /activeIdentity \? \{ workflow_uuid: activeIdentity\.uuid \} : \{\}/);
-  assert.match(open, /activeWorkflowUuidForOpenReply\(target\)/);
+  // #887 — the uuid gate now shares ONE observation of the active workflow with the
+  // binding report beside it. Two separate reads let a reply pair a uuid decided against
+  // one observation with binding fields decided against a later one, which is internally
+  // contradictory diagnostics (codex) — the exact class of thing #887 reports.
+  assert.match(open, /activeWorkflowUuidForOpenReply\(target, liveActiveAtReply\)/);
+  assert.match(open, /const liveActiveAtReply = /, "the snapshot must be taken once");
   assert.doesNotMatch(open, /activeWorkflowUuidForOpenReply\(target, s\.activeWorkflow\)/);
+  // The snapshot is what the #887 fields are derived from too — not a second read.
+  assert.match(open, /describeOpenActiveBinding\(\{/);
+  assert.doesNotMatch(
+    open,
+    /activeRoutingKey: \(\(\) => \{\s*try \{\s*const live = activeWorkflowRef\(\)/,
+    "the binding report must use the shared snapshot, not read the active workflow again",
+  );
   assert.match(open, /activeWorkflowUuid \? \{ workflow_uuid: activeWorkflowUuid \} : \{\}/);
 });
 
