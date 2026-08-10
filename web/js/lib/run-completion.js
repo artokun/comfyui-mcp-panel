@@ -383,6 +383,7 @@ export function createRunCompletionTracker({
       signature,
       panelQueued: panelQueued.has(k),
       promptId: promptIdOf(k),
+      durationMs,
     });
     if (!verdict.deliver) {
       // Retire it exactly as a delivered run would be: it IS accounted for, and
@@ -550,6 +551,13 @@ export function createRunCompletionTracker({
       // Same async-delivery hold as flush(): the reconciled batch is composed and
       // sent by the caller, so it is not "delivered" until the caller says so.
       markDispatched(k);
+      // #986 (codex NO-SHIP): a reconciled delivery must RECORD its signature too.
+      // Without this, a completion recovered from /history after a reconnect left no
+      // trace, so the first canvas re-queue of that same cached output afterwards got
+      // a free pass — the guarantee flush() makes was simply false on the #370 path.
+      // Recorded, never suppressed: a reconcile exists to deliver something the agent
+      // has NOT been told about, so it always goes through.
+      deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       onFlush({
         key: k,
         promptId,

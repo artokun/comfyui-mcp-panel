@@ -50,7 +50,7 @@ export function mediaSignature(images, videos) {
   if (add("v", videos) === null) return null;
   if (!parts.length) return null;
   parts.sort();
-  return parts.join("|");
+  return JSON.stringify(parts);
 }
 
 /**
@@ -62,7 +62,23 @@ export function mediaSignature(images, videos) {
  * which covers the reported burst (six in ~30 seconds) without swallowing a later
  * deliberate re-render.
  */
-export function createCompletionDeduper({ ttlMs = 5 * 60 * 1000, now = () => Date.now() } = {}) {
+export function createCompletionDeduper({
+  ttlMs = 5 * 60 * 1000,
+  now = () => Date.now(),
+  // #986 (codex NO-SHIP): same filename is NOT the same result. A node that writes a
+  // fixed name — no counter in the prefix — produces two REAL renders with identical
+  // signatures, and suppressing the second loses work the user waited for.
+  //
+  // The reporter's own evidence supplies the discriminator: the duplicates ran in
+  // 0.1-0.3s against a genuine first render of 10m51s. Nothing renders a 10s clip in
+  // 100ms; that is ComfyUI returning a cached result. So a repeat is only suppressed
+  // when it did not actually render. A real overwrite render takes real time and is
+  // always delivered.
+  //
+  // An UNKNOWN duration never suppresses: a missing start yields null, and null is
+  // not evidence of a cache hit.
+  cacheHitMaxMs = 1500,
+} = {}) {
   const seen = new Map(); // signature -> { at, promptId }
 
   const prune = () => {
@@ -80,14 +96,20 @@ export function createCompletionDeduper({ ttlMs = 5 * 60 * 1000, now = () => Dat
      * missed duplicate costs a redundant message, a wrongly-suppressed completion
      * costs the result itself.
      */
-    consider({ signature, panelQueued, promptId }) {
+    consider({ signature, panelQueued, promptId, durationMs }) {
       prune();
       if (panelQueued) return { deliver: true, duplicateOf: null };
       if (!signature) return { deliver: true, duplicateOf: null };
       const hit = seen.get(signature);
-      if (hit) return { deliver: false, duplicateOf: hit.promptId ?? null };
-      seen.set(signature, { at: now(), promptId: promptId ?? null });
-      return { deliver: true, duplicateOf: null };
+      if (!hit) {
+        seen.set(signature, { at: now(), promptId: promptId ?? null });
+        return { deliver: true, duplicateOf: null };
+      }
+      // Same output as something already announced — but that alone does not make it
+      // a replay. Only a run that plainly did not render is suppressed.
+      const looksCached = typeof durationMs === "number" && durationMs >= 0 && durationMs <= cacheHitMaxMs;
+      if (!looksCached) return { deliver: true, duplicateOf: null };
+      return { deliver: false, duplicateOf: hit.promptId ?? null };
     },
 
     /**

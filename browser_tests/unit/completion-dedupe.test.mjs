@@ -23,7 +23,7 @@ test("#986 the reported burst: six cached re-queues of one clip deliver ONCE", (
   const ids = ["2d9d64f5", "c3e90187", "c5184f9e", "4ce0a352", "740ff0f5", "aa11bb22"];
   const delivered = ids.filter(
     (promptId) =>
-      d.consider({ signature: mediaSignature([], media), panelQueued: false, promptId }).deliver,
+      d.consider({ signature: mediaSignature([], media), panelQueued: false, promptId, durationMs: 100 }).deliver,
   );
   assert.deepEqual(delivered, ["2d9d64f5"], "only the first announcement survives");
 });
@@ -32,7 +32,7 @@ test("#986 the suppressed ones name what they duplicate", () => {
   const d = createCompletionDeduper();
   const sig = mediaSignature([], [vid("Video_00144.mp4")]);
   d.consider({ signature: sig, panelQueued: false, promptId: "first" });
-  const second = d.consider({ signature: sig, panelQueued: false, promptId: "second" });
+  const second = d.consider({ signature: sig, panelQueued: false, promptId: "second", durationMs: 100 });
   assert.equal(second.deliver, false);
   assert.equal(second.duplicateOf, "first");
 });
@@ -43,7 +43,7 @@ test("#986 a PANEL-QUEUED run is NEVER suppressed — it was promised a notifica
   // duplicates this fixes.
   const d = createCompletionDeduper();
   const sig = mediaSignature([], [vid("same.mp4")]);
-  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "canvas" }).deliver, true);
+  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "canvas", durationMs: 100 }).deliver, true);
   assert.equal(d.consider({ signature: sig, panelQueued: true, promptId: "panel" }).deliver, true);
   assert.equal(d.consider({ signature: sig, panelQueued: true, promptId: "panel2" }).deliver, true);
 });
@@ -53,7 +53,7 @@ test("#986 a panel-queued delivery is RECORDED, so a later canvas replay is caug
   const d = createCompletionDeduper();
   const sig = mediaSignature([], [vid("same.mp4")]);
   d.record({ signature: sig, promptId: "panel-run" });
-  const replay = d.consider({ signature: sig, panelQueued: false, promptId: "canvas-replay" });
+  const replay = d.consider({ signature: sig, panelQueued: false, promptId: "canvas-replay", durationMs: 100 });
   assert.equal(replay.deliver, false);
   assert.equal(replay.duplicateOf, "panel-run");
 });
@@ -62,19 +62,19 @@ test("#986 a DIFFERENT output is always delivered", () => {
   const d = createCompletionDeduper();
   const a = mediaSignature([], [vid("Video_00144.mp4")]);
   const b = mediaSignature([], [vid("Video_00145.mp4")]);
-  assert.equal(d.consider({ signature: a, panelQueued: false, promptId: "1" }).deliver, true);
-  assert.equal(d.consider({ signature: b, panelQueued: false, promptId: "2" }).deliver, true);
+  assert.equal(d.consider({ signature: a, panelQueued: false, promptId: "1", durationMs: 100 }).deliver, true);
+  assert.equal(d.consider({ signature: b, panelQueued: false, promptId: "2", durationMs: 100 }).deliver, true);
 });
 
 test("#986 the window EXPIRES — a deliberate re-render later is a real event", () => {
   let t = 0;
   const d = createCompletionDeduper({ ttlMs: 1000, now: () => t });
   const sig = mediaSignature([], [vid("same.mp4")]);
-  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "1" }).deliver, true);
+  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "1", durationMs: 100 }).deliver, true);
   t = 500;
-  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "2" }).deliver, false);
+  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "2", durationMs: 100 }).deliver, false);
   t = 2000; // past the window
-  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "3" }).deliver, true);
+  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "3", durationMs: 100 }).deliver, true);
 });
 
 test("#986 signature ignores ORDER but not identity", () => {
@@ -102,8 +102,8 @@ test("#986 an UNIDENTIFIABLE media set yields no signature, and is therefore nev
   assert.equal(mediaSignature([], []), null);
   assert.equal(mediaSignature(null, null), null);
   const d = createCompletionDeduper();
-  assert.equal(d.consider({ signature: null, panelQueued: false, promptId: "1" }).deliver, true);
-  assert.equal(d.consider({ signature: null, panelQueued: false, promptId: "2" }).deliver, true);
+  assert.equal(d.consider({ signature: null, panelQueued: false, promptId: "1", durationMs: 100 }).deliver, true);
+  assert.equal(d.consider({ signature: null, panelQueued: false, promptId: "2", durationMs: 100 }).deliver, true);
 });
 
 test("#986 one unnamed item poisons the whole signature, rather than hashing the rest", () => {
@@ -115,7 +115,7 @@ test("#986 the deduper is bounded in TIME, so it cannot grow without limit", () 
   let t = 0;
   const d = createCompletionDeduper({ ttlMs: 100, now: () => t });
   for (let i = 0; i < 50; i++) {
-    d.consider({ signature: `sig-${i}`, panelQueued: false, promptId: String(i) });
+    d.consider({ signature: `sig-${i}`, panelQueued: false, promptId: String(i), durationMs: 100 });
     t += 10;
   }
   assert.ok(d.size() < 50, "entries older than the window are pruned");
@@ -128,4 +128,45 @@ test("#986 the note explains the collapse and reassures about panel_run", () => 
   assert.match(note, /served from ComfyUI's cache/, "names the likely cause without asserting internals");
   assert.match(note, /queued through panel_run are never suppressed/, "the guarantee that matters");
   assert.equal(duplicateSuppressedNote(0, "x"), "", "silent when nothing was suppressed");
+});
+
+test("#986 (codex): a REAL re-render that overwrites the same filename is always delivered", () => {
+  // The false positive that would make this worse than the bug. A node writing a fixed
+  // name — no counter in the prefix — produces two genuine results with identical
+  // signatures. Same filename is not the same result; what separates a cache replay
+  // from a real render is that the replay did not render. 0.1s vs 10m51s, from the
+  // report itself.
+  const d = createCompletionDeduper();
+  const sig = mediaSignature([], [vid("clip.mp4")]);
+  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "r1", durationMs: 651000 }).deliver, true);
+  assert.equal(
+    d.consider({ signature: sig, panelQueued: false, promptId: "r2", durationMs: 640000 }).deliver,
+    true,
+    "a 10-minute render is never a cache hit, whatever it is called",
+  );
+});
+
+test("#986 (codex): an UNKNOWN duration never suppresses — null is not evidence of a cache hit", () => {
+  const d = createCompletionDeduper();
+  const sig = mediaSignature([], [vid("clip.mp4")]);
+  d.consider({ signature: sig, panelQueued: false, promptId: "1", durationMs: 100 });
+  for (const durationMs of [null, undefined, -1, Number.NaN, "100"]) {
+    assert.equal(
+      d.consider({ signature: sig, panelQueued: false, promptId: "x", durationMs }).deliver,
+      true,
+      `durationMs=${String(durationMs)} must not be read as cached`,
+    );
+  }
+});
+
+test("#986 (codex): the signature is INJECTIVE — delimiters in a filename cannot forge a collision", () => {
+  // The fields are producer-controlled. Concatenating them with delimiters let a name
+  // containing one make two different sets share a signature, which here means a real
+  // result is suppressed.
+  const a = mediaSignature([], [vid('a", "b.mp4')]);
+  const b = mediaSignature([], [vid("a", "b.mp4")]);
+  assert.notEqual(a, b);
+  const c = mediaSignature([], [{ filename: "x.mp4", subfolder: 'sub", "', type: "output" }]);
+  const e = mediaSignature([], [{ filename: "x.mp4", subfolder: "sub", type: '", "output' }]);
+  assert.notEqual(c, e);
 });

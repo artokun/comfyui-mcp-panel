@@ -25122,6 +25122,23 @@ function buildPanel() {
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
+    // #986 — a suppressed duplicate is not silently dropped. It is a canvas re-queue
+    // whose output was already announced and which plainly did not render (a
+    // sub-second "render" of a clip that took minutes the first time), so the agent
+    // gains nothing from a second identical turn — but the console should still be
+    // able to show that it happened, and this is the seam that makes it observable
+    // rather than a claim in a comment.
+    onDuplicateSuppressed: ({ promptId, duplicateOf, durationMs }) => {
+      try {
+        console.info(
+          `[comfyui-mcp-panel] #986 duplicate completion suppressed: prompt ${promptId} ` +
+            `delivered the same output as ${duplicateOf ?? "an earlier run"} in ${durationMs}ms ` +
+            `(cache replay, not a new render)`,
+        );
+      } catch {
+        /* logging must never break the run lifecycle */
+      }
+    },
     onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs, noMedia }) => {
       // #370: track whether the composed completion frame actually reached the
       // agent. sendFrame returns false when the bridge socket is down — in that
