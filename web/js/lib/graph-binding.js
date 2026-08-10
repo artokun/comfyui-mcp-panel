@@ -1399,9 +1399,10 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
  *                record ties it to the tag): the tag is the active tab's own
  *                lineage, stale relative to its current identity, so the root
  *                is provably its own canvas — re-stamp and proceed. Also when
- *                `staleTagOnEmptyCanvas` is set (#565): ComfyUI reuses the
- *                app.graph object across tabs and its clear/configure does NOT
- *                reset graph.extra, so a brand-new blank tab inherits the
+ *                `staleTagOnEmptyCanvas` is set (#565): on the frontend that
+ *                report came from, ComfyUI reused the app.graph object across
+ *                tabs and its clear/configure did NOT reset graph.extra, so a
+ *                brand-new blank tab inherited the
  *                PREVIOUS workflow's tag while minting its own identity. With
  *                zero nodes on BOTH sides there is no workflow content that
  *                could be confused — the #349 fence protects CONTENT — so the
@@ -1414,12 +1415,29 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
  *                the evidence does not get weaker because a stale tag happens to
  *                be sitting on the object. The asymmetry it removes was the #817
  *                report: switching tabs leaves the PREVIOUS workflow's tag on the
- *                reused app.graph (configure does not reset graph.extra — the
+ *                reused app.graph (on that build configure did not reset graph.extra — the
  *                same mechanism the empty-canvas clause above records), so a
  *                canvas that IS the active workflow's, byte for byte, was refused
  *                where an untagged copy of it was allowed. Nothing self-healed
  *                it: the seal declines a root that already carries a tag, so a
  *                WRONG tag was stickier than no tag at all;
+ *
+ * MEASURED 2026-08-09 on ComfyUI frontend 1.48.7 — stamp a marker on the live
+ * root, then change its content three ways, same graph object throughout:
+ *
+ *   configure(payload with extra:{})      -> tag gone, nodes 10 -> 1
+ *   configure(payload with NO extra key)  -> tag gone, nodes  1 -> 2
+ *   clear()                               -> tag gone, nodes    -> 0
+ *
+ * So on THAT build a tag does not survive a content change, including the
+ * no-extra-key case both clauses above name. Their premise is therefore
+ * frontend-specific, and the clauses may simply not be reachable on current
+ * builds. They are left in place deliberately: both ADMIT (they widen the
+ * fence), so an unreachable one costs nothing, while removing one would make
+ * the fence stricter for anyone still on the frontend that reported it. The
+ * wording is scoped rather than deleted so the next reader does not inherit a
+ * universal claim from a single observation — in either direction. Verified on
+ * one frontend, which is exactly why neither statement should be universal.
  *   "conflict" — anything else. A tag claimed by a FOREIGN open workflow is the
  *                #349 wrong-canvas case, and a tag NOBODY claims may be a
  *                closed tab's stale canvas — re-stamping either would authorize
