@@ -18409,7 +18409,7 @@ function describeCommand(cmd, msg, reply) {
               // accepted prompt, not that this run queued it. A concurrent queue
               // action would otherwise be reported as this run's doing.
               (r.disabled_outputs_in_graph?.length
-                ? ` — WARNING: this workflow has ${r.disabled_outputs_in_graph.length} output node${r.disabled_outputs_in_graph.length === 1 ? "" : "s"} inside a nested muted/bypassed subgraph, which this ComfyUI build does not exclude`
+                ? ` — WARNING: this workflow has ${r.disabled_outputs_in_graph.length} output node${r.disabled_outputs_in_graph.length === 1 ? "" : "s"} inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them`
                 : ""),
             ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }

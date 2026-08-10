@@ -21,6 +21,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   MODE_MUTE,
@@ -262,4 +263,21 @@ test("#985 (codex final): the top-level suppression still holds when ids collide
   // fooled by the matching ids either.
   const g = graphOf([wrapper(7, MODE_MUTE, [wrapper(7, 0, [outputNode(9, "SaveVideo")])])]);
   assert.deepEqual(collectDisabledAncestorOutputs(g), []);
+});
+
+test("#985 (codex final): the summary label attributes the behaviour to the MEASURED build", () => {
+  // The label is the part most people read. Saying "this ComfyUI build does not exclude
+  // them" asserts something about the user's CURRENT build, which a graph walk never
+  // inspected — and which is false on a fixed one. Asserted against the shipped source
+  // because the summariser lives inside the monolith's switch.
+  const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(panelSrc, /the measured ComfyUI build did not exclude them/, "past tense, about the measurement");
+  assert.ok(
+    !/which this ComfyUI build does not exclude/.test(panelSrc),
+    "must not claim anything about the build actually running",
+  );
+  assert.ok(
+    !/are execution roots in this workflow/.test(panelSrc),
+    "and must not claim roots of the accepted run — the walk cannot establish that",
+  );
 });
