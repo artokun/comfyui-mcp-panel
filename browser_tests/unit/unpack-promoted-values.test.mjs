@@ -193,6 +193,71 @@ test("#979 (codex final): promoted-but-unresolvable REFUSES; definitively-not-pr
   assert.equal(ordinary.unresolved.length, 1);
 });
 
+test("#979 (codex final): an accessor that MUTATES then throws refuses — it is not swallowed", () => {
+  // The internal catches used to file these as `unresolved`, so the unpack proceeded
+  // over state nothing could prove. Each of the three pre-write reads is injected or
+  // node-supplied code that can mutate on its way to throwing.
+  let sideEffects = 0;
+  const cases = {
+    "resolver throws": {
+      widgets: [widget("text", "NEW")],
+      resolve: () => {
+        sideEffects += 1;
+        throw new Error("resolver mutated then threw");
+      },
+    },
+    "rail getter throws": {
+      widgets: [
+        {
+          name: "text",
+          get value() {
+            sideEffects += 1;
+            throw new Error("rail getter mutated then threw");
+          },
+        },
+      ],
+      resolve: () => ({ promoted: true, target: { node: { id: 9 }, widget: widget("text", "OLD") } }),
+    },
+    "inner getter throws": {
+      widgets: [widget("text", "NEW")],
+      resolve: () => ({
+        promoted: true,
+        target: {
+          node: { id: 9 },
+          widget: {
+            name: "text",
+            get value() {
+              sideEffects += 1;
+              throw new Error("inner getter mutated then threw");
+            },
+            set value(_v) {},
+          },
+        },
+      }),
+    },
+  };
+  for (const [label, c] of Object.entries(cases)) {
+    const res = materializePromotedValues({ id: 5, widgets: c.widgets }, c.resolve);
+    assert.deepEqual(res.unresolved, [], `${label}: never benign`);
+    assert.equal(res.unrecoverable.length, 1, `${label}: must refuse the unpack`);
+  }
+  assert.ok(sideEffects >= 3, "each case really did run the accessor");
+});
+
+test("#979 (codex final): the preflight refuses a promoted rail whose target cannot be identified", () => {
+  const divergent = findDivergentPromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => ({
+    promoted: true,
+    target: null,
+  }));
+  assert.equal(divergent.length, 1, "unknown promotion + no snapshot ⇒ refuse");
+  assert.match(divergent[0].reason, /could not be identified/);
+  // And a definitive non-promotion still does not block.
+  assert.deepEqual(
+    findDivergentPromotedValues({ id: 5, widgets: [widget("x", 1)] }, () => ({ promoted: false })),
+    [],
+  );
+});
+
 test("#979 (codex final): an ITERATION-level throw is reported as aborted, not as no-work-done", () => {
   // Per-rail isolation does not cover the loop itself. An indexed getter that throws
   // after an earlier rail was carried used to escape the function, so the executor
@@ -373,13 +438,19 @@ test("#979 (codex r4) source guard: no snapshot ⇒ preflight refuses rather tha
   assert.match(src, /Nothing was ` \+\s*`changed/, "and that nothing was changed");
 });
 
-test("#979 a THROWING resolver costs coverage, never the unpack", () => {
+test("#979 a THROWING resolver REFUSES the unpack (contract tightened by codex final)", () => {
+  // This test originally asserted the opposite — that a throwing resolver merely cost
+  // coverage and the unpack continued. That was the hole: the resolver is injected
+  // code running against the live graph, and one that mutates before throwing left
+  // the unpack to proceed over state nothing could prove.
   const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
   const res = materializePromotedValues(sgNode, () => {
     throw new Error("resolver boom");
   });
   assert.deepEqual(res.applied, []);
-  assert.deepEqual(res.unresolved, [{ widget: "text" }]);
+  assert.deepEqual(res.unresolved, []);
+  assert.equal(res.unrecoverable.length, 1);
+  assert.match(res.unrecoverable[0].reason, /cannot be established/);
 });
 
 test("#979 malformed input yields nothing and never throws", () => {

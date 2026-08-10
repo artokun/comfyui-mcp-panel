@@ -130,7 +130,16 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     try {
       resolved = resolvePromoted(subgraphNode, name);
     } catch {
-      resolved = null;
+      // NOT swallowed into `unresolved` (codex final): the resolver is injected code
+      // that ran against the live graph, and one that mutates and then throws would
+      // otherwise let the unpack proceed over state nothing can prove. An exception
+      // here is an unknown, and unknown is unsafe on a destructive path.
+      unrecoverable.push({
+        widget: name,
+        reason: "resolving its promotion threw, so its state before the unpack cannot be established",
+        value_restored: true, // nothing was written by us
+      });
+      return;
     }
     const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
     const innerNode = resolved?.target?.node ?? null;
@@ -160,7 +169,12 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     try {
       railValue = rail.value;
     } catch {
-      unresolved.push({ widget: name, reason: "rail value could not be read" });
+      // Same reasoning as the resolver: a getter that mutates and then throws.
+      unrecoverable.push({
+        widget: name,
+        reason: "reading the parent's value threw, so its state before the unpack cannot be established",
+        value_restored: true,
+      });
       return;
     }
     let innerValue;
@@ -168,13 +182,19 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     try {
       innerValue = innerWidget.value;
     } catch {
-      innerValue = undefined;
-      innerReadable = false;
+      // An inner value we cannot read is one we cannot restore either, so there is no
+      // safe way to attempt the carry — and no way to show the widget is unchanged.
+      unrecoverable.push({
+        widget: name,
+        reason: "reading the inner widget's value threw, so it could not be compared or restored",
+        value_restored: false,
+      });
+      return;
     }
     // Only a genuine DIVERGENCE is written. Writing every promoted widget would fire
     // node callbacks for values that never changed, on a path that is already about
     // to restructure the graph.
-    if (innerReadable && Object.is(railValue, innerValue)) {
+    if (Object.is(railValue, innerValue)) {
       onSkip();
       return;
     }
@@ -186,7 +206,6 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     // value leaves the graph holding something that was in NEITHER the rail nor the
     // inner — and the caller must not destroy the subgraph over that (codex round 2).
     const restore = () => {
-      if (!innerReadable) return false;
       try {
         if (Object.is(innerWidget.value, innerValue)) return true;
         innerWidget.value = innerValue;
@@ -288,7 +307,14 @@ export function findDivergentPromotedValues(subgraphNode, resolvePromoted) {
         continue;
       }
       const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
-      if (!innerWidget) continue;
+      if (!innerWidget) {
+        // Only a definitive `promoted: false` is safe to skip (codex final). A rail
+        // that resolves as promoted but yields no usable target is an UNKNOWN — its
+        // value may be diverged, and with no snapshot there would be nothing to
+        // recover it from once the unpack destroys the rail.
+        if (resolved?.promoted) divergent.push({ widget: name, reason: "its inner widget could not be identified" });
+        continue;
+      }
       if (!Object.is(rail.value, innerWidget.value)) divergent.push({ widget: name });
     } catch {
       // A widget that cannot be read cannot be shown safe. On a destructive path that
