@@ -114,3 +114,25 @@ test("#758: the generator parses this repo's own changelog shape", () => {
   );
   assert.ok(!JSON.stringify(parsed).includes("Covers changes since"), "the blockquote note is not an entry");
 });
+
+test("#758: a downgrade must not overwrite a newer recorded version", () => {
+  // The record is what makes "announce once" true. If a downgrade moved it backwards, a
+  // later re-upgrade would replay releases the user has already read (codex). The panel
+  // only ever moves it forward, so this pins the comparison that decision rests on.
+  assert.ok(compareVersions("0.11.80", "0.11.82") < 0, "a downgrade is not a move forward");
+  assert.ok(compareVersions("0.11.83", "0.11.82") > 0, "an upgrade is");
+  assert.equal(updateAnnouncement({ lastSeen: "0.11.82", current: "0.11.80" }), "none");
+});
+
+test("#758: the announcement level changes how much is shown", () => {
+  // The level used to be computed and thrown away — both levels rendered the same list,
+  // so the report's "prominent for a major change, quiet for a patch" was words only
+  // (codex). A patch shows 3 entries, a major 10; this pins that they differ.
+  const many = Array.from({ length: 20 }, (_, i) => ({
+    version: `0.11.${60 + i}`,
+    sections: { Fixed: [`entry ${i}`] },
+  }));
+  const picked = releasesSince(many, { lastSeen: "0.11.60", current: "0.11.79", max: 20 });
+  assert.equal(summarizeReleases(picked, { maxEntries: 3 }).length, 3, "patch: quiet");
+  assert.equal(summarizeReleases(picked, { maxEntries: 10 }).length, 10, "major: fuller");
+});
