@@ -183,3 +183,27 @@ test("#636: an unrecognised prefix does not get asked at all", () => {
     "the predicate must be gated on the prefix having matched",
   );
 });
+
+// ── the refusal must not advise an impossible remedy ───────────────────────
+
+const refusalSite = src.slice(
+  src.indexOf("let collisionIsGlobal = false;"),
+  src.indexOf("await store.publishSubgraph(finalName);"),
+);
+
+test("#636: a GLOBAL collision is not told to delete it", () => {
+  // subgraphStore.deleteBlueprint refuses a bundled blueprint outright, so "delete it and
+  // retry" is unfollowable — and on a stock install most blueprints are global, making it
+  // the likeliest collision.
+  assert.ok(refusalSite.length > 0, "the refusal must classify the collision");
+  assert.match(refusalSite, /ships WITH ComfyUI/, "it must say why the name cannot be freed");
+  assert.match(refusalSite, /Save under a different one/, "and give the one remedy that works");
+});
+
+test("#636: UNKNOWN is not treated as global", () => {
+  // Only a positive true narrows the remedy. An older frontend or unreadable predicate
+  // keeps the existing wording rather than withholding an option that may well work.
+  assert.match(refusalSite, /=== true;/, "globality must be a positive test");
+  assert.match(refusalSite, /collisionIsGlobal = false;/, "and anything else falls back");
+  assert.match(refusalSite, /startsWith\(prefix\)/, "with the same prefix gate as the listing");
+});
