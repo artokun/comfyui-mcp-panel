@@ -6,6 +6,38 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.80] - 2026-08-09
+
+> Covers changes since 0.11.79.
+
+### Fixed
+
+- **Your first chat about a workflow no longer disappears when you filter to that
+  workflow (#847).** Chat, start a second chat, then tick "Current workflow only": the
+  first conversation vanished, even though both were held on the same canvas.
+
+  The panel saves an unsaved workflow before a turn ("grounding", #330), and ComfyUI
+  replaces the workflow object at that save. Every carrier that could hand the identity
+  to the successor is empty at that instant — the object maps are keyed on the object
+  that just went away, the embedded uuid is unreadable because the fields it is looked
+  for in are all absent on this frontend, and the path alias gets written from the new
+  id. So the successor minted a fresh identity and the conversation from seconds earlier
+  was left holding one that nothing answered to.
+
+  The tab's pre-save route id is now captured *inside* the grounding transaction and
+  filed under the path that save produced. That location matters: an observer watching
+  the change afterwards cannot prove the old id was this tab's past rather than a
+  workflow you switched away from, which is why the panel deliberately migrates nothing
+  there. The save knows by causation — it is the panel's own call, on its own active
+  workflow — so nothing is inferred.
+
+  Scope is small on purpose: these forms are consulted by the history filter alone.
+  They never resolve a workflow's identity, authorize a graph write, or restore a
+  session. One limit stays open and is documented rather than hidden — deleting a
+  workflow and creating a new one with the same name can show the old chats under the
+  new one, since a path is not proof of ownership.
+
+
 ## [0.11.79] - 2026-08-09
 
 > Covers changes since 0.11.78.
