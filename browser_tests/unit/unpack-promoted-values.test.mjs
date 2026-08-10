@@ -187,6 +187,58 @@ test("#979 (codex): a throwing accessor on the REPORT metadata does not lose the
   assert.equal(res.applied.length + res.unresolved.length, 1, "and it is accounted for exactly once");
 });
 
+test("#979 (codex r2): a restore that ALSO normalizes is UNRECOVERABLE, not merely unresolved", () => {
+  // The case the transactional restore alone did not cover: the setter clamps the
+  // rail write (45 → 30) AND clamps the restore of the original (20 → 25). The widget
+  // ends up holding a third value that was in neither the rail nor the inner, and
+  // unpacking over it would make that invented value permanent.
+  const inner = {
+    name: "steps",
+    _v: 20,
+    get value() {
+      return this._v;
+    },
+    set value(v) {
+      this._v = Math.max(Math.min(Number(v) || 0, 30), 25); // clamps BOTH directions
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("steps", 45)] };
+  const res = materializePromotedValues(sgNode, resolverFor({ steps: { node: { id: 9 }, widget: inner } }));
+  assert.deepEqual(res.applied, []);
+  assert.deepEqual(res.unresolved, [], "this is NOT a mere annotation");
+  assert.equal(res.unrecoverable.length, 1, "it is the condition that must stop the unpack");
+  assert.match(res.unrecoverable[0].reason, /could not be restored/);
+});
+
+test("#979 (codex r2): a recoverable failure stays unresolved and does NOT stop the unpack", () => {
+  // The boundary: a clean rollback is reported, but it is not a reason to refuse.
+  const inner = {
+    name: "steps",
+    _v: 20,
+    get value() {
+      return this._v;
+    },
+    set value(v) {
+      this._v = Number(v) === 45 ? 30 : Number(v); // clamps the write, restores cleanly
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("steps", 45)] };
+  const res = materializePromotedValues(sgNode, resolverFor({ steps: { node: { id: 9 }, widget: inner } }));
+  assert.equal(inner._v, 20, "put back exactly");
+  assert.equal(res.unresolved.length, 1);
+  assert.deepEqual(res.unrecoverable, [], "nothing to refuse over");
+});
+
+test("#979 (codex r2) source guard: the unpack REFUSES when a carry could not be rolled back", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const guard = src.indexOf("materialized?.unrecoverable?.length");
+  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  assert.ok(guard > 0, "the refusal must exist");
+  assert.ok(guard < unpack, "and it must come BEFORE the destructive call");
+  assert.match(src, /unpack_subgraph refused/, "and it refuses rather than annotating");
+  assert.match(src, /nothing was destroyed/, "and says the subgraph is intact when it could restore");
+});
+
 test("#979 a THROWING resolver costs coverage, never the unpack", () => {
   const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
   const res = materializePromotedValues(sgNode, () => {

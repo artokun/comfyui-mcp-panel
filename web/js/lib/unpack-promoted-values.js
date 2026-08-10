@@ -48,8 +48,12 @@
 export function materializePromotedValues(subgraphNode, resolvePromoted) {
   const applied = [];
   const unresolved = [];
+  // #979 (codex round 2): failures whose ROLLBACK could not be proven. These are not
+  // an annotation — they mean the graph holds a value that was in neither the rail
+  // nor the inner, and the caller must refuse to unpack over that.
+  const unrecoverable = [];
   let skipped = 0;
-  if (!subgraphNode || typeof resolvePromoted !== "function") return { applied, unresolved, skipped };
+  if (!subgraphNode || typeof resolvePromoted !== "function") return { applied, unresolved, unrecoverable, skipped };
   const rails = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
   for (const rail of rails) {
     // PER-RAIL isolation (codex NO-SHIP): a hostile or merely unusual accessor on ONE
@@ -58,7 +62,7 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
     // suppressed the disclosure, on a path that then destroys the subgraph anyway.
     // One bad widget now costs its own entry and nothing else.
     try {
-      carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, () => (skipped += 1));
+      carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, unrecoverable, () => (skipped += 1));
     } catch {
       let label = null;
       try {
@@ -69,7 +73,7 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
       unresolved.push({ widget: label ?? "(unreadable)", reason: "widget could not be inspected" });
     }
   }
-  return { applied, unresolved, skipped };
+  return { applied, unresolved, unrecoverable, skipped };
 }
 
 /**
@@ -82,7 +86,7 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
  * altered and `unpackSubgraph` committed it — silent destructive corruption on exactly
  * the error path this function claims is safe.
  */
-function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, onSkip) {
+function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, unrecoverable, onSkip) {
   {
     const name = typeof rail?.name === "string" ? rail.name : null;
     if (!name) return;
@@ -126,19 +130,39 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     // Best-effort restore of the value we found. Used on EVERY failure path below —
     // a widget left holding a half-applied value is worse than one left alone, because
     // the unpack that follows makes it permanent.
+    // Returns TRUE only when the widget is PROVABLY back to what we found. A restore
+    // that throws, that cannot be read back, or that itself normalizes to a third
+    // value leaves the graph holding something that was in NEITHER the rail nor the
+    // inner — and the caller must not destroy the subgraph over that (codex round 2).
     const restore = () => {
-      if (!innerReadable) return;
+      if (!innerReadable) return false;
       try {
-        if (!Object.is(innerWidget.value, innerValue)) innerWidget.value = innerValue;
+        if (Object.is(innerWidget.value, innerValue)) return true;
+        innerWidget.value = innerValue;
       } catch {
-        /* nothing further can be done; it is reported as unresolved either way */
+        /* fall through to the read-back — a setter that applies and THEN throws has
+           still restored the value, and refusing the unpack over that would be a
+           false alarm on a graph that is actually intact */
       }
+      // The verdict comes from the OBSERVED value, never from whether the assignment
+      // reported success. Both directions matter: a throw that restored is recovered,
+      // and a silent success that normalized is not.
+      try {
+        return Object.is(innerWidget.value, innerValue);
+      } catch {
+        return false; // cannot even confirm — treat as unrecoverable
+      }
+    };
+    const failed = (reason) => {
+      if (restore()) unresolved.push({ widget: name, reason });
+      // UNRECOVERABLE: the value we found is not back. Reported separately because it
+      // is the one condition that must stop the unpack rather than merely annotate it.
+      else unrecoverable.push({ widget: name, reason: `${reason}, and the previous value could not be restored` });
     };
     try {
       innerWidget.value = railValue;
     } catch {
-      restore();
-      unresolved.push({ widget: name, reason: "inner widget rejected the write" });
+      failed("inner widget rejected the write");
       return;
     }
     let landed;
@@ -152,8 +176,7 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
     // coercing one is why the restore matters, since it leaves the widget holding a
     // third value that was never in the graph.
     if (!Object.is(landed, railValue)) {
-      restore();
-      unresolved.push({ widget: name, reason: "inner widget did not retain the value" });
+      failed("inner widget did not retain the value");
       return;
     }
     // Report metadata is built inside the guarded span too: `innerNode.id` and

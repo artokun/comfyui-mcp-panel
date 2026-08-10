@@ -13198,6 +13198,36 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       materialized = null;
     }
+    // #979 (codex round 2) — REFUSE to unpack when a carry could not be rolled back.
+    // A setter that normalizes the write and then also normalizes the restore leaves
+    // the widget holding a value that was in NEITHER the rail nor the inner. Unpacking
+    // over that would make a third, invented value permanent, which is worse than the
+    // data loss this whole change exists to stop. Restore the pre-carry workflow and
+    // report instead — the subgraph is still there, so nothing is lost.
+    if (materialized?.unrecoverable?.length) {
+      const names = materialized.unrecoverable.map((u) => u.widget).join(", ");
+      let restored = false;
+      if (rollback && typeof app?.loadGraphData === "function") {
+        try {
+          const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+          await app.loadGraphData(...resolveLoadGraphArgs(rollback, activeWorkflow));
+          restored = true;
+        } catch {
+          restored = false;
+        }
+      }
+      throw new Error(
+        `unpack_subgraph refused: carrying the promoted value(s) ${names} into the inner ` +
+          `node(s) failed, and the value found beforehand could not be put back — the widget ` +
+          `now holds something that was in neither the parent nor the inner node. Unpacking ` +
+          `would make that permanent (#979). ` +
+          (restored
+            ? `The workflow was reloaded from its pre-unpack snapshot, so the subgraph and its ` +
+              `values are intact; nothing was destroyed.`
+            : `The pre-unpack snapshot could NOT be reloaded, so check those widget values before ` +
+              `doing anything else — the subgraph is still present and was not unpacked.`),
+      );
+    }
     // unpackSubgraph wraps its own beforeChange/afterChange for undo, so don't
     // nest another pair here.
     try {
