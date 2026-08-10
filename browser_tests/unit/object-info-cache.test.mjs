@@ -192,3 +192,48 @@ test("#716: the shared payload cannot have type keys added or removed", async ()
   }, TypeError);
   assert.deepEqual(Object.keys(defs), ["KSampler"]);
 });
+
+test("#716: a SYNCHRONOUSLY throwing fetch reports its own error and unblocks the cache", async () => {
+  // codex: the finally referenced the promise binding it was being assigned to, so a
+  // synchronous throw raised a temporal-dead-zone ReferenceError that REPLACED the real
+  // error. Worse than the wrong message: the rejected promise was attached to the slot
+  // afterwards, so every later read in the same generation joined a request that could only
+  // ever reject.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  await assert.rejects(
+    () =>
+      cache.read(() => {
+        throw new TypeError("synchronous boom");
+      }),
+    /synchronous boom/,
+    "the caller must see its own error, not a ReferenceError about internals",
+  );
+  assert.equal(cache.peek().cached, false);
+  // The slot must be free: a later read issues its own request and succeeds.
+  assert.equal(await cache.read(async () => DEFS), DEFS);
+  assert.equal(cache.peek().cached, true);
+});
+
+test("#716: a retired request cannot overwrite a newer value — deterministically", async () => {
+  // codex asked for this as an explicit schedule rather than relying on a hanging test:
+  // old request starts, invalidate, new request starts and succeeds, THEN the old one
+  // resolves. The new value must survive.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let releaseOld;
+  const oldGate = new Promise((r) => (releaseOld = r));
+  const old = cache.read(async () => {
+    await oldGate;
+    return { OldType: {} };
+  });
+  cache.invalidate();
+  assert.deepEqual(await cache.read(async () => ({ NewType: {} })), { NewType: {} });
+  releaseOld();
+  assert.deepEqual(await old, { OldType: {} }, "its own caller still gets its answer");
+  assert.deepEqual(
+    await cache.read(async () => ({ MustNotBeFetched: {} })),
+    { NewType: {} },
+    "the retired response must not have replaced the newer value",
+  );
+});

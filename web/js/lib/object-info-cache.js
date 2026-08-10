@@ -32,6 +32,23 @@
  *      request. A refresh could then register new definitions while an older in-flight
  *      response restored the pre-change map for another full TTL. A generation counter
  *      makes both impossible: an invalidation retires every request issued before it.
+ *
+ * COVERAGE, audited and NOT claimed to be exhaustive. `registerComfyNodeDefs` — which drops
+ * this cache — runs on reconnect, on the `refresh_nodes` tool, after a panel-driven Manager
+ * install, on download completion, and on the combo-refresh path. Between them those cover
+ * every schema change the PANEL causes or observes.
+ *
+ * The gap is a change made entirely outside the panel: a user uninstalling a pack through
+ * ComfyUI's own Manager UI while an agent is mid-burst. Nothing tells the panel, so a widget
+ * write in the following ≤1.5s could be authorized against a map that still lists the
+ * removed type. Note the direction — an INSTALL is harmless here (a type missing from the
+ * cached map is refused, which fails closed); only a REMOVAL can authorize something it
+ * should not, and only for that window, and only for a write to that exact type.
+ *
+ * That is a real widening of an existing race, not a new class of hole: without this cache
+ * the same uninstall could land between the fetch and the write. It is recorded here rather
+ * than waved past, because the honest version is "the window grew from milliseconds to
+ * ≤1.5s for out-of-panel removals", and someone weighing the TTL later needs that sentence.
  */
 
 /** How long a fetched payload may be reused. */
@@ -46,6 +63,10 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
   let at = 0;
   let inflight = null;
   let inflightGeneration = -1;
+  // Identity of the in-flight request, so the finally below can release the slot without
+  // referring to a binding that may not be initialized yet.
+  let inflightId = 0;
+  let requestSeq = 0;
   // Bumped by every invalidation. A request carries the generation it was issued under and
   // is discarded if that no longer matches — which is what retires an in-flight fetch
   // rather than merely forgetting the value it will produce.
@@ -65,7 +86,21 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
       // otherwise still issue one request per caller, which is the reported symptom moved.
       if (inflight && inflightGeneration === generation) return inflight;
       const issuedAt = generation;
+      // An id captured BEFORE the promise exists, because `finally` must not name the
+      // binding it is being assigned to: a fetchDefs() that throws SYNCHRONOUSLY runs the
+      // finally before that assignment completes, and comparing against `request` there
+      // raised a temporal-dead-zone ReferenceError that REPLACED the real error (codex).
+      // It failed closed, but it lied about why.
+      const requestId = ++requestSeq;
       const request = (async () => {
+        // YIELD FIRST, and this is load-bearing rather than stylistic. A `fetchDefs()` that
+        // throws SYNCHRONOUSLY would otherwise run the whole try/finally during this IIFE's
+        // initial synchronous execution — before the slot below is assigned. The finally
+        // would then fail to release a slot that had not been taken yet, and the rejected
+        // promise would be attached immediately afterwards, so every later read in this
+        // generation would join a permanently rejected request. One microtask makes the
+        // ordering unconditional.
+        await null;
         try {
           const defs = await fetchDefs();
           // Store only a USABLE payload from a still-current generation. Caching a
@@ -92,14 +127,16 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
         } finally {
           // Release the slot only if it is still ours — a newer generation may have started
           // its own request while this one was in flight.
-          if (inflight === request) {
+          if (inflightId === requestId) {
             inflight = null;
             inflightGeneration = -1;
+            inflightId = 0;
           }
         }
       })();
       inflight = request;
       inflightGeneration = issuedAt;
+      inflightId = requestId;
       return request;
     },
 
@@ -115,6 +152,7 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
       // longer be stored or joined; whoever is already awaiting it still gets their answer.
       inflight = null;
       inflightGeneration = -1;
+      inflightId = 0;
     },
 
     /** Test/diagnostic view. Never used to make a decision. */
