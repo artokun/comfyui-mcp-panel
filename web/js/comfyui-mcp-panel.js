@@ -2559,91 +2559,6 @@ function saveProducedIdentity(savedRecord, savedAs) {
   }
 }
 
-/**
- * #1001 — RE-DERIVE a saved workflow's identity from its own path, for the case where
- * the live-object map has lost it.
- *
- * A reconnect can REPLACE the active ComfyWorkflow object (the same succession the
- * embedded-uuid fork rule at `workflowStableUuid` already accounts for). The successor
- * is not in the live-object WeakMap, so `establishedWorkflowReplyIdentity` found nothing
- * and the hello published no `workflow_uuid` — and with no identity to fence against,
- * every mutating command was refused while reads kept working. That is the reported
- * wedge, and the reporter's own recovery was `panel_open_workflow` on the workflow that
- * was ALREADY active: the open mints through `workflowStableUuid`, which seeds the map.
- * So the identity was derivable at the exact moment it went missing.
- *
- * ADOPTION, NOT MINTING, and the distinction is the whole safety argument (#716). This
- * returns an identity ONLY when one was already established for this exact saved file
- * and recorded in the persisted path→uuid alias map. A workflow with no path, or a path
- * nothing was ever established for, still yields null — the fence stays fail-closed and
- * the caller is told to open. It cannot invent an identity for a canvas the panel has
- * never seen.
- *
- * The live-owner check is what stops it handing the same identity to two objects: if
- * another OPEN workflow still owns that uuid, this object is a co-open copy rather than
- * a successor, and adopting would let commands stamped for one canvas pass against the
- * other.
- */
-function rederiveSavedWorkflowIdentity(wf) {
-  try {
-    // THE PATH IS NOT PROOF OF INCARNATION (codex P1). A path can be REUSED: delete
-    // workflow A, save a new workflow B at A's old path, reconnect — and a path-only
-    // rule would hand B the identity A established, letting a stale A-scoped command
-    // pass the fence against B. That is precisely the hazard the fork rules in
-    // `workflowStableUuid` exist to prevent, reintroduced through a different door.
-    //
-    // So adoption also requires the LIVE CANVAS to corroborate: this object must be the
-    // ACTIVE workflow, and the root graph it is mounted on must already carry that same
-    // uuid in the panel's own tag. That tag is written when the identity is established
-    // and travels with the graph, so a reconnect (which replaces the workflow OBJECT,
-    // not the mounted root) still has it, while a different workflow saved at the same
-    // path carries its own tag or none. Two independent records must agree before
-    // anything is adopted.
-    // THE ROOT TAG TRAVELS WITH THE GRAPH, so on its own it is not independent of the
-    // alias (codex r2): copy workflow A with its tag, save the copy at A's old path, and
-    // both records read UUID_A for what is now a different workflow. What makes a copied
-    // tag impossible is the loadGraphData creation-boundary wrapper, which re-mints on
-    // every creation and every in-place replace — the same sanitizer `workflowStableUuid`
-    // already refuses to trust an embedded uuid without. So adoption requires proof it is
-    // installed. Without it this returns null and the caller opens the workflow, which is
-    // lost-resume rather than wrong-resume — the trade this file makes everywhere else.
-    if (_loadGraphDataForkInstalled !== true) return null;
-    const active = activeWorkflowRef();
-    if (!active || !sameWorkflowObject(active, wf)) return null;
-    const path = savedWorkflowPath(wf);
-    // Stated for the reader, not for the machine: an unsaved workflow has no path, and
-    // `workflowAliasForPath(_, null)` already returns null, so deleting this line
-    // changes no result (verified by mutation). It is kept because "only a SAVED
-    // workflow is re-derivable" is the rule, and a rule that lives only in the
-    // behaviour of a helper two calls away is one a later edit will not notice.
-    if (!path) return null;
-    const alias = workflowAliasForPath(_workflowUuidAliases, path);
-    if (!isCanonicalWorkflowInstanceUuid(alias)) return null;
-    // The second record: the tag on the graph this workflow is actually mounted on.
-    const rootTagged = graphRootWorkflowUuidMatches({
-      rootGraph: app?.rootGraph ?? app?.graph ?? null,
-      activeWorkflowUuid: alias,
-    });
-    if (rootTagged !== true) return null;
-    const owner = workflowUuidOwner(alias);
-    if (owner != null && !sameWorkflowObject(owner, wf)) {
-      // FAIL CLOSED when the open-tab list cannot be read (codex P1). A known distinct
-      // owner is a reason to refuse; an unreadable `openWorkflows` is not evidence that
-      // owner went away, and treating it as such would adopt an identity another live
-      // object still holds. Proxy-safe, like every other owner comparison here (#558 r2).
-      const open = app?.extensionManager?.workflow?.openWorkflows;
-      if (!Array.isArray(open)) return null;
-      if (open.some((w) => sameWorkflowObject(w, owner))) return null;
-    }
-    setWorkflowObjectUuid(wf, alias);
-    rememberWorkflowUuidOwner(alias, wf);
-    return alias;
-  } catch {
-    // An identity that cannot be re-derived is the state this function was called in.
-    return null;
-  }
-}
-
 function establishedWorkflowReplyIdentity(wf) {
   if (!wf || typeof wf !== "object") return null;
   // THE ESTABLISHMENT TEST, and the only one that matters here (#716): the uuid
@@ -2651,10 +2566,18 @@ function establishedWorkflowReplyIdentity(wf) {
   // it never mints — so a reply still cannot initialize an identity. Everything
   // below runs only for an object the panel has already established.
   //
-  // #1001 — with ONE addition, which is still not minting: a SAVED workflow whose
-  // object lost its entry (a reconnect replaced the object) re-derives the identity
-  // already recorded for that path. See rederiveSavedWorkflowIdentity.
-  const uuid = workflowObjectUuid(wf) ?? rederiveSavedWorkflowIdentity(wf);
+  // #1001 tried to add a re-derivation here — a saved workflow whose object was
+  // REPLACED by a reconnect publishes nothing, so every mutating command is refused
+  // while reads keep working. It was built and then removed in review, because the
+  // records available to corroborate it are not independent: the panel's tag TRAVELS
+  // WITH THE GRAPH, so a copy of workflow A saved at A's former path carries both A's
+  // path alias and A's tag. `_loadGraphDataForkInstalled` is capability evidence — the
+  // sanitizer is installed NOW — not provenance that THIS root was created through it.
+  // Sound adoption needs a per-load marker minted per session and stamped by the
+  // loadGraphData wrapper on every load, so a tag's provenance can be checked rather
+  // than assumed. Recorded on #1001; the wedge stands until then, with
+  // `panel_open_workflow` as the recovery that mints.
+  const uuid = workflowObjectUuid(wf);
   if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
   const savedPath = savedWorkflowPath(wf);
   // #640 — the SHARED spelling of the handle format, not a second local one.
@@ -12997,11 +12920,13 @@ const GRAPH_TOOL_EXECUTORS = {
             // state, and this reply is how you find out they were rewritten.
             geometry_rewritten_note:
               `Every node in this workflow came back with the same id and type, and every ` +
-              `serialized field matched EXCEPT per-node ${openGeometryRewritten.join(", ")}, which ` +
-              `differs from the file. On this frontend that is the box measurement being ` +
-              `recomputed on load, so the panel treats the content as reproduced and publishes ` +
-              `the workflow_uuid rather than refusing. It is still a real difference from what is ` +
-              `on disk: saving from here writes the recomputed value (#1001).`,
+              `serialized field matched EXCEPT per-node ${openGeometryRewritten.join(", ")} — and ` +
+              `every difference there is a HEIGHT, with the width unchanged. That is consistent ` +
+              `with the box-measurement recomputation measured on this frontend, though the ` +
+              `panel observed the difference and not its cause, so the content is treated as ` +
+              `reproduced and the workflow_uuid is published rather than refused. It is still a ` +
+              `real difference from what is on disk: saving from here writes the recomputed ` +
+              `value (#1001).`,
           }
         : {}),
       modified: !!target.isModified,

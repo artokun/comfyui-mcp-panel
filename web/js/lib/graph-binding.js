@@ -864,8 +864,16 @@ function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
 export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
   const NOT_PROVEN = { proven: false, exact: false, fields: [] };
   try {
-    if (graphRootMatchesState({ rootGraph, state })) return { proven: true, exact: true, fields: [] };
-    const diff = describeGraphStateDifference({ rootGraph, state });
+    // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
+    // per check let a synchronous serialization hook — a broken or hostile custom node —
+    // show a height-only difference to the classifier and then alter a widget before the
+    // size check re-serialized, so a fence would be published for content no comparison
+    // ever saw. A single snapshot cannot disagree with itself.
+    const actualState = rootGraph?.serialize?.();
+    if (actualState == null) return NOT_PROVEN;
+    const frozen = { serialize: () => actualState };
+    if (graphRootMatchesState({ rootGraph: frozen, state })) return { proven: true, exact: true, fields: [] };
+    const diff = describeGraphStateDifference({ rootGraph: frozen, state });
     // Never inferred from an absent comparison: `comparable:false` means no
     // comparison happened, which is not evidence either way.
     if (diff?.comparable !== true) return NOT_PROVEN;
@@ -887,7 +895,7 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // field-name allowlist admits any rewrite of the whole `[w, h]` pair — so a changed
     // width, or an arbitrary replacement, would have been PROVEN on the strength of a
     // measurement about something else. Every differing size must be height-only.
-    if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, rootGraph?.serialize?.()?.nodes)) {
+    if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, actualState?.nodes)) {
       return NOT_PROVEN;
     }
     // An empty field list with a differing `nodes` surface means the two disagreed

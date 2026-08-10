@@ -117,6 +117,41 @@ test("#1001 (codex r2) a changed WIDTH is never proven — the measurement was a
   assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(widthOnly), state }).proven, false, "width alone");
 });
 
+test("#1001 (codex r3) every check reads ONE snapshot — a shifting serializer cannot slip content past", () => {
+  // A synchronous serialization hook (a broken or hostile custom node) can return a
+  // different graph each call. Serializing per check let it show a height-only
+  // difference to the classifier and then alter a widget before the size check
+  // re-serialized, publishing a fence for content no comparison ever saw.
+  const state = stateOf([node(1, "KSampler", { size: [200, 100] })]);
+  let call = 0;
+  const shifting = {
+    serialize: () => {
+      call += 1;
+      // First call: an innocent height change. Every call after: a changed widget value.
+      return call === 1
+        ? stateOf([node(1, "KSampler", { size: [200, 60] })])
+        : stateOf([node(1, "KSampler", { size: [200, 60], widgets_values: ["SMUGGLED"] })]);
+    },
+  };
+  const proof = graphRootReproducesStateContent({ rootGraph: shifting, state });
+  assert.equal(call, 1, "the root is serialized exactly once");
+  assert.equal(proof.proven, true, "…and the ONE snapshot it saw is the one it judged");
+
+  // The reverse order proves the same rule from the other side: if the first snapshot
+  // carries the smuggled value, the proof refuses however clean later calls look.
+  let n = 0;
+  const smuggledFirst = {
+    serialize: () => {
+      n += 1;
+      return n === 1
+        ? stateOf([node(1, "KSampler", { size: [200, 60], widgets_values: ["SMUGGLED"] })])
+        : stateOf([node(1, "KSampler", { size: [200, 60] })]);
+    },
+  };
+  assert.equal(graphRootReproducesStateContent({ rootGraph: smuggledFirst, state }).proven, false);
+  assert.equal(n, 1, "still exactly one");
+});
+
 test("#1001 (codex r2) an UNREADABLE size is never proven", () => {
   // A proof cannot rest on a value nobody could read, so a non-pair or a non-finite
   // number refuses rather than being treated as a height change.
