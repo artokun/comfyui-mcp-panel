@@ -18234,7 +18234,16 @@ function describeCommand(cmd, msg, reply) {
       // names NO construct: `write_warning` covers a throwing setter, accessor, or
       // callback on any of the widgets the write touches, so it must not assert
       // which one threw (codex delta-gate).
+      //
+      // #976: unless the lib says which — `write_warning_source` is DATA the lib only
+      // emits for the case it can establish, so this reads the field rather than
+      // pattern-matching the prose. Any other value (or none) keeps the unattributed
+      // wording, so a future source the summary does not know about degrades to the
+      // line it already showed. The attributed line says where the exception came
+      // FROM and stops there; it does not assign fault, because this write invokes
+      // the callback programmatically and that alone can be why it threw.
       const writeDisclosed = typeof r.set?.write_warning === "string";
+      const threwInNodeCallback = r.set?.write_warning_source === "widget_callback";
       return railStale
         ? {
             icon: "pi-exclamation-triangle",
@@ -18246,7 +18255,9 @@ function describeCommand(cmd, msg, reply) {
             text:
               `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
               (writeDisclosed
-                ? ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
+                ? threwInNodeCallback
+                  ? ` — value verified in effect; the exception came from invoking the widget's own callback, so its side effects may not have run`
+                  : ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
                 : ""),
             detail: `was ${JSON.stringify(r.set?.previous)}`,
           };
