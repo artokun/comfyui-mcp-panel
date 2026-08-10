@@ -152,6 +152,11 @@ import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
+import {
+  collectDisabledAncestorOutputs,
+  disabledOutputsInPrompt,
+  disabledOutputsNote,
+} from "./lib/muted-subgraph-outputs.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -11138,6 +11143,9 @@ const GRAPH_TOOL_EXECUTORS = {
           origFetchApi,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
+          // #985 — keep each prompt AS SUBMITTED AND ACCEPTED. Re-deriving one
+          // afterwards with a second app.graphToPrompt() would describe a different
+          // compilation than the one ComfyUI accepted, and that call is not read-only.
         });
       }
       try {
@@ -11351,6 +11359,41 @@ const GRAPH_TOOL_EXECUTORS = {
     if (partialTargets && runScopeResult?.overrunBlocked > 0) {
       accept.extra_dispatch_blocked = runScopeResult.overrunBlocked;
       accept.extra_dispatch_note = runScopeResult.overrunNote;
+    }
+    // #985 — a WHOLE-GRAPH run hands prompt construction to ComfyUI, and ComfyUI
+    // applies a subgraph wrapper's mute/bypass only at the TOP level: a wrapper
+    // nested inside another subgraph is ignored, so outputs under it execute.
+    // Measured on 0.31.1 / frontend 1.48.7, the reporter's exact versions. They
+    // paid 18m44s and three unwanted videos for it, and the run reported success.
+    //
+    // The panel does not build this prompt and will not silently rewrite what the
+    // caller asked to run — but it can stop being silent, which is the actual
+    // harm here. Reported at QUEUE time, so an agent can interrupt rather than
+    // learn about it when the renders land.
+    //
+    // Scoped runs are exempt: partial_execution_targets already names the roots,
+    // and the reporter verified that path scopes correctly.
+    if (!partialTargets) {
+      try {
+        // Read from the LIVE GRAPH, not from any prompt (codex rounds 2-5). Every
+        // way of obtaining the queued prompt failed: a second app.graphToPrompt()
+        // compiles a different one and is not read-only, and the outgoing POST body
+        // cannot be attributed on an UNSCOPED run — it carries no queue mark, so a
+        // concurrent post from the UI or another extension whose keys happen to
+        // collide would be reported as containing THIS graph’s muted outputs.
+        //
+        // The trade is stated in the note rather than hidden: on a build that
+        // applies nested wrapper modes correctly this warns about a run that was
+        // fine. Over-warning is the safe direction here — a wrong QUIET answer is
+        // what cost the reporter 18 minutes.
+        const offenders = collectDisabledAncestorOutputs(rootGraph);
+        if (offenders.length) {
+          accept.disabled_outputs_in_graph = offenders;
+          accept.disabled_outputs_note = disabledOutputsNote(offenders);
+        }
+      } catch {
+        /* a diagnostic must never take down the run it describes */
+      }
     }
     return accept;
   },
@@ -18353,10 +18396,22 @@ function describeCommand(cmd, msg, reply) {
     case "graph_run":
       return r.queued
         ? {
-            icon: "pi-play",
+            // #985 — an accepted prompt carrying outputs from muted/bypassed
+            // subgraphs is not a plain success, and the user is the one paying for
+            // the renders. The count goes in the LABEL: this warning is worthless if
+            // it only exists in a payload field, since the whole failure was being
+            // silent about it. Ownership is NOT asserted — see the result fields.
+            icon: r.disabled_outputs_in_graph?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
               `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
-              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : ""),
+              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : "") +
+              // Ownership-neutral here too: the label says what was OBSERVED in an
+              // accepted prompt, not that this run queued it. A concurrent queue
+              // action would otherwise be reported as this run's doing.
+              (r.disabled_outputs_in_graph?.length
+                ? ` — WARNING: this workflow has ${r.disabled_outputs_in_graph.length} output node${r.disabled_outputs_in_graph.length === 1 ? "" : "s"} inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them`
+                : ""),
+            ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }
         : {
             icon: "pi-exclamation-triangle",
