@@ -45,6 +45,7 @@
 // `onFlush` callback, which receives the full, correctly-scoped batch — plus the
 // prompt_id `key` for machine-readable attribution — exactly once per completion.
 
+import { mediaSignature, createCompletionDeduper } from "./completion-dedupe.js";
 import { parseHistoryEntry } from "./history-reconcile.js";
 
 export const NO_PROMPT_KEY = "__no_prompt__";
@@ -73,6 +74,9 @@ export function createRunCompletionTracker({
   maxRearms = 40,
   reconcileRetryMs = 3000,
   maxReconcileRetries = 5,
+  // #986 — injected so the dedupe window is testable and the tracker keeps no
+  // second source of truth for time.
+  duplicateWindowMs = 5 * 60 * 1000,
 } = {}) {
   if (typeof onFlush !== "function") {
     throw new TypeError("createRunCompletionTracker requires an onFlush callback");
@@ -87,9 +91,12 @@ export function createRunCompletionTracker({
   // (no real prompt) collapses to the shared NO_PROMPT_KEY.
   const key = (id) => (id == null ? NO_PROMPT_KEY : String(id));
   const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
+  const deduper = createCompletionDeduper({ ttlMs: duplicateWindowMs, now });
   const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
   const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
+  // Keys whose start came from a real lifecycle signal, not a fallback (#986).
+  const startObserved = new Set();
   // #370 reconciliation state. A run is PENDING from its first liveness signal
   // until its completion is CONFIRMED delivered to the agent. If the connection
   // drops (WS lost → execution_success missed, OR bridge down → the composed
@@ -315,14 +322,33 @@ export function createRunCompletionTracker({
     retryCounts.delete(k);
   }
 
-  function markStart(id) {
+  function markStart(id, { observed = true } = {}) {
     const k = key(id);
-    // First signal wins — a later per-node event must not reset an earlier start.
-    if (!starts.has(k)) starts.set(k, now());
-    // Bound the map so a run that never signals end can't leak entries.
+    // #986 (codex): remember whether this start was OBSERVED or FABRICATED. When
+    // execution_start and executing(node) are both dropped, the start is invented at
+    // the FINAL output event, so a genuine ten-minute render reports a sub-second
+    // duration. The dedupe gate reads duration as evidence of a cache hit, and an
+    // invented duration is not evidence of anything.
+    // The trust bit belongs to the TIMESTAMP, and only the first signal sets one.
+    // A later observed signal must NOT upgrade a fabricated start (codex): with the
+    // start frame and the first node's `executing` both lost, `onExecuted` invents a
+    // timestamp, and a subsequent `executing` for a second output node would then mark
+    // that invented value trusted — making a genuine long multi-output render look
+    // sub-second and trusted, which is exactly the shape that gets suppressed. Once
+    // fabricated, untrusted for the life of the run.
+    if (!starts.has(k)) {
+      starts.set(k, now());
+      if (observed) startObserved.add(k);
+      else startObserved.delete(k);
+    }
+    // Bound the map so a run that never signals end can't leak entries — and retire
+    // the trust bit WITH it, or the set outlives the map it describes.
     if (starts.size > 20) {
       const oldest = starts.keys().next().value;
-      if (oldest !== k) starts.delete(oldest);
+      if (oldest !== k) {
+        starts.delete(oldest);
+        startObserved.delete(oldest);
+      }
     }
   }
 
@@ -360,9 +386,35 @@ export function createRunCompletionTracker({
     // Read + retire the start synchronously so a concurrent flush can't
     // double-count it. A missing start ⇒ null duration (never a bogus 0.0s).
     const startTs = starts.get(k);
+    // Read the trust flag BEFORE retiring it — the dedupe gate below needs to know
+    // whether this duration came from a real lifecycle signal or was invented at the
+    // final output event. Retiring first made every duration untrusted, which the
+    // integration tests caught by refusing to suppress the reported burst.
+    const durationTrusted = startObserved.has(k);
     starts.delete(k);
+    startObserved.delete(k);
     const durationMs = startTs != null ? now() - startTs : null;
     if (!buf.images.length && !buf.videos.length) return;
+    // #986 — the same finished output was re-announced six times in ~30s, each under
+    // a DIFFERENT prompt id, because the user re-queued from the canvas and ComfyUI
+    // served it from cache (hence the 0.1s "renders"). The `delivered` fence above is
+    // keyed by prompt id, so it cannot collapse genuinely different prompts; what is
+    // the same is the OUTPUT, so that is what this compares.
+    //
+    // Only for runs the panel did NOT queue. `panel_run` promises the agent it will
+    // be notified and tells it to end its turn — suppressing one of those would wedge
+    // it waiting for a message that never comes, which is worse than the duplicates.
+    const signature = mediaSignature(buf.images, buf.videos);
+    const verdict = deduper.consider({
+      signature,
+      panelQueued: panelQueued.has(k),
+      promptId: promptIdOf(k),
+      durationMs,
+      durationTrusted,
+    });
+    // A panel-queued delivery still records its signature, so a canvas re-queue of
+    // the SAME output afterwards is recognised rather than getting one free pass.
+    if (panelQueued.has(k)) deduper.record({ signature, promptId: promptIdOf(k) });
     // Optimistically mark delivered so a reconnect-triggered reconcile racing
     // this flush can't double-deliver the same prompt. If the caller reports the
     // send FAILED (bridge down), it calls markUndelivered() to re-pend it (#370).
@@ -380,6 +432,12 @@ export function createRunCompletionTracker({
       videos: buf.videos,
       durationMs,
       finishedAt: now(),
+      // #986 — the agent is TOLD this output was already announced, never denied it.
+      // Which of a replay or a fast re-render it is cannot be proven, so the panel
+      // reports what it observed and lets the reader decide.
+      ...(verdict.duplicateOf
+        ? { duplicateOf: verdict.duplicateOf, looksCached: !!verdict.looksCached }
+        : {}),
     });
   }
 
@@ -468,6 +526,7 @@ export function createRunCompletionTracker({
     active.delete(k);
     const startTs = starts.get(k);
     starts.delete(k);
+    startObserved.delete(k);
     // #356 Bug 2 — read BEFORE markDelivered, which retires the key from BOTH
     // `pending` and `panelQueued`. Checking after would always see false, so the
     // media-less recovery below would never fire — the mistake this line exists to
@@ -514,6 +573,13 @@ export function createRunCompletionTracker({
       // Same async-delivery hold as flush(): the reconciled batch is composed and
       // sent by the caller, so it is not "delivered" until the caller says so.
       markDispatched(k);
+      // #986 (codex NO-SHIP): a reconciled delivery must RECORD its signature too.
+      // Without this, a completion recovered from /history after a reconnect left no
+      // trace, so the first canvas re-queue of that same cached output afterwards got
+      // a free pass — the guarantee flush() makes was simply false on the #370 path.
+      // Recorded, never suppressed: a reconcile exists to deliver something the agent
+      // has NOT been told about, so it always goes through.
+      deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       onFlush({
         key: k,
         promptId,
@@ -557,6 +623,7 @@ export function createRunCompletionTracker({
     buffers.delete(k);
     active.delete(k);
     starts.delete(k);
+    startObserved.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
@@ -666,7 +733,9 @@ export function createRunCompletionTracker({
       // Fallback render-start if execution_start was missed (no-op otherwise).
       // Does NOT mark active: `executing(node)` is the run-liveness signal, so an
       // output with no start AND no executing(node) is treated as an orphan.
-      markStart(id);
+      // FABRICATED (#986): invented at the final output, so any duration derived from
+      // it is meaningless and must never be read as a cache-hit signal.
+      markStart(id, { observed: false });
       trackPending(id);
       const k = key(id);
       const buf = ensureBuffer(k);
@@ -685,6 +754,7 @@ export function createRunCompletionTracker({
       // live state (codex P1 idempotency fence; `terminal`, not `delivered`).
       if (terminal.has(k)) {
         starts.delete(k);
+    startObserved.delete(k);
         return;
       }
       // #356 Bug 2 — a run that produced NO image and NO video buffers nothing
@@ -721,6 +791,7 @@ export function createRunCompletionTracker({
       }
       // Retire start for runs that buffered nothing (flush early-returns then).
       starts.delete(k);
+    startObserved.delete(k);
       // A terminal success we OBSERVED live needs no /history reconcile — clear it
       // from pending. (If the completion frame is later reported undelivered, the
       // caller's markUndelivered re-pends it, so a bridge-down drop still recovers.)
@@ -735,6 +806,7 @@ export function createRunCompletionTracker({
       if (buf?.timer) clearTimer(buf.timer);
       buffers.delete(k);
       starts.delete(k);
+    startObserved.delete(k);
       // If already terminal (reconcile surfaced this run's outcome), don't re-mark
       // (which would clear a re-pend). The caller uses wasTerminal() BEFORE calling
       // this to suppress a duplicate run_error frame (codex P1).

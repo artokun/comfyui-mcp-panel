@@ -25122,7 +25122,17 @@ function buildPanel() {
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
-    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs, noMedia }) => {
+    // #986 — a suppressed duplicate is not silently dropped. It is a canvas re-queue
+    // whose output was already announced and which plainly did not render (a
+    // sub-second "render" of a clip that took minutes the first time), so the agent
+    // gains nothing from a second identical turn — but the console should still be
+    // able to show that it happened, and this is the seam that makes it observable
+    // rather than a claim in a comment.
+    // #986 — a repeated output is ANNOTATED, never withheld: which of a cache replay
+    // or a fast re-render it is cannot be proven, and losing a render the user waited
+    // for would be worse than an extra message. The console line makes the annotation
+    // visible without the agent having to infer it.
+    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs, noMedia, duplicateOf, looksCached }) => {
       // #370: track whether the composed completion frame actually reached the
       // agent. sendFrame returns false when the bridge socket is down — in that
       // case the completion is LOST, so we re-pend the prompt (markUndelivered) so
@@ -25142,7 +25152,7 @@ function buildPanel() {
         // no image or video. Without it the composer returns null, the call site
         // below reads that as "empty batch ⇒ already delivered", and the agent that
         // panel_run told to end its turn and wait is never told anything.
-        { promptId, images: flImages, videos: flVideos, durationMs, noMedia },
+        { promptId, images: flImages, videos: flVideos, durationMs, noMedia, duplicateOf, looksCached },
         {
           sendFrame: (frame) => {
             const ok = client.sendFrame(frame);
