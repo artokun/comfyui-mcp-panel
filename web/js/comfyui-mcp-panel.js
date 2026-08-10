@@ -5667,7 +5667,14 @@ function kickPostReconnectSettleWatch(epoch) {
 function assertGraphBoundToActiveWorkflow(
   graph,
   rootGraph,
-  { includeBaselineReadGuard = true, requireDirtyMutationBinding = false } = {},
+  {
+    includeBaselineReadGuard = true,
+    requireDirtyMutationBinding = false,
+    // #995 — opt-IN, and false unless a caller classified this command as a read through
+    // `graphCommandBindingBar`. Gating the stale-tag bypass on the absence of the
+    // mutation flag would be default-permit (codex).
+    staleTagReadBypass = false,
+  } = {},
 ) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
@@ -5808,11 +5815,16 @@ function assertGraphBoundToActiveWorkflow(
     // workflow — its canvas would carry this identity, and the wedge would follow the user
     // when they switched back. So nothing is written: the flag is cleared for THIS call.
     //
-    // What a read can then return is content EQUAL to what the active workflow's own
-    // tracker reports for it. If the snapshot lags, that is stale-but-its-own content —
-    // the lag the read path already tolerates by design (#545) — never a different
-    // workflow's different content, because unequal content fails the proof outright.
-    if (rootUuidMismatch && requireDirtyMutationBinding !== true) {
+    // WHAT IS ESTABLISHED, exactly: serialized-content EQUALITY between the mounted root
+    // and the active workflow's tracker snapshot. NOT ownership (codex) — in the A/B
+    // sequence above the returned graph equals A's snapshot while being B's mounted
+    // canvas, and nothing here can tell those apart. What follows is only that a read
+    // returns content equal to what the active workflow itself reports, which is the bar
+    // the read path already works to (#545 exempts read-only tools from the proof
+    // requirement precisely so a lagging tracker cannot block inspection). Unequal
+    // content fails the proof outright, so no read can return a graph the active
+    // workflow's own snapshot disagrees with.
+    if (rootUuidMismatch && staleTagReadBypass === true) {
       let others = null;
       try {
         const open = app?.extensionManager?.workflow?.openWorkflows;

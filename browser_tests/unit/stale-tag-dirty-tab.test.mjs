@@ -199,7 +199,7 @@ test("#995 (codex P1) source guard: READS only, and NOTHING is written", () => {
   // onto the OTHER workflow and the wedge would follow the user back to it. So the flag
   // is cleared for one call and the tag is left alone.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  const escape = src.slice(src.indexOf("if (rootUuidMismatch && requireDirtyMutationBinding !== true)"));
+  const escape = src.slice(src.indexOf("if (rootUuidMismatch && staleTagReadBypass === true)"));
   assert.ok(escape, "the escape must be gated on the command being read-only");
   const body = escape.slice(0, escape.indexOf("\n  }"));
   assert.match(body, /rootContentProvesActiveWorkflowDespiteEdits\(\{/, "it uses the relaxed proof");
@@ -212,24 +212,31 @@ test("#995 (codex P1) source guard: READS only, and NOTHING is written", () => {
   assert.match(body, /if \(Array\.isArray\(open\)\) others = open\.filter/, "only a readable list is used");
   // The REBIND path keeps the clean-only proof: it re-stamps, which this evidence
   // cannot license.
-  const rebind = src.slice(src.indexOf("resolveGraphRootUuidRebind({"), src.indexOf("if (rootUuidMismatch && requireDirtyMutationBinding"));
+  const rebind = src.slice(src.indexOf("resolveGraphRootUuidRebind({"), src.indexOf("if (rootUuidMismatch && staleTagReadBypass"));
   assert.ok(!/DespiteEdits/.test(rebind), "the re-stamp must not run on dirty-tab evidence");
 });
 
-test("#995 (codex P1) a MUTATION is still refused on the same evidence", () => {
-  // The read escape is gated on requireDirtyMutationBinding !== true. A mutation on a
-  // canvas whose identity is unproven is exactly what the fence exists to refuse, and
-  // dirty-tab content equality cannot license one: the content may be another tab's
-  // matching graph, and a write would land on it.
+test("#995 (codex r2) the bypass is OPT-IN, never inferred from the absence of a flag", () => {
+  // `requireDirtyMutationBinding !== true` was default-permit: a caller that omits the
+  // flag, or any fence call added later without the classification, would have inherited
+  // a bypass nobody decided to give it. The gate is now positive, set in exactly one
+  // place, so the read-only command list is the whole surface that can reach it.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.ok(
-    src.includes("if (rootUuidMismatch && requireDirtyMutationBinding !== true) {"),
-    "mutations never reach the relaxed proof",
+    src.includes("if (rootUuidMismatch && staleTagReadBypass === true) {"),
+    "the bypass is opt-IN",
   );
-  // …and the bar itself still separates the two: a mutating command asks for
-  // requireDirtyMutationBinding true, so the escape above is unreachable for it.
-  assert.equal(graphCommandBindingBar("graph_outline").requireDirtyMutationBinding, false);
-  assert.equal(graphCommandBindingBar("graph_add_node").requireDirtyMutationBinding, true);
+  assert.ok(
+    !src.includes("rootUuidMismatch && requireDirtyMutationBinding !== true"),
+    "a default-permit gate must not come back",
+  );
+  assert.match(src, /staleTagReadBypass = false,/, "and it defaults to OFF at the fence");
+  assert.equal(graphCommandBindingBar("graph_outline").staleTagReadBypass, true, "a read opts in");
+  assert.equal(graphCommandBindingBar("graph_add_node").staleTagReadBypass, undefined, "a mutation never does");
+  // The bar is the ONLY place that sets it, so a new fence call cannot acquire it by
+  // accident — it has to be classified read-only first.
+  const lib = readFileSync(new URL("../../web/js/lib/graph-binding.js", import.meta.url), "utf8");
+  assert.equal((lib.match(/staleTagReadBypass: true/g) ?? []).length, 1, "set in exactly one place");
 });
 
 test("#995 the SEAL path is untouched — writing a tag is a different decision from re-stamping one", () => {

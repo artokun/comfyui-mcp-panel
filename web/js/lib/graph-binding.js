@@ -1860,7 +1860,17 @@ export const MUTATION_BINDING_BAR = Object.freeze({
 export function graphCommandBindingBar(command) {
   return graphCommandMayMutateWorkflow(command)
     ? { ...MUTATION_BINDING_BAR }
-    : { includeBaselineReadGuard: false, requireDirtyMutationBinding: false };
+    : {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: false,
+        // #995 — POSITIVE evidence that this call is a classified read, set in exactly
+        // one place. The stale-tag content bypass is gated on this rather than on
+        // `requireDirtyMutationBinding !== true`, which is default-permit: a caller that
+        // omits the flag, or a fence call added later without the classification, would
+        // have inherited a bypass nobody decided to give it (codex). Opting in here means
+        // the read list above is the whole surface that can reach it.
+        staleTagReadBypass: true,
+      };
 }
 
 /**
