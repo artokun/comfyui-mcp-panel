@@ -25,8 +25,15 @@
  * lets the caller cancel instead of discovering it from identical outputs.
  */
 
-/** Values of `control_after_generate` that mean "change this between runs". */
-const ADVANCING = new Set(["randomize", "increment", "decrement"]);
+/**
+ * Values of `control_after_generate` that mean "change this between runs".
+ *
+ * `increment-wrap` is here because ComfyUI ships it and it advances like the rest
+ * (codex) — the report only names `randomize`, and warning on that alone would have
+ * left a mode silently broken. `fixed` is the only standard non-advancing value, so it
+ * is the only one that legitimately repeats.
+ */
+const ADVANCING = new Set(["randomize", "increment", "decrement", "increment-wrap"]);
 
 /**
  * Widgets whose value an unscoped batch would have advanced between items, and which
@@ -54,17 +61,33 @@ export function findRepeatingControlWidgets(nodes) {
         // `fixed` is the one setting that WANTS the same value every time, so a scoped
         // batch repeating it is correct and must not be warned about.
         if (!mode || !ADVANCING.has(mode)) continue;
-        // ComfyUI places the control immediately AFTER the value it governs. Reported
-        // only when that neighbour exists — a guess about which widget is affected
-        // would be worse than saying nothing about it.
-        const prev = i > 0 ? widgets[i - 1] : null;
-        const pairedName = typeof prev?.name === "string" ? prev.name : null;
+        // Prefer the widget's own LINKAGE when the frontend provides it (codex).
+        // Adjacency is only a UI-insertion convention: custom nodes, promoted widgets
+        // and widget-mutating extensions need not preserve it, and blaming the wrong
+        // value widget is worse than naming none. Adjacency stays as a LABELLED
+        // fallback — `paired_widget_source` says which was used, so a reader knows how
+        // much to trust it.
+        let pairedName = null;
+        let pairedSource = null;
+        const linked = Array.isArray(w.linkedWidgets) ? w.linkedWidgets : null;
+        const linkedName = linked?.find((lw) => typeof lw?.name === "string")?.name ?? null;
+        if (linkedName) {
+          pairedName = linkedName;
+          pairedSource = "linked";
+        } else {
+          const prev = i > 0 ? widgets[i - 1] : null;
+          const adjacent = typeof prev?.name === "string" ? prev.name : null;
+          if (adjacent) {
+            pairedName = adjacent;
+            pairedSource = "adjacent";
+          }
+        }
         found.push({
           node_id: node?.id != null ? String(node.id) : null,
           node_type: node?.type ?? null,
           widget: name,
           mode,
-          ...(pairedName ? { paired_widget: pairedName } : {}),
+          ...(pairedName ? { paired_widget: pairedName, paired_widget_source: pairedSource } : {}),
         });
       }
     } catch {
@@ -86,16 +109,24 @@ export function scopedBatchSeedNote(controls, batchCount) {
     .map((c) => `node ${c.node_id}${c.node_type ? ` (${c.node_type})` : ""} ${c.paired_widget ?? "value"}=${c.mode}`)
     .join("; ");
   const more = controls.length > 5 ? `, and ${controls.length - 5} more` : "";
+  // CONDITIONAL, not absolute (codex). The scan walks every graph level, while a scoped
+  // run executes only what feeds `to_node_id` — so a control on a branch this run never
+  // reaches would otherwise be described as certainly repeating. The panel cannot
+  // cheaply derive the executed set from here, so it says "the ones its scope reaches"
+  // and admits it is listing all of them.
   return (
-    `EVERY ITEM OF THIS BATCH WILL USE THE SAME ${controls.length === 1 ? "VALUE" : "VALUES"}: ` +
-    `${which}${more}. A run scoped with to_node_id is a PARTIAL execution, and ComfyUI does ` +
-    `not advance control_after_generate between the items of one — measured on frontend ` +
-    `1.48.7 by comparing the submitted prompts, where an unscoped batch of 3 sent three ` +
-    `different seeds and a scoped batch of 3 sent the same seed three times. So items after ` +
-    `the first are identical prompts, which ComfyUI answers from cache in a fraction of a ` +
-    `second with the same output file (#988). This is the frontend's queue behaviour, not ` +
-    `something the panel chose, and the panel does not rewrite your seeds to work around it. ` +
-    `To get different results: run batch_count:1 several times setting the value yourself ` +
-    `between runs, or drop to_node_id so the run is unscoped and ComfyUI advances it for you.`
+    `THIS BATCH WILL REUSE THE SAME ${controls.length === 1 ? "VALUE" : "VALUES"} for any of ` +
+    `these controls its scope actually reaches: ${which}${more}. A run scoped with to_node_id ` +
+    `is a PARTIAL execution, and ComfyUI does not advance control_after_generate between the ` +
+    `items of one — measured on frontend 1.48.7 by comparing the submitted prompts, where an ` +
+    `unscoped batch of 3 sent three different seeds and a scoped batch of 3 sent the same seed ` +
+    `three times. Items after the first are then identical prompts, which ComfyUI answers from ` +
+    `cache in a fraction of a second with the same output file (#988). Every such control in ` +
+    `the workflow is listed because the panel cannot tell from here which ones this scope ` +
+    `reaches; one outside the executed branch is harmless. This is the frontend's queue ` +
+    `behaviour, not something the panel chose, and the panel does not rewrite your values to ` +
+    `work around it. The prompts are ALREADY QUEUED — interrupt them if this is not what you ` +
+    `wanted. For different results: run batch_count:1 several times, setting the value ` +
+    `yourself between runs, or drop to_node_id so the run is unscoped and ComfyUI advances it.`
   );
 }

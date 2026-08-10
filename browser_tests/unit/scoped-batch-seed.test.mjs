@@ -14,6 +14,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   findRepeatingControlWidgets,
@@ -40,6 +41,7 @@ test("#988 an advancing control is found, with the value widget it governs", () 
     widget: "control_after_generate",
     mode: "randomize",
     paired_widget: "seed",
+    paired_widget_source: "adjacent",
   });
 });
 
@@ -95,18 +97,54 @@ test("#988 the note fires ONLY for the reported combination", () => {
 
 test("#988 the note names the nodes, the cause, and the two things that DO work", () => {
   const note = scopedBatchSeedNote(findRepeatingControlWidgets([ksampler(42, "randomize")]), 3);
-  assert.match(note, /^EVERY ITEM OF THIS BATCH WILL USE THE SAME/, "the consequence first");
+  assert.match(note, /^THIS BATCH WILL REUSE THE SAME/, "the consequence first");
   assert.match(note, /node 42 \(KSampler\) seed=randomize/, "which widget on which node");
   assert.match(note, /1\.48\.7/, "attributes the behaviour to the build it was measured on");
   assert.match(note, /batch_count:1/, "workaround one");
   assert.match(note, /drop to_node_id/, "workaround two");
   // Two claims it must NOT make.
-  assert.match(note, /not something the panel chose/, "the cause is the frontend's queue loop");
-  assert.match(note, /does not rewrite your seeds/, "and the panel says what it declined to do");
+  assert.match(note, /not something the panel chose/, "the cause is the frontend queue loop");
+  // codex: the scan is workflow-wide but the run is scoped, so the claim is conditional.
+  assert.match(note, /any of these controls its scope actually reaches/, "conditional, not absolute");
+  assert.match(note, /ALREADY QUEUED/, "and it does not pretend the caller can still prevent it");
+  assert.match(note, /does not rewrite your values/, "and the panel says what it declined to do");
 });
 
 test("#988 the note caps its list but says how many it left out", () => {
   const many = Array.from({ length: 9 }, (_, i) => ksampler(i, "randomize"));
   const note = scopedBatchSeedNote(findRepeatingControlWidgets(many), 2);
   assert.match(note, /and 4 more/, "a truncated list must not read as the whole list");
+});
+
+test("#988 (codex): `increment-wrap` advances too and must be warned about", () => {
+  // ComfyUI ships it. The report only names randomize, and warning on that alone would
+  // have left a mode silently broken.
+  assert.equal(findRepeatingControlWidgets([ksampler(1, "increment-wrap")]).length, 1);
+});
+
+test("#988 (codex): LINKAGE beats adjacency for naming the governed widget", () => {
+  // Adjacency is a UI-insertion convention custom nodes need not preserve, so the
+  // source of the pairing is reported and linkage wins when the frontend supplies it.
+  const node = {
+    id: 7,
+    type: "Custom",
+    widgets: [
+      { name: "not_the_seed", value: 1 },
+      { name: "control_after_generate", value: "randomize", linkedWidgets: [{ name: "real_seed" }] },
+    ],
+  };
+  const found = findRepeatingControlWidgets([node]);
+  assert.equal(found[0].paired_widget, "real_seed");
+  assert.equal(found[0].paired_widget_source, "linked");
+});
+
+test("#988 (codex) source guard: the scan runs BEFORE dispatch, not after", () => {
+  // Measuring afterwards described a run already submitted while the note claimed it
+  // let the caller cancel — a remedy it could not offer.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const scan = src.indexOf("repeatingControls = findRepeatingControlWidgets(");
+  const dispatch = src.indexOf("await app.queuePrompt(0, batch, undefined)");
+  const scopedDispatch = src.indexOf("runScopeResult = await dispatchScopedRun({");
+  assert.ok(scan > 0, "the pre-dispatch scan must exist");
+  assert.ok(scan < dispatch && scan < scopedDispatch, "and precede BOTH dispatch paths");
 });
