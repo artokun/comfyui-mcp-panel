@@ -81,7 +81,11 @@ test('two tabs on one saved workflow never share a bridge route', async ({
 
     // A SAVED workflow specifically. An unsaved tab routes on a per-object `tmp:<uuid>`
     // and could never collide, so using one would pass for the wrong reason.
-    const saved = await mockBridge.command('workflow_save', {})
+    // #907 — an unnamed save gets ComfyUI's `Untitled <date> <time>`, the SAME
+    // name it gives the developer's own unnamed saves, so nothing downstream can
+    // tell them apart and the cleanup must not try. Name it ours.
+    const e2eSaveName = `cmcp-e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const saved = await mockBridge.command('workflow_save_as', { name: e2eSaveName })
     expect(saved.ok, 'the workflow must save so both tabs share a FILE').toBe(true)
     const savedName = String(saved.result?.workflow || '')
     expect(savedName, 'the save must report a name').toBeTruthy()

@@ -59,7 +59,13 @@ test('closing a workflow refuses when a NODE left unsaved work', async ({
   // assertion is still cleaned up (codex).
   let savedName = ''
   try {
-    const saved = await mockBridge.command('workflow_save', {})
+    // #907 — SAVE UNDER A NAME THAT IS UNMISTAKABLY OURS. An unnamed save gets
+    // ComfyUI's `Untitled <date> <time>`, which is the SAME shape it gives the
+    // developer's own unnamed saves — so a cleanup keyed on that name can delete
+    // their work if they happen to save while the suite runs (codex). Naming it
+    // here means nothing the suite deletes is ever ambiguous.
+    const e2eName = `cmcp-e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const saved = await mockBridge.command('workflow_save_as', { name: e2eName })
     expect(saved.ok, 'the save must succeed so the tab starts clean').toBe(true)
     savedName = String(saved.result?.workflow || '')
     expect(savedName, 'the save must report a name, or cleanup has nothing to remove').toBeTruthy()
@@ -132,7 +138,11 @@ test('force:true still discards — the guard refuses, it does not trap', async 
   await settleCanvas(page)
   let savedName2 = ''
   try {
-    const saved2 = await mockBridge.command('workflow_save', {})
+    // #907 — an unnamed save gets ComfyUI's `Untitled <date> <time>`, the SAME
+    // name it gives the developer's own unnamed saves, so nothing downstream can
+    // tell them apart and the cleanup must not try. Name it ours.
+    const e2eSaveName = `cmcp-e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const saved2 = await mockBridge.command('workflow_save_as', { name: e2eSaveName })
     // Asserted, not assumed (codex): without this the setup save could fail, the test
     // still pass, and cleanup ask to delete `workflows/.json`.
     expect(saved2.ok, 'the setup save must succeed').toBe(true)
