@@ -12,28 +12,30 @@ import assert from "node:assert/strict";
 import {
   mediaSignature,
   createCompletionDeduper,
-  duplicateSuppressedNote,
+  duplicateCompletionNote,
 } from "../../web/js/lib/completion-dedupe.js";
 
 const vid = (filename, subfolder = "", type = "output") => ({ filename, subfolder, type });
 
-test("#986 the reported burst: six cached re-queues of one clip deliver ONCE", () => {
+test("#986 the reported burst: every repeat is DELIVERED and labelled", () => {
   const d = createCompletionDeduper();
   const media = [vid("Video_00144.mp4")];
-  const ids = ["2d9d64f5", "c3e90187", "c5184f9e", "4ce0a352", "740ff0f5", "aa11bb22"];
-  const delivered = ids.filter(
-    (promptId) =>
-      d.consider({ signature: mediaSignature([], media), panelQueued: false, promptId, durationMs: 100, durationTrusted: true }).deliver,
+  const ids = ["2d9d64f5", "c3e90187", "c5184f9e"];
+  const results = ids.map((promptId) =>
+    d.consider({ signature: mediaSignature([], media), panelQueued: false, promptId, durationMs: 100, durationTrusted: true }),
   );
-  assert.deepEqual(delivered, ["2d9d64f5"], "only the first announcement survives");
+  assert.ok(results.every((r) => r.deliver), "nothing is ever withheld");
+  assert.equal(results[0].duplicateOf, null);
+  assert.equal(results[1].duplicateOf, "2d9d64f5");
+  assert.equal(results[1].looksCached, true);
 });
 
-test("#986 the suppressed ones name what they duplicate", () => {
+test("#986 a repeat names what it duplicates", () => {
   const d = createCompletionDeduper();
   const sig = mediaSignature([], [vid("Video_00144.mp4")]);
   d.consider({ signature: sig, panelQueued: false, promptId: "first" });
   const second = d.consider({ signature: sig, panelQueued: false, promptId: "second", durationMs: 100, durationTrusted: true });
-  assert.equal(second.deliver, false);
+  assert.equal(second.deliver, true);
   assert.equal(second.duplicateOf, "first");
 });
 
@@ -54,8 +56,8 @@ test("#986 a panel-queued delivery is RECORDED, so a later canvas replay is caug
   const sig = mediaSignature([], [vid("same.mp4")]);
   d.record({ signature: sig, promptId: "panel-run" });
   const replay = d.consider({ signature: sig, panelQueued: false, promptId: "canvas-replay", durationMs: 100, durationTrusted: true });
-  assert.equal(replay.deliver, false);
-  assert.equal(replay.duplicateOf, "panel-run");
+  assert.equal(replay.deliver, true, "delivered — nothing is ever withheld");
+  assert.equal(replay.duplicateOf, "panel-run", "but labelled with what it repeats");
 });
 
 test("#986 a DIFFERENT output is always delivered", () => {
@@ -72,7 +74,7 @@ test("#986 the window EXPIRES — a deliberate re-render later is a real event",
   const sig = mediaSignature([], [vid("same.mp4")]);
   assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "1", durationMs: 100, durationTrusted: true }).deliver, true);
   t = 500;
-  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "2", durationMs: 100, durationTrusted: true }).deliver, false);
+  assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "2", durationMs: 100, durationTrusted: true }).duplicateOf, "1");
   t = 2000; // past the window
   assert.equal(d.consider({ signature: sig, panelQueued: false, promptId: "3", durationMs: 100, durationTrusted: true }).deliver, true);
 });
@@ -121,13 +123,20 @@ test("#986 the deduper is bounded in TIME, so it cannot grow without limit", () 
   assert.ok(d.size() < 50, "entries older than the window are pruned");
 });
 
-test("#986 the note explains the collapse and reassures about panel_run", () => {
-  const note = duplicateSuppressedNote(5, "2d9d64f5");
-  assert.match(note, /5 further completions/);
-  assert.match(note, /2d9d64f5/);
-  assert.match(note, /served from ComfyUI's cache/, "names the likely cause without asserting internals");
-  assert.match(note, /queued through panel_run are never suppressed/, "the guarantee that matters");
-  assert.equal(duplicateSuppressedNote(0, "x"), "", "silent when nothing was suppressed");
+test("#986 the note distinguishes a likely replay from a possible real re-render", () => {
+  const cached = duplicateCompletionNote("2d9d64f5", true);
+  assert.match(cached, /already delivered by prompt 2d9d64f5/);
+  assert.match(cached, /spent no real time rendering/, "the strongest available hint");
+  assert.match(cached, /very likely the same result again/);
+
+  const real = duplicateCompletionNote("2d9d64f5", false);
+  assert.match(real, /DID spend real time rendering/);
+  assert.match(real, /cannot tell those apart and does not guess/, "no claim it cannot establish");
+
+  for (const note of [cached, real]) {
+    assert.match(note, /Nothing is withheld/, "the guarantee that matters most");
+  }
+  assert.equal(duplicateCompletionNote(null, true), "", "silent when nothing is duplicated");
 });
 
 test("#986 (codex): a REAL re-render that overwrites the same filename is always delivered", () => {
@@ -204,4 +213,41 @@ test("#986 (codex r2): fields cannot bleed into each other across the delimiter"
   const a = mediaSignature([], [{ filename: "x.png", type: "output/foo", subfolder: "bar" }]);
   const b = mediaSignature([], [{ filename: "x.png", type: "output", subfolder: "foo/bar" }]);
   assert.notEqual(a, b);
+});
+
+test("#986 the duplicate note reaches the agent-facing FRAME, not just the payload", async () => {
+  // The annotation is worthless if it only exists in a result field nobody renders.
+  // Asserted through the real composer, which is what the agent actually receives.
+  const { composeRunCompletionFrame } = await import("../../web/js/lib/run-completion-frame.js");
+  const frames = [];
+  await composeRunCompletionFrame(
+    {
+      promptId: "second",
+      images: [{ filename: "a.png", type: "output" }],
+      videos: [],
+      durationMs: 100,
+      duplicateOf: "first",
+      looksCached: true,
+    },
+    {
+      sendFrame: (f) => (frames.push(f), true),
+      coerceMessageText: (t) => t,
+      formatDuration: (ms) => `${ms}ms`,
+      formatClock: () => "12:00",
+      imageViewUrl: () => "u",
+      fetchImageBytes: async () => null,
+      fetchImageDimensions: async () => null,
+      humanizeBytes: () => "1 KB",
+      buildVideoStoryboard: async () => null,
+      uploadBlobToInput: async () => null,
+      storyboardFrameCount: () => 0,
+      paintImage: async () => null,
+      agentReceivesImages: () => true,
+      now: () => new Date(0),
+    },
+  );
+  assert.equal(frames.length, 1, "one completion frame");
+  const note = String(frames[0]?.note ?? "");
+  assert.match(note, /already delivered by prompt first/, "the agent is told, in the frame it reads");
+  assert.match(note, /Nothing is withheld/);
 });

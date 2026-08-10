@@ -76,7 +76,6 @@ export function createRunCompletionTracker({
   maxReconcileRetries = 5,
   // #986 — injected so the dedupe window is testable and the tracker keeps no
   // second source of truth for time.
-  onDuplicateSuppressed = null,
   duplicateWindowMs = 5 * 60 * 1000,
 } = {}) {
   if (typeof onFlush !== "function") {
@@ -413,18 +412,6 @@ export function createRunCompletionTracker({
       durationMs,
       durationTrusted,
     });
-    if (!verdict.deliver) {
-      // Retire it exactly as a delivered run would be: it IS accounted for, and
-      // leaving it pending would have a later reconcile deliver the duplicate anyway.
-      markDelivered(k);
-      onDuplicateSuppressed?.({
-        key: k,
-        promptId: promptIdOf(k),
-        duplicateOf: verdict.duplicateOf,
-        durationMs,
-      });
-      return;
-    }
     // A panel-queued delivery still records its signature, so a canvas re-queue of
     // the SAME output afterwards is recognised rather than getting one free pass.
     if (panelQueued.has(k)) deduper.record({ signature, promptId: promptIdOf(k) });
@@ -445,6 +432,12 @@ export function createRunCompletionTracker({
       videos: buf.videos,
       durationMs,
       finishedAt: now(),
+      // #986 — the agent is TOLD this output was already announced, never denied it.
+      // Which of a replay or a fast re-render it is cannot be proven, so the panel
+      // reports what it observed and lets the reader decide.
+      ...(verdict.duplicateOf
+        ? { duplicateOf: verdict.duplicateOf, looksCached: !!verdict.looksCached }
+        : {}),
     });
   }
 

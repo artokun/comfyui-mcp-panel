@@ -22,6 +22,7 @@
 // the SAME bound, so it now lives in one place both import. Behaviour is
 // unchanged except that a throwing `onTimeout`/`clearTimer` degrades instead of
 // leaving the segment pending forever.
+import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
 
 /**
@@ -34,7 +35,7 @@ import { withTimeout } from "./bounded-step.js";
  * @returns {Promise<object|null>}
  */
 export async function composeRunCompletionFrame(
-  { promptId, images = [], videos = [], durationMs, noMedia = false },
+  { promptId, images = [], videos = [], durationMs, noMedia = false, duplicateOf = null, looksCached = false },
   deps,
 ) {
   const {
@@ -81,6 +82,10 @@ export async function composeRunCompletionFrame(
 
   const outImages = []; // consolidated images for the single frame
   const noteSections = []; // note segments joined into the single note
+  // #986 — FIRST section, because it changes how everything after it should be read:
+  // this exact output has already been delivered under another prompt id. It is never
+  // a reason to withhold the completion (see completion-dedupe.js), only to say so.
+  if (duplicateOf) noteSections.push(duplicateCompletionNote(duplicateOf, looksCached));
   let metadata = [];
 
   // ── Stills segment ─────────────────────────────────────────────────────

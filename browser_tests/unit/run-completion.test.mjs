@@ -648,10 +648,8 @@ function makeDedupeHarness({ duplicateWindowMs = 5 * 60 * 1000 } = {}) {
   let seq = 0;
   const timers = new Map();
   const flushes = [];
-  const suppressed = [];
   const tracker = createRunCompletionTracker({
     onFlush: (p) => flushes.push(p),
-    onDuplicateSuppressed: (p) => suppressed.push(p),
     duplicateWindowMs,
     now: () => clock,
     setTimer: (fn, ms) => {
@@ -661,7 +659,7 @@ function makeDedupeHarness({ duplicateWindowMs = 5 * 60 * 1000 } = {}) {
     },
     clearTimer: (id) => timers.delete(id),
   });
-  return { tracker, flushes, suppressed, advance: (ms) => (clock += ms) };
+  return { tracker, flushes, advance: (ms) => (clock += ms) };
 }
 
 /** One canvas run that produces the given video and finishes. */
@@ -671,16 +669,18 @@ const canvasRun = (h, promptId, filename) => {
   h.tracker.onExecutionSuccess(promptId);
 };
 
-test("#986: six cached canvas re-queues of one clip deliver ONE completion", () => {
+test("#986: the reported burst — every repeat is DELIVERED, and every repeat is labelled", () => {
   const h = makeDedupeHarness();
   for (const id of ["2d9d64f5", "c3e90187", "c5184f9e", "4ce0a352", "740ff0f5", "aa11bb22"]) {
     canvasRun(h, id, "Video_00144.mp4");
     h.advance(5000); // the reported burst was ~30s across six
   }
-  assert.equal(h.flushes.length, 1, "the agent is told once");
-  assert.equal(h.flushes[0].promptId, "2d9d64f5");
-  assert.equal(h.suppressed.length, 5, "and the rest are accounted for, not silently dropped");
-  assert.equal(h.suppressed[0].duplicateOf, "2d9d64f5", "naming what they duplicate");
+  assert.equal(h.flushes.length, 6, "no result is ever swallowed");
+  assert.equal(h.flushes[0].duplicateOf, undefined, "the first duplicates nothing");
+  for (const f of h.flushes.slice(1)) {
+    assert.equal(f.duplicateOf, "2d9d64f5", "each repeat names the delivery it duplicates");
+    assert.equal(f.looksCached, true, "and says it did no real work — the 0.1s giveaway");
+  }
 });
 
 test("#986: a PANEL-QUEUED run is delivered even when its output was already seen", () => {
@@ -692,7 +692,7 @@ test("#986: a PANEL-QUEUED run is delivered even when its output was already see
   h.tracker.onQueued("panel-1");
   canvasRun(h, "panel-1", "same.mp4");
   assert.equal(h.flushes.length, 2, "the run the agent is waiting for always arrives");
-  assert.deepEqual(h.suppressed, []);
+  assert.equal(h.flushes[h.flushes.length-1].duplicateOf, undefined, "not labelled a duplicate");
 });
 
 test("#986: a DIFFERENT output is never collapsed into a previous one", () => {
@@ -700,7 +700,7 @@ test("#986: a DIFFERENT output is never collapsed into a previous one", () => {
   canvasRun(h, "p1", "Video_00144.mp4");
   canvasRun(h, "p2", "Video_00145.mp4");
   assert.equal(h.flushes.length, 2);
-  assert.deepEqual(h.suppressed, []);
+  assert.equal(h.flushes[h.flushes.length-1].duplicateOf, undefined, "not labelled a duplicate");
 });
 
 test("#986: past the window, a deliberate re-render of the same file is a real event again", () => {
@@ -711,12 +711,17 @@ test("#986: past the window, a deliberate re-render of the same file is a real e
   assert.equal(h.flushes.length, 2, "an hour-later re-render is not a duplicate");
 });
 
-test("#986: a suppressed duplicate is RETIRED, so a later reconcile cannot re-deliver it", () => {
-  const h = makeDedupeHarness();
-  canvasRun(h, "p1", "same.mp4");
-  canvasRun(h, "p2", "same.mp4");
-  assert.equal(h.suppressed.length, 1);
-  assert.equal(h.tracker.isSettled("p2"), true, "not left pending for a sweep to pick up");
+test("#986: a REAL re-render overwriting the same filename is delivered and NOT called cached", () => {
+  // The case that killed suppression: a fixed-name writer producing different bytes.
+  const h = makeDedupeHarness({ duplicateWindowMs: 60 * 60 * 1000 });
+  canvasRun(h, "first", "fixed.mp4");
+  h.tracker.onExecutionStart("second");
+  h.advance(600000);
+  h.tracker.onExecuted("second", { images: [], videos: [{ filename: "fixed.mp4", subfolder: "", type: "output" }] });
+  h.tracker.onExecutionSuccess("second");
+  assert.equal(h.flushes.length, 2, "a real render always arrives");
+  assert.equal(h.flushes[1].duplicateOf, "first", "the filename repeat is still disclosed");
+  assert.equal(h.flushes[1].looksCached, false, "but it is NOT claimed to be a replay");
 });
 
 test("#986 (codex r3): a later `executing` must NOT upgrade a FABRICATED start to trusted", () => {
@@ -735,5 +740,5 @@ test("#986 (codex r3): a later `executing` must NOT upgrade a FABRICATED start t
   h.tracker.onExecutingNode("second", "node-2"); // later signal, different node
   h.tracker.onExecutionSuccess("second"); // finishes within the cache-hit threshold
   assert.equal(h.flushes.length, 2, "a real render is delivered even when its duration looks tiny");
-  assert.deepEqual(h.suppressed, []);
+  assert.equal(h.flushes[1].looksCached, false, "an INVENTED duration is never called a cache hit");
 });

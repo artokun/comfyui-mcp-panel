@@ -16,11 +16,16 @@
  *
  * WHAT IS THE SAME is the OUTPUT. So the dedupe is on the media itself.
  *
- * SCOPED TO RUNS THE PANEL DID NOT QUEUE. A panel-queued run was promised a
- * notification — `panel_run` tells the agent "you will be notified automatically, do
- * NOT poll, end your turn now" — so suppressing one would wedge the agent waiting for
- * a message that never comes. That is a worse failure than the duplicates. A canvas
- * run carries no such promise, which is exactly the case the report is about.
+ * NOTHING IS EVER WITHHELD. The first design suppressed a repeat that looked cached,
+ * and review showed that cannot be made sound: a fixed-name writer can produce
+ * different bytes in under a second with a normal lifecycle, so no duration threshold
+ * separates a replay from a fast re-render. A completion is therefore always
+ * delivered, ANNOTATED with the prompt it duplicates and whether it looks cached —
+ * which is what the agent lacked. Losing a render someone waited for is the worse
+ * failure, and it is the one this cannot commit.
+ *
+ * A panel-queued run is never even annotated as a duplicate: `panel_run` promised the
+ * agent a notification and told it to end its turn, so that delivery is its own event.
  */
 
 /**
@@ -30,7 +35,7 @@
  * Sorted so ordering differences cannot mint a new signature, and built from the
  * fields that identify a file on the server (`filename`, `subfolder`, `type`).
  * Returns null when there is nothing identifying to hash — no signature means no
- * suppression, which is the safe direction.
+ * duplicate claim, which is the safe direction.
  */
 export function mediaSignature(images, videos) {
   const parts = [];
@@ -75,18 +80,10 @@ export function mediaSignature(images, videos) {
 export function createCompletionDeduper({
   ttlMs = 5 * 60 * 1000,
   now = () => Date.now(),
-  // #986 (codex NO-SHIP): same filename is NOT the same result. A node that writes a
-  // fixed name — no counter in the prefix — produces two REAL renders with identical
-  // signatures, and suppressing the second loses work the user waited for.
-  //
-  // The reporter's own evidence supplies the discriminator: the duplicates ran in
-  // 0.1-0.3s against a genuine first render of 10m51s. Nothing renders a 10s clip in
-  // 100ms; that is ComfyUI returning a cached result. So a repeat is only suppressed
-  // when it did not actually render. A real overwrite render takes real time and is
-  // always delivered.
-  //
-  // An UNKNOWN duration never suppresses: a missing start yields null, and null is
-  // not evidence of a cache hit.
+  // Below this, a repeat is flagged as looking like a cache hit rather than work. The
+  // reporter's numbers set it: 0.1-0.3s replays against a genuine 10m51s first render.
+  // It only ever changes the WORDING of an annotation — nothing is withheld on it —
+  // so being approximate here is cheap.
   cacheHitMaxMs = 1500,
 } = {}) {
   const seen = new Map(); // signature -> { at, promptId }
@@ -98,13 +95,13 @@ export function createCompletionDeduper({
 
   return {
     /**
-     * Should this completion be delivered?
+     * How should this completion be reported?
      *
-     * Returns `{ deliver, duplicateOf }`. `deliver` is false ONLY when every condition
-     * holds: the panel did not queue this run, the media is identifiable, and the same
-     * media was announced within the window. Anything unestablished delivers — a
-     * missed duplicate costs a redundant message, a wrongly-suppressed completion
-     * costs the result itself.
+     * Returns `{ deliver, duplicateOf, looksCached }`. `deliver` is ALWAYS true — see
+     * the module header. `duplicateOf` names the earlier prompt that delivered this
+     * exact media, or null; `looksCached` says whether this repeat also failed to
+     * spend any real time rendering, which is the strongest available hint that it
+     * came from ComfyUI's cache rather than from work.
      */
     consider({ signature, panelQueued, promptId, durationMs, durationTrusted = false }) {
       prune();
@@ -115,21 +112,28 @@ export function createCompletionDeduper({
         seen.set(signature, { at: now(), promptId: promptId ?? null });
         return { deliver: true, duplicateOf: null };
       }
-      // Same output as something already announced — but that alone does not make it
-      // a replay. Only a run that plainly did not render is suppressed.
-      // `durationTrusted` is required (codex): when execution_start and executing()
-      // are both dropped, the tracker invents a start at the FINAL output event, so a
-      // genuine ten-minute render reports a sub-second duration. An invented duration
-      // is not evidence of a cache hit, and suppressing on it would lose a real result
-      // precisely when frames were being dropped.
+      // Same output as one already announced. Whether that is a cache REPLAY or a
+      // genuinely fast re-render CANNOT be proven from here (codex, final round): a
+      // custom fixed-name writer can legitimately produce different bytes in under a
+      // second, with an entirely normal lifecycle making its duration trustworthy. No
+      // threshold separates the two, and a first-run comparator does not either.
+      //
+      // So nothing is ever withheld. Losing a render someone waited for is a worse
+      // outcome than an extra message, and the agent's actual complaint — being unable
+      // to tell a replay from a real result — is answered by SAYING which it looks
+      // like, not by deciding on its behalf.
+      //
+      // `durationTrusted` still gates the flag. When execution_start and executing()
+      // are both dropped the tracker invents a start at the final output event, so a
+      // ten-minute render can report a sub-second duration; calling that a cache hit
+      // would be wrong on the facts as well as unhelpful.
       const looksCached =
         durationTrusted &&
         typeof durationMs === "number" &&
         Number.isFinite(durationMs) &&
         durationMs >= 0 &&
         durationMs <= cacheHitMaxMs;
-      if (!looksCached) return { deliver: true, duplicateOf: null };
-      return { deliver: false, duplicateOf: hit.promptId ?? null };
+      return { deliver: true, duplicateOf: hit.promptId ?? null, looksCached };
     },
 
     /**
@@ -156,14 +160,17 @@ export function createCompletionDeduper({
  * explain, once, that further identical completions are being collapsed. States what
  * was observed rather than diagnosing ComfyUI's caching.
  */
-export function duplicateSuppressedNote(count, duplicateOf) {
-  if (!count) return "";
+export function duplicateCompletionNote(duplicateOf, looksCached) {
+  if (!duplicateOf) return "";
   return (
-    `${count} further completion${count === 1 ? "" : "s"} carrying this exact output ` +
-    `${count === 1 ? "was" : "were"} not re-announced. They arrived under different prompt ids ` +
-    `${duplicateOf ? `(first seen as ${duplicateOf}) ` : ""}but delivered the same file(s), which is ` +
-    `what a re-queue served from ComfyUI's cache looks like — the sub-second durations are the ` +
-    `giveaway. Runs queued through panel_run are never suppressed, so a result you asked for ` +
-    `always arrives.`
+    `This output was already delivered by prompt ${duplicateOf}. The files are identical; only ` +
+    `the prompt id differs.` +
+    (looksCached
+      ? ` It also spent no real time rendering, which is what a re-queue served from ComfyUI's ` +
+        `cache looks like — so this is very likely the same result again, not new work.`
+      : ` It DID spend real time rendering, so this may be a genuine re-render that happens to ` +
+        `write the same filename — the panel cannot tell those apart and does not guess.`) +
+    ` Nothing is withheld either way: a completion is always delivered, because losing a render ` +
+    `you waited for would be worse than an extra message.`
   );
 }
