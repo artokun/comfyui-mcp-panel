@@ -23,6 +23,22 @@
  *
  * FAIL-CLOSED IS UNCHANGED. Only a usable, non-empty payload authorizes anything; every
  * failure path returns `defs: null`, which the fence already refuses on.
+ *
+ * DOES THE SECOND ROUTE AUTHORIZE MORE THAN THE FIRST? (codex). If `api.getNodeDefs()`
+ * filtered or narrowed the schema, falling back to the raw route would quietly widen what
+ * a write may be authorized against. MEASURED on ComfyUI 0.31.1 / frontend 1.48.7, both
+ * routes fetched back to back on a 4183-type install:
+ *
+ *   api.getNodeDefs()      4183 types
+ *   GET /object_info       4183 types
+ *   types in only one      none, either direction
+ *   per-type field sets    identical for the sampled types
+ *
+ * So on the build this was written against the two answer the same question. That is
+ * evidence, not a contract: a frontend that starts filtering would make the fallback
+ * broader than the client route, and this comment is where that would need re-checking.
+ * The fallback is only ever consulted when the client route returned NOTHING usable, so
+ * it can never override a narrower answer the client actually gave.
  */
 
 /** A payload that can actually answer "does the backend define this type?" */
@@ -30,9 +46,32 @@ function usableDefs(value) {
   return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
 }
 
-/** One attempt's outcome, in the words of what happened rather than a category. */
+/** How much of a thrown value's own words may ride into a refusal message. */
+const MAX_DETAIL_CHARS = 200;
+
+/**
+ * Flatten and cap any UNTRUSTED text before it can reach a caller-visible message
+ * (codex). It comes from a backend, a frontend client, or any installed extension, and
+ * it is interpolated into an error a caller reads: control characters are collapsed so a
+ * newline cannot forge structure in the reply, and the length is capped so an
+ * arbitrarily large message cannot become the response. Applied at BOTH boundaries — the
+ * per-attempt description and the note builder — because a caller can hand the latter
+ * strings this module never produced.
+ */
+function sanitizeDetail(value) {
+  const flattened = String(value ?? "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flattened.length > MAX_DETAIL_CHARS
+    ? `${flattened.slice(0, MAX_DETAIL_CHARS)}… (truncated)`
+    : flattened;
+}
+
 function describeFailure(label, err, extra = "") {
-  const detail = err instanceof Error ? err.message : err == null ? "" : String(err);
+  const raw = err instanceof Error ? err.message : err == null ? "" : String(err);
+  const detail = sanitizeDetail(raw);
   const suffix = detail ? `: ${detail}` : "";
   return `${label}${extra}${suffix}`;
 }
@@ -96,7 +135,7 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
  */
 export function objectInfoOracleFailureNote(failures) {
   if (!Array.isArray(failures) || !failures.length) return "";
-  const which = failures.map((f) => String(f)).filter(Boolean);
+  const which = failures.map((f) => sanitizeDetail(f)).filter(Boolean);
   if (!which.length) return "";
   return ` Tried ${which.length === 1 ? "one route" : `${which.length} routes`}: ${which.join("; ")}.`;
 }

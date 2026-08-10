@@ -134,3 +134,56 @@ test("#982 source guard: the refusal states an observation, and the panel wires 
   // The burst cache still wraps it: two transports must not become two fetches per write.
   assert.match(panel, /await objectInfoCache\.read\(async \(\) => \{/, "still read through the #716 cache");
 });
+
+test("#982 (codex) the fallback is consulted ONLY when the client returned nothing usable", () => {
+  // If `api.getNodeDefs()` ever narrows the schema, the raw route would be the broader
+  // answer — so the fallback must never be able to override an answer the client gave.
+  const src = readFileSync(new URL("../../web/js/lib/object-info-oracle.js", import.meta.url), "utf8");
+  const clientBlock = src.slice(src.indexOf("if (typeof getNodeDefs === \"function\")"), src.indexOf("// SECOND TRANSPORT"));
+  assert.match(clientBlock, /if \(usableDefs\(defs\)\) return \{ defs, failures \};/, "a usable client answer returns");
+  // …and the measured equivalence is recorded rather than assumed.
+  assert.match(src, /MEASURED on ComfyUI 0\.31\.1 \/ frontend 1\.48\.7/, "the comparison is on the record");
+  assert.match(src, /That is\s*\n? \* evidence, not a contract/, "and its limit is stated");
+});
+
+test("#982 (codex) untrusted failure text is flattened and capped", () => {
+  const nasty = "line one\nline two\r\nthird\u0007bell " + "x".repeat(500);
+  const note = objectInfoOracleFailureNote([nasty]);
+  assert.ok(!note.includes("\n") && !note.includes("\r"), "no newline can forge structure in the reply");
+  assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(note), "no control characters survive");
+  assert.ok(note.length < 400, `capped, got ${note.length}`);
+  assert.match(note, /truncated/, "and the truncation is disclosed rather than silent");
+});
+
+test("#982 (codex) a thrown value's own words are flattened at the source", async () => {
+  const { failures } = await fetchWholeObjectInfo({
+    getNodeDefs: async () => {
+      throw new Error("first\nsecond\ttab");
+    },
+    fetchApi: null,
+  });
+  assert.equal(failures[0].includes("\n"), false);
+  assert.match(failures[0], /first second tab/);
+});
+
+test("#982 (codex) the observed failures are PER-REQUEST, not module state", () => {
+  // A concurrent refresh or a second widget write would otherwise overwrite the record
+  // between one request's failed fetch and its refusal, so the message would name routes
+  // another call tried. The variable lives in the handler's own scope.
+  const panel = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const handler = panel.slice(panel.indexOf("async graph_set_widget({"));
+  const body = handler.slice(0, handler.indexOf("\n  async "));
+  assert.match(body, /let oracleFailures = \[\];/, "declared inside the handler");
+  assert.match(body, /oracleFailures = defs \? \[\] : failures;/, "written there");
+  assert.match(body, /objectInfoOracleFailureNote\(oracleFailures\)/, "and read there");
+  assert.ok(
+    !/lastObjectInfoOracleFailures/.test(panel),
+    "no module-scope record survives — that is the cross-request race",
+  );
+});
+
+test("#982 (codex) a control character cannot forge structure at either boundary", () => {
+  const nasty = "a\u0000b\u001fc\u007fd\u009fe";
+  assert.match(objectInfoOracleFailureNote([nasty]), /a b c d e/, "collapsed, not stripped into a run-on");
+  assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(objectInfoOracleFailureNote([nasty])));
+});

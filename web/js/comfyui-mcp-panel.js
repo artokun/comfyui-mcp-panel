@@ -669,8 +669,6 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // #716 — one /object_info per BURST of widget writes, instead of one per write.
 const objectInfoCache = createObjectInfoCache();
-/** #982 — what the last /object_info oracle attempt observed, for the refusal text. */
-let lastObjectInfoOracleFailures = [];
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -10218,6 +10216,11 @@ const GRAPH_TOOL_EXECUTORS = {
   async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
+    // widget write would otherwise overwrite this between one request's failed fetch and
+    // its refusal, so the message would name routes another call tried. Declared in the
+    // handler's own scope, so each invocation reports what IT observed.
+    let oracleFailures = [];
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -10305,13 +10308,13 @@ const GRAPH_TOOL_EXECUTORS = {
               getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
               fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
             });
-            lastObjectInfoOracleFailures = defs ? [] : failures;
+            oracleFailures = defs ? [] : failures;
             return defs;
           }),
         ),
       // What the last oracle attempt observed, so a refusal can say which routes were
       // tried and what each one did instead of asserting an unreachable backend.
-      describeObjectInfoFailure: () => objectInfoOracleFailureNote(lastObjectInfoOracleFailures),
+      describeObjectInfoFailure: () => objectInfoOracleFailureNote(oracleFailures),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
       // node — refuse (non-forgeable; client shape/name/provenance can't prove this).

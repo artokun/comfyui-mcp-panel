@@ -623,8 +623,10 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
         `ComfyUI backend — no usable /object_info schema was obtained.${observed} ` +
         `Refusing to write rather than trust a possibly-stale node cache (#458). ` +
-        `Reconnect ComfyUI and retry; if the backend answers /object_info by hand, the ` +
-        `routes named above are what the panel could not use (#982).`,
+        `Reconnect ComfyUI and retry. If /object_info answers when you run it by hand, ` +
+        `compare it with what each route above reported — one of them may have answered ` +
+        `without returning a usable schema, which is a different fault from an ` +
+        `unreachable backend (#982).`,
     );
   }
   if (!freshBackendDefinesType(freshDefs, type)) {
