@@ -14,15 +14,15 @@
 //
 // Both failure directions produce a plausible file — too wide misattributes shipped work,
 // too narrow silently drops the release's own changes — which is why this is pinned.
+//
+// These import the SHIPPED predicate. The first version of this file re-declared it
+// locally, so it asserted against its own copy: reverting the source to the broken
+// original left all three tests green. That is why the rules were moved into
+// scripts/lib/changelog-match.mjs — gen-changelog.mjs rewrites CHANGELOG.md at import
+// time and cannot be imported by a test.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-
-const src = readFileSync(new URL("../../scripts/gen-changelog.mjs", import.meta.url), "utf8");
-
-/** The shipped release-subject predicate, kept in step with the source below. */
-const isReleaseSubject = (s) =>
-  /^release:/i.test(s) || /^v?\d+\.\d+\.\d+([^0-9]|$)/.test(s);
+import { RELEASE_SUBJECT_ERE, isReleaseSubject } from "../../scripts/lib/changelog-match.mjs";
 
 test("#932: this repo's own release subjects are recognised", () => {
   // The shape every release here actually has. The old predicate matched none of them.
@@ -45,24 +45,24 @@ test("#932: ordinary commits are not mistaken for releases", () => {
     "docs(changelog): 0.11.75 said the wrong thing",
     "feat: support 1.2.3 style ids",
     "chore: bump deps",
+    "",
+    "0.11", // not a version
   ]) {
-    assert.equal(isReleaseSubject(s), false, s);
+    assert.equal(isReleaseSubject(s), false, JSON.stringify(s));
   }
 });
 
-test("#932: the base anchors on a version subject, not a release: prefix", () => {
-  assert.ok(
-    src.includes('-E --grep="^v?[0-9]+'),
-    "prevTag must grep for a leading VERSION — the anchor this repo's releases carry",
-  );
-  // The old grep, not any MENTION of it — the comment explaining this fix names the
-  // pattern it replaced, and an unscoped check matches that instead of the code.
-  assert.ok(
-    !/--grep="\^\\\(chore\(release\)/.test(src),
-    "the release:-prefix grep matched nothing here and must be gone",
-  );
-  assert.ok(
-    src.includes("rev-list --max-parents=0"),
-    "the first-commit fallback stays as the last resort, just no longer the only outcome",
-  );
+test("#932: the grep the base search uses is the same rule, in ERE", () => {
+  // prevTag() hands this to `git log -E --grep`. If it drifts from isReleaseSubject, the
+  // base commit and the commits excluded from the entry disagree — which is exactly the
+  // silent, plausible-looking corruption this issue is about.
+  const ere = new RegExp(RELEASE_SUBJECT_ERE);
+  for (const s of ["0.11.75 — a thing (#920)", "0.11.40 (#656)", "v1.2.3"]) {
+    assert.equal(ere.test(s), true, `grep must match ${s}`);
+  }
+  for (const s of ["fix(x): not a release", "feat: support 1.2.3 style ids"]) {
+    assert.equal(ere.test(s), false, `grep must not match ${s}`);
+  }
+  // A version must not anchor on a LONGER one: 0.11.7 is not 0.11.75.
+  assert.equal(new RegExp("^v?0\\.11\\.7([^0-9]|$)").test("0.11.75 — x"), false);
 });
