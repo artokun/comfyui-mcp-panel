@@ -22,6 +22,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { isReleaseSubject, pickReleaseSha } from "./lib/changelog-match.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHANGELOG = join(ROOT, "CHANGELOG.md");
@@ -51,24 +52,43 @@ const git = (args) => execSync(`git ${args}`, { cwd: ROOT, encoding: "utf-8", st
  *  has no per-release tags); else the first commit. */
 function prevTag() {
   try {
-    const t = git("describe --tags --abbrev=0");
+    // --match, because bare `describe --tags` accepts the nearest reachable tag of ANY
+    // name — a `backup`, a CI marker, anything — and would silently make it the release
+    // base (codex, #932). This repo has no tags today, so this guards the sibling mcp
+    // repo and whatever tags land here later, not a present bug.
+    //
+    // It is a GLOB, not a regex: `[0-9]*` is one digit followed by anything, so a tag like
+    // `v1.backup.2.3` still gets through (codex). It rules out the obviously-unrelated
+    // names, not every malformed one. Two further limits on a tagged repo, unaddressed
+    // because neither can arise here: describe can pick the CURRENT release's tag if
+    // generation runs after tagging, yielding an empty range, and nothing validates that
+    // the tag is an exact version.
+    const t = git('describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" --match "[0-9]*.[0-9]*.[0-9]*"');
     if (t) return t;
   } catch {
-    /* no tags */
+    /* no version tags */
   }
   try {
-    const sha = git('log -1 --pretty=format:%H --grep="^\\(chore(release)\\|release\\):"');
-    if (/^[0-9a-f]{7,40}$/.test(sha)) return sha;
+    // #932 — match the shape this repo ACTUALLY produces. Releases here are squash
+    // merges titled `<version> — <description> (#N)`, so a grep for `release:` or
+    // `chore(release):` never matched one, every run fell through to the first commit,
+    // and each entry regenerated the entire history. The anchor is the version at the
+    // START of the subject; whatever follows it is free text.
+    // Subjects only, matched in JS. NOT `--grep`: that searches the whole message per
+    // line, so `^<version>` also fires on a BODY line and an ordinary commit becomes the
+    // release boundary — silently truncating the entry (codex, #932).
+    const sha = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
+    if (sha) return sha;
   } catch {
     /* no release commit */
   }
   return git("rev-list --max-parents=0 HEAD").split(/\s+/)[0]; // first commit
 }
 
-/** A release commit, in either shape we actually produce: `release: 0.11.40`, or the
- *  squash-merge form GitHub writes from a PR titled with the bare version — `0.11.40 (#656)`.
- *  Only the first was recognised. */
-const isReleaseSubject = (s) => /^release:/i.test(s) || /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s);
+// The release-subject rules live in ./lib/changelog-match.mjs so the tests can import the
+// SHIPPED predicate. This file rewrites CHANGELOG.md at import time and so is untestable
+// directly — the first attempt at a test copied the predicate instead, and passed against
+// a copy while the real one stayed broken (#932).
 
 /** Parsed commits since `range`, newest-first, minus noise.
  *
