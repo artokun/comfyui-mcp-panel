@@ -147,6 +147,7 @@ import {
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
+import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
@@ -2531,7 +2532,7 @@ function establishedWorkflowReplyIdentity(wf) {
   return routingKey ? { routingKey, uuid } : null;
 }
 
-function activeWorkflowUuidForOpenReply(target) {
+function activeWorkflowUuidForOpenReply(target, activeSnapshot) {
   // Do not accept a workflow-service reference captured before workflow_open's
   // awaits: a reconnect can replace/rebind that service while the old instance
   // still reports `target` as active. Read the panel's CURRENT binding at reply
@@ -12605,10 +12606,46 @@ const GRAPH_TOOL_EXECUTORS = {
     // after another tab wins the active slot during any await above; publishing
     // its UUID then would let the MCP stamp a command for a different canvas.
     // Omission is deliberate: the MCP keeps its existing fence fail-closed.
-    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target);
+    // ONE observation, shared by the uuid decision and the binding report (codex).
+    // Reading the active workflow twice let a reply pair a uuid decided against one
+    // observation with binding fields decided against a later one — internally
+    // contradictory diagnostics, which is what this issue is about.
+    const liveActiveAtReply = (() => {
+      try {
+        return activeWorkflowRef();
+      } catch {
+        return null;
+      }
+    })();
+    const targetRoutingKeyAtReply = workflowTabId(target);
+    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target, liveActiveAtReply);
+    // #887 — report WHAT WAS OBSERVED to be active, beside what was requested.
+    //
+    // `opened` and `routing_key` both name the TARGET, and nothing in the reply said what
+    // the panel saw in the active slot. The orchestrator renders that as a flat assertion
+    // ("the canvas IS bound to X ... You are NOT on the wrong workflow") while
+    // panel_list_workflows can name a different workflow a moment later — and a Save-As
+    // taken on that assurance writes the LIVE canvas, not the one the caller believes.
+    //
+    // This does NOT close the window: a reply describes a moment, and the active workflow
+    // can change immediately after it is composed (measured — steal the active slot while
+    // an open is in flight and the target's uuid still ships, because at emission the
+    // target really WAS active). It makes the moment REPORTABLE, so a caller can compare
+    // rather than trust.
+    const openActiveBinding = describeOpenActiveBinding({
+      targetRoutingKey: targetRoutingKeyAtReply,
+      activeRoutingKey: (() => {
+        try {
+          return liveActiveAtReply ? workflowTabId(liveActiveAtReply) : null;
+        } catch {
+          return null; // unreadable -> `active_matches_target: null`, never a false mismatch
+        }
+      })(),
+    });
     return {
       opened: { path: target.path, filename: target.filename },
-      routing_key: workflowTabId(target),
+      routing_key: targetRoutingKeyAtReply,
+      ...openActiveBinding,
       ...(activeWorkflowUuid ? { workflow_uuid: activeWorkflowUuid } : {}),
       modified: !!target.isModified,
       // #402 — the receipt id for THIS open. Journaled in the panel, so if this reply
