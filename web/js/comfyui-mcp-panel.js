@@ -11355,11 +11355,13 @@ const GRAPH_TOOL_EXECUTORS = {
         // NOT paired with a claim about which builds are broken: this is one build
         // measured, and inventing a range from it is the #752 mistake exactly.
         `On ComfyUI_frontend 1.48.7 the positional argument shape DOES carry the ` +
-        `scope into the request — measured by capturing the outgoing body — so this ` +
-        `fallback is not expected on that build, and upgrading may be the shortest ` +
-        `fix. Which OTHER builds take which shape is not something the panel can ` +
-        `determine from inside one of them, so please report this build (#996), ` +
-        `including your ComfyUI_frontend version.`;
+        `scope into the request — measured by capturing the outgoing body, which ` +
+        `establishes that the request is built correctly there, not that a whole run ` +
+        `behaves differently — so this fallback is not expected on that build, and ` +
+        `trying ComfyUI_frontend 1.48.7 may be the quickest workaround. Which OTHER ` +
+        `builds take which shape is not something the panel can determine from inside ` +
+        `one of them, so please report this build (#996), including your ` +
+        `ComfyUI_frontend version.`;
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and

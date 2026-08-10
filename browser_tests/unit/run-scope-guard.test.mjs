@@ -905,12 +905,21 @@ test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED fr
   );
   assert.match(note, /measured by capturing the outgoing body/, "and how it was established");
   assert.match(note, /please report this build \(#996\)/, "the ask survives — one datum is not a diagnosis");
+  // The workaround must name the version that was actually measured. "upgrading may
+  // help" does not say to WHAT, and no 1.48.6→1.48.7 end-to-end result was taken
+  // (codex).
+  assert.match(note, /trying ComfyUI_frontend 1\.48\.7 may be the quickest workaround/i,
+    "the workaround names the measured build, not upgrading in general");
+  // And the datum is bounded to what capturing a request body can show.
+  assert.match(note, /establishes that the request is built correctly there, not that a whole run behaves differently/,
+    "serialization is not end-to-end behaviour, and the note says so");
   // #752's lesson, which this change sits one edit away from repeating: a version
   // RANGE is a claim about builds nobody here has measured. One build must not
-  // become one.
+  // become one. The first version of this guard missed "all 1.48.x builds" and
+  // "1.48.6 through 1.48.9" (codex), so it matches the SHAPES a range takes.
   assert.doesNotMatch(
     note,
-    /affects versions|all builds (before|after)|1\.4\d\s*-\s*1\.\d+/i,
+    /affects versions|all builds (before|after)|all 1\.\d+\.x|\d+\.\d+\.\d+\s*(-|–|through|to)\s*\d+\.\d+\.\d+|1\.4\d\s*-\s*1\.\d+/i,
     "one measured build must never be inflated into a range",
   );
 });
