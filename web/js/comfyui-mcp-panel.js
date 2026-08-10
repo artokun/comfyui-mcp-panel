@@ -157,6 +157,11 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
+import {
+  materializePromotedValues,
+  materializedValuesNote,
+  findDivergentPromotedValues,
+} from "./lib/unpack-promoted-values.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -13177,6 +13182,92 @@ const GRAPH_TOOL_EXECUTORS = {
       rollback = null; // couldn't snapshot — we'll still surface a clean error below
     }
     const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    // #979 — carry PROMOTED values inward BEFORE the unpack. `unpackSubgraph` inlines
+    // the INNER widget's value and drops the parent rail's, so a promoted widget the
+    // user set on the parent came back as whatever the inner node was created with —
+    // measured, and the reporter lost a long custom prompt to a pack's template
+    // default that way. #366 makes the rail authoritative (it is what serializes at
+    // queue time), so rail → inner is the direction that preserves what the graph
+    // would actually have rendered.
+    //
+    // Before, not after: unpack is DESTRUCTIVE, and once the subgraph is gone the
+    // rail is gone with it — there is nothing left to recover the value from.
+    // Never allowed to block the unpack the caller asked for; a failure here reduces
+    // what is carried and is reported.
+    //
+    // NO SNAPSHOT: the carry is only safe because a failed one can be erased by
+    // reloading the pre-carry workflow, so without a snapshot it is not attempted.
+    // But skipping it is NOT a free fallback (codex round 4) — it is exactly the data
+    // loss this change exists to stop, and after the unpack the rail is gone and a
+    // long prompt may exist nowhere at all. Snapshot failure must not re-authorize
+    // that. So a READ-ONLY preflight looks for divergence and refuses if it finds any;
+    // an unpack with nothing diverged proceeds exactly as before.
+    if (!rollback) {
+      const divergent = findDivergentPromotedValues(node, (sgNode, widgetName) =>
+        resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
+      );
+      if (divergent.length) {
+        throw new Error(
+          `unpack_subgraph refused: this workflow could not be snapshotted, so the promoted ` +
+            `value(s) ${divergent.map((d) => d.widget).join(", ")} cannot be carried into the inner ` +
+            `node(s) safely — and unpacking without carrying them would replace them with whatever ` +
+            `the inner nodes were created with, with no copy left anywhere (#979). Nothing was ` +
+            `changed. Set those values on the inner nodes first, or retry once the workflow can be ` +
+            `serialized.`,
+        );
+      }
+    }
+    let materialized = null;
+    let carryFailed = false;
+    if (rollback) {
+      try {
+        materialized = materializePromotedValues(node, (sgNode, widgetName) =>
+          resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
+        );
+        // `aborted` means the ITERATION came apart — earlier rails may already have
+        // been carried, so this is not a "no work done" outcome (codex final).
+        carryFailed = !!materialized?.aborted;
+      } catch {
+        // A throw ESCAPING the carry is the same situation and used to be the worst
+        // case: the record was discarded, so partial work became invisible, and the
+        // unpack proceeded anyway and destroyed the divergent values this exists to
+        // protect. It is now a refusal like any other unprovable state.
+        materialized = null;
+        carryFailed = true;
+      }
+    }
+    // #979 (codex round 2) — REFUSE to unpack when a carry could not be rolled back.
+    // A setter that normalizes the write and then also normalizes the restore leaves
+    // the widget holding a value that was in NEITHER the rail nor the inner. Unpacking
+    // over that would make a third, invented value permanent, which is worse than the
+    // data loss this whole change exists to stop. Restore the pre-carry workflow and
+    // report instead — the subgraph is still there, so nothing is lost.
+    if (carryFailed || materialized?.unrecoverable?.length) {
+      const names = materialized?.unrecoverable?.length
+        ? materialized.unrecoverable.map((u) => u.widget).join(", ")
+        : "(the carry failed before it could name them)";
+      let restored = false;
+      if (rollback && typeof app?.loadGraphData === "function") {
+        try {
+          const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+          await app.loadGraphData(...resolveLoadGraphArgs(rollback, activeWorkflow));
+          restored = true;
+        } catch {
+          restored = false;
+        }
+      }
+      throw new Error(
+        `unpack_subgraph refused: carrying the promoted value(s) ${names} into the inner ` +
+          `node(s) failed, and the value found beforehand could not be put back — the widget ` +
+          `now holds something that was in neither the parent nor the inner node. Unpacking ` +
+          `would make that permanent (#979). ` +
+          (restored
+            ? `The workflow was reloaded from its pre-unpack snapshot, so the subgraph and its ` +
+              `values are intact; nothing was destroyed.`
+            : `The pre-unpack snapshot could NOT be reloaded, so check those widget values before ` +
+              `doing anything else — the subgraph is still present and was not unpacked.`),
+      );
+    }
     // unpackSubgraph wraps its own beforeChange/afterChange for undo, so don't
     // nest another pair here.
     try {
@@ -13209,6 +13300,12 @@ const GRAPH_TOOL_EXECUTORS = {
         node_id,
         new_node_ids: newNodeIds,
         node_count: newNodeIds.length,
+        // #979 — disclose what was carried inward. An unpack cannot be undone from
+        // this result, so a caller checking values afterwards needs to know which
+        // ones this moved, and which widgets it could not match.
+        ...(materialized?.applied?.length ? { promoted_values_carried: materialized.applied } : {}),
+        ...(materialized?.unresolved?.length ? { promoted_values_unresolved: materialized.unresolved } : {}),
+        ...(materializedValuesNote(materialized) ? { promoted_values_note: materializedValuesNote(materialized) } : {}),
       },
     };
   },
