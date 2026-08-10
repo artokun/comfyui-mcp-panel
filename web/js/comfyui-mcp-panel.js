@@ -393,6 +393,7 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
+import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
 import { probeConsoleRoute, UNBUILT_ROUTE_TITLE } from "./lib/console-route-probe.js";
 import {
@@ -3386,6 +3387,10 @@ function panelSettingsList() {
             `backend: ${(getSetting(SETTING_BACKEND) ?? "claude")}`,
             `comfyui: ${window.app?.frontendVersion ?? window.app?.extensionManager?.appVersion ?? "unknown"}`,
             `page: ${location.origin}`,
+            // #584 — the one fact five rounds of fixes were guessing at. A user
+            // pasting diagnostics into an issue now brings the measurement with
+            // them instead of being asked to open DevTools afterwards.
+            describeModuleCache(readModuleCacheSummary()),
             `ua: ${navigator.userAgent}`,
             `time: ${new Date().toISOString()}`,
           ].join("\n");
@@ -28481,6 +28486,31 @@ async function healStaleBundleIfNeeded() {
     if (staleness === "current") {
       // A previous heal took — clear the marker so the NEXT update heals too.
       if (ssGet(BUNDLE_HEAL_KEY)) ssSet(BUNDLE_HEAL_KEY, null);
+      // #584 — "current" IS THE BLIND SPOT. This compares one number: the
+      // PANEL_VERSION of the module that happens to hold it. ComfyUI imports
+      // 112 of our modules independently, so a page can carry that constant
+      // fresh and its siblings stale, report `current`, heal nothing, and still
+      // refuse every write. That is the shape this issue keeps coming back
+      // with — a version check that looks healthy while the page does not
+      // behave like it.
+      //
+      // So when the version says current, ask the OTHER question: did these
+      // modules actually come off the wire? A healthy load is all-network and
+      // says nothing. Anything else is the datum five rounds of fixes have been
+      // missing, and it is stated once, at the moment it is observable.
+      try {
+        const cache = readModuleCacheSummary();
+        if (cache.verdict === "mixed" || cache.verdict === "all-cached") {
+          console.warn(
+            `[comfyui-mcp-panel] version reads CURRENT (${PANEL_VERSION}), but ${describeModuleCache(cache)} ` +
+              `If panel_* writes are being refused, quote this line in ` +
+              `https://github.com/artokun/comfyui-mcp-panel/issues/584 — it is the measurement that ` +
+              `issue is missing. A hard refresh (Ctrl+Shift+R) is the workaround.`,
+          );
+        }
+      } catch {
+        /* a diagnostic must never break startup */
+      }
       return;
     }
     if (staleness !== "stale") return;
