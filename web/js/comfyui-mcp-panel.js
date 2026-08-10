@@ -208,7 +208,7 @@ import {
   migratableRouteIds,
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
-import { describeMissingNode } from "./lib/node-scope-locator.js";
+import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
@@ -7177,6 +7177,22 @@ function resolveNode(graph, nodeId) {
   // instead of only that it is not here. Diagnostic-only: runs on the failure path,
   // never throws, and degrades to the original message when the root is unreadable.
   if (!node) {
+    // artokun/comfyui-mcp#1294 — ASK "WHAT IS IT" BEFORE ANSWERING "IT IS NOT HERE".
+    // panel_query_graph hands out `rails.<side>.rail_node_id` (e.g. -20). Fed back
+    // to a write, it used to be reported as an id from another workflow or a removed
+    // node, with a remedy of re-reading the surface that produced it. The id is
+    // neither missing nor foreign — it is a boundary rail, and `resolveRailNode`
+    // already resolves exactly this form for move_node (#302). Its real-node
+    // collision guard is what makes this safe here: a rail reference is only
+    // recognised once getNodeById has already declined the id.
+    let rail = null;
+    try {
+      rail = resolveRailNode(graph, nodeId);
+    } catch {
+      rail = null; // a diagnostic must never replace the failure with its own
+    }
+    if (rail) throw new Error(describeRailNodeTarget(nodeId, rail.rail));
+
     let rootGraph = null;
     let viewingRoot = true;
     try {
