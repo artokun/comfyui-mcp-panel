@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.91] - 2026-08-10
+
+> Covers changes since 0.11.90.
+
+### Changed
+
+- **"Run to node" falling back to a request repair now tells you a version that
+  works (#996).** When the panel runs a single branch, it asks ComfyUI to scope the
+  run. On some frontend builds that request never carries the scope, so the panel
+  writes it into the request itself and says so — a fallback that works, but one the
+  message asked you to report while giving you nothing to compare against.
+
+  It now carries one measured fact: on **ComfyUI frontend 1.48.7** the scope does
+  reach the request, so the fallback is not expected there and trying that build may
+  be the quickest workaround. That was established by capturing the outgoing request
+  on 1.48.7 — which shows the request is built correctly, not that a whole run
+  behaves differently, and the message says so rather than implying more.
+
+  It still does **not** claim which builds are affected. That is one build measured;
+  turning it into a version range would repeat a mistake this file has made before,
+  when a range covering builds nobody had tested told three reporters their own
+  evidence could not be happening.
+
+
 ## [0.11.90] - 2026-08-10
 
 > Covers changes since 0.11.89.
