@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.77] - 2026-08-09
+
+> Covers changes since 0.11.76. The first entry this generator produced correctly.
+
+### Fixed
+
+- **Generating a changelog no longer replays the entire history into one release
+  (#932).** Every entry was built from the first commit onward, so a release claimed
+  ~200 commits of already-shipped work as its own. Both release matchers had been
+  written for commit shapes this repo has never produced: the base search grepped for
+  `release:` / `chore(release):`, which matched nothing and fell through to
+  `rev-list --max-parents=0` — the root commit — and the predicate that keeps release
+  commits *out* of an entry required the version to be the whole subject, so releases
+  were written into the entries announcing them. Releases here read
+  `0.11.76 — <description> (#930) (#931)`, and now both rules key on a version at the
+  start of the subject.
+
+  The fix is deliberately not a `git log --grep`. `--grep` searches the whole commit
+  message and matches per line, so `^<version>` also fires on a *body* line — in this
+  repo's own history it selects 7521519, an ordinary `fix(subgraph):` commit, which
+  would have anchored a release on itself and silently truncated the entry. Subjects
+  are read from `%s` and matched in JS, by the same predicate the generator already
+  used, so there is one rule rather than two that can drift.
+
+  This was worked around by hand for all fourteen releases from 0.11.63 to 0.11.76.
+  A silent workaround is how a broken tool survives that long.
+
+
 ## [0.11.76] - 2026-08-09
 
 > Covers changes since 0.11.75.
