@@ -942,6 +942,9 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   assert.ok(pathSource && canonicalUuidSource && identitySource && helperSource, "the reply identity check must live in the shipped panel source");
 
@@ -959,7 +962,7 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${pathSource}; ${canonicalUuidSource}; ${rederiveSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => currentService.activeWorkflow,
     (wf) => workflowUuids.get(wf),
@@ -986,6 +989,9 @@ test("#716 P1: service rebind during workflow_list reports only the current acti
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const listActiveSource = namedFunctionSource(src, "liveWorkflowListActive");
   assert.ok(pathSource && canonicalUuidSource && identitySource && listActiveSource, "workflow_list must obtain its active identity through the shipped live-binding helper");
 
@@ -1025,6 +1031,9 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const malformedActive = {};
   const workflowUuids = new WeakMap();
@@ -1032,7 +1041,7 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${pathSource}; ${canonicalUuidSource}; ${rederiveSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => malformedActive,
     (wf) => workflowUuids.get(wf),
@@ -1077,6 +1086,9 @@ test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", (
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const temporaryActive = { isPersisted: false, isTemporary: true };
   const workflowUuids = new WeakMap([[temporaryActive, "33333333-3333-4333-8333-333333333333"]]);
@@ -1086,7 +1098,7 @@ test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", (
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${pathSource}; ${canonicalUuidSource}; ${rederiveSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     (wf) => workflowUuids.get(wf),
@@ -1109,6 +1121,9 @@ test("#760: an unsaved canvas with NO established uuid still publishes nothing (
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const unestablished = { isPersisted: false, isTemporary: true };
   let tabIdCalls = 0;
@@ -1117,7 +1132,7 @@ test("#760: an unsaved canvas with NO established uuid still publishes nothing (
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${pathSource}; ${canonicalUuidSource}; ${rederiveSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => unestablished,
     () => undefined, // never established
@@ -1139,6 +1154,9 @@ test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const temporaryActive = { isPersisted: false, isTemporary: true };
   const replyUuid = new Function(
@@ -1146,7 +1164,7 @@ test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${pathSource}; ${canonicalUuidSource}; ${rederiveSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     () => "tmp:not-a-uuid", // the ROUTING handle, wrongly offered as the uuid
@@ -1162,6 +1180,9 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
   const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  // #1001 — establishedWorkflowReplyIdentity now calls this, so the sandbox needs the
+  // REAL source rather than a stub: the guard exists to run shipped code.
+  const rederiveSource = namedFunctionSource(src, "rederiveSavedWorkflowIdentity");
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const invalidVersion = { isPersisted: true, isTemporary: false, path: "workflows/invalid-version.json" };
   const invalidVariant = { isPersisted: true, isTemporary: false, path: "workflows/invalid-variant.json" };
@@ -1176,7 +1197,7 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${pathSource}; ${canonicalUuidSource}; ${rederiveSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => active,
     (wf) => workflowUuids.get(wf),

@@ -2559,13 +2559,69 @@ function saveProducedIdentity(savedRecord, savedAs) {
   }
 }
 
+/**
+ * #1001 — RE-DERIVE a saved workflow's identity from its own path, for the case where
+ * the live-object map has lost it.
+ *
+ * A reconnect can REPLACE the active ComfyWorkflow object (the same succession the
+ * embedded-uuid fork rule at `workflowStableUuid` already accounts for). The successor
+ * is not in the live-object WeakMap, so `establishedWorkflowReplyIdentity` found nothing
+ * and the hello published no `workflow_uuid` — and with no identity to fence against,
+ * every mutating command was refused while reads kept working. That is the reported
+ * wedge, and the reporter's own recovery was `panel_open_workflow` on the workflow that
+ * was ALREADY active: the open mints through `workflowStableUuid`, which seeds the map.
+ * So the identity was derivable at the exact moment it went missing.
+ *
+ * ADOPTION, NOT MINTING, and the distinction is the whole safety argument (#716). This
+ * returns an identity ONLY when one was already established for this exact saved file
+ * and recorded in the persisted path→uuid alias map. A workflow with no path, or a path
+ * nothing was ever established for, still yields null — the fence stays fail-closed and
+ * the caller is told to open. It cannot invent an identity for a canvas the panel has
+ * never seen.
+ *
+ * The live-owner check is what stops it handing the same identity to two objects: if
+ * another OPEN workflow still owns that uuid, this object is a co-open copy rather than
+ * a successor, and adopting would let commands stamped for one canvas pass against the
+ * other.
+ */
+function rederiveSavedWorkflowIdentity(wf) {
+  try {
+    const path = savedWorkflowPath(wf);
+    // Stated for the reader, not for the machine: an unsaved workflow has no path, and
+    // `workflowAliasForPath(_, null)` already returns null, so deleting this line
+    // changes no result (verified by mutation). It is kept because "only a SAVED
+    // workflow is re-derivable" is the rule, and a rule that lives only in the
+    // behaviour of a helper two calls away is one a later edit will not notice.
+    if (!path) return null;
+    const alias = workflowAliasForPath(_workflowUuidAliases, path);
+    if (!isCanonicalWorkflowInstanceUuid(alias)) return null;
+    const owner = workflowUuidOwner(alias);
+    if (owner != null && !sameWorkflowObject(owner, wf)) {
+      // Proxy-safe, like every other owner comparison in this file (#558 r2).
+      const open = app?.extensionManager?.workflow?.openWorkflows;
+      const ownerStillOpen = Array.isArray(open) && open.some((w) => sameWorkflowObject(w, owner));
+      if (ownerStillOpen) return null;
+    }
+    setWorkflowObjectUuid(wf, alias);
+    rememberWorkflowUuidOwner(alias, wf);
+    return alias;
+  } catch {
+    // An identity that cannot be re-derived is the state this function was called in.
+    return null;
+  }
+}
+
 function establishedWorkflowReplyIdentity(wf) {
   if (!wf || typeof wf !== "object") return null;
   // THE ESTABLISHMENT TEST, and the only one that matters here (#716): the uuid
   // must ALREADY be in the live-object map. workflowObjectUuid() is a pure read —
   // it never mints — so a reply still cannot initialize an identity. Everything
   // below runs only for an object the panel has already established.
-  const uuid = workflowObjectUuid(wf);
+  //
+  // #1001 — with ONE addition, which is still not minting: a SAVED workflow whose
+  // object lost its entry (a reconnect replaced the object) re-derives the identity
+  // already recorded for that path. See rederiveSavedWorkflowIdentity.
+  const uuid = workflowObjectUuid(wf) ?? rederiveSavedWorkflowIdentity(wf);
   if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
   const savedPath = savedWorkflowPath(wf);
   // #640 — the SHARED spelling of the handle format, not a second local one.
