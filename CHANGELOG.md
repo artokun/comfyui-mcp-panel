@@ -6,6 +6,36 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.94] - 2026-08-10
+
+> Covers changes since 0.11.93.
+
+### Added
+
+- **"Run to node" with a batch now warns that your seed will not change (#988).**
+  Someone ran `panel_run` with `to_node_id` and `batch_count: 3` on a workflow whose
+  KSampler was set to randomize. Three prompts were accepted; the first took 22
+  seconds and the rest finished in about a fifth of a second, returning the same file
+  and the same image.
+
+  Every item used the same seed. Measured by comparing the actual requests: an
+  unscoped batch of three sends three different seeds, and a scoped batch of three
+  sends the same seed three times. ComfyUI does not advance `control_after_generate`
+  between the items of a *partial* execution — which is what running to a node is —
+  so the later prompts are duplicates it answers from cache. Checked in both of
+  ComfyUI's widget-control modes, and it happens in both.
+
+  The panel now says so when you queue that combination: which controls will repeat,
+  why, and the two things that do work — `batch_count: 1` several times setting the
+  value yourself, or dropping `to_node_id` so the run is unscoped.
+
+  **It does not silently change your seeds.** Doing that would mean re-implementing
+  ComfyUI's own widget behaviour — randomize, increment and decrement all differ, each
+  with its own range — on the one path where the panel already has to patch the
+  request. The warning also says what it cannot know: it lists every such control in
+  the workflow, because it cannot tell which ones a scoped run actually reaches.
+
+
 ## [0.11.93] - 2026-08-10
 
 > Covers changes since 0.11.92.
