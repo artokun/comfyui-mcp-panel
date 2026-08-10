@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.71] - 2026-08-09
+
+> Covers changes since 0.11.70.
+
+### Fixed
+
+- **Saving a subgraph under a name you've already used is caught again (#636).** The
+  panel refuses to save a reusable subgraph over an existing one, because replacing it
+  needs ComfyUI's own confirmation dialog — which an agent has no way to answer. On
+  current ComfyUI that check had stopped working: blueprints are now stored under a
+  generated id rather than the name you gave them, so the panel was comparing your name
+  against an id it could never equal, and saw no clash at all.
+
+  It now also compares the name shown in the library, which is where your name actually
+  lives. Older ComfyUI versions that store blueprints by name are unaffected, and a
+  different subgraph is still not treated as a clash.
+
+  Updating an existing saved subgraph is still not possible from the agent — that half
+  of the report is open.
+
 ## [0.11.70] - 2026-08-09
 
 > Covers changes since 0.11.69.
