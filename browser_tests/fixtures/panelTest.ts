@@ -9,9 +9,10 @@
  * A typical spec: point the panel at `mockBridge.url`, open the sidebar, connect,
  * then drive the conversation via the MockBridge helpers.
  */
-import type { Page } from '@playwright/test'
+import type { BrowserContext, Page } from '@playwright/test'
 import { test as base } from '@playwright/test'
 
+import { deleteWorkflowByPath } from '../global-workflow-litter'
 import { MockBridge } from './MockBridge'
 import { PanelPage } from './PanelPage'
 
@@ -105,6 +106,55 @@ export async function isolatePanelPage(page: Page, panelFlags: string[] = []) {
   await applyPanelRouteStubs(page, panelFlags)
 }
 
+/**
+ * Record every workflow file a test WRITES, so the fixture deletes exactly those (#907).
+ *
+ * The leaks left after 0.11.79 were not `workflow_save` — converted to an owned
+ * `cmcp-e2e-*` name — and not `workflow_new`, which persists nothing. They are GROUNDING
+ * (#330): the panel auto-saves an unsaved workflow before a turn, so any spec that calls
+ * `sendMessage` silently creates `Untitled <date> <time>.json`. Measured:
+ *
+ *   before  workflows/Unsaved Workflow.json
+ *   after   workflows/Untitled 2026-08-09 22-51-44.json   persisted: true
+ *
+ * Which is why auditing the save TOOLS never found it — nothing in those specs asks to save.
+ *
+ * OWNERSHIP IS OBSERVED, NOT INFERRED, and that is what makes this safe where name-matching
+ * was not. `Untitled <date> <time>` is also what ComfyUI names a developer's own unnamed
+ * save, so a cleanup keyed on that pattern could delete their file (codex refused exactly
+ * that on #940). This records the requests this test's own browser context actually issued.
+ *
+ * Recorded in the TEST PROCESS rather than in the page, and both page-side attempts that
+ * failed are worth keeping: a window array is wiped by `addInitScript` re-running on every
+ * navigation, and sessionStorage dies with the page — a spec calling `pageB.close()` takes
+ * its record with it, which was the last leak left in a full suite run.
+ */
+function recordWorkflowWrites(context: BrowserContext, sink: Set<string>) {
+  context.on('request', (request) => {
+    try {
+      const method = request.method().toUpperCase()
+      if (method === 'GET' || method === 'HEAD') return
+      const m = /\/userdata\/([^?]+)/.exec(request.url())
+      if (!m) return
+      const decoded = decodeURIComponent(m[1])
+      if (/^workflows\//.test(decoded) && /\.json$/i.test(decoded)) sink.add(decoded)
+    } catch {
+      // Never let bookkeeping interfere with the request under test.
+    }
+  })
+}
+
+/** Delete what this test wrote. Best-effort: a cleanup failure must never mask a real one. */
+async function cleanupRecordedWorkflowWrites(sink: Set<string>) {
+  for (const userdataPath of sink) {
+    try {
+      await deleteWorkflowByPath(userdataPath)
+    } catch {
+      // The suite-level sweep still reports anything left behind.
+    }
+  }
+}
+
 export const test = base.extend<PanelFixtures & PanelOptions>({
   panelFlags: [[], { option: true }],
   mockBridge: async ({}, use) => {
@@ -115,7 +165,13 @@ export const test = base.extend<PanelFixtures & PanelOptions>({
   },
   panel: async ({ page, panelFlags }, use) => {
     await applyPanelRouteStubs(page, panelFlags)
+    // #907 — record before anything loads, clean up after the test whatever it ends up
+    // being. Runs on FAILURE too, which per-spec cleanup at the end of a test body never
+    // did — and a failing test is exactly when a spec is most likely to have left a file.
+    const wrote = new Set<string>()
+    recordWorkflowWrites(page.context(), wrote)
     await use(new PanelPage(page))
+    await cleanupRecordedWorkflowWrites(wrote)
   }
 })
 
@@ -151,6 +207,11 @@ export async function deleteSavedWorkflow(page: Page, workflowName: string): Pro
       // fetchApi RESOLVES on an HTTP error, so the status has to be read (codex) —
       // otherwise a 500 leaves litter and looks exactly like success.
       const res = await api.fetchApi(`/userdata/${encodeURIComponent(path)}`, { method: 'DELETE' })
+      // 404 IS success: the file is gone, which is the whole objective. It happens
+      // routinely now that the fixture also sweeps what the page wrote — a spec that
+      // cleaned up after itself is then asked a second time. Warning on it trains readers
+      // to ignore the warning, which is worse than not printing it.
+      if (res?.status === 404) return 'ok'
       return res?.ok ? 'ok' : `HTTP ${res?.status ?? '?'}`
     }, `workflows/${name}.json`)
   } catch (err) {

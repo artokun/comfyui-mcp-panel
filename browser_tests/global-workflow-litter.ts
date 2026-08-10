@@ -193,3 +193,22 @@ export async function cleanWorkflowLitter(): Promise<void> {
     )
   }
 }
+
+/**
+ * Delete one workflow by its userdata path (#907), straight over HTTP.
+ *
+ * Exported so the per-test fixture can sweep what a page WROTE even after that page has
+ * been closed — a spec that calls `pageB.close()` takes its in-page record with it, and
+ * the last leak of a full suite run was exactly that. A 404 is success: the file is gone,
+ * which is the objective.
+ */
+export async function deleteWorkflowByPath(userdataPath: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BASE_URL}/api/userdata/${encodeURIComponent(userdataPath)}`, {
+      method: "DELETE",
+    })
+    return res.ok || res.status === 404
+  } catch {
+    return false
+  }
+}
