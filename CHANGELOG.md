@@ -6,6 +6,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.72] - 2026-08-09
+
+> Covers changes since 0.11.71.
+
+### Fixed
+
+- **You can add a saved subgraph by the name you see in the library (#636).** Asking for
+  one by its name failed with *"No saved subgraph blueprint"*, because current ComfyUI
+  stores them under a generated id and the panel only looked for that. The name shown in
+  the library — the only one you'd think to use — was the one thing that didn't work,
+  while the unreadable id did.
+
+  It now accepts either. The id is still tried first, so nothing that already worked
+  changes.
+
+  If two saved subgraphs share the same library name, it says so and asks for the id
+  instead of picking one. Adding the wrong graph quietly is worse than being asked to be
+  specific. And if the lookup itself fails, the error says that rather than claiming you
+  never saved it.
+
+  Same cause as the name-clash fix in 0.11.71. Updating an existing saved subgraph is
+  still not possible from the agent — that part of the report remains open.
+
 ## [0.11.71] - 2026-08-09
 
 > Covers changes since 0.11.70.
