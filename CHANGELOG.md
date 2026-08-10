@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.78] - 2026-08-09
+
+### Fixed
+- make the tab measure its own module cache instead of asking for DevTools (#934)
+
+
 ## [0.11.77] - 2026-08-09
 
 > Covers changes since 0.11.76. The first entry this generator produced correctly.
