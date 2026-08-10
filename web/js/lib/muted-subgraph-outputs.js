@@ -18,20 +18,29 @@
  * it. What it CAN do is stop being silent about it — which is the actual reported
  * harm, since the run reported success while doing something no one asked for.
  *
- * The check is a MEASUREMENT, never a reimplementation of ComfyUI's rules: it names
- * the outputs that have a disabled ancestor AND are present in a prompt the server
- * ACCEPTED. If a future frontend excludes them properly, the intersection is empty
- * and the panel says nothing — no version sniffing, nothing to un-teach later.
+ * WHY THIS READS THE GRAPH AND NOT A PROMPT (codex rounds 2-5, four rejected designs):
  *
- * What the caller may NOT conclude from these, and what the note therefore does not
- * say (codex rounds 2-4):
- *   - that a given prompt belonged to the panel_run that observed it. An unscoped
- *     run has no queue mark, and a concurrent queue action from the UI or another
- *     extension posts through the same window.
- *   - that these nodes will FINISH. An accepted execution root can be interrupted,
- *     fail at runtime, or be served from cache.
- * What IS established: they are execution ROOTS rather than dependencies, so nothing
- * else has to reference them for them to execute.
+ * The obvious version intersects "output under a disabled ancestor" with the prompt
+ * that was actually queued, so a build which excludes them correctly stays silent.
+ * Every way of getting that prompt failed:
+ *   - a second `app.graphToPrompt()` compiles a DIFFERENT prompt from the one sent,
+ *     and is not read-only (it runs virtual-node applyToGraph and every widget's
+ *     serializeValue);
+ *   - reading the outgoing POST body fixes that, but an UNSCOPED run carries no queue
+ *     mark, so a concurrent post from the UI or another extension is indistinguishable
+ *     from this run's. A foreign workflow whose keys collide (`5:4:3` is not rare)
+ *     would then be reported as containing THIS graph's muted outputs — a false
+ *     statement about someone else's prompt, which no `ownership: "unknown"` field
+ *     repairs.
+ *
+ * So the claim is made about the thing that CAN be established: the live graph. The
+ * cost is honest and stated in the note — on a build that fixes nested wrapper modes
+ * this warns about a run that was fine. That direction over-warns; the alternative
+ * asserts something false. This issue exists because a wrong quiet answer cost the
+ * reporter 18 minutes, so the bias goes toward saying too much.
+ *
+ * `disabledOutputsInPrompt` remains exported: it is how the browser measurement above
+ * was taken, and how anyone re-measuring on another build should check it.
  */
 
 /** LiteGraph node modes that mean "do not execute this node". */
@@ -46,16 +55,14 @@ export function disabledModeName(mode) {
 }
 
 /**
- * Walk every graph level, depth-first, and return one entry per node that has at
- * least one disabled (muted/bypassed) subgraph wrapper among its ancestors.
+ * Walk every graph level, depth-first, and return one entry per OUTPUT node that has
+ * at least one disabled (muted/bypassed) subgraph wrapper among its ancestors.
  *
  * `exec_id` is the colon-joined chain of wrapper ids ending in the node's own id —
  * the same NodeExecutionId ComfyUI's flattened prompt uses as its key ("5:4:3"), and
  * the same shape run-to-node already targets.
  *
- * This deliberately does NOT filter to "output nodes": see the note at the leaf.
- * The caller intersects with the prompt that was actually submitted, and that is the
- * only thing entitled to decide what runs.
+ * Filtered to OUTPUT nodes — the execution roots. See the note at the leaf.
  *
  * Fully defensive: a malformed node, a subgraph cycle, or a missing `_nodes` array
  * yields fewer entries, never a throw — a diagnostic must not be able to take down
@@ -130,12 +137,12 @@ export function collectDisabledAncestorOutputs(rootGraph) {
 }
 
 /**
- * Of the outputs with a disabled ancestor, the ones ComfyUI actually put in the
- * compiled prompt — i.e. the ones that really are about to run.
+ * Of the outputs with a disabled ancestor, the ones present in a compiled prompt.
  *
- * This intersection is the whole point: it reports the DEFECT, not the rule. An
- * output correctly excluded by prompt construction never appears here, so a frontend
- * that honours nested wrapper modes silences this automatically.
+ * Kept because it is the exact predicate the browser measurement used, and it is how
+ * anyone re-measuring this on another build should check it: compile a prompt for the
+ * graph and intersect. It is deliberately NOT wired into `panel_run` — see the module
+ * header for why no prompt available at run time can be attributed safely.
  */
 export function disabledOutputsInPrompt(promptOutput, disabledOutputs) {
   if (!promptOutput || typeof promptOutput !== "object" || !Array.isArray(disabledOutputs)) return [];
@@ -162,21 +169,19 @@ export function disabledOutputsNote(offenders) {
   // — or could have — is false). The remedy is therefore interruption, and the
   // scoped re-run, not a promise.
   return (
-    `IN AN ACCEPTED PROMPT: ${n} OUTPUT node${n === 1 ? "" : "s"} inside a ${states.join("/")} ` +
-    `subgraph ${n === 1 ? "is" : "are"} an execution root in a prompt the server accepted ` +
-    `during this run's queue call — ${which}${more}. Read from the request body itself, not ` +
-    `re-derived. Two things are deliberately NOT claimed: that this panel_run posted that ` +
-    `prompt (a concurrent queue action from the UI or another extension goes through the ` +
-    `same window, and there is no mark on an unscoped run to tell them apart), and that ` +
-    `these nodes will finish — an accepted root can still be interrupted, fail, or be ` +
-    `served from cache. What IS established is that they are roots rather than dependencies, ` +
-    `so nothing else has to reference them for them to execute. On the build measured for ` +
-    `this (ComfyUI 0.31.1 / frontend 1.48.7) a subgraph wrapper's mute/bypass is applied ` +
-    `only at the TOP level of the workflow and a wrapper nested inside another subgraph is ` +
-    `ignored; whether other builds differ has not been measured here. A whole-graph run ` +
-    `hands prompt construction to ComfyUI, so the panel did not build this prompt and does ` +
-    `not silently rewrite what you asked to run — it reports it. Check the queue now: ` +
-    `interrupt if this is not what you intended, then render just the branch you want with ` +
-    `panel_run's to_node_id, which scopes execution correctly.`
+    `${n} OUTPUT node${n === 1 ? "" : "s"} inside a ${states.join("/")} subgraph ${n === 1 ? "is" : "are"} ` +
+      `an execution root in this workflow — ${which}${more}. On the build measured for this ` +
+      `(ComfyUI 0.31.1 / frontend 1.48.7) a subgraph wrapper’s mute/bypass is applied only at the ` +
+      `TOP level of a workflow: a wrapper nested inside another subgraph is IGNORED, so these ` +
+      `rendered anyway. That is what #985 reports — one active source subgraph and two muted, ` +
+      `all three rendered, 18m44s.` +
+      ` This is read from the GRAPH, not from the prompt that was queued, and it says so because ` +
+      `the difference matters: on a build that applies nested wrapper modes correctly, this ` +
+      `warns about a run that was fine. It is deliberately biased that way — a whole-graph run ` +
+      `hands prompt construction to ComfyUI, the panel neither builds nor rewrites it, and a ` +
+      `wrong QUIET answer is what made this expensive. Verify against your own build by ` +
+      `compiling a prompt and checking whether these ids are in it.` +
+      ` Check the queue: interrupt if this is not what you intended, then render just the branch ` +
+      `you want with panel_run’s to_node_id, which scopes execution correctly.`
   );
 }

@@ -11110,12 +11110,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
     let runScopeResult = null;
-    // #985 — every ACCEPTED /prompt body observed during this run's queue call.
-    // Not just the first (codex NO-SHIP round 2): with batch>1 each repetition posts
-    // its own body, queue-time hooks can change later ones, and "the first is
-    // representative" is a guess, not an invariant. Keyed by prompt_id so a batch is
-    // covered and duplicates cannot inflate the count.
-    const submittedPrompts = new Map();
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -11152,16 +11146,6 @@ const GRAPH_TOOL_EXECUTORS = {
           // #985 — keep each prompt AS SUBMITTED AND ACCEPTED. Re-deriving one
           // afterwards with a second app.graphToPrompt() would describe a different
           // compilation than the one ComfyUI accepted, and that call is not read-only.
-          // The structural walk is taken BESIDE THE BODY, before the request is
-          // awaited (codex NO-SHIP rounds 3 and 4). Two separate races close here:
-          // ComfyUI's afterQueued hooks run before the queue loop returns and can
-          // change a wrapper's mode, and the graph can be edited by the user or an
-          // extension while the POST is in flight. Either way a walk taken later
-          // would be paired with a body serialized from a different graph.
-          snapshotOnSubmit: () => collectDisabledAncestorOutputs(rootGraph),
-          onPromptBody: (prompt, promptId, structural) => {
-            submittedPrompts.set(String(promptId), { prompt, structural: structural ?? [] });
-          },
         });
       }
       try {
@@ -11389,35 +11373,22 @@ const GRAPH_TOOL_EXECUTORS = {
     //
     // Scoped runs are exempt: partial_execution_targets already names the roots,
     // and the reporter verified that path scopes correctly.
-    if (!partialTargets && submittedPrompts.size) {
+    if (!partialTargets) {
       try {
-        // Intersect "structurally under a disabled ancestor" with the prompts THIS
-        // RUN ACTUALLY SUBMITTED AND HAD ACCEPTED. That intersection reports the
-        // defect rather than reimplementing ComfyUI's rules: a wrapper mode ComfyUI
-        // honoured (measured: the top-level one) keeps its outputs out of the body,
-        // so nothing is reported, and a build that fixes nested wrappers silences
-        // this by itself.
+        // Read from the LIVE GRAPH, not from any prompt (codex rounds 2-5). Every
+        // way of obtaining the queued prompt failed: a second app.graphToPrompt()
+        // compiles a different one and is not read-only, and the outgoing POST body
+        // cannot be attributed on an UNSCOPED run — it carries no queue mark, so a
+        // concurrent post from the UI or another extension whose keys happen to
+        // collide would be reported as containing THIS graph’s muted outputs.
         //
-        // Every accepted body in the batch is checked, and offenders are merged by
-        // exec id: one offending output is one finding however many repetitions
-        // carried it, and a repetition that differs is not missed.
-        const merged = new Map();
-        for (const { prompt, structural } of submittedPrompts.values()) {
-          for (const o of disabledOutputsInPrompt(prompt, structural)) merged.set(o.exec_id, o);
-        }
-        const offenders = [...merged.values()];
+        // The trade is stated in the note rather than hidden: on a build that
+        // applies nested wrapper modes correctly this warns about a run that was
+        // fine. Over-warning is the safe direction here — a wrong QUIET answer is
+        // what cost the reporter 18 minutes.
+        const offenders = collectDisabledAncestorOutputs(rootGraph);
         if (offenders.length) {
-          // OWNERSHIP-NEUTRAL throughout (codex NO-SHIP round 3). The unscoped
-          // interceptor cannot prove a body was THIS run's rather than a concurrent
-          // queue action from the UI or another extension, so nothing here says
-          // "this run queued these". What IS established: these prompts were
-          // accepted by the server during this run's queue call, and these output
-          // nodes are execution roots inside a muted/bypassed subgraph in them.
-          // Naming the field after the observation rather than after the run is the
-          // difference between a report and a false accusation.
-          accept.disabled_outputs_in_accepted_prompts = offenders;
-          accept.disabled_outputs_prompts_inspected = submittedPrompts.size;
-          accept.disabled_outputs_ownership = "unknown";
+          accept.disabled_outputs_in_graph = offenders;
           accept.disabled_outputs_note = disabledOutputsNote(offenders);
         }
       } catch {
@@ -18430,15 +18401,15 @@ function describeCommand(cmd, msg, reply) {
             // the renders. The count goes in the LABEL: this warning is worthless if
             // it only exists in a payload field, since the whole failure was being
             // silent about it. Ownership is NOT asserted — see the result fields.
-            icon: r.disabled_outputs_in_accepted_prompts?.length ? "pi-exclamation-triangle" : "pi-play",
+            icon: r.disabled_outputs_in_graph?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
               `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
               (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : "") +
               // Ownership-neutral here too: the label says what was OBSERVED in an
               // accepted prompt, not that this run queued it. A concurrent queue
               // action would otherwise be reported as this run's doing.
-              (r.disabled_outputs_in_accepted_prompts?.length
-                ? ` — WARNING: ${r.disabled_outputs_in_accepted_prompts.length} output${r.disabled_outputs_in_accepted_prompts.length === 1 ? "" : "s"} inside muted/bypassed subgraphs found in an accepted prompt`
+              (r.disabled_outputs_in_graph?.length
+                ? ` — WARNING: ${r.disabled_outputs_in_graph.length} output${r.disabled_outputs_in_graph.length === 1 ? "" : "s"} inside muted/bypassed subgraphs are execution roots in this workflow`
                 : ""),
             ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }

@@ -213,21 +213,20 @@ test("#985 disabledModeName classifies exactly the two disabled modes", () => {
   for (const m of [0, 1, 3, undefined, null, "2"]) assert.equal(disabledModeName(m), null);
 });
 
-test("#985 the note leads with the outcome, names the remedy, and never blames the panel's own run", () => {
+test("#985 the note states the trade it makes, and claims nothing about a queued prompt", () => {
   const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE));
   const note = disabledOutputsNote(found);
-  assert.match(note, /^IN AN ACCEPTED PROMPT/, "states the observation, not an ownership claim");
-  assert.match(note, /5:4:3/, "names the offending node");
+  assert.match(note, /5:4:3/, "names the offending output");
   assert.match(note, /to_node_id/, "the workaround the reporter verified");
-  assert.match(note, /interrupt if this is not what you intended/, "the only remedy that still saves GPU time");
-  assert.match(note, /NOT claimed/, "names what it is not asserting");
-  assert.doesNotMatch(note, /this run submitted|will run anyway/, "codex r3: no ownership claim, no completion promise");
-  // codex NO-SHIP: the note is read AFTER the POST, so any wording implying the
-  // panel prevented this — or could have — is false.
-  assert.doesNotMatch(note, /will be prevented|blocked|refused|stopped/i, "claims no prevention it did not perform");
-  // And it must not state one measured build's behaviour as timeless fact.
-  assert.match(note, /0\.31\.1|1\.48\.7/, "attributes the behaviour to the build it was measured on");
-  assert.match(note, /has not\s+been measured here/, "and says the limit of that evidence");
+  assert.match(note, /interrupt if this is not what you intended/, "the remedy that still saves GPU time");
+  // codex rounds 2-5: this is derived from the GRAPH. It must not describe itself as a
+  // fact about the prompt that was queued — no prompt available to an unscoped run can
+  // be attributed to that run, and claiming otherwise can describe a FOREIGN workflow.
+  assert.match(note, /read from the GRAPH, not from the prompt that was queued/);
+  assert.doesNotMatch(note, /ALREADY QUEUED|this run submitted|accepted prompt/i);
+  // And it must own the cost of that choice rather than hide it.
+  assert.match(note, /warns about a run that was fine/, "states the over-warning it can do");
+  assert.match(note, /0.31.1|1.48.7/, "attributes the behaviour to the build measured");
   assert.equal(disabledOutputsNote([]), "", "silent when there is nothing to say");
   assert.equal(disabledOutputsNote(null), "");
 });
