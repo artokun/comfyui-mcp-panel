@@ -16,6 +16,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { fetchNodeDefsWithRetry } from "../../web/js/lib/object-info-retry.js";
 
+/** #716 — records invalidate() calls so a test can assert the refresh drops the cache. */
+let cacheInvalidations = 0;
+const cacheSpy = { invalidate: () => { cacheInvalidations += 1; }, read: async (f) => f() };
+
 import {
   describeNodeDefRefresh,
   NODE_DEF_REFRESH_REASONS,
@@ -352,6 +356,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
     "fetchNodeDefsWithRetry",
+    "objectInfoCache",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
@@ -364,6 +369,9 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     describeNodeDefRefresh,
     // No real waiting: the delays are the shipped ones, the sleep is not.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #716 — the shipping function drops the widget-write burst cache after a successful
+    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
+    cacheSpy,
   );
 }
 
@@ -474,6 +482,7 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
     "fetchNodeDefsWithRetry",
+    "objectInfoCache",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs };`,
@@ -494,6 +503,9 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     describeNodeDefRefresh,
     // No real waiting: the shipped delays, an instant sleep.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #716 — the shipping function drops the widget-write burst cache after a successful
+    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
+    cacheSpy,
   );
   const verdict = await registerWithThrowingRecorder(undefined);
   assert.equal(verdict.reason, "register_failed");
@@ -530,6 +542,7 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
     "fetchNodeDefsWithRetry",
+    "objectInfoCache",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
@@ -548,6 +561,9 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     describeNodeDefRefresh,
     // No real waiting: the shipped delays, an instant sleep.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #716 — the shipping function drops the widget-write burst cache after a successful
+    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
+    cacheSpy,
   );
   const verdict = await registerComfyNodeDefs(undefined);
   assert.equal(verdict.refreshed, false);
@@ -593,4 +609,19 @@ test("#954: a persistent getNodeDefs throw still reports the fetch failure it al
   assert.equal(verdict.reason, "object_info_fetch_failed");
   assert.match(String(verdict.detail ?? ""), /Failed to fetch/);
   assert.equal(calls, 3, "bounded — it does not retry forever");
+});
+
+test("#716: a successful refresh DROPS the widget-write burst cache", async () => {
+  // The TTL is only safe because anything that knows the schema moved drops the entry.
+  // A refresh is exactly that event — it runs on refresh_nodes, on a completed install and
+  // on reconnect. Without this the next widget write would be authorized against a map
+  // taken before the very change that prompted the refresh.
+  const before = cacheInvalidations;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true);
+  assert.equal(cacheInvalidations, before + 1, "the burst cache must be dropped by a refresh");
 });

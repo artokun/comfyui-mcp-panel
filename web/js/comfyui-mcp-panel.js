@@ -160,6 +160,7 @@ import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
+import { createObjectInfoCache } from "./lib/object-info-cache.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -648,6 +649,8 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 // registerComfyNodeDefs: any observation taken after an unobserved window cannot support
 // the "never backend-defined this session" claim a baseline makes.
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
+// #716 — one /object_info per BURST of widget writes, instead of one per write.
+const objectInfoCache = createObjectInfoCache();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -762,6 +765,12 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // (A throw here is attributed to "record": the fetch itself already succeeded,
     // and registration has not been attempted yet — the verdict must not claim it.)
     phase = "record";
+    // #716 — this run just fetched an AUTHORITATIVE payload, and it runs on exactly the
+    // events that change the schema: refresh_nodes, a completed install/download, and
+    // reconnect. Drop the burst cache so the next widget write sees this reality rather
+    // than a copy taken before it. A cache that could only expire on time would serve a
+    // stale map immediately after the one event most likely to have changed it.
+    objectInfoCache.invalidate();
     recordObjectInfoTypes(defs);
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
@@ -10144,7 +10153,15 @@ const GRAPH_TOOL_EXECUTORS = {
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
+          typeof api?.getNodeDefs === "function"
+            ? // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
+              // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
+              // Still the WHOLE payload, so no question this fence asks changes scope —
+              // only how often it is re-fetched. Dropped by anything that knows the schema
+              // moved. See lib/object-info-cache.js for why the per-class route #767 used
+              // for add_node is NOT safe here.
+              await objectInfoCache.read(() => api.getNodeDefs())
+            : null,
         ),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
