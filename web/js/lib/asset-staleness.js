@@ -528,7 +528,13 @@ export function graphErrorsResultIsClean(result) {
     !len(result.missing_models) &&
     !len(result.missing_media) &&
     !len(result.missing_node_types) &&
-    !(Number(result.missing_node_count) > 0)
+    !(Number(result.missing_node_count) > 0) &&
+    // #984 — the #745 LIVE scan was added to the payload after this helper was
+    // written and never folded in, so a result carrying `unavailable_widget_values`
+    // was still labelled "Checked errors — none". Every entry there is a widget
+    // value the server does not offer (a file it does not have, or a value outside
+    // the options it publishes) — the node fails on it at queue time either way.
+    !len(result.unavailable_widget_values)
   );
 }
 

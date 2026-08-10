@@ -7,6 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   findNodeByScopedId,
@@ -785,6 +786,69 @@ test("graphErrorsResultIsClean: FALSE for missing_models / missing_media / missi
   assert.equal(graphErrorsResultIsClean({ missing_models: [{ file: "x.safetensors" }] }), false);
   assert.equal(graphErrorsResultIsClean({ missing_media: [{ file: "in.png" }] }), false);
   assert.equal(graphErrorsResultIsClean({ missing_node_count: 2 }), false);
+});
+
+test("graphErrorsResultIsClean: FALSE for an unavailable_widget_values-ONLY result (#984)", () => {
+  // Measured on a live install before the fix: a CheckpointLoader whose `config_name`
+  // named an absent models/configs .yaml. No missing-MODEL store adjudicates that
+  // folder, so every load-time surface was empty while the #745 live scan found it —
+  // and the payload carried the finding AND "Checked errors — none".
+  assert.equal(
+    graphErrorsResultIsClean({
+      errored_count: 0,
+      node_errors: null,
+      last_execution_error: null,
+      unavailable_widget_values: [
+        {
+          id: 1,
+          type: "CheckpointLoader",
+          widget: "config_name",
+          value: "totally_absent_config.yaml",
+          kind: "missing_asset",
+        },
+      ],
+    }),
+    false,
+  );
+  // The other kind the scan reports is just as fatal at queue time — a value outside
+  // the options the server publishes — so it must not be treated as cosmetic either.
+  assert.equal(
+    graphErrorsResultIsClean({
+      unavailable_widget_values: [{ id: 2, widget: "sampler_name", value: "nope", kind: "invalid_value" }],
+    }),
+    false,
+  );
+  assert.equal(graphErrorsResultIsClean({ unavailable_widget_values: [] }), true, "an empty list is still clean");
+});
+
+test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", () => {
+  // The helper above governs the SUMMARY LABEL. The `note: "no errors recorded…"` in
+  // the payload comes from a separate `clean` expression inside the monolith's
+  // executor, which is not importable — and it is the one that produced the
+  // self-contradicting payload. Both must fold in the live scan or the contradiction
+  // simply moves. Deleting either half fails here.
+  const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const cleanExpr = /const clean =([\s\S]{0,600}?);/.exec(panelSrc)?.[1] ?? "";
+  assert.ok(cleanExpr.length > 0, "the `clean` expression must still exist to be checked");
+  assert.match(cleanExpr, /!liveScan\?\.unavailable\?\.length/, "`clean` must account for the live scan (#984)");
+  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount"]) {
+    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399 surfaces must survive: ${surface}`);
+  }
+  assert.match(
+    panelSrc,
+    /r\.unavailable_widget_values\?\.length \|\| 0/,
+    "the summary label must count the live-scan findings too, or an unavailable-only result reads as a bare read",
+  );
+});
+
+test("graphErrorsResultIsClean: unchecked_nodes alone does NOT make a result dirty (#984 scope)", () => {
+  // The scan reports what it could not judge on almost every call. Treating that as an
+  // error would make "Checked errors — none" unreachable on a normal canvas, which is
+  // a different lie. Only what the scan positively FOUND counts.
+  assert.equal(
+    graphErrorsResultIsClean({ unchecked_nodes: [{ id: 9, type: "SomePack" }], unchecked_budget_exhausted: true }),
+    true,
+  );
 });
 
 test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", () => {

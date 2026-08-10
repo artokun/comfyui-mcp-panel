@@ -11665,6 +11665,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // NOT emit the "no errors recorded" note alongside a populated missing_* field
     // (#399/#356 self-contradiction). Fold the asset surfaces in so the note and the
     // reported misses can never disagree in one payload.
+    //
+    // #984 — the SAME contradiction, re-opened by the #745 live scan. That field was
+    // added to the payload below without being folded in here, so a graph whose only
+    // defect the LOAD-TIME stores cannot adjudicate (measured: `CheckpointLoader`'s
+    // `config_name`, a models/configs .yaml that no missing-MODEL store tracks)
+    // emitted `unavailable_widget_values: [...]` and "no errors recorded" in ONE
+    // payload. Every entry in that list is a value the server does not offer, so the
+    // node fails on it at queue time whichever kind it is.
     const clean =
       !nodeErrors &&
       !lastExecFailure &&
@@ -11672,7 +11680,8 @@ const GRAPH_TOOL_EXECUTORS = {
       !missingModels.length &&
       !missingMedia.length &&
       !missingNodeTypes.length &&
-      !missingNodeCount;
+      !missingNodeCount &&
+      !liveScan?.unavailable?.length;
     return {
       viewing: describeActiveGraph(graph),
       node_count: nodes.length,
@@ -18374,9 +18383,17 @@ function describeCommand(cmd, msg, reply) {
         (r.missing_media?.length || 0) +
         (r.missing_node_types?.length || 0) +
         (Number(r.missing_node_count) || 0);
+      // #984 — count the LIVE scan too, or a result whose ONLY finding came from it
+      // reads "Read execution errors" (the empty-parts fallback) while its payload
+      // names the offending widget. Kept as its own part rather than folded into
+      // missingAssets: these were established from the server's current /object_info,
+      // and the list mixes absent files with values outside the offered options.
+      const unavailable = r.unavailable_widget_values?.length || 0;
       const parts = [];
       if (r.errored_count) parts.push(`${r.errored_count} node${r.errored_count === 1 ? "" : "s"}`);
       if (missingAssets) parts.push(`${missingAssets} missing asset${missingAssets === 1 ? "" : "s"}`);
+      if (unavailable)
+        parts.push(`${unavailable} unavailable widget value${unavailable === 1 ? "" : "s"}`);
       return {
         icon: "pi-exclamation-triangle",
         text: parts.length ? `Found errors — ${parts.join(", ")}` : "Read execution errors",
