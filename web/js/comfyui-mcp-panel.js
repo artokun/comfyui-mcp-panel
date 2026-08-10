@@ -396,6 +396,8 @@ import {
   sealProvenRootBinding,
   emptyCanvasBindingProven,
   rootContentProvesActiveWorkflow,
+  rootContentProvesActiveWorkflowDespiteEdits,
+  contentProofExclusiveAmongOpen,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
@@ -5770,12 +5772,38 @@ function assertGraphBoundToActiveWorkflow(
     // app.graph, so a canvas that IS the active workflow's was refused where an
     // untagged copy of it was allowed, and nothing self-healed it: the seal below
     // declines a root that already carries a tag. Same proof the seal accepts.
-    const contentProvesActiveWorkflow = rootContentProvesActiveWorkflow({
+    let contentProvesActiveWorkflow = rootContentProvesActiveWorkflow({
       rootGraph,
       activeWorkflow,
       inSubgraph,
       proofExclusive: sealProofExclusive,
     });
+    // #995 — the same escape for a tab with UNSAVED EDITS. MEASURED live, reproducing
+    // the report through UI clicks: a modified workflow, a root the panel's own
+    // comparison proves is that workflow's canvas, and the PREVIOUS workflow's tag still
+    // on it — verdict "conflict", every graph tool refused. The clean-tab requirement is
+    // there because a lagging tracker cannot describe the canvas, but a lagging snapshot
+    // makes an equality test FAIL rather than falsely succeed. What a dirty tab really
+    // costs is the twin comparison, so this takes a STRICTER exclusivity: every other
+    // open workflow must be readable and provably different, and any one of them being
+    // modified makes it unprovable. Only then may a dirty tab's content speak.
+    if (!contentProvesActiveWorkflow) {
+      let others = null;
+      try {
+        const open = app?.extensionManager?.workflow?.openWorkflows;
+        // Unreadable enumeration → `others` stays null → the proof refuses. Never an
+        // empty list by default: "no other tabs" and "could not look" are different.
+        if (Array.isArray(open)) others = open.filter((w) => !sameWorkflowObject(w, activeWorkflow));
+      } catch {
+        others = null;
+      }
+      contentProvesActiveWorkflow = rootContentProvesActiveWorkflowDespiteEdits({
+        rootGraph,
+        activeWorkflow,
+        inSubgraph,
+        proofExclusive: contentProofExclusiveAmongOpen({ rootGraph, others }),
+      });
+    }
     if (
       resolveGraphRootUuidRebind({
         rootGraph,
