@@ -11347,9 +11347,19 @@ const GRAPH_TOOL_EXECUTORS = {
         // real time: it told reporters their own evidence could not be happening.
         // A version range is a claim about builds nobody here has measured, and
         // this note has no way to earn one — so it no longer makes it.
-        `Please report this build (#556), including your ComfyUI_frontend version — ` +
-        `which builds take which argument shape is not something the panel can ` +
-        `determine from inside one of them.`;
+        // #996 — one MEASURED datum, because the note above sent reporters off to
+        // file with nothing to compare against. Measured directly on 1.48.7 by
+        // capturing the outgoing body: the POSITIONAL array shape puts
+        // `partial_execution_targets: ["<id>"]` into the request, so the capability
+        // is present upstream and this fallback should not fire there. Deliberately
+        // NOT paired with a claim about which builds are broken: this is one build
+        // measured, and inventing a range from it is the #752 mistake exactly.
+        `On ComfyUI_frontend 1.48.7 the positional argument shape DOES carry the ` +
+        `scope into the request — measured by capturing the outgoing body — so this ` +
+        `fallback is not expected on that build, and upgrading may be the shortest ` +
+        `fix. Which OTHER builds take which shape is not something the panel can ` +
+        `determine from inside one of them, so please report this build (#996), ` +
+        `including your ComfyUI_frontend version.`;
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
