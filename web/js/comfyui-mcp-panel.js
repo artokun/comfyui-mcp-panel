@@ -14850,7 +14850,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // #920 — a registry-lookup miss reads like a lookup bug and sends people to
           // re-check spelling and channels. On a stock v4 an unlisted git URL is simply
           // not installable, and saying so beats echoing a name the caller never supplied.
-          unlistedGitUrlAdvice(recentFailures.map((f) => f?.reason ?? "").join(" ")),
+          unlistedGitUrlAdvice(recentFailures.map((f) => f?.result ?? "").join(" ")),
       };
     }
     return { status };

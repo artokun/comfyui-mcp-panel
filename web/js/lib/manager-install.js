@@ -811,7 +811,7 @@ function taskStatusStr(item) {
  * message we positively recognise is reshaped, everything else passes through.
  */
 export function isRegistryLookupMiss(text) {
-  return typeof text === "string" && /not found in\s*\[[^\]]*\]/i.test(text);
+  return typeof text === "string" && /Node\s+'[^']*@[^']*'\s+not found in\s*\[[^\]]*\]/i.test(text);
 }
 
 /**
@@ -846,9 +846,13 @@ export function unlistedGitUrlAdvice(failureText) {
     ` name. IF YOU PASSED A GIT URL: this ComfyUI-Manager cannot install one. It resolves` +
     ` installs from its own database, and the parameter that would carry a URL (repository)` +
     ` is accepted and then IGNORED by its install handler — so no argument to this tool will` +
-    ` make it clone your URL. What does work: start ComfyUI with --enable-manager-legacy-ui` +
-    ` (that registers the legacy route, which installs from a URL), or clone the repo into` +
-    ` custom_nodes/ and restart, or ask the pack author to publish it to the registry.` +
+    ` make it clone your URL. WHAT WORKS, least effort first: clone the repo into` +
+    ` custom_nodes/ and restart ComfyUI; or ask the pack author to publish it to the` +
+    ` registry. There IS a legacy git-URL route, but reaching it takes TWO steps: start` +
+    ` ComfyUI with --enable-manager-legacy-ui (which REPLACES the v2 Manager API rather` +
+    ` than adding to it) AND set allow_git_url_install = true in ComfyUI-Manager's` +
+    ` config.ini — an unlisted pack is rated "high+" risk, and without that setting the` +
+    ` route answers 404 "A security error has occurred".` +
     ` IF YOU MEANT A REGISTRY PACK: check the id and the channel/mode named in the brackets.`
   );
 }

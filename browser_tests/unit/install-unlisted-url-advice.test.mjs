@@ -41,7 +41,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { isRegistryLookupMiss, unlistedGitUrlAdvice } from "../../web/js/lib/manager-install.js";
+import {
+  collectRecentTaskFailures,
+  isRegistryLookupMiss,
+  unlistedGitUrlAdvice,
+} from "../../web/js/lib/manager-install.js";
 
 const MISS =
   "Node 'ComfyUI-SolAttn_triton@nightly' not found in [ManagerChannel.dev, ManagerDatabaseSource.cache]";
@@ -68,6 +72,13 @@ test("#920 an unrelated failure is left completely alone", () => {
     "pip install failed: No matching distribution found for torch==9.9",
     "git clone failed: repository not found",
     "the Manager reported the task as failed (no detail provided)",
+    // The reason the pattern requires Manager's literal `Node '<id>@<ver>'` prefix
+    // rather than just "not found in [...]": a custom node's own post-install code
+    // can raise this shape, and it lands in status.messages the same way. Without
+    // the prefix, a pack whose installer throws a plain ValueError would be told
+    // its GIT URL is the problem.
+    "ValueError: 'chroma' not found in ['red', 'green', 'blue']",
+    "KeyError: 'sampler' not found in [euler, dpmpp_2m]",
     "",
     null,
     undefined,
@@ -87,9 +98,23 @@ test("#920 the advice names the real blocker and the routes that work", () => {
 
   assert.match(a, /NODE REGISTRY lookup/, "names what the lookup actually was");
   assert.match(a, /accepted and then IGNORED/, "says the repository field does nothing");
-  assert.match(a, /--enable-manager-legacy-ui/, "the route that does install from a URL");
   assert.match(a, /custom_nodes\//, "the manual clone");
   assert.match(a, /publish it to the registry/, "the durable fix");
+});
+
+test("#920 the legacy-route advice names BOTH steps, or it sends people to a 404", () => {
+  // The first cut said "start ComfyUI with --enable-manager-legacy-ui" and stopped.
+  // That is not sufficient for the only case this advice is shown for: an UNLISTED
+  // pack is rated "high+" by get_risky_level, and the legacy route then requires
+  // config allow_git_url_install (default FALSE) or it answers
+  // 404 "A security error has occurred". Following the advice as written would have
+  // been the THIRD wrong instruction on this issue.
+  const a = unlistedGitUrlAdvice(MISS);
+  assert.match(a, /--enable-manager-legacy-ui/, "step one");
+  assert.match(a, /allow_git_url_install\s*=\s*true/, "step two — without it the route 404s");
+  assert.match(a, /security error/i, "and says what failure to expect if it is skipped");
+  // It also REPLACES the v2 API rather than adding to it, which the wording must not hide.
+  assert.match(a, /REPLACES/, "the mutex, not additive");
 });
 
 test("#920 the advice does NOT assert which mistake the caller made", () => {
@@ -112,14 +137,42 @@ test("#920 the advice never promises the install can be made to work from here",
 // 3. WIRING — the advice is worth nothing if the surface never appends it.
 // ---------------------------------------------------------------------------
 
-test("#920 WIRING: the queue-status failure note appends the advice", () => {
-  // This is the surface the reporter actually polled ("Poll
-  // panel_node_queue_status. Observe the task failure below"), so it is the one
-  // that has to carry the explanation.
+test("#920 WIRING: a real Manager history reaches the advice END TO END", () => {
+  // THE ASSERTION THE FIRST CUT OF THIS FILE WAS MISSING. It matched
+  // /unlistedGitUrlAdvice\(recentFailures\.map\(/ and stopped BEFORE the field
+  // name — so it passed against `f?.reason` (always undefined, advice always ""),
+  // against `f?.result` (correct), and against a garbage field. The suite was
+  // green with the defect in place. That is the third inert fix on this issue and
+  // the second caused by a wiring assertion that could not fail.
+  //
+  // This drives the real chain instead: Manager history -> collectRecentTaskFailures
+  // -> the exact join the handler performs -> the advice.
+  const history = {
+    history: [
+      {
+        ui_id: "ui-1",
+        kind: "install",
+        params: { id: "ComfyUI-SolAttn_triton" },
+        status: { status_str: "error", messages: [MISS] },
+      },
+    ],
+  };
+  const failures = collectRecentTaskFailures(history);
+  assert.equal(failures.length, 1, "the failure must be collected at all");
+
+  // The handler's own expression. If the field name drifts, this dies.
+  const joined = failures.map((f) => f?.result ?? "").join(" ");
+  assert.ok(joined.includes("not found in"), `the joined text lost the reason: ${JSON.stringify(joined)}`);
+  assert.notEqual(unlistedGitUrlAdvice(joined), "", "the advice must actually be produced");
+});
+
+test("#920 WIRING: the handler joins on the field collectRecentTaskFailures emits", () => {
+  // Pins the field name specifically, since that is what broke. `reason` is the
+  // plausible-sounding wrong one — it is what I wrote.
   const panel = readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
   assert.ok(
-    /unlistedGitUrlAdvice\(recentFailures\.map\(/.test(panel),
-    "the queue-status note must append unlistedGitUrlAdvice over the recent failures",
+    /unlistedGitUrlAdvice\(recentFailures\.map\(\(f\) => f\?\.result \?\? ""\)\.join\(" "\)\)/.test(panel),
+    "the queue-status note must join on `result` — `reason` is always undefined here",
   );
   assert.ok(/^\s*unlistedGitUrlAdvice,\s*$/m.test(panel), "and it must be imported");
 });

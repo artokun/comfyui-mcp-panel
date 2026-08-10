@@ -17,8 +17,8 @@ All notable changes to this project are documented here. This project adheres to
   `repository` field ComfyUI-Manager's API declares for it.
 
   **This does not yet make such an install succeed, and this entry originally said it did —
-  that was wrong.** ComfyUI-Manager v4 accepts the field and then ignores it: its install
-  handler reads only `id`, `selected_version`, `channel`, `mode` and `skip_post_install`,
+  that was wrong.** ComfyUI-Manager v4's v2 install handler accepts the field and then ignores it: it
+  reads only `id`, `selected_version`, `channel`, `mode` and `skip_post_install`,
   and resolves the clone URL from its own database instead. A pack that is not in the
   registry still cannot be installed by URL on a stock v4, and you will still see
   *"Node '<name>@<version>' not found in [...]"*.
@@ -26,10 +26,12 @@ All notable changes to this project are documented here. This project adheres to
   The change is kept because it is what the documented API asks for and it will start
   working if Manager implements the field — but it is forward-compatibility, not a fix.
 
-  What works today for an unlisted pack: run ComfyUI with `--enable-manager-legacy-ui`
-  (which registers the legacy route that installs from a URL), `git clone` into
-  `custom_nodes/` and restart, or ask the pack author to publish to the registry.
-  Tracking in #920.
+  What works today for an unlisted pack, least effort first: `git clone` into
+  `custom_nodes/` and restart, or ask the pack author to publish to the registry. There is
+  a legacy git-URL route, but reaching it takes two steps — `--enable-manager-legacy-ui`
+  (which *replaces* the v2 Manager API rather than adding to it) **and**
+  `allow_git_url_install = true` in ComfyUI-Manager's `config.ini`; an unlisted pack is
+  rated "high+" risk and without that setting the route answers 404. Tracking in #920.
 
 ## [0.11.74] - 2026-08-09
 
