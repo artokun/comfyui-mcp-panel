@@ -132,7 +132,7 @@ test("WIRING: resolveNode builds its error through describeMissingNode", async (
   // at source. Without it every one of them reverts to the bare message.
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.match(src, /import \{ describeMissingNode \} from "\.\/lib\/node-scope-locator\.js";/);
+  assert.match(src, /import \{ describeMissingNode(?:, describeRailNodeTarget)? \} from "\.\/lib\/node-scope-locator\.js";/);
   const fn = src.slice(src.indexOf("function resolveNode(graph, nodeId) {"));
   const body = fn.slice(0, fn.indexOf("function normalizeLegacyNodeId"));
   assert.ok(body.includes("describeMissingNode(nodeId, rootGraph, viewingRoot)"),
