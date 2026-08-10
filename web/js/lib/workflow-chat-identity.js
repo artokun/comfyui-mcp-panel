@@ -94,6 +94,134 @@ export function shouldCarryIdentityAcrossSaveSwap({
   return postWfIsSaveProducedRecord === true;
 }
 
+/**
+ * #847 — remember the identity a tab held immediately BEFORE the panel grounded it.
+ *
+ * The problem this closes: grounding (the automatic save before a turn, #330) gives an
+ * unsaved workflow a real path, and ComfyUI REPLACES the ComfyWorkflow object at that
+ * moment. The successor finds no object uuid (new object), no embedded uuid (the carriers
+ * `workflowOwnedExtra` reads are all absent on this frontend), and no path alias (the path
+ * was just created), so it mints a fresh identity. A conversation recorded seconds earlier
+ * keeps the old one and vanishes from "Current workflow only" — the workflow it was
+ * actually held on.
+ *
+ * Why keyed on PATH and written HERE, when `onWorkflowMaybeChanged` deliberately refuses
+ * to migrate anything: that observer sees the transition after the fact and cannot prove
+ * the old id was THIS tab's past rather than a workflow the user switched away from —
+ * `openWorkflows` not claiming an id is absence of a competing claimant, not ownership
+ * (codex). Grounding is different in kind. The panel CALLS it, on its own active
+ * workflow, and awaits it; `groundActiveWorkflow` already refuses if the user switched
+ * tabs during the probe. Ownership is known by CAUSATION, not inferred from evidence.
+ * That is the whole reason this can be recorded safely and that one cannot.
+ *
+ * Scope, deliberately: these forms feed the history FILTER only. They never enter identity
+ * resolution, never authorize a graph write, and never define a workflow's uuid. The worst
+ * a wrong entry can do is show one extra row in a chat list.
+ *
+ * Only a genuinely pre-save form is recorded — `routeId` must be a `tmp:` id. A save of an
+ * already-saved workflow has no lineage break to bridge, and recording one would invent a
+ * relationship rather than remember it.
+ *
+ * ACCEPTED LIMIT, written down rather than left to be discovered (codex): a path is not
+ * durable ownership. Delete a workflow, create a new one with the SAME name, and nothing
+ * available here tells them apart — the old workflow's chats can appear under the new one.
+ * Grounded names are `Untitled <timestamp>`, so reuse takes deliberate effort, and the cost
+ * is one extra row in a chat list. Closing it properly needs a delete/rename signal the
+ * panel does not currently receive.
+ */
+export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } = {}) {
+  const key = normalizedWorkflowPath(path);
+  if (!key || !map || typeof map !== "object") return false;
+  // A `tmp:` route is the proof that this tab was unsaved a moment ago. Without it there
+  // is no boundary to bridge.
+  // `tmp:` alone is a prefix with no identifier behind it and matches nothing real
+  // (codex). Require an actual id.
+  if (typeof routeId !== "string" || !/^tmp:.+/.test(routeId)) return false;
+  const forms = [storageKey, routeId].filter((f) => typeof f === "string" && f);
+  if (!forms.length) return false;
+  // Latest grounding into a path wins. Delete first so a REFRESHED lineage moves to the
+  // end of the insertion order — plain assignment leaves an existing key in place, and the
+  // cap evicts from the front, so a just-refreshed entry could be dropped as "oldest"
+  // (codex).
+  delete map[key];
+  map[key] = forms;
+  return true;
+}
+
+/**
+ * Drop lineages that can no longer be about a workflow that exists (#847, codex).
+ *
+ * A path is not durable ownership. Delete `Untitled 2026-08-09.json` and let a later
+ * workflow take the same name and the stale entry would surface a dead workflow's
+ * conversations under its namesake — a false INCLUSION, which is worse than the missing
+ * row this fixes, because "Current workflow only" is precisely a promise not to do that.
+ *
+ * `knownPaths` is the workflow store's own list. An entry whose path is not in it names a
+ * file that is gone, so its lineage can never legitimately match again. When the list
+ * cannot be read the map is left ALONE rather than cleared — absence of evidence is not
+ * evidence that every workflow was deleted.
+ *
+ * `max` is hygiene, not correctness: insertion order is preserved by JS objects for string
+ * keys, so the oldest entries go first once the map exceeds it.
+ */
+export function pruneGroundingIdentities(map, { knownPaths, max = 200 } = {}) {
+  if (!map || typeof map !== "object") return false;
+  const limit = Number.isFinite(max) && max > 0 ? max : 200;
+  const keys = Object.keys(map);
+  // ONLY act when over the cap. Pruning eagerly on every grounding raced the store
+  // (codex): a just-created path is not listed yet — that is established, it is why the
+  // prune runs before the record — so an EARLIER legitimate lineage whose path was still
+  // unlisted got deleted by the next grounding, losing exactly the history this restores.
+  // Over the cap something must go regardless, so preferring dead paths is free there.
+  if (keys.length <= limit) return false;
+  let changed = false;
+  const overBy = keys.length - limit;
+  const live = Array.isArray(knownPaths)
+    ? new Set(knownPaths.map((p) => normalizedWorkflowPath(p)).filter(Boolean))
+    : null;
+  // Dead paths first, oldest first within that; then oldest overall.
+  const victims = [
+    ...(live ? keys.filter((k) => !live.has(k)) : []),
+    ...keys.filter((k) => !live || live.has(k)),
+  ].slice(0, overBy);
+  for (const key of victims) {
+    delete map[key];
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * The path a grounding save's returned NAME refers to, in the one shape this map is keyed
+ * on (#847).
+ *
+ * Exported so the panel and its tests share it. The first cut inlined this in the panel and
+ * asserted a copy of it in the test — which passes happily while the shipped behaviour
+ * diverges (codex; same trap as #932 earlier today).
+ *
+ * Naive concatenation mangled real inputs: `Name.json` became `workflows/Name.json.json`,
+ * a backslash path grew a second prefix, and `workflows/Name` never got an extension. Each
+ * files the lineage under a key nothing will look for, so the fix silently does nothing.
+ */
+export function groundedWorkflowPath(savedName) {
+  const raw = String(savedName ?? "")
+    .replaceAll("\\", "/")
+    .replace(/\/{2,}/g, "/")
+    .replace(/\/+$/, "")
+    .replace(/^\/+/, "");
+  if (!raw) return null;
+  const withDir = raw.includes("/") ? raw : `workflows/${raw}`;
+  return /\.json$/i.test(withDir) ? withDir : `${withDir}.json`;
+}
+
+/** The pre-grounding identity forms recorded for `path`, if any (#847). */
+export function preGroundingIdentityForms(map, path) {
+  const key = normalizedWorkflowPath(path);
+  if (!key || !map || typeof map !== "object") return [];
+  const forms = map[key];
+  return Array.isArray(forms) ? forms.filter((f) => typeof f === "string" && f) : [];
+}
+
 /** Return true when an embedded UUID belongs to a different workflow file.
  *  An existing objectUuid means ComfyUI mutated the same live workflow object
  *  during rename/Save-As, so continuity wins. Otherwise an embedded path or a

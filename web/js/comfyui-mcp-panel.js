@@ -123,6 +123,10 @@ import {
   shouldForkInPlaceReload,
   workflowAliasForPath,
   workflowIdentityForms,
+  rememberPreGroundingIdentity,
+  preGroundingIdentityForms,
+  pruneGroundingIdentities,
+  groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
@@ -1518,6 +1522,39 @@ let _workflowUuidAliases = (() => {
     return {};
   }
 })();
+
+// #847 — path -> the identity forms the tab held immediately before the panel GROUNDED it
+// into that path. Durable (localStorage) because the in-memory carriers all die with the
+// workflow object the save replaces, so a reload would otherwise lose the lineage that a
+// WeakMap held for the session. Read only by the chat-history filter.
+const PRE_GROUNDING_IDENTITIES_KEY = "comfyui-mcp.panel.preGroundingIdentities";
+const _preGroundingIdentities = (() => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PRE_GROUNDING_IDENTITIES_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+})();
+
+/** Paths the workflow store currently lists, or null when it cannot be read (#847). */
+function knownWorkflowPaths() {
+  try {
+    const list = app?.extensionManager?.workflow?.workflows;
+    if (!Array.isArray(list)) return null;
+    return list.map((w) => w?.path).filter((p) => typeof p === "string" && p);
+  } catch {
+    return null;
+  }
+}
+
+function persistPreGroundingIdentities() {
+  try {
+    window.localStorage.setItem(PRE_GROUNDING_IDENTITIES_KEY, JSON.stringify(_preGroundingIdentities));
+  } catch {
+    // Quota/private-mode: the in-memory map still covers this session.
+  }
+}
 let workflowAliasMutationSink = null;
 // MODULE-scoped so they survive buildPanel re-mounts (the panel re-mounts on every
 // ComfyUI workflow switch). If these lived in the panel closure, each re-mount would
@@ -4259,14 +4296,53 @@ async function groundUnsavedWorkflow() {
     // probe, so we can't authorize on tab A and overwrite tab B), single-flighted so
     // concurrent turns can't create duplicate copies. Only a provably never-persisted
     // source is saved; anything unprovable is left for a manual Ctrl+S.
-    return await groundActiveWorkflow(app?.extensionManager?.workflow, {
+    const saved = await groundActiveWorkflow(app?.extensionManager?.workflow, {
       existsOnDisk: workflowExistsOnDisk,
       autoWorkflowName,
       reconcileSavedCopy: reconcileSavedWorkflowCopy,
       // #708 — grounding is the save that CREATES the "Untitled …" file, so it is the
       // one that must not write a canvas belonging to a different workflow into it.
       canvasBinding: describeLiveCanvasBinding,
+      // #847 — both halves run INSIDE the serialized grounding, against the workflow that
+      // transaction is saving. The probe is synchronous with reading it, and the path comes
+      // from the save's own result, so neither can be about a tab the user switched to.
+      // ROUTE ID ONLY, and that restriction is the fix for a regression I caused:
+      // `workflowStorageKey()` is NOT a read. It runs the full identity resolution, which
+      // mints uuids and writes path aliases — so probing it here performed identity work at
+      // a point in the save where it had never happened, and conversation-persistence:350
+      // ("clear all … preserves workflow identity") went red. `workflowTabId` returns the
+      // tmp: id this tab already routes on, and threads carry it as `workflowRouteKey`,
+      // which is what the filter matches. Enough to bridge, without touching identity.
+      // A PURE READ. Neither `workflowStorageKey()` nor `workflowTabId()` is one:
+      // the first runs full identity resolution (minting uuids, writing path aliases) and
+      // the second mints a tmp: id. Calling either here performed identity work at a point
+      // in the save where it had never happened, and turned conversation-persistence:350
+      // ("clear all … preserves workflow identity") red. The tmp: id this tab already
+      // routes on is enough — threads carry it as `workflowRouteKey`, which is what the
+      // filter matches — and if none exists yet there is nothing to bridge anyway.
+      identityProbe: (wf) => ({ routeId: (wf ? _tempWorkflowInstanceIds.get(wf) : null) ?? null }),
+      onGrounded: ({ savedName, identity }) => {
+        // One implementation, shared with the tests (codex) — see groundedWorkflowPath.
+        const path = groundedWorkflowPath(savedName);
+        if (!path) return;
+        // Prune BEFORE recording, never after: the path this save just created is not in
+        // the workflow store's list yet, so pruning afterwards deletes the very entry it
+        // just wrote. That is not theoretical — it broke conversation-persistence:507 the
+        // first time round.
+        const pruned = pruneGroundingIdentities(_preGroundingIdentities, {
+          knownPaths: knownWorkflowPaths(),
+        });
+        const recorded = rememberPreGroundingIdentity(_preGroundingIdentities, {
+          path,
+          storageKey: identity?.storageKey,
+          routeId: identity?.routeId,
+        });
+        // EITHER change has to be persisted. Persisting only on `recorded` left a prune's
+        // deletions in memory alone, so they came back from localStorage on reload (codex).
+        if (pruned || recorded) persistPreGroundingIdentities();
+      },
     });
+    return saved;
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
   }
@@ -23092,6 +23168,13 @@ function buildPanel() {
         routeId: liveRouteId,
         priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
       });
+      // #847 — and the identity this tab held before GROUNDING created this path. The
+      // WeakMap above cannot help here: grounding replaces the workflow object, so it has
+      // nothing under the successor's key. This lineage was recorded by the save itself,
+      // which is the only observer that can prove the old id was this tab's.
+      for (const form of preGroundingIdentityForms(_preGroundingIdentities, savedWorkflowPath(activeWf))) {
+        currentWorkflowKeys.add(form);
+      }
 
       const visible = threads
         .filter((candidate) =>
