@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.76] - 2026-08-09
+
+> Covers changes since 0.11.75.
+
+### Fixed
+
+- **A subgraph boundary rail is no longer reported as a node that doesn't exist
+  (comfyui-mcp#1294).** `panel_query_graph` hands out a subgraph's rails as
+  `rails.output.rail_node_id: "-20"`. Passing that back to an edit answered *"No node with
+  id -20 in the current graph … The id may be from a different workflow, or the node was
+  removed. Re-read with panel_graph_outline before retrying."* Every clause after the
+  first was false — the id came from that graph, from the panel's own read, one call
+  earlier — and the remedy re-read the surface that produced it, so following it looped.
+  The failure now names what the id actually is, notes that `panel_move_node` takes a rail
+  id (position only) while `panel_move_rail` addresses it by side, and says plainly that
+  no unexpose operation exists rather than implying one.
+
 ## [0.11.75] - 2026-08-10
 
 > Covers changes since 0.11.74.
