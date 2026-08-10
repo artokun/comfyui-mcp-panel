@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.73] - 2026-08-09
+
+> Covers changes since 0.11.72.
+
+### Fixed
+
+- **The saved-subgraph list no longer claims every blueprint is yours (#636).** Listing
+  saved subgraphs reported `is_global: false` for all of them — including the ones
+  ComfyUI ships — because it read a property blueprints do not have. The agent had no way
+  to tell a bundled subgraph from one you saved.
+
+  It now asks ComfyUI, using the same call ComfyUI's own library menu uses. Where that
+  answer can't be trusted — an older frontend, or one that names blueprints in a shape
+  the panel doesn't recognise — the field is `null` rather than a guess. "I can't tell"
+  and "this one is yours" are different answers, and reporting the second in place of the
+  first is exactly what was wrong before.
+
 ## [0.11.72] - 2026-08-09
 
 > Covers changes since 0.11.71.
