@@ -11152,8 +11152,18 @@ const GRAPH_TOOL_EXECUTORS = {
           // #985 — keep each prompt AS SUBMITTED AND ACCEPTED. Re-deriving one
           // afterwards with a second app.graphToPrompt() would describe a different
           // compilation than the one ComfyUI accepted, and that call is not read-only.
+          // The structural read happens HERE, not after queuePrompt returns (codex
+          // NO-SHIP round 3): ComfyUI runs afterQueued hooks after each successful
+          // POST and before the queue loop returns, and an extension hook can change
+          // a wrapper's mode or a subgraph's contents. Pairing an accepted body with
+          // post-queue structure would compare two different graphs — a false
+          // positive or a false negative depending on which way it moved. Both are
+          // read at the same instant instead.
           onPromptBody: (prompt, promptId) => {
-            submittedPrompts.set(String(promptId), prompt);
+            submittedPrompts.set(String(promptId), {
+              prompt,
+              structural: collectDisabledAncestorOutputs(rootGraph),
+            });
           },
         });
       }
@@ -11394,21 +11404,24 @@ const GRAPH_TOOL_EXECUTORS = {
         // Every accepted body in the batch is checked, and offenders are merged by
         // exec id: one offending output is one finding however many repetitions
         // carried it, and a repetition that differs is not missed.
-        const structural = collectDisabledAncestorOutputs(rootGraph);
         const merged = new Map();
-        for (const prompt of submittedPrompts.values()) {
+        for (const { prompt, structural } of submittedPrompts.values()) {
           for (const o of disabledOutputsInPrompt(prompt, structural)) merged.set(o.exec_id, o);
         }
         const offenders = [...merged.values()];
         if (offenders.length) {
-          accept.disabled_outputs_queued = offenders;
-          accept.disabled_outputs_note = disabledOutputsNote(offenders);
-          // The claim is scoped to what was actually inspected: prompts POSTED
-          // during this run's queue call and accepted by the server. The unscoped
-          // interceptor cannot prove a body was ours rather than a concurrent
-          // queue action from the UI or another extension, so the count is
-          // reported instead of an ownership claim that has not been established.
+          // OWNERSHIP-NEUTRAL throughout (codex NO-SHIP round 3). The unscoped
+          // interceptor cannot prove a body was THIS run's rather than a concurrent
+          // queue action from the UI or another extension, so nothing here says
+          // "this run queued these". What IS established: these prompts were
+          // accepted by the server during this run's queue call, and these output
+          // nodes are execution roots inside a muted/bypassed subgraph in them.
+          // Naming the field after the observation rather than after the run is the
+          // difference between a report and a false accusation.
+          accept.disabled_outputs_in_accepted_prompts = offenders;
           accept.disabled_outputs_prompts_inspected = submittedPrompts.size;
+          accept.disabled_outputs_ownership = "unknown";
+          accept.disabled_outputs_note = disabledOutputsNote(offenders);
         }
       } catch {
         /* a diagnostic must never take down the run it describes */
@@ -18419,12 +18432,15 @@ function describeCommand(cmd, msg, reply) {
             // a plain success, and the user is the one paying for the renders. The
             // count goes in the LABEL: this warning is worthless if it only exists
             // in a payload field, since the whole failure was being silent about it.
-            icon: r.disabled_outputs_queued?.length ? "pi-exclamation-triangle" : "pi-play",
+            icon: r.disabled_outputs_in_accepted_prompts?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
               `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
               (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : "") +
-              (r.disabled_outputs_queued?.length
-                ? ` — WARNING: ${r.disabled_outputs_queued.length} output${r.disabled_outputs_queued.length === 1 ? "" : "s"} inside muted/bypassed subgraphs will run anyway`
+              // Ownership-neutral here too: the label says what was OBSERVED in an
+              // accepted prompt, not that this run queued it. A concurrent queue
+              // action would otherwise be reported as this run's doing.
+              (r.disabled_outputs_in_accepted_prompts?.length
+                ? ` — WARNING: ${r.disabled_outputs_in_accepted_prompts.length} output${r.disabled_outputs_in_accepted_prompts.length === 1 ? "" : "s"} inside muted/bypassed subgraphs found in an accepted prompt`
                 : ""),
             ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }

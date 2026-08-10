@@ -152,17 +152,21 @@ export function disabledOutputsNote(offenders) {
   // — or could have — is false). The remedy is therefore interruption, and the
   // scoped re-run, not a promise.
   return (
-    `ALREADY QUEUED, AND WILL RUN: ${n} OUTPUT node${n === 1 ? "" : "s"} inside a ` +
-    `${states.join("/")} subgraph ${n === 1 ? "is" : "are"} in the prompt this run submitted — ` +
-    `${which}${more}. Output nodes are the execution roots ComfyUI renders from, so these ` +
-    `produce results. Read from the request body of a prompt the server ACCEPTED, so this is ` +
-    `not a re-derivation. On the build measured for this (ComfyUI 0.31.1 / frontend 1.48.7) ` +
-    `a subgraph wrapper's mute/bypass is applied only at the TOP level of the workflow and a ` +
-    `wrapper nested inside another subgraph is ignored; whether other builds differ has not ` +
-    `been measured here. A whole-graph run hands prompt construction to ComfyUI, so the panel ` +
-    `did not build this prompt and does not silently rewrite what you asked to run — it ` +
-    `reports it. The run is queued NOW: interrupt it if this is not what you intended, then ` +
-    `render just the branch you want with panel_run's to_node_id, which scopes execution ` +
-    `correctly.`
+    `IN AN ACCEPTED PROMPT: ${n} OUTPUT node${n === 1 ? "" : "s"} inside a ${states.join("/")} ` +
+    `subgraph ${n === 1 ? "is" : "are"} an execution root in a prompt the server accepted ` +
+    `during this run's queue call — ${which}${more}. Read from the request body itself, not ` +
+    `re-derived. Two things are deliberately NOT claimed: that this panel_run posted that ` +
+    `prompt (a concurrent queue action from the UI or another extension goes through the ` +
+    `same window, and there is no mark on an unscoped run to tell them apart), and that ` +
+    `these nodes will finish — an accepted root can still be interrupted, fail, or be ` +
+    `served from cache. What IS established is that they are roots rather than dependencies, ` +
+    `so nothing else has to reference them for them to execute. On the build measured for ` +
+    `this (ComfyUI 0.31.1 / frontend 1.48.7) a subgraph wrapper's mute/bypass is applied ` +
+    `only at the TOP level of the workflow and a wrapper nested inside another subgraph is ` +
+    `ignored; whether other builds differ has not been measured here. A whole-graph run ` +
+    `hands prompt construction to ComfyUI, so the panel did not build this prompt and does ` +
+    `not silently rewrite what you asked to run — it reports it. Check the queue now: ` +
+    `interrupt if this is not what you intended, then render just the branch you want with ` +
+    `panel_run's to_node_id, which scopes execution correctly.`
   );
 }

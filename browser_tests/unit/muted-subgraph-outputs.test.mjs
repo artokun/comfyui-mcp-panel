@@ -216,10 +216,12 @@ test("#985 disabledModeName classifies exactly the two disabled modes", () => {
 test("#985 the note leads with the outcome, names the remedy, and never blames the panel's own run", () => {
   const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE));
   const note = disabledOutputsNote(found);
-  assert.match(note, /^ALREADY QUEUED, AND WILL RUN/, "states what happened — the prompt is accepted by now");
+  assert.match(note, /^IN AN ACCEPTED PROMPT/, "states the observation, not an ownership claim");
   assert.match(note, /5:4:3/, "names the offending node");
   assert.match(note, /to_node_id/, "the workaround the reporter verified");
-  assert.match(note, /interrupt it/, "the only remedy that still saves GPU time");
+  assert.match(note, /interrupt if this is not what you intended/, "the only remedy that still saves GPU time");
+  assert.match(note, /NOT claimed/, "names what it is not asserting");
+  assert.doesNotMatch(note, /this run submitted|will run anyway/, "codex r3: no ownership claim, no completion promise");
   // codex NO-SHIP: the note is read AFTER the POST, so any wording implying the
   // panel prevented this — or could have — is false.
   assert.doesNotMatch(note, /will be prevented|blocked|refused|stopped/i, "claims no prevention it did not perform");
