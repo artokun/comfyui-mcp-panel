@@ -6,6 +6,27 @@ import { explainNumericNormalization, normalizationNote } from "./widget-normali
 // throw INSIDE the span that attributes the throw to the callback body) and cannot
 // depend on globals a page could later redefine.
 const reflectApply = Reflect.apply;
+// A module-load capture cannot defend against a `Reflect.apply` that was already
+// replaced BEFORE this module evaluated (codex round 2). Nothing here can: at that
+// point the page owns the intrinsics the whole panel runs on. Written down rather
+// than defended, so the limit is known instead of assumed away.
+
+/**
+ * #976: describe a thrown value for a disclosure message.
+ *
+ * `throw` accepts any value, so `.message` may be absent, empty, or itself a getter
+ * that throws — and interpolating a value whose `toString` throws would blow up the
+ * disclosure that exists to report a throw. Total by construction.
+ */
+function describeThrown(err) {
+  try {
+    const message = err === null || err === undefined ? null : err.message;
+    if (typeof message === "string" && message !== "") return message;
+    return `non-Error value thrown: ${String(err)}`;
+  } catch {
+    return "a thrown value that could not be described";
+  }
+}
 
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
@@ -1182,11 +1203,26 @@ export function applyWidgetWrite(
   // fired its hooks: an afterChange hook can itself re-stale a widget or change the
   // promotion topology, and that must be caught too (not just callback-time drift).
   let threw = null;
-  // #976: TRUE only while the widget's own callback function is executing. It is the
-  // one construct in this envelope whose throw the mechanism can ATTRIBUTE, and only
-  // because the lookup and the argument evaluation are hoisted out of it below — see
-  // the note there. Everything else stays unattributed, exactly as #639 requires.
+  // #976 (codex NO-SHIP round 2): a captured throw cannot be detected by testing
+  // `threw` for truthiness — `throw undefined`, `throw null`, `throw 0`, `throw ""`
+  // are all legal, and a callback that did any of them produced NO disclosure at all:
+  // the write reported clean while its side effects had not run. Pre-existing, and it
+  // silently defeats the whole attribution, so it is fixed here.
+  let didThrow = false;
+  // #976: TRUE when the throw arose from this write's INVOCATION of the widget's own
+  // callback — including a callback that could not be invoked at all. It is the one
+  // step in this envelope whose throw the mechanism can attribute, and only because
+  // the lookup and the argument evaluation are hoisted out of it below (see the note
+  // there). Everything else stays unattributed, exactly as #639 requires.
+  //
+  // It does NOT establish that the callback's BODY ran: a non-callable value, a class
+  // constructor, a revoked Proxy and a throwing `apply` trap all throw at the
+  // invocation without entering any body (codex NO-SHIP round 2). The wording below is
+  // written to be true of all of them, and never says the callback executed.
   let threwFromCallback = false;
+  // Captured at lookup so the disclosure can describe it WITHOUT reading `w.callback`
+  // a second time (it may be an accessor with side effects, or a throwing one).
+  let widgetCallback = null;
   safeBefore();
   try {
     // Assign BOTH values first. The parent's projected promoted widget is a VIEW of
@@ -1224,7 +1260,7 @@ export function applyWidgetWrite(
     // non-callable callback still throws a TypeError exactly as before, and it takes
     // the argument list without spreading — no `Symbol.iterator` to poison either.
     // `reflectApply` is captured at module load for the same reason.
-    const widgetCallback = w.callback;
+    widgetCallback = w.callback;
     if (widgetCallback !== null && widgetCallback !== undefined) {
       const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
       threwFromCallback = true;
@@ -1239,7 +1275,8 @@ export function applyWidgetWrite(
     // and a write to a frozen widget throws with no user code at all. For every one
     // of those `threwFromCallback` is FALSE and the disclosure names no construct,
     // unchanged. #976 adds the single case the mechanism CAN establish: the throw
-    // propagated out of calling the widget's own callback function.
+    // arose from this write's invocation of the widget's own callback.
+    didThrow = true;
     threw = err;
   } finally {
     safeAfter();
@@ -1384,27 +1421,43 @@ export function applyWidgetWrite(
   // defect because of it.
   //
   // The attributed wording says exactly what the mechanism observed — the exception
-  // came OUT OF the callback, not out of the assignment — and stops there. It does
-  // NOT say whose code the callback is (a pack, an extension, a prototype, or the
-  // frontend itself may have installed it) and it does NOT assign fault: this write
-  // invokes the callback PROGRAMMATICALLY, and a callback written for a click can
-  // throw here for that reason alone (measured on #757). Both of those were codex
-  // NO-SHIP findings on the first draft of this text, and both were right — an
-  // attribution that overshoots just relocates the wrong blame.
-  if (threw) {
-    const threwDetail = threw?.message ?? threw;
+  // arose from the INVOCATION step, not from the assignment — and stops there. Three
+  // things it deliberately does NOT claim, each a codex NO-SHIP finding on an earlier
+  // draft of this text, each right:
+  //   * whose code the callback is. A pack, an extension, a prototype or the frontend
+  //     itself may have installed it.
+  //   * that anyone is at FAULT. This write invokes the callback PROGRAMMATICALLY, and
+  //     a callback written for a click can throw for that reason alone (measured on
+  //     #757), which would make the throw ours as much as anyone's.
+  //   * that the callback's BODY ran. A non-callable value, a class constructor, a
+  //     revoked Proxy and a throwing `apply` trap all throw at the invocation without
+  //     entering a body. "came from this write's invocation of" is true of every one
+  //     of them; "the callback threw" would not be.
+  // An attribution that overshoots just relocates the wrong blame.
+  if (didThrow) {
+    const threwDetail = describeThrown(threw);
     const threwLabel = threwFromCallback
-      ? `an exception came out of the widget's OWN callback while applying the write`
+      ? `an exception came from invoking the widget's OWN callback while applying the write`
       : `an exception was thrown while applying the write`;
+    // Establishable and worth saying when it holds: a value that is not a function
+    // cannot have been entered, so the throw is the invocation refusing, not the
+    // node's logic failing.
+    // Reads the value CAPTURED at lookup time — never `w.callback` again, which would
+    // invoke a throwing accessor a second time.
+    const notCallable = threwFromCallback && typeof widgetCallback !== "function";
     if (!failure) {
       writeWarning = threwFromCallback
         ? `the write itself SUCCEEDED: the requested value IS in effect — verified present by ` +
-          `read-back — and was NOT rolled back. The exception (${threwDetail}) came out of the ` +
-          `widget's OWN callback, which this write invokes AFTER assigning the value — the ` +
-          `assignment did not throw. Side effects that callback would normally perform ` +
-          `(refreshing dependent widgets, previews, thumbnails) may not have run or completed; ` +
-          `inspect the node if dependents look stale. This invocation is programmatic, so a ` +
-          `callback written to assume a click can throw here and not in the UI.`
+          `read-back — and was NOT rolled back. The exception (${threwDetail}) came from this ` +
+          `write's invocation of the widget's own callback, which runs AFTER the value is ` +
+          `assigned — the assignment itself did not throw.` +
+          (notCallable
+            ? ` The widget's callback is a ${typeof widgetCallback}, not a function, so it could not ` +
+              `be invoked at all and none of its side effects ran.`
+            : ` Side effects that callback would normally perform (refreshing dependent widgets, ` +
+              `previews, thumbnails) may not have run or completed; inspect the node if dependents ` +
+              `look stale. This invocation is programmatic, so a callback written to assume a click ` +
+              `can throw here and not in the UI.`)
         : `${threwLabel} (${threwDetail}); the requested value IS in effect — ` +
           `verified present by read-back — and was NOT rolled back. Side effects the write ` +
           `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +

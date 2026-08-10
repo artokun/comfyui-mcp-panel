@@ -18256,7 +18256,7 @@ function describeCommand(cmd, msg, reply) {
               `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
               (writeDisclosed
                 ? threwInNodeCallback
-                  ? ` — value verified in effect; the exception came out of the widget's own callback, so its side effects may not have run`
+                  ? ` — value verified in effect; the exception came from invoking the widget's own callback, so its side effects may not have run`
                   : ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
                 : ""),
             detail: `was ${JSON.stringify(r.set?.previous)}`,
