@@ -170,3 +170,16 @@ test("#636: an unavailable predicate reports null, never false", () => {
   assert.match(listSite, /isGlobal = null;/, "and a throw returns to null");
   assert.doesNotMatch(listSite, /isGlobal = false/, "absence must never be reported as user-owned");
 });
+
+test("#636: an unrecognised prefix does not get asked at all", () => {
+  // `prefix` is a fallback — the measured frontend exposes no typePrefix — so a type that
+  // does not start with it leaves the name UNSTRIPPED, and the predicate would answer
+  // `false` for a question it was never asked properly. That is indistinguishable from a
+  // real user blueprint, and nothing at runtime can detect the disagreement, so the only
+  // honest answer is null (codex).
+  assert.match(
+    listSite,
+    /type\.startsWith\(prefix\) && typeof store\.isGlobalBlueprint === "function"/,
+    "the predicate must be gated on the prefix having matched",
+  );
+});

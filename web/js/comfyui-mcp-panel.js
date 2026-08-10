@@ -13103,9 +13103,15 @@ const GRAPH_TOOL_EXECUTORS = {
       // `null` when the predicate is absent or throws, NOT false: "this frontend cannot
       // tell me" and "this is a user blueprint" are different answers, and the whole
       // defect here was the second being asserted in place of the first.
+      // ONLY when the prefix actually matched (codex). `prefix` is a FALLBACK — the
+      // measured frontend exposes no `typePrefix` — so a type that does not start with it
+      // leaves `bare` unstripped, and passing that yields a `false` indistinguishable from
+      // a real user blueprint. A predicate cannot report "you asked me the wrong
+      // question", and nothing at runtime can detect the disagreement, so the only honest
+      // answer for an unrecognised prefix is null.
       let isGlobal = null;
       try {
-        if (typeof store.isGlobalBlueprint === "function") {
+        if (type.startsWith(prefix) && typeof store.isGlobalBlueprint === "function") {
           isGlobal = store.isGlobalBlueprint(bare) === true;
         }
       } catch {
