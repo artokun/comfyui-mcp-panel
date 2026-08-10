@@ -6,6 +6,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.83] - 2026-08-09
+
+> Covers changes since 0.11.82.
+
+### Added
+
+- **The panel now tells you what changed when it updates under you (#758).** It installs
+  from the Comfy Registry and the orchestrator runs the latest agent, so the version can
+  move without you asking — and the first sign was usually something behaving differently
+  than you remembered, which reads as a bug rather than a release.
+
+  On the first load after an update the transcript shows what shipped between the version
+  this browser last saw and this one, each line tagged Added, Fixed or Changed. That
+  distinction is the point: "this used to work differently on purpose" is a different
+  message from "this was broken". It appears once, says nothing on a fresh install, and
+  says nothing if you roll back.
+
+  Settings → Comfy MCP Agent → About → **Show what is new** re-opens it whenever you want,
+  since a line in a transcript scrolls away and the request was for somewhere to look.
+
+
 ## [0.11.82] - 2026-08-09
 
 > Covers changes since 0.11.81.
