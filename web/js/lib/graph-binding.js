@@ -822,6 +822,45 @@ const RECOMPUTED_NODE_FIELDS = new Set(["size"]);
  * repaint from one where geometry was rewritten, so a caller can DISCLOSE the
  * difference instead of the panel quietly deciding it did not happen.
  */
+/**
+ * Every node whose `size` differs differs ONLY in height, and both sides are a readable
+ * `[width, height]` pair.
+ *
+ * The measurement behind the whole exemption is a recomputed BOX HEIGHT. Width is not
+ * something the frontend was observed rewriting, so a width change is not covered by
+ * the evidence and must not ride in on the field's name (codex r2). Anything
+ * unreadable — a non-pair, a non-finite number, an unpairable node — answers false,
+ * because a proof cannot rest on a value nobody could read.
+ */
+function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
+  try {
+    if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return false;
+    // STRICTLY numbers. `Number.isFinite(Number(n))` would accept `null` (Number(null)
+    // is 0) and a numeric string — and a JSON round-trip turns NaN into null, so a
+    // height that arrived unreadable would have passed as a readable zero.
+    const readable = (size) =>
+      Array.isArray(size) && size.length === 2 && size.every((n) => typeof n === "number" && Number.isFinite(n));
+    const actualByKey = new Map();
+    for (const node of actualNodes) {
+      if (!node || typeof node !== "object") return false;
+      actualByKey.set(nodeIdentityKey(node), node);
+    }
+    for (const expectedNode of expectedNodes) {
+      if (!expectedNode || typeof expectedNode !== "object") return false;
+      const actualNode = actualByKey.get(nodeIdentityKey(expectedNode));
+      if (!actualNode) return false;
+      const before = expectedNode.size;
+      const after = actualNode.size;
+      if (JSON.stringify(canonicalizeShapeValue(before)) === JSON.stringify(canonicalizeShapeValue(after))) continue;
+      if (!readable(before) || !readable(after)) return false;
+      if (Number(before[0]) !== Number(after[0])) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
   const NOT_PROVEN = { proven: false, exact: false, fields: [] };
   try {
@@ -844,6 +883,13 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // remove the other's guarantee.
     if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return NOT_PROVEN;
     const fields = Array.isArray(nodes.fields) ? nodes.fields : [];
+    // WIDTH IS NOT MEASURED (codex r2). The evidence is a recomputed HEIGHT, and a
+    // field-name allowlist admits any rewrite of the whole `[w, h]` pair — so a changed
+    // width, or an arbitrary replacement, would have been PROVEN on the strength of a
+    // measurement about something else. Every differing size must be height-only.
+    if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, rootGraph?.serialize?.()?.nodes)) {
+      return NOT_PROVEN;
+    }
     // An empty field list with a differing `nodes` surface means the two disagreed
     // somewhere this classifier could not name — proving content off a difference
     // nobody can point at is exactly the fabricated all-clear to avoid.

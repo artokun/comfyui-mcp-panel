@@ -2599,6 +2599,15 @@ function rederiveSavedWorkflowIdentity(wf) {
     // not the mounted root) still has it, while a different workflow saved at the same
     // path carries its own tag or none. Two independent records must agree before
     // anything is adopted.
+    // THE ROOT TAG TRAVELS WITH THE GRAPH, so on its own it is not independent of the
+    // alias (codex r2): copy workflow A with its tag, save the copy at A's old path, and
+    // both records read UUID_A for what is now a different workflow. What makes a copied
+    // tag impossible is the loadGraphData creation-boundary wrapper, which re-mints on
+    // every creation and every in-place replace — the same sanitizer `workflowStableUuid`
+    // already refuses to trust an embedded uuid without. So adoption requires proof it is
+    // installed. Without it this returns null and the caller opens the workflow, which is
+    // lost-resume rather than wrong-resume — the trade this file makes everywhere else.
+    if (_loadGraphDataForkInstalled !== true) return null;
     const active = activeWorkflowRef();
     if (!active || !sameWorkflowObject(active, wf)) return null;
     const path = savedWorkflowPath(wf);

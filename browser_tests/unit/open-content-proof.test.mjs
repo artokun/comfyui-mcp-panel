@@ -105,6 +105,32 @@ test("#1001 a WIDGET VALUE difference is never proven — that is real content",
   assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(live), state }).proven, false);
 });
 
+test("#1001 (codex r2) a changed WIDTH is never proven — the measurement was a height", () => {
+  // A field-name allowlist admits any rewrite of the whole `[w, h]` pair, so a changed
+  // width would have ridden in on evidence about something else.
+  const state = stateOf([node(1, "KSampler", { size: [200, 100] })]);
+  const heightOnly = stateOf([node(1, "KSampler", { size: [200, 60] })]);
+  const widthToo = stateOf([node(1, "KSampler", { size: [340, 60] })]);
+  const widthOnly = stateOf([node(1, "KSampler", { size: [340, 100] })]);
+  assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(heightOnly), state }).proven, true);
+  assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(widthToo), state }).proven, false, "width moved too");
+  assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(widthOnly), state }).proven, false, "width alone");
+});
+
+test("#1001 (codex r2) an UNREADABLE size is never proven", () => {
+  // A proof cannot rest on a value nobody could read, so a non-pair or a non-finite
+  // number refuses rather than being treated as a height change.
+  const state = stateOf([node(1, "KSampler", { size: [200, 100] })]);
+  for (const size of [null, [200], [200, 100, 5], ["a", "b"], [200, NaN], "200x100", {}]) {
+    const live = stateOf([node(1, "KSampler", { size })]);
+    assert.equal(
+      graphRootReproducesStateContent({ rootGraph: rootOf(live), state }).proven,
+      false,
+      `size ${JSON.stringify(size)}`,
+    );
+  }
+});
+
 test("#1001 (codex) `pos` and `order` hold the proof back — only `size` was measured", () => {
   // An earlier cut listed both as "layout too". Neither was ever observed being
   // rewritten, `pos` is authored by dragging a node, and `order` is execution-order

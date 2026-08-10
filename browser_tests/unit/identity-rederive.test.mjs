@@ -60,6 +60,9 @@ function sandbox(opts = {}) {
   // from "supplied as undefined" — and the latter IS the unreadable list this rule is
   // about. Presence is therefore tested explicitly.
   const openWorkflows = Object.hasOwn(opts, "openWorkflows") ? opts.openWorkflows : [];
+  /** Is the copy/import fork sanitizer installed? Adoption requires it — and `undefined`
+   *  is one of the values that must NOT count as installed, so presence is explicit. */
+  const forkInstalled = Object.hasOwn(opts, "forkInstalled") ? opts.forkInstalled : true;
   const {
     aliases = {},
     objectUuids = new WeakMap(),
@@ -87,6 +90,7 @@ function sandbox(opts = {}) {
     "sameWorkflowObject",
     "setWorkflowObjectUuid",
     "rememberWorkflowUuidOwner",
+    "_loadGraphDataForkInstalled",
     "activeWorkflowRef",
     "graphRootWorkflowUuidMatches",
     "app",
@@ -110,6 +114,7 @@ function sandbox(opts = {}) {
       objectUuids.set(wf, uuid);
     },
     (id, owner) => owners.set(id, owner),
+    forkInstalled,
     () => activeRef,
     // The REAL predicate, over a root whose tag is whatever the fixture says.
     ({ activeWorkflowUuid }) => rootUuid !== undefined && rootUuid === activeWorkflowUuid,
@@ -242,6 +247,30 @@ test("#1001 (codex P1) an UNREADABLE open-tab list fails CLOSED, not open", () =
       rootUuid: UUID_A,
     });
     assert.equal(identity(successor), null, `openWorkflows=${JSON.stringify(openWorkflows)}`);
+  }
+});
+
+test("#1001 (codex r2) a COPIED root tag cannot adopt — the sanitizer must be installed", () => {
+  // The two records are not independent: the root tag TRAVELS WITH THE GRAPH, so a copy
+  // of workflow A saved at A's former path carries A's tag and A's path alias, and both
+  // read UUID_A for what is now a different workflow. What makes that impossible is the
+  // loadGraphData creation-boundary wrapper, which re-mints on every creation and every
+  // in-place replace. Adoption therefore requires proof it is installed; without it, a
+  // matching alias and a matching tag are not enough.
+  const wf = savedWorkflow("workflows/a.json");
+  const { identity, minted } = sandbox({
+    aliases: { "workflows/a.json": UUID_A },
+    rootUuid: UUID_A,
+    forkInstalled: false,
+  });
+  assert.equal(identity(wf), null, "no sanitizer, no adoption — lost-resume, never wrong-resume");
+  assert.deepEqual(minted, []);
+  for (const notInstalled of [undefined, null, 0, "yes"]) {
+    assert.equal(
+      sandbox({ aliases: { "workflows/a.json": UUID_A }, rootUuid: UUID_A, forkInstalled: notInstalled }).identity(wf),
+      null,
+      `forkInstalled=${JSON.stringify(notInstalled)} is not proof it is installed`,
+    );
   }
 });
 
