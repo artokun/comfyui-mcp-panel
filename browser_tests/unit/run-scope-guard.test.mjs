@@ -2801,3 +2801,55 @@ test("#985 the body is passed through untouched — the diagnostic reads, never 
   await intercepted(route, options);
   assert.equal(spy.calls[0].options, options, "the exact options object, not a copy");
 });
+
+test("#985 the structural snapshot is taken BEFORE the request is awaited, not after", async () => {
+  // codex NO-SHIP round 4: the graph can be edited by the user or an extension while
+  // the POST is in flight, so a walk taken after the response would be paired with a
+  // body serialized from a different graph. `snapshotOnSubmit` must run beside the
+  // body parse, before origFetchApi is awaited.
+  const order = [];
+  let liveState = "before";
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => {
+      order.push("request-in-flight");
+      liveState = "edited-mid-flight"; // whatever a hook or the user did
+      return jsonResponse(200, { prompt_id: "p-9" });
+    }),
+    snapshotOnSubmit: () => {
+      order.push("snapshot");
+      return liveState;
+    },
+    onPromptBody: (_prompt, _id, snapshot) => order.push(`published:${snapshot}`),
+  });
+  await intercepted(...promptPost({ prompt: { "1": {} } }));
+  assert.deepEqual(order, ["snapshot", "request-in-flight", "published:before"]);
+});
+
+test("#985 a snapshot for a REJECTED prompt is discarded, never published", async () => {
+  let snapshots = 0;
+  const published = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(400, { error: { type: "x" } })),
+    snapshotOnSubmit: () => ++snapshots,
+    onPromptBody: (_p, _id, s) => published.push(s),
+    onRejection: () => {},
+  });
+  await intercepted(...promptPost({ prompt: { "1": {} } }));
+  assert.equal(snapshots, 1, "taken eagerly — it has to be, to be timely");
+  assert.deepEqual(published, [], "and thrown away when nothing was accepted");
+});
+
+test("#985 a THROWING snapshotOnSubmit costs the diagnostic, not the run", async () => {
+  const ids = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p-10" })),
+    onPromptId: (p) => ids.push(p),
+    snapshotOnSubmit: () => {
+      throw new Error("walk boom");
+    },
+    onPromptBody: () => {},
+  });
+  const res = await intercepted(...promptPost({ prompt: { "1": {} } }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(ids, ["p-10"]);
+});

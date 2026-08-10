@@ -996,6 +996,7 @@ export function createRunFetchInterceptor({
   onRejection = null,
   onPromptId = null,
   onPromptBody = null,
+  snapshotOnSubmit = null,
 } = {}) {
   return async function runFetchInterceptor(route, options) {
     const isPrompt = isPromptPost(route, options);
@@ -1011,6 +1012,7 @@ export function createRunFetchInterceptor({
     // that "will run". Only a body whose own response yielded a prompt_id is
     // reported, and it is reported WITH that id so a caller can tie the two.
     let pending = null;
+    let pendingSnapshot = null;
     if (typeof onPromptBody === "function" && isPrompt) {
       try {
         // Stock ComfyUI posts a JSON string. Any other body shape (FormData,
@@ -1018,7 +1020,17 @@ export function createRunFetchInterceptor({
         // an absence, not a claim of support.
         const raw = options?.body;
         const parsed = typeof raw === "string" ? JSON.parse(raw) : null;
-        if (parsed && typeof parsed.prompt === "object" && parsed.prompt) pending = parsed.prompt;
+        if (parsed && typeof parsed.prompt === "object" && parsed.prompt) {
+          pending = parsed.prompt;
+          // #985 (codex NO-SHIP round 4): anything the caller needs to read off the
+          // LIVE graph must be captured HERE — beside the body, before the await.
+          // The request is in flight for as long as the server takes, and the user
+          // or an extension can edit the graph during that window; a walk taken
+          // after the response would be paired with a body serialized from a
+          // different graph. Opaque to this module: it is captured now and simply
+          // handed back if the prompt is accepted.
+          if (typeof snapshotOnSubmit === "function") pendingSnapshot = snapshotOnSubmit(parsed.prompt);
+        }
       } catch {
         /* an unreadable body yields no report, never a broken run */
       }
@@ -1035,7 +1047,7 @@ export function createRunFetchInterceptor({
       });
       if (pending && acceptedId != null) {
         try {
-          onPromptBody(pending, acceptedId);
+          onPromptBody(pending, acceptedId, pendingSnapshot);
         } catch {
           /* a diagnostic must never break the run it describes */
         }

@@ -19,9 +19,19 @@
  * harm, since the run reported success while doing something no one asked for.
  *
  * The check is a MEASUREMENT, never a reimplementation of ComfyUI's rules: it names
- * the outputs that have a disabled ancestor AND are present in the compiled prompt.
- * If a future frontend excludes them properly, the intersection is empty and the
- * panel says nothing — no version sniffing, and nothing to un-teach later.
+ * the outputs that have a disabled ancestor AND are present in a prompt the server
+ * ACCEPTED. If a future frontend excludes them properly, the intersection is empty
+ * and the panel says nothing — no version sniffing, nothing to un-teach later.
+ *
+ * What the caller may NOT conclude from these, and what the note therefore does not
+ * say (codex rounds 2-4):
+ *   - that a given prompt belonged to the panel_run that observed it. An unscoped
+ *     run has no queue mark, and a concurrent queue action from the UI or another
+ *     extension posts through the same window.
+ *   - that these nodes will FINISH. An accepted execution root can be interrupted,
+ *     fail at runtime, or be served from cache.
+ * What IS established: they are execution ROOTS rather than dependencies, so nothing
+ * else has to reference them for them to execute.
  */
 
 /** LiteGraph node modes that mean "do not execute this node". */

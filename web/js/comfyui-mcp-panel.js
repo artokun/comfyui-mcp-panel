@@ -11152,18 +11152,15 @@ const GRAPH_TOOL_EXECUTORS = {
           // #985 — keep each prompt AS SUBMITTED AND ACCEPTED. Re-deriving one
           // afterwards with a second app.graphToPrompt() would describe a different
           // compilation than the one ComfyUI accepted, and that call is not read-only.
-          // The structural read happens HERE, not after queuePrompt returns (codex
-          // NO-SHIP round 3): ComfyUI runs afterQueued hooks after each successful
-          // POST and before the queue loop returns, and an extension hook can change
-          // a wrapper's mode or a subgraph's contents. Pairing an accepted body with
-          // post-queue structure would compare two different graphs — a false
-          // positive or a false negative depending on which way it moved. Both are
-          // read at the same instant instead.
-          onPromptBody: (prompt, promptId) => {
-            submittedPrompts.set(String(promptId), {
-              prompt,
-              structural: collectDisabledAncestorOutputs(rootGraph),
-            });
+          // The structural walk is taken BESIDE THE BODY, before the request is
+          // awaited (codex NO-SHIP rounds 3 and 4). Two separate races close here:
+          // ComfyUI's afterQueued hooks run before the queue loop returns and can
+          // change a wrapper's mode, and the graph can be edited by the user or an
+          // extension while the POST is in flight. Either way a walk taken later
+          // would be paired with a body serialized from a different graph.
+          snapshotOnSubmit: () => collectDisabledAncestorOutputs(rootGraph),
+          onPromptBody: (prompt, promptId, structural) => {
+            submittedPrompts.set(String(promptId), { prompt, structural: structural ?? [] });
           },
         });
       }
@@ -18428,10 +18425,11 @@ function describeCommand(cmd, msg, reply) {
     case "graph_run":
       return r.queued
         ? {
-            // #985 — a run that queues outputs from muted/bypassed subgraphs is not
-            // a plain success, and the user is the one paying for the renders. The
-            // count goes in the LABEL: this warning is worthless if it only exists
-            // in a payload field, since the whole failure was being silent about it.
+            // #985 — an accepted prompt carrying outputs from muted/bypassed
+            // subgraphs is not a plain success, and the user is the one paying for
+            // the renders. The count goes in the LABEL: this warning is worthless if
+            // it only exists in a payload field, since the whole failure was being
+            // silent about it. Ownership is NOT asserted — see the result fields.
             icon: r.disabled_outputs_in_accepted_prompts?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
               `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
