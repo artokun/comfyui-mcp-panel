@@ -272,18 +272,45 @@ const _groundingChain = new Map(); // svc -> tail Promise<void>
  *  EXACT SAME workflow it probed (`expect: wf` → saveActiveWorkflow refuses if the
  *  active workflow changed during the async probe, so we never authorize on tab A
  *  and write to tab B). Best-effort: any refusal/hiccup ⇒ null (leave ungrounded). */
-async function groundOnce(svc, { existsOnDisk, autoWorkflowName, reconcileSavedCopy, canvasBinding } = {}) {
+async function groundOnce(
+  svc,
+  { existsOnDisk, autoWorkflowName, reconcileSavedCopy, canvasBinding, identityProbe, onGrounded } = {},
+) {
   try {
     const wf = svc?.activeWorkflow;
     if (!needsGrounding(wf)) return null;
+    // #847 — probe the identity of the EXACT workflow this transaction is about to save,
+    // SYNCHRONOUSLY with reading it, before any await can change what is active.
+    //
+    // Doing this in the caller around `await groundActiveWorkflow(...)` is NOT equivalent,
+    // and that difference was a real defect (codex): grounding is single-flighted, so a
+    // caller can capture workflow B, await a grounding already running for A, and receive a
+    // truthy result — then record B's forms against A's save. Capture and record have to
+    // sit inside the same serialized operation as the save itself, keyed to `wf`.
+    let preIdentity = null;
+    try {
+      preIdentity = typeof identityProbe === "function" ? identityProbe(wf) : null;
+    } catch {
+      preIdentity = null; // bookkeeping must never stop a save that protects user work
+    }
     if (!(await groundingIsSafe(wf, existsOnDisk))) return null;
-    return await saveActiveWorkflow(svc, undefined, {
+    const savedName = await saveActiveWorkflow(svc, undefined, {
       autoWorkflowName,
       existsOnDisk,
       reconcileSavedCopy,
       canvasBinding,
       expect: wf,
     });
+    // The name the save ITSELF produced — never re-read from `svc.activeWorkflow`, which by
+    // now may be a different tab entirely.
+    if (savedName && preIdentity && typeof onGrounded === "function") {
+      try {
+        onGrounded({ savedName, identity: preIdentity, workflow: wf });
+      } catch {
+        /* same rule: never fail the save for bookkeeping */
+      }
+    }
+    return savedName;
   } catch {
     return null;
   }

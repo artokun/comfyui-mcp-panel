@@ -125,6 +125,7 @@ import {
   workflowIdentityForms,
   rememberPreGroundingIdentity,
   preGroundingIdentityForms,
+  pruneGroundingIdentities,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
@@ -1534,6 +1535,17 @@ const _preGroundingIdentities = (() => {
     return {};
   }
 })();
+
+/** Paths the workflow store currently lists, or null when it cannot be read (#847). */
+function knownWorkflowPaths() {
+  try {
+    const list = app?.extensionManager?.workflow?.workflows;
+    if (!Array.isArray(list)) return null;
+    return list.map((w) => w?.path).filter((p) => typeof p === "string" && p);
+  } catch {
+    return null;
+  }
+}
 
 function persistPreGroundingIdentities() {
   try {
@@ -4277,25 +4289,6 @@ function describeLiveCanvasBinding(wf) {
 /** If the open workflow was never saved to disk, save it (no dialog) so the
  *  agent works from a grounded file. Best-effort. Returns the saved name or null. */
 async function groundUnsavedWorkflow() {
-  // #847 — capture the identity this tab holds BEFORE the save, while it still holds it.
-  // Grounding replaces the ComfyWorkflow object and re-mints the storage uuid, and by the
-  // time anything observes the result every live carrier of the old identity is gone
-  // (measured: the object WeakMaps die with the object, `activeState.extra` is cleared,
-  // and the path alias is written from the NEW id). Read it here or not at all.
-  const preGroundRoute = (() => {
-    try {
-      return workflowTabId();
-    } catch {
-      return null;
-    }
-  })();
-  const preGroundStorageKey = (() => {
-    try {
-      return workflowStorageKey();
-    } catch {
-      return null;
-    }
-  })();
   try {
     // #330: ground the active workflow ATOMICALLY — probe its on-disk state and save
     // the EXACT SAME workflow (refusing if the user switched tabs during the async
@@ -4309,26 +4302,32 @@ async function groundUnsavedWorkflow() {
       // #708 — grounding is the save that CREATES the "Untitled …" file, so it is the
       // one that must not write a canvas belonging to a different workflow into it.
       canvasBinding: describeLiveCanvasBinding,
-    });
-    // #847 — bind the pre-save identity to the path the save just created. `saved` is a
-    // truthy name ONLY when this call actually persisted this tab's workflow, which is the
-    // causal ownership the history filter needs and which no later observer can prove.
-    if (saved) {
-      try {
-        const path = savedWorkflowPath(activeWorkflowRef()) || `workflows/${saved}.json`;
+      // #847 — both halves run INSIDE the serialized grounding, against the workflow that
+      // transaction is saving. The probe is synchronous with reading it, and the path comes
+      // from the save's own result, so neither can be about a tab the user switched to.
+      identityProbe: (wf) => ({
+        storageKey: workflowStorageKey(),
+        routeId: workflowTabId(wf),
+      }),
+      onGrounded: ({ savedName, identity }) => {
+        // A bare name from the save; a name that already carries a directory is used as-is.
+        const path = String(savedName).includes("/") ? String(savedName) : `workflows/${savedName}.json`;
+        // Prune BEFORE recording, never after: the path this save just created is not in
+        // the workflow store's list yet, so pruning afterwards deletes the very entry it
+        // just wrote. That is not theoretical — it broke conversation-persistence:507 the
+        // first time round.
+        pruneGroundingIdentities(_preGroundingIdentities, { knownPaths: knownWorkflowPaths() });
         if (
           rememberPreGroundingIdentity(_preGroundingIdentities, {
             path,
-            storageKey: preGroundStorageKey,
-            routeId: preGroundRoute,
+            storageKey: identity?.storageKey,
+            routeId: identity?.routeId,
           })
         ) {
           persistPreGroundingIdentities();
         }
-      } catch {
-        // Bookkeeping for a chat filter must never break the save that just succeeded.
-      }
-    }
+      },
+    });
     return saved;
   } catch {
     return null; // best-effort — never block the chat on a save hiccup

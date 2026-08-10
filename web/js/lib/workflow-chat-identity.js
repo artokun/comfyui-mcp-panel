@@ -74,6 +74,26 @@ export function sameWorkflowObject(a, b) {
  *  can't prove fails SAFE (no carry); the lazy backstop / proven repaint heals
  *  the genuine case afterward. Unknown predecessor state defaults to still-open
  *  (fail-safe: no carry). */
+export function shouldCarryIdentityAcrossSaveSwap({
+  preWf,
+  postWf,
+  savedAs = false,
+  preWfStillOpen = true,
+  postWfHasConflictingEstablishedIdentity = false,
+  postWfIsSaveProducedRecord = false,
+} = {}) {
+  if (savedAs) return false;
+  if (!preWf || !postWf || typeof postWf !== "object") return false;
+  if (preWf === postWf || sameWorkflowObject(preWf, postWf)) return false;
+  if (preWfStillOpen) return false;
+  // r7 P0 — an established, DIFFERENT identity on the successor is a conflict:
+  // overwriting it would promote the pre-save stamp over the object's own
+  // identity and poison the owner map (the r6 stale-lineage bypass, via
+  // registration this time). Fail closed; the proven-repaint remedy heals.
+  if (postWfHasConflictingEstablishedIdentity) return false;
+  return postWfIsSaveProducedRecord === true;
+}
+
 /**
  * #847 — remember the identity a tab held immediately BEFORE the panel grounded it.
  *
@@ -107,7 +127,9 @@ export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } 
   if (!key || !map || typeof map !== "object") return false;
   // A `tmp:` route is the proof that this tab was unsaved a moment ago. Without it there
   // is no boundary to bridge.
-  if (typeof routeId !== "string" || !routeId.startsWith("tmp:")) return false;
+  // `tmp:` alone is a prefix with no identifier behind it and matches nothing real
+  // (codex). Require an actual id.
+  if (typeof routeId !== "string" || !/^tmp:.+/.test(routeId)) return false;
   const forms = [storageKey, routeId].filter((f) => typeof f === "string" && f);
   if (!forms.length) return false;
   // Latest grounding into a path wins. A path is created fresh by the grounding that
@@ -117,32 +139,49 @@ export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } 
   return true;
 }
 
+/**
+ * Drop lineages that can no longer be about a workflow that exists (#847, codex).
+ *
+ * A path is not durable ownership. Delete `Untitled 2026-08-09.json` and let a later
+ * workflow take the same name and the stale entry would surface a dead workflow's
+ * conversations under its namesake — a false INCLUSION, which is worse than the missing
+ * row this fixes, because "Current workflow only" is precisely a promise not to do that.
+ *
+ * `knownPaths` is the workflow store's own list. An entry whose path is not in it names a
+ * file that is gone, so its lineage can never legitimately match again. When the list
+ * cannot be read the map is left ALONE rather than cleared — absence of evidence is not
+ * evidence that every workflow was deleted.
+ *
+ * `max` is hygiene, not correctness: insertion order is preserved by JS objects for string
+ * keys, so the oldest entries go first once the map exceeds it.
+ */
+export function pruneGroundingIdentities(map, { knownPaths, max = 200 } = {}) {
+  if (!map || typeof map !== "object") return false;
+  let changed = false;
+  if (Array.isArray(knownPaths)) {
+    const live = new Set(knownPaths.map((p) => normalizedWorkflowPath(p)).filter(Boolean));
+    for (const key of Object.keys(map)) {
+      if (!live.has(key)) {
+        delete map[key];
+        changed = true;
+      }
+    }
+  }
+  const keys = Object.keys(map);
+  const limit = Number.isFinite(max) && max > 0 ? max : 200;
+  for (const key of keys.slice(0, Math.max(0, keys.length - limit))) {
+    delete map[key];
+    changed = true;
+  }
+  return changed;
+}
+
 /** The pre-grounding identity forms recorded for `path`, if any (#847). */
 export function preGroundingIdentityForms(map, path) {
   const key = normalizedWorkflowPath(path);
   if (!key || !map || typeof map !== "object") return [];
   const forms = map[key];
   return Array.isArray(forms) ? forms.filter((f) => typeof f === "string" && f) : [];
-}
-
-export function shouldCarryIdentityAcrossSaveSwap({
-  preWf,
-  postWf,
-  savedAs = false,
-  preWfStillOpen = true,
-  postWfHasConflictingEstablishedIdentity = false,
-  postWfIsSaveProducedRecord = false,
-} = {}) {
-  if (savedAs) return false;
-  if (!preWf || !postWf || typeof postWf !== "object") return false;
-  if (preWf === postWf || sameWorkflowObject(preWf, postWf)) return false;
-  if (preWfStillOpen) return false;
-  // r7 P0 — an established, DIFFERENT identity on the successor is a conflict:
-  // overwriting it would promote the pre-save stamp over the object's own
-  // identity and poison the owner map (the r6 stale-lineage bypass, via
-  // registration this time). Fail closed; the proven-repaint remedy heals.
-  if (postWfHasConflictingEstablishedIdentity) return false;
-  return postWfIsSaveProducedRecord === true;
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.

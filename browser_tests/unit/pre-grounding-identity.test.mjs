@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import {
   rememberPreGroundingIdentity,
   preGroundingIdentityForms,
+  pruneGroundingIdentities,
   normalizedWorkflowPath,
 } from "../../web/js/lib/workflow-chat-identity.js";
 
@@ -85,4 +86,43 @@ test("#847: the latest grounding into a path replaces an older lineage", () => {
   rememberPreGroundingIdentity(map, { path: PATH, storageKey: KEY, routeId: TMP });
   rememberPreGroundingIdentity(map, { path: PATH, storageKey: "workflow:newer", routeId: "tmp:newer" });
   assert.deepEqual(preGroundingIdentityForms(map, PATH), ["workflow:newer", "tmp:newer"]);
+});
+
+test("#847: a bare tmp: prefix is not an identity", () => {
+  // `startsWith("tmp:")` accepted `tmp:` itself (codex) — a prefix with nothing behind it,
+  // which names no workflow and could only ever match by accident.
+  const map = {};
+  assert.equal(rememberPreGroundingIdentity(map, { path: PATH, storageKey: KEY, routeId: "tmp:" }), false);
+  assert.deepEqual(map, {});
+});
+
+test("#847: a lineage whose workflow is gone is dropped, not left to catch a namesake", () => {
+  // The dangerous direction. Delete a workflow, let a new one take the name, and a kept
+  // entry would show the dead workflow's chats under its successor — a false INCLUSION in
+  // the one filter whose entire promise is not to do that.
+  const map = {};
+  rememberPreGroundingIdentity(map, { path: "workflows/Gone.json", storageKey: KEY, routeId: TMP });
+  rememberPreGroundingIdentity(map, { path: "workflows/Live.json", storageKey: KEY, routeId: TMP });
+  assert.equal(pruneGroundingIdentities(map, { knownPaths: ["workflows/Live.json"] }), true);
+  assert.deepEqual(preGroundingIdentityForms(map, "workflows/Gone.json"), []);
+  assert.deepEqual(preGroundingIdentityForms(map, "workflows/Live.json"), [KEY, TMP]);
+});
+
+test("#847: an unreadable workflow list prunes nothing", () => {
+  // Absence of evidence is not evidence every workflow was deleted. Clearing here would
+  // silently reintroduce the bug whenever the store is momentarily unavailable.
+  const map = {};
+  rememberPreGroundingIdentity(map, { path: PATH, storageKey: KEY, routeId: TMP });
+  assert.equal(pruneGroundingIdentities(map, { knownPaths: null }), false);
+  assert.deepEqual(preGroundingIdentityForms(map, PATH), [KEY, TMP]);
+});
+
+test("#847: the map stays bounded, oldest first", () => {
+  const map = {};
+  const paths = Array.from({ length: 6 }, (_, i) => `workflows/w${i}.json`);
+  for (const p of paths) rememberPreGroundingIdentity(map, { path: p, storageKey: KEY, routeId: TMP });
+  pruneGroundingIdentities(map, { knownPaths: paths, max: 4 });
+  assert.equal(Object.keys(map).length, 4);
+  assert.deepEqual(preGroundingIdentityForms(map, paths[0]), [], "the oldest went first");
+  assert.deepEqual(preGroundingIdentityForms(map, paths[5]), [KEY, TMP], "the newest stayed");
 });
