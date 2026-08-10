@@ -22,7 +22,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { RELEASE_SUBJECT_ERE, isReleaseSubject } from "./lib/changelog-match.mjs";
+import { isReleaseSubject, pickReleaseSha } from "./lib/changelog-match.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHANGELOG = join(ROOT, "CHANGELOG.md");
@@ -63,8 +63,11 @@ function prevTag() {
     // `chore(release):` never matched one, every run fell through to the first commit,
     // and each entry regenerated the entire history. The anchor is the version at the
     // START of the subject; whatever follows it is free text.
-    const sha = git(`log -1 --pretty=format:%H -E --grep="${RELEASE_SUBJECT_ERE}"`);
-    if (/^[0-9a-f]{7,40}$/.test(sha)) return sha;
+    // Subjects only, matched in JS. NOT `--grep`: that searches the whole message per
+    // line, so `^<version>` also fires on a BODY line and an ordinary commit becomes the
+    // release boundary — silently truncating the entry (codex, #932).
+    const sha = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
+    if (sha) return sha;
   } catch {
     /* no release commit */
   }

@@ -22,7 +22,7 @@
 // time and cannot be imported by a test.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { RELEASE_SUBJECT_ERE, isReleaseSubject } from "../../scripts/lib/changelog-match.mjs";
+import { SEP, isReleaseSubject, pickReleaseSha } from "../../scripts/lib/changelog-match.mjs";
 
 test("#932: this repo's own release subjects are recognised", () => {
   // The shape every release here actually has. The old predicate matched none of them.
@@ -52,17 +52,43 @@ test("#932: ordinary commits are not mistaken for releases", () => {
   }
 });
 
-test("#932: the grep the base search uses is the same rule, in ERE", () => {
-  // prevTag() hands this to `git log -E --grep`. If it drifts from isReleaseSubject, the
-  // base commit and the commits excluded from the entry disagree — which is exactly the
-  // silent, plausible-looking corruption this issue is about.
-  const ere = new RegExp(RELEASE_SUBJECT_ERE);
-  for (const s of ["0.11.75 — a thing (#920)", "0.11.40 (#656)", "v1.2.3"]) {
-    assert.equal(ere.test(s), true, `grep must match ${s}`);
-  }
-  for (const s of ["fix(x): not a release", "feat: support 1.2.3 style ids"]) {
-    assert.equal(ere.test(s), false, `grep must not match ${s}`);
-  }
-  // A version must not anchor on a LONGER one: 0.11.7 is not 0.11.75.
-  assert.equal(new RegExp("^v?0\\.11\\.7([^0-9]|$)").test("0.11.75 — x"), false);
+/** One `--pretty=format:%H%x1f%s` line. */
+const logLine = (sha, subject) => `${sha}${SEP}${subject}`;
+
+test("#932: the base is the most recent release commit", () => {
+  const sha = pickReleaseSha(
+    [
+      logLine("aaaaaaa1", "fix(save): report the workflow instance a save leaves active (#800)"),
+      logLine("bbbbbbb2", "0.11.76 — a rail id is not a missing node (comfyui-mcp#1294) (#931)"),
+      logLine("ccccccc3", "0.11.75 — installing a custom node clones it again (#920) (#928)"),
+    ].join("\n"),
+  );
+  assert.equal(sha, "bbbbbbb2", "the FIRST release in log order — git logs newest first");
+});
+
+test("#932: a version at the start of a commit BODY is not a release boundary", () => {
+  // The hazard that made `git log --grep` wrong (codex): --grep searches the whole message
+  // and matches per line, so `^<version>` fires on body lines too. Reading %s only is what
+  // makes this safe — and the commits in this very fix have bodies quoting versions.
+  //
+  // The body cannot even reach the predicate now, so this asserts the SHAPE that keeps it
+  // that way: a line whose subject is ordinary is skipped no matter what follows it, and
+  // the real release below it is the one selected.
+  const sha = pickReleaseSha(
+    [
+      logLine("aaaaaaa1", "docs(release): quote the release titles we produce"),
+      // If a body ever leaked into the subject field, it would arrive looking like this —
+      // and must still not win, because the subject is what is tested.
+      logLine("bbbbbbb2", "fix(changelog): anchor on the previous release (#932)"),
+      logLine("ccccccc3", "0.11.76 — a rail id is not a missing node (#931)"),
+    ].join("\n"),
+  );
+  assert.equal(sha, "ccccccc3", "an ordinary subject must never become the release anchor");
+});
+
+test("#932: no release in history falls back to the caller's first-commit path", () => {
+  assert.equal(pickReleaseSha([logLine("aaaaaaa1", "feat: initial commit")].join("\n")), null);
+  assert.equal(pickReleaseSha(""), null);
+  // Malformed lines must be skipped, not crash a release.
+  assert.equal(pickReleaseSha("garbage\nnot-a-sha\x1f0.11.76 — x"), null);
 });
