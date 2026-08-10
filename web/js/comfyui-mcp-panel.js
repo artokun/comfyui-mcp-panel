@@ -148,6 +148,7 @@ import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/n
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
+import { releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
@@ -2818,6 +2819,14 @@ function lsSet(key, val) {
 // (never plaintext in comfy.settings.json) — their settings are BUTTONS that drive
 // the existing secure request_secret flow into the orchestrator's secure store.
 // ---------------------------------------------------------------------------
+// #758 — the panel version this browser last ANNOUNCED to the user.
+//
+// localStorage, not a ComfyUI setting, for two reasons. It is genuinely per-browser —
+// "what this browser has already been told" — and a ComfyUI setting is per-user across
+// devices, which would silence the notice on a second machine that has not seen it. And
+// a setting has to be REGISTERED to be readable, which would put a bookkeeping value in
+// the settings UI where a user could only break it.
+const LAST_SEEN_VERSION_KEY = "comfyui-mcp.panel.lastSeenVersion";
 const SETTING_BACKEND = "comfyui-mcp.defaultBackend";
 // Default model/effort are now PER-BACKEND (one independent setting each per
 // provider), so the Claude group never resets/repopulates the Codex group on a
@@ -17863,6 +17872,15 @@ const PANEL_CSS = `
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
 .cmcp-iconbtn .pi { font-size: 0.875rem; }
+/* #758 — the update notice. Sits in the transcript as a system line, so it inherits
+   the panel's scale and scroll rather than becoming a modal the user must dismiss. */
+.cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+.cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
+.cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
+.cmcp-whatsnew-list li { line-height: 1.45; }
+.cmcp-whatsnew-tag { display: inline-block; font-size: 0.58rem; text-transform: uppercase;
+  letter-spacing: 0.04em; opacity: 0.75; border: 1px solid currentColor; border-radius: 3px;
+  padding: 0 0.22rem; margin-right: 0.15rem; vertical-align: baseline; }
 .cmcp-workflow-version { margin-top: 0.35rem; font-size: 0.58rem; opacity: 0.62;
   display: flex; gap: 0.3rem; align-items: center; }
 .cmcp-workflow-version .pi { font-size: 0.58rem; }
@@ -22842,6 +22860,67 @@ function buildPanel() {
     scrollLog();
   }
 
+  /**
+   * #758 — say what changed, once, after the install moved under the user.
+   *
+   * The panel updates from the Comfy Registry and the orchestrator runs
+   * `npx comfyui-mcp@latest`, so the version moves without the user asking. Their first
+   * signal is behaviour they did not expect, which reads as a bug rather than a release.
+   *
+   * Silent on a FIRST run. An unrecorded last-seen version means a fresh install or a
+   * user who predates this feature, and opening with a wall of history nobody asked for
+   * is the opposite of the point — it records the version and announces the NEXT change,
+   * which is the first one it can honestly call a change.
+   *
+   * The changelog is fetched ONLY when there is something to announce. It is ~140KB and
+   * the overwhelmingly common case is no version change at all.
+   */
+  async function announcePanelUpdate() {
+    try {
+      const lastSeen = lsGet(LAST_SEEN_VERSION_KEY);
+      // Record first, announce second. If the fetch below throws, the user is not asked
+      // again on every reload for a change that already happened.
+      if (String(lastSeen || '') === PANEL_VERSION) return;
+      lsSet(LAST_SEEN_VERSION_KEY, PANEL_VERSION);
+      if (updateAnnouncement({ lastSeen, current: PANEL_VERSION }) === 'none') return;
+
+      const res = await fetch('/extensions/comfyui-mcp-panel/changelog.json', { cache: 'no-cache' });
+      if (!res.ok) return; // a missing file is not worth a message about a message
+      const data = await res.json();
+      const picked = releasesSince(data?.releases, { lastSeen, current: PANEL_VERSION });
+      const entries = summarizeReleases(picked, { maxEntries: 8 });
+      if (!entries.length) return;
+
+      const box = document.createElement('div');
+      box.className = 'cmcp-sys cmcp-whatsnew';
+      box.dataset.testid = 'panel-whats-new';
+      const head = document.createElement('div');
+      head.className = 'cmcp-whatsnew-head';
+      head.textContent = `Updated to ${PANEL_VERSION} (you were on ${lastSeen}) — what changed:`;
+      box.appendChild(head);
+      const list = document.createElement('ul');
+      list.className = 'cmcp-whatsnew-list';
+      for (const entry of entries) {
+        const li = document.createElement('li');
+        const tag = document.createElement('span');
+        tag.className = 'cmcp-whatsnew-tag';
+        // Fixed vs Changed is the distinction the report asks for: "this used to work
+        // differently on purpose" is a different message from "this was broken".
+        tag.textContent = entry.section;
+        li.appendChild(tag);
+        // textContent, never innerHTML — changelog text is repo-authored but this is a
+        // rendering path, and one day it will be fed something else.
+        li.appendChild(document.createTextNode(' ' + entry.text));
+        list.appendChild(li);
+      }
+      box.appendChild(list);
+      log.appendChild(box);
+      scrollLog();
+    } catch {
+      // A release note is never worth breaking the panel over.
+    }
+  }
+
   function appendActivity(cmd, msg, reply) {
     const { icon, text, detail } = describeCommand(cmd, msg, reply);
     const card = { icon, text, detail, error: !reply.ok };
@@ -24647,6 +24726,10 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+
+  // #758 — announce an update once the transcript exists to receive it. Deliberately
+  // NOT awaited: a release note must never sit in front of the panel becoming usable.
+  announcePanelUpdate();
 
   // Per-workflow auto-follow. Sync to the current workflow's thread NOW (initial
   // bind), then poll: under keep-alive the panel does NOT re-mount on a ComfyUI

@@ -45,6 +45,10 @@ console.log(`set version ${version} in pyproject.toml + PANEL_VERSION (web/js/co
 // — a bump must not fail because the changelog gen hiccuped.
 try {
   execFileSync("node", [join(root, "scripts", "gen-changelog.mjs"), version], { stdio: "inherit" });
+  // #758 — regenerate the panel-readable copy from the changelog we just wrote. It has to
+  // run AFTER gen-changelog, or the release ships notes that stop one version short of
+  // itself — the one version the user most needs to read.
+  execFileSync("node", [join(root, "scripts", "gen-changelog-json.mjs")], { stdio: "inherit" });
 } catch (err) {
   console.warn(`changelog generation skipped: ${err instanceof Error ? err.message : String(err)}`);
 }
