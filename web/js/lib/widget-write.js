@@ -14,12 +14,17 @@ const reflectApply = Reflect.apply;
 /**
  * #976: describe a thrown value for a disclosure message.
  *
- * Renders EXACTLY what `${threw?.message ?? threw}` rendered before — `new Error("")`
- * still yields an empty detail, a thrown string still yields itself, `{ message: 0 }`
- * still yields `0` — and adds only the two things that were missing: nullish throws
- * (which the old truthiness test never reached) and totality. `throw` accepts any
- * value, so `.message` may be a getter that throws and `toString` may throw, and a
- * disclosure that exists to REPORT a throw must not itself throw (codex round 3).
+ * Renders what `${threw?.message ?? threw}` rendered before — `new Error("")` still
+ * yields an empty detail, a thrown string still yields itself, `{ message: 0 }` still
+ * yields `0` — and adds only what was missing: nullish throws (which the old
+ * truthiness test never reached) and totality. `throw` accepts any value, so
+ * `.message` may be a getter that throws and `toString` may throw, and a disclosure
+ * that exists to REPORT a throw must not itself throw (codex round 3).
+ *
+ * Not equivalent in the cases where the OLD form threw: a Symbol (or a Symbol-valued
+ * `message`) cannot be implicitly coerced, so template interpolation threw where
+ * `String()` returns `Symbol(x)`. Deliberate — those are exactly the throws that used
+ * to escape the reporting path (codex round 4).
  */
 function describeThrown(err) {
   // The one case where a label is warranted: there is nothing else to print, and

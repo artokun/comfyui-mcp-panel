@@ -2649,6 +2649,12 @@ test("#976 (codex NO-SHIP 3): the detail text renders exactly what it rendered b
   assert.doesNotMatch(detailFor(new Error("")), /non-Error/, "an Error is never labelled a non-Error value");
   assert.match(detailFor({ message: 0 }), /The exception \(0\) came from/, "a non-string message renders as before");
   assert.match(detailFor("boom"), /The exception \(boom\) came from/, "a thrown string renders as itself");
+  // codex round 4: the ONE place it is deliberately NOT equivalent. Implicit coercion
+  // of a Symbol throws, so the old `${threw?.message ?? threw}` blew up inside the
+  // reporting path — the throw that reports a throw. `String()` is explicit and does
+  // not, so this is now describable instead of fatal.
+  assert.match(detailFor(Symbol("sym boom")), /The exception \(Symbol\(sym boom\)\) came from/);
+  assert.match(detailFor({ message: Symbol("msg boom") }), /The exception \(Symbol\(msg boom\)\) came from/);
 });
 
 test("#976 (codex NO-SHIP 3): a HOSTILE thrown value cannot break the report that exists to disclose it", () => {
