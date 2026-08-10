@@ -22,9 +22,10 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
   mockBridge
 }) => {
   await panel.goto()
-  // Point the panel at the MockBridge. In external mode this non-default URL is a
-  // manual override, so Connect dials it straight (no host involvement).
-  await panel.setBridgeUrl(mockBridge.url)
+  // NB: panel.setBridgeUrl() is deliberately NOT used here. It only records a
+  // PENDING url that panel.connect() applies via Advanced + Reconnect; this spec
+  // clicks the real **Connect** button instead (that is the behaviour under test),
+  // so the pending url would never be applied. See step 4 below.
 
   // EVERYTHING that shapes the connect decision must be in place BEFORE the panel
   // mounts (openSidebar), otherwise the panel can auto-connect during mount and
@@ -69,14 +70,29 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
     })
   })
 
+  // 4) The bridge URL is configured AFTER mount, just before the click — see the
+  //    block below. It is the one piece of setup that must NOT be pre-mount.
   // Now mount the panel — external mode on, auto-connect off, guard armed.
   await panel.openSidebar()
+
+  //    …and re-apply it AFTER mount. The pre-mount write above is clobbered when
+  //    the panel registers its own settings during mount: reading it back at that
+  //    point returned the DEFAULT `ws://127.0.0.1:9180`, which is exactly what this
+  //    spec was dialling. Auto-connect was removed in (1), so the panel sits idle
+  //    here and this write lands before the only connect attempt.
+  await panel.page.evaluate(([id, u]) => {
+    const w = window as unknown as {
+      comfyAPI?: { app?: { app?: { ui?: { settings?: { setSettingValue?: (k: string, v: unknown) => void } } } } }
+      app?: { ui?: { settings?: { setSettingValue?: (k: string, v: unknown) => void } } }
+    }
+    const app = w.comfyAPI?.app?.app || w.app
+    app?.ui?.settings?.setSettingValue?.(id, u)
+  }, ['comfyui-mcp.bridgeUrl.single', mockBridge.url])
 
   // Click the REAL Connect button (whose default path would POST /connect) — in
   // external mode it must skip that and dial the Bridge URL directly.
   await panel.openConnectionSettings()
   await panel.connectButton.click()
-
   await expect(panel.statusPill).toContainText('connected')
   await expect(panel.statusDot).toHaveClass(/connected/)
   expect(connectPosts).toBe(0)
