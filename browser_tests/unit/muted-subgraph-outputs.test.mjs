@@ -69,20 +69,26 @@ test("#985 an ACTIVE chain yields nothing — this must not fire on a healthy gr
   assert.deepEqual(collectDisabledAncestorOutputs(nesting(0)), []);
 });
 
-test("#985 (codex): NO output-node predicate gates the collector — the submitted prompt decides", () => {
-  // The first version filtered on `constructor.nodeData.output_node`. graphToPrompt
-  // does not decide prompt membership that way, so that convention could have hidden
-  // a real execution root — a FALSE NEGATIVE, the exact failure class of this issue.
-  // Every node under a disabled ancestor is collected; the intersection with the
-  // prompt that was actually submitted is what reports.
-  const g = graphOf([wrapper(5, 0, [wrapper(4, MODE_MUTE, [plainNode(3, "KSampler"), plainNode(9, "VAEDecode")])])]);
+test("#985 (codex r2): prompt membership is NOT execution — only OUTPUT nodes are claimed", () => {
+  // Presence in the submitted body does not mean a node runs: the backend picks
+  // execution ROOTS from output nodes and runs what those depend on. An unconnected
+  // KSampler inside a muted wrapper is serialized into the body and never executes,
+  // so reporting it as "will run" would be a false claim — this issue's own failure
+  // mode, pointed the other way.
+  const g = graphOf([
+    wrapper(5, 0, [
+      wrapper(4, MODE_MUTE, [plainNode(3, "KSampler"), plainNode(9, "VAEDecode"), outputNode(8, "SaveImage")]),
+    ]),
+  ]);
   const found = collectDisabledAncestorOutputs(g);
-  assert.deepEqual(found.map((f) => f.exec_id).sort(), ["5:4:3", "5:4:9"], "collected without judging node kind");
-  // ComfyUI queued only one of them ⇒ only that one is reported.
-  assert.deepEqual(
-    disabledOutputsInPrompt({ "5:4:9": { class_type: "VAEDecode" } }, found).map((o) => o.exec_id),
-    ["5:4:9"],
-  );
+  assert.deepEqual(found.map((f) => f.exec_id), ["5:4:8"], "the output node, and only it");
+  // Even with every node in the body, the two non-outputs are never reported.
+  const body = {
+    "5:4:3": { class_type: "KSampler" },
+    "5:4:9": { class_type: "VAEDecode" },
+    "5:4:8": { class_type: "SaveImage" },
+  };
+  assert.deepEqual(disabledOutputsInPrompt(body, found).map((o) => o.exec_id), ["5:4:8"]);
 });
 
 test("#985 (codex): one subgraph DEFINITION instanced twice is walked per INSTANCE", () => {
@@ -232,6 +238,6 @@ test("#985 the note caps its list but says how many it left out", () => {
     disabled_ancestor_state: "muted",
   }));
   const note = disabledOutputsNote(many);
-  assert.match(note, /9 nodes/);
+  assert.match(note, /9 OUTPUT nodes/);
   assert.match(note, /and 4 more/, "a truncated list must not read as the whole list");
 });

@@ -84,13 +84,19 @@ export function collectDisabledAncestorOutputs(rootGraph) {
         continue;
       }
       if (!disabledAncestors.length) continue;
-      // NO output-node predicate (codex NO-SHIP): `graphToPrompt` does not decide
-      // prompt membership by `constructor.nodeData.output_node`, so gating on that
-      // convention risked missing a real execution root — a false negative, which is
-      // the failure this issue is about. Every node under a disabled ancestor is
-      // collected here; the intersection with the SUBMITTED prompt below is what
-      // decides, and a node ComfyUI did not queue never appears.
+      // Only OUTPUT nodes (codex NO-SHIP round 2). Presence in the submitted prompt
+      // is NOT execution: the backend picks execution ROOTS from output nodes and
+      // then runs what those roots depend on, so an unconnected KSampler inside a
+      // muted wrapper is serialized into the body and never runs. Reporting it as
+      // "will run" would be exactly the kind of false claim this issue is about,
+      // pointed the other way.
       //
+      // The known limit, stated rather than hidden: this uses ComfyUI's own
+      // `nodeData.output_node` convention, so a custom node the server treats as an
+      // output while advertising it differently would be MISSED. That direction is
+      // an under-report of a defect that is already happening, never a false alarm
+      // about a healthy graph.
+      if (!node?.constructor?.nodeData?.output_node) continue;
       // The NEAREST disabled ancestor is the one a reader acts on — the wrapper
       // whose switch they flipped.
       const nearest = disabledAncestors[disabledAncestors.length - 1];
@@ -146,9 +152,10 @@ export function disabledOutputsNote(offenders) {
   // — or could have — is false). The remedy is therefore interruption, and the
   // scoped re-run, not a promise.
   return (
-    `ALREADY QUEUED, AND WILL RUN: ${n} node${n === 1 ? "" : "s"} inside a ` +
+    `ALREADY QUEUED, AND WILL RUN: ${n} OUTPUT node${n === 1 ? "" : "s"} inside a ` +
     `${states.join("/")} subgraph ${n === 1 ? "is" : "are"} in the prompt this run submitted — ` +
-    `${which}${more}. Read from the request body as sent, so this is what ComfyUI accepted, ` +
+    `${which}${more}. Output nodes are the execution roots ComfyUI renders from, so these ` +
+    `produce results. Read from the request body of a prompt the server ACCEPTED, so this is ` +
     `not a re-derivation. On the build measured for this (ComfyUI 0.31.1 / frontend 1.48.7) ` +
     `a subgraph wrapper's mute/bypass is applied only at the TOP level of the workflow and a ` +
     `wrapper nested inside another subgraph is ignored; whether other builds differ has not ` +

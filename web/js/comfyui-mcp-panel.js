@@ -11110,9 +11110,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
     let runScopeResult = null;
-    // #985 — the FIRST /prompt body this run submitted, captured by the interceptor.
-    // The batch repeats the same graph, so the first is representative.
-    let submittedPrompt = null;
+    // #985 — every ACCEPTED /prompt body observed during this run's queue call.
+    // Not just the first (codex NO-SHIP round 2): with batch>1 each repetition posts
+    // its own body, queue-time hooks can change later ones, and "the first is
+    // representative" is a guess, not an invariant. Keyed by prompt_id so a batch is
+    // covered and duplicates cannot inflate the count.
+    const submittedPrompts = new Map();
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -11146,11 +11149,11 @@ const GRAPH_TOOL_EXECUTORS = {
           origFetchApi,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
-          // #985 — keep the prompt AS SUBMITTED. Re-deriving it afterwards with a
-          // second app.graphToPrompt() would describe a different compilation than
-          // the one ComfyUI accepted, and that call is not read-only.
-          onPromptBody: (prompt) => {
-            if (submittedPrompt == null) submittedPrompt = prompt;
+          // #985 — keep each prompt AS SUBMITTED AND ACCEPTED. Re-deriving one
+          // afterwards with a second app.graphToPrompt() would describe a different
+          // compilation than the one ComfyUI accepted, and that call is not read-only.
+          onPromptBody: (prompt, promptId) => {
+            submittedPrompts.set(String(promptId), prompt);
           },
         });
       }
@@ -11379,20 +11382,33 @@ const GRAPH_TOOL_EXECUTORS = {
     //
     // Scoped runs are exempt: partial_execution_targets already names the roots,
     // and the reporter verified that path scopes correctly.
-    if (!partialTargets && submittedPrompt) {
+    if (!partialTargets && submittedPrompts.size) {
       try {
-        // Intersect "structurally under a disabled ancestor" with the prompt THIS
-        // RUN ACTUALLY SUBMITTED. That intersection reports the defect rather than
-        // reimplementing ComfyUI's rules: a wrapper mode ComfyUI honoured (measured:
-        // the top-level one) keeps its nodes out of the body, so nothing is
-        // reported, and a build that fixes nested wrappers silences this by itself.
-        const offenders = disabledOutputsInPrompt(
-          submittedPrompt,
-          collectDisabledAncestorOutputs(rootGraph),
-        );
+        // Intersect "structurally under a disabled ancestor" with the prompts THIS
+        // RUN ACTUALLY SUBMITTED AND HAD ACCEPTED. That intersection reports the
+        // defect rather than reimplementing ComfyUI's rules: a wrapper mode ComfyUI
+        // honoured (measured: the top-level one) keeps its outputs out of the body,
+        // so nothing is reported, and a build that fixes nested wrappers silences
+        // this by itself.
+        //
+        // Every accepted body in the batch is checked, and offenders are merged by
+        // exec id: one offending output is one finding however many repetitions
+        // carried it, and a repetition that differs is not missed.
+        const structural = collectDisabledAncestorOutputs(rootGraph);
+        const merged = new Map();
+        for (const prompt of submittedPrompts.values()) {
+          for (const o of disabledOutputsInPrompt(prompt, structural)) merged.set(o.exec_id, o);
+        }
+        const offenders = [...merged.values()];
         if (offenders.length) {
           accept.disabled_outputs_queued = offenders;
           accept.disabled_outputs_note = disabledOutputsNote(offenders);
+          // The claim is scoped to what was actually inspected: prompts POSTED
+          // during this run's queue call and accepted by the server. The unscoped
+          // interceptor cannot prove a body was ours rather than a concurrent
+          // queue action from the UI or another extension, so the count is
+          // reported instead of an ownership claim that has not been established.
+          accept.disabled_outputs_prompts_inspected = submittedPrompts.size;
         }
       } catch {
         /* a diagnostic must never take down the run it describes */

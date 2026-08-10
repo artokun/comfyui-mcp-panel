@@ -998,25 +998,48 @@ export function createRunFetchInterceptor({
   onPromptBody = null,
 } = {}) {
   return async function runFetchInterceptor(route, options) {
-    // #985 — hand out the prompt AS SUBMITTED, before awaiting the response. A
-    // caller that wants to know which nodes this run will execute must read THIS
-    // body: re-deriving it with a second `app.graphToPrompt()` compiles a
-    // DIFFERENT prompt (the graph may have moved, and that call is not read-only
-    // — it runs virtual-node applyToGraph and every widget's serializeValue), so
-    // it could describe a run that was never dispatched. Read-only here: the body
-    // is parsed, never modified, and a malformed one is simply not reported.
-    if (typeof onPromptBody === "function" && isPromptPost(route, options)) {
+    const isPrompt = isPromptPost(route, options);
+    // #985 — read the body BEFORE dispatch (it is the outgoing request) but only
+    // HAND IT OUT once the server has ACCEPTED it. Re-deriving the prompt later
+    // with a second `app.graphToPrompt()` would describe a different compilation
+    // than the one that was sent, and that call is not read-only — it runs
+    // virtual-node applyToGraph and every widget's serializeValue. Read-only here:
+    // the body is parsed, never modified.
+    //
+    // Gating on acceptance matters (codex NO-SHIP round 2): a request that failed
+    // to dispatch, was aborted, or was rejected must not be described as something
+    // that "will run". Only a body whose own response yielded a prompt_id is
+    // reported, and it is reported WITH that id so a caller can tie the two.
+    let pending = null;
+    if (typeof onPromptBody === "function" && isPrompt) {
       try {
+        // Stock ComfyUI posts a JSON string. Any other body shape (FormData,
+        // URLSearchParams, a Request) yields no diagnostic rather than a guess —
+        // an absence, not a claim of support.
         const raw = options?.body;
         const parsed = typeof raw === "string" ? JSON.parse(raw) : null;
-        if (parsed && typeof parsed.prompt === "object" && parsed.prompt) onPromptBody(parsed.prompt);
+        if (parsed && typeof parsed.prompt === "object" && parsed.prompt) pending = parsed.prompt;
       } catch {
         /* an unreadable body yields no report, never a broken run */
       }
     }
     const res = await origFetchApi(route, options);
-    if (isPromptPost(route, options) && res) {
-      await captureRunResponse(res, { onRejection, onPromptId });
+    if (isPrompt && res) {
+      let acceptedId = null;
+      await captureRunResponse(res, {
+        onRejection,
+        onPromptId: (pid) => {
+          acceptedId = pid;
+          onPromptId?.(pid);
+        },
+      });
+      if (pending && acceptedId != null) {
+        try {
+          onPromptBody(pending, acceptedId);
+        } catch {
+          /* a diagnostic must never break the run it describes */
+        }
+      }
     }
     return res;
   };

@@ -2725,3 +2725,79 @@ test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, n
     stop()
   }
 })
+
+// ---------------------------------------------------------------------------
+// #985 — onPromptBody hands out the prompt AS SUBMITTED, but ONLY once the server
+// has ACCEPTED it. The diagnostic built on this says "already queued, and will
+// run"; a body that never dispatched, was aborted, or was rejected must never
+// reach it. (codex NO-SHIP round 2 — the first version fired before dispatch.)
+// ---------------------------------------------------------------------------
+
+test("#985 onPromptBody fires with the submitted prompt and its accepted prompt_id", async () => {
+  const seen = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p-1" })),
+    onPromptBody: (prompt, id) => seen.push([prompt, id]),
+  });
+  await intercepted(...promptPost({ prompt: { "5:4:3": { class_type: "SaveVideo" } } }));
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0][0], { "5:4:3": { class_type: "SaveVideo" } }, "the body as sent");
+  assert.equal(seen[0][1], "p-1", "paired with the id the server returned");
+});
+
+test("#985 a REJECTED prompt is never handed out — nothing was queued to warn about", async () => {
+  const seen = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(400, { error: { type: "prompt_no_outputs" } })),
+    onPromptBody: (p) => seen.push(p),
+    onRejection: () => {},
+  });
+  await intercepted(...promptPost({ prompt: { "5:4:3": {} } }));
+  assert.deepEqual(seen, []);
+});
+
+test("#985 a request that THROWS hands out nothing, and the throw still propagates", async () => {
+  const seen = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: async () => {
+      throw new Error("network down");
+    },
+    onPromptBody: (p) => seen.push(p),
+  });
+  await assert.rejects(() => intercepted(...promptPost({ prompt: { "5:4:3": {} } })), /network down/);
+  assert.deepEqual(seen, [], "a request that never reached the server is not 'already queued'");
+});
+
+test("#985 a non-JSON body yields no diagnostic rather than a guess, and never breaks the run", async () => {
+  const seen = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p-2" })),
+    onPromptBody: (p) => seen.push(p),
+  });
+  for (const body of [new URLSearchParams({ a: "1" }), "{not json", undefined, JSON.stringify({ no_prompt: 1 })]) {
+    await intercepted("/prompt", { method: "POST", body });
+  }
+  assert.deepEqual(seen, [], "an unreadable or prompt-less body is an absence, never a claim");
+});
+
+test("#985 a THROWING onPromptBody cannot take down the run it only describes", async () => {
+  const ids = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p-3" })),
+    onPromptId: (p) => ids.push(p),
+    onPromptBody: () => {
+      throw new Error("diagnostic boom");
+    },
+  });
+  const res = await intercepted(...promptPost({ prompt: { "1": {} } }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(ids, ["p-3"], "the run's own bookkeeping is unaffected");
+});
+
+test("#985 the body is passed through untouched — the diagnostic reads, never rewrites", async () => {
+  const spy = makeServer(async () => jsonResponse(200, { prompt_id: "p-4" }));
+  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onPromptBody: () => {} });
+  const [route, options] = promptPost({ prompt: { "1": {} } });
+  await intercepted(route, options);
+  assert.equal(spy.calls[0].options, options, "the exact options object, not a copy");
+});
