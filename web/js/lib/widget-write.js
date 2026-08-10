@@ -1176,6 +1176,11 @@ export function applyWidgetWrite(
   // fired its hooks: an afterChange hook can itself re-stale a widget or change the
   // promotion topology, and that must be caught too (not just callback-time drift).
   let threw = null;
+  // #976: TRUE only while the widget's own callback function is executing. It is the
+  // one construct in this envelope whose throw the mechanism can ATTRIBUTE, and only
+  // because the lookup and the argument evaluation are hoisted out of it below — see
+  // the note there. Everything else stays unattributed, exactly as #639 requires.
+  let threwFromCallback = false;
   safeBefore();
   try {
     // Assign BOTH values first. The parent's projected promoted widget is a VIEW of
@@ -1192,14 +1197,33 @@ export function applyWidgetWrite(
     for (const dw of displayWidgets) dw.value = coerced;
     // Fire the inner widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
-    w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
+    //
+    // #976: the lookup and the arguments are evaluated BEFORE `threwFromCallback` is
+    // raised, and deliberately so. `w.callback` may be a throwing ACCESSOR and
+    // `targetNode.pos` a GETTER; neither of those is the callback failing, and
+    // blaming the node's callback for them would be exactly the unestablishable
+    // attribution #639 forbids. Only the invocation itself carries the flag.
+    //
+    // The call is bound explicitly because the original `w.callback?.(…)` form binds
+    // `this` to the widget and callbacks read `this.value`. A non-null callback that
+    // is not callable still throws a TypeError from this same point (from `.call`),
+    // which is attributable to the callback the node supplied.
+    const widgetCallback = w.callback;
+    const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
+    if (widgetCallback !== null && widgetCallback !== undefined) {
+      threwFromCallback = true;
+      widgetCallback.call(w, ...callbackArgs);
+      threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+    }
   } catch (err) {
-    // #639 (codex round-3 + delta-gate): WHICH construct threw is NOT recorded — a
-    // value setter can invoke the callback itself, `w.callback` can be a throwing
-    // accessor, a setter can throw before OR after applying, a rail/proxy setter
-    // or a `targetNode.pos` getter can throw, and a write to a frozen widget
-    // throws with no user code at all — so no attribution the mechanism cannot
-    // establish is ever reported. The disclosure below names none of them.
+    // #639 (codex round-3 + delta-gate): WHICH construct threw is not recorded for
+    // anything but the callback invocation — a value setter can invoke the callback
+    // itself, `w.callback` can be a throwing accessor, a setter can throw before OR
+    // after applying, a rail/proxy setter or a `targetNode.pos` getter can throw,
+    // and a write to a frozen widget throws with no user code at all. For every one
+    // of those `threwFromCallback` is FALSE and the disclosure names no construct,
+    // unchanged. #976 adds the single case the mechanism CAN establish: the throw
+    // propagated out of calling the widget's own callback function.
     threw = err;
   } finally {
     safeAfter();
@@ -1328,23 +1352,41 @@ export function applyWidgetWrite(
   // ESTABLISH is claimed. The write envelope evaluates value setters on the inner,
   // rail, and display proxies, property reads (`w.callback` may be a throwing
   // accessor, `targetNode.pos` a getter), and the callback invocation — and a
-  // plain write to a frozen widget throws with NO user code involved. So the
-  // message does not name ANY construct: only that an exception was thrown while
+  // plain write to a frozen widget throws with NO user code involved. So for all of
+  // those the message names NO construct: only that an exception was thrown while
   // applying the write. And read-back verifies only that the requested value IS
   // present — not that THIS write put it there (a frozen widget may already have
   // held it), so the disclosure claims "IS in effect", never "DID take effect".
   // What IS established and claimed: the requested value is present by read-back,
   // and the write's side effects may not have run or completed.
+  //
+  // #976: the callback INVOCATION is the one construct that is establishable, once
+  // its lookup and arguments are hoisted out of it (see the envelope above) — and
+  // naming it matters, because the unattributed wording leads with "an exception was
+  // thrown while applying the write", which reads as THE PANEL FAILED TO APPLY YOUR
+  // WRITE. That is the opposite of what happened, and #976 was filed here as a panel
+  // defect because of it. When the node's own callback is what threw, the disclosure
+  // leads with the write having succeeded and says whose code threw. Same facts, and
+  // an agent reading it stops treating an applied write as a failed one.
   if (threw) {
-    const threwLabel = "an exception was thrown while applying the write";
+    const threwDetail = threw?.message ?? threw;
+    const threwLabel = threwFromCallback
+      ? `an exception was thrown by the widget's OWN callback while applying the write`
+      : `an exception was thrown while applying the write`;
     if (!failure) {
-      writeWarning =
-        `${threwLabel} (${threw?.message ?? threw}); the requested value IS in effect — ` +
-        `verified present by read-back — and was NOT rolled back. Side effects the write ` +
-        `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +
-        `not have run or completed; inspect the node if dependents look stale.`;
+      writeWarning = threwFromCallback
+        ? `the write itself SUCCEEDED: the requested value IS in effect — verified present by ` +
+          `read-back — and was NOT rolled back. What threw is the widget's OWN callback, which ` +
+          `the node supplies and this write only invokes (${threwDetail}) — the fault is in that ` +
+          `node's code, not in the panel's write. Side effects that callback would normally ` +
+          `perform (refreshing dependent widgets, previews, thumbnails) may not have run or ` +
+          `completed; inspect the node if dependents look stale.`
+        : `${threwLabel} (${threwDetail}); the requested value IS in effect — ` +
+          `verified present by read-back — and was NOT rolled back. Side effects the write ` +
+          `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +
+          `not have run or completed; inspect the node if dependents look stale.`;
     } else {
-      failure = `${threwLabel} (${threw?.message ?? threw}); ${failure}`;
+      failure = `${threwLabel} (${threwDetail}); ${failure}`;
       if (threw instanceof WidgetWriteError) {
         originalErr = new WidgetWriteError(failure, {
           combo: threw.combo,
@@ -1563,12 +1605,20 @@ export function applyWidgetWrite(
   // proxies also synced so the outer node no longer shows a stale value (#477).
   // #639: write_warning discloses a widget callback that threw AFTER the verified
   // write landed — the value IS in effect, its side effects are uncertain.
+  // #976: `write_warning_source` carries the attribution as DATA, so a caller does not
+  // have to pattern-match prose to render it. Present ONLY for the establishable case;
+  // its absence means "not attributable", never "the panel's fault".
   return {
     node_id: targetNode.id,
     widget: w.name,
     previous: parentWidget ? previousParent : previous,
     value: w.value,
-    ...(writeWarning ? { write_warning: writeWarning } : {}),
+    ...(writeWarning
+      ? {
+          write_warning: writeWarning,
+          ...(threwFromCallback ? { write_warning_source: "widget_callback" } : {}),
+        }
+      : {}),
     // #805 — the write applied and the node quantized it. Report BOTH values so the
     // caller can carry the stored one forward instead of retrying the request.
     ...(normalization

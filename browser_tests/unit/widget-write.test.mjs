@@ -15,6 +15,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   applyWidgetWrite,
@@ -1211,7 +1212,11 @@ test("#366×#639: an INNER callback that throws AFTER the value landed is DISCLO
   // NOT rolled back: both inner and parent rail hold the new value (verified).
   assert.equal(inner.widgets[0].value, 704, "inner write stays — it took effect before the throw");
   assert.equal(parent.widgets[0].value, 704, "rail synced — never reported failed while applied");
-  assert.match(set.write_warning ?? "", /thrown while applying the write \(inner boom\)/, "the throw is disclosed, not hidden");
+  assert.match(
+    set.write_warning ?? "",
+    /widget's OWN callback, which the node supplies and this write only invokes \(inner boom\)/,
+    "the throw is disclosed, not hidden — and #976 attributes it to the node's callback",
+  );
   assert.equal(afterChangeRan, true, "afterChange still closes the envelope");
 });
 
@@ -1361,7 +1366,12 @@ test("#366×#639: a THROWING afterChange hook does not bypass verification — a
   // effect and is disclosed, never reported as a clean failure (#639).
   assert.equal(inner.widgets[0].value, 704, "inner write stays");
   assert.equal(parent.widgets[0].value, 704, "rail synced");
-  assert.match(set.write_warning ?? "", /thrown while applying the write \(inner boom\)/);
+  assert.match(set.write_warning ?? "", /widget's OWN callback[\s\S]*\(inner boom\)/);
+  assert.equal(
+    set.write_warning_source,
+    "widget_callback",
+    "a throwing afterChange hook does not steal the attribution from the callback that actually threw",
+  );
 });
 
 test("#366 HARD FAIL: an afterChange HOOK that re-stales the rail (after all callbacks) is still caught + rolled back", () => {
@@ -2446,9 +2456,144 @@ test("#639: a throwing callback on a verified write is DISCLOSED (write_warning)
   assert.equal(node.widgets[0].value, 10, "the write took effect and is NOT rolled back");
   assert.equal(set.value, 10);
   assert.ok(typeof set.write_warning === "string", "the throw is disclosed, never hidden");
-  assert.match(set.write_warning, /thrown while applying the write/, "the throw is disclosed, not hidden");
   assert.match(set.write_warning, /reading 'options'/, "carries the original error message");
   assert.match(set.write_warning, /IS in effect/, "says the requested value is present — never a clean-failure report");
+  // #976: the reporter read the old unattributed lede as "the panel failed to apply
+  // your write" and filed it here as a panel defect. The disclosure now leads with the
+  // write having SUCCEEDED and names whose code threw.
+  assert.match(set.write_warning, /^the write itself SUCCEEDED/, "leads with the outcome, not with the exception");
+  assert.match(set.write_warning, /widget's OWN callback/, "says WHOSE exception it was");
+  assert.match(
+    set.write_warning,
+    /not in the panel's write/,
+    "states the negative explicitly — this is what stops it being filed as a panel defect",
+  );
+  assert.equal(set.write_warning_source, "widget_callback", "the attribution is DATA, not only prose");
+});
+
+// ---- #976 boundary: attribution is claimed ONLY for the invocation itself. The
+//      lookup of `w.callback` and the evaluation of the callback's arguments happen
+//      OUTSIDE the attributed span, because a throwing accessor and a throwing
+//      `node.pos` getter are not the callback failing — and blaming the node's
+//      callback for them is precisely the unestablishable claim #639 forbids. -----
+
+test("#976 boundary: a throwing `callback` ACCESSOR is NOT attributed to the callback — it never ran", () => {
+  const w = {
+    name: "n",
+    type: "INT",
+    value: 1,
+    get callback() {
+      throw new Error("accessor boom");
+    },
+  };
+  const node = { id: 1, type: "N", widgets: [w] };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(node.widgets[0].value, 5, "the value assignment ran before the accessor was read");
+  assert.match(set.write_warning ?? "", /^an exception was thrown while applying the write \(accessor boom\)/);
+  assert.equal(set.write_warning_source, undefined, "no source claimed — the callback function never executed");
+  assert.doesNotMatch(set.write_warning ?? "", /OWN callback/, "must not blame a callback that never ran");
+});
+
+test("#976 boundary: a throwing `node.pos` GETTER is NOT attributed to the callback — the args failed, not the node's code", () => {
+  let callbackRan = false;
+  const node = {
+    id: 1,
+    type: "N",
+    get pos() {
+      throw new Error("pos boom");
+    },
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          callbackRan = true;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(callbackRan, false, "the argument list is evaluated before the call, so the callback never ran");
+  assert.equal(node.widgets[0].value, 5);
+  assert.match(set.write_warning ?? "", /^an exception was thrown while applying the write \(pos boom\)/);
+  assert.equal(set.write_warning_source, undefined, "no source claimed");
+});
+
+test("#976: a callback that RETURNS normally leaves no attribution behind for a later throw", () => {
+  // The flag is raised around the invocation and cleared when it returns. If it were
+  // only ever raised, every subsequent throw in the envelope would be mis-blamed on a
+  // callback that completed successfully. Nothing in this envelope throws after the
+  // callback today; this pins the clear so that stays true when something does.
+  let callbackRan = false;
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          callbackRan = true;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(callbackRan, true);
+  assert.equal(set.write_warning, undefined, "a clean write discloses nothing");
+  assert.equal(set.write_warning_source, undefined);
+});
+
+test("#976: the callback is still invoked with the widget as `this` and the same five arguments", () => {
+  // The attributed call binds explicitly (`cb.call(w, …)`) where the original used
+  // `w.callback?.(…)`. Both bind `this` to the widget and callbacks read `this.value`
+  // — a regression here would silently break every node that does.
+  let seenThis = null;
+  let seenArgs = null;
+  const canvas = { marker: "canvas" };
+  const w = {
+    name: "n",
+    type: "INT",
+    value: 1,
+    callback(...args) {
+      seenThis = this;
+      seenArgs = args;
+    },
+  };
+  const node = { id: 7, type: "N", pos: [10, 20], widgets: [w] };
+  applyWidgetWrite(node, "n", 5, { canvas });
+  assert.equal(seenThis, w, "`this` is the widget");
+  assert.equal(seenArgs.length, 5);
+  assert.equal(seenArgs[0], 5, "the coerced value");
+  assert.equal(seenArgs[1], canvas);
+  assert.equal(seenArgs[2], node);
+  assert.deepEqual(seenArgs[3], [10, 20], "node.pos");
+  assert.equal(seenArgs[4], undefined);
+});
+
+test("#976: the panel's own graph_set_widget summary reads the attribution DATA, and still has its unattributed fallback", () => {
+  // The lib's prose is what an AGENT reads; the summary line is what the USER reads,
+  // and it repeated the same "an exception was thrown while applying it" lede. This
+  // asserts the SHIPPED panel source (the summariser lives inside the monolith's
+  // switch and is not importable), so deleting either branch fails here.
+  const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(
+    panelSrc,
+    /r\.set\?\.write_warning_source === "widget_callback"/,
+    "reads the structured field — never pattern-matches the warning prose",
+  );
+  assert.match(
+    panelSrc,
+    /the node's own widget callback threw, so its side effects may not have run/,
+    "the attributed summary line",
+  );
+  assert.match(
+    panelSrc,
+    /an exception was thrown while applying it; side effects may not have run or completed/,
+    "the unattributed line SURVIVES — an unrecognised source must degrade to it, not mis-attribute",
+  );
 });
 
 test("#639: a promoted write whose inner callback throws still discloses success when inner + rail both verify", () => {
@@ -2489,7 +2634,9 @@ test("#639: a callback that throws AND leaves the write unverified still FAILS +
     () => applyWidgetWrite(node, "c", "a", HOOKS),
     (err) =>
       err instanceof WidgetWriteError &&
-      /thrown while applying the write \(combo boom\)/.test(err.message) &&
+      // #976: the failure branch is attributed too — the structural verdict is the
+      // panel's, the exception that preceded it is the node's, and both are named.
+      /thrown by the widget's OWN callback while applying the write \(combo boom\)/.test(err.message) &&
       /did not retain the requested value/.test(err.message),
   );
   assert.equal(seenAtCallback, "a", "the requested value WAS assigned before the callback fired");
@@ -2517,7 +2664,7 @@ test("#639: a thrown WidgetWriteError on an unverified write keeps BOTH causes a
     (err) =>
       err instanceof WidgetWriteError &&
       err.combo === true && // the refresh-retry signal survives the composition
-      /thrown while applying the write \(combo list went stale\)/.test(err.message) &&
+      /thrown by the widget's OWN callback while applying the write \(combo list went stale\)/.test(err.message) &&
       /did not retain the requested value/.test(err.message),
   );
   assert.equal(node.widgets[0].value, "b", "rolled back");
@@ -2547,9 +2694,10 @@ test("#639: a throwing value SETTER on a verified write is disclosed without une
   assert.match(set.write_warning ?? "", /IS in effect/);
   assert.doesNotMatch(
     set.write_warning ?? "",
-    /never ran|after applying|callback threw|setter threw/,
+    /never ran|after applying|callback threw|setter threw|OWN callback/,
     "names NO construct — the mechanism cannot establish which one threw (codex delta-gate)",
   );
+  assert.equal(set.write_warning_source, undefined, "#976: no source claimed for a throw outside the invocation");
 });
 
 test("#639: a REENTRANT setter (one that invokes the callback, which throws) gets the same attribution-free wording", () => {
@@ -2578,6 +2726,11 @@ test("#639: a REENTRANT setter (one that invokes the callback, which throws) get
   assert.match(set.write_warning ?? "", /thrown while applying the write/);
   assert.match(set.write_warning ?? "", /reentrant boom/);
   assert.doesNotMatch(set.write_warning ?? "", /callback never ran|after applying|callback threw|setter threw/);
+  // #976: the callback DID run and DID throw here — but the throw surfaced from the
+  // ASSIGNMENT, before the attributed span was entered, so nothing may be claimed.
+  // This is the case that keeps the attribution honest rather than merely plausible.
+  assert.doesNotMatch(set.write_warning ?? "", /OWN callback/);
+  assert.equal(set.write_warning_source, undefined);
 });
 
 test("#667×#507: a numeric request against a numeric-LABELLED rail option is ADOPTED on the empty-inner-list path (codex round-3)", () => {
@@ -2683,6 +2836,7 @@ test("#639 (delta-gate 2): a FROZEN widget already holding the requested value r
   assert.match(set.write_warning ?? "", /thrown while applying the write/);
   assert.match(set.write_warning ?? "", /IS in effect/);
   assert.doesNotMatch(set.write_warning ?? "", /DID take effect/);
+  assert.equal(set.write_warning_source, undefined, "#976: a frozen widget throws with no node code involved");
 });
 
 test("#667×#507 (delta-gate 2): re-validation checks the SAME list snapshot as admission — a stateful non-function source cannot cause a false DISAGREE", () => {
