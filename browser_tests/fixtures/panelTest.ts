@@ -12,7 +12,7 @@
 import type { BrowserContext, Page } from '@playwright/test'
 import { test as base } from '@playwright/test'
 
-import { deleteWorkflowByPath } from '../global-workflow-litter'
+import { COMFY_BASE_URL, deleteWorkflowByPath } from '../global-workflow-litter'
 import { MockBridge } from './MockBridge'
 import { PanelPage } from './PanelPage'
 
@@ -129,24 +129,81 @@ export async function isolatePanelPage(page: Page, panelFlags: string[] = []) {
  * navigation, and sessionStorage dies with the page — a spec calling `pageB.close()` takes
  * its record with it, which was the last leak left in a full suite run.
  */
-function recordWorkflowWrites(context: BrowserContext, sink: Set<string>) {
+function recordWorkflowWrites(context: BrowserContext, state: WriteRecord) {
+  // A CREATE is what proves ownership. ComfyUI's workflow write is
+  // `POST /api/userdata/workflows%2F<name>.json?overwrite=false`, and `overwrite=false`
+  // means the server REFUSES an existing path — so an ok response is proof the file did not
+  // exist a moment ago and this browser is what brought it into being. Anything else is
+  // skipped rather than guessed at (codex): an OPTIONS preflight, a DELETE, a write that
+  // permits overwriting, a failed write, or a request to some other instance are all cases
+  // where deleting the path could destroy a file this test did not create.
+  const owns = (url: string, method: string) => {
+    if (method !== 'POST' && method !== 'PUT') return null
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      return null
+    }
+    // Same instance the cleanup will delete against — a spec pointed at another ComfyUI
+    // must never make us delete a same-named workflow on the default one.
+    if (parsed.origin !== new URL(COMFY_BASE_URL).origin) return null
+    if (parsed.pathname !== '/api/userdata' && !parsed.pathname.startsWith('/api/userdata/')) return null
+    if (parsed.searchParams.get('overwrite') !== 'false') return null
+    const m = /^\/api\/userdata\/(.+)$/.exec(parsed.pathname)
+    if (!m) return null
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(m[1])
+    } catch {
+      return null
+    }
+    if (!/^workflows\//.test(decoded) || !/\.json$/i.test(decoded)) return null
+    return decoded
+  }
+
   context.on('request', (request) => {
     try {
-      const method = request.method().toUpperCase()
-      if (method === 'GET' || method === 'HEAD') return
-      const m = /\/userdata\/([^?]+)/.exec(request.url())
-      if (!m) return
-      const decoded = decodeURIComponent(m[1])
-      if (/^workflows\//.test(decoded) && /\.json$/i.test(decoded)) sink.add(decoded)
+      if (owns(request.url(), request.method().toUpperCase())) state.pending.add(request)
     } catch {
-      // Never let bookkeeping interfere with the request under test.
+      /* bookkeeping must never interfere with the request under test */
     }
+  })
+  const settle = (request: import('@playwright/test').Request) => state.pending.delete(request)
+  context.on('requestfailed', settle)
+  context.on('requestfinished', (request) => {
+    settle(request)
+    void (async () => {
+      try {
+        const path = owns(request.url(), request.method().toUpperCase())
+        if (!path) return
+        const response = await request.response()
+        // Only a SUCCEEDED create is ours to remove.
+        if (response?.ok()) state.created.add(path)
+      } catch {
+        /* unreadable response ⇒ claim nothing */
+      }
+    })()
   })
 }
 
-/** Delete what this test wrote. Best-effort: a cleanup failure must never mask a real one. */
-async function cleanupRecordedWorkflowWrites(sink: Set<string>) {
-  for (const userdataPath of sink) {
+interface WriteRecord {
+  created: Set<string>
+  pending: Set<import('@playwright/test').Request>
+}
+
+/** Delete what this test created. Best-effort: a cleanup failure must never mask a real one. */
+async function cleanupRecordedWorkflowWrites(state: WriteRecord) {
+  // WAIT FOR IN-FLIGHT WRITES FIRST (codex). Deleting while a save is still on the wire
+  // gets a 404 and then the write lands afterwards — recreating the very file this is
+  // supposed to remove, and doing it invisibly because the delete "succeeded". Bounded, so
+  // a wedged request delays teardown by a second rather than hanging the suite; anything
+  // still pending after that is left to the suite-level sweep, which reports it.
+  const deadline = Date.now() + 1000
+  while (state.pending.size > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  for (const userdataPath of state.created) {
     try {
       await deleteWorkflowByPath(userdataPath)
     } catch {
@@ -168,7 +225,7 @@ export const test = base.extend<PanelFixtures & PanelOptions>({
     // #907 — record before anything loads, clean up after the test whatever it ends up
     // being. Runs on FAILURE too, which per-spec cleanup at the end of a test body never
     // did — and a failing test is exactly when a spec is most likely to have left a file.
-    const wrote = new Set<string>()
+    const wrote: WriteRecord = { created: new Set<string>(), pending: new Set() }
     recordWorkflowWrites(page.context(), wrote)
     await use(new PanelPage(page))
     await cleanupRecordedWorkflowWrites(wrote)
