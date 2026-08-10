@@ -6,6 +6,38 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.98] - 2026-08-10
+
+> A widget write could be refused for "object_info is unavailable — the backend is
+> unreachable or the fetch failed" on a machine where ComfyUI was answering perfectly
+> well. Two problems in one sentence: the panel had only one way to ask for the schema,
+> and when that way failed it reported a cause it had never established. The reporter went
+> checking a backend that was fine.
+
+### Fixed
+- a widget write no longer gives up when the frontend's own `getNodeDefs()` call fails —
+  it asks the same question again over plain HTTP, which is the route that answers when
+  the client does not (#982). Verified live: with the client made to throw, the fallback
+  returned the full 4183-type schema on this install.
+- the refusal now says what actually happened rather than naming a cause. It reports that
+  no usable schema was obtained and lists what each route did, so a backend that answers
+  by hand and a panel that cannot use it are told apart immediately.
+- an EMPTY schema from the frontend client is treated as its answer, not as a failure to
+  answer, so the fallback can never overrule a deliberate deny-all with a broader one.
+  Everything else about the fence is unchanged: only a usable schema authorizes a write.
+- the diagnostic text is bounded — control characters collapsed, per-entry length capped,
+  at most four routes named with the remainder counted — because it comes from a backend
+  or an extension and ends up in a message someone reads.
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.11.97] - 2026-08-10
 
 > A workflow with unsaved edits could have every graph tool refused after a tab switch,
