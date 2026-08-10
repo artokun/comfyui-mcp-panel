@@ -134,10 +134,14 @@ test("#981 the note credits what the refresh DID do, and names the one thing tha
   // codex r2: the predicate establishes that the CLIENT can instantiate the class now —
   // not that the definition is current, not that this refresh registered it, and nothing
   // at all about what the backend will do with the prompt. The note may claim only that.
-  assert.match(note, /This page can NOW instantiate/, "the refresh is not described as having failed");
-  assert.doesNotMatch(note, /definitions ARE now current/, "…but does not claim currency it never checked");
+  assert.match(note, /NOW registered in this page's client node registry/, "exactly the predicate");
+  assert.doesNotMatch(note, /definitions ARE now current/, "…not currency it never checked");
   assert.doesNotMatch(note, /will still fail at queue time/, "nor a backend outcome it never measured");
-  assert.match(note, /does not serialize the values its class expects/, "what it CAN say about the dead node");
+  // codex r3: a registry ENTRY is not a successful createNode, and "no widgets" says
+  // nothing about values arriving over links, retained properties or class defaults.
+  assert.doesNotMatch(note, /can NOW instantiate/, "an entry is not a proven instantiation");
+  assert.doesNotMatch(note, /does not serialize the values its class expects/, "nor a serialization claim");
+  assert.match(note, /never rebuilt against the class/, "what it CAN say about the dead node");
   assert.match(note, /MiniMaxChunkFeedForward/, "names the classes");
   assert.match(note, /still a PLACEHOLDER/, "and what did not happen");
   assert.match(note, /does not rehydrate nodes that were created while it was unknown/, "why");
@@ -244,9 +248,10 @@ test("#981 (codex): an UNAVAILABLE missing-node record claims nothing at all", (
 });
 
 test("#981 (codex r2) source guard: the disclosure survives the SUCCESS path of refresh_nodes", () => {
-  // It is only ever produced on a successful refresh, and `{ok:true, refreshed:true}`
-  // dropped every extra field — so the warning existed but no caller could ever see it.
-  // Found by tracing the consumers of the verdict, not by reading the producer.
+  // The producer runs the scan whatever the verdict says, so the disclosure can ride on
+  // either path — but `{ok:true, refreshed:true}` discarded every extra field, so on the
+  // success path the warning existed and no caller could ever see it. Found by tracing
+  // the consumers of the verdict, not by reading the producer.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(src, /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale \};/, "forwarded on success");
   assert.match(src, /stale_placeholders_note: verdict\.stale_placeholders_note/, "and the note with it");

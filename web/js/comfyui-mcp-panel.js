@@ -8098,9 +8098,11 @@ const GRAPH_TOOL_EXECUTORS = {
   async refresh_nodes() {
     const verdict = await refreshComfyNodeDefs(undefined, { force: true });
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
-    // #981: the stale-placeholder disclosure has to survive the SUCCESS path, which is
-    // the only path it is ever produced on. `{ok:true, refreshed:true}` dropped it —
-    // caught by tracing the consumers rather than assuming the verdict flowed through.
+    // #981: the stale-placeholder disclosure has to survive BOTH paths. The producer
+    // runs the scan whatever the verdict says — a refresh that failed at the combo phase
+    // can still leave placeholders behind — but only this branch dropped it, because
+    // `{ok:true, refreshed:true}` discards every other field. Caught by tracing the
+    // consumers rather than assuming the verdict flowed through.
     // `ok` stays true and `refreshed` stays true: the refresh did what it claims. The
     // reload flag is advisory, about the canvas, not a failure of the refresh.
     const stale = verdict != null && typeof verdict === "object" && verdict.requires_reload

@@ -121,23 +121,26 @@ export function stalePlaceholderNote(stale) {
   const types = [...new Set(stale.map((s) => s.type))];
   const which = types.slice(0, 6).join(", ");
   const more = types.length > 6 ? `, and ${types.length - 6} more` : "";
-  // EVERY CLAIM HERE IS ONE THE PREDICATE ESTABLISHES (codex r2). What was actually
-  // tested is that the class is present in the client registry NOW — not that its
-  // definition is current, not that this refresh is what registered it, and not what the
-  // backend will do with the serialized prompt. The earlier wording asserted all three.
+  // EVERY CLAIM HERE IS ONE THE PREDICATE ESTABLISHES (codex r2/r3). The predicate is
+  // exactly `!!LiteGraph.registered_node_types[type]` — an ENTRY in the client registry.
+  // Not that the definition is current, not that this refresh registered it, not that
+  // `createNode` would succeed (a constructor can be present and still throw), and
+  // nothing about what the backend would do with the prompt. Earlier drafts claimed all
+  // four in turn.
   return (
-    `This page can NOW instantiate ${types.length} class${types.length === 1 ? "" : "es"} ` +
-    `that ${types.length === 1 ? "was" : "were"} recorded as missing when this workflow ` +
-    `loaded (${which}${more}). But ${stale.length} node${stale.length === 1 ? "" : "s"} already ` +
+    `${types.length} class${types.length === 1 ? "" : "es"} ` +
+    `that ${types.length === 1 ? "was" : "were"} recorded as missing when this workflow loaded ` +
+    `${types.length === 1 ? "is" : "are"} NOW registered in this page's client node registry ` +
+    `(${which}${more}). But ${stale.length} node${stale.length === 1 ? "" : "s"} already ` +
     `on the canvas ${stale.length === 1 ? "is" : "are"} still a PLACEHOLDER: registering a class ` +
     `does not rehydrate nodes that were created while it was unknown — measured, they keep no ` +
-    `definition and no widgets. They will still be reported as missing, and a node with no ` +
-    `widgets does not serialize the values its class expects, so do not rely on ${stale.length === 1 ? "it" : "them"} ` +
+    `definition and no widgets. They will still be reported as missing, and they were never ` +
+    `rebuilt against the class, so do not rely on ${stale.length === 1 ? "it" : "them"} ` +
     // "Reload" alone is ambiguous (codex) — a browser refresh restores whatever the
     // frontend last autosaved, which is not reliably the graph on screen. The remedy is
     // stated as the two steps it actually is: persist the graph, then reopen THAT
     // workflow, so the rebuild reads a document whose contents are known.
-    `at queue time. To rebuild them against the class this page can now instantiate: SAVE the ` +
+    `at queue time. To rebuild them against the registered class: SAVE the ` +
     `workflow, then reload/reopen that saved workflow (#981). The save is the load-bearing ` +
     `step — the rebuild reads the stored document, so anything not saved is not rebuilt, and ` +
     `a plain browser refresh restores whatever the frontend last autosaved rather than the ` +
