@@ -98,11 +98,13 @@ test("#985 (codex): one subgraph DEFINITION instanced twice is walked per INSTAN
   // path-local, exactly as ComfyUI's own traversal is.
   const shared = graphOf([outputNode(3, "SaveVideo")]);
   const g = graphOf([
-    { id: 10, type: "SubgraphNode", mode: 0, subgraph: shared }, // active instance, visited FIRST
-    { id: 11, type: "SubgraphNode", mode: MODE_MUTE, subgraph: shared }, // muted instance
+    wrapper(9, 0, [
+      { id: 10, type: "SubgraphNode", mode: 0, subgraph: shared }, // active instance, visited FIRST
+      { id: 11, type: "SubgraphNode", mode: MODE_MUTE, subgraph: shared }, // muted instance
+    ]),
   ]);
   const found = collectDisabledAncestorOutputs(g);
-  assert.deepEqual(found.map((f) => f.exec_id), ["11:3"], "the muted instance is still reported");
+  assert.deepEqual(found.map((f) => f.exec_id), ["9:11:3"], "the muted instance is still reported");
 });
 
 test("#985 (codex): deep nesting is diagnosed — no arbitrary depth cap silently stops the walk", () => {
@@ -119,14 +121,14 @@ test("#985 (codex): deep nesting is diagnosed — no arbitrary depth cap silentl
   assert.equal(found[0].exec_id, [...ids, "999"].join(":"));
 });
 
-test("#985 the MEASUREMENT decides, not the rule: a correctly-excluded output is not reported", () => {
-  // The root-level mute case, which ComfyUI already handles. The collector still
-  // finds it structurally — the prompt intersection is what keeps it quiet, so a
-  // frontend that fixes nested wrappers silences this with no change here.
-  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE, MODE_MUTE));
-  assert.equal(found.length, 1, "structurally under a disabled ancestor");
-  const compiled = { 1: { class_type: "EmptyLatentImage" }, 2: { class_type: "VAEDecode" } };
-  assert.deepEqual(disabledOutputsInPrompt(compiled, found), [], "ComfyUI excluded it ⇒ nothing to warn about");
+test("#985 a disabled TOP-LEVEL wrapper is NOT reported — ComfyUI honours that one", () => {
+  // Measured: the top-level wrapper’s mode IS applied, and muting a top-level
+  // subgraph is the ordinary way to switch a branch off. Warning about it would fire
+  // on healthy everyday workflows, which is how a warning gets ignored.
+  assert.deepEqual(collectDisabledAncestorOutputs(nesting(0, MODE_MUTE)), []);
+  assert.deepEqual(collectDisabledAncestorOutputs(nesting(MODE_MUTE, MODE_MUTE)), [], "even with a nested one too");
+  // But the nested-only case — the actual defect — is still reported.
+  assert.equal(collectDisabledAncestorOutputs(nesting(MODE_MUTE)).length, 1);
 });
 
 test("#985 the reported case: present in the compiled prompt ⇒ reported", () => {
@@ -173,7 +175,7 @@ test("#985 a disabled wrapper ANY number of levels up still blames the nearest o
 });
 
 test("#985 two disabled ancestors: the NEAREST is named, and the depth counts both", () => {
-  const g = graphOf([wrapper(5, MODE_BYPASS, [wrapper(4, MODE_MUTE, [outputNode(3, "SaveImage")])])]);
+  const g = graphOf([wrapper(9, 0, [wrapper(5, MODE_BYPASS, [wrapper(4, MODE_MUTE, [outputNode(3, "SaveImage")])])])]);
   const found = collectDisabledAncestorOutputs(g);
   assert.equal(found[0].disabled_ancestor, "4");
   assert.equal(found[0].disabled_ancestor_state, "muted");

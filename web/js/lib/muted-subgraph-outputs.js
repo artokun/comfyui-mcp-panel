@@ -114,6 +114,16 @@ export function collectDisabledAncestorOutputs(rootGraph) {
       // an under-report of a defect that is already happening, never a false alarm
       // about a healthy graph.
       if (!node?.constructor?.nodeData?.output_node) continue;
+      // A disabled TOP-LEVEL wrapper is honoured — measured, and it is the ordinary
+      // way people switch a branch off. Warning about it would fire on healthy
+      // everyday workflows, which is how a warning gets ignored. `path[0]` is the
+      // root-level node of this chain, so when IT is the disabled one ComfyUI has
+      // already excluded everything below and there is nothing to report.
+      //
+      // This is the one place upstream's behaviour is encoded rather than observed,
+      // and it is encoded in the SUPPRESSING direction: if a future build stops
+      // honouring the top level too, this under-reports rather than cries wolf.
+      if (disabledAncestors.some((a) => a.id === nodePath[0])) continue;
       // The NEAREST disabled ancestor is the one a reader acts on — the wrapper
       // whose switch they flipped.
       const nearest = disabledAncestors[disabledAncestors.length - 1];
