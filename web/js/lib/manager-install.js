@@ -798,6 +798,65 @@ function taskStatusStr(item) {
  * shape we don't recognize can never become a FALSE failure). Prefers the
  * `status.messages` (the crash/exception text) for the reason, then `result`.
  */
+/**
+ * #920 — does this Manager failure mean "that pack is not in the registry"?
+ *
+ * v4 resolves an install from its OWN database — `get_custom_nodes(channel, mode)`,
+ * falling back to `cnr_map[node_id]` — and when neither has the pack it answers
+ *
+ *   Node '<id>@<version>' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]
+ *
+ * Matched on the STABLE part ("not found in" + a bracketed source list) rather than
+ * the enum spellings, which vary with channel/mode. Deliberately narrow: only a
+ * message we positively recognise is reshaped, everything else passes through.
+ */
+export function isRegistryLookupMiss(text) {
+  return typeof text === "string" && /Node\s+'[^']*@[^']*'\s+not found in\s*\[[^\]]*\]/i.test(text);
+}
+
+/**
+ * #920 — what to add when a GIT URL install hits that miss.
+ *
+ * The reporter passed a repository URL and got a registry-lookup failure naming a
+ * pack id they never supplied. That reads like a lookup bug and sends people to
+ * re-check spelling, channel and mode; none of it is the problem.
+ *
+ * Both facts below are read from ComfyUI-Manager's SOURCE, not its schema — the
+ * schema is what misled two separate attempts at this issue (`InstallPackParams`
+ * declares `repository` "required if selected_version is nightly", and `do_install`
+ * reads only id/selected_version/channel/mode/skip_post_install):
+ *
+ *   1. the pack is not in the registry — that IS what the lookup missed;
+ *   2. a stock v4 has NO route that installs an arbitrary git URL. The legacy
+ *      `/manager/queue/install` route does (`@unknown` + `files:[url]`), but
+ *      `comfyui_manager/__init__.py` registers the legacy server only under
+ *      `--enable-manager-legacy-ui`.
+ *
+ * Returns "" when there is nothing extra to say, so callers may append blindly.
+ */
+export function unlistedGitUrlAdvice(failureText) {
+  if (!isRegistryLookupMiss(failureText)) return "";
+  // Phrased for BOTH readers, because the surface that shows this failure
+  // (panel_node_queue_status) does not carry the original request and plumbing it
+  // through for a message is not worth the coupling. Someone who mistyped a
+  // registry id needs the first sentence; someone who passed a git URL needs the
+  // rest, and the conditional wording keeps it from asserting which they did.
+  return (
+    ` — NOTE: that is a NODE REGISTRY lookup. The pack is not in the registry under that` +
+    ` name. IF YOU PASSED A GIT URL: this ComfyUI-Manager cannot install one. It resolves` +
+    ` installs from its own database, and the parameter that would carry a URL (repository)` +
+    ` is accepted and then IGNORED by its install handler — so no argument to this tool will` +
+    ` make it clone your URL. WHAT WORKS, least effort first: clone the repo into` +
+    ` custom_nodes/ and restart ComfyUI; or ask the pack author to publish it to the` +
+    ` registry. There IS a legacy git-URL route, but reaching it takes TWO steps: start` +
+    ` ComfyUI with --enable-manager-legacy-ui (which REPLACES the v2 Manager API rather` +
+    ` than adding to it) AND set allow_git_url_install = true in ComfyUI-Manager's` +
+    ` config.ini — an unlisted pack is rated "high+" risk, and without that setting the` +
+    ` route answers 404 "A security error has occurred".` +
+    ` IF YOU MEANT A REGISTRY PACK: check the id and the channel/mode named in the brackets.`
+  );
+}
+
 export function taskFailureReason(item) {
   if (!isTaskHistoryItem(item)) return null;
   if (!TASK_FAILURE_STATUS.has(taskStatusStr(item))) return null;

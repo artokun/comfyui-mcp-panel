@@ -91,6 +91,7 @@ import {
   rebootCandidates,
   searchNodesVia,
   taskFailureReason,
+  unlistedGitUrlAdvice,
   taskSucceeded,
 } from "./lib/manager-install.js";
 import {
@@ -15150,7 +15151,11 @@ const GRAPH_TOOL_EXECUTORS = {
         note:
           `${recentFailures.length} recent ComfyUI-Manager task(s) FAILED (see recent_failures). ` +
           `A drained queue that shows "done" does NOT mean every task succeeded — check these ` +
-          `before reporting an install/update as successful.`,
+          `before reporting an install/update as successful.` +
+          // #920 — a registry-lookup miss reads like a lookup bug and sends people to
+          // re-check spelling and channels. On a stock v4 an unlisted git URL is simply
+          // not installable, and saying so beats echoing a name the caller never supplied.
+          unlistedGitUrlAdvice(recentFailures.map((f) => f?.result ?? "").join(" ")),
       };
     }
     return { status };
