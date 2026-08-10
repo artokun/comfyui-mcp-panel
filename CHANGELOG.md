@@ -6,6 +6,38 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.96] - 2026-08-10
+
+> A report said the post-load compare in `workflow_open` was racing the frontend's
+> normalisation. It is not a race. Sampling that compare at 0ms, one animation frame,
+> 50ms, 250ms, 1s and 2s after the load resolved gave an identical answer every time — it
+> is deterministic, and it fires for any workflow whose stored node sizes are not what
+> this frontend computes. A perfect open was reported as unverified, and because that
+> verdict throws, the open never published the workflow identity, so the NEXT command was
+> refused too. The reporter needed four calls to reach a state the panel already believed
+> it was in.
+
+### Fixed
+- an open that reproduced a workflow faithfully no longer reports its content unverified,
+  and no longer withholds the workflow identity the following command needs (#1001).
+  Content is proven when every node came back with the same id, type and serialized
+  fields apart from node HEIGHT — the one thing the frontend was measured recomputing on
+  load — with the width unchanged and both values readable numbers. Anything else,
+  including a changed width, still refuses.
+- the same compare reported a phantom difference on every node of every saved workflow.
+  The frontend stamps `showAdvanced` on each node it instantiates with the value
+  `undefined`, which no saved file can carry because JSON drops it. A key present with
+  `undefined` now reads as absent; a key present as `null` still counts, since JSON does
+  carry null and a nulled widget value is a real loss.
+- when an open proves content that way, the reply says so — which field differed, that
+  every difference was a height, and that the panel observed the difference rather than
+  its cause. Saving from there writes the recomputed value, which is now stated rather
+  than left to be discovered.
+
+### Changed
+- 0.11.95 (#1012)
+
+
 ## [0.11.95] - 2026-08-10
 
 > `panel_refresh_nodes` said `{ok:true, refreshed:true}` while `panel_get_errors` kept
