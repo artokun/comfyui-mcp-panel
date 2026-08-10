@@ -846,13 +846,17 @@ export function unlistedGitUrlAdvice(failureText) {
     ` name. IF YOU PASSED A GIT URL: this ComfyUI-Manager cannot install one. It resolves` +
     ` installs from its own database, and the parameter that would carry a URL (repository)` +
     ` is accepted and then IGNORED by its install handler — so no argument to this tool will` +
-    ` make it clone your URL. WHAT WORKS, least effort first: clone the repo into` +
-    ` custom_nodes/ and restart ComfyUI; or ask the pack author to publish it to the` +
-    ` registry. There IS a legacy git-URL route, but reaching it takes TWO steps: start` +
-    ` ComfyUI with --enable-manager-legacy-ui (which REPLACES the v2 Manager API rather` +
-    ` than adding to it) AND set allow_git_url_install = true in ComfyUI-Manager's` +
-    ` config.ini — an unlisted pack is rated "high+" risk, and without that setting the` +
-    ` route answers 404 "A security error has occurred".` +
+    ` make it clone your URL. USE install_custom_node INSTEAD: that tool runs on the` +
+    ` machine rather than in this browser, and when the Manager cannot resolve a pack it` +
+    ` clones the repository into custom_nodes/ itself. It is the one path that installs an` +
+    ` unlisted URL — so this tool's usual "prefer me over the headless install_custom_node"` +
+    ` guidance does NOT hold for this case. Restart ComfyUI afterwards to load it.` +
+    ` If that is not available (a REMOTE target has no local tree to clone into, and it` +
+    ` keeps the Manager's error for that reason), the remaining options are to clone into` +
+    ` custom_nodes/ by hand, or ask the pack author to publish to the registry. A legacy` +
+    ` git-URL route also exists but needs TWO steps — --enable-manager-legacy-ui (which` +
+    ` REPLACES the v2 Manager API) AND allow_git_url_install = true in ComfyUI-Manager's` +
+    ` config.ini, without which an unlisted pack is rated "high+" risk and it answers 404.` +
     ` IF YOU MEANT A REGISTRY PACK: check the id and the channel/mode named in the brackets.`
   );
 }

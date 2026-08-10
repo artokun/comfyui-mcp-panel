@@ -99,7 +99,28 @@ test("#920 the advice names the real blocker and the routes that work", () => {
   assert.match(a, /NODE REGISTRY lookup/, "names what the lookup actually was");
   assert.match(a, /accepted and then IGNORED/, "says the repository field does nothing");
   assert.match(a, /custom_nodes\//, "the manual clone");
-  assert.match(a, /publish it to the registry/, "the durable fix");
+  assert.match(a, /publish to the registry/, "the durable fix");
+});
+
+test("#920 the advice names the tool that CAN clone, and says the usual preference is off", () => {
+  // The workaround, found after the honest error shipped: install_custom_node
+  // runs on the MACHINE, and its install path clones directly when the Manager
+  // accepts a task but the pack never appears installed — exactly this case
+  // (node-management.ts, cloneCustomNodeFallback). panel_install_node's own
+  // description says "Prefer this over the headless install_custom_node tool",
+  // which is precisely backwards here, so the advice has to say so explicitly or
+  // a reader follows the description and stays stuck.
+  const a = unlistedGitUrlAdvice(MISS);
+  // The RECOMMENDATION, not just the name: the tool is mentioned twice (once to
+  // cancel the standing preference), so /install_custom_node/ alone passed even
+  // when the recommendation itself was deleted. Caught by mutation.
+  assert.match(a, /USE install_custom_node INSTEAD/, "recommends it, not merely mentions it");
+  assert.match(a, /clones the repository into custom_nodes/, "and why it can");
+  assert.match(a, /does NOT hold/, "cancels the standing preference for this case");
+  // A remote target genuinely cannot: there is no local tree to clone into, and
+  // the orchestrator keeps the Manager's error for that reason. Saying so stops
+  // this reading as a promise that always works.
+  assert.match(a, /REMOTE target has no local tree/, "the case where it does not apply");
 });
 
 test("#920 the legacy-route advice names BOTH steps, or it sends people to a 404", () => {
@@ -112,7 +133,7 @@ test("#920 the legacy-route advice names BOTH steps, or it sends people to a 404
   const a = unlistedGitUrlAdvice(MISS);
   assert.match(a, /--enable-manager-legacy-ui/, "step one");
   assert.match(a, /allow_git_url_install\s*=\s*true/, "step two — without it the route 404s");
-  assert.match(a, /security error/i, "and says what failure to expect if it is skipped");
+  assert.match(a, /answers 404/, "and says what failure to expect if the second step is skipped");
   // It also REPLACES the v2 API rather than adding to it, which the wording must not hide.
   assert.match(a, /REPLACES/, "the mutex, not additive");
 });
