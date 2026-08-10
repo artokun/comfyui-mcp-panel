@@ -13026,11 +13026,39 @@ const GRAPH_TOOL_EXECUTORS = {
     const beforeKeys = new Set(before.map((d) => d?.name));
     const collision = before.find(matchesRequested);
     if (collision) {
+      // #636 — DON'T SEND THEM AFTER A BLUEPRINT COMFYUI WON'T DELETE. The remedy below
+      // used to say "delete it from the library and retry" unconditionally, and
+      // subgraphStore.deleteBlueprint refuses a global/bundled one outright:
+      //
+      //     if (isGlobalBlueprint(name)) { toast(cannotDeleteGlobal); return }
+      //
+      // On a stock install the overwhelming majority of blueprints are global (89 of 91
+      // measured here), so the collision most likely to happen is exactly the one where
+      // that advice cannot be followed — the user goes looking for a delete that is not
+      // offered, and the message has suggested nothing else.
+      //
+      // Unknown is not global: only a POSITIVE true narrows the remedy, so an older
+      // frontend or an unreadable predicate keeps the existing wording rather than
+      // withholding an option that may well work.
+      let collisionIsGlobal = false;
+      try {
+        const collidedBare = bareName(collision);
+        collisionIsGlobal =
+          typeof store.isGlobalBlueprint === "function" &&
+          String(collision?.name ?? "").startsWith(prefix) &&
+          store.isGlobalBlueprint(collidedBare) === true;
+      } catch {
+        collisionIsGlobal = false;
+      }
       throw new Error(
         `a subgraph blueprint named "${finalName}" already exists (type "${collision.name}") and this ` +
           `tool will not replace it — replacing one programmatically would need ComfyUI's overwrite ` +
-          `dialog, which cannot be answered from here. Either save under a different name, or delete ` +
-          `"${finalName}" from the subgraph library in the ComfyUI UI first and then retry this call.`,
+          `dialog, which cannot be answered from here. ` +
+          (collisionIsGlobal
+            ? `That one ships WITH ComfyUI, and ComfyUI refuses to delete a bundled blueprint — so ` +
+              `there is no way to free the name. Save under a different one.`
+            : `Either save under a different name, or delete "${finalName}" from the subgraph library ` +
+              `in the ComfyUI UI first and then retry this call.`),
       );
     }
     await store.publishSubgraph(finalName);
