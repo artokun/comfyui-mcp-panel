@@ -330,17 +330,26 @@ export function createRunCompletionTracker({
     // the FINAL output event, so a genuine ten-minute render reports a sub-second
     // duration. The dedupe gate reads duration as evidence of a cache hit, and an
     // invented duration is not evidence of anything.
+    // The trust bit belongs to the TIMESTAMP, and only the first signal sets one.
+    // A later observed signal must NOT upgrade a fabricated start (codex): with the
+    // start frame and the first node's `executing` both lost, `onExecuted` invents a
+    // timestamp, and a subsequent `executing` for a second output node would then mark
+    // that invented value trusted — making a genuine long multi-output render look
+    // sub-second and trusted, which is exactly the shape that gets suppressed. Once
+    // fabricated, untrusted for the life of the run.
     if (!starts.has(k)) {
       starts.set(k, now());
       if (observed) startObserved.add(k);
       else startObserved.delete(k);
-    } else if (observed) {
-      startObserved.add(k);
     }
-    // Bound the map so a run that never signals end can't leak entries.
+    // Bound the map so a run that never signals end can't leak entries — and retire
+    // the trust bit WITH it, or the set outlives the map it describes.
     if (starts.size > 20) {
       const oldest = starts.keys().next().value;
-      if (oldest !== k) starts.delete(oldest);
+      if (oldest !== k) {
+        starts.delete(oldest);
+        startObserved.delete(oldest);
+      }
     }
   }
 

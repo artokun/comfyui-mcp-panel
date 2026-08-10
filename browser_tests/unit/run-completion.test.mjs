@@ -718,3 +718,22 @@ test("#986: a suppressed duplicate is RETIRED, so a later reconcile cannot re-de
   assert.equal(h.suppressed.length, 1);
   assert.equal(h.tracker.isSettled("p2"), true, "not left pending for a sweep to pick up");
 });
+
+test("#986 (codex r3): a later `executing` must NOT upgrade a FABRICATED start to trusted", () => {
+  // Partial frame loss: execution_start and the first node's `executing` are both
+  // dropped, so `onExecuted` invents a timestamp. A later `executing` for a SECOND
+  // output node used to mark that invented value trusted — making a genuine long
+  // multi-output render look sub-second AND trusted, which is the shape that gets
+  // suppressed. It must deliver.
+  const h = makeDedupeHarness();
+  // Seed: an earlier run announced the same fixed filename.
+  canvasRun(h, "earlier", "fixed.mp4");
+  assert.equal(h.flushes.length, 1);
+  h.advance(1000);
+  // The genuine second render, with its start frames lost.
+  h.tracker.onExecuted("second", { images: [], videos: [{ filename: "fixed.mp4", subfolder: "", type: "output" }] });
+  h.tracker.onExecutingNode("second", "node-2"); // later signal, different node
+  h.tracker.onExecutionSuccess("second"); // finishes within the cache-hit threshold
+  assert.equal(h.flushes.length, 2, "a real render is delivered even when its duration looks tiny");
+  assert.deepEqual(h.suppressed, []);
+});
