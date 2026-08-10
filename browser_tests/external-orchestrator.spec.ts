@@ -1,16 +1,22 @@
 /**
  * Tier 1 — external/local orchestrator mode.
  *
- * Covers the "Use external/local orchestrator (advanced)" Settings toggle: when
- * ON, Connect must NOT ask the ComfyUI host to spawn an orchestrator (the host —
- * e.g. a remote RunPod pod — may have no Node/agent). Instead it dials the
- * configured Bridge URL directly. This is the path that lets an agent running on
- * the USER's machine (`npx -y comfyui-mcp connect <url>`) drive a remote ComfyUI.
+ * NOT a mode test any more. `externalOrchestratorMode()` returns `true`
+ * unconditionally — the pack is pure-frontend and can no longer spawn anything
+ * (Comfy Registry security standards), so the "external/local orchestrator
+ * (advanced)" setting is a back-compat NO-OP. Flipping it to `false` was measured
+ * here and changes nothing: the spec passes either way.
  *
- * Asserts:
- *   1. clicking the real Connect button connects to the MockBridge (handshake →
- *      status pill "connected"), and
- *   2. the host spawn route `/comfyui_mcp_panel/connect` is NEVER POSTed.
+ * What it still pins, and the reason to keep it: the pure-frontend pack must NEVER
+ * ask the ComfyUI host to spawn an orchestrator (a remote pod may have no Node,
+ * and the stripped node answers /connect with 503). So this is a regression guard
+ * on a PERMANENT invariant, not a branch test — `connectPosts === 0` cannot fail
+ * today, and it exists to fail the day someone reintroduces host spawning.
+ *
+ * The load-bearing assertion is therefore the OTHER one: clicking the real Connect
+ * button reaches a real handshake with the MockBridge at the CONFIGURED url.
+ * That one is a true regression test — removing the url write in step (4) turns
+ * this red (measured: it dialled the default ws://127.0.0.1:9180 instead).
  */
 import { test, expect } from './fixtures/panelTest'
 
@@ -45,18 +51,10 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
     }
   })
 
-  // 2) Turn ON the external/local orchestrator toggle via ComfyUI's settings store
-  //    (the same store the panel reads through getSetting()) — before mount, so the
-  //    mount-time connect decision and the Connect click both see external mode.
-  await panel.page.evaluate((id) => {
-    const w = window as unknown as {
-      comfyAPI?: { app?: { app?: { ui?: { settings?: { setSettingValue?: (k: string, v: unknown) => void } } } } }
-      app?: { ui?: { settings?: { setSettingValue?: (k: string, v: unknown) => void } } }
-    }
-    const app = w.comfyAPI?.app?.app || w.app
-    app?.ui?.settings?.setSettingValue?.(id, true)
-  }, EXTERNAL_SETTING)
-
+  // 2) Set the external toggle anyway, for the day it stops being a no-op. It is
+  //    INERT today (externalOrchestratorMode() is a hardcoded `return true`), and
+  //    a pre-mount settings write is clobbered at mount regardless — see step 4.
+  //    Nothing in this spec depends on it.
   // 3) Install the host-spawn guard/spy. External mode must never depend on the
   //    ComfyUI host starting anything, so fail loudly if the panel POSTs /connect —
   //    installed BEFORE mount so even a stray mount-time connect would be caught.
