@@ -6,6 +6,36 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.93] - 2026-08-10
+
+> Covers changes since 0.11.92.
+
+### Added
+
+- **A repeated render result now says so (#986).** Someone had the same finished clip
+  announced to the agent six times in about thirty seconds — each with a different
+  prompt id, each with a "render time" of a tenth of a second against a first render
+  that had taken almost eleven minutes. Every one asked the agent to respond, and
+  nothing told it these were the same file it had already reviewed.
+
+  They were separate prompts, because the runs were re-queued from the canvas and
+  ComfyUI answered each from its cache. The panel's existing check compares prompt
+  ids, so it had nothing to match on. It now also compares what the run actually
+  produced: a completion whose output files were already delivered says which earlier
+  run delivered them, and whether it finished too fast to have rendered anything.
+
+  **Nothing is held back.** An earlier version of this suppressed the repeats
+  outright, and that turned out not to be safe — a node that writes to a fixed
+  filename can produce a genuinely different result in under a second, and there is no
+  way to tell that apart from a cached replay. Withholding a render you waited for is
+  worse than an extra message, so every completion still arrives; it just arrives
+  labelled.
+
+  The label is careful about what it knows: the panel compares file *references*, not
+  file contents, and says so, and it does not claim a run did real work when all it can
+  see is that the run was not suspiciously fast.
+
+
 ## [0.11.92] - 2026-08-10
 
 > Covers changes since 0.11.91.
