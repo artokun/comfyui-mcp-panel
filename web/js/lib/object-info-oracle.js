@@ -59,7 +59,16 @@ const MAX_DETAIL_CHARS = 200;
  * strings this module never produced.
  */
 function sanitizeDetail(value) {
-  const flattened = String(value ?? "")
+  // `String(value)` can itself THROW — a hostile object with a throwing toString or a
+  // Symbol both do it — and a diagnostic path must never raise an exception of its own
+  // (codex).
+  let text = "";
+  try {
+    text = String(value ?? "");
+  } catch {
+    return "(an unprintable value)";
+  }
+  const flattened = text
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
     .replace(/\s+/g, " ")
@@ -91,11 +100,20 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
     try {
       const defs = await getNodeDefs();
       if (usableDefs(defs)) return { defs, failures };
+      // AN EMPTY MAP IS AN ANSWER, NOT AN ABSENCE (codex). A client that deliberately
+      // filters could express deny-all as `{}`, and consulting the raw route would then
+      // overrule it with a broader schema — the one direction this fallback must never
+      // move. Only a client that returned NOTHING (null/undefined/non-object) or threw
+      // leaves the question unanswered, and only that may be asked again elsewhere.
+      if (defs && typeof defs === "object" && !Array.isArray(defs)) {
+        failures.push("api.getNodeDefs() returned an EMPTY schema — treated as its answer, not as an absence");
+        return { defs: null, failures };
+      }
       failures.push(
         describeFailure(
           "api.getNodeDefs() returned no usable schema",
           null,
-          defs && typeof defs === "object" ? " (an empty object)" : ` (${defs === null ? "null" : typeof defs})`,
+          ` (${defs === null ? "null" : Array.isArray(defs) ? "an array" : typeof defs})`,
         ),
       );
     } catch (err) {
@@ -133,9 +151,19 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
  * Empty when nothing was recorded, so a caller that never ran this helper reads exactly
  * as it did before rather than gaining a hollow "no failures" clause.
  */
+/** At most this many attempts are named, however long the list a caller hands in. */
+const MAX_FAILURES_REPORTED = 4;
+
 export function objectInfoOracleFailureNote(failures) {
   if (!Array.isArray(failures) || !failures.length) return "";
-  const which = failures.map((f) => sanitizeDetail(f)).filter(Boolean);
-  if (!which.length) return "";
-  return ` Tried ${which.length === 1 ? "one route" : `${which.length} routes`}: ${which.join("; ")}.`;
+  // BOUNDED AT THE PUBLIC BOUNDARY (codex): each entry is capped, and so is the number
+  // of entries — a caller may hand this an arbitrarily long array this module never
+  // produced, and the result goes into an error someone reads.
+  const all = failures.map((f) => sanitizeDetail(f)).filter(Boolean);
+  if (!all.length) return "";
+  const shown = all.slice(0, MAX_FAILURES_REPORTED);
+  const dropped = all.length - shown.length;
+  const more = dropped > 0 ? ` (and ${dropped} more not shown)` : "";
+  const label = all.length === 1 ? "one route" : `${all.length} routes`;
+  return ` Tried ${label}: ${shown.join("; ")}${more}.`;
 }

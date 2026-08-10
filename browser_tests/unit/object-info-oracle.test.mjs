@@ -58,17 +58,33 @@ test("#982 the reported case: the client THROWS and the HTTP route answers", asy
   assert.match(failures[0], /api\.getNodeDefs\(\) threw: Failed to fetch/, "and what failed is recorded verbatim");
 });
 
-test("#982 an EMPTY payload from the client is a failure, not an answer", async () => {
-  // `{}` is an object, so a bare truthiness test would have accepted it and then reported
-  // every type as removed — a fabricated verdict from an unusable payload.
+test("#982 (codex r2) an EMPTY map from the client is its ANSWER — the fallback is not consulted", async () => {
+  // A client that deliberately filters could express deny-all as `{}`. Asking the raw
+  // route then would overrule it with a broader schema, which is the one direction this
+  // fallback must never move. `{}` therefore fails closed WITHOUT a second attempt.
+  let fetched = 0;
   const { defs, failures } = await fetchWholeObjectInfo({
     getNodeDefs: async () => ({}),
-    fetchApi: async () => okResponse(SCHEMA),
+    fetchApi: async () => {
+      fetched += 1;
+      return okResponse(SCHEMA);
+    },
   });
-  assert.deepEqual(defs, SCHEMA);
-  assert.match(failures[0], /returned no usable schema \(an empty object\)/);
+  assert.equal(defs, null, "fail closed on the answer the client gave");
+  assert.equal(fetched, 0, "the raw route is never asked to overrule it");
+  assert.match(failures[0], /EMPTY schema — treated as its answer, not as an absence/);
 });
 
+test("#982 a client that returned NOTHING leaves the question open, and the fallback answers", async () => {
+  for (const nothing of [null, undefined, "nope", 42]) {
+    const { defs, failures } = await fetchWholeObjectInfo({
+      getNodeDefs: async () => nothing,
+      fetchApi: async () => okResponse(SCHEMA),
+    });
+    assert.deepEqual(defs, SCHEMA, `client returned ${String(nothing)}`);
+    assert.match(failures[0], /returned no usable schema/);
+  }
+});
 test("#982 both routes failing yields NO defs and names both", async () => {
   const { defs, failures } = await fetchWholeObjectInfo({
     getNodeDefs: async () => null,
@@ -174,7 +190,7 @@ test("#982 (codex) the observed failures are PER-REQUEST, not module state", () 
   const handler = panel.slice(panel.indexOf("async graph_set_widget({"));
   const body = handler.slice(0, handler.indexOf("\n  async "));
   assert.match(body, /let oracleFailures = \[\];/, "declared inside the handler");
-  assert.match(body, /oracleFailures = defs \? \[\] : failures;/, "written there");
+  assert.match(body, /oracleFailures = defs \? \[\] : \(outcome\?\.failures \?\? \[\]\);/, "written there");
   assert.match(body, /objectInfoOracleFailureNote\(oracleFailures\)/, "and read there");
   assert.ok(
     !/lastObjectInfoOracleFailures/.test(panel),
@@ -186,4 +202,61 @@ test("#982 (codex) a control character cannot forge structure at either boundary
   const nasty = "a\u0000b\u001fc\u007fd\u009fe";
   assert.match(objectInfoOracleFailureNote([nasty]), /a b c d e/, "collapsed, not stripped into a run-on");
   assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(objectInfoOracleFailureNote([nasty])));
+});
+
+test("#982 (codex r2) a JOINED read still learns which routes were tried", async () => {
+  // The burst cache coalesces concurrent reads: only the producer runs the loader. If the
+  // loader returned bare defs, a second widget write joining a FAILED read would refuse
+  // while naming no routes at all. The OUTCOME rides through the cache instead.
+  const { createObjectInfoCache } = await import("../../web/js/lib/object-info-cache.js");
+  const cache = createObjectInfoCache();
+  let loaderRuns = 0;
+  const load = async () => {
+    loaderRuns += 1;
+    await new Promise((r) => setTimeout(r, 5));
+    return fetchWholeObjectInfo({ getNodeDefs: async () => null, fetchApi: async () => ({ ok: false, status: 502 }) });
+  };
+  const [a, b] = await Promise.all([cache.read(load), cache.read(load)]);
+  assert.equal(loaderRuns, 1, "the second read joined the first");
+  for (const outcome of [a, b]) {
+    assert.equal(outcome.defs, null, "both fail closed");
+    assert.equal(outcome.failures.length, 2, "and both can name the routes");
+    assert.match(outcome.failures[1], /status 502/);
+  }
+  assert.equal(cache.peek().cached, false, "a failed outcome is never cached — the wrapper must not fool it");
+});
+
+test("#982 (codex r2) a SUCCESSFUL outcome still caches, and the payload is what gets stored", async () => {
+  const { createObjectInfoCache } = await import("../../web/js/lib/object-info-cache.js");
+  const cache = createObjectInfoCache();
+  let runs = 0;
+  const load = async () => {
+    runs += 1;
+    return fetchWholeObjectInfo({ getNodeDefs: async () => SCHEMA, fetchApi: null });
+  };
+  const first = await cache.read(load);
+  const second = await cache.read(load);
+  assert.equal(runs, 1, "the second read came from the cache");
+  assert.deepEqual(first.defs, SCHEMA);
+  assert.deepEqual(second.defs, SCHEMA);
+  assert.equal(cache.peek().cached, true);
+});
+
+test("#982 (codex r2) the note caps HOW MANY routes it names, and says how many it dropped", () => {
+  const many = Array.from({ length: 9 }, (_, i) => `route ${i} failed`);
+  const note = objectInfoOracleFailureNote(many);
+  assert.match(note, /Tried 9 routes/, "the count is honest");
+  assert.match(note, /and 5 more not shown/, "a truncated list must not read as the whole list");
+  assert.ok(note.length < 400, `bounded, got ${note.length}`);
+});
+
+test("#982 (codex r2) a value that cannot be stringified yields text, never a throw", () => {
+  const hostile = {
+    toString() {
+      throw new Error("nope");
+    },
+  };
+  assert.doesNotThrow(() => objectInfoOracleFailureNote([hostile]));
+  assert.match(objectInfoOracleFailureNote([hostile]), /an unprintable value/);
+  assert.doesNotThrow(() => objectInfoOracleFailureNote([Symbol("s")]));
 });
