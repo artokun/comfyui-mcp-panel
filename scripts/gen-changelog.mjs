@@ -56,6 +56,13 @@ function prevTag() {
     // name — a `backup`, a CI marker, anything — and would silently make it the release
     // base (codex, #932). This repo has no tags today, so this guards the sibling mcp
     // repo and whatever tags land here later, not a present bug.
+    //
+    // It is a GLOB, not a regex: `[0-9]*` is one digit followed by anything, so a tag like
+    // `v1.backup.2.3` still gets through (codex). It rules out the obviously-unrelated
+    // names, not every malformed one. Two further limits on a tagged repo, unaddressed
+    // because neither can arise here: describe can pick the CURRENT release's tag if
+    // generation runs after tagging, yielding an empty range, and nothing validates that
+    // the tag is an exact version.
     const t = git('describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" --match "[0-9]*.[0-9]*.[0-9]*"');
     if (t) return t;
   } catch {

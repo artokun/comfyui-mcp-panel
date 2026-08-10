@@ -66,14 +66,16 @@ test("#932: the base is the most recent release commit", () => {
   assert.equal(sha, "bbbbbbb2", "the FIRST release in log order — git logs newest first");
 });
 
-test("#932: a version at the start of a commit BODY is not a release boundary", () => {
-  // The hazard that made `git log --grep` wrong (codex): --grep searches the whole message
-  // and matches per line, so `^<version>` fires on body lines too. Reading %s only is what
-  // makes this safe — and the commits in this very fix have bodies quoting versions.
+test("#932: an ordinary subject is never chosen as the release boundary", () => {
+  // Scope, stated honestly (codex): this feeds SUBJECTS, so it cannot prove git has
+  // stopped searching bodies, and it would NOT catch a future rewrite of prevTag() back
+  // to `--grep`. Catching that automatically needs a fixture repository, which this does
+  // not have. What it does pin is the selection rule itself.
   //
-  // The body cannot even reach the predicate now, so this asserts the SHAPE that keeps it
-  // that way: a line whose subject is ordinary is skipped no matter what follows it, and
-  // the real release below it is the one selected.
+  // The hazard it descends from is real and live: `--grep "^<version>"` matches per line
+  // over the WHOLE message, and in this repo's own history it selects 7521519, whose
+  // subject is `fix(subgraph): …` and which matched on a body line. Reading %s is what
+  // keeps a body away from the predicate.
   const sha = pickReleaseSha(
     [
       logLine("aaaaaaa1", "docs(release): quote the release titles we produce"),

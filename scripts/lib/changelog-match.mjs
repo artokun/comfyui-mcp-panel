@@ -11,7 +11,13 @@
  * is exactly one copy to be wrong.
  */
 
-/** Field separator for `--pretty=format:%H%x1f%s` — a byte no commit subject contains. */
+/**
+ * Field separator for `--pretty=format:%H%x1f%s`.
+ *
+ * Not a byte git forbids in a subject (codex) — parsing is safe because only the FIRST
+ * separator is read, and it always follows the fixed-width SHA. A later one lands
+ * harmlessly inside the subject.
+ */
 export const SEP = "\x1f";
 
 /**
