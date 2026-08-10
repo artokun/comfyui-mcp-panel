@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.81] - 2026-08-09
+
+> Covers changes since 0.11.80.
+
+### Fixed
+
+- **A Save-As no longer strands the agent that performed it (#941).** `panel_save_workflow`
+  with a new name writes the copy and switches the active canvas to it — which fences the
+  very session that asked for the save, so every following `panel_*` graph call is refused.
+  That is survivable only if the reply says what to re-fence to, and it did not: it reported
+  the identity as unavailable, while the next call was refused *using* an identity the panel
+  had declined to publish one call earlier.
+
+  The identity read is deliberately pure — a fence refreshed from a value a read invented
+  would be agreeing with itself rather than observing anything — and a Save-As activates a
+  brand-new object nothing had established an identity for. So the read honestly found
+  nothing while the fence, whose own read mints, immediately found one. The identity is now
+  established as part of the save, from the record the save itself produced and proved
+  active, never from a later look at whichever canvas happens to be current. A Save-As that
+  cannot produce one still reports absence rather than substituting a different canvas.
+
+- Name the canvas swap point, from the canvas-rebuild side (#944).
+
+
 ## [0.11.80] - 2026-08-09
 
 > Covers changes since 0.11.79.
