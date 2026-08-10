@@ -13003,7 +13003,17 @@ const GRAPH_TOOL_EXECUTORS = {
       return t.startsWith(prefix) ? t.slice(prefix.length) : t;
     };
     const blueprintList = () => [...(store.subgraphBlueprints ?? [])];
-    const matchesRequested = (d) => d?.name === fullType || bareName(d) === finalName;
+    // #636 — MATCH THE DISPLAY NAME TOO. Measured on ComfyUI 0.31: `typePrefix` is
+    // absent (so the literal fallback above is what gets used), 89 of 91 blueprints are
+    // named `SubgraphBlueprint.<content-hash>`, and the name a user typed lives in
+    // `display_name`. Against that, both tests below compare a NAME-derived key against a
+    // HASH and can never match — so the preflight was blind, and publishSubgraph() would
+    // reach the confirmOverwrite() dialog this exists to keep a programmatic call away
+    // from. The comment above predicted this exact failure for "a frontend that names
+    // blueprints differently"; it is not hypothetical.
+    const displayName = (d) => (typeof d?.display_name === "string" ? d.display_name : "");
+    const matchesRequested = (d) =>
+      d?.name === fullType || bareName(d) === finalName || displayName(d) === finalName;
     // publishSubgraph() pops a confirmOverwrite() dialog on a name COLLISION — which
     // would hang this programmatic call waiting for UI. Preflight and refuse with a
     // clear error instead. The remedy must be actionable from where the caller IS:
