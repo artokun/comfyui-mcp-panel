@@ -379,6 +379,7 @@ import {
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
+  graphRootReproducesStateContent,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
   MUTATION_BINDING_BAR,
@@ -2564,6 +2565,18 @@ function establishedWorkflowReplyIdentity(wf) {
   // must ALREADY be in the live-object map. workflowObjectUuid() is a pure read —
   // it never mints — so a reply still cannot initialize an identity. Everything
   // below runs only for an object the panel has already established.
+  //
+  // #1001 tried to add a re-derivation here — a saved workflow whose object was
+  // REPLACED by a reconnect publishes nothing, so every mutating command is refused
+  // while reads keep working. It was built and then removed in review, because the
+  // records available to corroborate it are not independent: the panel's tag TRAVELS
+  // WITH THE GRAPH, so a copy of workflow A saved at A's former path carries both A's
+  // path alias and A's tag. `_loadGraphDataForkInstalled` is capability evidence — the
+  // sanitizer is installed NOW — not provenance that THIS root was created through it.
+  // Sound adoption needs a per-load marker minted per session and stamped by the
+  // loadGraphData wrapper on every load, so a tag's provenance can be checked rather
+  // than assumed. Recorded on #1001; the wedge stands until then, with
+  // `panel_open_workflow` as the recovery that mints.
   const uuid = workflowObjectUuid(wf);
   if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
   const savedPath = savedWorkflowPath(wf);
@@ -12378,6 +12391,11 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloadError = null;
     let openFailed = null;
     let rebindFailed = null;
+    // #1001 — the per-node geometry the frontend rewrote while reproducing this load
+    // faithfully. Non-null means the content proof passed WITHOUT being byte-identical,
+    // and the reply says which fields moved rather than quietly deciding it did not
+    // happen: the caller is the one who knows whether stored node sizes matter to them.
+    let openGeometryRewritten = null;
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
@@ -12550,7 +12568,18 @@ const GRAPH_TOOL_EXECUTORS = {
               const instanceStillTarget = sameWorkflowObject(activeNow, target);
               const markerMatches = graphRootCarriesOpenProof({ rootGraph, proofMarker: openProofMarker });
               const identityMatches = graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid: targetUuid });
-              const contentMatches = graphRootMatchesState({ rootGraph, state: repaintState });
+              // #1001 — content proof allows for the geometry the frontend measures
+              // for itself. A byte-shape equality made EVERY open of a workflow whose
+              // stored node sizes are not what this frontend computes report
+              // CONTENT_UNVERIFIED, which throws, which skips the line that publishes
+              // `workflow_uuid` — so a perfectly good open left the caller's fence
+              // stale and the next command was refused as an instance mismatch. The
+              // rewritten geometry is DISCLOSED on the reply rather than swallowed.
+              const contentProof = graphRootReproducesStateContent({ rootGraph, state: repaintState });
+              const contentMatches = contentProof.proven;
+              if (contentProof.proven && !contentProof.exact) {
+                openGeometryRewritten = contentProof.fields;
+              }
               const verdict = resolveOpenRebindVerdict({
                 instanceStillTarget,
                 markerMatches,
@@ -12877,6 +12906,29 @@ const GRAPH_TOOL_EXECUTORS = {
       routing_key: targetRoutingKeyAtReply,
       ...openActiveBinding,
       ...(activeWorkflowUuid ? { workflow_uuid: activeWorkflowUuid } : {}),
+      // #1001 — present only when the repaint was NOT byte-identical: the node set and
+      // every value came through, and the frontend rewrote its own geometry. Disclosed
+      // rather than swallowed, because the open now reports proven on the strength of
+      // that judgement and a caller who stores node sizes deserves to know.
+      ...(openGeometryRewritten?.length
+        ? {
+            geometry_rewritten: openGeometryRewritten,
+            // Says what was COMPARED, not "nothing was lost" (codex): the comparison
+            // establishes that every node came back with the same id, type and
+            // serialized fields APART from the ones named — it does not establish that
+            // the named ones did not matter to you. Saved node heights are your file's
+            // state, and this reply is how you find out they were rewritten.
+            geometry_rewritten_note:
+              `Every node in this workflow came back with the same id and type, and every ` +
+              `serialized field matched EXCEPT per-node ${openGeometryRewritten.join(", ")} — and ` +
+              `every difference there is a HEIGHT, with the width unchanged. That is consistent ` +
+              `with the box-measurement recomputation measured on this frontend, though the ` +
+              `panel observed the difference and not its cause, so the content is treated as ` +
+              `reproduced and the workflow_uuid is published rather than refused. It is still a ` +
+              `real difference from what is on disk: saving from here writes the recomputed ` +
+              `value (#1001).`,
+          }
+        : {}),
       modified: !!target.isModified,
       // #402 — the receipt id for THIS open. Journaled in the panel, so if this reply
       // never reaches the caller the outcome is still recoverable from workflow_list's

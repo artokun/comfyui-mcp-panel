@@ -491,7 +491,13 @@ test("#721 P1: dirty rebind success requires the target UUID, never only a read-
   assert.match(repaint, /const instanceStillTarget = sameWorkflowObject\(activeNow, target\);/);
   assert.doesNotMatch(repaint, /activeWorkflowRef\(\) !== target/, "the raw-identity comparison must be gone");
   assert.match(repaint, /graphRootWorkflowUuidMatches\(\{ rootGraph, activeWorkflowUuid: targetUuid \}\)/);
-  assert.match(repaint, /graphRootMatchesState\(\{ rootGraph, state: repaintState \}\)/);
+  // #1001 — still a proof against the state that was LOADED, but no longer a byte-shape
+  // equality: the frontend recomputes node geometry while reproducing a graph faithfully,
+  // and demanding byte-identity made every such open report CONTENT_UNVERIFIED (which
+  // throws, which withholds the fence). The predicate still refuses anything but a
+  // nodes-only, same-set, geometry-only difference.
+  assert.match(repaint, /graphRootReproducesStateContent\(\{ rootGraph, state: repaintState \}\)/);
+  assert.match(repaint, /const contentMatches = contentProof\.proven;/);
   // The ATTEMPT-scoped marker: a workflow uuid can be on the root from a previous load
   // or a rebind heal, so it cannot say that THIS load landed.
   assert.match(repaint, /\[OPEN_PROOF_FIELD\]: openProofMarker/, "the payload must carry a single-use marker");

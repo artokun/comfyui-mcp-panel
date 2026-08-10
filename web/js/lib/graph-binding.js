@@ -656,7 +656,25 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
     // entirely, and a size change alongside it passed the cosmetic gate. A
     // classifier that erases the very field that would have blocked the all-clear
     // is the worst possible failure here.
-    const has = (node, field) => Object.prototype.hasOwnProperty.call(node, field);
+    //
+    // `undefined` IS ABSENT, though — and only `undefined` (#1001). A saved workflow
+    // is JSON, and `JSON.stringify` drops a key whose value is `undefined`, so no
+    // file can carry one: comparing a live in-memory `serialize()` against a parsed
+    // file declares a difference in a form that cannot exist on disk. MEASURED on
+    // ComfyUI 0.31.1 / frontend 1.48.7 — every node the frontend instantiates carries
+    // `showAdvanced: undefined`, absent from the file, so EVERY open of EVERY saved
+    // workflow reported a non-cosmetic per-node difference and the caller was told to
+    // go read widget values that had never changed.
+    //
+    // `null` stays significant, deliberately: JSON carries null, so present-as-null
+    // and absent are genuinely different states of a saved file, and collapsing them
+    // is the erasure the paragraph above exists to prevent. Spelling this `!= null`
+    // would in fact behave identically today — the value comparison below flags
+    // absent-vs-null anyway, `"undefined" !== "null"` — so the strict test is chosen
+    // for what it MEANS, not because the looser one currently misbehaves. Verified by
+    // mutation: swapping it changes no result, which is why no test claims otherwise.
+    const has = (node, field) =>
+      Object.prototype.hasOwnProperty.call(node, field) && node[field] !== undefined;
     const fields = new Set();
 
     for (const [key, expectedNode] of expected) {
@@ -757,6 +775,137 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
     return expected != null && actual != null && expected === actual;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Per-node fields the ComfyUI frontend RECOMPUTES while loading a graph it
+ * reproduced faithfully.
+ *
+ * Deliberately NARROWER than `COSMETIC_NODE_FIELDS`. That set answers "may I
+ * reassure the reader", and it includes `color`/`bgcolor` because the sentence it
+ * feeds names the fields. THIS set answers "may the panel call the content
+ * PROVEN", and a lost `color` is a lost authored value — it must be able to hold
+ * the proof back even though it is cosmetic to look at.
+ *
+ * ONE FIELD, and only the one that was MEASURED. An earlier cut also listed `pos`
+ * and `order`, on the reasoning that they are layout too. Neither was observed
+ * being rewritten by anything, `pos` is authored by the user dragging a node, and
+ * `order` is execution-order state in a LiteGraph-derived graph — proving content
+ * across a changed `order` would publish a fence for a graph whose observable
+ * behaviour changed (codex). What the live install actually rewrote, on every open
+ * of every saved workflow, was node HEIGHT. So that is the whole set, and it grows
+ * only when a measurement says it must.
+ */
+const RECOMPUTED_NODE_FIELDS = new Set(["size"]);
+
+/**
+ * Did the live root reproduce this state's CONTENT — allowing for the geometry the
+ * frontend measures for itself?
+ *
+ * THE DEFECT THIS ANSWERS (#1001). `workflow_open` proved its content with
+ * `graphRootMatchesState`, a byte-shape equality over the whole serialized node
+ * array. MEASURED on ComfyUI 0.31.1 / frontend 1.48.7, opening a saved workflow
+ * from the user's own library: the frontend re-measured node boxes on load
+ * (`SaveVideo` 358 -> 126 high), so the shapes differed and the open reported
+ * CONTENT_UNVERIFIED — on a load that was perfect. That verdict throws, and a
+ * throwing open never reaches the line that publishes `workflow_uuid`, so the
+ * caller's fence stayed stale and the NEXT command was refused as a workflow
+ * instance mismatch. The reporter needed four calls to reach a state the panel
+ * already believed it was in.
+ *
+ * The difference is not a race — sampled at 0ms, one frame, 50ms, 250ms, 1s and 2s
+ * after the load resolved, it was identical every time. It is deterministic, and it
+ * applies to any workflow whose stored sizes are not what this frontend computes.
+ *
+ * Returns `{ proven, exact, fields }`. `exact` distinguishes a byte-identical
+ * repaint from one where geometry was rewritten, so a caller can DISCLOSE the
+ * difference instead of the panel quietly deciding it did not happen.
+ */
+/**
+ * Every node whose `size` differs differs ONLY in height, and both sides are a readable
+ * `[width, height]` pair.
+ *
+ * The measurement behind the whole exemption is a recomputed BOX HEIGHT. Width is not
+ * something the frontend was observed rewriting, so a width change is not covered by
+ * the evidence and must not ride in on the field's name (codex r2). Anything
+ * unreadable — a non-pair, a non-finite number, an unpairable node — answers false,
+ * because a proof cannot rest on a value nobody could read.
+ */
+function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
+  try {
+    if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return false;
+    // STRICTLY numbers. `Number.isFinite(Number(n))` would accept `null` (Number(null)
+    // is 0) and a numeric string — and a JSON round-trip turns NaN into null, so a
+    // height that arrived unreadable would have passed as a readable zero.
+    const readable = (size) =>
+      Array.isArray(size) && size.length === 2 && size.every((n) => typeof n === "number" && Number.isFinite(n));
+    const actualByKey = new Map();
+    for (const node of actualNodes) {
+      if (!node || typeof node !== "object") return false;
+      actualByKey.set(nodeIdentityKey(node), node);
+    }
+    for (const expectedNode of expectedNodes) {
+      if (!expectedNode || typeof expectedNode !== "object") return false;
+      const actualNode = actualByKey.get(nodeIdentityKey(expectedNode));
+      if (!actualNode) return false;
+      const before = expectedNode.size;
+      const after = actualNode.size;
+      if (JSON.stringify(canonicalizeShapeValue(before)) === JSON.stringify(canonicalizeShapeValue(after))) continue;
+      if (!readable(before) || !readable(after)) return false;
+      if (Number(before[0]) !== Number(after[0])) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
+  const NOT_PROVEN = { proven: false, exact: false, fields: [] };
+  try {
+    // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
+    // per check let a synchronous serialization hook — a broken or hostile custom node —
+    // show a height-only difference to the classifier and then alter a widget before the
+    // size check re-serialized, so a fence would be published for content no comparison
+    // ever saw. A single snapshot cannot disagree with itself.
+    const actualState = rootGraph?.serialize?.();
+    if (actualState == null) return NOT_PROVEN;
+    const frozen = { serialize: () => actualState };
+    if (graphRootMatchesState({ rootGraph: frozen, state })) return { proven: true, exact: true, fields: [] };
+    const diff = describeGraphStateDifference({ rootGraph: frozen, state });
+    // Never inferred from an absent comparison: `comparable:false` means no
+    // comparison happened, which is not evidence either way.
+    if (diff?.comparable !== true) return NOT_PROVEN;
+    const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
+    // ONE surface, and it must be `nodes`. A group or a link that disagrees is
+    // unexplained by anything the node comparison establishes.
+    if (surfaces.length !== 1 || surfaces[0] !== "nodes") return NOT_PROVEN;
+    const nodes = diff.nodeDifference;
+    // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
+    // mutation: `classifyNodeDifference` only computes `fields` once the sets match, so
+    // a changed set arrives here as `sameNodeSet:false` with an EMPTY field list and
+    // either check refuses it. Removing BOTH does fail the suite. They are kept as two
+    // because they answer different questions — "is this the same graph" and "can the
+    // panel name what moved" — and a later change to one classifier must not silently
+    // remove the other's guarantee.
+    if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return NOT_PROVEN;
+    const fields = Array.isArray(nodes.fields) ? nodes.fields : [];
+    // WIDTH IS NOT MEASURED (codex r2). The evidence is a recomputed HEIGHT, and a
+    // field-name allowlist admits any rewrite of the whole `[w, h]` pair — so a changed
+    // width, or an arbitrary replacement, would have been PROVEN on the strength of a
+    // measurement about something else. Every differing size must be height-only.
+    if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, actualState?.nodes)) {
+      return NOT_PROVEN;
+    }
+    // An empty field list with a differing `nodes` surface means the two disagreed
+    // somewhere this classifier could not name — proving content off a difference
+    // nobody can point at is exactly the fabricated all-clear to avoid.
+    if (!fields.length) return NOT_PROVEN;
+    if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return NOT_PROVEN;
+    return { proven: true, exact: false, fields };
+  } catch {
+    return NOT_PROVEN;
   }
 }
 
