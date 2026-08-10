@@ -69,11 +69,13 @@ export function installGitUrl({ id, repository } = {}) {
  *
  * A git URL (via `id` OR `repository`, any recognized protocol) always routes to
  * the repo-name-as-id payload: v4 installs by {id: repoName, selected_version:
- * ref||"nightly", channel:"dev"} (no files — v4 resolves by CNR/repo name);
- * v2-batch + legacy install the URL natively via {id: repoName, version:
- * "unknown", files:[url]}. A registry id keeps the versioned body. `id` is
- * NEVER a full URL (a full URL matches nothing on v4 → silent "done"; on 3.x it
- * fails LATER while resolving, past the immediate `failed` array).
+ * ref||"nightly", repository: url, channel:"dev"} (no files — that is a 3.x
+ * shape); v2-batch + legacy install the URL natively via {id: repoName, version:
+ * "unknown", files:[url]}. A registry id keeps the versioned body and carries NO
+ * repository. `id` is NEVER a full URL (a full URL matches nothing on v4 →
+ * silent "done"; on 3.x it fails LATER while resolving, past the immediate
+ * `failed` array) — the URL travels in `repository`, which is where v4's schema
+ * puts it and which it REQUIRES for a nightly install (#920).
  */
 export function buildInstallRequest(dialect, args = {}, ui_id) {
   const { id, version, repository, channel, mode, selected_version } = args;
@@ -82,6 +84,41 @@ export function buildInstallRequest(dialect, args = {}, ui_id) {
   if (dialect === "v2") {
     if (gitUrl) {
       const selected = selected_version || version || "nightly";
+      // #920 — SEND THE URL. Manager v4's InstallPackParams carries a
+      // `repository` field, and the v4 API's own generated schema says it is
+      // REQUIRED when `selected_version` is nightly:
+      //
+      //   InstallPackParams: ManagerPackInfo & {
+      //     selected_version: string | 'latest' | 'nightly'
+      //     /** GitHub repository URL (required if selected_version is nightly) */
+      //     repository?: string
+      //     ...
+      //   }
+      //
+      // (Comfy-Org/ComfyUI_frontend, manager/types/generatedManagerTypes.ts —
+      // generated FROM the v4 API, so this is the contract rather than a guess.
+      // Guessing is what #809 was: `params` is an UNTAGGED Pydantic union with
+      // InstallPackParams first, so unrecognised fields are dropped silently and
+      // the wrong model can win.)
+      //
+      // Dropping it did not merely lose detail — it turned a source install into
+      // a REGISTRY LOOKUP, which is why the report reads "not found in
+      // [ManagerChannel.dev, ManagerDatabaseSource.cache]": those are the
+      // channel/mode defaults immediately below. Adding `repository` makes this
+      // payload match InstallPackParams MORE specifically, which is the safe
+      // direction across that union.
+      //
+      // `id` is deliberately LEFT as the repo name. ManagerPackInfo describes it
+      // as "Either github-author/github-repo or name of pack from the registry",
+      // which reads as though owner/repo would be better — I changed it to that
+      // first, and it broke three existing tests, one of them #301's assertion
+      // that a bare `author/repo` SHORTHAND must never be sent as `id`. That
+      // assertion exists because of a real failure.
+      //
+      // A doc string is not evidence that v4 ACCEPTS the other form, and this
+      // change fixes a PROVEN bug (the dropped URL). Bundling an unproven id
+      // change into it would risk the installs that currently work to chase a
+      // description. Filed separately instead.
       return {
         dialect,
         envelope: "task",
@@ -89,6 +126,7 @@ export function buildInstallRequest(dialect, args = {}, ui_id) {
           id: gitRepoName(gitUrl),
           version: selected,
           selected_version: selected,
+          repository: gitUrl,
           channel: channel || "dev",
           mode: mode || "cache",
         },
