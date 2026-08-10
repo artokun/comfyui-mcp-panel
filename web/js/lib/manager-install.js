@@ -89,6 +89,23 @@ export function buildInstallRequest(dialect, args = {}, ui_id) {
           id: gitRepoName(gitUrl),
           version: selected,
           selected_version: selected,
+          // #920 — SEND THE URL. Reducing it to `gitRepoName` and stopping there turned a
+          // from-source install into a registry lookup, and Manager answered
+          // "Node '<name>@nightly' not found in [ManagerChannel.dev,
+          // ManagerDatabaseSource.cache]" — both sources being the two defaults below.
+          //
+          // The field is not inferred. Manager's own model declares it:
+          //
+          //   class InstallPackParams(ManagerPackInfo):
+          //     repository: Optional[str] = Field(
+          //       None, description="GitHub repository URL (required if selected_version
+          //                          is nightly)")
+          //
+          // and "required if nightly" is exactly the reported call. `id` stays the derived
+          // NAME rather than the URL: sending a URL there made v4 silently mark the
+          // install done while doing nothing, which is why it was derived in the first
+          // place — that behaviour is preserved, this only stops discarding the URL.
+          repository: gitUrl,
           channel: channel || "dev",
           mode: mode || "cache",
         },

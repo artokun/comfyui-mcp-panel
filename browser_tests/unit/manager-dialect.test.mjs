@@ -1000,3 +1000,48 @@ test("#605: nodes_install legacy-on-legacy unreachable surfaces the original err
   );
   assert.deepEqual(calls, ["manager/queue/install"], "the rejected submit is not repeated");
 });
+
+// ── #920: a repository URL must reach Manager, not be reduced to an id ──────
+//
+// buildInstallRequest's v2 git branch sent `id: gitRepoName(url)` and dropped the URL, so
+// a from-source install became a registry lookup and Manager answered:
+//
+//   Node 'ComfyUI-SolAttn_triton@nightly' not found in
+//     [ManagerChannel.dev, ManagerDatabaseSource.cache]
+//
+// both sources being that branch's own channel:"dev" and mode:"cache" defaults.
+//
+// The field is read from Manager's installed model, not inferred:
+//
+//   class InstallPackParams(ManagerPackInfo):
+//     repository: Optional[str] = Field(
+//       None, description="GitHub repository URL (required if selected_version is nightly)")
+
+const GIT_URL = "https://github.com/kijai/ComfyUI-SolAttn_triton.git";
+
+test("#920: a repository-only nightly install carries the URL", () => {
+  const req = ManagerInstall.buildInstallRequest("v2", { repository: GIT_URL, version: "nightly" }, "u-1");
+  assert.equal(req.params.repository, GIT_URL, "the URL must reach Manager");
+  assert.equal(req.params.selected_version, "nightly", "and nightly is what makes it required");
+});
+
+test("#920: the id stays the derived NAME, not the URL", () => {
+  // Sending a URL as `id` made v4 silently mark the install done while doing nothing,
+  // which is why it was derived. That behaviour is preserved — this only stops the URL
+  // being discarded.
+  const req = ManagerInstall.buildInstallRequest("v2", { repository: GIT_URL, version: "nightly" }, "u-1");
+  assert.equal(req.params.id, "ComfyUI-SolAttn_triton");
+  assert.notEqual(req.params.id, GIT_URL);
+});
+
+test("#920: a URL passed as `id` is carried too — same routing, either field", () => {
+  const req = ManagerInstall.buildInstallRequest("v2", { id: GIT_URL, version: "nightly" }, "u-1");
+  assert.equal(req.params.repository, GIT_URL);
+  assert.equal(req.params.id, "ComfyUI-SolAttn_triton");
+});
+
+test("#920: a REGISTRY install is untouched — no repository field invented", () => {
+  const req = ManagerInstall.buildInstallRequest("v2", { id: "comfyui-impact-pack", version: "1.2.3" }, "u-1");
+  assert.equal(req.params.repository, undefined, "a non-git install must not carry one");
+  assert.equal(req.params.id, "comfyui-impact-pack");
+});
