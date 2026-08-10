@@ -18,7 +18,21 @@ import { tmpdir } from 'node:os'
 import { leakReport, plannedDeletions, workflowUserdataPath } from './fixtures/workflow-litter'
 
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8188'
-const BASELINE_FILE = join(tmpdir(), 'cmcp-e2e-workflow-baseline.json')
+/**
+ * PER RUN, not per machine (codex). A shared, predictable path let two runs
+ * against one ComfyUI overwrite each other's ownership record — and then run A's
+ * teardown would delete files run B was still using, judged against a baseline
+ * that was never A's. globalSetup and globalTeardown share a process, so the env
+ * var carries it; the pid-named file is the fallback.
+ */
+const BASELINE_ENV = 'CMCP_E2E_WORKFLOW_BASELINE'
+function BASELINE_FILE_PATH(): string {
+  const named = process.env[BASELINE_ENV]
+  if (named) return named
+  const path = join(tmpdir(), `cmcp-e2e-workflow-baseline-${process.pid}.json`)
+  process.env[BASELINE_ENV] = path
+  return path
+}
 
 /**
  * NOT `fetch`. Global fetch is undici, whose connection pool outlives these
@@ -41,7 +55,10 @@ function httpJson(method: 'GET' | 'DELETE', url: string): Promise<unknown | null
       return
     }
     const send = target.protocol === 'https:' ? httpsRequest : httpRequest
-    const req = send(target, { method, agent: false }, (res) => {
+    // BOUNDED (codex). A server that accepts the connection and never ends the
+    // response would hang setup or teardown forever — wedging CI rather than
+    // failing open, which is the opposite of every other guard here.
+    const req = send(target, { method, agent: false, timeout: 10_000 }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (c: Buffer) => chunks.push(c))
       res.on('end', () => {
@@ -56,6 +73,10 @@ function httpJson(method: 'GET' | 'DELETE', url: string): Promise<unknown | null
           resolve(method === 'DELETE' ? true : null) // a DELETE need not return JSON
         }
       })
+    })
+    req.on('timeout', () => {
+      req.destroy()
+      resolve(null)
     })
     req.on('error', () => resolve(null))
     req.end()
@@ -80,7 +101,7 @@ async function listWorkflows(): Promise<string[] | null> {
 export async function recordWorkflowBaseline(): Promise<void> {
   const before = await listWorkflows()
   try {
-    rmSync(BASELINE_FILE, { force: true })
+    rmSync(BASELINE_FILE_PATH(), { force: true })
   } catch {
     /* nothing to clear */
   }
@@ -91,13 +112,13 @@ export async function recordWorkflowBaseline(): Promise<void> {
     )
     return
   }
-  mkdirSync(dirname(BASELINE_FILE), { recursive: true })
-  writeFileSync(BASELINE_FILE, JSON.stringify(before), 'utf-8')
+  mkdirSync(dirname(BASELINE_FILE_PATH()), { recursive: true })
+  writeFileSync(BASELINE_FILE_PATH(), JSON.stringify(before), 'utf-8')
 }
 
 function readBaseline(): string[] | null {
   try {
-    const parsed = JSON.parse(readFileSync(BASELINE_FILE, 'utf-8'))
+    const parsed = JSON.parse(readFileSync(BASELINE_FILE_PATH(), 'utf-8'))
     return Array.isArray(parsed) ? parsed : null
   } catch {
     return null
@@ -131,31 +152,44 @@ export async function cleanWorkflowLitter(): Promise<void> {
     )
   }
 
-  const remaining = (await listWorkflows()) ?? after
-  const { undeleted, unrecognised } = leakReport(before, remaining, planned)
-  rmSync(BASELINE_FILE, { force: true })
+  // If the CHECK cannot be taken, say so — do not treat a failed listing as proof
+  // that every delete failed (codex). The old `?? after` did exactly that, and
+  // would have failed a green run on a transient read error.
+  const remaining = await listWorkflows()
+  rmSync(BASELINE_FILE_PATH(), { force: true })
+  if (!remaining) {
+    console.warn(
+      `[e2e] removed ${planned.length} saved workflow(s), but the directory could not be re-read, ` +
+        `so the cleanup is UNVERIFIED for this run (#907).`,
+    )
+    return
+  }
 
+  const { undeleted, unrecognised } = leakReport(before, remaining, planned)
   if (planned.length) {
     console.log(`[e2e] removed ${planned.length - undeleted.length} saved workflow(s) this run (#907).`)
   }
-  if (undeleted.length || unrecognised.length) {
-    const lines = [
-      `[e2e] SAVED-WORKFLOW LEAK (#907) — the suite left files in the user's workflow library.`,
-    ]
-    if (undeleted.length) {
-      lines.push(
-        `  ${undeleted.length} recognised file(s) could NOT be deleted, so the cleanup itself is broken: ` +
-          undeleted.slice(0, 10).join(', '),
-      )
-    }
-    if (unrecognised.length) {
-      lines.push(
-        `  ${unrecognised.length} new file(s) match no pattern the suite knows: ` +
-          unrecognised.slice(0, 10).join(', ') +
-          `. If a spec started saving under a new name, add it to LITTER_PATTERNS; if this was ` +
-          `saved by hand while the suite ran, it is safe to ignore.`,
-      )
-    }
-    throw new Error(lines.join('\n'))
+
+  // A NEW FILE WE DID NOT MAKE IS NOT A FAILURE (codex). A developer saving
+  // something while the suite runs is normal, and failing their run for it — with
+  // a message that itself said "safe to ignore" — teaches people to distrust the
+  // check. Warn and name it, so a spec that starts saving under a new name still
+  // surfaces.
+  if (unrecognised.length) {
+    console.warn(
+      `[e2e] ${unrecognised.length} workflow(s) appeared during this run that the suite does not ` +
+        `recognise: ${unrecognised.slice(0, 10).join(', ')}. Left alone. If a spec started saving ` +
+        `under a new name, add it to LITTER_PATTERNS (#907).`,
+    )
+  }
+
+  // THIS is the failure: we recognised the file as ours, tried to delete it, and it
+  // is still there — the cleanup itself has stopped working. That is the silence
+  // that let 1269 files accumulate, so it has to be loud.
+  if (undeleted.length) {
+    throw new Error(
+      `[e2e] SAVED-WORKFLOW CLEANUP IS BROKEN (#907): ${undeleted.length} file(s) the suite created ` +
+        `could not be deleted: ${undeleted.slice(0, 10).join(', ')}`,
+    )
   }
 }

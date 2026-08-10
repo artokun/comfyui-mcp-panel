@@ -44,7 +44,11 @@ test('the tab re-registers after the bridge dies and respawns', async ({
   await panel.openSidebar()
   await panel.connect()
 
-  const saved = await mockBridge.command('workflow_save', {})
+  // #907 — an unnamed save gets ComfyUI's `Untitled <date> <time>`, the SAME
+  // name it gives the developer's own unnamed saves, so nothing downstream can
+  // tell them apart and the cleanup must not try. Name it ours.
+  const e2eSaveName = `cmcp-e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const saved = await mockBridge.command('workflow_save_as', { name: e2eSaveName })
   expect(saved.ok, 'the workflow must save so the route is the composed wf: form').toBe(true)
   const savedName = String(saved.result?.workflow || '')
   expect(savedName).toBeTruthy()

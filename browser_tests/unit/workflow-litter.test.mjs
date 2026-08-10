@@ -16,17 +16,37 @@ import {
   workflowUserdataPath,
 } from "../fixtures/workflow-litter.ts";
 
-test("recognises the names the suite actually produces", () => {
-  // ComfyUI's default for an unnamed save. TAKEN FROM THE REAL DIRECTORY, not
-  // from what the format looked like it should be: it carries a time too. The
-  // first pattern I wrote stopped at the date and matched zero of 1272 files.
-  assert.equal(isTestLitter("Untitled 2026-08-09 19-37-51.json"), true);
-  assert.equal(isTestLitter("Untitled 2026-08-06 21-12-26.json"), true);
-  // The date-only form older frontends produced.
-  assert.equal(isTestLitter("Untitled 2026-08-09.json"), true);
-  assert.equal(isTestLitter("Untitled 2026-08-09 (2).json"), true);
-  // The suite's own nonce prefix.
+test("recognises ONLY names the suite itself chose", () => {
+  assert.equal(isTestLitter("cmcp-e2e-m2x1a-a7bd9c.json"), true);
+  // ComfyUI's `Untitled <date> <time>` is deliberately NOT matched by the
+  // automated cleanup, even though 1272 such files were the original symptom.
+  // It is the same name ComfyUI gives the developer's own unnamed saves, so a
+  // developer who saves during a run would lose it (codex P0). The specs save
+  // under the prefix above instead, and the ambiguous family is left to a human
+  // running scripts/clean-e2e-litter.mjs --include-untitled.
+  assert.equal(isTestLitter("Untitled 2026-08-09 19-37-51.json"), false);
+  assert.equal(isTestLitter("Untitled 2026-08-09.json"), false);
+});
+
+test("THE P0: a developer's unnamed save during a run is never a target", () => {
+  // Both conditions used to hold for this file — new since baseline, and matching
+  // the pattern — so it would have been deleted. That is someone's work.
+  const before = ["Artokun Flow v1.json"];
+  const after = [...before, "Untitled 2026-08-09 20-15-00.json"];
+  assert.deepEqual(plannedDeletions(before, after), []);
+});
+
+test("recognises the suite prefix in the shapes the specs generate", () => {
+  // Every spec builds its name as `cmcp-e2e-<base36 time>-<nonce>`, and one adds
+  // a purpose in the middle. Dots and dashes are allowed because a name is
+  // assembled, not validated, at the call site.
+  assert.equal(isTestLitter("cmcp-e2e-m2x1a-a7bd9c.json"), true);
   assert.equal(isTestLitter("cmcp-e2e-identity-m2x1-a7bd9c.json"), true);
+  assert.equal(isTestLitter("cmcp-e2e-b-1.json"), true);
+  assert.equal(isTestLitter("cmcp-e2e-x.y.json"), true);
+  // Near misses stay out: the prefix is the whole ownership claim.
+  assert.equal(isTestLitter("cmcp-e2e.json"), false);
+  assert.equal(isTestLitter("my-cmcp-e2e-copy.json"), false);
 });
 
 test("does not recognise the user's own work", () => {
@@ -42,14 +62,14 @@ test("does not recognise the user's own work", () => {
 });
 
 test("BOTH conditions are required — new AND recognisable", () => {
-  const before = ["Artokun Flow v1.json", "Untitled 2026-08-01.json"];
+  const before = ["Artokun Flow v1.json", "cmcp-e2e-old.json"];
   const after = [
     "Artokun Flow v1.json",
-    "Untitled 2026-08-01.json", // recognisable BUT pre-existing → the user's
-    "Untitled 2026-08-09.json", // new AND recognisable → ours
+    "cmcp-e2e-old.json", // recognisable BUT pre-existing → left alone
+    "cmcp-e2e-abc123.json", // new AND recognisable → ours
     "New Idea.json", // new but NOT recognisable → the user saved it mid-run
   ];
-  assert.deepEqual(plannedDeletions(before, after), ["Untitled 2026-08-09.json"]);
+  assert.deepEqual(plannedDeletions(before, after), ["cmcp-e2e-abc123.json"]);
 });
 
 test("a file the user saved DURING the run is never deleted", () => {
@@ -61,7 +81,7 @@ test("a file the user saved DURING the run is never deleted", () => {
 test("last week's Untitled is never deleted", () => {
   // The case that makes "matches the pattern" alone unsafe — ComfyUI gives the
   // user's own unnamed saves exactly this shape.
-  const before = ["Untitled 2026-08-04.json"];
+  const before = ["cmcp-e2e-lastweek.json"];
   assert.deepEqual(plannedDeletions(before, [...before]), []);
 });
 
@@ -72,8 +92,8 @@ test("an empty or unreadable listing plans nothing", () => {
 });
 
 test("duplicates in a listing are planned once", () => {
-  const planned = plannedDeletions([], ["Untitled 2026-08-09.json", "Untitled 2026-08-09.json"]);
-  assert.deepEqual(planned, ["Untitled 2026-08-09.json"]);
+  const planned = plannedDeletions([], ["cmcp-e2e-x.json", "cmcp-e2e-x.json"]);
+  assert.deepEqual(planned, ["cmcp-e2e-x.json"]);
 });
 
 // ── THE LEAK REPORT ───────────────────────────────────────────────────────
@@ -82,15 +102,15 @@ test("duplicates in a listing are planned once", () => {
 // down, so the teardown has to be able to say it failed.
 
 test("a clean run reports nothing", () => {
-  const r = leakReport(["a.json"], ["a.json"], ["Untitled 2026-08-09.json"]);
+  const r = leakReport(["a.json"], ["a.json"], ["cmcp-e2e-zz.json"]);
   assert.deepEqual(r, { undeleted: [], unrecognised: [] });
 });
 
 test("a delete that did not take is UNDELETED — the cleanup is broken", () => {
-  const r = leakReport(["a.json"], ["a.json", "Untitled 2026-08-09.json"], [
-    "Untitled 2026-08-09.json",
+  const r = leakReport(["a.json"], ["a.json", "cmcp-e2e-zz.json"], [
+    "cmcp-e2e-zz.json",
   ]);
-  assert.deepEqual(r.undeleted, ["Untitled 2026-08-09.json"]);
+  assert.deepEqual(r.undeleted, ["cmcp-e2e-zz.json"]);
   assert.deepEqual(r.unrecognised, []);
 });
 
@@ -103,15 +123,15 @@ test("a new name we never tried is UNRECOGNISED — a spec may have changed", ()
 });
 
 test("the two kinds are reported separately — they mean different things", () => {
-  const r = leakReport([], ["Untitled 2026-08-09.json", "something-else.json"], [
-    "Untitled 2026-08-09.json",
+  const r = leakReport([], ["cmcp-e2e-zz.json", "something-else.json"], [
+    "cmcp-e2e-zz.json",
   ]);
-  assert.deepEqual(r.undeleted, ["Untitled 2026-08-09.json"]);
+  assert.deepEqual(r.undeleted, ["cmcp-e2e-zz.json"]);
   assert.deepEqual(r.unrecognised, ["something-else.json"]);
 });
 
 test("userdata paths are namespaced to workflows", () => {
-  assert.equal(workflowUserdataPath("Untitled 2026-08-09.json"), "workflows/Untitled 2026-08-09.json");
+  assert.equal(workflowUserdataPath("cmcp-e2e-zz.json"), "workflows/cmcp-e2e-zz.json");
 });
 
 // ── WIRING ────────────────────────────────────────────────────────────────

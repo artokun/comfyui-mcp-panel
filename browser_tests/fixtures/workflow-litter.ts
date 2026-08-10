@@ -27,19 +27,22 @@
  * last week — the same shape ComfyUI gives every unnamed save, including theirs.
  */
 
-/** Names the suite is known to create. */
-const LITTER_PATTERNS: readonly RegExp[] = [
-  // ComfyUI's default name for an unnamed `workflow_save`. MEASURED against the
-  // real directory rather than assumed: it carries a TIME as well as a date —
-  // "Untitled 2026-08-09 19-37-51.json". The first version of this pattern
-  // stopped at the date and matched ZERO of the 1272 real files, which would have
-  // deleted nothing and then failed every run by reporting all of them as
-  // unrecognised. The date-only form is kept as an alternative because older
-  // frontends produced it.
-  /^Untitled \d{4}-\d{2}-\d{2}(?: \d{2}-\d{2}-\d{2})?(?: \(\d+\))?\.json$/,
-  // The suite's own explicit prefix, used by specs that save under a nonce.
-  /^cmcp-e2e-[A-Za-z0-9-]+\.json$/,
-]
+/**
+ * Names the suite is known to create — and ONLY names no one else can produce.
+ *
+ * The first version of this also matched ComfyUI's `Untitled <date> <time>`,
+ * because that is what an unnamed `workflow_save` produces and 1272 such files
+ * were sitting in the library. Codex was right to refuse it: that is the SAME
+ * name ComfyUI gives the developer's own unnamed saves. A developer who hits
+ * save during a run creates a file that is both new and matching, and this would
+ * delete their work. "Both conditions" is not enough when one of them is a name
+ * anybody can produce by accident.
+ *
+ * So the specs now save under this prefix instead (workflow_save_as), and the
+ * automated cleanup deletes nothing else. Pre-existing `Untitled` litter is left
+ * to scripts/clean-e2e-litter.mjs, where a human decides.
+ */
+const LITTER_PATTERNS: readonly RegExp[] = [/^cmcp-e2e-[A-Za-z0-9._-]+\.json$/]
 
 /** Does this filename match something the suite creates? */
 export function isTestLitter(name: string): boolean {

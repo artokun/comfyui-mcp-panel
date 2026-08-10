@@ -63,7 +63,13 @@ test('an in-place save persists a value the tracker never saw', async ({
   // finally, which no-ops on an empty one.
   let name = ''
   try {
-    const first = await mockBridge.command('workflow_save', {})
+    // #907 — SAVE UNDER A NAME THAT IS UNMISTAKABLY OURS. An unnamed save gets
+    // ComfyUI's `Untitled <date> <time>`, which is the SAME shape it gives the
+    // developer's own unnamed saves — so a cleanup keyed on that name can delete
+    // their work if they happen to save while the suite runs (codex). Naming it
+    // here means nothing the suite deletes is ever ambiguous.
+    const e2eName = `cmcp-e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const first = await mockBridge.command('workflow_save_as', { name: e2eName })
     expect(first.ok, 'the first save must succeed so the tab has a path').toBe(true)
     name = String(first.result?.workflow || '')
     expect(name, 'the save must report the workflow name').toBeTruthy()
