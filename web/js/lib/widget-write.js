@@ -1,5 +1,4 @@
 import { pressableWidgetHint } from "./pressable-widget.js";
-import { serializedWidgetValueState, notPersistedNote } from "./widget-persistence.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
@@ -1702,19 +1701,6 @@ export function applyWidgetWrite(
 
   setDirty?.();
 
-  // #983 — the write verified against the LIVE widget, which is the right check and
-  // is not what failed here. Ask the deeper question too: did the value reach what the
-  // node SERIALIZES? A widget that is a view of state kept elsewhere accepts the
-  // write, satisfies read-back, and is then regenerated — so the value cannot reach a
-  // saved workflow or a queued prompt, and reporting a plain success for it is wrong.
-  //
-  // Measured on the widget the report names, against two composites that DO persist,
-  // so this separates them without an allowlist: see web/js/lib/widget-persistence.js.
-  // "unknown" makes no claim — a node that cannot be serialized must not turn a
-  // working write into a warning.
-  const persistence = serializedWidgetValueState(targetNode, w.name, w.value);
-  const notPersisted = persistence === "absent";
-
   // On success, a promoted write has ALWAYS synced the authoritative parent rail
   // widget (verified AFTER afterChange, or it would have rolled back + thrown).
   // parent_widget_synced is reported for observability / defense-in-depth in the
@@ -1730,12 +1716,6 @@ export function applyWidgetWrite(
     widget: w.name,
     previous: parentWidget ? previousParent : previous,
     value: w.value,
-    ...(notPersisted
-      ? {
-          persisted: false,
-          not_persisted_note: notPersistedNote(w.name, targetNode.type),
-        }
-      : {}),
     ...(writeWarning
       ? {
           write_warning: writeWarning,
