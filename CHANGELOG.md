@@ -6,6 +6,43 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.89] - 2026-08-10
+
+> Covers changes since 0.11.88.
+
+### Fixed
+
+- **`panel_get_errors` no longer reports a problem and "no errors" in the same
+  answer (#984).** The panel has two ways of finding a widget that names a file the
+  server does not have: the snapshot ComfyUI takes when a workflow loads, and a live
+  check against the server's current node list. The live one was added later, and the
+  "no errors recorded" verdict was never taught about it — so a defect only the live
+  check could see was reported in the payload while the summary said
+  `Checked errors — none`.
+
+  The case that shows it: a `CheckpointLoader` whose `config_name` names a
+  `models/configs` file that is not there. No missing-**model** tracking covers that
+  folder, so the load-time snapshot has nothing, and the live check is the only one
+  that knows. Both halves now decide the verdict together.
+
+  Two related corrections came out of reviewing it:
+
+  - **The same missing file is no longer counted twice.** Both halves usually find
+    it, and the summary was adding the lists — reporting six problems where there
+    were three.
+  - **A widget that is driven by a connection is no longer judged on its own value.**
+    When you convert a widget to an input and connect something, ComfyUI keeps the
+    widget around and runs the connection instead; its leftover value is often stale.
+    Checking it reported an error on a workflow that runs perfectly well.
+
+  Worth saying plainly for anyone who filed something like this: if `panel_get_errors`
+  reports clean while your canvas shows red loaders, this fix may not be your problem.
+  The originally reported shape did not reproduce — with loaders naming absent files,
+  including subfolder-qualified ones with backslashes, every layer detected them
+  correctly. A tool refusal in the same report pointed at a stale panel bundle in the
+  browser instead, for which the remedy is a hard refresh.
+
+
 ## [0.11.88] - 2026-08-10
 
 > Covers changes since 0.11.87.
