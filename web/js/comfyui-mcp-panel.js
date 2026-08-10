@@ -723,6 +723,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let comboApiPresent = false;
   let comboRan = false;
   let phase = "fetch";
+  // #716 — drop the widget-write burst cache at the START of this run, not after it
+  // succeeds (codex). This function runs on exactly the events that change the schema —
+  // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
+  // when the schema is most likely to have moved. Invalidating only on success would leave
+  // the pre-change map authorizing writes for the rest of the TTL, where the old code would
+  // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
+  // be wrong in the dangerous direction.
+  objectInfoCache.invalidate();
   let thrown = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
@@ -765,12 +773,6 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // (A throw here is attributed to "record": the fetch itself already succeeded,
     // and registration has not been attempted yet — the verdict must not claim it.)
     phase = "record";
-    // #716 — this run just fetched an AUTHORITATIVE payload, and it runs on exactly the
-    // events that change the schema: refresh_nodes, a completed install/download, and
-    // reconnect. Drop the burst cache so the next widget write sees this reality rather
-    // than a copy taken before it. A cache that could only expire on time would serve a
-    // stale map immediately after the one event most likely to have changed it.
-    objectInfoCache.invalidate();
     recordObjectInfoTypes(defs);
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered

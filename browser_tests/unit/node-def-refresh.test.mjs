@@ -625,3 +625,23 @@ test("#716: a successful refresh DROPS the widget-write burst cache", async () =
   assert.equal(verdict.refreshed, true);
   assert.equal(cacheInvalidations, before + 1, "the burst cache must be dropped by a refresh");
 });
+
+test("#716: a FAILED refresh still drops the burst cache", async () => {
+  // codex: invalidating only after a successful fetch left the pre-change map authorizing
+  // writes for the rest of the TTL when the refresh failed — and a failed refresh is when
+  // the schema is most likely to have moved. The old code would have fetched and failed
+  // closed. So the drop happens when the run STARTS, whatever it goes on to do.
+  const before = cacheInvalidations;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.equal(cacheInvalidations, before + 1, "a failed refresh must not leave a usable entry");
+});

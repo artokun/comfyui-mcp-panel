@@ -1,11 +1,10 @@
 /**
- * #716 — one /object_info fetch per BURST of widget writes, not per write.
+ * #716 — one /object_info fetch per BURST of widget writes, not one per write.
  *
- * Reported: 29 `panel_set_widget` calls on one workflow meant 29 full `/object_info`
- * downloads, because the fence's `getFreshObjectInfo` calls `api.getNodeDefs()` every time.
- * Measured elsewhere in this repo on a 63-pack install (#767): `GET /object_info` is
- * 5,413,770 bytes / 167 ms. Twenty-nine of those is ~157 MB of redundant transfer to edit
- * text fields on nodes that did not change between calls.
+ * Reported: 29 `panel_set_widget` calls meant 29 full `/object_info` downloads, because the
+ * fence's `getFreshObjectInfo` calls `api.getNodeDefs()` every time. Measured elsewhere in
+ * this repo on a 63-pack install (#767): 5,413,770 bytes / 167 ms each. That is ~157MB of
+ * redundant transfer to edit text fields on nodes that did not change between calls.
  *
  * WHY NOT THE PER-CLASS ROUTE `/object_info/<Type>`, which #767 used for `panel_add_node`:
  * `set_widget` authorizes TWO types for a subgraph promoted write — the node's own and the
@@ -16,20 +15,23 @@
  * re-fetched.
  *
  * WHAT THIS DOES NOT WEAKEN. Every caller still receives the SAME whole-schema map, so no
- * question changes scope and no verdict changes meaning. What changes is age: a write may
- * be authorized against a map fetched up to `ttlMs` ago rather than milliseconds ago. That
- * is a difference of degree, not of kind — the payload is already stale the instant it
- * arrives, and a pack uninstalled 1ms after a fetch was never covered by the old code
- * either. The fence's guarantee is "authorized against a recently-observed backend", not
- * "atomic with the backend".
+ * question changes scope. What changes is age: a write may be authorized against a map
+ * fetched up to `ttlMs` ago. The fence's guarantee is "authorized against a recently
+ * observed backend", not "atomic with the backend" — the payload is already stale the
+ * instant it arrives.
  *
- * The TTL is therefore deliberately short — long enough to cover an agent's burst of edits,
- * far too short to span a user installing a pack and then editing widgets.
+ * BUT AGE IS THE WHOLE POINT OF THE FENCE, so the invalidation has to be airtight, and two
+ * ways it was not are the reason this file reads the way it does (codex):
  *
- * INVALIDATION IS EXPLICIT, and it is the part that makes the TTL safe to have at all.
- * Anything that KNOWS the schema changed — a node-def refresh, an install, a reconnect —
- * drops the entry, so the next read re-fetches. A cache that could only expire on time
- * would serve a stale map right after the one event most likely to change it.
+ *   1. A refresh that FAILS is exactly when the schema is most likely to have moved. If the
+ *      cache were dropped only after a successful refresh, a failed one would leave the old
+ *      entry authorizing writes for the rest of the TTL — where the old code would have
+ *      fetched and failed closed. So the caller invalidates when a refresh STARTS.
+ *   2. `invalidate()` clearing only the stored value left an already-running fetch able to
+ *      repopulate it afterwards, and a later read able to join that pre-invalidation
+ *      request. A refresh could then register new definitions while an older in-flight
+ *      response restored the pre-change map for another full TTL. A generation counter
+ *      makes both impossible: an invalidation retires every request issued before it.
  */
 
 /** How long a fetched payload may be reused. */
@@ -43,6 +45,11 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
   let value = null;
   let at = 0;
   let inflight = null;
+  let inflightGeneration = -1;
+  // Bumped by every invalidation. A request carries the generation it was issued under and
+  // is discarded if that no longer matches — which is what retires an in-flight fetch
+  // rather than merely forgetting the value it will produce.
+  let generation = 0;
 
   return {
     /**
@@ -52,37 +59,67 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
      */
     async read(fetchDefs) {
       if (value !== null && now() - at < ttlMs) return value;
-      // COALESCE concurrent misses onto one request. Without this, a burst that arrives
-      // faster than the fetch completes still issues one request per caller — which is the
-      // reported symptom, merely moved.
-      if (inflight) return inflight;
-      inflight = (async () => {
+      // Join a concurrent miss — but ONLY one issued under the current generation. Without
+      // that check an invalidation could be overtaken by the very request it was meant to
+      // retire. Coalescing matters: a burst arriving faster than the fetch completes would
+      // otherwise still issue one request per caller, which is the reported symptom moved.
+      if (inflight && inflightGeneration === generation) return inflight;
+      const issuedAt = generation;
+      const request = (async () => {
         try {
           const defs = await fetchDefs();
-          // Only a USABLE payload is cached. Caching a null/empty would pin the fence's
-          // fail-closed state for the whole TTL, turning one transient failure into a
-          // second and a half of refusals.
-          if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
-            value = defs;
+          // Store only a USABLE payload from a still-current generation. Caching a
+          // null/empty would pin the fence's fail-closed state for the whole TTL, turning
+          // one transient failure into a second and a half of refused writes.
+          if (
+            issuedAt === generation &&
+            defs &&
+            typeof defs === "object" &&
+            Object.keys(defs).length > 0
+          ) {
+            // SHARED IDENTITY IS NEW (codex): every write used to get its own object, and
+            // now they share one. A consumer that mutated the map would contaminate every
+            // later authorization instead of only its own call. Freezing the TOP LEVEL —
+            // the level the fence's `hasOwnProperty(defs, type)` reads — makes adding or
+            // removing a type key throw here and now, in a test or a dev console, rather
+            // than silently authorizing a type nobody installed. Shallow on purpose: a
+            // deep freeze of a 5MB schema on every fetch would cost more than the fetch
+            // this exists to avoid, and per-class contents are not what the fence rules on.
+            value = Object.freeze(defs);
             at = now();
           }
           return defs;
         } finally {
-          inflight = null;
+          // Release the slot only if it is still ours — a newer generation may have started
+          // its own request while this one was in flight.
+          if (inflight === request) {
+            inflight = null;
+            inflightGeneration = -1;
+          }
         }
       })();
-      return inflight;
+      inflight = request;
+      inflightGeneration = issuedAt;
+      return request;
     },
 
-    /** Drop the entry — for anything that KNOWS the schema may have changed. */
+    /**
+     * Drop the entry AND retire anything in flight — for anything that knows, or merely
+     * suspects, that the schema may have changed.
+     */
     invalidate() {
       value = null;
       at = 0;
+      generation += 1;
+      // Not awaited and not cancelled — it cannot be. Retiring it means its result can no
+      // longer be stored or joined; whoever is already awaiting it still gets their answer.
+      inflight = null;
+      inflightGeneration = -1;
     },
 
     /** Test/diagnostic view. Never used to make a decision. */
     peek() {
-      return { cached: value !== null, ageMs: value === null ? null : now() - at };
+      return { cached: value !== null, ageMs: value === null ? null : now() - at, generation };
     },
   };
 }

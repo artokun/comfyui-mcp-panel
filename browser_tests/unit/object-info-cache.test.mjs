@@ -114,3 +114,81 @@ test("#716: the window is short enough to be about a burst, not about a session"
   assert.ok(OBJECT_INFO_CACHE_TTL_MS >= 500, "too short and a burst still re-downloads");
   assert.ok(OBJECT_INFO_CACHE_TTL_MS <= 5000, "too long and the payload stops being 'fresh' in any useful sense");
 });
+
+test("#716: an invalidation retires an ALREADY-RUNNING fetch", async () => {
+  // codex: clearing only the stored value left an in-flight request able to repopulate it
+  // afterwards. A refresh could register new definitions while an older response quietly
+  // restored the pre-change map for another full TTL — the fence then authorizing against
+  // a schema that had already been replaced.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const slow = cache.read(async () => {
+    await gate;
+    return { OldType: {} };
+  });
+  cache.invalidate();
+  release();
+  assert.deepEqual(await slow, { OldType: {} }, "whoever awaited it still gets their answer");
+  assert.equal(cache.peek().cached, false, "but it must NOT have repopulated the cache");
+});
+
+test("#716: a read after invalidation does not JOIN the retired request", async () => {
+  // The other half of the same hole: joining a pre-invalidation request hands the caller
+  // the very map the invalidation existed to discard.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const stale = cache.read(async () => {
+    await gate;
+    return { OldType: {} };
+  });
+  cache.invalidate();
+  const fresh = await cache.read(async () => ({ NewType: {} }));
+  assert.deepEqual(fresh, { NewType: {} }, "the new read must issue its own request");
+  release();
+  await stale;
+  assert.deepEqual(cache.peek().cached, true);
+  // And the retired request must not have overwritten the fresh entry on its way out.
+  assert.deepEqual(await cache.read(async () => ({ ShouldNotBeCalled: {} })), { NewType: {} });
+});
+
+test("#716: every joined caller sees a failing fetch fail", async () => {
+  // codex noted this was untested. A coalesced failure that resolved for some callers and
+  // rejected for others would be a fence that authorizes for one write and refuses another
+  // from the same request.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const fetchDefs = async () => {
+    await gate;
+    throw new Error("Failed to fetch");
+  };
+  const a = cache.read(fetchDefs);
+  const b = cache.read(fetchDefs);
+  const d = cache.read(fetchDefs);
+  release();
+  for (const p of [a, b, d]) await assert.rejects(() => p, /Failed to fetch/);
+  assert.equal(cache.peek().cached, false);
+});
+
+test("#716: the shared payload cannot have type keys added or removed", async () => {
+  // Shared identity is new (codex): writes used to each get their own object. A consumer
+  // that mutated the map would contaminate every later authorization, and the dangerous
+  // direction is adding a key — authorizing a type nobody installed.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  const defs = await cache.read(async () => ({ KSampler: {} }));
+  assert.throws(() => {
+    "use strict";
+    defs.ForgedType = {};
+  }, TypeError);
+  assert.throws(() => {
+    "use strict";
+    delete defs.KSampler;
+  }, TypeError);
+  assert.deepEqual(Object.keys(defs), ["KSampler"]);
+});
