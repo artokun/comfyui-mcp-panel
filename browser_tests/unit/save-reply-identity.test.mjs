@@ -78,7 +78,10 @@ test("#747 non-string identity fields are rejected, not stringified into the fen
 test("#747 WIRING: BOTH save handlers report the identity, and save_as always flags the change", () => {
   // A green helper proves nothing about the reply the agent receives (#792).
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(src, /import \{ saveReplyIdentity \} from "\.\/lib\/save-reply-identity\.js"/);
+  // The SYMBOL is imported from that module — not the exact import line. Pinning the whole
+  // line broke the moment #941 added a second export beside it, which says nothing about
+  // whether the reply is wired up.
+  assert.match(src, /import \{[^}]*saveReplyIdentity[^}]*\} from "\.\/lib\/save-reply-identity\.js"/);
 
   const saveIdx = src.indexOf("async workflow_save({ name } = {})");
   const saveAsIdx = src.indexOf("async workflow_save_as({ name })");
@@ -88,7 +91,18 @@ test("#747 WIRING: BOTH save handlers report the identity, and save_as always fl
   const saveAsBlock = src.slice(saveAsIdx, saveAsIdx + 900);
 
   // workflow_save is only a Save-As when the outcome says so…
-  assert.match(saveBlock, /saveReplyIdentity\(liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
+  assert.match(saveBlock, /saveReplyIdentity\(outcome\.saved_as \? replyIdentity : replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
   // …while workflow_save_as always changes which workflow is active.
-  assert.match(saveAsBlock, /saveReplyIdentity\(liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: true \}\)/);
+  assert.match(saveAsBlock, /saveReplyIdentity\(replyIdentity, \{ savedAs: true \}\)/);
+  // #941 — and a Save-As must NOT fall back to the live active canvas. Absence stays
+  // absence; substituting whatever is active can name a foreign canvas (codex).
+  assert.doesNotMatch(saveAsBlock, /savedAs: true[\s\S]{0,80}liveWorkflowListActive/);
+
+  // #941 — and BOTH must establish the identity first, or the read above finds nothing for
+  // a Save-As's brand-new object and reports `workflow_identity_unavailable` while the
+  // fence, whose own read mints, refuses the next call with the identity it just declined
+  // to publish.
+  // …from the record the SAVE produced, not a later active-canvas read (#941, codex).
+  assert.match(saveBlock, /saveProducedIdentity\(producedRecord, !!outcome\.saved_as\)/);
+  assert.match(saveAsBlock, /saveProducedIdentity\(producedRecord, true\)/);
 });

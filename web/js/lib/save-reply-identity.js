@@ -65,3 +65,36 @@ export function saveReplyIdentity(identity, { savedAs = false } = {}) {
       : {}),
   };
 }
+
+/**
+ * Should the panel ESTABLISH an identity for the canvas a save just made active (#941)?
+ *
+ * The #716 rule this sits next to is that a READ must never establish identity — a fence
+ * refreshed from a value a read invented is agreeing with itself rather than observing
+ * anything. `establishedWorkflowReplyIdentity` therefore refuses to mint, and that is
+ * right.
+ *
+ * But a Save-As is not a read. It is a mutation whose entire job is to make a DIFFERENT
+ * workflow active, and the object it activates is brand new — nothing has ever established
+ * an identity for it. So the reply found none and said so honestly, while the fence, whose
+ * own read DOES mint, immediately saw one. Measured on 0.11.80:
+ *
+ *     workflow_save({name}) -> { saved: true, saved_as: true, workflow_identity_unavailable: true }
+ *     graph_outline()       -> "workflow instance mismatch: ... issued for instance b273a69f,
+ *                               and the active canvas reports 14d699d3"
+ *
+ * The panel knew the new identity well enough to refuse the next call with it, and had
+ * refused to report it one call earlier. Every `panel_*` graph tool is then dead for the
+ * session, and the documented recovery is fence-exempt but cannot re-derive what was never
+ * published — which left the reporter choosing between a ComfyUI restart and ~3h of queued
+ * renders (#941).
+ *
+ * Establishing it as part of the save closes that gap at the only moment the panel knows
+ * the new instance and the caller does not. Deliberately NOT widened to every save: an
+ * in-place save keeps the same object, whose identity is already established, so there is
+ * nothing to mint and no reason to touch it. Only the case that strands a caller.
+ */
+export function shouldEstablishIdentityAfterSave({ savedAs = false, alreadyEstablished = false } = {}) {
+  if (alreadyEstablished) return false;
+  return savedAs === true;
+}
