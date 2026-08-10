@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.79] - 2026-08-09
+
+> Covers changes since 0.11.78.
+
+### Fixed
+
+- **The e2e suite stops leaving saved workflows in your library, and says so when it
+  cannot be sure (#907).** Specs that persist a workflow were leaving the file behind:
+  1272 of 1288 files in the dev workflow directory were test output. Per-spec cleanup
+  could not fix it, because it sat at the end of a test body and so never ran when a
+  test failed. Cleanup is now suite-level, and deletes only files that appeared during
+  the run AND carry the suite's own name prefix — ComfyUI names an unnamed save
+  `Untitled <date> <time>`, which is exactly what it names YOURS, so nothing keyed on
+  that name is safe to delete automatically. Anything else that appears is reported by
+  name rather than removed or ignored. Developer-facing only; nothing in the shipped
+  panel changes.
+
 ## [0.11.78] - 2026-08-09
 
 > Covers changes since 0.11.77.
