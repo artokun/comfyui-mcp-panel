@@ -100,9 +100,12 @@ test("#636: the add path resolves a blueprint by display_name", () => {
 test("#636: the caller's string is tried AS A TYPE first", () => {
   // So an exact type or a hash resolves exactly as it did before, and this can only ever
   // add a resolution that previously failed — never change one that already worked.
+  // The type lookup is attempted first; the display-name candidate is only CONSULTED
+  // after it fails (it is computed earlier, but nothing is resolved from it until then).
   const typeFirst = addSite.indexOf("let type = asType;");
-  const displayAfter = addSite.indexOf("byDisplayName()");
-  assert.ok(typeFirst >= 0 && displayAfter > typeFirst, "display_name is the FALLBACK, not the first try");
+  const displayUsed = addSite.indexOf("displayMatches[0]?.name");
+  assert.ok(typeFirst >= 0, "the type attempt must exist");
+  assert.ok(displayUsed > typeFirst, "display_name is the FALLBACK, not the first try");
 });
 
 test("#636: the refusal names both things the caller could pass", () => {
@@ -112,4 +115,26 @@ test("#636: the refusal names both things the caller could pass", () => {
   const msg = src.slice(src.indexOf("No saved subgraph blueprint"), src.indexOf("const position = placementFor"));
   assert.match(msg, /display_name/, "the library name is an accepted input and must be named");
   assert.match(msg, /type/, "so is the type");
+});
+
+test("#636: an AMBIGUOUS library name refuses rather than guessing", () => {
+  // display_name is user-controlled and not unique. Taking the first match could insert a
+  // DIFFERENT graph than the one asked for, and a wrong subgraph silently added is far
+  // worse than a refusal the caller can resolve by passing the unique type (codex).
+  const site = src.slice(
+    src.indexOf("const displayMatches ="),
+    src.indexOf("const position = placementFor(graph, pos);"),
+  );
+  assert.match(site, /displayMatches\.length > 1/, "more than one match must be detected");
+  assert.match(site, /would be a guess/, "and refused in those words");
+  assert.doesNotMatch(site, /\.find\(/, "no first-match shortcut may remain");
+});
+
+test("#636: a real store failure is not reported as 'never saved'", () => {
+  const site = src.slice(
+    src.indexOf("const displayMatches ="),
+    src.indexOf("const position = placementFor(graph, pos);"),
+  );
+  assert.match(site, /lookupError = err;/, "the thrown error must be kept");
+  assert.match(site, /the lookup also failed/, "and surfaced when nothing resolves");
 });

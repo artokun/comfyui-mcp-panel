@@ -13128,27 +13128,39 @@ const GRAPH_TOOL_EXECUTORS = {
     // hash keeps resolving exactly as before and this can only ever add a resolution that
     // previously failed. Only if that finds nothing is `display_name` consulted.
     const asType = name.startsWith(prefix) ? name : `${prefix}${name}`;
-    const byDisplayName = () => {
-      const match = (store.subgraphBlueprints ?? []).find(
-        (d) => typeof d?.display_name === "string" && d.display_name === name,
-      );
-      return typeof match?.name === "string" ? match.name : null;
-    };
+    // AMBIGUITY REFUSES, it does not guess (codex). `display_name` is user-controlled and
+    // not unique, so taking the first match could insert a DIFFERENT graph than the one
+    // asked for — and a wrong subgraph silently added is far worse than a refusal, which
+    // the caller can resolve by passing the unique `type`.
+    const displayMatches = (store.subgraphBlueprints ?? []).filter(
+      (d) => typeof d?.display_name === "string" && d.display_name === name,
+    );
     let type = asType;
-    let bp;
+    let bp = null;
+    let lookupError = null;
     try {
       bp = store.getBlueprint(type);
-    } catch {
-      bp = null;
+    } catch (err) {
+      // Kept, not discarded: if nothing resolves, a real store failure must not be
+      // reported as "you never saved this" (codex).
+      lookupError = err;
     }
     if (!bp) {
-      const viaDisplay = byDisplayName();
+      if (displayMatches.length > 1) {
+        throw new Error(
+          `"${name}" matches ${displayMatches.length} saved subgraphs with that library ` +
+            `name, so adding one would be a guess. Pass the unique \`type\` instead — ` +
+            `panel_list_subgraphs reports it for each.`,
+        );
+      }
+      const viaDisplay =
+        typeof displayMatches[0]?.name === "string" ? displayMatches[0].name : null;
       if (viaDisplay) {
         type = viaDisplay;
         try {
           bp = store.getBlueprint(type);
-        } catch {
-          bp = null;
+        } catch (err) {
+          lookupError = err;
         }
       }
     }
@@ -13156,7 +13168,10 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error(
         `No saved subgraph blueprint "${name}" — neither as a blueprint type nor as the ` +
           `name shown in the library. List them with panel_list_subgraphs and use either ` +
-          `the \`type\` or the \`display_name\` it reports.`,
+          `the \`type\` or the \`display_name\` it reports.` +
+          // A store that THREW is a different fact from one that simply has no such
+          // blueprint, and the caller cannot act on the second remedy if it was the first.
+          (lookupError ? ` (the lookup also failed: ${coerceMessageText(lookupError?.message ?? lookupError)})` : ""),
       );
     }
     const position = placementFor(graph, pos);
