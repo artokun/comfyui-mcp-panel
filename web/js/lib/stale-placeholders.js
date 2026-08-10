@@ -55,6 +55,12 @@ export function isPlaceholderNode(node) {
  * Returns `[{ node_id, type }]`. A placeholder whose class is STILL absent is NOT
  * included: that one is genuinely missing, the existing `missing_node_types` reporting
  * already covers it, and nothing about it is stale.
+ *
+ * KNOWN FALSE NEGATIVE, deliberately (codex r2). Requiring membership in the load-time
+ * record means a genuine placeholder whose miss the frontend did NOT record is missed —
+ * the gate is not a proof that such a node cannot exist, only a refusal to guess. That
+ * is the safe direction: under-reporting costs a diagnosis, while the over-reporting it
+ * replaced sent people reloading workflows that were fine.
  */
 export function findStalePlaceholders(nodes, options) {
   const found = [];
@@ -106,27 +112,32 @@ export function findStalePlaceholders(nodes, options) {
 /**
  * The disclosure a refresh must carry when it did not finish the job.
  *
- * Says what the refresh DID do (definitions are current), what it did not (these nodes
- * are still placeholders), and the one thing that fixes it. Empty when nothing is
- * stale, so an ordinary refresh stays quiet.
+ * Says exactly what the predicate established (this page can instantiate the class now),
+ * what it did not (these nodes are still placeholders), and the one thing that fixes it.
+ * Empty when nothing is stale, so an ordinary refresh stays quiet.
  */
 export function stalePlaceholderNote(stale) {
   if (!Array.isArray(stale) || !stale.length) return "";
   const types = [...new Set(stale.map((s) => s.type))];
   const which = types.slice(0, 6).join(", ");
   const more = types.length > 6 ? `, and ${types.length - 6} more` : "";
+  // EVERY CLAIM HERE IS ONE THE PREDICATE ESTABLISHES (codex r2). What was actually
+  // tested is that the class is present in the client registry NOW — not that its
+  // definition is current, not that this refresh is what registered it, and not what the
+  // backend will do with the serialized prompt. The earlier wording asserted all three.
   return (
-    `The node definitions ARE now current — ${types.length} class${types.length === 1 ? "" : "es"} ` +
-    `that ${types.length === 1 ? "was" : "were"} missing ${types.length === 1 ? "is" : "are"} ` +
-    `registered (${which}${more}). But ${stale.length} node${stale.length === 1 ? "" : "s"} already ` +
+    `This page can NOW instantiate ${types.length} class${types.length === 1 ? "" : "es"} ` +
+    `that ${types.length === 1 ? "was" : "were"} recorded as missing when this workflow ` +
+    `loaded (${which}${more}). But ${stale.length} node${stale.length === 1 ? "" : "s"} already ` +
     `on the canvas ${stale.length === 1 ? "is" : "are"} still a PLACEHOLDER: registering a class ` +
     `does not rehydrate nodes that were created while it was unknown — measured, they keep no ` +
-    `definition and no widgets. They will still be reported as missing, and they will still fail ` +
+    `definition and no widgets. They will still be reported as missing, and a node with no ` +
+    `widgets does not serialize the values its class expects, so do not rely on ${stale.length === 1 ? "it" : "them"} ` +
     // "Reload" alone is ambiguous (codex) — a browser refresh restores whatever the
     // frontend last autosaved, which is not reliably the graph on screen. The remedy is
     // stated as the two steps it actually is: persist the graph, then reopen THAT
     // workflow, so the rebuild reads a document whose contents are known.
-    `at queue time. To rebuild them against the definitions that are now present: SAVE the ` +
+    `at queue time. To rebuild them against the class this page can now instantiate: SAVE the ` +
     `workflow, then reload/reopen that saved workflow (#981). The save is the load-bearing ` +
     `step — the rebuild reads the stored document, so anything not saved is not rebuilt, and ` +
     `a plain browser refresh restores whatever the frontend last autosaved rather than the ` +

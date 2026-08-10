@@ -131,7 +131,13 @@ test("#981 the note credits what the refresh DID do, and names the one thing tha
     { node_id: "2", type: "MiniMaxChunkFeedForward" },
     { node_id: "3", type: "MiniMaxLowVRAMAttention" },
   ]);
-  assert.match(note, /definitions ARE now current/, "the refresh is not described as having failed");
+  // codex r2: the predicate establishes that the CLIENT can instantiate the class now —
+  // not that the definition is current, not that this refresh registered it, and nothing
+  // at all about what the backend will do with the prompt. The note may claim only that.
+  assert.match(note, /This page can NOW instantiate/, "the refresh is not described as having failed");
+  assert.doesNotMatch(note, /definitions ARE now current/, "…but does not claim currency it never checked");
+  assert.doesNotMatch(note, /will still fail at queue time/, "nor a backend outcome it never measured");
+  assert.match(note, /does not serialize the values its class expects/, "what it CAN say about the dead node");
   assert.match(note, /MiniMaxChunkFeedForward/, "names the classes");
   assert.match(note, /still a PLACEHOLDER/, "and what did not happen");
   assert.match(note, /does not rehydrate nodes that were created while it was unknown/, "why");
@@ -235,4 +241,17 @@ test("#981 (codex): an UNAVAILABLE missing-node record claims nothing at all", (
     1,
     "and Note/Reroute stay excluded even then",
   );
+});
+
+test("#981 (codex r2) source guard: the disclosure survives the SUCCESS path of refresh_nodes", () => {
+  // It is only ever produced on a successful refresh, and `{ok:true, refreshed:true}`
+  // dropped every extra field — so the warning existed but no caller could ever see it.
+  // Found by tracing the consumers of the verdict, not by reading the producer.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(src, /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale \};/, "forwarded on success");
+  assert.match(src, /stale_placeholders_note: verdict\.stale_placeholders_note/, "and the note with it");
+  // `ok` must stay true: the refresh did what it claims, and the reload flag is about
+  // the canvas, not about the refresh having failed.
+  assert.ok(!/ok: false/.test(src.slice(src.indexOf("async refresh_nodes()"), src.indexOf("graph_serialize()"))),
+    "requires_reload must not be turned into a failure");
 });
