@@ -125,13 +125,15 @@ test("#986 the deduper is bounded in TIME, so it cannot grow without limit", () 
 
 test("#986 the note distinguishes a likely replay from a possible real re-render", () => {
   const cached = duplicateCompletionNote("2d9d64f5", true);
-  assert.match(cached, /already delivered by prompt 2d9d64f5/);
-  assert.match(cached, /spent no real time rendering/, "the strongest available hint");
-  assert.match(cached, /very likely the same result again/);
+  assert.match(cached, /Prompt 2d9d64f5 already delivered/);
+  assert.match(cached, /compares references, not file contents/, "codex: same name is not same bytes");
+  assert.match(cached, /finished too fast to have rendered anything/, "the strongest available hint");
+  assert.match(cached, /served from ComfyUI.s cache looks like/);
 
   const real = duplicateCompletionNote("2d9d64f5", false);
-  assert.match(real, /DID spend real time rendering/);
-  assert.match(real, /cannot tell those apart and does not guess/, "no claim it cannot establish");
+  assert.match(real, /did NOT finish suspiciously fast/);
+  assert.match(real, /duration simply could not be established/, "codex: false also covers unknown");
+  assert.match(real, /does not guess/, "no claim it cannot establish");
 
   for (const note of [cached, real]) {
     assert.match(note, /Nothing is withheld/, "the guarantee that matters most");
@@ -248,6 +250,6 @@ test("#986 the duplicate note reaches the agent-facing FRAME, not just the paylo
   );
   assert.equal(frames.length, 1, "one completion frame");
   const note = String(frames[0]?.note ?? "");
-  assert.match(note, /already delivered by prompt first/, "the agent is told, in the frame it reads");
+  assert.match(note, /Prompt first already delivered/, "the agent is told, in the frame it reads");
   assert.match(note, /Nothing is withheld/);
 });

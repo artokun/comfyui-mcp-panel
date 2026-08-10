@@ -162,15 +162,21 @@ export function createCompletionDeduper({
  */
 export function duplicateCompletionNote(duplicateOf, looksCached) {
   if (!duplicateOf) return "";
+  // Says only what the mechanism saw (codex). It compared FILE REFERENCES, not bytes,
+  // and `looksCached === false` covers "took longer than the threshold" AND "the
+  // duration could not be trusted" — two different things, neither of which is proof
+  // that work happened.
   return (
-    `This output was already delivered by prompt ${duplicateOf}. The files are identical; only ` +
-    `the prompt id differs.` +
+    `Prompt ${duplicateOf} already delivered output with the same file reference(s) — same ` +
+    `name, folder and type. The panel compares references, not file contents, so it cannot ` +
+    `say whether the bytes are the same.` +
     (looksCached
-      ? ` It also spent no real time rendering, which is what a re-queue served from ComfyUI's ` +
-        `cache looks like — so this is very likely the same result again, not new work.`
-      : ` It DID spend real time rendering, so this may be a genuine re-render that happens to ` +
-        `write the same filename — the panel cannot tell those apart and does not guess.`) +
-    ` Nothing is withheld either way: a completion is always delivered, because losing a render ` +
-    `you waited for would be worse than an extra message.`
+      ? ` This run also finished too fast to have rendered anything, which is what a re-queue ` +
+        `served from ComfyUI's cache looks like.`
+      : ` This run did NOT finish suspiciously fast, so it may be a genuine re-render that ` +
+        `happens to write the same filename — or its duration simply could not be established. ` +
+        `Either way the panel does not guess.`) +
+    ` Nothing is withheld on any of this: a completion is always delivered, because losing a ` +
+    `render you waited for would be worse than an extra message.`
   );
 }
