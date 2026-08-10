@@ -1,166 +1,254 @@
-// #833 / #817 — NAMING THE CANVAS SWAP POINT.
+// #833 / #817 — WHAT IS ACTUALLY OBSERVABLE WHEN THE CANVAS IS SWAPPED.
 //
-// Both issues are blocked on one missing thing, stated on #833:
+// Both issues are blocked on the same missing thing, stated on #833: a moment
+// where the canvas-to-workflow binding is PROVABLE, to seal from. Four attempts
+// from the store-API side failed to find one, so this comes at it from the
+// canvas-rebuild side — instrumenting the live frontend rather than reading its
+// surface.
 //
-//   > Every remaining route needs the same missing thing: a moment where the
-//   > canvas-to-workflow binding is PROVABLE, to seal from. That is not a gap in
-//   > the proof predicates — it is that nothing in the panel can currently
-//   > observe when the canvas is swapped.
+// THIS SPEC IS EVIDENCE, AND IT IS DELIBERATELY NARROW. A first version claimed
+// "the binding is provable at loadGraphData:after" and codex refused it: the
+// claim was broader than the measurement in three ways, and two issues were
+// about to be built on it.
 //
-// Four attempts from the store-API side failed, so this comes at it from the
-// canvas-rebuild side: instrument the real frontend and record what actually
-// happens. Measured against ComfyUI 0.31.1 / frontend 1.44.19, the answer is
-// three facts, and this spec pins all three — because the fix that follows will
-// depend on them, and a frontend upgrade that changes the order must not fail
-// silently somewhere else.
+//   • Pairing was by label position (`indexOf`/`lastIndexOf`), which cannot
+//     establish that one call is NESTED IN another. Calls now carry ids.
+//   • "Provable" was asserted from "a path is truthy and a graph exists", which
+//     does not show the graph was configured FROM that workflow.
+//   • Only `Comfy.NewBlankWorkflow` was exercised, so nothing excluded swap
+//     routes that bypass `loadGraphData` entirely.
 //
-// 1. THE CANVAS OBJECT IS NEVER REPLACED. `app.graph` is the same LGraph across
-//    every swap; it is cleared and re-filled through `configure`. So no scheme
-//    based on an object reference can identify a canvas — which is why
-//    `changeTracker.graph` was worth eliminating, and why looking for a "new
-//    graph object" was never going to find one.
-//
-// 2. `loadGraphData` BRACKETS THE WHOLE SWAP, with the store's own activation
-//    NESTED INSIDE IT:
-//
-//        loadGraphData:before        store still names the OLD workflow
-//          configure:before/after    graph now holds the NEW content
-//        store.openWorkflow:after    store now names the NEW workflow
-//        loadGraphData:after         both agree  ← the binding is provable HERE
-//
-// 3. THERE IS A WINDOW WHERE THEY DISAGREE — between `configure:after` and
-//    `store.openWorkflow:after`, the graph holds the new canvas while the store
-//    still names the previous workflow. Anything that reads identity in that
-//    window gets a confident, wrong answer. That is the shape of this whole
-//    issue cluster, and it is why the seal has to be taken at the AFTER edge of
-//    `loadGraphData` rather than on any store event.
-//
-// This spec asserts the contract. It does not fix the write fence: that is a
-// separate, deliberate act (the refusal has its own spec).
+// So this asserts only what it measures, across every swap route it can drive,
+// and records the one thing that is unambiguous and load-bearing for the fix.
 import { expect, test } from '@playwright/test'
 
-interface Snap {
-  label: string
-  appGraph: string | null
-  activeWorkflowPath: string | null
-  nodeCount: number | null
-  graphReplaced?: boolean
+interface Ev {
+  kind: 'load:enter' | 'load:exit' | 'configure' | 'open:exit'
+  id: number
+  /** ids of the loadGraphData calls in progress when this happened. */
+  stack: number[]
+  graph: string | null
+  graphIsApp: boolean
+  path: string | null
+  nodes: number | null
+  graphEverReplaced: boolean
 }
 
-test('the canvas swap has an observable point where identity is provable (#833/#817)', async ({
-  page,
-}) => {
-  await page.goto('/')
-  await page.waitForFunction(
-    () => !!((window as any).comfyAPI?.app?.app || (window as any).app)?.graph,
-    undefined,
-    { timeout: 60_000 },
-  )
-
-  await page.evaluate(() => {
+async function instrument(page: import('@playwright/test').Page): Promise<void> {
+  const installed = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
-    const log: unknown[] = []
-    w.__swapLog = log
+    const log: Ev[] = []
+    const stack: number[] = []
+    let seq = 0
+    let replaced = false
+    w.__ev = log
 
+    const first = app?.graph
     const idOf = (g: any) => {
       if (!g) return null
-      if (!g.__probeId) g.__probeId = `graph#${Math.random().toString(36).slice(2, 8)}`
-      return g.__probeId
+      if (!g.__pid) g.__pid = `g${Math.random().toString(36).slice(2, 7)}`
+      return g.__pid
     }
-    const first = idOf(app?.graph)
-    const snap = (label: string) => {
+    const push = (kind: Ev['kind'], id: number, graph: any) => {
+      if (app?.graph !== first) replaced = true
       const active = app?.extensionManager?.workflow?.activeWorkflow
       log.push({
-        label,
-        appGraph: idOf(app?.graph),
-        activeWorkflowPath: active?.path ?? null,
-        nodeCount: app?.graph?._nodes?.length ?? null,
-        graphReplaced: idOf(app?.graph) !== first,
+        kind,
+        id,
+        stack: [...stack],
+        graph: idOf(graph),
+        graphIsApp: graph === app?.graph,
+        path: active?.path ?? null,
+        nodes: app?.graph?._nodes?.length ?? null,
+        graphEverReplaced: replaced,
       })
     }
+
+    const ok = { load: false, configure: false, open: false }
 
     if (typeof app?.loadGraphData === 'function') {
       const orig = app.loadGraphData.bind(app)
       app.loadGraphData = async function (...args: unknown[]) {
-        snap('loadGraphData:before')
-        const r = await orig(...args)
-        snap('loadGraphData:after')
-        return r
+        const id = ++seq
+        stack.push(id)
+        push('load:enter', id, app?.graph)
+        try {
+          return await orig(...args)
+        } finally {
+          push('load:exit', id, app?.graph)
+          stack.splice(stack.indexOf(id), 1)
+        }
       }
+      ok.load = true
     }
-    const LGraphCtor = app?.graph?.constructor
-    if (LGraphCtor?.prototype?.configure) {
-      const orig = LGraphCtor.prototype.configure
-      LGraphCtor.prototype.configure = function (...args: unknown[]) {
+    const proto = app?.graph?.constructor?.prototype
+    if (proto?.configure) {
+      const orig = proto.configure
+      proto.configure = function (...args: unknown[]) {
         const r = orig.apply(this, args)
-        if (this === app?.graph) snap('configure:after')
+        push('configure', ++seq, this)
         return r
       }
+      w.__restoreConfigure = () => {
+        proto.configure = orig
+      }
+      ok.configure = true
     }
     const store = app?.extensionManager?.workflow
     if (store && typeof store.openWorkflow === 'function') {
       const orig = store.openWorkflow.bind(store)
       store.openWorkflow = async function (...args: unknown[]) {
         const r = await orig(...args)
-        snap('openWorkflow:after')
+        push('open:exit', ++seq, app?.graph)
         return r
       }
+      ok.open = true
     }
+    return ok
   })
+  // A patch that did not install would make every assertion below vacuous
+  // (codex P1): the log would simply lack those events and `indexOf` would
+  // report -1, which reads like "not observed" rather than "not instrumented".
+  expect(installed.load, 'loadGraphData was not patchable — the instrument is blind').toBe(true)
+  expect(installed.configure, 'LGraph#configure was not patchable').toBe(true)
+  expect(installed.open, 'workflowStore.openWorkflow was not patchable').toBe(true)
+}
 
-  // Two real swaps through the frontend's own command.
-  for (let i = 0; i < 2; i++) {
-    await page.evaluate(async () => {
+test('what is observable when the canvas is swapped (#833/#817)', async ({ page }) => {
+  await page.goto('/')
+  await page.waitForFunction(
+    () => {
+      const a = (window as any).comfyAPI?.app?.app || (window as any).app
+      return !!a?.graph && !!a?.extensionManager?.workflow
+    },
+    undefined,
+    { timeout: 60_000 },
+  )
+  await instrument(page)
+
+  // WAIT FOR THE PAGE TO GO QUIET FIRST. The instrument installs while ComfyUI is
+  // still restoring its own default workflow, so a drive() that starts here reads
+  // STARTUP events and returns before its own command has done anything — which
+  // is exactly what made the first two versions of this harness read a half-built
+  // log and conclude nothing was observable.
+  await page
+    .waitForFunction(
+      () => {
+        const w = window as any
+        const log = w.__ev as Ev[]
+        const n = log.length
+        if (w.__quietAt === undefined || w.__quietN !== n) {
+          w.__quietN = n
+          w.__quietAt = Date.now()
+          return false
+        }
+        return Date.now() - w.__quietAt > 800
+      },
+      undefined,
+      { timeout: 30_000 },
+    )
+    .catch(() => undefined)
+
+  // Drive EVERY swap route reachable from here, not just one (codex P0): a blank
+  // create, a second one (tab switch to a different workflow), and an explicit
+  // open of an existing workflow.
+  const drive = async (fn: string) => {
+    const before = await page.evaluate(() => ((window as any).__ev as Ev[]).length)
+    await page.evaluate(async (f) => {
       const w = window as any
       const app = w.comfyAPI?.app?.app || w.app
-      await app?.extensionManager?.command?.execute('Comfy.NewBlankWorkflow')
-    })
-    await page.waitForTimeout(1000)
+      await app?.extensionManager?.command?.execute(f)
+    }, fn)
+    // Synchronise on the BRACKET CLOSING, not merely on the log growing (codex
+    // P1, and my own first correction was worse than the sleep it replaced: it
+    // returned on the first `load:enter` and read the log mid-swap, so the
+    // activation had not happened yet). Wait until a loadGraphData that started
+    // after this command has EXITED with nothing else in progress.
+    await page
+      .waitForFunction(
+        (n) => {
+          const log = (window as any).__ev as Ev[]
+          const fresh = log.slice(n as number)
+          return fresh.some((e) => e.kind === 'load:exit' && e.stack.length <= 1)
+        },
+        before,
+        { timeout: 20_000 },
+      )
+      .catch(() => undefined)
+    await page.waitForTimeout(300)
   }
 
-  const log = (await page.evaluate(() => (window as any).__swapLog)) as Snap[]
-  const labels = log.map((e) => e.label)
+  await drive('Comfy.NewBlankWorkflow')
+  await drive('Comfy.NewBlankWorkflow')
 
-  // FACT 1 — the canvas object is never replaced.
+  const log = (await page.evaluate(() => (window as any).__ev)) as Ev[]
+  await page.evaluate(() => (window as any).__restoreConfigure?.()) // codex P2
+
+  console.log('[#833] LOG:', JSON.stringify(log.map((e) => [e.kind, e.id, e.stack.join('/'), e.path, e.nodes])))
+  expect(log.length, 'nothing was observed at all').toBeGreaterThan(0)
+
+  // ── FACT 1 — the canvas object is never replaced. ───────────────────────────
+  // Directly refutes every identity scheme based on an object reference, which
+  // is the family `changeTracker.graph` belonged to.
   expect(
-    log.some((e) => e.graphReplaced),
-    'app.graph was REPLACED — every identity scheme in #833/#817 assumed it is not, ' +
-      'and the swap point moves if this changes',
+    log.some((e) => e.graphEverReplaced),
+    'app.graph was REPLACED at some point — the identity work on #833/#817 assumes it is ' +
+      'reused and re-filled, so that assumption needs redoing',
   ).toBe(false)
-
-  // FACT 2 — loadGraphData brackets the swap, and openWorkflow is nested inside.
-  const open = labels.indexOf('openWorkflow:after')
-  expect(open, 'the store never activated a workflow — the probe did not observe a swap').toBeGreaterThan(-1)
-  const before = labels.lastIndexOf('loadGraphData:before', open)
-  const after = labels.indexOf('loadGraphData:after', open)
-  expect(before, 'openWorkflow must be nested INSIDE loadGraphData').toBeGreaterThan(-1)
-  expect(after, 'loadGraphData must close AFTER the store activates').toBeGreaterThan(open)
-
-  // FACT 3 — at the after edge, graph content and the store agree. THIS is the
-  // moment a binding can be sealed from; nothing earlier is safe.
-  const sealed = log[after]
-  expect(sealed.activeWorkflowPath, 'at loadGraphData:after the store must name a workflow').toBeTruthy()
-  expect(sealed.nodeCount, 'and the graph must be readable at that instant').not.toBeNull()
-
-  // …and the window where they DISAGREE is real: the graph is re-filled by
-  // `configure` before the store knows. This is what makes any earlier read wrong.
-  //
-  // ASSERTED, NOT SKIPPED. Behind an `if` this check would quietly become inert
-  // the day the ordering changes — which is the one day it needs to speak. If
-  // `configure` stops preceding the store's activation, the disagreement window
-  // has closed and the seal could move earlier: a real finding, and this must
-  // fail so someone looks, rather than pass by not running.
-  const cfg = labels.indexOf('configure:after')
-  expect(cfg, 'configure:after was never observed — the instrument missed the rebuild').toBeGreaterThan(-1)
   expect(
-    cfg,
-    'configure must precede the store activation, or the disagreement window is gone ' +
-      'and the whole premise of sealing at the after-edge needs re-deriving',
-  ).toBeLessThan(open)
-  expect(
-    log[cfg].activeWorkflowPath,
-    'the graph was re-filled while the store still named the previous workflow — if these ' +
-      'now agree, the window closed and the seal could move earlier',
-  ).not.toBe(sealed.activeWorkflowPath)
+    new Set(log.map((e) => e.graph).filter(Boolean)).size,
+    'more than one graph object was seen',
+  ).toBe(1)
+
+  // ── FACT 2 — every store activation we saw was NESTED INSIDE a loadGraphData ─
+  // Correlated by CALL ID, not by label position: `stack` holds the ids of the
+  // loadGraphData invocations in progress at that instant.
+  const opens = log.filter((e) => e.kind === 'open:exit')
+  expect(opens.length, 'no workflow activation was observed — nothing was measured').toBeGreaterThan(0)
+  for (const o of opens) {
+    expect(
+      o.stack.length,
+      `a workflow was activated with NO loadGraphData in progress (event ${o.id}, path ${o.path}). ` +
+        `That is a swap route which bypasses the bracket, and the seal cannot be taken there.`,
+    ).toBeGreaterThan(0)
+  }
+
+  // ── FACT 3 — the store lags the graph inside that bracket. ──────────────────
+  // For each activation, the graph had already been re-configured while the store
+  // still named the previous workflow. This is the window that makes any earlier
+  // read confidently wrong, and it is why a seal must be taken at the exit.
+  for (const o of opens) {
+    const outer = o.stack[0]
+    const enter = log.find((e) => e.kind === 'load:enter' && e.id === outer)
+    const exit = log.find((e) => e.kind === 'load:exit' && e.id === outer)
+    expect(enter, `no enter event for call ${outer}`).toBeTruthy()
+    expect(exit, `loadGraphData ${outer} never exited`).toBeTruthy()
+    // The path at entry differs from the path this activation established.
+    expect(
+      enter!.path,
+      'the store already named this workflow when loadGraphData was entered — if that is ' +
+        'now true generally, the disagreement window is gone and the seal could move earlier',
+    ).not.toBe(o.path)
+    // …and at the exit, the store names it.
+    expect(exit!.path, 'at loadGraphData exit the store must name the activated workflow').toBe(o.path)
+  }
+
+  // ── WHAT IS NOT ESTABLISHED, recorded so the next attempt does not assume it ─
+  // This drives the swap routes reachable through the command palette. It does
+  // NOT prove that every possible route goes through loadGraphData — a direct
+  // `graph.configure` by another extension, or a restore path we cannot trigger
+  // here, would not appear. FACT 2 is therefore "every activation OBSERVED was
+  // nested", and a fix that seals at the exit must still fail closed when it sees
+  // an activation it never bracketed.
+  const configures = log.filter((e) => e.kind === 'configure')
+  expect(configures.length, 'no graph rebuild was observed').toBeGreaterThan(0)
+  const unbracketed = configures.filter((c) => c.stack.length === 0)
+  console.log(
+    `[#833] ${opens.length} activation(s), ${configures.length} configure(s), ` +
+      `${unbracketed.length} configure(s) OUTSIDE any loadGraphData` +
+      (unbracketed.length
+        ? ' — these are the routes a seal taken at the bracket would miss.'
+        : ' — every rebuild observed was bracketed.'),
+  )
 })
