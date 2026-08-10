@@ -69,9 +69,13 @@ export function installGitUrl({ id, repository } = {}) {
  *
  * A git URL (via `id` OR `repository`, any recognized protocol) always routes to
  * the repo-name-as-id payload: v4 installs by {id: repoName, selected_version:
- * ref||"nightly", channel:"dev"} (no files — v4 resolves by CNR/repo name);
- * v2-batch + legacy install the URL natively via {id: repoName, version:
- * "unknown", files:[url]}. A registry id keeps the versioned body. `id` is
+ * ref||"nightly", channel:"dev", repository: url}. The `repository` half was missing
+ * and is #920 — without it v4 has only the NAME and resolves it against the registry,
+ * which is a lookup rather than a clone; Manager's own InstallPackParams documents the
+ * field as "required if selected_version is nightly". v2-batch + legacy install the URL
+ * natively via {id: repoName, version: "unknown", files:[url]} — a different shape whose
+ * handler reads files[0], so they were never missing it. A registry id keeps the
+ * versioned body and carries no `repository` at all. `id` is
  * NEVER a full URL (a full URL matches nothing on v4 → silent "done"; on 3.x it
  * fails LATER while resolving, past the immediate `failed` array).
  */
@@ -89,6 +93,23 @@ export function buildInstallRequest(dialect, args = {}, ui_id) {
           id: gitRepoName(gitUrl),
           version: selected,
           selected_version: selected,
+          // #920 — SEND THE URL. Reducing it to `gitRepoName` and stopping there turned a
+          // from-source install into a registry lookup, and Manager answered
+          // "Node '<name>@nightly' not found in [ManagerChannel.dev,
+          // ManagerDatabaseSource.cache]" — both sources being the two defaults below.
+          //
+          // The field is not inferred. Manager's own model declares it:
+          //
+          //   class InstallPackParams(ManagerPackInfo):
+          //     repository: Optional[str] = Field(
+          //       None, description="GitHub repository URL (required if selected_version
+          //                          is nightly)")
+          //
+          // and "required if nightly" is exactly the reported call. `id` stays the derived
+          // NAME rather than the URL: sending a URL there made v4 silently mark the
+          // install done while doing nothing, which is why it was derived in the first
+          // place — that behaviour is preserved, this only stops discarding the URL.
+          repository: gitUrl,
           channel: channel || "dev",
           mode: mode || "cache",
         },
