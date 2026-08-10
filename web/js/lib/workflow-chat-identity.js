@@ -74,6 +74,57 @@ export function sameWorkflowObject(a, b) {
  *  can't prove fails SAFE (no carry); the lazy backstop / proven repaint heals
  *  the genuine case afterward. Unknown predecessor state defaults to still-open
  *  (fail-safe: no carry). */
+/**
+ * #847 — remember the identity a tab held immediately BEFORE the panel grounded it.
+ *
+ * The problem this closes: grounding (the automatic save before a turn, #330) gives an
+ * unsaved workflow a real path, and ComfyUI REPLACES the ComfyWorkflow object at that
+ * moment. The successor finds no object uuid (new object), no embedded uuid (the carriers
+ * `workflowOwnedExtra` reads are all absent on this frontend), and no path alias (the path
+ * was just created), so it mints a fresh identity. A conversation recorded seconds earlier
+ * keeps the old one and vanishes from "Current workflow only" — the workflow it was
+ * actually held on.
+ *
+ * Why keyed on PATH and written HERE, when `onWorkflowMaybeChanged` deliberately refuses
+ * to migrate anything: that observer sees the transition after the fact and cannot prove
+ * the old id was THIS tab's past rather than a workflow the user switched away from —
+ * `openWorkflows` not claiming an id is absence of a competing claimant, not ownership
+ * (codex). Grounding is different in kind. The panel CALLS it, on its own active
+ * workflow, and awaits it; `groundActiveWorkflow` already refuses if the user switched
+ * tabs during the probe. Ownership is known by CAUSATION, not inferred from evidence.
+ * That is the whole reason this can be recorded safely and that one cannot.
+ *
+ * Scope, deliberately: these forms feed the history FILTER only. They never enter identity
+ * resolution, never authorize a graph write, and never define a workflow's uuid. The worst
+ * a wrong entry can do is show one extra row in a chat list.
+ *
+ * Only a genuinely pre-save form is recorded — `routeId` must be a `tmp:` id. A save of an
+ * already-saved workflow has no lineage break to bridge, and recording one would invent a
+ * relationship rather than remember it.
+ */
+export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } = {}) {
+  const key = normalizedWorkflowPath(path);
+  if (!key || !map || typeof map !== "object") return false;
+  // A `tmp:` route is the proof that this tab was unsaved a moment ago. Without it there
+  // is no boundary to bridge.
+  if (typeof routeId !== "string" || !routeId.startsWith("tmp:")) return false;
+  const forms = [storageKey, routeId].filter((f) => typeof f === "string" && f);
+  if (!forms.length) return false;
+  // Latest grounding into a path wins. A path is created fresh by the grounding that
+  // names it, so this is self-healing if a name is ever reused rather than accumulating
+  // lineages that no longer apply.
+  map[key] = forms;
+  return true;
+}
+
+/** The pre-grounding identity forms recorded for `path`, if any (#847). */
+export function preGroundingIdentityForms(map, path) {
+  const key = normalizedWorkflowPath(path);
+  if (!key || !map || typeof map !== "object") return [];
+  const forms = map[key];
+  return Array.isArray(forms) ? forms.filter((f) => typeof f === "string" && f) : [];
+}
+
 export function shouldCarryIdentityAcrossSaveSwap({
   preWf,
   postWf,
