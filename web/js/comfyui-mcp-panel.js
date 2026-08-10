@@ -158,6 +158,7 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
+import { findStalePlaceholders, stalePlaceholderNote } from "./lib/stale-placeholders.js";
 import { findRepeatingControlWidgets, scopedBatchSeedNote } from "./lib/scoped-batch-seed.js";
 import {
   materializePromotedValues,
@@ -834,7 +835,42 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  return describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, didThrow, thrown });
+  const verdict = describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, didThrow, thrown });
+  // #981 — a refresh that registered the definitions has NOT necessarily fixed the
+  // canvas. MEASURED: after registering a formerly-missing class, an already-placed
+  // node of that class keeps no definition, no widgets and no title — it stays a
+  // placeholder, and get_errors keeps reporting it. Reporting a clean refresh there is
+  // the same over-claim this session keeps removing, and the reporter asked for exactly
+  // this: say a reload is required rather than claim a complete refresh.
+  //
+  // Note what is deliberately NOT done: the frontend's missing-node store exposes
+  // `removeMissingNodesByType`, and clearing it here would make get_errors report clean
+  // while the canvas still holds a dead node that fails at queue time — trading one
+  // wrong answer for a worse one.
+  try {
+    const nodes = collectAllGraphs(getGraphCtx().rootGraph).flatMap((g) => g?._nodes ?? []);
+    // The frontend's own load-time record of what was missing. Without it a
+    // frontend-only node — Note, Reroute, PrimitiveNode, MarkdownNote, none of which
+    // carry `nodeData` — is indistinguishable from a real placeholder, and MEASURED,
+    // all four were reported by the first version. Absent store ⇒ empty set ⇒ nothing
+    // claimed.
+    const recordedMissingTypes = collectMissingAssets().nodeTypes ?? [];
+    const stale = findStalePlaceholders(nodes, {
+      recordedMissingTypes,
+      // CLIENT registration, deliberately: /object_info proves the BACKEND has the
+      // definition, which is not the same as this page being able to instantiate it,
+      // and only the latter makes a reload capable of repairing the node.
+      isClientRegistered: (type) => !!LiteGraph?.registered_node_types?.[type],
+    });
+    if (stale.length) {
+      verdict.requires_reload = true;
+      verdict.stale_placeholders = stale;
+      verdict.stale_placeholders_note = stalePlaceholderNote(stale);
+    }
+  } catch {
+    /* a diagnosis must never turn a successful refresh into a failure */
+  }
+  return verdict;
 }
 
 // Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
@@ -8062,10 +8098,25 @@ const GRAPH_TOOL_EXECUTORS = {
   async refresh_nodes() {
     const verdict = await refreshComfyNodeDefs(undefined, { force: true });
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
-    if (refreshed) return { ok: true, refreshed: true };
+    // #981: the stale-placeholder disclosure has to survive BOTH paths. The producer
+    // runs the scan whatever the verdict says — a refresh that failed at the combo phase
+    // can still leave placeholders behind — but only this branch dropped it, because
+    // `{ok:true, refreshed:true}` discards every other field. Caught by tracing the
+    // consumers rather than assuming the verdict flowed through.
+    // `ok` stays true and `refreshed` stays true: the refresh did what it claims. The
+    // reload flag is advisory, about the canvas, not a failure of the refresh.
+    const stale = verdict != null && typeof verdict === "object" && verdict.requires_reload
+      ? {
+          requires_reload: true,
+          stale_placeholders: verdict.stale_placeholders,
+          stale_placeholders_note: verdict.stale_placeholders_note,
+        }
+      : {};
+    if (refreshed) return { ok: true, refreshed: true, ...stale };
     return {
       ok: true,
       refreshed: false,
+      ...stale,
       reason: verdict?.reason ?? "unknown",
       ...(verdict?.detail ? { detail: verdict.detail } : {}),
       remedy:
