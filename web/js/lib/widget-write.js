@@ -1,6 +1,12 @@
 import { pressableWidgetHint } from "./pressable-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 
+// #976: captured at module load so invoking a widget's callback cannot read any
+// property off the callback itself (a poisoned `.call` getter or a Proxy trap would
+// throw INSIDE the span that attributes the throw to the callback body) and cannot
+// depend on globals a page could later redefine.
+const reflectApply = Reflect.apply;
+
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
 // RIGHT value and can be unit-tested by driving the SAME code path the handler
@@ -1198,21 +1204,31 @@ export function applyWidgetWrite(
     // Fire the inner widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
     //
-    // #976: the lookup and the arguments are evaluated BEFORE `threwFromCallback` is
-    // raised, and deliberately so. `w.callback` may be a throwing ACCESSOR and
-    // `targetNode.pos` a GETTER; neither of those is the callback failing, and
-    // blaming the node's callback for them would be exactly the unestablishable
-    // attribution #639 forbids. Only the invocation itself carries the flag.
+    // #976: the flagged span contains the INVOCATION and nothing else, because the
+    // flag is an attribution and an attribution that can be raised by anything but
+    // the callback body is a lie. Hoisted out of it, in order:
+    //   - the `w.callback` LOOKUP: it may be a throwing accessor, which is not the
+    //     callback failing (it never ran)
+    //   - the ARGUMENTS, including `targetNode.pos`, which may be a throwing getter
+    //   - and they are built INSIDE the nullish guard, because the original
+    //     `w.callback?.(…)` short-circuited: with no callback, `pos` was never read,
+    //     and a node with a throwing `pos` getter and no callback must keep the clean
+    //     verified write it had (codex NO-SHIP round 1)
     //
-    // The call is bound explicitly because the original `w.callback?.(…)` form binds
-    // `this` to the widget and callbacks read `this.value`. A non-null callback that
-    // is not callable still throws a TypeError from this same point (from `.call`),
-    // which is attributable to the callback the node supplied.
+    // `Reflect.apply` rather than `widgetCallback.call(…)`: `.call` is a property read
+    // ON the callback, so a poisoned getter or a Proxy `get` trap could throw INSIDE
+    // the flagged span without the callback running — and, worse, a non-callable
+    // `{ call() {} }` would have been INVOKED through its own `.call` method and
+    // reported as a clean write, where the optional-call form correctly threw
+    // (codex NO-SHIP round 1). Reflect.apply checks callability first, so a
+    // non-callable callback still throws a TypeError exactly as before, and it takes
+    // the argument list without spreading — no `Symbol.iterator` to poison either.
+    // `reflectApply` is captured at module load for the same reason.
     const widgetCallback = w.callback;
-    const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
     if (widgetCallback !== null && widgetCallback !== undefined) {
+      const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
       threwFromCallback = true;
-      widgetCallback.call(w, ...callbackArgs);
+      reflectApply(widgetCallback, w, callbackArgs);
       threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
     }
   } catch (err) {
@@ -1365,22 +1381,30 @@ export function applyWidgetWrite(
   // naming it matters, because the unattributed wording leads with "an exception was
   // thrown while applying the write", which reads as THE PANEL FAILED TO APPLY YOUR
   // WRITE. That is the opposite of what happened, and #976 was filed here as a panel
-  // defect because of it. When the node's own callback is what threw, the disclosure
-  // leads with the write having succeeded and says whose code threw. Same facts, and
-  // an agent reading it stops treating an applied write as a failed one.
+  // defect because of it.
+  //
+  // The attributed wording says exactly what the mechanism observed — the exception
+  // came OUT OF the callback, not out of the assignment — and stops there. It does
+  // NOT say whose code the callback is (a pack, an extension, a prototype, or the
+  // frontend itself may have installed it) and it does NOT assign fault: this write
+  // invokes the callback PROGRAMMATICALLY, and a callback written for a click can
+  // throw here for that reason alone (measured on #757). Both of those were codex
+  // NO-SHIP findings on the first draft of this text, and both were right — an
+  // attribution that overshoots just relocates the wrong blame.
   if (threw) {
     const threwDetail = threw?.message ?? threw;
     const threwLabel = threwFromCallback
-      ? `an exception was thrown by the widget's OWN callback while applying the write`
+      ? `an exception came out of the widget's OWN callback while applying the write`
       : `an exception was thrown while applying the write`;
     if (!failure) {
       writeWarning = threwFromCallback
         ? `the write itself SUCCEEDED: the requested value IS in effect — verified present by ` +
-          `read-back — and was NOT rolled back. What threw is the widget's OWN callback, which ` +
-          `the node supplies and this write only invokes (${threwDetail}) — the fault is in that ` +
-          `node's code, not in the panel's write. Side effects that callback would normally ` +
-          `perform (refreshing dependent widgets, previews, thumbnails) may not have run or ` +
-          `completed; inspect the node if dependents look stale.`
+          `read-back — and was NOT rolled back. The exception (${threwDetail}) came out of the ` +
+          `widget's OWN callback, which this write invokes AFTER assigning the value — the ` +
+          `assignment did not throw. Side effects that callback would normally perform ` +
+          `(refreshing dependent widgets, previews, thumbnails) may not have run or completed; ` +
+          `inspect the node if dependents look stale. This invocation is programmatic, so a ` +
+          `callback written to assume a click can throw here and not in the UI.`
         : `${threwLabel} (${threwDetail}); the requested value IS in effect — ` +
           `verified present by read-back — and was NOT rolled back. Side effects the write ` +
           `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +

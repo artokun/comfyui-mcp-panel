@@ -18239,7 +18239,9 @@ function describeCommand(cmd, msg, reply) {
       // emits for the case it can establish, so this reads the field rather than
       // pattern-matching the prose. Any other value (or none) keeps the unattributed
       // wording, so a future source the summary does not know about degrades to the
-      // line it already showed.
+      // line it already showed. The attributed line says where the exception came
+      // FROM and stops there; it does not assign fault, because this write invokes
+      // the callback programmatically and that alone can be why it threw.
       const writeDisclosed = typeof r.set?.write_warning === "string";
       const threwInNodeCallback = r.set?.write_warning_source === "widget_callback";
       return railStale
@@ -18254,7 +18256,7 @@ function describeCommand(cmd, msg, reply) {
               `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
               (writeDisclosed
                 ? threwInNodeCallback
-                  ? ` — value verified in effect; the node's own widget callback threw, so its side effects may not have run`
+                  ? ` — value verified in effect; the exception came out of the widget's own callback, so its side effects may not have run`
                   : ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
                 : ""),
             detail: `was ${JSON.stringify(r.set?.previous)}`,
