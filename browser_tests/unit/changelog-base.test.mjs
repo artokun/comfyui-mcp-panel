@@ -55,8 +55,10 @@ test("#932: the base anchors on a version subject, not a release: prefix", () =>
     src.includes('-E --grep="^v?[0-9]+'),
     "prevTag must grep for a leading VERSION — the anchor this repo's releases carry",
   );
+  // The old grep, not any MENTION of it — the comment explaining this fix names the
+  // pattern it replaced, and an unscoped check matches that instead of the code.
   assert.ok(
-    !src.includes("chore(release)"),
+    !/--grep="\^\\\(chore\(release\)/.test(src),
     "the release:-prefix grep matched nothing here and must be gone",
   );
   assert.ok(
