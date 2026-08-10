@@ -78,3 +78,63 @@ test("#636: the panel actually uses the display-name test", () => {
     "and compare it against the requested name",
   );
 });
+
+// ── Adding a saved blueprint by the name the library shows ──────────────────
+//
+// Same root cause as the preflight above: `graph_add_subgraph` built the type as
+// prefix + name and called getBlueprint(type). On a hash-keyed store that resolves to
+// nothing for the ONE name a user or agent would use — the one the library shows — while
+// the opaque hash worked.
+
+const addSite = src.slice(
+  src.indexOf("const asType = name.startsWith(prefix)"),
+  src.indexOf("const position = placementFor(graph, pos);"),
+);
+
+test("#636: the add path resolves a blueprint by display_name", () => {
+  assert.ok(addSite.length > 0, "the resolution must exist");
+  assert.match(addSite, /d\.display_name === name/, "the library name must be consulted");
+  assert.match(addSite, /store\.getBlueprint\(type\)/, "and resolved through the store");
+});
+
+test("#636: the caller's string is tried AS A TYPE first", () => {
+  // So an exact type or a hash resolves exactly as it did before, and this can only ever
+  // add a resolution that previously failed — never change one that already worked.
+  // The type lookup is attempted first; the display-name candidate is only CONSULTED
+  // after it fails (it is computed earlier, but nothing is resolved from it until then).
+  const typeFirst = addSite.indexOf("let type = asType;");
+  const displayUsed = addSite.indexOf("displayMatches[0]?.name");
+  assert.ok(typeFirst >= 0, "the type attempt must exist");
+  assert.ok(displayUsed > typeFirst, "display_name is the FALLBACK, not the first try");
+});
+
+test("#636: the refusal names both things the caller could pass", () => {
+  // The old message said only "No saved subgraph blueprint X", which on a hash-keyed
+  // store was true of the name the user could actually see — unhelpful precisely when it
+  // fired most.
+  const msg = src.slice(src.indexOf("No saved subgraph blueprint"), src.indexOf("const position = placementFor"));
+  assert.match(msg, /display_name/, "the library name is an accepted input and must be named");
+  assert.match(msg, /type/, "so is the type");
+});
+
+test("#636: an AMBIGUOUS library name refuses rather than guessing", () => {
+  // display_name is user-controlled and not unique. Taking the first match could insert a
+  // DIFFERENT graph than the one asked for, and a wrong subgraph silently added is far
+  // worse than a refusal the caller can resolve by passing the unique type (codex).
+  const site = src.slice(
+    src.indexOf("const displayMatches ="),
+    src.indexOf("const position = placementFor(graph, pos);"),
+  );
+  assert.match(site, /displayMatches\.length > 1/, "more than one match must be detected");
+  assert.match(site, /would be a guess/, "and refused in those words");
+  assert.doesNotMatch(site, /\.find\(/, "no first-match shortcut may remain");
+});
+
+test("#636: a real store failure is not reported as 'never saved'", () => {
+  const site = src.slice(
+    src.indexOf("const displayMatches ="),
+    src.indexOf("const position = placementFor(graph, pos);"),
+  );
+  assert.match(site, /lookupError = err;/, "the thrown error must be kept");
+  assert.match(site, /the lookup also failed/, "and surfaced when nothing resolves");
+});

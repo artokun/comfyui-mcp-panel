@@ -13114,16 +13114,64 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!name || typeof name !== "string") throw new Error("name (blueprint name or type) is required");
     const store = getSubgraphStore();
     const prefix = store.typePrefix ?? "SubgraphBlueprint.";
-    const type = name.startsWith(prefix) ? name : `${prefix}${name}`;
     if (typeof store.getBlueprint !== "function") {
       throw new Error("subgraph store does not expose getBlueprint on this frontend");
     }
-    let bp;
+    // #636 — RESOLVE THE NAME THE USER CAN SEE. Blueprints are keyed by a content hash on
+    // current ComfyUI (measured: 89 of 91 named `SubgraphBlueprint.<hash>`, the typed name
+    // in `display_name`, and `typePrefix` absent so the literal fallback above is what is
+    // used). Building the type as prefix+name therefore resolved to nothing for the ONLY
+    // name a user or agent would think to use — the one the library shows — while the
+    // opaque hash worked. Same root cause as the collision preflight fixed in 0.11.71.
+    //
+    // Order matters: the caller's string is tried AS a type first, so an exact type or a
+    // hash keeps resolving exactly as before and this can only ever add a resolution that
+    // previously failed. Only if that finds nothing is `display_name` consulted.
+    const asType = name.startsWith(prefix) ? name : `${prefix}${name}`;
+    // AMBIGUITY REFUSES, it does not guess (codex). `display_name` is user-controlled and
+    // not unique, so taking the first match could insert a DIFFERENT graph than the one
+    // asked for — and a wrong subgraph silently added is far worse than a refusal, which
+    // the caller can resolve by passing the unique `type`.
+    const displayMatches = (store.subgraphBlueprints ?? []).filter(
+      (d) => typeof d?.display_name === "string" && d.display_name === name,
+    );
+    let type = asType;
+    let bp = null;
+    let lookupError = null;
     try {
       bp = store.getBlueprint(type);
     } catch (err) {
+      // Kept, not discarded: if nothing resolves, a real store failure must not be
+      // reported as "you never saved this" (codex).
+      lookupError = err;
+    }
+    if (!bp) {
+      if (displayMatches.length > 1) {
+        throw new Error(
+          `"${name}" matches ${displayMatches.length} saved subgraphs with that library ` +
+            `name, so adding one would be a guess. Pass the unique \`type\` instead — ` +
+            `panel_list_subgraphs reports it for each.`,
+        );
+      }
+      const viaDisplay =
+        typeof displayMatches[0]?.name === "string" ? displayMatches[0].name : null;
+      if (viaDisplay) {
+        type = viaDisplay;
+        try {
+          bp = store.getBlueprint(type);
+        } catch (err) {
+          lookupError = err;
+        }
+      }
+    }
+    if (!bp) {
       throw new Error(
-        `No saved subgraph blueprint "${name}" (${coerceMessageText(err?.message ?? err)}). List them with panel_list_subgraphs.`,
+        `No saved subgraph blueprint "${name}" — neither as a blueprint type nor as the ` +
+          `name shown in the library. List them with panel_list_subgraphs and use either ` +
+          `the \`type\` or the \`display_name\` it reports.` +
+          // A store that THREW is a different fact from one that simply has no such
+          // blueprint, and the caller cannot act on the second remedy if it was the first.
+          (lookupError ? ` (the lookup also failed: ${coerceMessageText(lookupError?.message ?? lookupError)})` : ""),
       );
     }
     const position = placementFor(graph, pos);
