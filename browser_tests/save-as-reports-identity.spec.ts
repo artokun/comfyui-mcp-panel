@@ -63,6 +63,21 @@ test('a Save-As reply carries the new workflow instance identity', async ({
     // identity it was just handed.
     expect(saved.result?.workflow_instance_changed).toBe(true)
 
+    // A Save-As copy is a NEW workflow and must not inherit the original's instance
+    // identity — shouldCarryIdentityAcrossSaveSwap refuses the carry for savedAs, but the
+    // resolution order is `objectUuid || embedded || pathAlias || random`, so an inherited
+    // embedded id could still collapse the two onto one uuid (codex). Assert the outcome,
+    // not the intent.
+    expect(
+      saved.result?.workflow_uuid,
+      'the copy must not share the original workflow instance identity'
+    ).not.toBe(first.result?.workflow_uuid)
+
+    // The identity must describe the COPY, not whichever canvas happened to be active when
+    // the reply was built — the reply's name and its identity have to be one snapshot.
+    expect(saved.result?.routing_key).toBe(`wf:workflows/${copyName}.json`)
+    expect(saved.result?.routing_key).not.toBe(`wf:workflows/${original}.json`)
+
     // The published identity has to be the one the fence actually compares against —
     // otherwise it is a plausible-looking value that re-fences to nothing.
     const refused = await mockBridge.command('graph_outline', {})
@@ -71,6 +86,13 @@ test('a Save-As reply carries the new workflow instance identity', async ({
       String(refused.error || ''),
       'the mismatch must name the identity the save reported, or the reply cannot recover the session'
     ).toContain(String(saved.result.workflow_uuid))
+
+    // And the reported identity genuinely recovers the session: re-open the copy (the
+    // fence-exempt path), then a graph read must succeed against it.
+    const reopened = await mockBridge.command('workflow_open', { path: `workflows/${copyName}.json` })
+    expect(reopened.ok, 'the fence-exempt recovery must work').toBe(true)
+    const after = await mockBridge.command('graph_outline', {})
+    expect(after.ok, 'graph tools must work again once the session is re-fenced').toBe(true)
   } finally {
     for (const name of cleanup.reverse()) {
       try {

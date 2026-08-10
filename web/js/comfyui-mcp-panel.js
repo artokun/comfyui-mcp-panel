@@ -2386,39 +2386,40 @@ function isCanonicalWorkflowInstanceUuid(value) {
 // canonical workflow. A tmp: routing handle is intentionally not durable enough
 // to publish as a command-fence refresh source.
 /**
- * #941 — after a save that made a DIFFERENT workflow active, establish that canvas's
- * identity so the reply can report it.
+ * #941 — the identity to report for the workflow a save just produced.
  *
- * A Save-As activates a brand-new object. Nothing has established an identity for it, so
- * `establishedWorkflowReplyIdentity` (a deliberate pure read, #716) found none and the
- * reply said "unavailable" — while the very next command was refused BY that identity,
+ * A Save-As activates a brand-new object that nothing has established an identity for, so
+ * `establishedWorkflowReplyIdentity` — a deliberate pure read (#716) — found none and the
+ * reply said "unavailable", while the very next command was refused BY that identity,
  * because the fence's own read mints. The panel knew the value and would not publish it,
- * which is what made the wedge unrecoverable: the documented recovery is fence-exempt but
- * cannot re-derive something that was never reported.
+ * and a caller fenced to the pre-save workflow had nothing to recover with.
  *
- * Minting here does not weaken the #716 rule. That rule stops a READ from deciding what
- * the canvas is. This runs inside `workflow_save`, a mutation that just changed which
- * canvas is active — establishing the identity of the canvas it created is part of doing
- * the work, not a read inventing one.
+ * Minting here does not weaken #716. That rule stops a READ from deciding what the canvas
+ * is. This runs inside `workflow_save`, a mutation whose job is to change which canvas is
+ * active, and it establishes for the object the SAVE ITSELF produced — never for whatever
+ * happens to be active afterwards, which a tab switch during the save's awaits could make
+ * a different workflow entirely (codex).
  */
-function establishActiveIdentityAfterSave(savedAs) {
+function saveProducedIdentity(savedRecord, savedAs) {
   try {
-    const active = activeWorkflowRef();
-    if (!active) return;
+    if (!savedRecord || typeof savedRecord !== "object") return null;
     if (
       !shouldEstablishIdentityAfterSave({
         savedAs,
-        alreadyEstablished: Boolean(establishedWorkflowReplyIdentity(active)),
+        alreadyEstablished: Boolean(establishedWorkflowReplyIdentity(savedRecord)),
       })
     ) {
-      return;
+      return establishedWorkflowReplyIdentity(savedRecord);
     }
-    // The minting read. Records into the live-object map + owner map, which is exactly
-    // what `establishedWorkflowReplyIdentity` then finds.
-    workflowStableUuid(active);
+    // The minting read — records into the live-object and owner maps, which is exactly
+    // what establishedWorkflowReplyIdentity then finds.
+    workflowStableUuid(savedRecord);
+    return establishedWorkflowReplyIdentity(savedRecord);
   } catch {
     // A reply that cannot report identity is the bug being fixed, not a reason to fail a
-    // save that already succeeded.
+    // save that already wrote the file. saveReplyIdentity(null) still reports ABSENCE
+    // explicitly, so the caller is told rather than left to assume continuity.
+    return null;
   }
 }
 
@@ -4147,7 +4148,21 @@ async function programmaticSave(name) {
       outcome.original_on_disk = status === "present" ? true : "unverified";
     }
   }
-  return { name: saved || getWorkflowTitle(), ...outcome };
+  // #941 — establish the identity of the object the SAVE PRODUCED, and report THAT.
+  //
+  // Not `activeWorkflowRef()` after the await (codex): a tab switch during the save's
+  // internal awaits would mint for whichever canvas happens to be active, and the reply
+  // would then pair `workflow: "<copy>"` with a uuid describing a DIFFERENT canvas. An
+  // agent re-fencing on it would authorize graph writes against that other workflow. Same
+  // transaction-boundary mistake as #847, one iteration later.
+  //
+  // `details.savedRecord` is the save's own authoritative output — the same value
+  // shouldCarryIdentityAcrossSaveSwap is threaded with above — so name, routing key and
+  // uuid all come from one snapshot.
+  // Hand back the RECORD, and let the caller resolve identity from it. `activatedRecord` is
+  // the Save-As copy the adapter PROVED active; `savedRecord` covers the first-save path.
+  // Either way it is the save transaction's own output, never a later active-canvas read.
+  return { name: saved || getWorkflowTitle(), producedRecord: details?.activatedRecord || details?.savedRecord || null, ...outcome };
 }
 
 /** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
@@ -11594,7 +11609,8 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_save({ name } = {}) {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
-    const { name: workflow, ...outcome } = await programmaticSave(name);
+    const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
+    const replyIdentity = saveProducedIdentity(producedRecord, !!outcome.saved_as);
     // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
     // first_save) so a rename-vs-copy is never silent (mcp#579).
     //
@@ -11602,17 +11618,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // DIFFERENT workflow active, which fences the very session that asked for the
     // save; without an identity in this reply the caller has nothing to re-fence
     // to, and every call that could tell it is itself refused.
-    establishActiveIdentityAfterSave(!!outcome.saved_as);
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
-    const { name: workflow, ...outcome } = await programmaticSave(name);
+    const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
-    establishActiveIdentityAfterSave(true);
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: true }) };
+    const replyIdentity = saveProducedIdentity(producedRecord, true);
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: true }) };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------

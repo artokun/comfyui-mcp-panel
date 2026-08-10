@@ -91,14 +91,15 @@ test("#747 WIRING: BOTH save handlers report the identity, and save_as always fl
   const saveAsBlock = src.slice(saveAsIdx, saveAsIdx + 900);
 
   // workflow_save is only a Save-As when the outcome says so…
-  assert.match(saveBlock, /saveReplyIdentity\(liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
+  assert.match(saveBlock, /saveReplyIdentity\(replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
   // …while workflow_save_as always changes which workflow is active.
-  assert.match(saveAsBlock, /saveReplyIdentity\(liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: true \}\)/);
+  assert.match(saveAsBlock, /saveReplyIdentity\(replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: true \}\)/);
 
   // #941 — and BOTH must establish the identity first, or the read above finds nothing for
   // a Save-As's brand-new object and reports `workflow_identity_unavailable` while the
   // fence, whose own read mints, refuses the next call with the identity it just declined
   // to publish.
-  assert.match(saveBlock, /establishActiveIdentityAfterSave\(!!outcome\.saved_as\)/);
-  assert.match(saveAsBlock, /establishActiveIdentityAfterSave\(true\)/);
+  // …from the record the SAVE produced, not a later active-canvas read (#941, codex).
+  assert.match(saveBlock, /saveProducedIdentity\(producedRecord, !!outcome\.saved_as\)/);
+  assert.match(saveAsBlock, /saveProducedIdentity\(producedRecord, true\)/);
 });

@@ -688,6 +688,17 @@ export async function saveActiveWorkflow(
       // user/reconnect switch to a DISTINCT tab during the awaited persist fails that
       // proof ⇒ consume NOTHING and thread NOTHING (fail safe: the cosmetic ghost
       // stays — never the #349 wrong-canvas seeding of a foreign tab).
+      // #941 — thread the adapter's PROVEN produced record for the reply's identity,
+      // whatever the source classification. A Save-As from a PERSISTED workflow takes the
+      // branch below and so never reached `details`, which is why the reply had no identity
+      // to report and the caller's session was stranded.
+      //
+      // A SEPARATE field from `savedRecord` deliberately: that one is the #557 succession
+      // proof and carries the PREDECESSOR's identity onto the successor, which a Save-As
+      // copy must never do — it is a new workflow. This one only says "the save activated
+      // this object", so the reply can report ITS identity rather than re-reading whichever
+      // canvas is active later (codex).
+      if (details && producedRecord.record) details.activatedRecord = producedRecord.record;
       if (cls === "never-persisted") {
         const produced = producedRecord.record ?? null;
         if (produced) {
