@@ -56,20 +56,41 @@ export function isPlaceholderNode(node) {
  * included: that one is genuinely missing, the existing `missing_node_types` reporting
  * already covers it, and nothing about it is stale.
  */
-export function findStalePlaceholders(nodes, isRegistered) {
+export function findStalePlaceholders(nodes, options) {
   const found = [];
-  if (!Array.isArray(nodes) || typeof isRegistered !== "function") return found;
+  // `= {}` in the signature would only cover `undefined` — a caller that computed its
+  // options and got `null` would take a TypeError out of a diagnostic, which is exactly
+  // the failure this module exists to avoid.
+  const { recordedMissingTypes, isClientRegistered } = options && typeof options === "object" ? options : {};
+  if (!Array.isArray(nodes) || typeof isClientRegistered !== "function") return found;
+  // MEMBERSHIP IN THE LOAD-TIME MISSING SNAPSHOT is the discriminator (codex), not the
+  // absence of `nodeData`. Frontend-only nodes have no backend definition and no
+  // `nodeData` at all — MEASURED: Note, Reroute, PrimitiveNode and MarkdownNote were ALL
+  // reported by the first version, so a canvas with a single Note on it would have
+  // demanded a reload after every refresh. Only a type the frontend actually recorded
+  // as missing can have a placeholder that a reload would repair.
+  const recorded =
+    recordedMissingTypes instanceof Set
+      ? recordedMissingTypes
+      : new Set(Array.isArray(recordedMissingTypes) ? recordedMissingTypes : []);
+  // Fast path only — `recorded.has(type)` below is the actual guard, and deleting this
+  // line changes no behaviour (verified by mutation). It is kept so the common case,
+  // where nothing was ever missing, does not walk the graph at all.
+  if (!recorded.size) return found;
   for (const node of nodes) {
     try {
       if (!isPlaceholderNode(node)) continue;
       const type = typeof node.type === "string" ? node.type : null;
-      if (!type) continue;
+      if (!type || !recorded.has(type)) continue;
       let registered = false;
       try {
-        registered = !!isRegistered(type);
+        // CLIENT registration, deliberately — /object_info proves the BACKEND has the
+        // definition, which is not the same as this page being able to instantiate it
+        // (codex). A reload only helps once the class exists here.
+        registered = !!isClientRegistered(type);
       } catch {
         // Unknown registration status is not evidence the node is recoverable, and
-        // claiming a reload would fix it would be a guess. Skipped.
+        // claiming a reload would fix it would be a guess.
         continue;
       }
       if (!registered) continue;
@@ -80,6 +101,7 @@ export function findStalePlaceholders(nodes, isRegistered) {
   }
   return found;
 }
+
 
 /**
  * The disclosure a refresh must carry when it did not finish the job.
@@ -100,8 +122,14 @@ export function stalePlaceholderNote(stale) {
     `on the canvas ${stale.length === 1 ? "is" : "are"} still a PLACEHOLDER: registering a class ` +
     `does not rehydrate nodes that were created while it was unknown — measured, they keep no ` +
     `definition and no widgets. They will still be reported as missing, and they will still fail ` +
-    `at queue time. Reload the workflow to rebuild them against the definitions that are now ` +
-    `present (#981). Save first if you have unsaved changes: a reload rebuilds from the stored ` +
-    `workflow, so anything not saved is lost.`
+    // "Reload" alone is ambiguous (codex) — a browser refresh restores whatever the
+    // frontend last autosaved, which is not reliably the graph on screen. The remedy is
+    // stated as the two steps it actually is: persist the graph, then reopen THAT
+    // workflow, so the rebuild reads a document whose contents are known.
+    `at queue time. To rebuild them against the definitions that are now present: SAVE the ` +
+    `workflow, then reload/reopen that saved workflow (#981). The save is the load-bearing ` +
+    `step — the rebuild reads the stored document, so anything not saved is not rebuilt, and ` +
+    `a plain browser refresh restores whatever the frontend last autosaved rather than the ` +
+    `graph in front of you.`
   );
 }

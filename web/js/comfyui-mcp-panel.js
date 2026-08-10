@@ -849,10 +849,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // wrong answer for a worse one.
   try {
     const nodes = collectAllGraphs(getGraphCtx().rootGraph).flatMap((g) => g?._nodes ?? []);
-    const registry = defs && typeof defs === "object" ? defs : null;
-    const stale = findStalePlaceholders(nodes, (type) =>
-      registry ? Object.prototype.hasOwnProperty.call(registry, type) : !!LiteGraph?.registered_node_types?.[type],
-    );
+    // The frontend's own load-time record of what was missing. Without it a
+    // frontend-only node — Note, Reroute, PrimitiveNode, MarkdownNote, none of which
+    // carry `nodeData` — is indistinguishable from a real placeholder, and MEASURED,
+    // all four were reported by the first version. Absent store ⇒ empty set ⇒ nothing
+    // claimed.
+    const recordedMissingTypes = collectMissingAssets().nodeTypes ?? [];
+    const stale = findStalePlaceholders(nodes, {
+      recordedMissingTypes,
+      // CLIENT registration, deliberately: /object_info proves the BACKEND has the
+      // definition, which is not the same as this page being able to instantiate it,
+      // and only the latter makes a reload capable of repairing the node.
+      isClientRegistered: (type) => !!LiteGraph?.registered_node_types?.[type],
+    });
     if (stale.length) {
       verdict.requires_reload = true;
       verdict.stale_placeholders = stale;

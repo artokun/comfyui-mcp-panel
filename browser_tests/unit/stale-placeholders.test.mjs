@@ -32,7 +32,23 @@ import {
 const realNode = (id, type) => ({ id, type, constructor: { nodeData: { name: type }, title: type } });
 /** A placeholder: instantiated while the class was unknown, so it carries no def. */
 const placeholder = (id, type) => ({ id, type, constructor: {} });
-const registry = (...types) => (type) => types.includes(type);
+/** Every type these fixtures ever place as a placeholder — i.e. what the frontend would
+ *  have recorded as missing at load. The collector requires membership here, so a
+ *  frontend-only node (Note, Reroute, …) can never be mistaken for a placeholder. */
+const RECORDED = [
+  "MiniMaxChunkFeedForward",
+  "MiniMaxLowVRAMAttention",
+  "OllamaImageList_CLIPGenerateText",
+  "NeverInstalled",
+  "StillGone",
+  "CLIPTextEncode",
+  "X",
+];
+/** `registry(...clientRegistered)` — what THIS page can instantiate now. */
+const registry = (...clientRegistered) => ({
+  recordedMissingTypes: RECORDED,
+  isClientRegistered: (type) => clientRegistered.includes(type),
+});
 
 test("#981 a node with no nodeData is a placeholder; one with it is not", () => {
   assert.equal(isPlaceholderNode(placeholder(1, "X")), true);
@@ -84,8 +100,11 @@ test("#981 the reporter's three classes, mixed with healthy nodes", () => {
 });
 
 test("#981 a registration lookup that THROWS skips that node rather than guessing", () => {
-  const stale = findStalePlaceholders([placeholder(1, "X")], () => {
-    throw new Error("registry boom");
+  const stale = findStalePlaceholders([placeholder(1, "X")], {
+    recordedMissingTypes: RECORDED,
+    isClientRegistered: () => {
+      throw new Error("registry boom");
+    },
   });
   assert.deepEqual(stale, [], "unknown registration status is not evidence the node is recoverable");
 });
@@ -116,8 +135,11 @@ test("#981 the note credits what the refresh DID do, and names the one thing tha
   assert.match(note, /MiniMaxChunkFeedForward/, "names the classes");
   assert.match(note, /still a PLACEHOLDER/, "and what did not happen");
   assert.match(note, /does not rehydrate nodes that were created while it was unknown/, "why");
-  assert.match(note, /Reload the workflow/, "the remedy");
-  assert.match(note, /Save first/, "and its cost, since a reload discards unsaved work");
+  // codex: "reload" on its own is ambiguous — a browser refresh restores the last
+  // autosave, not necessarily the graph on screen. The remedy must name both steps.
+  assert.match(note, /SAVE the workflow, then reload\/reopen that saved workflow/, "the remedy, both steps");
+  assert.match(note, /anything not saved is not rebuilt/, "and its cost");
+  assert.match(note, /browser refresh restores whatever the frontend last autosaved/, "not a plain refresh");
   assert.equal(stalePlaceholderNote([]), "", "silent when nothing is stale");
   assert.equal(stalePlaceholderNote(null), "");
 });
@@ -131,5 +153,86 @@ test("#981 source guard: the refresh reports requires_reload and does NOT clear 
   assert.ok(
     !/removeMissingNodesByType\s*\(/.test(src),
     "the missing-node store must NOT be cleared while the placeholders remain",
+  );
+});
+
+test("#981 (codex): FRONTEND-ONLY nodes are never reported — the false positive that killed v1", () => {
+  // MEASURED live: Note, Reroute, PrimitiveNode and MarkdownNote all lack
+  // `constructor.nodeData`, so the first version reported ALL FOUR. A canvas with one
+  // Note on it would have demanded a workflow reload after every refresh. They are
+  // excluded because the frontend never recorded them as missing — membership in that
+  // load-time record is the discriminator, not the absence of a definition.
+  const nodes = ["Note", "Reroute", "PrimitiveNode", "MarkdownNote"].map((t, i) => placeholder(i + 1, t));
+  const stale = findStalePlaceholders(nodes, {
+    recordedMissingTypes: [], // none of them were ever missing
+    isClientRegistered: () => true, // and all are instantiable
+  });
+  assert.deepEqual(stale, [], "a node the frontend never called missing is not a stale placeholder");
+});
+
+test("#981 (codex): BACKEND availability is not CLIENT registration", () => {
+  // /object_info proves the server has the definition; it does not prove this page can
+  // instantiate the class. Only the latter makes a reload capable of repairing the node,
+  // so the lookup is deliberately the client registry.
+  const nodes = [placeholder(1, "X")];
+  const backendOnly = findStalePlaceholders(nodes, {
+    recordedMissingTypes: ["X"],
+    isClientRegistered: () => false, // present on the server, not registered here
+  });
+  assert.deepEqual(backendOnly, [], "no reload claim while the class cannot be instantiated here");
+  assert.equal(findStalePlaceholders(nodes, registry("X")).length, 1, "…and one once it can");
+});
+
+test("#981 (codex) source guard: the panel feeds the load-time record and the CLIENT registry", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(src, /const recordedMissingTypes = collectMissingAssets\(\)\.nodeTypes \?\? \[\]/, "the frontend's own record");
+  assert.match(src, /findStalePlaceholders\(nodes, \{\r?\n\s*recordedMissingTypes,/, "…is what the scan is given");
+  assert.match(src, /isClientRegistered: \(type\) => !!LiteGraph\?\.registered_node_types\?\.\[type\]/, "client registry");
+  assert.ok(
+    !/Object\.prototype\.hasOwnProperty\.call\(registry, type\)/.test(src),
+    "the /object_info lookup must not come back — backend availability is a different fact",
+  );
+});
+
+test("#981 (codex): a REBUILT node plus a stale missing-store snapshot is NOT a finding", () => {
+  // The store is a load-time snapshot the frontend never clears, so it keeps naming a
+  // type long after the node was rebuilt. The node's own state, not the record, decides:
+  // the record only narrows WHICH types may be considered.
+  const stale = findStalePlaceholders([realNode(1, "MiniMaxChunkFeedForward")], registry("MiniMaxChunkFeedForward"));
+  assert.deepEqual(stale, [], "a node carrying a definition is healthy whatever the snapshot says");
+});
+
+test("#981 (codex): the warning PERSISTS across refreshes until the node is rebuilt", () => {
+  // Registering the class does not rehydrate the node, so a second and third refresh
+  // must keep saying so. The collector holds no state that could let it go quiet.
+  const nodes = [placeholder(1, "MiniMaxChunkFeedForward")];
+  const opts = registry("MiniMaxChunkFeedForward");
+  const runs = [findStalePlaceholders(nodes, opts), findStalePlaceholders(nodes, opts), findStalePlaceholders(nodes, opts)];
+  for (const r of runs) assert.deepEqual(r, [{ node_id: "1", type: "MiniMaxChunkFeedForward" }]);
+  // …and goes quiet only once the reload actually replaced the node.
+  nodes[0] = realNode(1, "MiniMaxChunkFeedForward");
+  assert.deepEqual(findStalePlaceholders(nodes, opts), [], "silent once the rebuild happened");
+});
+
+test("#981 (codex): an UNAVAILABLE missing-node record claims nothing at all", () => {
+  // If the frontend's record cannot be read the discriminator is gone, and without it
+  // every frontend-only node looks like a placeholder. Absent record means silence, not
+  // a fallback to the shape test that produced the false positives.
+  const nodes = [placeholder(1, "Note"), placeholder(2, "Reroute"), placeholder(3, "MiniMaxChunkFeedForward")];
+  for (const absent of [undefined, null, [], "boom", 42, new Set()]) {
+    assert.deepEqual(
+      findStalePlaceholders(nodes, { recordedMissingTypes: absent, isClientRegistered: () => true }),
+      [],
+      `no record (${String(absent)}) -> no claim`,
+    );
+  }
+  // A Set is accepted when it HAS entries — the panel may hand either shape.
+  assert.equal(
+    findStalePlaceholders(nodes, {
+      recordedMissingTypes: new Set(["MiniMaxChunkFeedForward"]),
+      isClientRegistered: () => true,
+    }).length,
+    1,
+    "and Note/Reroute stay excluded even then",
   );
 });
