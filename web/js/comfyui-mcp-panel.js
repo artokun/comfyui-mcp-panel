@@ -146,7 +146,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
-import { saveReplyIdentity } from "./lib/save-reply-identity.js";
+import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
@@ -2385,6 +2385,43 @@ function isCanonicalWorkflowInstanceUuid(value) {
 // a real workflow. Accept only an already-established UUID on a persisted,
 // canonical workflow. A tmp: routing handle is intentionally not durable enough
 // to publish as a command-fence refresh source.
+/**
+ * #941 — after a save that made a DIFFERENT workflow active, establish that canvas's
+ * identity so the reply can report it.
+ *
+ * A Save-As activates a brand-new object. Nothing has established an identity for it, so
+ * `establishedWorkflowReplyIdentity` (a deliberate pure read, #716) found none and the
+ * reply said "unavailable" — while the very next command was refused BY that identity,
+ * because the fence's own read mints. The panel knew the value and would not publish it,
+ * which is what made the wedge unrecoverable: the documented recovery is fence-exempt but
+ * cannot re-derive something that was never reported.
+ *
+ * Minting here does not weaken the #716 rule. That rule stops a READ from deciding what
+ * the canvas is. This runs inside `workflow_save`, a mutation that just changed which
+ * canvas is active — establishing the identity of the canvas it created is part of doing
+ * the work, not a read inventing one.
+ */
+function establishActiveIdentityAfterSave(savedAs) {
+  try {
+    const active = activeWorkflowRef();
+    if (!active) return;
+    if (
+      !shouldEstablishIdentityAfterSave({
+        savedAs,
+        alreadyEstablished: Boolean(establishedWorkflowReplyIdentity(active)),
+      })
+    ) {
+      return;
+    }
+    // The minting read. Records into the live-object map + owner map, which is exactly
+    // what `establishedWorkflowReplyIdentity` then finds.
+    workflowStableUuid(active);
+  } catch {
+    // A reply that cannot report identity is the bug being fixed, not a reason to fail a
+    // save that already succeeded.
+  }
+}
+
 function establishedWorkflowReplyIdentity(wf) {
   if (!wf || typeof wf !== "object") return null;
   // THE ESTABLISHMENT TEST, and the only one that matters here (#716): the uuid
@@ -11565,6 +11602,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // DIFFERENT workflow active, which fences the very session that asked for the
     // save; without an identity in this reply the caller has nothing to re-fence
     // to, and every call that could tell it is itself refused.
+    establishActiveIdentityAfterSave(!!outcome.saved_as);
     return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
@@ -11573,6 +11611,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const { name: workflow, ...outcome } = await programmaticSave(name);
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
+    establishActiveIdentityAfterSave(true);
     return { saved: true, workflow, ...outcome, ...saveReplyIdentity(liveWorkflowListActive().activeIdentity, { savedAs: true }) };
   },
 

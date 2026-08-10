@@ -78,7 +78,10 @@ test("#747 non-string identity fields are rejected, not stringified into the fen
 test("#747 WIRING: BOTH save handlers report the identity, and save_as always flags the change", () => {
   // A green helper proves nothing about the reply the agent receives (#792).
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(src, /import \{ saveReplyIdentity \} from "\.\/lib\/save-reply-identity\.js"/);
+  // The SYMBOL is imported from that module — not the exact import line. Pinning the whole
+  // line broke the moment #941 added a second export beside it, which says nothing about
+  // whether the reply is wired up.
+  assert.match(src, /import \{[^}]*saveReplyIdentity[^}]*\} from "\.\/lib\/save-reply-identity\.js"/);
 
   const saveIdx = src.indexOf("async workflow_save({ name } = {})");
   const saveAsIdx = src.indexOf("async workflow_save_as({ name })");
@@ -91,4 +94,11 @@ test("#747 WIRING: BOTH save handlers report the identity, and save_as always fl
   assert.match(saveBlock, /saveReplyIdentity\(liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
   // …while workflow_save_as always changes which workflow is active.
   assert.match(saveAsBlock, /saveReplyIdentity\(liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: true \}\)/);
+
+  // #941 — and BOTH must establish the identity first, or the read above finds nothing for
+  // a Save-As's brand-new object and reports `workflow_identity_unavailable` while the
+  // fence, whose own read mints, refuses the next call with the identity it just declined
+  // to publish.
+  assert.match(saveBlock, /establishActiveIdentityAfterSave\(!!outcome\.saved_as\)/);
+  assert.match(saveAsBlock, /establishActiveIdentityAfterSave\(true\)/);
 });
