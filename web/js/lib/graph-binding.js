@@ -1706,6 +1706,94 @@ export function rootContentProvesActiveWorkflow({
   }
 }
 
+/**
+ * EXCLUSIVITY for a content proof that has to hold even though the active tab has
+ * unsaved edits (#995).
+ *
+ * The ordinary exclusivity check SKIPS a dirty twin — "unprovable, not evidence of
+ * ambiguity" — which is right while the ACTIVE side must be clean, because a clean
+ * active workflow plus a dirty twin still leaves only one provable owner. Once the
+ * active side may itself be dirty, that skip becomes the hole: a dirty twin holding the
+ * same content would be invisible, and the panel could re-stamp the active identity onto
+ * a root that is the twin's canvas — wedging THAT tab the moment the user switched to it.
+ *
+ * So here a dirty twin is DISQUALIFYING rather than skippable. `others` is every OTHER
+ * open workflow; each must be readable and provably different from the root, and any one
+ * of them being modified (or unreadable) makes the whole thing unprovable.
+ */
+export function contentProofExclusiveAmongOpen({ rootGraph, others } = {}) {
+  try {
+    if (!rootGraph || !Array.isArray(others)) return false;
+    for (const other of others) {
+      if (!other || typeof other !== "object") return false; // unreadable — prove nothing
+      // A lagging tracker cannot establish that its canvas DIFFERS either, so a dirty
+      // twin is not "no evidence" here: it is missing evidence the proof requires.
+      if (other.isModified === true) return false;
+      const state = activeWorkflowCurrentState(other);
+      if (state == null) return false; // no readable state — same reason
+      if (graphRootMatchesState({ rootGraph, state })) return false; // a proven twin
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #995 — the content proof, for a canvas whose tab has UNSAVED EDITS.
+ *
+ * MEASURED on ComfyUI 0.31.1 / frontend 1.48.7, reproducing the report through UI clicks:
+ * a modified workflow whose canvas the panel's own comparison proves is its own, and a
+ * root still carrying the PREVIOUS workflow's tag:
+ *
+ *   active workflow            probe995.json, isModified true
+ *   root tag                   e66e531b…  (another workflow's)
+ *   uuid mismatch              true
+ *   rootContentProvesActiveWorkflow   false   <- only because the tab is dirty
+ *   graphRootMatchesState(root, tracker state)   TRUE
+ *   rebind verdict             "conflict"      -> every graph tool refused
+ *
+ * The clean-tab requirement on the ordinary proof exists because a dirty tracker can LAG
+ * the canvas (#545). But a lagging snapshot makes an equality test FAIL, not falsely
+ * succeed — the failure mode it guards against is a false NEGATIVE. What a dirty tab
+ * genuinely costs is the twin comparison, which is why this takes its exclusivity from
+ * `contentProofExclusiveAmongOpen` instead, where a dirty twin disqualifies.
+ *
+ * Deliberately NOT used by `sealProvenRootBinding`. That path WRITES a tag onto an
+ * untagged root, and relaxing what may be written is a different decision from relaxing
+ * what may be re-stamped over a tag the panel itself minted.
+ */
+export function rootContentProvesActiveWorkflowDespiteEdits({
+  rootGraph,
+  activeWorkflow,
+  inSubgraph = false,
+  proofExclusive = false,
+} = {}) {
+  try {
+    if (inSubgraph) return false;
+    if (proofExclusive !== true) return false;
+    if (!rootGraph || !activeWorkflow) return false;
+    // AN EMPTY CANVAS CANNOT IDENTIFY ITSELF. Every blank graph serialises alike, so
+    // equality against a blank tracker state is not evidence about WHOSE canvas this is —
+    // a dirty blank twin is exactly as plausible an owner, and re-stamping would wedge
+    // THAT tab. The clean path guards this through `staleTagOnEmptyCanvas`, which demands
+    // both sides be provably empty AND the tab be clean; here the tab is dirty, so the
+    // only safe answer is to refuse. (Caught by the #565 gate, not by reasoning.)
+    // Both sides are tested, and neither can be killed alone by mutation: the proof only
+    // fires when the two are EQUAL, so an empty one implies an empty other and either
+    // check refuses. Removing BOTH does fail the suite. They are kept as two because they
+    // answer the question about different objects, and a later change to one side's
+    // emptiness rule must not silently remove the other's guarantee.
+    if (graphRootProvenEmpty(rootGraph)) return false;
+    const state = activeWorkflowCurrentState(activeWorkflow);
+    if (state == null) return false;
+    if (serializedStateProvenEmpty(state)) return false;
+    return graphRootMatchesState({ rootGraph, state });
+  } catch {
+    return false;
+  }
+}
+
 export function sealProvenRootBinding({
   rootGraph,
   activeWorkflow,
@@ -1772,7 +1860,17 @@ export const MUTATION_BINDING_BAR = Object.freeze({
 export function graphCommandBindingBar(command) {
   return graphCommandMayMutateWorkflow(command)
     ? { ...MUTATION_BINDING_BAR }
-    : { includeBaselineReadGuard: false, requireDirtyMutationBinding: false };
+    : {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: false,
+        // #995 — POSITIVE evidence that this call is a classified read, set in exactly
+        // one place. The stale-tag content bypass is gated on this rather than on
+        // `requireDirtyMutationBinding !== true`, which is default-permit: a caller that
+        // omits the flag, or a fence call added later without the classification, would
+        // have inherited a bypass nobody decided to give it (codex). Opting in here means
+        // the read list above is the whole surface that can reach it.
+        staleTagReadBypass: true,
+      };
 }
 
 /**

@@ -396,6 +396,8 @@ import {
   sealProvenRootBinding,
   emptyCanvasBindingProven,
   rootContentProvesActiveWorkflow,
+  rootContentProvesActiveWorkflowDespiteEdits,
+  contentProofExclusiveAmongOpen,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
@@ -5665,7 +5667,14 @@ function kickPostReconnectSettleWatch(epoch) {
 function assertGraphBoundToActiveWorkflow(
   graph,
   rootGraph,
-  { includeBaselineReadGuard = true, requireDirtyMutationBinding = false } = {},
+  {
+    includeBaselineReadGuard = true,
+    requireDirtyMutationBinding = false,
+    // #995 — opt-IN, and false unless a caller classified this command as a read through
+    // `graphCommandBindingBar`. Gating the stale-tag bypass on the absence of the
+    // mutation flag would be default-permit (codex).
+    staleTagReadBypass = false,
+  } = {},
 ) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
@@ -5790,6 +5799,50 @@ function assertGraphBoundToActiveWorkflow(
         rootUuidMismatch = false;
       } catch {
         // A root that refuses the re-stamp stays mismatched and throws below.
+      }
+    }
+    // #995 — A READ, AND ONLY A READ, may proceed on a stale tag when the root's content
+    // equals the active workflow's own current state. MEASURED live through UI clicks: a
+    // MODIFIED workflow, a canvas the panel's own comparison proves matches it, the
+    // previous workflow's tag still on the root — and every graph tool refused, including
+    // panel_graph_outline.
+    //
+    // NOT a rebind, and the distinction is the whole safety argument (codex). Equality
+    // against a DIRTY tab's tracker snapshot cannot establish whose canvas this is: two
+    // tabs can hold the same content, the snapshot can lag, and the owner may not even be
+    // in `openWorkflows` at this instant (mid-switch, background load, a closed tab's
+    // canvas still mounted). Re-stamping on that would move the error onto the OTHER
+    // workflow — its canvas would carry this identity, and the wedge would follow the user
+    // when they switched back. So nothing is written: the flag is cleared for THIS call.
+    //
+    // WHAT IS ESTABLISHED, exactly: serialized-content EQUALITY between the mounted root
+    // and the active workflow's tracker snapshot. NOT ownership (codex) — in the A/B
+    // sequence above the returned graph equals A's snapshot while being B's mounted
+    // canvas, and nothing here can tell those apart. What follows is only that a read
+    // returns content equal to what the active workflow itself reports, which is the bar
+    // the read path already works to (#545 exempts read-only tools from the proof
+    // requirement precisely so a lagging tracker cannot block inspection). Unequal
+    // content fails the proof outright, so no read can return a graph the active
+    // workflow's own snapshot disagrees with.
+    if (rootUuidMismatch && staleTagReadBypass === true) {
+      let others = null;
+      try {
+        const open = app?.extensionManager?.workflow?.openWorkflows;
+        // Unreadable enumeration → `others` stays null → the proof refuses. Never an
+        // empty list by default: "no other tabs" and "could not look" are different.
+        if (Array.isArray(open)) others = open.filter((w) => !sameWorkflowObject(w, activeWorkflow));
+      } catch {
+        others = null;
+      }
+      if (
+        rootContentProvesActiveWorkflowDespiteEdits({
+          rootGraph,
+          activeWorkflow,
+          inSubgraph,
+          proofExclusive: contentProofExclusiveAmongOpen({ rootGraph, others }),
+        })
+      ) {
+        rootUuidMismatch = false; // this call only — the tag on the root is left alone
       }
     }
   }
