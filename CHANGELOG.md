@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.92] - 2026-08-10
+
+> Covers changes since 0.11.91.
+
+### Fixed
+
+- **Unpacking a subgraph no longer throws away the values you set on it (#979).**
+  Someone unpacked a subgraph and got the pack's template prompt back instead of the
+  long custom one they had written, and a duration of 2 instead of the 15 they had
+  set. Model and VAE choices survived; the values they had actually typed did not.
+
+  When a widget is promoted to the outside of a subgraph, the value you see on the
+  parent is the one that renders. Unpacking inlined the **inner** node's value
+  instead — usually whatever the pack shipped as a default. Since unpacking is
+  destructive, the parent's value was gone at that point, and the only fix was
+  remembering what it had been and typing it back.
+
+  The values are now carried inward before the subgraph is taken apart, and the
+  result says which ones moved.
+
+  The rest of this change is about what happens when that carry goes wrong. Custom
+  nodes can do arbitrary things when a widget is written — clamp the value, throw
+  halfway, change something else on the node. If any of that happens, the panel now
+  **restores the workflow and refuses to unpack**, rather than pulling the subgraph
+  apart around a value it cannot account for. Refusing leaves everything intact and
+  recoverable; guessing would not.
+
+
 ## [0.11.91] - 2026-08-10
 
 > Covers changes since 0.11.90.
