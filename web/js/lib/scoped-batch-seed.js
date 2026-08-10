@@ -8,6 +8,17 @@
  *   app.queuePrompt(0, 3, undefined)   -> seeds 0, 275253667108059, 219005225600584
  *   app.queuePrompt(0, 3, ["<id>"])    -> seeds 0, 0, 0
  *
+ * MEASURED IN BOTH WIDGET-CONTROL MODES, because ComfyUI can install the control's
+ * mutation as either `beforeQueued` or `afterQueued` and only one had been observed
+ * (codex). Flipping `Comfy.WidgetControlMode` and repeating the capture:
+ *
+ *   mode "after"  scoped [0,0,0]   unscoped [0, 1052866786709601, 413884900582428]
+ *   mode "before" scoped [0,0,0]   unscoped [267357841888133, 145435791190359, 43867923644491]
+ *
+ * The scoped batch repeats in BOTH, so the warning does not need gating on the setting.
+ * (The unscoped difference is the setting doing its job: "before" randomizes the first
+ * item too, "after" sends the value you set and advances from there.)
+ *
  * That is ComfyUI's OWN queue loop, called directly with no panel code in the path.
  * Passing the scope as the third argument stops it advancing `control_after_generate`
  * between batch items — a partial execution skips the queue-time widget hooks. The

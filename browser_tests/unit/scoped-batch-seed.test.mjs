@@ -154,3 +154,20 @@ test("#988 (codex) source guard: the scan runs BEFORE dispatch, not after", () =
   assert.ok(scan > 0, "the pre-dispatch scan must exist");
   assert.ok(scan < dispatch && scan < scopedDispatch, "and precede BOTH dispatch paths");
 });
+
+test("#988 (codex r3): the warning is NOT gated on Comfy.WidgetControlMode — measured in both", () => {
+  // ComfyUI can install the control's mutation as beforeQueued OR afterQueued, and only
+  // one mode had been observed. Flipping `Comfy.WidgetControlMode` on the live install
+  // and repeating the prompt-body capture:
+  //
+  //   mode "after"   scoped [0,0,0]   unscoped [0, 1052866786709601, 413884900582428]
+  //   mode "before"  scoped [0,0,0]   unscoped [267357841888133, 145435791190359, 43867923644491]
+  //
+  // The scoped batch repeats in BOTH, so a mode-dependent gate would add a branch that
+  // is never taken — and gating on a setting the panel cannot see would have been
+  // guesswork. This pins that the detector deliberately ignores the setting.
+  const controls = findRepeatingControlWidgets([ksampler(42, "randomize")]);
+  assert.equal(controls.length, 1, "detection does not consult any widget-control-mode setting");
+  const note = scopedBatchSeedNote(controls, 3);
+  assert.doesNotMatch(note, /WidgetControlMode|beforeQueued|afterQueued/, "and makes no claim about it");
+});
