@@ -159,6 +159,7 @@ import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-lab
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
+import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -734,7 +735,15 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // combo trust below. Decoupled from registerNodesFromDefs so the trust signal
     // doesn't hinge on that method existing (codex #2).
     if (!defs && typeof api?.getNodeDefs === "function") {
-      defs = await api.getNodeDefs();
+      // #954 — retry a TRANSIENT failure. A refresh issued just after a restart-related
+      // operation landed in a reconnect window and came back
+      // `object_info_fetch_failed / "Failed to fetch"` while other reads succeeded moments
+      // later against the same server, printing a remedy that sends the user to check a
+      // process that was never down. The startup baseline seed already retries getNodeDefs
+      // for this reason; this path did not, so the same blip was survivable at page load
+      // and fatal to a tool call. Bounded (~800ms worst case) because this blocks the call,
+      // and the LAST error is rethrown so a genuine outage still reports what it always did.
+      defs = await fetchNodeDefsWithRetry(() => api.getNodeDefs());
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.

@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { fetchNodeDefsWithRetry } from "../../web/js/lib/object-info-retry.js";
 
 import {
   describeNodeDefRefresh,
@@ -347,6 +348,10 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
     "describeNodeDefRefresh",
+    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
+    // a harness that substituted a pass-through would stop proving what this file exists to
+    // prove: that the shipped code produces these verdicts.
+    "fetchNodeDefsWithRetry",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
@@ -357,6 +362,8 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     () => ({}),
     () => {},
     describeNodeDefRefresh,
+    // No real waiting: the delays are the shipped ones, the sleep is not.
+    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
   );
 }
 
@@ -463,6 +470,10 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
     "describeNodeDefRefresh",
+    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
+    // a harness that substituted a pass-through would stop proving what this file exists to
+    // prove: that the shipped code produces these verdicts.
+    "fetchNodeDefsWithRetry",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs };`,
@@ -481,6 +492,8 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     },
     () => {},
     describeNodeDefRefresh,
+    // No real waiting: the shipped delays, an instant sleep.
+    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
   );
   const verdict = await registerWithThrowingRecorder(undefined);
   assert.equal(verdict.reason, "register_failed");
@@ -513,6 +526,10 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
     "describeNodeDefRefresh",
+    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
+    // a harness that substituted a pass-through would stop proving what this file exists to
+    // prove: that the shipped code produces these verdicts.
+    "fetchNodeDefsWithRetry",
     `let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
@@ -529,6 +546,8 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     },
     () => {},
     describeNodeDefRefresh,
+    // No real waiting: the shipped delays, an instant sleep.
+    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
   );
   const verdict = await registerComfyNodeDefs(undefined);
   assert.equal(verdict.refreshed, false);
