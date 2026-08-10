@@ -148,6 +148,12 @@ test("#981 the note credits what the refresh DID do, and names the one thing tha
   // codex: "reload" on its own is ambiguous — a browser refresh restores the last
   // autosave, not necessarily the graph on screen. The remedy must name both steps.
   assert.match(note, /SAVE the workflow, then reload\/reopen that saved workflow/, "the remedy, both steps");
+  // codex r4: only `constructor.nodeData` is tested per node — "no widgets" was measured
+  // on one instance — and a registry entry makes a reload worth trying, not certain.
+  assert.match(note, /on the instance measured for #981/, "the widgets claim is attributed");
+  assert.doesNotMatch(note, /they keep no definition and no widgets/, "not asserted of every node");
+  assert.match(note, /To ATTEMPT a rebuild/, "an attempt, not a guarantee");
+  assert.match(note, /not a guarantee the class constructs cleanly/, "and says why it is only an attempt");
   assert.match(note, /anything not saved is not rebuilt/, "and its cost");
   assert.match(note, /browser refresh restores whatever the frontend last autosaved/, "not a plain refresh");
   assert.equal(stalePlaceholderNote([]), "", "silent when nothing is stale");

@@ -133,15 +133,24 @@ export function stalePlaceholderNote(stale) {
     `${types.length === 1 ? "is" : "are"} NOW registered in this page's client node registry ` +
     `(${which}${more}). But ${stale.length} node${stale.length === 1 ? "" : "s"} already ` +
     `on the canvas ${stale.length === 1 ? "is" : "are"} still a PLACEHOLDER: registering a class ` +
-    `does not rehydrate nodes that were created while it was unknown — measured, they keep no ` +
-    `definition and no widgets. They will still be reported as missing, and they were never ` +
+    // PER-NODE vs MEASURED-ONCE (codex r4). The only thing tested on each reported node
+    // is the absence of `constructor.nodeData`. "No widgets" came from the one live
+    // instance that was instrumented, so it is attributed to that measurement rather
+    // than asserted of every node in the list.
+    `does not rehydrate nodes that were created while it was unknown. Each of these carries no ` +
+    `class definition; on the instance measured for #981 that also meant no widgets and no ` +
+    `title. They will still be reported as missing, and they were never ` +
     `rebuilt against the class, so do not rely on ${stale.length === 1 ? "it" : "them"} ` +
     // "Reload" alone is ambiguous (codex) — a browser refresh restores whatever the
     // frontend last autosaved, which is not reliably the graph on screen. The remedy is
     // stated as the two steps it actually is: persist the graph, then reopen THAT
     // workflow, so the rebuild reads a document whose contents are known.
-    `at queue time. To rebuild them against the registered class: SAVE the ` +
-    `workflow, then reload/reopen that saved workflow (#981). The save is the load-bearing ` +
+    // ATTEMPT, not guarantee (codex r4): the same registry entry that makes a reload
+    // worth trying does not prove `createNode` will succeed.
+    `at queue time. To ATTEMPT a rebuild against the registered class: SAVE the ` +
+    `workflow, then reload/reopen that saved workflow (#981) — the entry in the registry is ` +
+    `what makes that worth trying, not a guarantee the class constructs cleanly. The save is ` +
+    `the load-bearing ` +
     `step — the rebuild reads the stored document, so anything not saved is not rebuilt, and ` +
     `a plain browser refresh restores whatever the frontend last autosaved rather than the ` +
     `graph in front of you.`
