@@ -900,6 +900,59 @@ test("#984: the overlap join is injective — a concatenation collision cannot s
   assert.equal(counts.unavailable, 1, "different (node, file) pairs must not collide into one key");
 });
 
+test("#984 (codex r2): a filename containing the separator BYTE cannot forge a duplicate", () => {
+  // A delimiter is not an encoding, whichever byte it is — a POSIX filename may contain
+  // 0x1f, so `(node 1, file "x\x1fy")` and `(node 1, widget "x", value "y")` keyed the
+  // same and the live finding vanished. The fields are escaped now, not just separated.
+  // The collision must be built WITHIN one key shape, or the shape tag masks it — the
+  // first version of this test put the two entries in different shapes and passed
+  // against the broken join, proving nothing. Here both sides key as (node, widget,
+  // file): the store's widget "x" + file "y<SEP>z" and the live entry's widget
+  // "x<SEP>y" + value "z" delimit to the same string.
+  const SEP = String.fromCharCode(31); // built, never written literally into source
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "1", widget: "x", file: `y${SEP}z` }],
+    unavailable_widget_values: [{ id: "1", widget: `x${SEP}y`, value: "z", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 1, "a control byte inside a field must not forge a key collision");
+});
+
+test("#984 (codex r2): a store miss on ONE widget does not swallow a live finding on ANOTHER", () => {
+  // Same node, same filename, different widgets — genuinely two faults. The first
+  // version added the widget-less key unconditionally, so the store's `unet_name` miss
+  // absorbed the live scan's distinct `config_name` finding.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "shared.safetensors", widget: "unet_name" }],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "shared.safetensors", kind: "missing_asset" },
+      { id: 1, widget: "config_name", value: "shared.safetensors", kind: "invalid_value" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 1, "only the widget the store actually named is absorbed");
+});
+
+test("#984 (codex r2): a store entry with NO widget still absorbs any widget on that node", () => {
+  // The other direction: with no widget recorded there is no identity to tell the
+  // node's widgets apart, so the store entry has to be allowed to cover them.
+  const counts = graphErrorsFindingCounts({
+    missing_media: [{ node_id: 3, file: "in.png" }],
+    unavailable_widget_values: [{ id: 3, widget: "image", value: "in.png", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 0);
+});
+
+test("#984 (codex r2): a subgraph LOCATOR and a bare id are kept apart, deliberately", () => {
+  // The two producers do not canonicalize locators between them. Treating
+  // "<uuid>:7" and 7 as the same node would merge findings on different nodes;
+  // keeping them apart over-reports at worst. Over-reporting is the safe direction.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890:7", file: "m.safetensors" }],
+    unavailable_widget_values: [{ id: 7, widget: "unet_name", value: "m.safetensors" }],
+  });
+  assert.equal(counts.unavailable, 1);
+});
+
 test("#984: graphErrorsFindingCounts is total — a malformed or absent result yields zeroes", () => {
   for (const bad of [null, undefined, 42, "x", {}, { missing_models: "nope", unavailable_widget_values: 7 }]) {
     const c = graphErrorsFindingCounts(bad);
