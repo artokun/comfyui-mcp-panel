@@ -141,8 +141,13 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
       });
       return;
     }
-    const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
+    // A usable target needs BOTH a node and a widget (codex final). A target carrying
+    // a widget but no node was accepted, so a malformed resolver could steer the carry
+    // into a widget nothing owns: the write lands there, is reported as a success, and
+    // the unpack still inlines the REAL inner widget's old value — the original data
+    // loss, now with a success message on top of it.
     const innerNode = resolved?.target?.node ?? null;
+    const innerWidget = resolved?.promoted && innerNode ? (resolved?.target?.widget ?? null) : null;
     if (!innerWidget) {
       // Two DIFFERENT outcomes, and collapsing them was the last hole (codex final).
       //
@@ -306,7 +311,10 @@ export function findDivergentPromotedValues(subgraphNode, resolvePromoted) {
         divergent.push({ widget: name, reason: "its promotion could not be resolved" });
         continue;
       }
-      const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
+      // Same both-or-neither requirement as the carry, so the two modes cannot
+      // disagree about what counts as a resolvable promotion.
+      const innerWidget =
+        resolved?.promoted && resolved?.target?.node ? (resolved?.target?.widget ?? null) : null;
       if (!innerWidget) {
         // Only a definitive `promoted: false` is safe to skip (codex final). A rail
         // that resolves as promoted but yields no usable target is an UNKNOWN — its

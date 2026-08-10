@@ -262,7 +262,19 @@ test("#979 (codex final): an INDETERMINATE resolver result refuses — only `pro
   // Truthiness was too weak: `undefined`, `null`, `{}` and `{promoted: undefined}` are
   // all "I do not know", and treating them as ordinary widgets let a divergent value be
   // destroyed in BOTH modes — carried-with-snapshot and preflight-without.
-  for (const result of [undefined, null, {}, { promoted: undefined }, { promoted: true, target: {} }]) {
+  for (const result of [
+    undefined,
+    null,
+    {},
+    { promoted: undefined },
+    { promoted: true, target: {} },
+    // A widget with NO node: accepted before, so a malformed resolver could steer the
+    // carry into a widget nothing owns — the write lands there and is reported as a
+    // success while the unpack still inlines the real inner widget's old value.
+    { promoted: true, target: { widget: { name: "text", value: "DECOY" } } },
+    // …and the mirror image.
+    { promoted: true, target: { node: { id: 9 } } },
+  ]) {
     const res = materializePromotedValues({ id: 5, widgets: [widget("text", "NEW")] }, () => result);
     assert.deepEqual(res.unresolved, [], `snapshot mode: ${JSON.stringify(result)} must not be benign`);
     assert.equal(res.unrecoverable.length, 1, `snapshot mode: ${JSON.stringify(result)} must refuse`);
