@@ -5772,38 +5772,12 @@ function assertGraphBoundToActiveWorkflow(
     // app.graph, so a canvas that IS the active workflow's was refused where an
     // untagged copy of it was allowed, and nothing self-healed it: the seal below
     // declines a root that already carries a tag. Same proof the seal accepts.
-    let contentProvesActiveWorkflow = rootContentProvesActiveWorkflow({
+    const contentProvesActiveWorkflow = rootContentProvesActiveWorkflow({
       rootGraph,
       activeWorkflow,
       inSubgraph,
       proofExclusive: sealProofExclusive,
     });
-    // #995 — the same escape for a tab with UNSAVED EDITS. MEASURED live, reproducing
-    // the report through UI clicks: a modified workflow, a root the panel's own
-    // comparison proves is that workflow's canvas, and the PREVIOUS workflow's tag still
-    // on it — verdict "conflict", every graph tool refused. The clean-tab requirement is
-    // there because a lagging tracker cannot describe the canvas, but a lagging snapshot
-    // makes an equality test FAIL rather than falsely succeed. What a dirty tab really
-    // costs is the twin comparison, so this takes a STRICTER exclusivity: every other
-    // open workflow must be readable and provably different, and any one of them being
-    // modified makes it unprovable. Only then may a dirty tab's content speak.
-    if (!contentProvesActiveWorkflow) {
-      let others = null;
-      try {
-        const open = app?.extensionManager?.workflow?.openWorkflows;
-        // Unreadable enumeration → `others` stays null → the proof refuses. Never an
-        // empty list by default: "no other tabs" and "could not look" are different.
-        if (Array.isArray(open)) others = open.filter((w) => !sameWorkflowObject(w, activeWorkflow));
-      } catch {
-        others = null;
-      }
-      contentProvesActiveWorkflow = rootContentProvesActiveWorkflowDespiteEdits({
-        rootGraph,
-        activeWorkflow,
-        inSubgraph,
-        proofExclusive: contentProofExclusiveAmongOpen({ rootGraph, others }),
-      });
-    }
     if (
       resolveGraphRootUuidRebind({
         rootGraph,
@@ -5818,6 +5792,45 @@ function assertGraphBoundToActiveWorkflow(
         rootUuidMismatch = false;
       } catch {
         // A root that refuses the re-stamp stays mismatched and throws below.
+      }
+    }
+    // #995 — A READ, AND ONLY A READ, may proceed on a stale tag when the root's content
+    // equals the active workflow's own current state. MEASURED live through UI clicks: a
+    // MODIFIED workflow, a canvas the panel's own comparison proves matches it, the
+    // previous workflow's tag still on the root — and every graph tool refused, including
+    // panel_graph_outline.
+    //
+    // NOT a rebind, and the distinction is the whole safety argument (codex). Equality
+    // against a DIRTY tab's tracker snapshot cannot establish whose canvas this is: two
+    // tabs can hold the same content, the snapshot can lag, and the owner may not even be
+    // in `openWorkflows` at this instant (mid-switch, background load, a closed tab's
+    // canvas still mounted). Re-stamping on that would move the error onto the OTHER
+    // workflow — its canvas would carry this identity, and the wedge would follow the user
+    // when they switched back. So nothing is written: the flag is cleared for THIS call.
+    //
+    // What a read can then return is content EQUAL to what the active workflow's own
+    // tracker reports for it. If the snapshot lags, that is stale-but-its-own content —
+    // the lag the read path already tolerates by design (#545) — never a different
+    // workflow's different content, because unequal content fails the proof outright.
+    if (rootUuidMismatch && requireDirtyMutationBinding !== true) {
+      let others = null;
+      try {
+        const open = app?.extensionManager?.workflow?.openWorkflows;
+        // Unreadable enumeration → `others` stays null → the proof refuses. Never an
+        // empty list by default: "no other tabs" and "could not look" are different.
+        if (Array.isArray(open)) others = open.filter((w) => !sameWorkflowObject(w, activeWorkflow));
+      } catch {
+        others = null;
+      }
+      if (
+        rootContentProvesActiveWorkflowDespiteEdits({
+          rootGraph,
+          activeWorkflow,
+          inSubgraph,
+          proofExclusive: contentProofExclusiveAmongOpen({ rootGraph, others }),
+        })
+      ) {
+        rootUuidMismatch = false; // this call only — the tag on the root is left alone
       }
     }
   }

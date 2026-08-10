@@ -39,6 +39,7 @@ import {
   rootContentProvesActiveWorkflowDespiteEdits,
   rootContentProvesActiveWorkflow,
   resolveGraphRootUuidRebind,
+  graphCommandBindingBar,
 } from "../../web/js/lib/graph-binding.js";
 
 const STALE = "aaaaaaaa-1111-4111-8111-111111111111";
@@ -79,11 +80,14 @@ test("#995 the reported state: a MODIFIED tab whose canvas is provably its own",
     activeWorkflow: active,
     proofExclusive: contentProofExclusiveAmongOpen({ rootGraph: root, others: [] }),
   });
-  assert.equal(proof, true, "…and the relaxed one proves it, because the content matches");
+  assert.equal(proof, true, "…and the relaxed one proves the content matches");
+  // What that licenses is a READ, not a rebind: the panel clears the mismatch for the
+  // call and leaves the tag alone. Feeding this proof to the REBIND resolver — which
+  // re-stamps — is exactly the P1 the review caught, so the panel does not do it.
   assert.equal(
-    resolveGraphRootUuidRebind({ rootGraph: root, activeWorkflowUuid: ACTIVE, contentProvesActiveWorkflow: proof }),
-    "rebind",
-    "so the stale tag is re-stamped instead of wedging every graph tool",
+    resolveGraphRootUuidRebind({ rootGraph: root, activeWorkflowUuid: ACTIVE, contentProvesActiveWorkflow: false }),
+    "conflict",
+    "the re-stamp path is not reached on dirty-tab evidence",
   );
 });
 
@@ -188,15 +192,44 @@ test("#995 exclusivity is REQUIRED — the proof never fires on its own", () => 
   );
 });
 
-test("#995 source guard: the panel tries the relaxed proof only after the clean one, with the strict list", () => {
+test("#995 (codex P1) source guard: READS only, and NOTHING is written", () => {
+  // Equality against a dirty tab's snapshot cannot establish whose canvas this is — two
+  // tabs can hold the same content, the snapshot can lag, and the owner may not be in
+  // `openWorkflows` at that instant. Re-stamping on that evidence would move the error
+  // onto the OTHER workflow and the wedge would follow the user back to it. So the flag
+  // is cleared for one call and the tag is left alone.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.match(src, /if \(!contentProvesActiveWorkflow\) \{/, "the clean proof is still tried first");
-  assert.match(src, /rootContentProvesActiveWorkflowDespiteEdits\(\{/, "and the relaxed one only after it");
-  assert.match(src, /proofExclusive: contentProofExclusiveAmongOpen\(\{ rootGraph, others \}\)/, "with the STRICT exclusivity");
+  const escape = src.slice(src.indexOf("if (rootUuidMismatch && requireDirtyMutationBinding !== true)"));
+  assert.ok(escape, "the escape must be gated on the command being read-only");
+  const body = escape.slice(0, escape.indexOf("\n  }"));
+  assert.match(body, /rootContentProvesActiveWorkflowDespiteEdits\(\{/, "it uses the relaxed proof");
+  assert.match(body, /proofExclusive: contentProofExclusiveAmongOpen\(\{ rootGraph, others \}\)/, "with STRICT exclusivity");
+  assert.match(body, /rootUuidMismatch = false; \/\/ this call only/, "and clears the flag for this call");
+  assert.ok(!/stampGraphRootWorkflowUuid/.test(body), "it must NOT write the tag — that is the P1 hole");
   // `others` must stay null when the tab list cannot be read: an empty array would read
   // as "no other tabs" and make exclusivity vacuously true.
-  assert.match(src, /let others = null;/, "unreadable enumeration must not become an empty list");
-  assert.match(src, /if \(Array\.isArray\(open\)\) others = open\.filter/, "only a readable list is used");
+  assert.match(body, /let others = null;/, "unreadable enumeration must not become an empty list");
+  assert.match(body, /if \(Array\.isArray\(open\)\) others = open\.filter/, "only a readable list is used");
+  // The REBIND path keeps the clean-only proof: it re-stamps, which this evidence
+  // cannot license.
+  const rebind = src.slice(src.indexOf("resolveGraphRootUuidRebind({"), src.indexOf("if (rootUuidMismatch && requireDirtyMutationBinding"));
+  assert.ok(!/DespiteEdits/.test(rebind), "the re-stamp must not run on dirty-tab evidence");
+});
+
+test("#995 (codex P1) a MUTATION is still refused on the same evidence", () => {
+  // The read escape is gated on requireDirtyMutationBinding !== true. A mutation on a
+  // canvas whose identity is unproven is exactly what the fence exists to refuse, and
+  // dirty-tab content equality cannot license one: the content may be another tab's
+  // matching graph, and a write would land on it.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.ok(
+    src.includes("if (rootUuidMismatch && requireDirtyMutationBinding !== true) {"),
+    "mutations never reach the relaxed proof",
+  );
+  // …and the bar itself still separates the two: a mutating command asks for
+  // requireDirtyMutationBinding true, so the escape above is unreachable for it.
+  assert.equal(graphCommandBindingBar("graph_outline").requireDirtyMutationBinding, false);
+  assert.equal(graphCommandBindingBar("graph_add_node").requireDirtyMutationBinding, true);
 });
 
 test("#995 the SEAL path is untouched — writing a tag is a different decision from re-stamping one", () => {
