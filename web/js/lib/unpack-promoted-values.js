@@ -52,8 +52,40 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
   if (!subgraphNode || typeof resolvePromoted !== "function") return { applied, unresolved, skipped };
   const rails = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
   for (const rail of rails) {
+    // PER-RAIL isolation (codex NO-SHIP): a hostile or merely unusual accessor on ONE
+    // widget — `rail.name`, `innerNode.id`, `innerWidget.name` are all reads that can
+    // throw — used to abort the whole loop. That lost every remaining rail's value AND
+    // suppressed the disclosure, on a path that then destroys the subgraph anyway.
+    // One bad widget now costs its own entry and nothing else.
+    try {
+      carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, () => (skipped += 1));
+    } catch {
+      let label = null;
+      try {
+        label = typeof rail?.name === "string" ? rail.name : null;
+      } catch {
+        label = null;
+      }
+      unresolved.push({ widget: label ?? "(unreadable)", reason: "widget could not be inspected" });
+    }
+  }
+  return { applied, unresolved, skipped };
+}
+
+/**
+ * One rail's transfer. Extracted so a throw anywhere in it — including while building
+ * the report entry — is contained to that rail by the caller.
+ *
+ * TRANSACTIONAL (codex NO-SHIP): the previous inner value is captured first, and any
+ * assignment that throws, coerces, or is silently ignored is ROLLED BACK before being
+ * reported. Without that, a setter which mutates and then throws left the inner widget
+ * altered and `unpackSubgraph` committed it — silent destructive corruption on exactly
+ * the error path this function claims is safe.
+ */
+function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, onSkip) {
+  {
     const name = typeof rail?.name === "string" ? rail.name : null;
-    if (!name) continue;
+    if (!name) return;
     let resolved = null;
     try {
       resolved = resolvePromoted(subgraphNode, name);
@@ -67,33 +99,47 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
       // promotion — the subgraph node's own widgets can include non-promoted ones.
       // Reported so a caller can say the coverage was partial rather than complete.
       unresolved.push({ widget: name });
-      continue;
+      return;
     }
     let railValue;
     try {
       railValue = rail.value;
     } catch {
       unresolved.push({ widget: name, reason: "rail value could not be read" });
-      continue;
+      return;
     }
     let innerValue;
+    let innerReadable = true;
     try {
       innerValue = innerWidget.value;
     } catch {
       innerValue = undefined;
+      innerReadable = false;
     }
     // Only a genuine DIVERGENCE is written. Writing every promoted widget would fire
     // node callbacks for values that never changed, on a path that is already about
     // to restructure the graph.
-    if (Object.is(railValue, innerValue)) {
-      skipped += 1;
-      continue;
+    if (innerReadable && Object.is(railValue, innerValue)) {
+      onSkip();
+      return;
     }
+    // Best-effort restore of the value we found. Used on EVERY failure path below —
+    // a widget left holding a half-applied value is worse than one left alone, because
+    // the unpack that follows makes it permanent.
+    const restore = () => {
+      if (!innerReadable) return;
+      try {
+        if (!Object.is(innerWidget.value, innerValue)) innerWidget.value = innerValue;
+      } catch {
+        /* nothing further can be done; it is reported as unresolved either way */
+      }
+    };
     try {
       innerWidget.value = railValue;
     } catch {
+      restore();
       unresolved.push({ widget: name, reason: "inner widget rejected the write" });
-      continue;
+      return;
     }
     let landed;
     try {
@@ -101,20 +147,24 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
     } catch {
       landed = undefined;
     }
-    // Read back: a frozen widget or a setter that ignores the assignment must not be
-    // reported as preserved. An unpack that silently loses it is the bug; an unpack
-    // that loses it and SAYS so is at least recoverable.
+    // Read back: a frozen widget, a setter that ignores the assignment, and a setter
+    // that COERCES to something else are all failures to carry the value — and the
+    // coercing one is why the restore matters, since it leaves the widget holding a
+    // third value that was never in the graph.
     if (!Object.is(landed, railValue)) {
+      restore();
       unresolved.push({ widget: name, reason: "inner widget did not retain the value" });
-      continue;
+      return;
     }
+    // Report metadata is built inside the guarded span too: `innerNode.id` and
+    // `innerWidget.name` are reads, and a read that throws must not lose the transfer
+    // that already succeeded — the caller's catch turns it into an unresolved entry.
     applied.push({
       widget: name,
       node_id: innerNode?.id != null ? String(innerNode.id) : null,
       inner_widget: typeof innerWidget.name === "string" ? innerWidget.name : name,
     });
   }
-  return { applied, unresolved, skipped };
 }
 
 /**

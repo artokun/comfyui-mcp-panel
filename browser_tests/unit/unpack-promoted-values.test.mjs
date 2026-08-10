@@ -108,6 +108,85 @@ test("#979 an inner widget that REJECTS or ignores the write is reported, never 
   }
 });
 
+test("#979 (codex): a setter that MUTATES then THROWS is rolled back, not left half-applied", () => {
+  // The path the first version corrupted: assignment happened, the throw was caught,
+  // the widget was reported unresolved — and left holding the new value, which the
+  // unpack then made permanent. Silent destructive corruption on the error path.
+  const inner = {
+    name: "text",
+    _v: "ORIGINAL",
+    get value() {
+      return this._v;
+    },
+    set value(v) {
+      this._v = v; // applies…
+      throw new Error("setter boom"); // …then fails
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
+  const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
+  assert.equal(inner._v, "ORIGINAL", "the widget is left exactly as it was found");
+  assert.deepEqual(res.applied, []);
+  assert.equal(res.unresolved[0].reason, "inner widget rejected the write");
+});
+
+test("#979 (codex): a COERCING setter is rolled back — a third value never reaches the graph", () => {
+  // Worse than a rejection: the widget ends up holding something that was in neither
+  // the rail nor the inner, and the unpack commits it.
+  const inner = {
+    name: "steps",
+    _v: 20,
+    get value() {
+      return this._v;
+    },
+    set value(v) {
+      this._v = Math.min(Number(v) || 0, 30); // clamps 45 -> 30
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("steps", 45)] };
+  const res = materializePromotedValues(sgNode, resolverFor({ steps: { node: { id: 9 }, widget: inner } }));
+  assert.equal(inner._v, 20, "restored to what was found, not left at the clamped 30");
+  assert.deepEqual(res.applied, []);
+  assert.equal(res.unresolved[0].reason, "inner widget did not retain the value");
+});
+
+test("#979 (codex): one hostile widget costs its own entry, not every rail after it", () => {
+  // A throwing accessor used to abort the whole loop: the remaining rails kept their
+  // stale inner values AND the disclosure was suppressed, on a path that destroys the
+  // subgraph regardless.
+  const good = widget("text", "OLD");
+  const hostile = {
+    get name() {
+      throw new Error("name boom");
+    },
+  };
+  const sgNode = { id: 5, widgets: [hostile, widget("text", "NEW")] };
+  const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: good } }));
+  assert.equal(good.value, "NEW", "the rail AFTER the hostile one was still carried");
+  assert.deepEqual(res.applied.map((a) => a.widget), ["text"]);
+  assert.equal(res.unresolved.length, 1, "and the hostile one is disclosed, not swallowed");
+  assert.match(res.unresolved[0].reason, /could not be inspected/);
+});
+
+test("#979 (codex): a throwing accessor on the REPORT metadata does not lose the transfer", () => {
+  const inner = {
+    _v: "OLD",
+    get value() {
+      return this._v;
+    },
+    set value(v) {
+      this._v = v;
+    },
+    get name() {
+      throw new Error("meta boom");
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
+  const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
+  assert.equal(inner._v, "NEW", "the value WAS carried — that must not be undone by a reporting failure");
+  assert.equal(res.applied.length + res.unresolved.length, 1, "and it is accounted for exactly once");
+});
+
 test("#979 a THROWING resolver costs coverage, never the unpack", () => {
   const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
   const res = materializePromotedValues(sgNode, () => {
