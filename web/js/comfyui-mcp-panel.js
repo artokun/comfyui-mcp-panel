@@ -126,6 +126,7 @@ import {
   rememberPreGroundingIdentity,
   preGroundingIdentityForms,
   pruneGroundingIdentities,
+  groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
@@ -4305,20 +4306,24 @@ async function groundUnsavedWorkflow() {
       // #847 — both halves run INSIDE the serialized grounding, against the workflow that
       // transaction is saving. The probe is synchronous with reading it, and the path comes
       // from the save's own result, so neither can be about a tab the user switched to.
-      identityProbe: (wf) => ({
-        storageKey: workflowStorageKey(),
-        routeId: workflowTabId(wf),
-      }),
+      // ROUTE ID ONLY, and that restriction is the fix for a regression I caused:
+      // `workflowStorageKey()` is NOT a read. It runs the full identity resolution, which
+      // mints uuids and writes path aliases — so probing it here performed identity work at
+      // a point in the save where it had never happened, and conversation-persistence:350
+      // ("clear all … preserves workflow identity") went red. `workflowTabId` returns the
+      // tmp: id this tab already routes on, and threads carry it as `workflowRouteKey`,
+      // which is what the filter matches. Enough to bridge, without touching identity.
+      // A PURE READ. Neither `workflowStorageKey()` nor `workflowTabId()` is one:
+      // the first runs full identity resolution (minting uuids, writing path aliases) and
+      // the second mints a tmp: id. Calling either here performed identity work at a point
+      // in the save where it had never happened, and turned conversation-persistence:350
+      // ("clear all … preserves workflow identity") red. The tmp: id this tab already
+      // routes on is enough — threads carry it as `workflowRouteKey`, which is what the
+      // filter matches — and if none exists yet there is nothing to bridge anyway.
+      identityProbe: (wf) => ({ routeId: (wf ? _tempWorkflowInstanceIds.get(wf) : null) ?? null }),
       onGrounded: ({ savedName, identity }) => {
-        // Canonicalise the save's own name into the SAME shape savedWorkflowPath()
-        // produces. Naive concatenation mangled real inputs (codex): `Name.json` became
-        // `workflows/Name.json.json`, and `workflows\Name.json` grew a second prefix.
-        const path = (() => {
-          const raw = normalizePath(savedName).replace(/^\/+/, "");
-          if (!raw) return null;
-          const withDir = raw.includes("/") ? raw : `workflows/${raw}`;
-          return /\.json$/i.test(withDir) ? withDir : `${withDir}.json`;
-        })();
+        // One implementation, shared with the tests (codex) — see groundedWorkflowPath.
+        const path = groundedWorkflowPath(savedName);
         if (!path) return;
         // Prune BEFORE recording, never after: the path this save just created is not in
         // the workflow store's list yet, so pruning afterwards deletes the very entry it

@@ -19,6 +19,7 @@ import {
   rememberPreGroundingIdentity,
   preGroundingIdentityForms,
   pruneGroundingIdentities,
+  groundedWorkflowPath,
   normalizedWorkflowPath,
 } from "../../web/js/lib/workflow-chat-identity.js";
 import { normalizePath } from "../../web/js/lib/workflow-save.js";
@@ -155,12 +156,7 @@ test("#847: a save's name canonicalises to one path shape", () => {
   // (codex): `Name.json` became `workflows/Name.json.json`, `workflows\Name.json` grew a
   // second prefix, and `workflows/Name` never got an extension. All four shapes must land
   // on the same key, or the lineage is filed where nothing will look for it.
-  const canon = (savedName) => {
-    const raw = normalizePath(savedName).replace(/^\/+/, "");
-    if (!raw) return null;
-    const withDir = raw.includes("/") ? raw : `workflows/${raw}`;
-    return /\.json$/i.test(withDir) ? withDir : `${withDir}.json`;
-  };
+  const canon = groundedWorkflowPath;
   const BACKSLASH = String.fromCharCode(92); // heredocs eat escaped backslashes; be literal
   for (const name of ["Flow", "Flow.json", "workflows/Flow.json", `workflows${BACKSLASH}Flow.json`, "workflows/Flow", "/workflows/Flow.json"]) {
     assert.equal(normalizedWorkflowPath(canon(name)), "workflows/flow.json", name);

@@ -191,6 +191,29 @@ export function pruneGroundingIdentities(map, { knownPaths, max = 200 } = {}) {
   return changed;
 }
 
+/**
+ * The path a grounding save's returned NAME refers to, in the one shape this map is keyed
+ * on (#847).
+ *
+ * Exported so the panel and its tests share it. The first cut inlined this in the panel and
+ * asserted a copy of it in the test — which passes happily while the shipped behaviour
+ * diverges (codex; same trap as #932 earlier today).
+ *
+ * Naive concatenation mangled real inputs: `Name.json` became `workflows/Name.json.json`,
+ * a backslash path grew a second prefix, and `workflows/Name` never got an extension. Each
+ * files the lineage under a key nothing will look for, so the fix silently does nothing.
+ */
+export function groundedWorkflowPath(savedName) {
+  const raw = String(savedName ?? "")
+    .replaceAll("\\", "/")
+    .replace(/\/{2,}/g, "/")
+    .replace(/\/+$/, "")
+    .replace(/^\/+/, "");
+  if (!raw) return null;
+  const withDir = raw.includes("/") ? raw : `workflows/${raw}`;
+  return /\.json$/i.test(withDir) ? withDir : `${withDir}.json`;
+}
+
 /** The pre-grounding identity forms recorded for `path`, if any (#847). */
 export function preGroundingIdentityForms(map, path) {
   const key = normalizedWorkflowPath(path);
