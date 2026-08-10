@@ -156,7 +156,11 @@ test("#982 (codex) the fallback is consulted ONLY when the client returned nothi
   // answer — so the fallback must never be able to override an answer the client gave.
   const src = readFileSync(new URL("../../web/js/lib/object-info-oracle.js", import.meta.url), "utf8");
   const clientBlock = src.slice(src.indexOf("if (typeof getNodeDefs === \"function\")"), src.indexOf("// SECOND TRANSPORT"));
-  assert.match(clientBlock, /if \(usableDefs\(defs\)\) return \{ defs, failures \};/, "a usable client answer returns");
+  assert.match(
+    clientBlock,
+    /if \(usableDefs\(defs\)\) return \{ \[CACHE_OUTCOME\]: true, defs, failures \};/,
+    "a usable client answer returns",
+  );
   // …and the measured equivalence is recorded rather than assumed.
   assert.match(src, /MEASURED on ComfyUI 0\.31\.1 \/ frontend 1\.48\.7/, "the comparison is on the record");
   assert.match(src, /That is\s*\n? \* evidence, not a contract/, "and its limit is stated");
@@ -259,4 +263,33 @@ test("#982 (codex r2) a value that cannot be stringified yields text, never a th
   assert.doesNotThrow(() => objectInfoOracleFailureNote([hostile]));
   assert.match(objectInfoOracleFailureNote([hostile]), /an unprintable value/);
   assert.doesNotThrow(() => objectInfoOracleFailureNote([Symbol("s")]));
+});
+
+test("#982 (codex r3) a node type literally named `defs` is not mistaken for an outcome wrapper", async () => {
+  // A structural `"defs" in value` test collided with a real schema key: a bare map
+  // containing a node type called `defs` would have been unwrapped, and that single
+  // definition would have become the cached schema. The tag is a Symbol, which JSON
+  // cannot carry, so only a deliberate producer can be read as a wrapper.
+  const { createObjectInfoCache, CACHE_OUTCOME } = await import("../../web/js/lib/object-info-cache.js");
+  const cache = createObjectInfoCache();
+  // The node named `defs` carries an EMPTY definition, which is what makes the two rules
+  // differ observably: a structural test would take `{}` as the payload, judge it
+  // unusable, and decline to cache a perfectly good schema — reinstating the full
+  // re-fetch per write that #716 exists to prevent.
+  const schemaWithDefsNode = { defs: {}, KSampler: { input: {} } };
+  let loads = 0;
+  const load = async () => {
+    loads += 1;
+    return schemaWithDefsNode;
+  };
+  assert.deepEqual(await cache.read(load), schemaWithDefsNode, "a bare schema comes back whole");
+  assert.deepEqual(await cache.read(load), schemaWithDefsNode);
+  assert.equal(loads, 1, "the second read was served from the cache — the schema WAS stored");
+  assert.equal(cache.peek().cached, true);
+
+  // A genuinely tagged outcome still unwraps.
+  const tagged = createObjectInfoCache();
+  const outcome = { [CACHE_OUTCOME]: true, defs: schemaWithDefsNode, failures: [] };
+  assert.deepEqual(await tagged.read(async () => outcome), outcome);
+  assert.equal(tagged.peek().cached, true);
 });

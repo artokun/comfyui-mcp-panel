@@ -41,6 +41,8 @@
  * it can never override a narrower answer the client actually gave.
  */
 
+import { CACHE_OUTCOME } from "./object-info-cache.js";
+
 /** A payload that can actually answer "does the backend define this type?" */
 function usableDefs(value) {
   return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
@@ -59,8 +61,8 @@ const MAX_DETAIL_CHARS = 200;
  * strings this module never produced.
  */
 function sanitizeDetail(value) {
-  // `String(value)` can itself THROW — a hostile object with a throwing toString or a
-  // Symbol both do it — and a diagnostic path must never raise an exception of its own
+  // `String(value)` can itself THROW — a hostile object with a throwing toString does it
+  // — and a diagnostic path must never raise an exception of its own
   // (codex).
   let text = "";
   try {
@@ -99,7 +101,7 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
   if (typeof getNodeDefs === "function") {
     try {
       const defs = await getNodeDefs();
-      if (usableDefs(defs)) return { defs, failures };
+      if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
       // AN EMPTY MAP IS AN ANSWER, NOT AN ABSENCE (codex). A client that deliberately
       // filters could express deny-all as `{}`, and consulting the raw route would then
       // overrule it with a broader schema — the one direction this fallback must never
@@ -107,7 +109,7 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
       // leaves the question unanswered, and only that may be asked again elsewhere.
       if (defs && typeof defs === "object" && !Array.isArray(defs)) {
         failures.push("api.getNodeDefs() returned an EMPTY schema — treated as its answer, not as an absence");
-        return { defs: null, failures };
+        return { [CACHE_OUTCOME]: true, defs: null, failures };
       }
       failures.push(
         describeFailure(
@@ -132,7 +134,7 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
         failures.push(describeFailure("GET /object_info was not OK", null, ` (status ${res?.status ?? "unknown"})`));
       } else {
         const defs = await res.json();
-        if (usableDefs(defs)) return { defs, failures };
+        if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
         failures.push("GET /object_info returned no usable schema (an empty or non-object body)");
       }
     } catch (err) {
@@ -142,7 +144,7 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
     failures.push("no fetchApi is wired for the fallback route");
   }
 
-  return { defs: null, failures };
+  return { [CACHE_OUTCOME]: true, defs: null, failures };
 }
 
 /**
@@ -159,11 +161,18 @@ export function objectInfoOracleFailureNote(failures) {
   // BOUNDED AT THE PUBLIC BOUNDARY (codex): each entry is capped, and so is the number
   // of entries — a caller may hand this an arbitrarily long array this module never
   // produced, and the result goes into an error someone reads.
-  const all = failures.map((f) => sanitizeDetail(f)).filter(Boolean);
-  if (!all.length) return "";
-  const shown = all.slice(0, MAX_FAILURES_REPORTED);
-  const dropped = all.length - shown.length;
+  // SLICE FIRST (codex): sanitizing every entry of an arbitrarily long array is
+  // unbounded work even though the string it produces is bounded. The dropped count
+  // comes from the ORIGINAL length, so truncation is still reported honestly.
+  //
+  // NO TEST PINS THIS ORDER, and that is stated rather than papered over: swapping the
+  // slice and the map produces an identical string, so it is a cost property with no
+  // observable output. Mutation testing confirms the swap survives. It is written this
+  // way deliberately; a later edit that reverses it will not be caught by the suite.
+  const shown = failures.slice(0, MAX_FAILURES_REPORTED).map((f) => sanitizeDetail(f)).filter(Boolean);
+  if (!shown.length) return "";
+  const dropped = failures.length - Math.min(failures.length, MAX_FAILURES_REPORTED);
   const more = dropped > 0 ? ` (and ${dropped} more not shown)` : "";
-  const label = all.length === 1 ? "one route" : `${all.length} routes`;
+  const label = failures.length === 1 ? "one route" : `${failures.length} routes`;
   return ` Tried ${label}: ${shown.join("; ")}${more}.`;
 }

@@ -51,6 +51,17 @@
  * ≤1.5s for out-of-panel removals", and someone weighing the TTL later needs that sentence.
  */
 
+/**
+ * The tag that marks a loader's return value as an OUTCOME WRAPPER rather than the
+ * schema itself.
+ *
+ * A structural `"defs" in value` test would collide with a real node type named
+ * `defs` (codex): a bare schema containing one would be misread as a wrapper, and that
+ * single definition would become the cached schema. A Symbol cannot appear in JSON, so
+ * only a producer that deliberately tagged its result can be mistaken for one.
+ */
+export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
+
 /** How long a fetched payload may be reused. */
 export const OBJECT_INFO_CACHE_TTL_MS = 1500;
 
@@ -113,7 +124,7 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
           // the wrapper around it — a wrapper carrying `defs: null` has two keys and
           // would otherwise be cached as a success, pinning fail-closed for the TTL,
           // which is exactly what this file exists to prevent (codex).
-          const payload = defs && typeof defs === "object" && "defs" in defs ? defs.defs : defs;
+          const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
           if (
             issuedAt === generation &&
             payload &&

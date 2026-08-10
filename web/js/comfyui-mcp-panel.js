@@ -174,7 +174,7 @@ import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
-import { createObjectInfoCache } from "./lib/object-info-cache.js";
+import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
@@ -10312,7 +10312,7 @@ const GRAPH_TOOL_EXECUTORS = {
             fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
           });
         });
-        const defs = outcome && typeof outcome === "object" && "defs" in outcome ? outcome.defs : outcome;
+        const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
         return recordObjectInfoTypes(defs);
       },
