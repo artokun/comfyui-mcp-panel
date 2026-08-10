@@ -21,8 +21,10 @@
  * rewrite seeds. Doing that would mean reimplementing the frontend's widget semantics
  * (`increment`/`decrement`/`randomize` differ, and each has a range), on the one path
  * where the panel already has to repair the request body — and this codebase has been
- * burned by re-deriving frontend behaviour before. Naming the problem at queue time
- * lets the caller cancel instead of discovering it from identical outputs.
+ * burned by re-deriving frontend behaviour before. It is computed BEFORE dispatch, so
+ * it describes the state the prompts were built from — but the prompts ARE submitted by
+ * the time anyone reads it, so the remedy it offers is interrupting the queue, not
+ * preventing it.
  */
 
 /**
@@ -67,12 +69,22 @@ export function findRepeatingControlWidgets(nodes) {
         // value widget is worse than naming none. Adjacency stays as a LABELLED
         // fallback — `paired_widget_source` says which was used, so a reader knows how
         // much to trust it.
+        // The link points VALUE -> CONTROL, not the other way round (codex): ComfyUI
+        // attaches the control to the VALUE widget's `linkedWidgets`. Reading it off
+        // the control found nothing in the ordinary core case and fell through to
+        // adjacency, so the authoritative signal was never actually being used.
         let pairedName = null;
         let pairedSource = null;
-        const linked = Array.isArray(w.linkedWidgets) ? w.linkedWidgets : null;
-        const linkedName = linked?.find((lw) => typeof lw?.name === "string")?.name ?? null;
-        if (linkedName) {
-          pairedName = linkedName;
+        const owner = widgets.find((cand) => {
+          try {
+            return Array.isArray(cand?.linkedWidgets) && cand.linkedWidgets.includes(w);
+          } catch {
+            return false;
+          }
+        });
+        const ownerName = typeof owner?.name === "string" ? owner.name : null;
+        if (ownerName) {
+          pairedName = ownerName;
           pairedSource = "linked";
         } else {
           const prev = i > 0 ? widgets[i - 1] : null;
@@ -120,8 +132,10 @@ export function scopedBatchSeedNote(controls, batchCount) {
     `is a PARTIAL execution, and ComfyUI does not advance control_after_generate between the ` +
     `items of one — measured on frontend 1.48.7 by comparing the submitted prompts, where an ` +
     `unscoped batch of 3 sent three different seeds and a scoped batch of 3 sent the same seed ` +
-    `three times. Items after the first are then identical prompts, which ComfyUI answers from ` +
-    `cache in a fraction of a second with the same output file (#988). Every such control in ` +
+    `three times. A control that repeats can produce duplicate prompts, cache hits and repeated ` +
+    `output files — though not necessarily: another extension's queue-time hook may still vary a ` +
+    `prompt independently, so this says what WILL repeat, not that every later prompt is ` +
+    `identical (#988). Every such control in ` +
     `the workflow is listed because the panel cannot tell from here which ones this scope ` +
     `reaches; one outside the executed branch is harmless. This is the frontend's queue ` +
     `behaviour, not something the panel chose, and the panel does not rewrite your values to ` +

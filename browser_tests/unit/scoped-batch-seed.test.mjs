@@ -125,12 +125,18 @@ test("#988 (codex): `increment-wrap` advances too and must be warned about", () 
 test("#988 (codex): LINKAGE beats adjacency for naming the governed widget", () => {
   // Adjacency is a UI-insertion convention custom nodes need not preserve, so the
   // source of the pairing is reported and linkage wins when the frontend supplies it.
+  // The link points VALUE -> CONTROL, which is the direction ComfyUI actually uses.
+  // An earlier version of this test attached `linkedWidgets` to the CONTROL and passed
+  // against code reading it the same wrong way — so it validated the wrong shape and
+  // the authoritative signal was never really exercised.
+  const control = { name: "control_after_generate", value: "randomize" };
   const node = {
     id: 7,
     type: "Custom",
     widgets: [
       { name: "not_the_seed", value: 1 },
-      { name: "control_after_generate", value: "randomize", linkedWidgets: [{ name: "real_seed" }] },
+      { name: "real_seed", value: 5, linkedWidgets: [control] },
+      control,
     ],
   };
   const found = findRepeatingControlWidgets([node]);
