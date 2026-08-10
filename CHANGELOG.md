@@ -6,6 +6,53 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.88] - 2026-08-10
+
+> Covers changes since 0.11.87.
+
+### Fixed
+
+- **A widget write that a node's own callback breaks no longer reads as the panel
+  failing (#976).** `panel_set_widget` would apply your value, verify by read-back that
+  it was in effect, refuse to roll it back — and then say "an exception was thrown while
+  applying the write". Which reads as *the panel failed to apply your write*. It is the
+  opposite of what happened, and it is why this was reported as a panel defect.
+
+  The reporter's node was `MiniMaxH3Director`, but the same message appears on a stock
+  `CLIPTextEncode` whose callback is made to throw, so nothing about it was specific to
+  that pack.
+
+  The wording named nothing on purpose. A widget write touches value setters on the
+  widget, the promoted rail and the display proxies; it reads properties that can be
+  throwing accessors; and assigning to a frozen widget throws with no node code involved
+  at all. Blaming "the callback" for any of those would be a guess.
+
+  So the panel now measures it instead of guessing. The callback is looked up and its
+  arguments are evaluated before the attributed step begins, and only an exception coming
+  out of the attempt to invoke it is attributed — which is why the disclosure says
+  "attempt to invoke" and never that the callback ran: a value that is not a function, a
+  class, and a revoked proxy all throw without any code of theirs executing. When the
+  callback is not a function at all, it says that outright.
+
+  It does not go further than that. It does not say who supplied the callback, and it
+  does not assign fault: the panel invokes callbacks programmatically, and that alone is
+  enough to make a callback written for a mouse click throw. What it does say, first, is
+  that your value is in effect.
+
+  Two things found on the way, both of which could hide a real problem:
+
+  - a callback doing `throw undefined` (or `null`, `0`, `""`) produced **no warning at
+    all** — the write reported clean while the callback's side effects had not run
+  - a thrown value that fights back (a proxy whose `message` and prototype both throw)
+    could break the report that exists to disclose it, losing the failure entirely
+
+### Changed
+
+- Documentation corrections to two binding claims and a run-scope build range (#970,
+  #752), and e2e cleanup that no longer leaves saved workflows behind or passes against
+  the wrong orchestrator (#907, #847).
+
+
 ## [0.11.87] - 2026-08-09
 
 ### Fixed
