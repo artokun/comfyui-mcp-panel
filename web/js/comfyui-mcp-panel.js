@@ -157,7 +157,11 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
-import { materializePromotedValues, materializedValuesNote } from "./lib/unpack-promoted-values.js";
+import {
+  materializePromotedValues,
+  materializedValuesNote,
+  findDivergentPromotedValues,
+} from "./lib/unpack-promoted-values.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -13191,12 +13195,28 @@ const GRAPH_TOOL_EXECUTORS = {
     // Never allowed to block the unpack the caller asked for; a failure here reduces
     // what is carried and is reported.
     //
-    // NO SNAPSHOT, NO CARRY (codex round 3). The carry is only safe because a failed
-    // one can be erased by reloading the pre-carry workflow. Without that snapshot
-    // there is nothing to reload, so attempting it would risk leaving a widget in a
-    // state nothing can undo. Skipping it restores the OLD behaviour — the promoted
-    // value may be lost to the inner default — which is a known, recoverable-by-hand
-    // loss rather than an unrepairable one, and it is disclosed below.
+    // NO SNAPSHOT: the carry is only safe because a failed one can be erased by
+    // reloading the pre-carry workflow, so without a snapshot it is not attempted.
+    // But skipping it is NOT a free fallback (codex round 4) — it is exactly the data
+    // loss this change exists to stop, and after the unpack the rail is gone and a
+    // long prompt may exist nowhere at all. Snapshot failure must not re-authorize
+    // that. So a READ-ONLY preflight looks for divergence and refuses if it finds any;
+    // an unpack with nothing diverged proceeds exactly as before.
+    if (!rollback) {
+      const divergent = findDivergentPromotedValues(node, (sgNode, widgetName) =>
+        resolvePromotedInnerTarget(sgNode, widgetName, sourceForSubgraphInput),
+      );
+      if (divergent.length) {
+        throw new Error(
+          `unpack_subgraph refused: this workflow could not be snapshotted, so the promoted ` +
+            `value(s) ${divergent.map((d) => d.widget).join(", ")} cannot be carried into the inner ` +
+            `node(s) safely — and unpacking without carrying them would replace them with whatever ` +
+            `the inner nodes were created with, with no copy left anywhere (#979). Nothing was ` +
+            `changed. Set those values on the inner nodes first, or retry once the workflow can be ` +
+            `serialized.`,
+        );
+      }
+    }
     let materialized = null;
     if (rollback) {
       try {

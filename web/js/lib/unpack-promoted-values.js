@@ -61,8 +61,13 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
     // throw — used to abort the whole loop. That lost every remaining rail's value AND
     // suppressed the disclosure, on a path that then destroys the subgraph anyway.
     // One bad widget now costs its own entry and nothing else.
+    // LATCHED before the assignment (codex round 4). If a read-back, a metadata read,
+    // or any accessor throws AFTER the write was attempted, the widget may already
+    // have been mutated — so that must land in `unrecoverable` and stop the unpack,
+    // never be swallowed as a benign "could not inspect".
+    const state = { attempted: false };
     try {
-      carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, unrecoverable, () => (skipped += 1));
+      carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, unrecoverable, () => (skipped += 1), state);
     } catch {
       let label = null;
       try {
@@ -70,7 +75,14 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
       } catch {
         label = null;
       }
-      unresolved.push({ widget: label ?? "(unreadable)", reason: "widget could not be inspected" });
+      const entry = {
+        widget: label ?? "(unreadable)",
+        reason: state.attempted
+          ? "the write was attempted and then something threw — the widget may hold a value from neither side"
+          : "widget could not be inspected",
+      };
+      if (state.attempted) unrecoverable.push({ ...entry, value_restored: false });
+      else unresolved.push(entry);
     }
   }
   return { applied, unresolved, unrecoverable, skipped };
@@ -86,7 +98,7 @@ export function materializePromotedValues(subgraphNode, resolvePromoted) {
  * altered and `unpackSubgraph` committed it — silent destructive corruption on exactly
  * the error path this function claims is safe.
  */
-function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, unrecoverable, onSkip) {
+function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, unrecoverable, onSkip, state) {
   {
     const name = typeof rail?.name === "string" ? rail.name : null;
     if (!name) return;
@@ -172,6 +184,7 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
       });
     };
     try {
+      state.attempted = true;
       innerWidget.value = railValue;
     } catch {
       failed("inner widget rejected the write");
@@ -200,6 +213,52 @@ function carryOneRail(rail, subgraphNode, resolvePromoted, applied, unresolved, 
       inner_widget: typeof innerWidget.name === "string" ? innerWidget.name : name,
     });
   }
+}
+
+/**
+ * #979 (codex round 4) — READ-ONLY: which promoted rails hold a value their inner
+ * widget does not. Writes nothing, so it is safe when there is no rollback snapshot
+ * to undo a failed write with.
+ *
+ * The caller uses this exactly there: snapshot capture failing must not re-authorize
+ * the data loss this whole change exists to stop. Skipping the carry "because it is
+ * only the old behaviour" is not recoverable-by-hand — after the unpack the rail is
+ * gone and a long prompt may exist nowhere at all. So a divergence found here refuses
+ * the unpack instead, and an unpack with no divergence proceeds untouched.
+ *
+ * An unreadable value counts as divergent: it cannot be shown to be safe, and the
+ * conservative direction on a destructive path is to refuse.
+ */
+export function findDivergentPromotedValues(subgraphNode, resolvePromoted) {
+  const divergent = [];
+  if (!subgraphNode || typeof resolvePromoted !== "function") return divergent;
+  const rails = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
+  for (const rail of rails) {
+    try {
+      const name = typeof rail?.name === "string" ? rail.name : null;
+      if (!name) continue;
+      let resolved = null;
+      try {
+        resolved = resolvePromoted(subgraphNode, name);
+      } catch {
+        continue; // not shown to be a promotion ⇒ not a divergence to refuse over
+      }
+      const innerWidget = resolved?.promoted ? (resolved?.target?.widget ?? null) : null;
+      if (!innerWidget) continue;
+      if (!Object.is(rail.value, innerWidget.value)) divergent.push({ widget: name });
+    } catch {
+      // A widget that cannot be read cannot be shown safe. On a destructive path that
+      // is a reason to stop, not to shrug.
+      let label = null;
+      try {
+        label = typeof rail?.name === "string" ? rail.name : null;
+      } catch {
+        label = null;
+      }
+      divergent.push({ widget: label ?? "(unreadable)", reason: "could not be compared" });
+    }
+  }
+  return divergent;
 }
 
 /**

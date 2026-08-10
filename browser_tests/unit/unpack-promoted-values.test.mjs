@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import {
   materializePromotedValues,
   materializedValuesNote,
+  findDivergentPromotedValues,
 } from "../../web/js/lib/unpack-promoted-values.js";
 
 const widget = (name, value) => ({ name, value });
@@ -242,6 +243,68 @@ test("#979 (codex r2) source guard: the unpack REFUSES when a carry could not be
   assert.ok(guard < unpack, "and it must come BEFORE the destructive call");
   assert.match(src, /unpack_subgraph refused/, "and it refuses rather than annotating");
   assert.match(src, /nothing was destroyed/, "and says the subgraph is intact when it could restore");
+});
+
+test("#979 (codex r4): the write-attempt latch keeps a post-write throw UNRECOVERABLE", () => {
+  // A setter can mutate and then a LATER read (read-back, metadata, any accessor) can
+  // throw. The outer per-rail catch used to file that as a benign "could not inspect"
+  // and let the unpack proceed over a widget that had already been written.
+  let reads = 0;
+  const inner = {
+    _v: "OLD",
+    get value() {
+      reads += 1;
+      if (reads > 1) throw new Error("read-back boom"); // throws AFTER the write
+      return this._v;
+    },
+    set value(v) {
+      this._v = v;
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
+  const res = materializePromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
+  assert.deepEqual(res.applied, []);
+  assert.deepEqual(res.unresolved, [], "a post-write throw is never benign");
+  assert.equal(res.unrecoverable.length, 1, "it stops the unpack");
+});
+
+test("#979 (codex r4): findDivergentPromotedValues is READ-ONLY and finds the divergence", () => {
+  // Used when no rollback snapshot exists, so it must not write anything.
+  let writes = 0;
+  const inner = {
+    name: "text",
+    _v: "OLD",
+    get value() {
+      return this._v;
+    },
+    set value(v) {
+      writes += 1;
+      this._v = v;
+    },
+  };
+  const sgNode = { id: 5, widgets: [widget("text", "NEW")] };
+  const divergent = findDivergentPromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } }));
+  assert.deepEqual(divergent, [{ widget: "text" }]);
+  assert.equal(writes, 0, "READ-ONLY — it runs where a failed write could not be undone");
+  assert.equal(inner._v, "OLD");
+});
+
+test("#979 (codex r4): no divergence ⇒ nothing to refuse over", () => {
+  const inner = widget("text", "SAME");
+  const sgNode = { id: 5, widgets: [widget("text", "SAME")] };
+  assert.deepEqual(findDivergentPromotedValues(sgNode, resolverFor({ text: { node: { id: 9 }, widget: inner } })), []);
+  // A rail that is not a promotion is not a divergence either.
+  assert.deepEqual(findDivergentPromotedValues({ id: 5, widgets: [widget("x", 1)] }, resolverFor({})), []);
+  assert.deepEqual(findDivergentPromotedValues(null, resolverFor({})), []);
+});
+
+test("#979 (codex r4) source guard: no snapshot ⇒ preflight refuses rather than losing values", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const preflight = src.indexOf("findDivergentPromotedValues(node,");
+  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  assert.ok(preflight > 0 && preflight < unpack, "the preflight must run before the destructive call");
+  assert.match(src, /could not be snapshotted/, "and it says why it refused");
+  assert.match(src, /Nothing was ` \+\s*`changed/, "and that nothing was changed");
 });
 
 test("#979 a THROWING resolver costs coverage, never the unpack", () => {
