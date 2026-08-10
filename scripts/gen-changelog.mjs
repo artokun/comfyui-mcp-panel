@@ -57,7 +57,12 @@ function prevTag() {
     /* no tags */
   }
   try {
-    const sha = git('log -1 --pretty=format:%H --grep="^\\(chore(release)\\|release\\):"');
+    // #932 — match the shape this repo ACTUALLY produces. Releases here are squash
+    // merges titled `<version> — <description> (#N)`, so a grep for `release:` or
+    // `chore(release):` never matched one, every run fell through to the first commit,
+    // and each entry regenerated the entire history. The anchor is the version at the
+    // START of the subject; whatever follows it is free text.
+    const sha = git('log -1 --pretty=format:%H -E --grep="^v?[0-9]+\\.[0-9]+\\.[0-9]+([^0-9]|$)"');
     if (/^[0-9a-f]{7,40}$/.test(sha)) return sha;
   } catch {
     /* no release commit */
@@ -68,7 +73,13 @@ function prevTag() {
 /** A release commit, in either shape we actually produce: `release: 0.11.40`, or the
  *  squash-merge form GitHub writes from a PR titled with the bare version — `0.11.40 (#656)`.
  *  Only the first was recognised. */
-const isReleaseSubject = (s) => /^release:/i.test(s) || /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s);
+const isReleaseSubject = (s) =>
+  /^release:/i.test(s) ||
+  // #932 — a release subject is a version FOLLOWED BY ANYTHING. Requiring the version to
+  // be the whole line (optionally plus a PR ref) matched no release this repo has ever
+  // cut, because they read `0.11.75 — <description> (#920) (#928)`. So release commits
+  // were also written INTO the entries they announce.
+  /^v?\d+\.\d+\.\d+([^0-9]|$)/.test(s);
 
 /** Parsed commits since `range`, newest-first, minus noise.
  *
