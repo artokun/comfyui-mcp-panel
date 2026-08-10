@@ -9,9 +9,10 @@
  * A typical spec: point the panel at `mockBridge.url`, open the sidebar, connect,
  * then drive the conversation via the MockBridge helpers.
  */
-import type { Page } from '@playwright/test'
+import type { BrowserContext, Page } from '@playwright/test'
 import { test as base } from '@playwright/test'
 
+import { COMFY_BASE_URL, deleteWorkflowByPath } from '../global-workflow-litter'
 import { MockBridge } from './MockBridge'
 import { PanelPage } from './PanelPage'
 
@@ -105,6 +106,135 @@ export async function isolatePanelPage(page: Page, panelFlags: string[] = []) {
   await applyPanelRouteStubs(page, panelFlags)
 }
 
+/**
+ * Record every workflow file a test WRITES, so the fixture deletes exactly those (#907).
+ *
+ * The leaks left after 0.11.79 were not `workflow_save` — converted to an owned
+ * `cmcp-e2e-*` name — and not `workflow_new`, which persists nothing. They are GROUNDING
+ * (#330): the panel auto-saves an unsaved workflow before a turn, so any spec that calls
+ * `sendMessage` silently creates `Untitled <date> <time>.json`. Measured:
+ *
+ *   before  workflows/Unsaved Workflow.json
+ *   after   workflows/Untitled 2026-08-09 22-51-44.json   persisted: true
+ *
+ * Which is why auditing the save TOOLS never found it — nothing in those specs asks to save.
+ *
+ * OWNERSHIP IS OBSERVED, NOT INFERRED, and that is what makes this safe where name-matching
+ * was not. `Untitled <date> <time>` is also what ComfyUI names a developer's own unnamed
+ * save, so a cleanup keyed on that pattern could delete their file (codex refused exactly
+ * that on #940). This records the requests this test's own browser context actually issued.
+ *
+ * Recorded in the TEST PROCESS rather than in the page, and both page-side attempts that
+ * failed are worth keeping: a window array is wiped by `addInitScript` re-running on every
+ * navigation, and sessionStorage dies with the page — a spec calling `pageB.close()` takes
+ * its record with it, which was the last leak left in a full suite run.
+ */
+function recordWorkflowWrites(context: BrowserContext, state: WriteRecord) {
+  // A CREATE is what proves ownership. ComfyUI's workflow write is
+  // `POST /api/userdata/workflows%2F<name>.json?overwrite=false`, and `overwrite=false`
+  // means the server REFUSES an existing path — so an ok response is proof the file did not
+  // exist a moment ago and this browser is what brought it into being. Anything else is
+  // skipped rather than guessed at (codex): an OPTIONS preflight, a DELETE, a write that
+  // permits overwriting, a failed write, or a request to some other instance are all cases
+  // where deleting the path could destroy a file this test did not create.
+  const owns = (url: string, method: string) => {
+    // POST only. That is the contract actually observed for the workflow save; accepting
+    // PUT as well would widen the trusted surface on an assumption rather than evidence
+    // (codex).
+    if (method !== 'POST') return null
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      return null
+    }
+    // Same instance the cleanup will delete against — a spec pointed at another ComfyUI
+    // must never make us delete a same-named workflow on the default one.
+    if (parsed.origin !== new URL(COMFY_BASE_URL).origin) return null
+    if (parsed.pathname !== '/api/userdata' && !parsed.pathname.startsWith('/api/userdata/')) return null
+    if (parsed.searchParams.get('overwrite') !== 'false') return null
+    const m = /^\/api\/userdata\/(.+)$/.exec(parsed.pathname)
+    if (!m) return null
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(m[1])
+    } catch {
+      return null
+    }
+    if (!/^workflows\//.test(decoded) || !/\.json$/i.test(decoded)) return null
+    return decoded
+  }
+
+  context.on('request', (request) => {
+    try {
+      if (owns(request.url(), request.method().toUpperCase())) state.pending.add(request)
+    } catch {
+      /* bookkeeping must never interfere with the request under test */
+    }
+  })
+  const settle = (request: import('@playwright/test').Request) => state.pending.delete(request)
+  context.on('requestfailed', settle)
+  context.on('requestfinished', (request) => {
+    let path: string | null = null
+    try {
+      path = owns(request.url(), request.method().toUpperCase())
+    } catch {
+      path = null
+    }
+    if (!path) {
+      settle(request)
+      return
+    }
+    // STAY PENDING UNTIL CLASSIFIED (codex). Settling first and classifying in a detached
+    // promise let teardown observe zero pending, delete the `created` set it had, and only
+    // then receive the path — recreating the missed-cleanup bug without needing a hung
+    // request at all. The drain below is only meaningful if "pending" covers the
+    // bookkeeping too, not just the wire.
+    const owned = path
+    void (async () => {
+      try {
+        const response = await request.response()
+        // Only a SUCCEEDED create is ours to remove.
+        if (response?.ok()) state.created.add(owned)
+      } catch {
+        /* unreadable response ⇒ claim nothing */
+      } finally {
+        settle(request)
+      }
+    })()
+  })
+}
+
+interface WriteRecord {
+  created: Set<string>
+  pending: Set<import('@playwright/test').Request>
+}
+
+/** Delete what this test created. Best-effort: a cleanup failure must never mask a real one. */
+async function cleanupRecordedWorkflowWrites(state: WriteRecord) {
+  // WAIT FOR IN-FLIGHT WRITES FIRST (codex). Deleting while a save is still on the wire
+  // gets a 404 and then the write lands afterwards — recreating the very file this is
+  // supposed to remove, and doing it invisibly because the delete "succeeded". Bounded, so
+  // a wedged request delays teardown by a second rather than hanging the suite.
+  //
+  // WHAT THIS DOES NOT PROMISE, stated rather than implied: it drains writes it has already
+  // OBSERVED. A save kicked off by a pending timer after the drain reads zero is recorded
+  // too late for this pass. Closing that needs quiescence the fixture cannot establish
+  // without closing the context first; the suite-level sweep still REPORTS anything left,
+  // which is how these were found in the first place.
+  const deadline = Date.now() + 1000
+  while (state.pending.size > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  for (const userdataPath of state.created) {
+    try {
+      await deleteWorkflowByPath(userdataPath)
+    } catch {
+      // The suite-level sweep still reports anything left behind.
+    }
+  }
+}
+
 export const test = base.extend<PanelFixtures & PanelOptions>({
   panelFlags: [[], { option: true }],
   mockBridge: async ({}, use) => {
@@ -115,7 +245,13 @@ export const test = base.extend<PanelFixtures & PanelOptions>({
   },
   panel: async ({ page, panelFlags }, use) => {
     await applyPanelRouteStubs(page, panelFlags)
+    // #907 — record before anything loads, clean up after the test whatever it ends up
+    // being. Runs on FAILURE too, which per-spec cleanup at the end of a test body never
+    // did — and a failing test is exactly when a spec is most likely to have left a file.
+    const wrote: WriteRecord = { created: new Set<string>(), pending: new Set() }
+    recordWorkflowWrites(page.context(), wrote)
     await use(new PanelPage(page))
+    await cleanupRecordedWorkflowWrites(wrote)
   }
 })
 
@@ -151,6 +287,11 @@ export async function deleteSavedWorkflow(page: Page, workflowName: string): Pro
       // fetchApi RESOLVES on an HTTP error, so the status has to be read (codex) —
       // otherwise a 500 leaves litter and looks exactly like success.
       const res = await api.fetchApi(`/userdata/${encodeURIComponent(path)}`, { method: 'DELETE' })
+      // 404 IS success: the file is gone, which is the whole objective. It happens
+      // routinely now that the fixture also sweeps what the page wrote — a spec that
+      // cleaned up after itself is then asked a second time. Warning on it trains readers
+      // to ignore the warning, which is worse than not printing it.
+      if (res?.status === 404) return 'ok'
       return res?.ok ? 'ok' : `HTTP ${res?.status ?? '?'}`
     }, `workflows/${name}.json`)
   } catch (err) {

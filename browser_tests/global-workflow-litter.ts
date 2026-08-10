@@ -18,6 +18,8 @@ import { tmpdir } from 'node:os'
 import { leakReport, plannedDeletions, workflowUserdataPath } from './fixtures/workflow-litter'
 
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8188'
+/** #907 — the fixture must delete against the SAME instance it observed a write on. */
+export const COMFY_BASE_URL = BASE_URL
 /**
  * PER RUN, not per machine (codex). A shared, predictable path let two runs
  * against one ComfyUI overwrite each other's ownership record — and then run A's
@@ -191,5 +193,24 @@ export async function cleanWorkflowLitter(): Promise<void> {
       `[e2e] SAVED-WORKFLOW CLEANUP IS BROKEN (#907): ${undeleted.length} file(s) the suite created ` +
         `could not be deleted: ${undeleted.slice(0, 10).join(', ')}`,
     )
+  }
+}
+
+/**
+ * Delete one workflow by its userdata path (#907), straight over HTTP.
+ *
+ * Exported so the per-test fixture can sweep what a page WROTE even after that page has
+ * been closed — a spec that calls `pageB.close()` takes its in-page record with it, and
+ * the last leak of a full suite run was exactly that. A 404 is success: the file is gone,
+ * which is the objective.
+ */
+export async function deleteWorkflowByPath(userdataPath: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BASE_URL}/api/userdata/${encodeURIComponent(userdataPath)}`, {
+      method: "DELETE",
+    })
+    return res.ok || res.status === 404
+  } catch {
+    return false
   }
 }
