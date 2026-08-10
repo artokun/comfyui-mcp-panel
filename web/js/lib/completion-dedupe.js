@@ -38,12 +38,22 @@ export function mediaSignature(images, videos) {
     if (!Array.isArray(list)) return;
     for (const item of list) {
       if (!item || typeof item !== "object") continue;
-      const filename = item.filename ?? item.name ?? null;
+      // Reconciled videos arrive WRAPPED as `{ m, nodeId }` from parseHistoryEntry,
+      // not as the bare ref (codex). Unwrapping here rather than at each call site
+      // keeps the two paths producing the SAME signature — without it a recovered
+      // video signed as null, so the reported clip shape seeded nothing and its next
+      // replay was announced again.
+      const ref = item.m && typeof item.m === "object" ? item.m : item;
+      const filename = ref.filename ?? ref.name ?? null;
       // A media item with no filename cannot be identified across runs. Including a
       // placeholder would let two DIFFERENT unnamed outputs collide, so the whole
       // signature is abandoned instead (see the null return below).
       if (typeof filename !== "string" || filename === "") return null;
-      parts.push(`${kind}:${item.type ?? ""}/${item.subfolder ?? ""}/${filename}`);
+      // JSON-encoded per FIELD, not concatenated (codex). An earlier attempt encoded
+      // only the outer array while each part stayed `kind:type/subfolder/filename`,
+      // so `type:"output/foo" subfolder:"bar"` and `type:"output" subfolder:"foo/bar"`
+      // still produced the same part — a collision here suppresses a real result.
+      parts.push(JSON.stringify([kind, ref.type ?? "", ref.subfolder ?? "", filename]));
     }
   };
   if (add("i", images) === null) return null;
@@ -96,7 +106,7 @@ export function createCompletionDeduper({
      * missed duplicate costs a redundant message, a wrongly-suppressed completion
      * costs the result itself.
      */
-    consider({ signature, panelQueued, promptId, durationMs }) {
+    consider({ signature, panelQueued, promptId, durationMs, durationTrusted = false }) {
       prune();
       if (panelQueued) return { deliver: true, duplicateOf: null };
       if (!signature) return { deliver: true, duplicateOf: null };
@@ -107,7 +117,17 @@ export function createCompletionDeduper({
       }
       // Same output as something already announced — but that alone does not make it
       // a replay. Only a run that plainly did not render is suppressed.
-      const looksCached = typeof durationMs === "number" && durationMs >= 0 && durationMs <= cacheHitMaxMs;
+      // `durationTrusted` is required (codex): when execution_start and executing()
+      // are both dropped, the tracker invents a start at the FINAL output event, so a
+      // genuine ten-minute render reports a sub-second duration. An invented duration
+      // is not evidence of a cache hit, and suppressing on it would lose a real result
+      // precisely when frames were being dropped.
+      const looksCached =
+        durationTrusted &&
+        typeof durationMs === "number" &&
+        Number.isFinite(durationMs) &&
+        durationMs >= 0 &&
+        durationMs <= cacheHitMaxMs;
       if (!looksCached) return { deliver: true, duplicateOf: null };
       return { deliver: false, duplicateOf: hit.promptId ?? null };
     },

@@ -96,6 +96,8 @@ export function createRunCompletionTracker({
   const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
   const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
+  // Keys whose start came from a real lifecycle signal, not a fallback (#986).
+  const startObserved = new Set();
   // #370 reconciliation state. A run is PENDING from its first liveness signal
   // until its completion is CONFIRMED delivered to the agent. If the connection
   // drops (WS lost → execution_success missed, OR bridge down → the composed
@@ -321,10 +323,20 @@ export function createRunCompletionTracker({
     retryCounts.delete(k);
   }
 
-  function markStart(id) {
+  function markStart(id, { observed = true } = {}) {
     const k = key(id);
-    // First signal wins — a later per-node event must not reset an earlier start.
-    if (!starts.has(k)) starts.set(k, now());
+    // #986 (codex): remember whether this start was OBSERVED or FABRICATED. When
+    // execution_start and executing(node) are both dropped, the start is invented at
+    // the FINAL output event, so a genuine ten-minute render reports a sub-second
+    // duration. The dedupe gate reads duration as evidence of a cache hit, and an
+    // invented duration is not evidence of anything.
+    if (!starts.has(k)) {
+      starts.set(k, now());
+      if (observed) startObserved.add(k);
+      else startObserved.delete(k);
+    } else if (observed) {
+      startObserved.add(k);
+    }
     // Bound the map so a run that never signals end can't leak entries.
     if (starts.size > 20) {
       const oldest = starts.keys().next().value;
@@ -366,7 +378,13 @@ export function createRunCompletionTracker({
     // Read + retire the start synchronously so a concurrent flush can't
     // double-count it. A missing start ⇒ null duration (never a bogus 0.0s).
     const startTs = starts.get(k);
+    // Read the trust flag BEFORE retiring it — the dedupe gate below needs to know
+    // whether this duration came from a real lifecycle signal or was invented at the
+    // final output event. Retiring first made every duration untrusted, which the
+    // integration tests caught by refusing to suppress the reported burst.
+    const durationTrusted = startObserved.has(k);
     starts.delete(k);
+    startObserved.delete(k);
     const durationMs = startTs != null ? now() - startTs : null;
     if (!buf.images.length && !buf.videos.length) return;
     // #986 — the same finished output was re-announced six times in ~30s, each under
@@ -384,6 +402,7 @@ export function createRunCompletionTracker({
       panelQueued: panelQueued.has(k),
       promptId: promptIdOf(k),
       durationMs,
+      durationTrusted,
     });
     if (!verdict.deliver) {
       // Retire it exactly as a delivered run would be: it IS accounted for, and
@@ -505,6 +524,7 @@ export function createRunCompletionTracker({
     active.delete(k);
     const startTs = starts.get(k);
     starts.delete(k);
+    startObserved.delete(k);
     // #356 Bug 2 — read BEFORE markDelivered, which retires the key from BOTH
     // `pending` and `panelQueued`. Checking after would always see false, so the
     // media-less recovery below would never fire — the mistake this line exists to
@@ -601,6 +621,7 @@ export function createRunCompletionTracker({
     buffers.delete(k);
     active.delete(k);
     starts.delete(k);
+    startObserved.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
@@ -710,7 +731,9 @@ export function createRunCompletionTracker({
       // Fallback render-start if execution_start was missed (no-op otherwise).
       // Does NOT mark active: `executing(node)` is the run-liveness signal, so an
       // output with no start AND no executing(node) is treated as an orphan.
-      markStart(id);
+      // FABRICATED (#986): invented at the final output, so any duration derived from
+      // it is meaningless and must never be read as a cache-hit signal.
+      markStart(id, { observed: false });
       trackPending(id);
       const k = key(id);
       const buf = ensureBuffer(k);
@@ -729,6 +752,7 @@ export function createRunCompletionTracker({
       // live state (codex P1 idempotency fence; `terminal`, not `delivered`).
       if (terminal.has(k)) {
         starts.delete(k);
+    startObserved.delete(k);
         return;
       }
       // #356 Bug 2 — a run that produced NO image and NO video buffers nothing
@@ -765,6 +789,7 @@ export function createRunCompletionTracker({
       }
       // Retire start for runs that buffered nothing (flush early-returns then).
       starts.delete(k);
+    startObserved.delete(k);
       // A terminal success we OBSERVED live needs no /history reconcile — clear it
       // from pending. (If the completion frame is later reported undelivered, the
       // caller's markUndelivered re-pends it, so a bridge-down drop still recovers.)
@@ -779,6 +804,7 @@ export function createRunCompletionTracker({
       if (buf?.timer) clearTimer(buf.timer);
       buffers.delete(k);
       starts.delete(k);
+    startObserved.delete(k);
       // If already terminal (reconcile surfaced this run's outcome), don't re-mark
       // (which would clear a re-pend). The caller uses wasTerminal() BEFORE calling
       // this to suppress a duplicate run_error frame (codex P1).
