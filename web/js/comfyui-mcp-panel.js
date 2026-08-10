@@ -160,6 +160,7 @@ import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
+import { createObjectInfoCache } from "./lib/object-info-cache.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -648,6 +649,8 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 // registerComfyNodeDefs: any observation taken after an unobserved window cannot support
 // the "never backend-defined this session" claim a baseline makes.
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
+// #716 — one /object_info per BURST of widget writes, instead of one per write.
+const objectInfoCache = createObjectInfoCache();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -720,6 +723,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let comboApiPresent = false;
   let comboRan = false;
   let phase = "fetch";
+  // #716 — drop the widget-write burst cache at the START of this run, not after it
+  // succeeds (codex). This function runs on exactly the events that change the schema —
+  // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
+  // when the schema is most likely to have moved. Invalidating only on success would leave
+  // the pre-change map authorizing writes for the rest of the TTL, where the old code would
+  // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
+  // be wrong in the dangerous direction.
+  objectInfoCache.invalidate();
   let thrown = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
@@ -10144,7 +10155,15 @@ const GRAPH_TOOL_EXECUTORS = {
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
+          typeof api?.getNodeDefs === "function"
+            ? // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
+              // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
+              // Still the WHOLE payload, so no question this fence asks changes scope —
+              // only how often it is re-fetched. Dropped by anything that knows the schema
+              // moved. See lib/object-info-cache.js for why the per-class route #767 used
+              // for add_node is NOT safe here.
+              await objectInfoCache.read(() => api.getNodeDefs())
+            : null,
         ),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
