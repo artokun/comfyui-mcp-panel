@@ -64,7 +64,27 @@ function prevTag() {
     // generation runs after tagging, yielding an empty range, and nothing validates that
     // the tag is an exact version.
     const t = git('describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" --match "[0-9]*.[0-9]*.[0-9]*"');
-    if (t) return t;
+    if (t) {
+      // WHICHEVER IS NEWER, not the tag unconditionally. Tags here lag releases — 0.11.85
+      // shipped untagged while v0.11.84 existed — and taking the tag anyway made the base
+      // a release too old, so 0.11.86 re-listed #954, which 0.11.85 had already announced.
+      // A duplicated entry is the mild version; the same gap re-attributes shipped work to
+      // a release that did not contain it.
+      //
+      // The release commit wins only when it is a DESCENDANT of the tag. Ancestry, not
+      // dates: a rebase or an out-of-order merge can leave a commit dated before a tag it
+      // sits after, and "which contains which" is the question actually being asked.
+      try {
+        const sha = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
+        if (sha) {
+          git(`merge-base --is-ancestor ${t} ${sha}`); // throws when it is NOT an ancestor
+          return sha;
+        }
+      } catch {
+        /* the tag is at or ahead of the newest release commit — use the tag */
+      }
+      return t;
+    }
   } catch {
     /* no version tags */
   }
