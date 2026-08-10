@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.82] - 2026-08-09
+
+> Covers changes since 0.11.81.
+
+### Added
+
+- **`panel_open_workflow` now reports which workflow it observed to be active, beside the
+  one that was requested (refs #887).** The reply named only the target, so a caller could
+  not tell "the requested workflow is active" from "the requested workflow is what you
+  asked for" — and a Save-As taken on that reading writes the live canvas, which may be a
+  different workflow. The reply carries `active_routing_key` and `active_matches_target`
+  (true, false, or null when it could not be read), with a warning when they disagree.
+
+  This is groundwork, not the fix: the contradictory "you are NOT on the wrong workflow"
+  message is composed by the orchestrator, which does not read these fields yet, so nothing
+  user-visible changes until it does. #887 stays open.
+
 ## [0.11.81] - 2026-08-09
 
 > Covers changes since 0.11.80.
