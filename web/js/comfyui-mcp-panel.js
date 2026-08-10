@@ -135,6 +135,7 @@ import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
   refreshComboOptionsFromDefs,
+  collectAllGraphs,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
@@ -157,6 +158,7 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
+import { findRepeatingControlWidgets, scopedBatchSeedNote } from "./lib/scoped-batch-seed.js";
 import {
   materializePromotedValues,
   materializedValuesNote,
@@ -11286,6 +11288,31 @@ const GRAPH_TOOL_EXECUTORS = {
       promptIds: queuedPromptIds,
       ranToNode: partialTargets ? Number(to_node_id) : null,
     });
+    // #988 — a SCOPED batch repeats the same seed. Measured on frontend 1.48.7 by
+    // capturing the submitted bodies: an unscoped batch of 3 sent three different
+    // seeds, a scoped batch of 3 sent the same seed three times. ComfyUI does not
+    // advance control_after_generate between the items of a PARTIAL execution, so
+    // every item after the first is an identical prompt answered from cache.
+    //
+    // Reported, not repaired. Rewriting the seeds would mean re-deriving the
+    // frontend's widget semantics — randomize, increment and decrement all differ and
+    // each has a range — on the one path where the panel already has to patch the
+    // request body. Saying it at queue time lets the caller cancel instead of finding
+    // out from identical outputs.
+    if (partialTargets && batch > 1) {
+      try {
+        // Every graph level, so a control inside a subgraph is not missed.
+        const allNodes = collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []);
+        const repeating = findRepeatingControlWidgets(allNodes);
+        const note = scopedBatchSeedNote(repeating, batch);
+        if (note) {
+          accept.repeating_controls = repeating;
+          accept.repeating_controls_note = note;
+        }
+      } catch {
+        /* a warning must never take down the run it describes */
+      }
+    }
     // #572 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
     // excluded queue-time hook inputs (beforeQueued carriers + their linked,
     // serialized targets — e.g. a control_after_generate seed reroll). A user
