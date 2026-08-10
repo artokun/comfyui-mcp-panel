@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.84] - 2026-08-09
+
+_No user-facing changes._
+
+
 ## [0.11.83] - 2026-08-09
 
 > Covers changes since 0.11.82.
