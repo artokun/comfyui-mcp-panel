@@ -7,6 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   findNodeByScopedId,
@@ -24,6 +25,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -785,6 +787,215 @@ test("graphErrorsResultIsClean: FALSE for missing_models / missing_media / missi
   assert.equal(graphErrorsResultIsClean({ missing_models: [{ file: "x.safetensors" }] }), false);
   assert.equal(graphErrorsResultIsClean({ missing_media: [{ file: "in.png" }] }), false);
   assert.equal(graphErrorsResultIsClean({ missing_node_count: 2 }), false);
+});
+
+test("graphErrorsResultIsClean: FALSE for an unavailable_widget_values-ONLY result (#984)", () => {
+  // Measured on a live install before the fix: a CheckpointLoader whose `config_name`
+  // named an absent models/configs .yaml. No missing-MODEL store adjudicates that
+  // folder, so every load-time surface was empty while the #745 live scan found it —
+  // and the payload carried the finding AND "Checked errors — none".
+  assert.equal(
+    graphErrorsResultIsClean({
+      errored_count: 0,
+      node_errors: null,
+      last_execution_error: null,
+      unavailable_widget_values: [
+        {
+          id: 1,
+          type: "CheckpointLoader",
+          widget: "config_name",
+          value: "totally_absent_config.yaml",
+          kind: "missing_asset",
+        },
+      ],
+    }),
+    false,
+  );
+  // The other kind the scan reports is just as fatal at queue time — a value outside
+  // the options the server publishes — so it must not be treated as cosmetic either.
+  assert.equal(
+    graphErrorsResultIsClean({
+      unavailable_widget_values: [{ id: 2, widget: "sampler_name", value: "nope", kind: "invalid_value" }],
+    }),
+    false,
+  );
+  assert.equal(graphErrorsResultIsClean({ unavailable_widget_values: [] }), true, "an empty list is still clean");
+});
+
+test("#984 (codex): the two detection halves finding the SAME defect count ONCE", () => {
+  // Measured on a live install: three absent UNET files appeared in BOTH the load-time
+  // missingModel store and the #745 live scan. Adding the lists claimed six findings
+  // for three problems — two corroborating signals, not two defects.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [
+      { node_id: 1, file: "a.safetensors", widget: "unet_name" },
+      { node_id: 2, file: "b.safetensors", widget: "unet_name" },
+    ],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "a.safetensors", kind: "missing_asset" },
+      { id: 2, widget: "unet_name", value: "b.safetensors", kind: "missing_asset" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 2);
+  assert.equal(counts.unavailable, 0, "both halves saw the same two files — nothing extra to report");
+});
+
+test("#984 (codex): a live-scan finding the load-time half MISSED is still counted", () => {
+  // The whole reason the live scan exists. CheckpointLoader.config_name is the measured
+  // case: no missing-MODEL store adjudicates models/configs, so this is the only report.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "a.safetensors", widget: "unet_name" }],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "a.safetensors", kind: "missing_asset" }, // dup
+      { id: 7, widget: "config_name", value: "totally_absent_config.yaml", kind: "missing_asset" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 1, "the config_name finding is new information");
+});
+
+test("#984 (codex): overlap is detected even when the store entry omits `widget`", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_media: [{ node_id: 3, file: "in.png" }], // no widget recorded
+    unavailable_widget_values: [{ id: 3, widget: "image", value: "in.png", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 0, "the (node, file) join still catches it");
+});
+
+test("#984 (codex): an unjoinable live-scan entry is counted rather than silently dropped", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "a.safetensors" }],
+    unavailable_widget_values: [{ widget: "unet_name", value: "a.safetensors" }], // no id
+  });
+  assert.equal(counts.unavailable, 1, "no identity to join on ⇒ report it, never assume a duplicate");
+});
+
+test("#984 (codex): node-type surfaces have no widget identity and are never deduped away", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_node_types: ["RIFEInterpolation"],
+    missing_node_count: 2,
+    errored_count: 4,
+  });
+  assert.equal(counts.missingAssets, 3, "1 type + a count of 2");
+  assert.equal(counts.erroredNodes, 4);
+  assert.equal(counts.unavailable, 0);
+});
+
+test("#984 (codex): `unchecked` is reported but is never a finding", () => {
+  const counts = graphErrorsFindingCounts({ unchecked_nodes: [{ id: 9 }, { id: 10 }] });
+  assert.equal(counts.unchecked, 2);
+  assert.equal(counts.missingAssets, 0);
+  assert.equal(counts.unavailable, 0);
+  assert.equal(counts.erroredNodes, 0);
+});
+
+test("#984: the overlap join is injective — a concatenation collision cannot swallow a finding", () => {
+  // Without a field separator, (node "1", file "23") and (node "12", file "3") produce
+  // the same key, and a real live-scan finding is silently deduped away as a phantom
+  // duplicate. Suppressing a finding is the exact failure this whole issue is about.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "1", file: "23" }],
+    unavailable_widget_values: [{ id: "12", value: "3", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 1, "different (node, file) pairs must not collide into one key");
+});
+
+test("#984 (codex r2): a filename containing the separator BYTE cannot forge a duplicate", () => {
+  // A delimiter is not an encoding, whichever byte it is — a POSIX filename may contain
+  // 0x1f, so `(node 1, file "x\x1fy")` and `(node 1, widget "x", value "y")` keyed the
+  // same and the live finding vanished. The fields are escaped now, not just separated.
+  // The collision must be built WITHIN one key shape, or the shape tag masks it — the
+  // first version of this test put the two entries in different shapes and passed
+  // against the broken join, proving nothing. Here both sides key as (node, widget,
+  // file): the store's widget "x" + file "y<SEP>z" and the live entry's widget
+  // "x<SEP>y" + value "z" delimit to the same string.
+  const SEP = String.fromCharCode(31); // built, never written literally into source
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "1", widget: "x", file: `y${SEP}z` }],
+    unavailable_widget_values: [{ id: "1", widget: `x${SEP}y`, value: "z", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 1, "a control byte inside a field must not forge a key collision");
+});
+
+test("#984 (codex r2): a store miss on ONE widget does not swallow a live finding on ANOTHER", () => {
+  // Same node, same filename, different widgets — genuinely two faults. The first
+  // version added the widget-less key unconditionally, so the store's `unet_name` miss
+  // absorbed the live scan's distinct `config_name` finding.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "shared.safetensors", widget: "unet_name" }],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "shared.safetensors", kind: "missing_asset" },
+      { id: 1, widget: "config_name", value: "shared.safetensors", kind: "invalid_value" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 1, "only the widget the store actually named is absorbed");
+});
+
+test("#984 (codex r2): a store entry with NO widget still absorbs any widget on that node", () => {
+  // The other direction: with no widget recorded there is no identity to tell the
+  // node's widgets apart, so the store entry has to be allowed to cover them.
+  const counts = graphErrorsFindingCounts({
+    missing_media: [{ node_id: 3, file: "in.png" }],
+    unavailable_widget_values: [{ id: 3, widget: "image", value: "in.png", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 0);
+});
+
+test("#984 (codex r2): a subgraph LOCATOR and a bare id are kept apart, deliberately", () => {
+  // The two producers do not canonicalize locators between them. Treating
+  // "<uuid>:7" and 7 as the same node would merge findings on different nodes;
+  // keeping them apart over-reports at worst. Over-reporting is the safe direction.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890:7", file: "m.safetensors" }],
+    unavailable_widget_values: [{ id: 7, widget: "unet_name", value: "m.safetensors" }],
+  });
+  assert.equal(counts.unavailable, 1);
+});
+
+test("#984: graphErrorsFindingCounts is total — a malformed or absent result yields zeroes", () => {
+  for (const bad of [null, undefined, 42, "x", {}, { missing_models: "nope", unavailable_widget_values: 7 }]) {
+    const c = graphErrorsFindingCounts(bad);
+    assert.deepEqual(c, { erroredNodes: 0, missingAssets: 0, unavailable: 0, unchecked: 0 });
+  }
+});
+
+test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", () => {
+  // The helper above governs the SUMMARY LABEL. The `note: "no errors recorded…"` in
+  // the payload comes from a separate `clean` expression inside the monolith's
+  // executor, which is not importable — and it is the one that produced the
+  // self-contradicting payload. Both must fold in the live scan or the contradiction
+  // simply moves. Deleting either half fails here.
+  const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const cleanExpr = /const clean =([\s\S]{0,600}?);/.exec(panelSrc)?.[1] ?? "";
+  assert.ok(cleanExpr.length > 0, "the `clean` expression must still exist to be checked");
+  assert.match(cleanExpr, /!liveScan\?\.unavailable\?\.length/, "`clean` must account for the live scan (#984)");
+  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount"]) {
+    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399 surfaces must survive: ${surface}`);
+  }
+  // The summary now derives every count from the shared helper above, which is tested
+  // BEHAVIOURALLY. This only pins that the label is wired to it — codex was right that
+  // a source regex cannot prove the wiring, so the regex is kept as thin as possible
+  // and the real assertions live on the importable helper.
+  assert.match(
+    panelSrc,
+    /const counts = graphErrorsFindingCounts\(r\);/,
+    "the summary label must count through the deduping helper, not by adding the lists",
+  );
+  assert.ok(
+    !/\(r\.missing_models\?\.length \|\| 0\) \+/.test(panelSrc),
+    "the old hand-rolled summing must not reappear — it double-counted the overlap",
+  );
+});
+
+test("graphErrorsResultIsClean: unchecked_nodes alone does NOT make a result dirty (#984 scope)", () => {
+  // The scan reports what it could not judge on almost every call. Treating that as an
+  // error would make "Checked errors — none" unreachable on a normal canvas, which is
+  // a different lie. Only what the scan positively FOUND counts.
+  assert.equal(
+    graphErrorsResultIsClean({ unchecked_nodes: [{ id: 9, type: "SomePack" }], unchecked_budget_exhausted: true }),
+    true,
+  );
 });
 
 test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", () => {

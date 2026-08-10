@@ -528,8 +528,99 @@ export function graphErrorsResultIsClean(result) {
     !len(result.missing_models) &&
     !len(result.missing_media) &&
     !len(result.missing_node_types) &&
-    !(Number(result.missing_node_count) > 0)
+    !(Number(result.missing_node_count) > 0) &&
+    // #984 — the #745 LIVE scan was added to the payload after this helper was
+    // written and never folded in, so a result carrying `unavailable_widget_values`
+    // was still labelled "Checked errors — none". Every entry there is a widget
+    // value the server does not offer (a file it does not have, or a value outside
+    // the options it publishes) — the node fails on it at queue time either way.
+    !len(result.unavailable_widget_values)
   );
+}
+
+// #984 — a field separator for the overlap-join keys below. Written as an ESCAPE, never
+// as a literal control byte: a raw 0x1f in shipped source trips the repo's own guard
+// (and the Registry's scanners), which is exactly how this was caught.
+/**
+ * #984 — an INJECTIVE key for the overlap join below.
+ *
+ * A delimiter is not enough, whichever byte it is. `"\x1f"` only moves the control
+ * character from the source file to runtime, and a POSIX filename may legally contain
+ * it: `(node "1", file "x\x1fy")` and `(node "1", widget "x", value "y")` then produce
+ * the same key, and a real live-scan finding is discarded as a phantom duplicate
+ * (codex round 2). `JSON.stringify` of an array of strings escapes every field, so
+ * distinct tuples cannot collide. The leading tag keeps the two key SHAPES apart too.
+ *
+ * Suppressing a finding is precisely the failure this issue is about, so the join
+ * fails toward counting: anything it cannot key is reported rather than merged.
+ */
+const joinKey = (tag, ...parts) => JSON.stringify([tag, ...parts.map((p) => String(p))]);
+
+/**
+ * #984 — the counts a `graph_get_errors` summary label should show, with the OVERLAP
+ * between the two detection halves removed.
+ *
+ * The load-time stores and the #745 live scan frequently find the SAME defect: an
+ * absent model file is both a `missing_models` entry and an `unavailable_widget_values`
+ * entry (measured — three absent UNET files appeared in both). Adding the lists gives
+ * six findings for three problems. Two corroborating signals are not two defects.
+ *
+ * So `unavailable` counts only what the load-time surfaces did NOT already report, on
+ * the (node, widget, value) it names. `missing_node_types`/`missing_node_count` have no
+ * widget-level identity and cannot overlap, so they stay in `missingAssets` untouched.
+ *
+ * KNOWN, deliberate limit: node ids are compared as written. `"7"` and `7` merge, but a
+ * subgraph locator `"<uuid>:7"` on one side and a bare `7` on the other do NOT — the
+ * two producers do not canonicalize locators between them, and guessing an equivalence
+ * would merge findings on genuinely different nodes. Splitting over-reports; merging
+ * hides. This splits.
+ *
+ * `unchecked` is reported SEPARATELY and is never a finding: the scan leaves something
+ * unjudged on nearly every call, and counting that as an error would make a quiet label
+ * unreachable on a healthy canvas. It exists so a caller can decline to say "none" when
+ * the check was not complete — no positive findings is not the same as a clean result.
+ */
+export function graphErrorsFindingCounts(result) {
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  const r = result && typeof result === "object" ? result : {};
+  const models = arr(r.missing_models);
+  const media = arr(r.missing_media);
+  // How precisely a store entry identifies its finding decides what it may absorb
+  // (codex round 2 — the first version added the widget-less key ALWAYS, so a store
+  // miss on `unet_name` swallowed a distinct live finding for `config_name` on the
+  // same node carrying the same filename, which can be two different faults).
+  //
+  //   named   — the store told us the widget: absorbs only that widget
+  //   unnamed — the store could not: absorbs any widget on that node, since there is
+  //             no identity to distinguish them by
+  //   anyFile — every store entry by (node, file), consulted ONLY when the LIVE entry
+  //             is the one that cannot name a widget
+  const named = new Set();
+  const unnamed = new Set();
+  const anyFile = new Set();
+  for (const m of [...models, ...media]) {
+    const node = m?.node_id ?? null;
+    const file = m?.file ?? null;
+    if (node == null || file == null) continue;
+    anyFile.add(joinKey("nf", node, file));
+    if (m?.widget != null) named.add(joinKey("nwf", node, m.widget, file));
+    else unnamed.add(joinKey("nf", node, file));
+  }
+  const unavailable = arr(r.unavailable_widget_values).filter((u) => {
+    const node = u?.id ?? null;
+    const value = u?.value ?? null;
+    if (node == null || value == null) return true; // no identity to join on → count it
+    if (u?.widget == null) return !anyFile.has(joinKey("nf", node, value));
+    if (unnamed.has(joinKey("nf", node, value))) return false;
+    return !named.has(joinKey("nwf", node, u.widget, value));
+  }).length;
+  return {
+    erroredNodes: Number(r.errored_count) || 0,
+    missingAssets:
+      models.length + media.length + arr(r.missing_node_types).length + (Number(r.missing_node_count) || 0),
+    unavailable,
+    unchecked: arr(r.unchecked_nodes).length,
+  };
 }
 
 // Input types that ComfyUI renders as a WIDGET rather than a connection socket.

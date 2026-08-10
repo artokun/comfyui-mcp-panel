@@ -138,6 +138,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -11665,6 +11666,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // NOT emit the "no errors recorded" note alongside a populated missing_* field
     // (#399/#356 self-contradiction). Fold the asset surfaces in so the note and the
     // reported misses can never disagree in one payload.
+    //
+    // #984 — the SAME contradiction, re-opened by the #745 live scan. That field was
+    // added to the payload below without being folded in here, so a graph whose only
+    // defect the LOAD-TIME stores cannot adjudicate (measured: `CheckpointLoader`'s
+    // `config_name`, a models/configs .yaml that no missing-MODEL store tracks)
+    // emitted `unavailable_widget_values: [...]` and "no errors recorded" in ONE
+    // payload. Every entry in that list is a value the server does not offer, so the
+    // node fails on it at queue time whichever kind it is.
     const clean =
       !nodeErrors &&
       !lastExecFailure &&
@@ -11672,7 +11681,8 @@ const GRAPH_TOOL_EXECUTORS = {
       !missingModels.length &&
       !missingMedia.length &&
       !missingNodeTypes.length &&
-      !missingNodeCount;
+      !missingNodeCount &&
+      !liveScan?.unavailable?.length;
     return {
       viewing: describeActiveGraph(graph),
       node_count: nodes.length,
@@ -18366,17 +18376,33 @@ function describeCommand(cmd, msg, reply) {
       // a missing-asset-ONLY result (e.g. a bypassed uninstalled node — #399) carries
       // neither node_errors nor last_execution_error, so the old check mislabelled it
       // "none" while the payload actually reported missing_node_types/models/media.
+      // #984 — counts come from the shared helper so the OVERLAP between the two
+      // detection halves is removed: an absent model file is reported by BOTH the
+      // load-time store and the live scan, and adding the lists claimed six findings
+      // for three problems.
+      const counts = graphErrorsFindingCounts(r);
       if (graphErrorsResultIsClean(r)) {
-        return { icon: "pi-info-circle", text: "Checked errors — none" };
+        // #984 (codex): "none" is a claim about the whole canvas, and the scan leaves
+        // something unjudged on most calls — a node type it could not look up, a
+        // budget cutoff. No positive findings is not a complete check, so say which
+        // one this was rather than let an incomplete pass read as an all-clear.
+        return counts.unchecked
+          ? {
+              icon: "pi-info-circle",
+              text: `Checked errors — none found (${counts.unchecked} node${counts.unchecked === 1 ? "" : "s"} could not be checked)`,
+            }
+          : { icon: "pi-info-circle", text: "Checked errors — none" };
       }
-      const missingAssets =
-        (r.missing_models?.length || 0) +
-        (r.missing_media?.length || 0) +
-        (r.missing_node_types?.length || 0) +
-        (Number(r.missing_node_count) || 0);
       const parts = [];
-      if (r.errored_count) parts.push(`${r.errored_count} node${r.errored_count === 1 ? "" : "s"}`);
-      if (missingAssets) parts.push(`${missingAssets} missing asset${missingAssets === 1 ? "" : "s"}`);
+      if (counts.erroredNodes)
+        parts.push(`${counts.erroredNodes} node${counts.erroredNodes === 1 ? "" : "s"}`);
+      if (counts.missingAssets)
+        parts.push(`${counts.missingAssets} missing asset${counts.missingAssets === 1 ? "" : "s"}`);
+      // Kept as its own category rather than folded into missing assets: these were
+      // established from the server's CURRENT /object_info, not the load-time scan,
+      // and the list mixes absent files with values outside the offered options.
+      if (counts.unavailable)
+        parts.push(`${counts.unavailable} unavailable widget value${counts.unavailable === 1 ? "" : "s"}`);
       return {
         icon: "pi-exclamation-triangle",
         text: parts.length ? `Found errors — ${parts.join(", ")}` : "Read execution errors",

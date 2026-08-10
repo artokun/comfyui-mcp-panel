@@ -93,6 +93,40 @@ export function comboInputsOf(body, className) {
  *   /object_info/<class> body; may reject.
  * @returns {Promise<{unavailable: Array<object>, unknown: Array<object>}>}
  */
+/**
+ * #984 — names of this node's widgets whose value the graph does NOT use, because a
+ * matching input is connected.
+ *
+ * When a widget is converted to an input, ComfyUI keeps the entry in `node.widgets`
+ * AND adds an input of the same name. While that input is CONNECTED the widget's own
+ * `.value` is dead weight — frequently a stale leftover from before the conversion —
+ * and the queue reads the link instead. Judging such a value against the combo
+ * reports an error on a graph that runs fine.
+ *
+ * Deliberately narrow: an input counts only when it names the widget (directly or via
+ * its `widget.name` back-reference) AND holds a non-null `link`. Everything else —
+ * no `inputs` array, an unconnected input, a malformed entry — yields nothing, so the
+ * widget stays judged. Skipping is the only thing this can do, and only on evidence.
+ */
+export function linkDrivenWidgetNames(node) {
+  const names = new Set();
+  try {
+    const inputs = node?.inputs;
+    if (!Array.isArray(inputs)) return names;
+    for (const input of inputs) {
+      if (!input || input.link === null || input.link === undefined) continue;
+      const name = typeof input.name === "string" ? input.name : null;
+      // Newer frontends carry the association explicitly; older ones match by name.
+      const widgetName = typeof input.widget?.name === "string" ? input.widget.name : null;
+      if (widgetName) names.add(widgetName);
+      else if (name) names.add(name);
+    }
+  } catch {
+    /* a malformed node judges every widget, exactly as before */
+  }
+  return names;
+}
+
 export async function scanComboAvailability(
   nodes,
   fetchClassInfo,
@@ -157,9 +191,17 @@ export async function scanComboAvailability(
       continue;
     }
     const combos = entry.combos;
+    // #984 — a widget whose matching input carries a LINK is driven by that link;
+    // ComfyUI serializes the connection and ignores the widget's own value, which is
+    // often a stale leftover from before the conversion. Judging it reports an error
+    // on a workflow that runs correctly. Consulted ONLY to skip: an unlinked input, a
+    // node with no `inputs`, or any unexpected shape leaves the widget judged exactly
+    // as before, so this can never suppress a value the graph really uses.
+    const linkDriven = linkDrivenWidgetNames(node);
     for (const widget of node.widgets) {
       const name = typeof widget?.name === "string" ? widget.name : null;
       if (!name) continue;
+      if (linkDriven.has(name)) continue;
       const options = combos.get(name);
       if (!options) continue; // not a combo input — nothing to judge it against
       const value = widget.value;
