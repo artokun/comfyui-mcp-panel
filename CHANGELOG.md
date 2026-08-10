@@ -8,9 +8,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [0.11.78] - 2026-08-09
 
-### Fixed
-- make the tab measure its own module cache instead of asking for DevTools (#934)
+> Covers changes since 0.11.77.
 
+### Fixed
+
+- **A tab now measures its own module cache instead of asking you to open DevTools
+  (#584).** This issue has had five fixes and keeps coming back, because each was built
+  on a hypothesis about the browser cache that nobody had measured — and the only way to
+  measure it was to ask someone whose tab was already wedged to read their Network tab.
+  The panel now reports, per module, whether it came from the server, from cache, or via
+  a 304 revalidation, and says so when the version check reads healthy but the modules
+  did not. That branch used to return silently, which is the shape this issue keeps
+  returning with: one version constant looking fine while the page it belongs to does
+  not behave like it. A healthy load stays silent. The same summary goes into the
+  diagnostics you copy into an issue, so the next report arrives with the measurement
+  already in it.
 
 ## [0.11.77] - 2026-08-09
 
