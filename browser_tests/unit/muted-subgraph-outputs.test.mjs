@@ -51,7 +51,7 @@ const nesting = (nestedMode, rootMode = 0) =>
   ]);
 
 test("#985 an output under a MUTED nested wrapper is found, with the exec id ComfyUI keys it by", () => {
-  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE), IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE));
   assert.equal(found.length, 1);
   assert.equal(found[0].exec_id, "5:4:3", "the colon path ComfyUI's flattened prompt uses");
   assert.equal(found[0].type, "PreviewImage");
@@ -60,32 +60,71 @@ test("#985 an output under a MUTED nested wrapper is found, with the exec id Com
 });
 
 test("#985 BYPASS is reported too — measured as equally ignored at nesting depth", () => {
-  const found = collectDisabledAncestorOutputs(nesting(MODE_BYPASS), IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(nesting(MODE_BYPASS));
   assert.equal(found.length, 1);
   assert.equal(found[0].disabled_ancestor_state, "bypassed");
 });
 
 test("#985 an ACTIVE chain yields nothing — this must not fire on a healthy graph", () => {
-  assert.deepEqual(collectDisabledAncestorOutputs(nesting(0), IS_OUTPUT), []);
+  assert.deepEqual(collectDisabledAncestorOutputs(nesting(0)), []);
 });
 
-test("#985 only OUTPUT nodes count — a muted subgraph full of ordinary nodes is not a finding", () => {
+test("#985 (codex): NO output-node predicate gates the collector — the submitted prompt decides", () => {
+  // The first version filtered on `constructor.nodeData.output_node`. graphToPrompt
+  // does not decide prompt membership that way, so that convention could have hidden
+  // a real execution root — a FALSE NEGATIVE, the exact failure class of this issue.
+  // Every node under a disabled ancestor is collected; the intersection with the
+  // prompt that was actually submitted is what reports.
   const g = graphOf([wrapper(5, 0, [wrapper(4, MODE_MUTE, [plainNode(3, "KSampler"), plainNode(9, "VAEDecode")])])]);
-  assert.deepEqual(collectDisabledAncestorOutputs(g, IS_OUTPUT), []);
+  const found = collectDisabledAncestorOutputs(g);
+  assert.deepEqual(found.map((f) => f.exec_id).sort(), ["5:4:3", "5:4:9"], "collected without judging node kind");
+  // ComfyUI queued only one of them ⇒ only that one is reported.
+  assert.deepEqual(
+    disabledOutputsInPrompt({ "5:4:9": { class_type: "VAEDecode" } }, found).map((o) => o.exec_id),
+    ["5:4:9"],
+  );
+});
+
+test("#985 (codex): one subgraph DEFINITION instanced twice is walked per INSTANCE", () => {
+  // A global visited set consumed the definition on its first visit, so the muted
+  // instance's offenders vanished — a false negative in precisely this incident
+  // class (one active source and one muted, sharing a definition). Visited must be
+  // path-local, exactly as ComfyUI's own traversal is.
+  const shared = graphOf([outputNode(3, "SaveVideo")]);
+  const g = graphOf([
+    { id: 10, type: "SubgraphNode", mode: 0, subgraph: shared }, // active instance, visited FIRST
+    { id: 11, type: "SubgraphNode", mode: MODE_MUTE, subgraph: shared }, // muted instance
+  ]);
+  const found = collectDisabledAncestorOutputs(g);
+  assert.deepEqual(found.map((f) => f.exec_id), ["11:3"], "the muted instance is still reported");
+});
+
+test("#985 (codex): deep nesting is diagnosed — no arbitrary depth cap silently stops the walk", () => {
+  // A cap made the "every output" claim false past its limit while reporting nothing.
+  const DEPTH = 40;
+  let level = graphOf([outputNode(999, "SaveImage")]);
+  const ids = [];
+  for (let i = DEPTH; i >= 1; i--) {
+    ids.unshift(String(i));
+    level = graphOf([{ id: i, type: "SubgraphNode", mode: i === DEPTH ? MODE_MUTE : 0, subgraph: level }]);
+  }
+  const found = collectDisabledAncestorOutputs(level);
+  assert.equal(found.length, 1, "still found past 32 levels");
+  assert.equal(found[0].exec_id, [...ids, "999"].join(":"));
 });
 
 test("#985 the MEASUREMENT decides, not the rule: a correctly-excluded output is not reported", () => {
   // The root-level mute case, which ComfyUI already handles. The collector still
   // finds it structurally — the prompt intersection is what keeps it quiet, so a
   // frontend that fixes nested wrappers silences this with no change here.
-  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE, MODE_MUTE), IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE, MODE_MUTE));
   assert.equal(found.length, 1, "structurally under a disabled ancestor");
   const compiled = { 1: { class_type: "EmptyLatentImage" }, 2: { class_type: "VAEDecode" } };
   assert.deepEqual(disabledOutputsInPrompt(compiled, found), [], "ComfyUI excluded it ⇒ nothing to warn about");
 });
 
 test("#985 the reported case: present in the compiled prompt ⇒ reported", () => {
-  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE), IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE));
   const compiled = {
     1: { class_type: "EmptyLatentImage" },
     2: { class_type: "VAEDecode" },
@@ -104,7 +143,7 @@ test("#985 the reporter's shape: one active source and two muted, all three queu
       wrapper(13, MODE_MUTE, [outputNode(103, "SaveText")]), // source C — muted
     ]),
   ]);
-  const found = collectDisabledAncestorOutputs(g, IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(g);
   assert.deepEqual(
     found.map((f) => f.exec_id).sort(),
     ["10:12:102", "10:13:103"],
@@ -120,7 +159,7 @@ test("#985 the reporter's shape: one active source and two muted, all three queu
 
 test("#985 a disabled wrapper ANY number of levels up still blames the nearest one", () => {
   const g = graphOf([wrapper(5, 0, [wrapper(4, MODE_MUTE, [wrapper(7, 0, [outputNode(3, "SaveImage")])])])]);
-  const found = collectDisabledAncestorOutputs(g, IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(g);
   assert.equal(found.length, 1);
   assert.equal(found[0].exec_id, "5:4:7:3");
   assert.equal(found[0].disabled_ancestor, "4");
@@ -129,7 +168,7 @@ test("#985 a disabled wrapper ANY number of levels up still blames the nearest o
 
 test("#985 two disabled ancestors: the NEAREST is named, and the depth counts both", () => {
   const g = graphOf([wrapper(5, MODE_BYPASS, [wrapper(4, MODE_MUTE, [outputNode(3, "SaveImage")])])]);
-  const found = collectDisabledAncestorOutputs(g, IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(g);
   assert.equal(found[0].disabled_ancestor, "4");
   assert.equal(found[0].disabled_ancestor_state, "muted");
   assert.equal(found[0].disabled_ancestor_depth, 2);
@@ -137,16 +176,15 @@ test("#985 two disabled ancestors: the NEAREST is named, and the depth counts bo
 
 test("#985 the collector is total — malformed input yields fewer findings, never a throw", () => {
   for (const bad of [null, undefined, {}, { _nodes: "nope" }, { _nodes: [null, {}, { id: null }] }]) {
-    assert.deepEqual(collectDisabledAncestorOutputs(bad, IS_OUTPUT), []);
+    assert.deepEqual(collectDisabledAncestorOutputs(bad), []);
   }
-  assert.deepEqual(collectDisabledAncestorOutputs(nesting(MODE_MUTE), null), [], "no predicate ⇒ no claims");
-  // A predicate that throws must not take down the run this is only describing.
-  assert.deepEqual(
-    collectDisabledAncestorOutputs(nesting(MODE_MUTE), () => {
+  // A graph whose `_nodes` getter throws must not take down the run being described.
+  const hostile = {
+    get _nodes() {
       throw new Error("boom");
-    }),
-    [],
-  );
+    },
+  };
+  assert.deepEqual(collectDisabledAncestorOutputs(hostile), []);
 });
 
 test("#985 a subgraph CYCLE terminates instead of spinning", () => {
@@ -154,7 +192,7 @@ test("#985 a subgraph CYCLE terminates instead of spinning", () => {
   const w = { id: 4, mode: MODE_MUTE, subgraph: inner };
   inner._nodes = [w]; // the wrapper contains itself
   const g = graphOf([wrapper(5, 0, [w])]);
-  assert.doesNotThrow(() => collectDisabledAncestorOutputs(g, IS_OUTPUT));
+  assert.doesNotThrow(() => collectDisabledAncestorOutputs(g));
 });
 
 test("#985 disabledOutputsInPrompt is total and never invents findings", () => {
@@ -170,12 +208,18 @@ test("#985 disabledModeName classifies exactly the two disabled modes", () => {
 });
 
 test("#985 the note leads with the outcome, names the remedy, and never blames the panel's own run", () => {
-  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE), IS_OUTPUT);
+  const found = collectDisabledAncestorOutputs(nesting(MODE_MUTE));
   const note = disabledOutputsNote(found);
-  assert.match(note, /^WILL RUN ANYWAY/, "the consequence first — this exists to be read in time to interrupt");
-  assert.match(note, /5:4:3/, "names the offending output");
+  assert.match(note, /^ALREADY QUEUED, AND WILL RUN/, "states what happened — the prompt is accepted by now");
+  assert.match(note, /5:4:3/, "names the offending node");
   assert.match(note, /to_node_id/, "the workaround the reporter verified");
-  assert.match(note, /Interrupt now/, "actionable while it still costs nothing");
+  assert.match(note, /interrupt it/, "the only remedy that still saves GPU time");
+  // codex NO-SHIP: the note is read AFTER the POST, so any wording implying the
+  // panel prevented this — or could have — is false.
+  assert.doesNotMatch(note, /will be prevented|blocked|refused|stopped/i, "claims no prevention it did not perform");
+  // And it must not state one measured build's behaviour as timeless fact.
+  assert.match(note, /0\.31\.1|1\.48\.7/, "attributes the behaviour to the build it was measured on");
+  assert.match(note, /has not\s+been measured here/, "and says the limit of that evidence");
   assert.equal(disabledOutputsNote([]), "", "silent when there is nothing to say");
   assert.equal(disabledOutputsNote(null), "");
 });
@@ -188,6 +232,6 @@ test("#985 the note caps its list but says how many it left out", () => {
     disabled_ancestor_state: "muted",
   }));
   const note = disabledOutputsNote(many);
-  assert.match(note, /9 output nodes/);
+  assert.match(note, /9 nodes/);
   assert.match(note, /and 4 more/, "a truncated list must not read as the whole list");
 });

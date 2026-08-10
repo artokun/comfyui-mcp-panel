@@ -991,8 +991,29 @@ async function classifyRunResponse(res, { onRejection, onPromptId }) {
  * that error exists; and EVERY accepted prompt_id is captured for the recovery
  * ledger. Installed only for the duration of the queuePrompt call.
  */
-export function createRunFetchInterceptor({ origFetchApi, onRejection = null, onPromptId = null } = {}) {
+export function createRunFetchInterceptor({
+  origFetchApi,
+  onRejection = null,
+  onPromptId = null,
+  onPromptBody = null,
+} = {}) {
   return async function runFetchInterceptor(route, options) {
+    // #985 — hand out the prompt AS SUBMITTED, before awaiting the response. A
+    // caller that wants to know which nodes this run will execute must read THIS
+    // body: re-deriving it with a second `app.graphToPrompt()` compiles a
+    // DIFFERENT prompt (the graph may have moved, and that call is not read-only
+    // — it runs virtual-node applyToGraph and every widget's serializeValue), so
+    // it could describe a run that was never dispatched. Read-only here: the body
+    // is parsed, never modified, and a malformed one is simply not reported.
+    if (typeof onPromptBody === "function" && isPromptPost(route, options)) {
+      try {
+        const raw = options?.body;
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : null;
+        if (parsed && typeof parsed.prompt === "object" && parsed.prompt) onPromptBody(parsed.prompt);
+      } catch {
+        /* an unreadable body yields no report, never a broken run */
+      }
+    }
     const res = await origFetchApi(route, options);
     if (isPromptPost(route, options) && res) {
       await captureRunResponse(res, { onRejection, onPromptId });

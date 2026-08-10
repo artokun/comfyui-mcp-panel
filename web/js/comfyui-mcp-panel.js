@@ -11110,6 +11110,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
     let runScopeResult = null;
+    // #985 — the FIRST /prompt body this run submitted, captured by the interceptor.
+    // The batch repeats the same graph, so the first is representative.
+    let submittedPrompt = null;
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -11143,6 +11146,12 @@ const GRAPH_TOOL_EXECUTORS = {
           origFetchApi,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
+          // #985 — keep the prompt AS SUBMITTED. Re-deriving it afterwards with a
+          // second app.graphToPrompt() would describe a different compilation than
+          // the one ComfyUI accepted, and that call is not read-only.
+          onPromptBody: (prompt) => {
+            if (submittedPrompt == null) submittedPrompt = prompt;
+          },
         });
       }
       try {
@@ -11370,22 +11379,20 @@ const GRAPH_TOOL_EXECUTORS = {
     //
     // Scoped runs are exempt: partial_execution_targets already names the roots,
     // and the reporter verified that path scopes correctly.
-    if (!partialTargets) {
+    if (!partialTargets && submittedPrompt) {
       try {
-        const disabled = collectDisabledAncestorOutputs(
-          rootGraph,
-          (n) => !!n?.constructor?.nodeData?.output_node,
+        // Intersect "structurally under a disabled ancestor" with the prompt THIS
+        // RUN ACTUALLY SUBMITTED. That intersection reports the defect rather than
+        // reimplementing ComfyUI's rules: a wrapper mode ComfyUI honoured (measured:
+        // the top-level one) keeps its nodes out of the body, so nothing is
+        // reported, and a build that fixes nested wrappers silences this by itself.
+        const offenders = disabledOutputsInPrompt(
+          submittedPrompt,
+          collectDisabledAncestorOutputs(rootGraph),
         );
-        if (disabled.length) {
-          // Ask the frontend what it ACTUALLY compiled rather than reimplementing
-          // its rules — an output it correctly excluded must not be reported, and
-          // a build that fixes this silences the warning with no change here.
-          const compiled = await app.graphToPrompt();
-          const offenders = disabledOutputsInPrompt(compiled?.output, disabled);
-          if (offenders.length) {
-            accept.disabled_outputs_queued = offenders;
-            accept.disabled_outputs_note = disabledOutputsNote(offenders);
-          }
+        if (offenders.length) {
+          accept.disabled_outputs_queued = offenders;
+          accept.disabled_outputs_note = disabledOutputsNote(offenders);
         }
       } catch {
         /* a diagnostic must never take down the run it describes */

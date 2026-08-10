@@ -36,31 +36,37 @@ export function disabledModeName(mode) {
 }
 
 /**
- * Walk every graph level, depth-first, and return one entry per OUTPUT node that has
- * at least one disabled (muted/bypassed) subgraph wrapper among its ancestors.
+ * Walk every graph level, depth-first, and return one entry per node that has at
+ * least one disabled (muted/bypassed) subgraph wrapper among its ancestors.
  *
- * `execId` is the colon-joined chain of wrapper ids ending in the node's own id —
+ * `exec_id` is the colon-joined chain of wrapper ids ending in the node's own id —
  * the same NodeExecutionId ComfyUI's flattened prompt uses as its key ("5:4:3"), and
  * the same shape run-to-node already targets.
  *
- * `isOutputNode` is injected so this stays pure and testable; the caller passes the
- * panel's existing output-node predicate rather than a second copy of that rule.
+ * This deliberately does NOT filter to "output nodes": see the note at the leaf.
+ * The caller intersects with the prompt that was actually submitted, and that is the
+ * only thing entitled to decide what runs.
  *
  * Fully defensive: a malformed node, a subgraph cycle, or a missing `_nodes` array
  * yields fewer entries, never a throw — a diagnostic must not be able to take down
- * the run it is describing. Depth is bounded for the same reason.
+ * the run it is describing.
  */
-export function collectDisabledAncestorOutputs(rootGraph, isOutputNode, { maxDepth = 32 } = {}) {
+export function collectDisabledAncestorOutputs(rootGraph) {
   const found = [];
-  if (typeof isOutputNode !== "function") return found;
-  const seen = new WeakSet();
 
-  const walk = (graph, path, disabledAncestors, depth) => {
-    if (!graph || depth > maxDepth) return;
-    if (typeof graph === "object") {
-      if (seen.has(graph)) return; // a subgraph cycle must not spin
-      seen.add(graph);
-    }
+  // Visited is PATH-LOCAL, not global (codex NO-SHIP: a global WeakSet is a
+  // false negative in exactly this incident class). One subgraph DEFINITION can be
+  // instanced more than once — wrapper A active and wrapper B muted, both pointing
+  // at the same `S` — and a global set consumes `S` on the first visit, so every
+  // offender under B disappears. ComfyUI's own traversal is path-local for the same
+  // reason: each instance is expanded separately and gets its own execution-id path.
+  // A path-local set still terminates a genuine CYCLE (a subgraph reachable from
+  // itself), which is the only thing the guard needs to do, and it needs no
+  // arbitrary depth cap — a cap would silently stop diagnosing a legal deep graph.
+  const walk = (graph, path, disabledAncestors, seenOnPath) => {
+    if (!graph || seenOnPath.has(graph)) return;
+    const nextSeen = new Set(seenOnPath);
+    nextSeen.add(graph);
     const nodes = Array.isArray(graph._nodes) ? graph._nodes : Array.isArray(graph.nodes) ? graph.nodes : [];
     for (const node of nodes) {
       if (!node || node.id == null) continue;
@@ -73,19 +79,19 @@ export function collectDisabledAncestorOutputs(rootGraph, isOutputNode, { maxDep
           sub,
           nodePath,
           name ? [...disabledAncestors, { id: String(node.id), mode: node.mode, state: name }] : disabledAncestors,
-          depth + 1,
+          nextSeen,
         );
         continue;
       }
       if (!disabledAncestors.length) continue;
-      let isOutput = false;
-      try {
-        isOutput = !!isOutputNode(node);
-      } catch {
-        isOutput = false; // an unjudgeable node is not reported as a finding
-      }
-      if (!isOutput) continue;
-      // The NEAREST disabled ancestor is the one a reader acts on — it is the wrapper
+      // NO output-node predicate (codex NO-SHIP): `graphToPrompt` does not decide
+      // prompt membership by `constructor.nodeData.output_node`, so gating on that
+      // convention risked missing a real execution root — a false negative, which is
+      // the failure this issue is about. Every node under a disabled ancestor is
+      // collected here; the intersection with the SUBMITTED prompt below is what
+      // decides, and a node ComfyUI did not queue never appears.
+      //
+      // The NEAREST disabled ancestor is the one a reader acts on — the wrapper
       // whose switch they flipped.
       const nearest = disabledAncestors[disabledAncestors.length - 1];
       found.push({
@@ -100,7 +106,7 @@ export function collectDisabledAncestorOutputs(rootGraph, isOutputNode, { maxDep
   };
 
   try {
-    walk(rootGraph, [], [], 0);
+    walk(rootGraph, [], [], new Set());
   } catch {
     /* partial findings beat none; never throw out of a diagnostic */
   }
@@ -135,15 +141,21 @@ export function disabledOutputsNote(offenders) {
     .map((o) => `${o.exec_id}${o.type ? ` (${o.type})` : ""} under ${o.disabled_ancestor_state} subgraph ${o.disabled_ancestor}`)
     .join("; ");
   const more = n > 5 ? `; and ${n - 5} more` : "";
+  // Says what HAPPENED, not what was prevented (codex NO-SHIP: the prompt is already
+  // accepted by the time this is read, so any wording implying the panel stopped it
+  // — or could have — is false). The remedy is therefore interruption, and the
+  // scoped re-run, not a promise.
   return (
-    `WILL RUN ANYWAY: ${n} output node${n === 1 ? "" : "s"} ${n === 1 ? "sits" : "sit"} inside a ` +
-    `${states.join("/")} subgraph, and ComfyUI queued ${n === 1 ? "it" : "them"} regardless — ` +
-    `${which}${more}. ComfyUI's prompt construction only applies a subgraph wrapper's ` +
-    `mute/bypass at the TOP level of the workflow; a wrapper nested inside another ` +
-    `subgraph is ignored. A whole-graph run hands prompt construction to ComfyUI, so the ` +
-    `panel cannot exclude these without changing what you asked to run — it reports them ` +
-    `instead. To render only the branch you want, run to that branch's output node ` +
-    `(panel_run with to_node_id), which scopes execution correctly. Interrupt now if this ` +
-    `is not what you intended.`
+    `ALREADY QUEUED, AND WILL RUN: ${n} node${n === 1 ? "" : "s"} inside a ` +
+    `${states.join("/")} subgraph ${n === 1 ? "is" : "are"} in the prompt this run submitted — ` +
+    `${which}${more}. Read from the request body as sent, so this is what ComfyUI accepted, ` +
+    `not a re-derivation. On the build measured for this (ComfyUI 0.31.1 / frontend 1.48.7) ` +
+    `a subgraph wrapper's mute/bypass is applied only at the TOP level of the workflow and a ` +
+    `wrapper nested inside another subgraph is ignored; whether other builds differ has not ` +
+    `been measured here. A whole-graph run hands prompt construction to ComfyUI, so the panel ` +
+    `did not build this prompt and does not silently rewrite what you asked to run — it ` +
+    `reports it. The run is queued NOW: interrupt it if this is not what you intended, then ` +
+    `render just the branch you want with panel_run's to_node_id, which scopes execution ` +
+    `correctly.`
   );
 }
