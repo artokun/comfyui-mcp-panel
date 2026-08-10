@@ -11618,7 +11618,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // DIFFERENT workflow active, which fences the very session that asked for the
     // save; without an identity in this reply the caller has nothing to re-fence
     // to, and every call that could tell it is itself refused.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
+    // NO active-canvas fallback for a Save-As (codex). If the produced record yielded no
+    // identity, absence must STAY absence: falling back to whatever is active now can pair
+    // this reply’s `workflow: "<copy>"` with a DIFFERENT canvas’s uuid, and an agent
+    // re-fencing on that would authorize graph writes against the wrong workflow — the
+    // exact misbinding this fix exists to prevent. saveReplyIdentity(null) reports
+    // `workflow_identity_unavailable` explicitly, so the caller is told rather than misled.
+    // An in-place save does not change which workflow is active, so its pre-existing #747
+    // fallback strands nobody and stays.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
   async workflow_save_as({ name }) {
@@ -11627,7 +11635,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
     const replyIdentity = saveProducedIdentity(producedRecord, true);
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: true }) };
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: true }) };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------

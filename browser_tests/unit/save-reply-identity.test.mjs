@@ -91,9 +91,12 @@ test("#747 WIRING: BOTH save handlers report the identity, and save_as always fl
   const saveAsBlock = src.slice(saveAsIdx, saveAsIdx + 900);
 
   // workflow_save is only a Save-As when the outcome says so…
-  assert.match(saveBlock, /saveReplyIdentity\(replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
+  assert.match(saveBlock, /saveReplyIdentity\(outcome\.saved_as \? replyIdentity : replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
   // …while workflow_save_as always changes which workflow is active.
-  assert.match(saveAsBlock, /saveReplyIdentity\(replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: true \}\)/);
+  assert.match(saveAsBlock, /saveReplyIdentity\(replyIdentity, \{ savedAs: true \}\)/);
+  // #941 — and a Save-As must NOT fall back to the live active canvas. Absence stays
+  // absence; substituting whatever is active can name a foreign canvas (codex).
+  assert.doesNotMatch(saveAsBlock, /savedAs: true[\s\S]{0,80}liveWorkflowListActive/);
 
   // #941 — and BOTH must establish the identity first, or the read above finds nothing for
   // a Save-As's brand-new object and reports `workflow_identity_unavailable` while the
