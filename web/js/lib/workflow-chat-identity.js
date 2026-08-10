@@ -121,6 +121,13 @@ export function shouldCarryIdentityAcrossSaveSwap({
  * Only a genuinely pre-save form is recorded — `routeId` must be a `tmp:` id. A save of an
  * already-saved workflow has no lineage break to bridge, and recording one would invent a
  * relationship rather than remember it.
+ *
+ * ACCEPTED LIMIT, written down rather than left to be discovered (codex): a path is not
+ * durable ownership. Delete a workflow, create a new one with the SAME name, and nothing
+ * available here tells them apart — the old workflow's chats can appear under the new one.
+ * Grounded names are `Untitled <timestamp>`, so reuse takes deliberate effort, and the cost
+ * is one extra row in a chat list. Closing it properly needs a delete/rename signal the
+ * panel does not currently receive.
  */
 export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } = {}) {
   const key = normalizedWorkflowPath(path);
@@ -132,9 +139,11 @@ export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } 
   if (typeof routeId !== "string" || !/^tmp:.+/.test(routeId)) return false;
   const forms = [storageKey, routeId].filter((f) => typeof f === "string" && f);
   if (!forms.length) return false;
-  // Latest grounding into a path wins. A path is created fresh by the grounding that
-  // names it, so this is self-healing if a name is ever reused rather than accumulating
-  // lineages that no longer apply.
+  // Latest grounding into a path wins. Delete first so a REFRESHED lineage moves to the
+  // end of the insertion order — plain assignment leaves an existing key in place, and the
+  // cap evicts from the front, so a just-refreshed entry could be dropped as "oldest"
+  // (codex).
+  delete map[key];
   map[key] = forms;
   return true;
 }
@@ -157,19 +166,25 @@ export function rememberPreGroundingIdentity(map, { path, storageKey, routeId } 
  */
 export function pruneGroundingIdentities(map, { knownPaths, max = 200 } = {}) {
   if (!map || typeof map !== "object") return false;
-  let changed = false;
-  if (Array.isArray(knownPaths)) {
-    const live = new Set(knownPaths.map((p) => normalizedWorkflowPath(p)).filter(Boolean));
-    for (const key of Object.keys(map)) {
-      if (!live.has(key)) {
-        delete map[key];
-        changed = true;
-      }
-    }
-  }
-  const keys = Object.keys(map);
   const limit = Number.isFinite(max) && max > 0 ? max : 200;
-  for (const key of keys.slice(0, Math.max(0, keys.length - limit))) {
+  const keys = Object.keys(map);
+  // ONLY act when over the cap. Pruning eagerly on every grounding raced the store
+  // (codex): a just-created path is not listed yet — that is established, it is why the
+  // prune runs before the record — so an EARLIER legitimate lineage whose path was still
+  // unlisted got deleted by the next grounding, losing exactly the history this restores.
+  // Over the cap something must go regardless, so preferring dead paths is free there.
+  if (keys.length <= limit) return false;
+  let changed = false;
+  const overBy = keys.length - limit;
+  const live = Array.isArray(knownPaths)
+    ? new Set(knownPaths.map((p) => normalizedWorkflowPath(p)).filter(Boolean))
+    : null;
+  // Dead paths first, oldest first within that; then oldest overall.
+  const victims = [
+    ...(live ? keys.filter((k) => !live.has(k)) : []),
+    ...keys.filter((k) => !live || live.has(k)),
+  ].slice(0, overBy);
+  for (const key of victims) {
     delete map[key];
     changed = true;
   }

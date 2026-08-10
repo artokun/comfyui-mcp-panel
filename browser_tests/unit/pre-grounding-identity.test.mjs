@@ -21,6 +21,7 @@ import {
   pruneGroundingIdentities,
   normalizedWorkflowPath,
 } from "../../web/js/lib/workflow-chat-identity.js";
+import { normalizePath } from "../../web/js/lib/workflow-save.js";
 
 const TMP = "tmp:8b7791e6-e618-4266-93fa-b3a1434d6902";
 const KEY = "workflow:ad8c385e-1111-2222-3333-444455556666";
@@ -103,7 +104,12 @@ test("#847: a lineage whose workflow is gone is dropped, not left to catch a nam
   const map = {};
   rememberPreGroundingIdentity(map, { path: "workflows/Gone.json", storageKey: KEY, routeId: TMP });
   rememberPreGroundingIdentity(map, { path: "workflows/Live.json", storageKey: KEY, routeId: TMP });
-  assert.equal(pruneGroundingIdentities(map, { knownPaths: ["workflows/Live.json"] }), true);
+  // Only over the cap: under it, an unlisted path is far more likely a store that has not
+  // caught up than a deletion, and eagerly pruning that lost real history (codex).
+  assert.equal(pruneGroundingIdentities(map, { knownPaths: ["workflows/Live.json"] }), false);
+  assert.deepEqual(preGroundingIdentityForms(map, "workflows/Gone.json"), [KEY, TMP]);
+  // Over the cap something must go, so the dead path goes first and the live one survives.
+  assert.equal(pruneGroundingIdentities(map, { knownPaths: ["workflows/Live.json"], max: 1 }), true);
   assert.deepEqual(preGroundingIdentityForms(map, "workflows/Gone.json"), []);
   assert.deepEqual(preGroundingIdentityForms(map, "workflows/Live.json"), [KEY, TMP]);
 });
@@ -115,6 +121,10 @@ test("#847: an unreadable workflow list prunes nothing", () => {
   rememberPreGroundingIdentity(map, { path: PATH, storageKey: KEY, routeId: TMP });
   assert.equal(pruneGroundingIdentities(map, { knownPaths: null }), false);
   assert.deepEqual(preGroundingIdentityForms(map, PATH), [KEY, TMP]);
+  // Even over the cap an unreadable list only evicts by age, never by "not listed".
+  rememberPreGroundingIdentity(map, { path: "workflows/Second.json", storageKey: KEY, routeId: TMP });
+  pruneGroundingIdentities(map, { knownPaths: null, max: 1 });
+  assert.deepEqual(preGroundingIdentityForms(map, "workflows/Second.json"), [KEY, TMP], "newest kept");
 });
 
 test("#847: the map stays bounded, oldest first", () => {
@@ -125,4 +135,36 @@ test("#847: the map stays bounded, oldest first", () => {
   assert.equal(Object.keys(map).length, 4);
   assert.deepEqual(preGroundingIdentityForms(map, paths[0]), [], "the oldest went first");
   assert.deepEqual(preGroundingIdentityForms(map, paths[5]), [KEY, TMP], "the newest stayed");
+});
+
+test("#847: re-grounding a path refreshes its position, so the cap cannot evict it", () => {
+  // Plain assignment leaves an existing key where it was in insertion order, and the cap
+  // evicts from the front — so a lineage refreshed seconds ago could be dropped as the
+  // "oldest" one (codex).
+  const map = {};
+  rememberPreGroundingIdentity(map, { path: "workflows/a.json", storageKey: KEY, routeId: TMP });
+  rememberPreGroundingIdentity(map, { path: "workflows/b.json", storageKey: KEY, routeId: TMP });
+  rememberPreGroundingIdentity(map, { path: "workflows/a.json", storageKey: KEY, routeId: "tmp:refreshed" });
+  pruneGroundingIdentities(map, { knownPaths: ["workflows/a.json", "workflows/b.json"], max: 1 });
+  assert.deepEqual(preGroundingIdentityForms(map, "workflows/a.json"), [KEY, "tmp:refreshed"]);
+  assert.deepEqual(preGroundingIdentityForms(map, "workflows/b.json"), [], "the genuinely older one went");
+});
+
+test("#847: a save's name canonicalises to one path shape", () => {
+  // The naive `includes("/") ? name : \`workflows/${name}.json\`` mangled real inputs
+  // (codex): `Name.json` became `workflows/Name.json.json`, `workflows\Name.json` grew a
+  // second prefix, and `workflows/Name` never got an extension. All four shapes must land
+  // on the same key, or the lineage is filed where nothing will look for it.
+  const canon = (savedName) => {
+    const raw = normalizePath(savedName).replace(/^\/+/, "");
+    if (!raw) return null;
+    const withDir = raw.includes("/") ? raw : `workflows/${raw}`;
+    return /\.json$/i.test(withDir) ? withDir : `${withDir}.json`;
+  };
+  const BACKSLASH = String.fromCharCode(92); // heredocs eat escaped backslashes; be literal
+  for (const name of ["Flow", "Flow.json", "workflows/Flow.json", `workflows${BACKSLASH}Flow.json`, "workflows/Flow", "/workflows/Flow.json"]) {
+    assert.equal(normalizedWorkflowPath(canon(name)), "workflows/flow.json", name);
+  }
+  assert.equal(canon(""), null);
+  assert.equal(canon(null), null);
 });

@@ -4310,22 +4310,31 @@ async function groundUnsavedWorkflow() {
         routeId: workflowTabId(wf),
       }),
       onGrounded: ({ savedName, identity }) => {
-        // A bare name from the save; a name that already carries a directory is used as-is.
-        const path = String(savedName).includes("/") ? String(savedName) : `workflows/${savedName}.json`;
+        // Canonicalise the save's own name into the SAME shape savedWorkflowPath()
+        // produces. Naive concatenation mangled real inputs (codex): `Name.json` became
+        // `workflows/Name.json.json`, and `workflows\Name.json` grew a second prefix.
+        const path = (() => {
+          const raw = normalizePath(savedName).replace(/^\/+/, "");
+          if (!raw) return null;
+          const withDir = raw.includes("/") ? raw : `workflows/${raw}`;
+          return /\.json$/i.test(withDir) ? withDir : `${withDir}.json`;
+        })();
+        if (!path) return;
         // Prune BEFORE recording, never after: the path this save just created is not in
         // the workflow store's list yet, so pruning afterwards deletes the very entry it
         // just wrote. That is not theoretical — it broke conversation-persistence:507 the
         // first time round.
-        pruneGroundingIdentities(_preGroundingIdentities, { knownPaths: knownWorkflowPaths() });
-        if (
-          rememberPreGroundingIdentity(_preGroundingIdentities, {
-            path,
-            storageKey: identity?.storageKey,
-            routeId: identity?.routeId,
-          })
-        ) {
-          persistPreGroundingIdentities();
-        }
+        const pruned = pruneGroundingIdentities(_preGroundingIdentities, {
+          knownPaths: knownWorkflowPaths(),
+        });
+        const recorded = rememberPreGroundingIdentity(_preGroundingIdentities, {
+          path,
+          storageKey: identity?.storageKey,
+          routeId: identity?.routeId,
+        });
+        // EITHER change has to be persisted. Persisting only on `recorded` left a prune's
+        // deletions in memory alone, so they came back from localStorage on reload (codex).
+        if (pruned || recorded) persistPreGroundingIdentities();
       },
     });
     return saved;
