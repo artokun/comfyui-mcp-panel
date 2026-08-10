@@ -2799,7 +2799,7 @@ test("#976 (codex NO-SHIP 1): a NON-CALLABLE callback carrying its own `.call` m
   assert.equal(impostorRan, 0, "a `.call` method on a non-function is NOT an invocation path");
   assert.match(
     set.write_warning ?? "",
-    /callback is a object, not a function, so it could not be invoked at all/,
+    /callback is of type "object", not a function, so it could not be invoked at all/,
     "#976 round 2: says the establishable thing — it could not be entered, so nothing of it ran",
   );
   assert.doesNotMatch(set.write_warning ?? "", /assume a click/, "the programmatic-invocation caveat is irrelevant here");

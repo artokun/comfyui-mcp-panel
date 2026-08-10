@@ -1464,8 +1464,11 @@ export function applyWidgetWrite(
           `write's attempt to invoke the widget's own callback, which happens AFTER the value ` +
           `is assigned — the assignment itself did not throw.` +
           (notCallable
-            ? ` The widget's callback is a ${typeof widgetCallback}, not a function, so it could not ` +
-              `be invoked at all and none of its side effects ran.`
+            ? // No indefinite article: `typeof` yields "object", where "a object" reads
+              // as a bug in the panel — which is the exact impression this whole fix
+              // exists to stop giving. Caught in the browser, not by a unit test.
+              ` The widget's callback is of type "${typeof widgetCallback}", not a function, so it ` +
+              `could not be invoked at all and none of its side effects ran.`
             : ` Side effects that callback would normally perform (refreshing dependent widgets, ` +
               `previews, thumbnails) may not have run or completed; inspect the node if dependents ` +
               `look stale. Note that this write invokes callbacks programmatically, which is by ` +
