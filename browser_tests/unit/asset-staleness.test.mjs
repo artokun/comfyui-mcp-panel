@@ -25,6 +25,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -821,6 +822,91 @@ test("graphErrorsResultIsClean: FALSE for an unavailable_widget_values-ONLY resu
   assert.equal(graphErrorsResultIsClean({ unavailable_widget_values: [] }), true, "an empty list is still clean");
 });
 
+test("#984 (codex): the two detection halves finding the SAME defect count ONCE", () => {
+  // Measured on a live install: three absent UNET files appeared in BOTH the load-time
+  // missingModel store and the #745 live scan. Adding the lists claimed six findings
+  // for three problems — two corroborating signals, not two defects.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [
+      { node_id: 1, file: "a.safetensors", widget: "unet_name" },
+      { node_id: 2, file: "b.safetensors", widget: "unet_name" },
+    ],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "a.safetensors", kind: "missing_asset" },
+      { id: 2, widget: "unet_name", value: "b.safetensors", kind: "missing_asset" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 2);
+  assert.equal(counts.unavailable, 0, "both halves saw the same two files — nothing extra to report");
+});
+
+test("#984 (codex): a live-scan finding the load-time half MISSED is still counted", () => {
+  // The whole reason the live scan exists. CheckpointLoader.config_name is the measured
+  // case: no missing-MODEL store adjudicates models/configs, so this is the only report.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "a.safetensors", widget: "unet_name" }],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "a.safetensors", kind: "missing_asset" }, // dup
+      { id: 7, widget: "config_name", value: "totally_absent_config.yaml", kind: "missing_asset" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 1, "the config_name finding is new information");
+});
+
+test("#984 (codex): overlap is detected even when the store entry omits `widget`", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_media: [{ node_id: 3, file: "in.png" }], // no widget recorded
+    unavailable_widget_values: [{ id: 3, widget: "image", value: "in.png", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 0, "the (node, file) join still catches it");
+});
+
+test("#984 (codex): an unjoinable live-scan entry is counted rather than silently dropped", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "a.safetensors" }],
+    unavailable_widget_values: [{ widget: "unet_name", value: "a.safetensors" }], // no id
+  });
+  assert.equal(counts.unavailable, 1, "no identity to join on ⇒ report it, never assume a duplicate");
+});
+
+test("#984 (codex): node-type surfaces have no widget identity and are never deduped away", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_node_types: ["RIFEInterpolation"],
+    missing_node_count: 2,
+    errored_count: 4,
+  });
+  assert.equal(counts.missingAssets, 3, "1 type + a count of 2");
+  assert.equal(counts.erroredNodes, 4);
+  assert.equal(counts.unavailable, 0);
+});
+
+test("#984 (codex): `unchecked` is reported but is never a finding", () => {
+  const counts = graphErrorsFindingCounts({ unchecked_nodes: [{ id: 9 }, { id: 10 }] });
+  assert.equal(counts.unchecked, 2);
+  assert.equal(counts.missingAssets, 0);
+  assert.equal(counts.unavailable, 0);
+  assert.equal(counts.erroredNodes, 0);
+});
+
+test("#984: the overlap join is injective — a concatenation collision cannot swallow a finding", () => {
+  // Without a field separator, (node "1", file "23") and (node "12", file "3") produce
+  // the same key, and a real live-scan finding is silently deduped away as a phantom
+  // duplicate. Suppressing a finding is the exact failure this whole issue is about.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "1", file: "23" }],
+    unavailable_widget_values: [{ id: "12", value: "3", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 1, "different (node, file) pairs must not collide into one key");
+});
+
+test("#984: graphErrorsFindingCounts is total — a malformed or absent result yields zeroes", () => {
+  for (const bad of [null, undefined, 42, "x", {}, { missing_models: "nope", unavailable_widget_values: 7 }]) {
+    const c = graphErrorsFindingCounts(bad);
+    assert.deepEqual(c, { erroredNodes: 0, missingAssets: 0, unavailable: 0, unchecked: 0 });
+  }
+});
+
 test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", () => {
   // The helper above governs the SUMMARY LABEL. The `note: "no errors recorded…"` in
   // the payload comes from a separate `clean` expression inside the monolith's
@@ -834,10 +920,18 @@ test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", 
   for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount"]) {
     assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399 surfaces must survive: ${surface}`);
   }
+  // The summary now derives every count from the shared helper above, which is tested
+  // BEHAVIOURALLY. This only pins that the label is wired to it — codex was right that
+  // a source regex cannot prove the wiring, so the regex is kept as thin as possible
+  // and the real assertions live on the importable helper.
   assert.match(
     panelSrc,
-    /r\.unavailable_widget_values\?\.length \|\| 0/,
-    "the summary label must count the live-scan findings too, or an unavailable-only result reads as a bare read",
+    /const counts = graphErrorsFindingCounts\(r\);/,
+    "the summary label must count through the deduping helper, not by adding the lists",
+  );
+  assert.ok(
+    !/\(r\.missing_models\?\.length \|\| 0\) \+/.test(panelSrc),
+    "the old hand-rolled summing must not reappear — it double-counted the overlap",
   );
 });
 

@@ -538,6 +538,61 @@ export function graphErrorsResultIsClean(result) {
   );
 }
 
+// #984 — a field separator for the overlap-join keys below. Written as an ESCAPE, never
+// as a literal control byte: a raw 0x1f in shipped source trips the repo's own guard
+// (and the Registry's scanners), which is exactly how this was caught.
+const JOIN_SEP = "\x1f";
+
+/**
+ * #984 — the counts a `graph_get_errors` summary label should show, with the OVERLAP
+ * between the two detection halves removed.
+ *
+ * The load-time stores and the #745 live scan frequently find the SAME defect: an
+ * absent model file is both a `missing_models` entry and an `unavailable_widget_values`
+ * entry (measured — three absent UNET files appeared in both). Adding the lists gives
+ * six findings for three problems. Two corroborating signals are not two defects.
+ *
+ * So `unavailable` counts only what the load-time surfaces did NOT already report, on
+ * the (node, widget, value) it names. `missing_node_types`/`missing_node_count` have no
+ * widget-level identity and cannot overlap, so they stay in `missingAssets` untouched.
+ *
+ * `unchecked` is reported SEPARATELY and is never a finding: the scan leaves something
+ * unjudged on nearly every call, and counting that as an error would make a quiet label
+ * unreachable on a healthy canvas. It exists so a caller can decline to say "none" when
+ * the check was not complete — no positive findings is not the same as a clean result.
+ */
+export function graphErrorsFindingCounts(result) {
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  const r = result && typeof result === "object" ? result : {};
+  const models = arr(r.missing_models);
+  const media = arr(r.missing_media);
+  // Two keys: with the widget when the store named one, and without — a store entry
+  // may omit `widget`, and an overlap must not be missed on that account.
+  const seen = new Set();
+  for (const m of [...models, ...media]) {
+    const node = m?.node_id ?? null;
+    const file = m?.file ?? null;
+    if (node == null || file == null) continue;
+    seen.add(`${String(node)}${JOIN_SEP}${String(file)}`);
+    if (m?.widget != null) seen.add(`${String(node)}${JOIN_SEP}${String(m.widget)}${JOIN_SEP}${String(file)}`);
+  }
+  const unavailable = arr(r.unavailable_widget_values).filter((u) => {
+    const node = u?.id ?? null;
+    const value = u?.value ?? null;
+    if (node == null || value == null) return true; // unjoinable → count it
+    if (seen.has(`${String(node)}${JOIN_SEP}${String(value)}`)) return false;
+    if (u?.widget != null && seen.has(`${String(node)}${JOIN_SEP}${String(u.widget)}${JOIN_SEP}${String(value)}`)) return false;
+    return true;
+  }).length;
+  return {
+    erroredNodes: Number(r.errored_count) || 0,
+    missingAssets:
+      models.length + media.length + arr(r.missing_node_types).length + (Number(r.missing_node_count) || 0),
+    unavailable,
+    unchecked: arr(r.unchecked_nodes).length,
+  };
+}
+
 // Input types that ComfyUI renders as a WIDGET rather than a connection socket.
 // A combo (the type spec is an array of option values) is also a widget.
 const WIDGET_INPUT_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"]);

@@ -138,6 +138,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -18375,25 +18376,33 @@ function describeCommand(cmd, msg, reply) {
       // a missing-asset-ONLY result (e.g. a bypassed uninstalled node — #399) carries
       // neither node_errors nor last_execution_error, so the old check mislabelled it
       // "none" while the payload actually reported missing_node_types/models/media.
+      // #984 — counts come from the shared helper so the OVERLAP between the two
+      // detection halves is removed: an absent model file is reported by BOTH the
+      // load-time store and the live scan, and adding the lists claimed six findings
+      // for three problems.
+      const counts = graphErrorsFindingCounts(r);
       if (graphErrorsResultIsClean(r)) {
-        return { icon: "pi-info-circle", text: "Checked errors — none" };
+        // #984 (codex): "none" is a claim about the whole canvas, and the scan leaves
+        // something unjudged on most calls — a node type it could not look up, a
+        // budget cutoff. No positive findings is not a complete check, so say which
+        // one this was rather than let an incomplete pass read as an all-clear.
+        return counts.unchecked
+          ? {
+              icon: "pi-info-circle",
+              text: `Checked errors — none found (${counts.unchecked} node${counts.unchecked === 1 ? "" : "s"} could not be checked)`,
+            }
+          : { icon: "pi-info-circle", text: "Checked errors — none" };
       }
-      const missingAssets =
-        (r.missing_models?.length || 0) +
-        (r.missing_media?.length || 0) +
-        (r.missing_node_types?.length || 0) +
-        (Number(r.missing_node_count) || 0);
-      // #984 — count the LIVE scan too, or a result whose ONLY finding came from it
-      // reads "Read execution errors" (the empty-parts fallback) while its payload
-      // names the offending widget. Kept as its own part rather than folded into
-      // missingAssets: these were established from the server's current /object_info,
-      // and the list mixes absent files with values outside the offered options.
-      const unavailable = r.unavailable_widget_values?.length || 0;
       const parts = [];
-      if (r.errored_count) parts.push(`${r.errored_count} node${r.errored_count === 1 ? "" : "s"}`);
-      if (missingAssets) parts.push(`${missingAssets} missing asset${missingAssets === 1 ? "" : "s"}`);
-      if (unavailable)
-        parts.push(`${unavailable} unavailable widget value${unavailable === 1 ? "" : "s"}`);
+      if (counts.erroredNodes)
+        parts.push(`${counts.erroredNodes} node${counts.erroredNodes === 1 ? "" : "s"}`);
+      if (counts.missingAssets)
+        parts.push(`${counts.missingAssets} missing asset${counts.missingAssets === 1 ? "" : "s"}`);
+      // Kept as its own category rather than folded into missing assets: these were
+      // established from the server's CURRENT /object_info, not the load-time scan,
+      // and the list mixes absent files with values outside the offered options.
+      if (counts.unavailable)
+        parts.push(`${counts.unavailable} unavailable widget value${counts.unavailable === 1 ? "" : "s"}`);
       return {
         icon: "pi-exclamation-triangle",
         text: parts.length ? `Found errors — ${parts.join(", ")}` : "Read execution errors",
