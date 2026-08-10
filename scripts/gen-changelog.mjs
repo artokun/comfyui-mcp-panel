@@ -52,10 +52,14 @@ const git = (args) => execSync(`git ${args}`, { cwd: ROOT, encoding: "utf-8", st
  *  has no per-release tags); else the first commit. */
 function prevTag() {
   try {
-    const t = git("describe --tags --abbrev=0");
+    // --match, because bare `describe --tags` accepts the nearest reachable tag of ANY
+    // name — a `backup`, a CI marker, anything — and would silently make it the release
+    // base (codex, #932). This repo has no tags today, so this guards the sibling mcp
+    // repo and whatever tags land here later, not a present bug.
+    const t = git('describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" --match "[0-9]*.[0-9]*.[0-9]*"');
     if (t) return t;
   } catch {
-    /* no tags */
+    /* no version tags */
   }
   try {
     // #932 — match the shape this repo ACTUALLY produces. Releases here are squash
