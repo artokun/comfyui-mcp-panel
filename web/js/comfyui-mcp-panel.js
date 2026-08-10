@@ -2586,6 +2586,21 @@ function saveProducedIdentity(savedRecord, savedAs) {
  */
 function rederiveSavedWorkflowIdentity(wf) {
   try {
+    // THE PATH IS NOT PROOF OF INCARNATION (codex P1). A path can be REUSED: delete
+    // workflow A, save a new workflow B at A's old path, reconnect — and a path-only
+    // rule would hand B the identity A established, letting a stale A-scoped command
+    // pass the fence against B. That is precisely the hazard the fork rules in
+    // `workflowStableUuid` exist to prevent, reintroduced through a different door.
+    //
+    // So adoption also requires the LIVE CANVAS to corroborate: this object must be the
+    // ACTIVE workflow, and the root graph it is mounted on must already carry that same
+    // uuid in the panel's own tag. That tag is written when the identity is established
+    // and travels with the graph, so a reconnect (which replaces the workflow OBJECT,
+    // not the mounted root) still has it, while a different workflow saved at the same
+    // path carries its own tag or none. Two independent records must agree before
+    // anything is adopted.
+    const active = activeWorkflowRef();
+    if (!active || !sameWorkflowObject(active, wf)) return null;
     const path = savedWorkflowPath(wf);
     // Stated for the reader, not for the machine: an unsaved workflow has no path, and
     // `workflowAliasForPath(_, null)` already returns null, so deleting this line
@@ -2595,12 +2610,21 @@ function rederiveSavedWorkflowIdentity(wf) {
     if (!path) return null;
     const alias = workflowAliasForPath(_workflowUuidAliases, path);
     if (!isCanonicalWorkflowInstanceUuid(alias)) return null;
+    // The second record: the tag on the graph this workflow is actually mounted on.
+    const rootTagged = graphRootWorkflowUuidMatches({
+      rootGraph: app?.rootGraph ?? app?.graph ?? null,
+      activeWorkflowUuid: alias,
+    });
+    if (rootTagged !== true) return null;
     const owner = workflowUuidOwner(alias);
     if (owner != null && !sameWorkflowObject(owner, wf)) {
-      // Proxy-safe, like every other owner comparison in this file (#558 r2).
+      // FAIL CLOSED when the open-tab list cannot be read (codex P1). A known distinct
+      // owner is a reason to refuse; an unreadable `openWorkflows` is not evidence that
+      // owner went away, and treating it as such would adopt an identity another live
+      // object still holds. Proxy-safe, like every other owner comparison here (#558 r2).
       const open = app?.extensionManager?.workflow?.openWorkflows;
-      const ownerStillOpen = Array.isArray(open) && open.some((w) => sameWorkflowObject(w, owner));
-      if (ownerStillOpen) return null;
+      if (!Array.isArray(open)) return null;
+      if (open.some((w) => sameWorkflowObject(w, owner))) return null;
     }
     setWorkflowObjectUuid(wf, alias);
     rememberWorkflowUuidOwner(alias, wf);
@@ -12957,11 +12981,18 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(openGeometryRewritten?.length
         ? {
             geometry_rewritten: openGeometryRewritten,
+            // Says what was COMPARED, not "nothing was lost" (codex): the comparison
+            // establishes that every node came back with the same id, type and
+            // serialized fields APART from the ones named — it does not establish that
+            // the named ones did not matter to you. Saved node heights are your file's
+            // state, and this reply is how you find out they were rewritten.
             geometry_rewritten_note:
-              `The canvas reproduced this workflow's content exactly — same nodes, same values, ` +
-              `same links — but the ComfyUI frontend recomputed per-node ${openGeometryRewritten.join(", ")} ` +
-              `while loading it, so the graph is not byte-identical to the file. Nothing was lost; ` +
-              `saving from here would write the recomputed geometry (#1001).`,
+              `Every node in this workflow came back with the same id and type, and every ` +
+              `serialized field matched EXCEPT per-node ${openGeometryRewritten.join(", ")}, which ` +
+              `differs from the file. On this frontend that is the box measurement being ` +
+              `recomputed on load, so the panel treats the content as reproduced and publishes ` +
+              `the workflow_uuid rather than refusing. It is still a real difference from what is ` +
+              `on disk: saving from here writes the recomputed value (#1001).`,
           }
         : {}),
       modified: !!target.isModified,

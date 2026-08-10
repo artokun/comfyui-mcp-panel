@@ -786,10 +786,18 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
  * reassure the reader", and it includes `color`/`bgcolor` because the sentence it
  * feeds names the fields. THIS set answers "may the panel call the content
  * PROVEN", and a lost `color` is a lost authored value — it must be able to hold
- * the proof back even though it is cosmetic to look at. Only the geometry the
- * frontend measures for itself is here.
+ * the proof back even though it is cosmetic to look at.
+ *
+ * ONE FIELD, and only the one that was MEASURED. An earlier cut also listed `pos`
+ * and `order`, on the reasoning that they are layout too. Neither was observed
+ * being rewritten by anything, `pos` is authored by the user dragging a node, and
+ * `order` is execution-order state in a LiteGraph-derived graph — proving content
+ * across a changed `order` would publish a fence for a graph whose observable
+ * behaviour changed (codex). What the live install actually rewrote, on every open
+ * of every saved workflow, was node HEIGHT. So that is the whole set, and it grows
+ * only when a measurement says it must.
  */
-const RECOMPUTED_NODE_FIELDS = new Set(["size", "pos", "order"]);
+const RECOMPUTED_NODE_FIELDS = new Set(["size"]);
 
 /**
  * Did the live root reproduce this state's CONTENT — allowing for the geometry the

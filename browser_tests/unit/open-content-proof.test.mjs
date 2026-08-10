@@ -105,6 +105,22 @@ test("#1001 a WIDGET VALUE difference is never proven — that is real content",
   assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(live), state }).proven, false);
 });
 
+test("#1001 (codex) `pos` and `order` hold the proof back — only `size` was measured", () => {
+  // An earlier cut listed both as "layout too". Neither was ever observed being
+  // rewritten, `pos` is authored by dragging a node, and `order` is execution-order
+  // state — proving content across a changed `order` would publish a fence for a graph
+  // whose observable behaviour changed. The set grows only when a measurement says so.
+  for (const field of ["pos", "order"]) {
+    const state = stateOf([node(1, "KSampler", { [field]: field === "pos" ? [0, 0] : 1 })]);
+    const live = stateOf([node(1, "KSampler", { [field]: field === "pos" ? [500, 500] : 7 })]);
+    assert.equal(
+      graphRootReproducesStateContent({ rootGraph: rootOf(live), state }).proven,
+      false,
+      `${field} must not prove content`,
+    );
+  }
+});
+
 test("#1001 `color`/`bgcolor` hold the proof back, though they ARE cosmetic to look at", () => {
   // They are in COSMETIC_NODE_FIELDS, which licenses a reassuring SENTENCE. They are
   // NOT in the recomputed set, because a lost color is a lost authored value and the
