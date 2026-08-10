@@ -14,15 +14,19 @@ const reflectApply = Reflect.apply;
 /**
  * #976: describe a thrown value for a disclosure message.
  *
- * `throw` accepts any value, so `.message` may be absent, empty, or itself a getter
- * that throws — and interpolating a value whose `toString` throws would blow up the
- * disclosure that exists to report a throw. Total by construction.
+ * Renders EXACTLY what `${threw?.message ?? threw}` rendered before — `new Error("")`
+ * still yields an empty detail, a thrown string still yields itself, `{ message: 0 }`
+ * still yields `0` — and adds only the two things that were missing: nullish throws
+ * (which the old truthiness test never reached) and totality. `throw` accepts any
+ * value, so `.message` may be a getter that throws and `toString` may throw, and a
+ * disclosure that exists to REPORT a throw must not itself throw (codex round 3).
  */
 function describeThrown(err) {
+  // The one case where a label is warranted: there is nothing else to print, and
+  // "(undefined)" alone reads like a bug in the reporting rather than the thrown value.
+  if (err === null || err === undefined) return `a non-Error value was thrown: ${String(err)}`;
   try {
-    const message = err === null || err === undefined ? null : err.message;
-    if (typeof message === "string" && message !== "") return message;
-    return `non-Error value thrown: ${String(err)}`;
+    return String(err.message ?? err);
   } catch {
     return "a thrown value that could not be described";
   }
@@ -1436,39 +1440,53 @@ export function applyWidgetWrite(
   // An attribution that overshoots just relocates the wrong blame.
   if (didThrow) {
     const threwDetail = describeThrown(threw);
+    // "ATTEMPT to invoke", uniformly (codex round 3). A class constructor and a
+    // revoked Proxy both satisfy `typeof === "function"` and then throw before any
+    // body runs, so any wording that says the callback RAN is false for them — and
+    // the mechanism cannot tell them from a body that threw. The weaker claim is true
+    // of every case, so it is the only one made.
     const threwLabel = threwFromCallback
-      ? `an exception came from invoking the widget's OWN callback while applying the write`
+      ? `an exception came from attempting to invoke the widget's OWN callback while applying the write`
       : `an exception was thrown while applying the write`;
     // Establishable and worth saying when it holds: a value that is not a function
-    // cannot have been entered, so the throw is the invocation refusing, not the
-    // node's logic failing.
-    // Reads the value CAPTURED at lookup time — never `w.callback` again, which would
-    // invoke a throwing accessor a second time.
+    // cannot have been entered at all. Reads the value CAPTURED at lookup time —
+    // never `w.callback` again, which would invoke a throwing accessor a second time.
     const notCallable = threwFromCallback && typeof widgetCallback !== "function";
     if (!failure) {
       writeWarning = threwFromCallback
         ? `the write itself SUCCEEDED: the requested value IS in effect — verified present by ` +
           `read-back — and was NOT rolled back. The exception (${threwDetail}) came from this ` +
-          `write's invocation of the widget's own callback, which runs AFTER the value is ` +
-          `assigned — the assignment itself did not throw.` +
+          `write's attempt to invoke the widget's own callback, which happens AFTER the value ` +
+          `is assigned — the assignment itself did not throw.` +
           (notCallable
             ? ` The widget's callback is a ${typeof widgetCallback}, not a function, so it could not ` +
               `be invoked at all and none of its side effects ran.`
             : ` Side effects that callback would normally perform (refreshing dependent widgets, ` +
               `previews, thumbnails) may not have run or completed; inspect the node if dependents ` +
-              `look stale. This invocation is programmatic, so a callback written to assume a click ` +
-              `can throw here and not in the UI.`)
+              `look stale. Note that this write invokes callbacks programmatically, which is by ` +
+              `itself enough to make a callback written for a click throw.`)
         : `${threwLabel} (${threwDetail}); the requested value IS in effect — ` +
           `verified present by read-back — and was NOT rolled back. Side effects the write ` +
           `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +
           `not have run or completed; inspect the node if dependents look stale.`;
     } else {
       failure = `${threwLabel} (${threwDetail}); ${failure}`;
-      if (threw instanceof WidgetWriteError) {
-        originalErr = new WidgetWriteError(failure, {
-          combo: threw.combo,
-          emptyOptions: threw.emptyOptions,
-        });
+      // #976 round 3: CLASSIFYING the thrown value can itself throw — a Proxy with a
+      // hostile `getPrototypeOf` trap breaks `instanceof`, and hostile `combo` /
+      // `emptyOptions` getters break the property reads that follow a successful one.
+      // That would escape from the branch whose whole job is to report a failure we
+      // ALREADY know, losing it. A thrown value gets to be described and, if it
+      // cooperates, classified — never to decide whether we report at all.
+      try {
+        if (threw instanceof WidgetWriteError) {
+          originalErr = new WidgetWriteError(failure, {
+            combo: threw.combo,
+            emptyOptions: threw.emptyOptions,
+          });
+        }
+      } catch {
+        // Composed message stands on its own; the retry flags are simply unavailable.
+        originalErr = null;
       }
     }
   }

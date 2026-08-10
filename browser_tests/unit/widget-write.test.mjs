@@ -1214,7 +1214,7 @@ test("#366×#639: an INNER callback that throws AFTER the value landed is DISCLO
   assert.equal(parent.widgets[0].value, 704, "rail synced — never reported failed while applied");
   assert.match(
     set.write_warning ?? "",
-    /The exception \(inner boom\) came from this \s*write's invocation of the widget's own callback/,
+    /The exception \(inner boom\) came from this \s*write's attempt to invoke the widget's own callback/,
     "the throw is disclosed, not hidden — and #976 says which construct it came out of",
   );
   assert.equal(afterChangeRan, true, "afterChange still closes the envelope");
@@ -1366,7 +1366,7 @@ test("#366×#639: a THROWING afterChange hook does not bypass verification — a
   // effect and is disclosed, never reported as a clean failure (#639).
   assert.equal(inner.widgets[0].value, 704, "inner write stays");
   assert.equal(parent.widgets[0].value, 704, "rail synced");
-  assert.match(set.write_warning ?? "", /\(inner boom\) came from this write's invocation/);
+  assert.match(set.write_warning ?? "", /\(inner boom\) came from this write's attempt to invoke/);
   assert.equal(
     set.write_warning_source,
     "widget_callback",
@@ -2462,7 +2462,7 @@ test("#639: a throwing callback on a verified write is DISCLOSED (write_warning)
   // your write" and filed it here as a panel defect. The disclosure now leads with the
   // write having SUCCEEDED and names whose code threw.
   assert.match(set.write_warning, /^the write itself SUCCEEDED/, "leads with the outcome, not with the exception");
-  assert.match(set.write_warning, /came from this write's invocation of the widget's own callback/, "says WHERE the exception came from");
+  assert.match(set.write_warning, /came from this write's attempt to invoke the widget's own callback/, "says WHERE the exception came from");
   assert.match(
     set.write_warning,
     /the assignment itself did not throw/,
@@ -2479,7 +2479,7 @@ test("#639: a throwing callback on a verified write is DISCLOSED (write_warning)
   // whole reason it threw. Overshooting the attribution just relocates the wrong blame.
   assert.doesNotMatch(set.write_warning, /fault/, "assigns no fault");
   assert.doesNotMatch(set.write_warning, /the node supplies/, "does not claim who installed the callback");
-  assert.match(set.write_warning, /invocation is programmatic/, "names the one thing that could make it our doing");
+  assert.match(set.write_warning, /invokes callbacks programmatically/, "names the one thing that could make it our doing");
 });
 
 // ---- #976 boundary: attribution is claimed ONLY for the invocation itself. The
@@ -2599,8 +2599,99 @@ test("#976 (codex NO-SHIP 2): a callback that throws `undefined` is still disclo
   const set = applyWidgetWrite(node, "n", 5, HOOKS);
   assert.equal(node.widgets[0].value, 5, "the value is in effect");
   assert.ok(typeof set.write_warning === "string", "a falsy throw is STILL a throw and is disclosed");
-  assert.match(set.write_warning, /non-Error value thrown: undefined/, "describes it instead of printing nothing");
+  assert.match(set.write_warning, /a non-Error value was thrown: undefined/, "describes it instead of printing nothing");
   assert.equal(set.write_warning_source, "widget_callback");
+});
+
+test("#976 (codex NO-SHIP 2): `throw null` is disclosed too — null was the old sentinel value for 'nothing was thrown'", () => {
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw null; // eslint-disable-line no-throw-literal
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.ok(typeof set.write_warning === "string", "the sentinel collision must not read as 'nothing was thrown'");
+  assert.match(set.write_warning, /a non-Error value was thrown: null/);
+  assert.equal(set.write_warning_source, "widget_callback");
+});
+
+test("#976 (codex NO-SHIP 3): the detail text renders exactly what it rendered before for real Errors and odd shapes", () => {
+  // describeThrown replaced `${threw?.message ?? threw}`. Round 3 caught a first draft
+  // that labelled `new Error("")` as a non-Error value — factually false — and
+  // stringified `{ message: 0 }` whole. These pin the equivalence.
+  const detailFor = (thrown) => {
+    const node = {
+      id: 1,
+      type: "N",
+      widgets: [
+        {
+          name: "n",
+          type: "INT",
+          value: 1,
+          callback() {
+            throw thrown;
+          },
+        },
+      ],
+    };
+    return applyWidgetWrite(node, "n", 5, HOOKS).write_warning ?? "";
+  };
+  assert.match(detailFor(new Error("")), /The exception \(\) came from/, "an empty Error message stays empty");
+  assert.doesNotMatch(detailFor(new Error("")), /non-Error/, "an Error is never labelled a non-Error value");
+  assert.match(detailFor({ message: 0 }), /The exception \(0\) came from/, "a non-string message renders as before");
+  assert.match(detailFor("boom"), /The exception \(boom\) came from/, "a thrown string renders as itself");
+});
+
+test("#976 (codex NO-SHIP 3): a HOSTILE thrown value cannot break the report that exists to disclose it", () => {
+  // A Proxy whose `message` getter throws AND whose `getPrototypeOf` trap throws:
+  // `describeThrown` must not throw, and `instanceof WidgetWriteError` must not either
+  // — that classification runs while composing a failure we ALREADY know, and letting
+  // it escape would lose the failure entirely.
+  const hostile = new Proxy(
+    {},
+    {
+      get(_t, prop) {
+        if (prop === "message" || prop === "combo" || prop === "emptyOptions") throw new Error("getter boom");
+        return undefined;
+      },
+      getPrototypeOf() {
+        throw new Error("proto boom");
+      },
+    },
+  );
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "c",
+        options: { values: ["a", "b", "c"] },
+        value: "b",
+        callback() {
+          this.value = "c"; // drift so verification FAILS and the composition branch runs
+          throw hostile;
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "c", "a", HOOKS),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /a thrown value that could not be described/.test(err.message) &&
+      /did not retain the requested value/.test(err.message),
+    "the structural failure survives a thrown value that fights back",
+  );
+  assert.equal(node.widgets[0].value, "b", "still rolled back");
 });
 
 test("#976 (codex NO-SHIP 2): a CLASS constructor callback is attributed to the invocation, never described as having run", () => {
@@ -2626,7 +2717,7 @@ test("#976 (codex NO-SHIP 2): a CLASS constructor callback is attributed to the 
   };
   const set = applyWidgetWrite(node, "n", 5, HOOKS);
   assert.equal(constructed, 0, "no body ran");
-  assert.match(set.write_warning ?? "", /came from this write's invocation of the widget's own callback/);
+  assert.match(set.write_warning ?? "", /came from this write's attempt to invoke the widget's own callback/);
   assert.doesNotMatch(set.write_warning ?? "", /callback threw|the callback ran/, "never claims a body executed");
   assert.equal(set.write_warning_source, "widget_callback");
 });
@@ -2637,7 +2728,12 @@ test("#976 (codex NO-SHIP 2): a REVOKED Proxy callback is attributed to the invo
   const node = { id: 1, type: "N", widgets: [{ name: "n", type: "INT", value: 1, callback: proxy }] };
   const set = applyWidgetWrite(node, "n", 5, HOOKS);
   assert.equal(node.widgets[0].value, 5, "the value landed before the invocation was attempted");
-  assert.match(set.write_warning ?? "", /came from this write's invocation of the widget's own callback/);
+  assert.match(set.write_warning ?? "", /came from this write's attempt to invoke the widget's own callback/);
+  assert.doesNotMatch(
+    set.write_warning ?? "",
+    /callback threw|the callback ran|which runs AFTER/,
+    "a revoked Proxy passes `typeof === 'function'` and then throws before any target code — nothing ran",
+  );
   assert.equal(set.write_warning_source, "widget_callback");
 });
 
@@ -2821,7 +2917,7 @@ test("#639: a callback that throws AND leaves the write unverified still FAILS +
       err instanceof WidgetWriteError &&
       // #976: the failure branch is attributed too — the structural verdict is the
       // panel's, the exception that preceded it is the node's, and both are named.
-      /came from invoking the widget's OWN callback while applying the write \(combo boom\)/.test(err.message) &&
+      /came from attempting to invoke the widget's OWN callback while applying the write \(combo boom\)/.test(err.message) &&
       /did not retain the requested value/.test(err.message),
   );
   assert.equal(seenAtCallback, "a", "the requested value WAS assigned before the callback fired");
@@ -2849,7 +2945,7 @@ test("#639: a thrown WidgetWriteError on an unverified write keeps BOTH causes a
     (err) =>
       err instanceof WidgetWriteError &&
       err.combo === true && // the refresh-retry signal survives the composition
-      /came from invoking the widget's OWN callback while applying the write \(combo list went stale\)/.test(err.message) &&
+      /came from attempting to invoke the widget's OWN callback while applying the write \(combo list went stale\)/.test(err.message) &&
       /did not retain the requested value/.test(err.message),
   );
   assert.equal(node.widgets[0].value, "b", "rolled back");
