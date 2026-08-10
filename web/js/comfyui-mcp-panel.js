@@ -22929,11 +22929,14 @@ function buildPanel() {
       const res = await fetch('/extensions/comfyui-mcp-panel/changelog.json', { cache: 'no-cache' });
       if (!res.ok) return; // offline / 404: say nothing, record nothing, try again next mount
       const data = await res.json();
-      // A patch is a quiet line; a minor bump or a pile of releases is the case the report
-      // is really about (a tool surface consolidating, a default flipping) and gets the
-      // fuller list. Without this the level was computed and then thrown away (codex).
-      const maxEntries = level === 'major' ? 10 : 3;
       const picked = releasesSince(data?.releases, { lastSeen, current: PANEL_VERSION });
+      // Re-decide the level with the release COUNT, which is only known now (codex). The
+      // first pass could not pass it, so a same-minor jump across a dozen releases always
+      // came out 'patch' and the pile-of-releases half of the policy never fired.
+      const shownLevel = updateAnnouncement({ lastSeen, current: PANEL_VERSION, releaseCount: picked.length });
+      // A patch is a quiet line; a minor bump or a pile of releases is the case the report
+      // is really about (a tool surface consolidating, a default flipping) and gets more.
+      const maxEntries = (force ? 'major' : shownLevel) === 'major' ? 10 : 3;
       const entries = summarizeReleases(picked, { maxEntries });
       if (!entries.length) return;
 
@@ -22942,7 +22945,11 @@ function buildPanel() {
       // would paint into a detached transcript nobody can see — and because the version
       // used to be recorded before the fetch, the new mount would decide there was nothing
       // to announce. The note was then lost for good, on an ordinary remount.
-      if (!force && (client !== liveBridgeClient || !log.isConnected)) return;
+      // UNCONDITIONAL (codex). `force` may skip the already-seen gate — that is its whole
+      // job — but never mount ownership. A Settings click whose fetch resolves after its
+      // panel unmounted would otherwise paint into a dead transcript, and the user's
+      // explicit "Show what's new" would visibly do nothing.
+      if (client !== liveBridgeClient || !log.isConnected) return;
 
       const box = document.createElement('div');
       box.className = 'cmcp-sys cmcp-whatsnew';
