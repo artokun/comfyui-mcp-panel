@@ -1005,21 +1005,25 @@ function cmcpApiBase() {
 }
 function cmcpOpenCredentialsFrame(client) {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
-    alert("Connect the panel first — the credentials console isn't available yet.");
+    alert(tr("panel.connect_the_panel_first_the_credentials_console", "Connect the panel first — the credentials console isn't available yet."));
     return;
   }
   const backdrop = document.createElement("div");
   backdrop.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;";
   const card = document.createElement("div");
   card.style.cssText = "width:440px;max-width:92vw;max-height:88vh;overflow:auto;padding:1rem 1.1rem;border-radius:12px;background:#0f1115;color:#e8eaed;border:1px solid #2a2f3a;box-shadow:0 12px 48px rgba(0,0,0,.5);font:13px system-ui,sans-serif;";
+  // Translated text goes through esc2 like every other interpolation in this card.
+  // `/i18n` merges EVERY installed pack's catalog into one object (see lib/i18n.js note 1),
+  // so a translation is not a literal we control at build time — and two of the holes below
+  // sit INSIDE a double-quoted attribute, where an unescaped `"` would break out of it.
   card.innerHTML = `
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
-      <b style="flex:1;font-size:15px">API Keys</b>
+      <b style="flex:1;font-size:15px">${esc2(tr("panel.api_keys", "API Keys"))}</b>
       <span data-close style="cursor:pointer;font-size:18px;opacity:.6;line-height:1">✕</span>
     </div>
-    <div style="opacity:.6;font-size:11px;margin-bottom:10px">Stored locally on the backend, per instance. Values are write-only and never leave this machine.</div>
+    <div style="opacity:.6;font-size:11px;margin-bottom:10px">${esc2(tr("panel.stored_locally_on_the_backend_per_instance", "Stored locally on the backend, per instance. Values are write-only and never leave this machine."))}</div>
     <div data-err style="color:#f28b82;font-size:12px;margin-bottom:8px;display:none"></div>
-    <div data-list style="opacity:.7">Loading…</div>
+    <div data-list style="opacity:.7">${esc2(tr("panel.loading", "Loading…"))}</div>
     <div data-oauth style="margin-top:14px;padding-top:10px;border-top:1px solid #2a2f3a"></div>`;
   const close = () => {
     stopOauthPolling();
@@ -1038,14 +1042,14 @@ function cmcpOpenCredentialsFrame(client) {
     r.style.cssText = "margin-bottom:12px";
     r.innerHTML = `
       <label style="display:block;margin-bottom:4px">${esc2(s.label)}
-        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${s.set ? "set · " + esc2(s.masked || "") : "not set"}</span></label>
+        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${esc2(s.set ? tr("panel.set", "set · ") + (s.masked || "") : tr("panel.not_set", "not set"))}</span></label>
       <div style="display:flex;gap:6px">
         <input type="password" autocomplete="off" data-input
-               placeholder="${s.set ? "•••• set — type to replace" : "paste key"}"
+               placeholder="${esc2(s.set ? tr("panel.set_type_to_replace", "•••• set — type to replace") : tr("panel.paste_key", "paste key"))}"
                style="flex:1;padding:6px;background:#1a1a1a;border:1px solid #333;color:#ddd;border-radius:4px;box-sizing:border-box"/>
-        <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">Save</button>
-        <button data-clear title="Remove this key from the orchestrator's store"
-                style="padding:6px 10px;border-radius:4px;cursor:pointer;${s.set ? "" : "display:none"}">Clear</button>
+        <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">${esc2(tr("panel.save", "Save"))}</button>
+        <button data-clear title="${esc2(tr("panel.remove_this_key_from_the_orchestrator_s", "Remove this key from the orchestrator's store"))}"
+                style="padding:6px 10px;border-radius:4px;cursor:pointer;${s.set ? "" : "display:none"}">${esc2(tr("panel.clear", "Clear"))}</button>
       </div>
       ${s.help ? `<div data-help style="font-size:11px;opacity:.55;margin-top:4px;line-height:1.45">${esc2(s.help)}</div>` : ""}`;
     const input = r.querySelector("[data-input]");
@@ -1063,9 +1067,16 @@ function cmcpOpenCredentialsFrame(client) {
           body: JSON.stringify({ slot: s.id, value }),
         });
         const d = await resp.json();
-        if (!resp.ok || !d.ok) throw new Error(d.error || "save failed");
+        // `d.error` is the orchestrator's own (English) reason; only OUR fallback is ours to
+        // translate — the server text is passed through untouched, as it always has been.
+        if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.save_failed", "save failed"));
         input.value = "";
         badge.textContent = tr("panel.set", "set · ") + (d.masked || "");
+        // Mirror the clear path, which resets this to the paste hint: the row has just gone
+        // from unset to set, so an emptied field still inviting a paste tells the user
+        // nothing was stored, one line under a badge saying it was. Surfaced by review of
+        // the i18n pass — the two branches were only ever half a pair.
+        input.placeholder = tr("panel.set_type_to_replace", "•••• set — type to replace");
         clearBtn.style.display = "";
         btn.textContent = tr("panel.saved", "Saved ✓");
         setTimeout(() => { btn.textContent = tr("panel.save", "Save"); btn.disabled = false; }, 1400);
@@ -1086,7 +1097,7 @@ function cmcpOpenCredentialsFrame(client) {
           body: JSON.stringify({ slot: s.id, clear: true }),
         });
         const d = await resp.json();
-        if (!resp.ok || !d.ok) throw new Error(d.error || "clear failed");
+        if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.clear_failed", "clear failed"));
         badge.textContent = tr("panel.not_set", "not set");
         input.placeholder = tr("panel.paste_key", "paste key");
         clearBtn.style.display = "none";
@@ -1103,13 +1114,19 @@ function cmcpOpenCredentialsFrame(client) {
     try {
       const resp = await fetch(cmcpApiBase());
       const d = await resp.json();
-      if (!resp.ok || !d.ok) throw new Error(d.error || "could not load");
+      if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.could_not_load", "could not load"));
       list.innerHTML = "";
       for (const s of (d.slots || [])) list.appendChild(row(s));
       if (!list.children.length) list.textContent = tr("panel.no_credential_slots", "No credential slots.");
     } catch (e) {
       list.textContent = "";
-      showErr("Couldn't load credentials — reconnect the panel. (" + String((e && e.message) || e) + ")");
+      // One interpolated sentence rather than a concatenation: a translator needs the
+      // parenthetical to be movable, and several languages put it elsewhere in the clause.
+      showErr(tr(
+        "panel.couldn_t_load_credentials_reconnect_the_panel",
+        "Couldn't load credentials — reconnect the panel. ({error})",
+        { error: String((e && e.message) || e) },
+      ));
     }
   })();
 
@@ -1204,7 +1221,9 @@ function cmcpOpenCredentialsFrame(client) {
       info.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap";
       const who = document.createElement("span");
       who.style.cssText = "opacity:.75;font-size:12px";
-      who.textContent = state.accountLabel ? `Signed in as ${state.accountLabel}` : "Signed in";
+      who.textContent = state.accountLabel
+        ? tr("panel.signed_in_as", "Signed in as {label}", { label: state.accountLabel })
+        : tr("panel.signed_in", "Signed in");
       const signOutBtn = document.createElement("button");
       signOutBtn.type = "button";
       signOutBtn.className = "cmcp-btn";
@@ -1264,7 +1283,7 @@ function cmcpOpenCredentialsFrame(client) {
       const signInBtn = document.createElement("button");
       signInBtn.type = "button";
       signInBtn.className = "cmcp-btn";
-      signInBtn.textContent = `Sign in with ${p.label}`;
+      signInBtn.textContent = tr("panel.sign_in_with", "Sign in with {provider}", { provider: p.label });
       signInBtn.disabled = !!state.busy;
       signInBtn.onclick = () => beginOauthSignin(p);
       rowEl.appendChild(signInBtn);
@@ -1288,7 +1307,7 @@ function cmcpOpenCredentialsFrame(client) {
       ...(p.experimental ? { allow_experimental: true } : {}),
     });
     if (!ok) {
-      entry.state = { status: "signed_out", busy: false, error: "Not connected — reconnect the panel first." };
+      entry.state = { status: "signed_out", busy: false, error: tr("panel.not_connected_reconnect_the_panel_first", "Not connected — reconnect the panel first.") };
       paintOauthRow(p);
       return;
     }
@@ -1302,7 +1321,7 @@ function cmcpOpenCredentialsFrame(client) {
     paintOauthRow(p);
     const ok = client?.sendFrame?.({ type: "oauth_signout", provider: p.id });
     if (!ok) {
-      entry.state = { ...entry.state, busy: false, error: "Not connected — reconnect the panel first." };
+      entry.state = { ...entry.state, busy: false, error: tr("panel.not_connected_reconnect_the_panel_first", "Not connected — reconnect the panel first.") };
       paintOauthRow(p);
       return;
     }
@@ -1341,7 +1360,7 @@ function cmcpOpenCredentialsFrame(client) {
         // Fix 2: surface a failed status probe instead of ignoring it — put the
         // error on the section header row so the user isn't left staring at
         // stale/blank rows with no explanation.
-        oauthError(ack.message || "Couldn't load sign-in status.");
+        oauthError(ack.message || tr("panel.couldn_t_load_sign_in_status", "Couldn't load sign-in status."));
       }
       return;
     }
@@ -1351,7 +1370,7 @@ function cmcpOpenCredentialsFrame(client) {
       if (!p) return;
       const entry = oauthEntry(id);
       if (!ack.ok) {
-        entry.state = { status: "signed_out", busy: false, error: ack.message || "Sign-in failed." };
+        entry.state = { status: "signed_out", busy: false, error: ack.message || tr("panel.sign_in_failed", "Sign-in failed.") };
         paintOauthRow(p);
         return;
       }
@@ -1370,7 +1389,7 @@ function cmcpOpenCredentialsFrame(client) {
       if (!p) return;
       const entry = oauthEntry(id);
       if (!ack.ok) {
-        entry.state = { ...entry.state, busy: false, error: ack.message || "Sign-out failed." };
+        entry.state = { ...entry.state, busy: false, error: ack.message || tr("panel.sign_out_failed", "Sign-out failed.") };
       } else {
         entry.state = { status: "signed_out", busy: false, error: null };
       }
@@ -3334,7 +3353,11 @@ function triggerSecret(envKey, friendly) {
       clearInterval(t);
       try {
         window.alert(
-          `Open the Agent panel, connect, then set the ${friendly} token again.`,
+          tr(
+            "panel.open_the_agent_panel_connect_then_set",
+            "Open the Agent panel, connect, then set the {name} token again.",
+            { name: friendly },
+          ),
         );
       } catch {
         /* alert unavailable (headless/embedded) — nothing else to do */
