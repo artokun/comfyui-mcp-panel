@@ -1052,6 +1052,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     stage.addEventListener("mousedown", (e) => { if (e.target === stage) closeLb(); });
     document.addEventListener("keydown", onKey, true);
     lb.append(stage, side);
+    // #753 — mounted on <body>, OUTSIDE .cmcp-root, so `em` inside it would resolve
+    // against the page's 16px rather than the panel's 13px. Anchor the root the same way
+    // .cmcp-root is anchored, in rem, so everything below renders as written.
+    lb.style.fontSize = "0.8125rem";
     document.body.appendChild(lb);
     lb.focus();
     render();

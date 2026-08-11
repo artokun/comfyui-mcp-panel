@@ -165,6 +165,10 @@ export function openSidePanel(ctx = {}, opts = {}) {
 
   modal.append(head, subnav, body);
   overlay.appendChild(modal);
+  // #753 — mounted on <body>, OUTSIDE .cmcp-root, so `em` inside it would resolve
+  // against the page's 16px rather than the panel's 13px. Anchor the root the same way
+  // .cmcp-root is anchored, in rem, so everything below renders as written.
+  overlay.style.fontSize = "0.8125rem";
   document.body.appendChild(overlay);
 
   // ── lifecycle state ─────────────────────────────────────────────────────────

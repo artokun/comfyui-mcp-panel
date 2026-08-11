@@ -1411,6 +1411,10 @@ function cmcpOpenCredentialsFrame(client) {
   // Prime with whatever status the orchestrator already has.
   client?.sendFrame?.({ type: "oauth_status" });
 
+  // #753 — mounted on <body>, OUTSIDE .cmcp-root, so `em` inside it would resolve
+  // against the page's 16px rather than the panel's 13px. Anchor the root in rem,
+  // exactly as .cmcp-root is anchored, so everything below renders as written.
+  backdrop.style.fontSize = "0.8125rem";
   backdrop.appendChild(card);
   document.body.appendChild(backdrop);
 }
@@ -22395,6 +22399,10 @@ function buildPanel() {
     const bar = document.createElement("div");
     bar.className = "cmcp-lightbox-bar";
     bar.append(caption, openBtn);
+    // #753 — mounted on <body>, OUTSIDE .cmcp-root, so `em` inside it would resolve
+    // against the page's 16px rather than the panel's 13px. Anchor the root in rem,
+    // exactly as .cmcp-root is anchored, so everything below renders as written.
+    overlay.style.fontSize = "0.8125rem";
     overlay.append(stage, bar);
     document.body.appendChild(overlay);
     window.addEventListener("keydown", onKey, true);

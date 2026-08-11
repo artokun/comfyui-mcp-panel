@@ -41,6 +41,10 @@ export function openSubModal(title, onClose, tracker) {
   if (tracker) tracker.add(close2);
   x.addEventListener("click", close2);
   ov.addEventListener("mousedown", (e) => { if (e.target === ov) close2(); });
+  // #753 — mounted on <body>, OUTSIDE .cmcp-root, so `em` inside it would resolve
+  // against the page's 16px rather than the panel's 13px. Anchor the root the same way
+  // .cmcp-root is anchored, in rem, so everything below renders as written.
+  ov.style.fontSize = "0.8125rem";
   m.append(head2, x, b); ov.appendChild(m); document.body.appendChild(ov);
   return { body: b, close: close2 };
 }
@@ -55,7 +59,7 @@ export function toast(msg, { ms = 3500 } = {}) {
   // whole explorer just closed after a successful load).
   t.style.cssText = "position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);" +
     "max-width:min(38rem,90vw);text-align:center;background:var(--p-surface-800,#27272a);" +
-    "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:1.0092em;" +
+    "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:.82rem;" +
     "box-shadow:0 4px 16px rgba(0,0,0,.5)";
   document.body.appendChild(t);
   setTimeout(() => t.remove(), ms);
