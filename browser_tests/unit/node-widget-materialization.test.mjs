@@ -524,14 +524,17 @@ test("#626: graph_add_node actually CONSUMES the reconciliation and discloses it
   assert.match(src, /applyCurrentDefWidgetValues,/, "imported");
   assert.match(
     src,
-    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef\);/,
+    // The optional third arg is #1369's rejected-corrections out-param. Kept optional
+    // here so this pins the WIRING — called on the created node with the CURRENT def —
+    // rather than an argument count, which is what made it fail on an unrelated change.
+    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef(, correctionOut)?\);/,
     "called on the created node with the CURRENT def",
   );
   assert.match(src, /added\.schema_value_corrections = valueCorrections;/, "disclosed on the result");
   // …and it must run BEFORE the node is added to the graph, or the graph briefly holds
   // the stale value and an undo step captures it.
   assert.ok(
-    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);") <
+    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef") <
       src.indexOf("      graph.add(node);"),
     "reconciliation must precede graph.add",
   );

@@ -490,11 +490,16 @@ function inputValueConfig(spec) {
  * Pure apart from the node it is handed; returns [] when there is nothing current to
  * compare against, so a frontend-only type is untouched.
  */
-export function applyCurrentDefWidgetValues(node, currentDef) {
+export function applyCurrentDefWidgetValues(node, currentDef, out) {
   const required = currentDef?.input?.required;
   if (!required || typeof required !== "object") return [];
   const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
   const corrections = [];
+  /** #1369 — corrections REFUSED because the definition's own default is not a member of
+   *  its own option list. Reported rather than dropped: the node is usable, but the
+   *  caller should know its schema is self-contradictory, and silently declining to act
+   *  is the same class of omission as silently acting. */
+  const rejected = [];
   for (const [name, spec] of Object.entries(required)) {
     const widget = widgets.find((w) => w?.name === name);
     if (!widget) continue; // a socket, or a widget that never materialized — not ours
@@ -511,8 +516,31 @@ export function applyCurrentDefWidgetValues(node, currentDef) {
       }
     }
     // 2) The VALUE comes from the CURRENT definition, never the stale registered one.
+    //    …UNLESS the definition contradicts itself. #1369: KJNodes declares
+    //
+    //      "sage_attention": [ ["disabled","auto",…], { "default": false } ]
+    //
+    //    a COMBO whose default is not a member of its own option list — a leftover from
+    //    when that input was a BOOLEAN. Applying it faithfully (which is what this
+    //    function is FOR) rewrote a perfectly good "disabled" to `false`, and ComfyUI
+    //    then refused the run with `Value not in list`.
+    //
+    //    The enum is already in hand — it is the same spec this default came from — so
+    //    the check costs nothing. A default outside it is DISCARDED rather than clamped
+    //    or coerced: there is no defensible way to pick a replacement from an option list
+    //    the node author evidently did not mean, and the value the widget already holds
+    //    came from the registered schema and is at least a real member.
     if (Object.prototype.hasOwnProperty.call(config, "default") && widget.value !== config.default) {
-      widget.value = config.default;
+      const comboOptions = Array.isArray(spec?.[0])
+        ? spec[0]
+        : Array.isArray(config.options)
+          ? config.options
+          : null;
+      if (comboOptions && !comboOptions.includes(config.default)) {
+        rejected.push({ name, proposed: config.default, kept: widget.value });
+      } else {
+        widget.value = config.default;
+      }
     }
     // 3) A numeric value still outside the CURRENT range (no default declared, or a
     //    default the def itself contradicts) is clamped rather than shipped invalid.
@@ -522,6 +550,12 @@ export function applyCurrentDefWidgetValues(node, currentDef) {
     }
     if (widget.value !== before) corrections.push({ name, from: before, to: widget.value });
   }
+  // Reported through an OPT-IN out-param rather than as a property on the returned array.
+  // The first cut attached `corrections.rejected` and claimed every existing caller was
+  // unaffected — wrong, and the #626 tests said so immediately: `.length` survives that
+  // but `assert.deepEqual` compares own properties, so four passing tests went red. A
+  // caller that does not ask for rejections gets exactly the array it always got.
+  if (out && typeof out === "object") out.rejected = rejected;
   return corrections;
 }
 

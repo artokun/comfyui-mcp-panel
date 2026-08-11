@@ -6,6 +6,75 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-08-11
+
+> #968: three reports of the panel saying "bound to the requested workflow" while graph
+> commands kept hitting the previous one — once queueing the wrong workflow outright. They
+> have not converged because, after the fact, a stale binding and a fresh one look identical.
+
+### Added
+- a workflow-instance refusal now reports **what last moved the active workflow**, when
+  anything did. If a panel command made the move it is named. If nothing claimed it, the
+  refusal says so — and says plainly that this does NOT prove the panel was uninvolved,
+  because not every command can register a claim. What it does establish either way is that
+  a binding taken before that move is stale.
+
+### Changed
+- it decides nothing, deliberately. No refusal becomes an acceptance, and a refusal with no
+  move to report is byte-for-byte what it was. Widening trust on an entry route nobody has
+  identified is how a refusal turns into the silent wrong-graph edit this issue is about.
+- ruled out along the way, and recorded on the issue: `panel_open_workflow` forces the canvas
+  repaint itself and verifies it, both of its skip paths fail closed, and the report where
+  the wrong workflow was queued ran on a build that already had both protections. So the
+  binding is correct when it is made, and something re-points the tab afterwards.
+
+
+## [0.13.5] - 2026-08-11
+
+> #1369: `panel_add_node` applied a node definition's declared default over a widget's
+> value whenever the two differed. For a COMBO whose option list does not CONTAIN that
+> default, the "correction" wrote a value the node cannot accept — and reported success.
+
+### Fixed
+
+- a stale-schema "correction" no longer rewrites a valid COMBO widget to a value the node
+  cannot accept (#1369). The live KJNodes def is
+  `"sage_attention": [["disabled","auto",...], {"default": false}]` — the widget held a
+  valid `"disabled"` and was overwritten with `false`.
+- when a declared default is absent from that same definition's option list, the existing
+  value is KEPT and the refusal recorded, rather than written and called a correction.
+
+### Changed
+
+- verified against this machine's live ComfyUI (4183 node types): of 1105 combo inputs
+  carrying a default, 1083 corrections still apply and 22 are refused. The 22 are the
+  reported KJNodes case plus model-filename defaults naming files not installed here,
+  which ComfyUI's own `validate_inputs` would reject as well. No valid default was
+  refused — the direction that would have quietly disabled the correction entirely.
+
+## [0.13.4] - 2026-08-10
+
+> #584: a ComfyUI tab that keeps running OLD panel JS after a reload, so the orchestrator
+> sees a stale version and refuses graph writes. This is a backstop for hosts that leave the
+> door open — not a cure, and the notes below say exactly which.
+
+### Fixed
+- the pack now gives its own `/extensions/comfyui-mcp-panel/` assets a cache policy on hosts
+  that set none, matching the value current ComfyUI already applies to every extension.
+  Older ComfyUI builds serve extension files with an ETag from mtime+size and no policy,
+  which is the shape that lets a replaced file keep being served from cache.
+
+### Changed
+- **Measured before claiming**: ComfyUI 0.31.1 already sends `Cache-Control: no-store` for
+  every `/extensions/` path, so on current builds this changes nothing. The staleness
+  reproduced while developing 0.13.3 turned out not to be a cache at all — it was a reload
+  cancelled by ComfyUI's unsaved-changes prompt.
+- A first attempt used a weaker header and was described as a no-op. It was not: this pack's
+  middleware runs INSIDE ComfyUI's own, so the host's `setdefault` preserved the weaker
+  value and the panel's assets ended up with a LOOSER policy than every other pack's. The
+  shipped version matches the host's value, so that inversion cannot happen.
+
+
 ## [0.13.3] - 2026-08-10
 
 > #753: the panel's text was small and the obvious fix did nothing. Overriding
