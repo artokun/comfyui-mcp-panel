@@ -248,6 +248,15 @@ export function findRgthreeSeedNodes(nodes) {
   for (const node of nodes) {
     try {
       if (!isRgthreeSeedNode(node)) continue;
+      // MUTED / BYPASSED nodes are not participating, and rgthree's own handler returns
+      // early for exactly these two modes:
+      //
+      //     if (this.mode === LiteGraph.NEVER || this.mode === 4) return;
+      //
+      // So it substitutes nothing, the node contributes nothing, and naming it would point
+      // the user at a node that is not in the run — noise in a warning whose whole value is
+      // naming the right one. (LiteGraph: 2 = NEVER/mute, 4 = bypass.)
+      if (node?.mode === 2 || node?.mode === 4) continue;
       const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
       const seedWidget = widgets.find((w) => w?.name === "seed");
       if (!seedWidget) continue;

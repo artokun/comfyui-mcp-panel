@@ -270,6 +270,17 @@ test("#1339 — an ARMED node with a degenerate random range still repeats", () 
   }
 });
 
+test("#1339 — a MUTED or BYPASSED seed node is not named", () => {
+  // rgthree's handler returns early for exactly these modes, so the node substitutes
+  // nothing and contributes nothing. Naming it points the user at a node that is not in
+  // the run, in a warning whose entire value is naming the right one.
+  for (const mode of [2, 4]) {
+    assert.deepEqual(findRgthreeSeedNodes([{ ...rgthreeSeed(649, 12345), mode }]), [], `mode ${mode}`);
+  }
+  // …and an ordinary mode (0 = ALWAYS) is still reported.
+  assert.equal(findRgthreeSeedNodes([{ ...rgthreeSeed(649, 12345), mode: 0 }]).length, 1);
+});
+
 test("#1339 — silent for a batch of one, where a repeated seed is not a surprise", () => {
   const found = findRgthreeSeedNodes([rgthreeSeed(649, 12345)]);
   assert.equal(rgthreeFixedSeedNote(found, 1), "");
