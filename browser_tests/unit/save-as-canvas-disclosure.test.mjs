@@ -17,10 +17,12 @@
  *   this at `workflow-save.js`, where it is the reason the copy's state is persisted from
  *   the SOURCE tab rather than re-read from the shared canvas (#708).
  *
- * So after a Save-As the copy is active while the canvas still holds the SOURCE
- * workflow's graph, and the graph fence refuses CORRECTLY: the canvas really is the other
- * workflow's. A caller that re-fenced perfectly is still refused, which is exactly what
- * the reporter did and saw.
+ * So a Save-As does not ASK for a repaint — which is all that is established. Whether the
+ * canvas still holds the source graph when the caller reads the reply is NOT observed: a
+ * user switching tabs, or a reconnect restoring one, can repaint during the save's awaits.
+ * When it was not repainted, the graph fence refuses CORRECTLY, because the canvas really
+ * is the other workflow's — and a caller that re-fenced perfectly is still refused, which
+ * is exactly what the reporter did and saw.
  *
  * An earlier version of this fix stamped the produced identity onto the root to clear the
  * refusal. It was removed in review: with the canvas still holding the source graph, that

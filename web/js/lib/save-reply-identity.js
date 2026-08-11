@@ -57,15 +57,18 @@ export function saveReplyIdentity(identity, { savedAs = false } = {}) {
     ...(savedAs
       ? {
           workflow_instance_changed: true,
-          // #978 — RE-FENCING IS NOT ENOUGH, and saying only that stranded a reporter who
-          // did it correctly and was still refused. ComfyUI's own store moves the active
-          // pointer without repainting: `workflowStore.openWorkflow` does not call
-          // `loadGraphData` (only `workflowService.openWorkflow` does), so after a Save-As
-          // the CANVAS still holds the SOURCE workflow's graph while the COPY is active.
-          // The graph fence compares the live root's identity against the active
+          // #978 — RE-FENCING MAY NOT BE ENOUGH, and saying only "re-fence" stranded a
+          // reporter who did it correctly and was still refused. ComfyUI's own store moves
+          // the active pointer without repainting: `workflowStore.openWorkflow` does not
+          // call `loadGraphData` (only `workflowService.openWorkflow` does), and the
+          // Save-As adapter documents this as the reason it persists the copy from the
+          // SOURCE tab. So this save does not ASK for a repaint — which is all that is
+          // established here. Whether the canvas still holds the source graph WHEN THE
+          // CALLER READS THIS is not observed: a user switching tabs, or a reconnect
+          // restoring one, can repaint during the save's awaits. If it was not repainted,
+          // the graph fence compares the live root's identity against the active
           // workflow's and refuses — correctly, because the canvas really is the other
-          // workflow's. The remedy is to bring the copy onto the canvas, which is what
-          // `panel_open_workflow` does.
+          // workflow's — and `panel_open_workflow` is what brings the copy onto it.
           // WHAT IS ESTABLISHED is that the save did not ASK for a repaint (codex): it
           // activates through the store, and nothing here observes the root at reply
           // time. A user switching tabs, or a reconnect restoring one, could repaint the
