@@ -163,3 +163,132 @@ test("#952 (codex) the retirement note takes the caller's detail, and defaults f
   retire(q, { alreadyAnswered: () => false });
   assert.match(q._children[0].textContent, /If it asked again, answer the newer card\./, "the default stands");
 });
+
+test("#952 (codex r2) a card painted BEFORE its socket handshakes is not retired by that handshake", () => {
+  // A command frame is accepted before the handshake, so an interactive card can be painted
+  // on socket B while the UI still believes A is live. Retiring on B's `connected` would
+  // then kill a card that is perfectly answerable — worse than the duplicate this fixes.
+  // The sandbox runs the SHIPPED registry functions with the shipped handler's two lines,
+  // which the source guard below pins.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const register = namedFunctionSource(src, "registerInteractiveCard");
+  const sweep = namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets");
+  const make = new Function(
+    `let liveSocketId = null;
+     const liveInteractiveCards = new Set();
+     ${register}
+     ${sweep}
+     function onStatus(state, socketId) {
+       if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
+       if (state === "connected") retireInteractiveCardsFromPreviousSockets();
+     }
+     return { registerInteractiveCard, onStatus, liveCount: () => liveInteractiveCards.size };`,
+  );
+  const s = make();
+
+  // Socket A connects; a card is painted and answered normally.
+  s.onStatus("connected", 1);
+  const retiredA = [];
+  s.registerInteractiveCard({ retire: () => retiredA.push("A") });
+
+  // A drops, B opens ("connecting" carries B's id) and receives ask_user BEFORE its models
+  // frame — the window this test exists for.
+  s.onStatus("connecting", 2);
+  const retiredB = [];
+  s.registerInteractiveCard({ retire: () => retiredB.push("B") });
+
+  // B handshakes.
+  s.onStatus("connected", 2);
+  assert.deepEqual(retiredA, ["A"], "the card from the previous socket IS retired");
+  assert.deepEqual(retiredB, [], "the card painted on B, before B handshaked, is NOT");
+  assert.equal(s.liveCount(), 1, "and B's card is still tracked");
+});
+
+test("#952 (codex r2) a RE-HANDSHAKE on the same socket retires nothing", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const make = new Function(
+    `let liveSocketId = null;
+     const liveInteractiveCards = new Set();
+     ${namedFunctionSource(src, "registerInteractiveCard")}
+     ${namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets")}
+     function onStatus(state, socketId) {
+       if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
+       if (state === "connected") retireInteractiveCardsFromPreviousSockets();
+     }
+     return { registerInteractiveCard, onStatus };`,
+  )();
+  make.onStatus("connected", 7);
+  const retired = [];
+  make.registerInteractiveCard({ retire: () => retired.push("x") });
+  // Every models frame re-emits "connected" on the SAME socket; a workflow change re-hellos it.
+  make.onStatus("connected", 7);
+  make.onStatus("connected", 7);
+  assert.deepEqual(retired, [], "a live card survives any number of re-handshakes");
+});
+
+test("#952 (codex r2) source guard: adoption is unconditional, retirement waits for the handshake", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(
+    src,
+    /if \(socketId != null && socketId !== liveSocketId\) liveSocketId = socketId;\r?\n\s*if \(state === "connected"\) retireInteractiveCardsFromPreviousSockets\(\);/,
+    "adopt on any status carrying a new id; sweep only on connected",
+  );
+  // The open path must actually emit a status carrying the new socket's id, or a card
+  // painted pre-handshake would still record the previous one.
+  assert.match(src, /thisSock\.__cmcpSocketId = \+\+socketSeq;/);
+  assert.match(src, /onStatus\(s, sock\?\.__cmcpSocketId \?\? null\)/);
+});
+
+test("#952 (codex r2) the card records the socket that ASKED, not the UI's belief", () => {
+  // The open status that would tell the UI about a new socket is suppressed once the
+  // patience window has been given up on (`if (!gaveUp) emitStatus("connecting")`), so a
+  // UI-side belief can be stale exactly when a pre-handshake command arrives. Taking the
+  // id from the command's own socket removes the dependency entirely.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /result = await onAsk\(msg, thisSock\.__cmcpSocketId \?\? null\);/, "ask carries its socket");
+  assert.match(src, /result = await onSecret\(msg, thisSock\.__cmcpSocketId \?\? null\);/, "so does the secret request");
+  assert.match(src, /onAsk\(msg, socketId\) \{/, "the UI takes it");
+  assert.match(src, /onSecret\(msg, socketId\) \{/);
+  assert.match(src, /const p = paintQuestion\(msg, socketId\);/, "and threads it to the painter");
+  assert.match(src, /const p = paintSecret\(msg, socketId\);/);
+  assert.match(src, /function paintQuestion\(msg, paintedOnSocket = null\) \{/);
+  assert.match(src, /function paintSecret\(msg, paintedOnSocket = null\) \{/);
+  // The registry entry prefers the painter's own id and falls back to the UI's belief.
+  // BOTH painters, COUNTED. Matching once passed while one of the two had lost it — a
+  // guard that cannot tell "both do this" from "at least one does" is not guarding much.
+  assert.equal(
+    (src.match(/\.\.\.\(paintedOnSocket != null \? \{ paintedOnSocket \} : \{\}\),/g) ?? []).length,
+    2,
+    "the question card AND the secret card each record the socket they were painted on",
+  );
+});
+
+test("#952 (codex r2) a card painted on a socket the UI never adopted is still tied to it", () => {
+  // The behavioural half: with the id coming from the COMMAND, a card painted while
+  // `liveSocketId` is stale still records the socket that asked, so that socket
+  // handshaking does not retire it — and the older one still does. This matters because
+  // the open status carrying a new socket's id is suppressed once the patience window has
+  // been given up on, so the UI's belief can be stale exactly when it counts.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const make = new Function(
+    `let liveSocketId = null;
+     const liveInteractiveCards = new Set();
+     ${namedFunctionSource(src, "registerInteractiveCard")}
+     ${namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets")}
+     function onStatus(state, socketId) {
+       if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
+       if (state === "connected") retireInteractiveCardsFromPreviousSockets();
+     }
+     return { registerInteractiveCard, onStatus };`,
+  )();
+  make.onStatus("connected", 1); // socket A is live
+  const retiredA = [];
+  make.registerInteractiveCard({ retire: () => retiredA.push("A") });
+  // Socket B opens with NO status reaching the UI, and an ask_user arrives on it: the
+  // painter names B explicitly.
+  const retiredB = [];
+  make.registerInteractiveCard({ paintedOnSocket: 2, retire: () => retiredB.push("B") });
+  make.onStatus("connected", 2); // B finally handshakes
+  assert.deepEqual(retiredA, ["A"], "the card from A is retired");
+  assert.deepEqual(retiredB, [], "the card that named B survives B handshaking");
+});
