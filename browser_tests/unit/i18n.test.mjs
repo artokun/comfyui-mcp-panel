@@ -192,7 +192,10 @@ test("module-scope config reads translations LAZILY, not at import time", () => 
     const rest = src.slice(start + 1);
     const endRel = rest.search(/\n(?:const|let|var|function|export|\/\*\*|\/\/ ─)/);
     const block = endRel === -1 ? rest : rest.slice(0, endRel);
-    const bare = block.split("\n").filter((l) => /\b(?:label|title|note|hint)\s*:\s*tr\(/.test(l));
+    // `desc` added after unit 7 found FLOWS' desc: fields eagerly evaluated while the title:
+    // fields beside them were correctly lazy — the guard listed the fields it had seen fail,
+    // not the fields that can fail. Add any new display field here when one appears.
+    const bare = block.split("\n").filter((l) => /\b(?:label|title|note|hint|desc|text|summary)\s*:\s*tr\(/.test(l));
     assert.deepEqual(
       bare,
       [],
