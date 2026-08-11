@@ -1360,11 +1360,18 @@ function isExternalWorkflowPath(path) {
  *  their first successful save came only from treating the URL source as never persisted.
  *
  *  Requiring "//" keeps this off an ordinary Windows drive letter and off a folder
- *  legitimately named "notes:draft". Opaque schemes (`blob:`, `data:`) are deliberately NOT
- *  matched: catching them needs a bare `scheme:`, which would hit real folder names, and the
- *  reported shape is hierarchical. On POSIX a managed directory could syntactically contain
- *  "://" — accepted knowingly, because such a directory cannot round-trip through /userdata
- *  anyway, and a save redirected to the workflows root is recoverable where a 500 is not. */
+ *  legitimately named "notes:draft".
+ *
+ *  What that leaves unmatched is narrower than "opaque schemes" (codex): `blob:http://…`
+ *  DOES match, on its embedded hierarchical URL. Only a form carrying no "://" at all —
+ *  `data:application/json,{}` — stays unmatched. Catching those needs a bare `scheme:`,
+ *  which would hit real folder names, and no reported shape needs it.
+ *
+ *  KNOWN FALSE POSITIVE: on POSIX a managed directory may syntactically contain "://"
+ *  (`workflows/notes://draft`), and this redirects its Save-As to the workflows root. Taken
+ *  knowingly rather than discovered later — a redirected save is recoverable and visible,
+ *  where the 500 it replaces left the tab unsaveable under any name. It cannot arise on
+ *  Windows, where ":" is illegal in a filename. */
 function isUrlDerivedWorkflowPath(path) {
   return /[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(String(path || ""));
 }

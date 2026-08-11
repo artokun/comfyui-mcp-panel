@@ -85,12 +85,24 @@ test("#1066 a bare colon is not a scheme — '//' is what makes it a URL", () =>
   }
 });
 
-test("#1066 opaque schemes are deliberately NOT matched, and the source says why", () => {
-  // Catching `blob:`/`data:` needs a bare `scheme:`, which would also hit real folder names.
-  // The reported shape is hierarchical, so the trade buys nothing.
-  assert.equal(isUrlDerived("blob:http://127.0.0.1:8188/abc"), true, "this one contains :// anyway");
-  assert.equal(isUrlDerived("data:application/json,{}"), false);
-  assert.match(SRC, /Opaque schemes \(`blob:`, `data:`\) are deliberately NOT/);
+test("#1066 what stays unmatched is narrower than 'opaque schemes'", () => {
+  // An earlier comment of mine claimed `blob:` was not matched. It IS — on its embedded
+  // hierarchical URL (codex). Only a form carrying no "://" at all stays out.
+  assert.equal(isUrlDerived("blob:http://127.0.0.1:8188/abc"), true, "matches on the embedded http://");
+  assert.equal(isUrlDerived("data:application/json,{}"), false, "no :// anywhere");
+});
+
+test("#1066 THE KNOWN FALSE POSITIVE, tested as behaviour rather than as prose", () => {
+  // A previous version of this test asserted that a comment existed, which proves nothing
+  // about what the code does (codex). On POSIX a managed directory can syntactically contain
+  // "://", and this predicate DOES match it — so such a tab's Save-As is redirected to the
+  // workflows root. That is the accepted cost: a redirected save is recoverable and visible,
+  // where the 500 it replaces left the tab unsaveable under any name.
+  assert.equal(isUrlDerived("workflows/notes://draft"), true, "a legal POSIX folder name matches");
+  assert.equal(isUrlDerived("workflows/a/b://c"), true);
+  // It cannot arise on Windows, where ":" is illegal in a filename — so the exposure is
+  // limited to POSIX deployments that use such a name deliberately.
+  assert.equal(isUrlDerived("workflows/notes-draft"), false, "the ordinary spelling is unaffected");
 });
 
 test("#1066 the directory redirect consumes it and sends the save to the workflows root", () => {
@@ -100,10 +112,3 @@ test("#1066 the directory redirect consumes it and sends the save to the workflo
   );
 });
 
-test("#1066 the POSIX false positive is acknowledged rather than discovered later", () => {
-  // A relative managed directory can syntactically contain "://" on POSIX. Accepted
-  // knowingly: such a directory cannot round-trip through /userdata anyway, and a save
-  // redirected to the root is recoverable where a 500 is not.
-  assert.match(SRC, /On POSIX a managed directory could syntactically contain/);
-  assert.match(SRC, /recoverable where a 500 is not/);
-});
