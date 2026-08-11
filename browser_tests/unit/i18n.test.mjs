@@ -37,6 +37,33 @@ test("placeholders interpolate in both the translation and the fallback", () => 
   assert.equal(tr("panel.absent", "Welcome {name}", { name: "Sean" }), "Welcome Sean");
 });
 
+test("a substituted VALUE is never re-scanned for placeholders", () => {
+  // The model picker renders `No model matches “{query}” across {count} connected
+  // providers`, where {query} is whatever the user typed. A per-variable substitution loop
+  // replaced {query} first and then re-scanned the result, so typing the literal text
+  // "{count}" into the search box had the user's own query overwritten by the provider
+  // count. Values are inserted, never re-interpreted — and this must hold whichever order
+  // the vars object happens to enumerate in.
+  __setCatalogForTest("en", {});
+  assert.equal(
+    tr("panel.absent", "No model matches “{query}” across {count} connected providers.", {
+      query: "{count}",
+      count: 3,
+    }),
+    "No model matches “{count}” across 3 connected providers.",
+  );
+  // Reversed declaration order must give the same answer.
+  assert.equal(
+    tr("panel.absent", "No model matches “{query}” across {count} connected providers.", {
+      count: 3,
+      query: "{count}",
+    }),
+    "No model matches “{count}” across 3 connected providers.",
+  );
+  // A hole with no matching var is still left verbatim, as it always was.
+  assert.equal(tr("panel.absent", "Hello {name}, you are {rank}", { name: "Sean" }), "Hello Sean, you are {rank}");
+});
+
 test("Detect defers to ComfyUI, an explicit choice overrides it", () => {
   // "" (Detect) -> ComfyUI's language.
   assert.equal(pickLocale({ ourSetting: "", comfyLocale: "ja", navigatorLangs: ["fr"] }), "ja");
