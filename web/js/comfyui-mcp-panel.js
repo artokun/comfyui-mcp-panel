@@ -16232,6 +16232,42 @@ function redactBridgeUrl(u) {
 // stamped on its receiving socket: a retained predecessor-process rid is
 // unknown in the new epoch and therefore fails open instead of replaying or
 // rejecting a prior session's command.
+// #646 — a duplicate delivery must not wait FOREVER on an in-flight original.
+//
+// The ledger records a command IN-FLIGHT at begin() and completes it at settleRid(). An
+// in-flight entry is never evicted, deliberately: dropping an unsettled command would let
+// its replay double-apply a mutation. So an executor that never returns leaves a redelivery
+// awaiting a promise that can never resolve, and the panel sends NOTHING — the caller sees
+// a timeout instead of an error, which is the reported shape.
+//
+// Bounded HERE, in a helper that returns an ordinary reply, so the handler keeps exactly the
+// statement shape #508 and #694 pin: one await, then the existing rid-rewrite and send. A
+// new branch in that region is what those guards forbid, and they are right to.
+//
+// The ORIGINAL entry is never settled by this. Answering "failed" for a command that may
+// still be running is how a caller retries into the double-apply the ledger exists to stop.
+const DUPLICATE_AWAIT_MS = 25000;
+function awaitDuplicateReply(prior, rid) {
+  return Promise.race([
+    Promise.resolve(prior),
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            rid,
+            ok: false,
+            error:
+              "This request id is STILL RUNNING in the panel and has not produced an outcome after " +
+              Math.round(DUPLICATE_AWAIT_MS / 1000) +
+              "s. This delivery was a DUPLICATE of it, so nothing new was started and nothing was " +
+              "applied twice. DO NOT RETRY: the original may still complete, and re-issuing it is how " +
+              "one mutation becomes two. Read the graph to see whether it took effect.",
+          }),
+        DUPLICATE_AWAIT_MS,
+      ),
+    ),
+  ]);
+}
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
 
 // #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
@@ -16844,7 +16880,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         if (priorRidReply !== undefined) {
           let dupReply;
           try {
-            dupReply = await priorRidReply;
+            dupReply = await awaitDuplicateReply(priorRidReply, msg.rid);
           } catch {
             return; // ledger promises never reject — defensive only
           }
