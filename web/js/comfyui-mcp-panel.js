@@ -24313,7 +24313,7 @@ function buildPanel() {
     skip.type = "button";
     skip.style.cssText =
       "flex:none;padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-      "background:transparent;color:inherit;cursor:pointer;font-size:0.8rem;";
+      "background:transparent;color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
     skip.textContent = tr("panel.skip", "Skip");
     skip.addEventListener("click", () => finish(""));
     btns.appendChild(skip);
