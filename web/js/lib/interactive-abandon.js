@@ -1,10 +1,17 @@
 // #952 — withdrawing an interactive card must also END the command behind it.
 //
 // `ask_user` and `request_secret` are the only panel commands whose executor
-// blocks on a HUMAN. When the connection that asked drops, the card is retired
-// (its controls are disabled and it says why) but its promise was deliberately
-// left unresolved: resolving it with an ANSWER would fabricate one, and the
-// panel's rule is that a reply CARRYING one does not cross a reconnect.
+// blocks on a HUMAN. Once a DIFFERENT socket reaches `connected`, cards painted
+// on the superseded one are retired (their controls are disabled and they say
+// why) but their promises were deliberately left unresolved: resolving one with
+// an ANSWER would fabricate it, and the panel's rule is that a reply CARRYING an
+// answer does not cross a reconnect.
+//
+// Note the trigger precisely (codex r4): a bare disconnect retires nothing. Until
+// a replacement connection hands the UI a new socket id, the card stays live and
+// its command stays pending — which is correct, since a socket that comes back is
+// the same conversation. Everything below is about what happens once the sweep
+// does run.
 //
 // Leaving it unresolved has its own cost, and that cost is what this module is
 // for. The executor stays suspended on `await onAsk(...)` forever, so:

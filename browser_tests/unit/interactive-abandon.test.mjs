@@ -158,8 +158,10 @@ test("#952 (codex ×2) the claim is the LEDGER — not a caller-visible recovery
   // buffer keeps `msg.ok` only. The second retreated to "a REDELIVERY reads it", which is
   // also not a production path for these two commands: every dispatch mints a fresh rid,
   // `retry_of` is injected only for RETRY_TOKEN_CMDS (which excludes both), and re-asking
-  // mints a new `ask_id` that is part of the fingerprint. What survives is narrow and
-  // true: the entry settles, so it is evictable and no later delivery can hang.
+  // mints a new `ask_id` that is part of the fingerprint. What survives is narrow: while
+  // the settled entry is RETAINED a matching duplicate replays its recorded failure, and
+  // settling makes the entry eligible for ordinary cap eviction. Not more — eviction is
+  // fail-open, so a duplicate after it ages out executes fresh and blocks on a human again.
   const src = readFileSync(new URL("../../web/js/lib/interactive-abandon.js", import.meta.url), "utf8");
   assert.match(src, /It does NOT rescue the interrupted call/, "the limit is stated, not implied");
   assert.match(src, /the caller\s*(?:\/\/\s*)?never sees the text below/, "and stated concretely");
@@ -171,14 +173,38 @@ test("#952 (codex ×2) the claim is the LEDGER — not a caller-visible recovery
   assert.match(src, /While the settled \(epoch, rid, fingerprint\) entry is RETAINED/);
   assert.match(src, /eligible for normal cap eviction/);
   assert.match(src, /Eviction is deliberately fail-open/);
+  // Scanned across the module AND this file (codex r4): a negative assertion that only
+  // polices the source lets the retracted claim survive in the comment that explains it,
+  // which is where the next reader would pick it back up.
+  const self = readFileSync(new URL("./interactive-abandon.test.mjs", import.meta.url), "utf8");
   for (const overclaim of [
     /the caller (?:learns|is told|sees) (?:that )?the card was withdrawn/i,
     /the only path on which a caller reads it/i,
     /does still reach the handler/i,
-    /no future delivery of that rid\s*(?:\/\/\s*)?can hang the handler/i,
+    /no (?:later|future) delivery (?:of that rid\s*(?:\/\/\s*)?)?can hang/i,
   ]) {
-    assert.ok(!overclaim.test(src), `retracted claim is gone: ${overclaim}`);
+    assert.ok(!overclaim.test(src), `retracted claim is gone from the module: ${overclaim}`);
+    // This file quotes the retracted phrasings inside the regex list itself, so compare
+    // against the prose only — everything outside these bracketed patterns.
+    const prose = self.replace(/for \(const overclaim of \[[\s\S]*?\]\) \{/, "");
+    assert.ok(!overclaim.test(prose), `…and from this test's own comments: ${overclaim}`);
   }
+});
+
+test("#952 (codex r4) the trigger is a REPLACEMENT connection, not a bare disconnect", () => {
+  // The header used to say the card is retired "when the connection that asked drops".
+  // The sweep runs from a `connected` status carrying a different socket id — so a socket
+  // that simply drops retires nothing, and the card stays live until something replaces
+  // it. Documenting the wrong trigger would have a reader expect an abandonment reply at
+  // a moment when none is produced.
+  const src = readFileSync(new URL("../../web/js/lib/interactive-abandon.js", import.meta.url), "utf8");
+  assert.match(src, /a bare disconnect retires nothing/, "the trigger is stated correctly");
+  const panel = readFileSync(PANEL, "utf8");
+  assert.match(
+    panel,
+    /if \(state === "connected"\) retireInteractiveCardsFromPreviousSockets\(\);/,
+    "and that is what the wiring does",
+  );
 });
 
 test("#952 (codex r3) the note does not claim a card that may not be on screen", () => {
