@@ -19,6 +19,8 @@ import { readFileSync } from "node:fs";
 import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
+  findRgthreeSeedNodes,
+  rgthreeFixedSeedNote,
 } from "../../web/js/lib/scoped-batch-seed.js";
 
 /** The real KSampler widget order: the control sits immediately after the value. */
@@ -170,4 +172,165 @@ test("#988 (codex r3): the warning is NOT gated on Comfy.WidgetControlMode — m
   assert.equal(controls.length, 1, "detection does not consult any widget-control-mode setting");
   const note = scopedBatchSeedNote(controls, 3);
   assert.doesNotMatch(note, /WidgetControlMode|beforeQueued|afterQueued/, "and makes no claim about it");
+});
+
+/**
+ * #1339 — the same surprise from a node #988's scan cannot see.
+ *
+ * The widget shape here is taken from a LIVE `Seed (rgthree)` instance created in the
+ * browser, not from what the node looks like in my head: rgthree removes
+ * `control_after_generate` and leaves `seed` plus three buttons.
+ */
+const rgthreeSeed = (id, seedValue) => ({
+  id,
+  type: "Seed (rgthree)",
+  widgets: [
+    { name: "seed", value: seedValue },
+    { name: "🎲 Randomize Each Time", value: "" },
+    { name: "🎲 New Fixed Random", value: "" },
+    { name: "USE_LAST_SEED", value: "okay" },
+  ],
+});
+
+test("#1339 — an rgthree seed node is invisible to the control_after_generate scan", () => {
+  // The defect, stated as a test: this is why the reporter got no warning at all.
+  assert.deepEqual(findRepeatingControlWidgets([rgthreeSeed(649, 12345)]), []);
+  // …and the new scan does see it.
+  assert.equal(findRgthreeSeedNodes([rgthreeSeed(649, 12345)]).length, 1);
+});
+
+test("#1339 — a FIXED rgthree seed is reported for a batch > 1", () => {
+  const found = findRgthreeSeedNodes([rgthreeSeed(649, 12345)]);
+  assert.deepEqual(found, [
+    { node_id: "649", node_type: "Seed (rgthree)", seed: 12345, armed: false, varies: false },
+  ]);
+  const note = rgthreeFixedSeedNote(found, 10);
+  assert.match(note, /ALL 10 ITEMS/);
+  assert.match(note, /node 649/);
+  assert.match(note, /12345/);
+  // The remedy is the button that arms it, named exactly as the node shows it.
+  assert.match(note, /Randomize Each Time/);
+});
+
+test("#1339 — an ARMED rgthree seed says NOTHING", () => {
+  // The direction that matters most. Measured: driving rgthree's handler three times with
+  // the sentinel posts three DIFFERENT seeds, and a scoped batch calls api.queuePrompt
+  // once per item — so an armed node genuinely varies, and warning about it would be a
+  // confident wrong sentence. This is also why the #988 note is not simply reused here.
+  for (const [sentinel, mode] of [
+    [-1, "randomize"],
+    [-2, "increment"],
+    [-3, "decrement"],
+  ]) {
+    const found = findRgthreeSeedNodes([rgthreeSeed(649, sentinel)]);
+    assert.deepEqual(found, [
+      { node_id: "649", node_type: "Seed (rgthree)", seed: sentinel, armed: true, varies: true, mode },
+    ]);
+    assert.equal(rgthreeFixedSeedNote(found, 10), "");
+  }
+});
+
+test("#1339 — a LINKED seed is still read from the widget, because rgthree overwrites it", () => {
+  // I added a guard here that declined when the seed was converted to an input, reasoning
+  // that the widget value would be stale. That is true of an ordinary node and FALSE of
+  // this one: rgthree's queue handler writes `outputInputs[seed] = getSeedToUse()` from
+  // its own widget regardless of any link. Declining suppressed the warning for a linked
+  // node holding a fixed number — a MISSED warning, which is the original bug rather than
+  // a new false claim (codex probe 2).
+  const driven = { ...rgthreeSeed(649, 12345), inputs: [{ name: "seed", link: 42 }] };
+  const found = findRgthreeSeedNodes([driven]);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].varies, false);
+  assert.match(rgthreeFixedSeedNote(found, 10), /node 649/);
+});
+
+test("#1339 — an ARMED node with a degenerate random range still repeats", () => {
+  // codex P2. rgthree's randomMin/randomMax are node PROPERTIES the user can edit, and
+  // `generateRandomSeed` draws inside them — so a range admitting one value returns that
+  // value every time while the node looks armed. Silence there would recreate the exact
+  // surprise this warning exists for, and it is the more confusing case: they DID press
+  // the button.
+  const degenerate = {
+    ...rgthreeSeed(649, -1),
+    properties: { randomMin: 5, randomMax: 5 },
+  };
+  const found = findRgthreeSeedNodes([degenerate]);
+  assert.equal(found[0].armed, true);
+  assert.equal(found[0].varies, false);
+  const note = rgthreeFixedSeedNote(found, 10);
+  assert.match(note, /armed to randomize/);
+  assert.match(note, /randomMin=5, randomMax=5/);
+  assert.match(note, /randomMin\/randomMax/);
+
+  // A range that LOOKS healthy but cannot vary, because of the widget's step. rgthree
+  // divides by step/10, so randomRange <= 1 makes every draw return randomMin — measured
+  // as ONE distinct value across 200 draws at min=0, max=5, step=100, while `min < max`
+  // says nothing is wrong. Found by working the probe rather than waiting to be told.
+  const bigStep = {
+    ...rgthreeSeed(650, -1),
+    properties: { randomMin: 0, randomMax: 5 },
+    widgets: [{ name: "seed", value: -1, options: { step: 100 } }],
+  };
+  assert.equal(findRgthreeSeedNodes([bigStep])[0].varies, false);
+  assert.match(rgthreeFixedSeedNote(findRgthreeSeedNodes([bigStep]), 3), /at step 100/);
+
+  // …and the same narrow range at the ORDINARY step still varies (50 distinct values).
+  const okStep = {
+    ...rgthreeSeed(651, -1),
+    properties: { randomMin: 0, randomMax: 5 },
+    widgets: [{ name: "seed", value: -1, options: { step: 1 } }],
+  };
+  assert.equal(findRgthreeSeedNodes([okStep])[0].varies, true);
+
+  // A NORMAL range keeps its silence — the defaults, and an explicit wide range.
+  for (const properties of [undefined, { randomMin: 0, randomMax: 1125899906842624 }]) {
+    const ok = { ...rgthreeSeed(649, -1), ...(properties ? { properties } : {}) };
+    assert.equal(findRgthreeSeedNodes([ok])[0].varies, true);
+    assert.equal(rgthreeFixedSeedNote(findRgthreeSeedNodes([ok]), 10), "");
+  }
+});
+
+test("#1339 — a MUTED or BYPASSED seed node is not named", () => {
+  // rgthree's handler returns early for exactly these modes, so the node substitutes
+  // nothing and contributes nothing. Naming it points the user at a node that is not in
+  // the run, in a warning whose entire value is naming the right one.
+  for (const mode of [2, 4]) {
+    assert.deepEqual(findRgthreeSeedNodes([{ ...rgthreeSeed(649, 12345), mode }]), [], `mode ${mode}`);
+  }
+  // …and an ordinary mode (0 = ALWAYS) is still reported.
+  assert.equal(findRgthreeSeedNodes([{ ...rgthreeSeed(649, 12345), mode: 0 }]).length, 1);
+});
+
+test("#1339 — silent for a batch of one, where a repeated seed is not a surprise", () => {
+  const found = findRgthreeSeedNodes([rgthreeSeed(649, 12345)]);
+  assert.equal(rgthreeFixedSeedNote(found, 1), "");
+  assert.equal(rgthreeFixedSeedNote(found, undefined), "");
+});
+
+test("#1339 — other seed nodes are NOT claimed as rgthree", () => {
+  // The over-broad direction: this scan must not start describing nodes it knows nothing
+  // about, or it will confidently call a node "fixed" whose extension randomizes it by
+  // some other mechanism — which is the exact error this whole issue is about.
+  //
+  // A KSampler alone does not test that: its type has no "seed" in it, so dropping the
+  // rgthree requirement leaves it unmatched and the mutation survives. These are REAL node
+  // types from this machine's /object_info that do contain "seed".
+  const foreignSeed = (id, type) => ({
+    id,
+    type,
+    widgets: [{ name: "seed", value: 12345 }],
+  });
+  for (const type of ["SeedNode", "LatentBatchSeedBehavior", "SeedVR2Conditioning"]) {
+    assert.deepEqual(findRgthreeSeedNodes([foreignSeed(1, type)]), [], type);
+  }
+  assert.deepEqual(findRgthreeSeedNodes([ksampler(53, "randomize")]), []);
+  assert.deepEqual(findRgthreeSeedNodes([ksampler(53, "fixed")]), []);
+});
+
+test("#1339 — survives malformed nodes without taking down the run", () => {
+  assert.deepEqual(findRgthreeSeedNodes(null), []);
+  assert.deepEqual(findRgthreeSeedNodes([null, {}, { type: "Seed (rgthree)" }]), []);
+  // A seed widget that is not a number establishes nothing, so it is not reported as fixed.
+  assert.deepEqual(findRgthreeSeedNodes([rgthreeSeed(1, "not-a-number")]), []);
+  assert.equal(rgthreeFixedSeedNote(null, 5), "");
 });
