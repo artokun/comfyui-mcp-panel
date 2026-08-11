@@ -339,6 +339,10 @@ import {
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
 import {
+  canvasFileDivergence,
+  canvasFileDivergenceNote,
+} from "./lib/canvas-file-divergence.js";
+import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
 } from "./lib/active-workflow-provenance.js";
@@ -12771,6 +12775,7 @@ const GRAPH_TOOL_EXECUTORS = {
     let onDiskContent = null;
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
+    let canvasDivergence = null; // #968
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -13125,6 +13130,23 @@ const GRAPH_TOOL_EXECUTORS = {
         // and the reload decision below. (Interaction is frozen across this whole block, so
         // this is a belt-and-braces second line of defence, not the only one.)
         dirtyNow = !!target.isModified;
+        // #968 — the file is already read here, and nothing compared it to the CANVAS.
+        // decideOpenStaleness asks 'has the file changed since this tab loaded it?' by
+        // comparing disk against the tab's BASELINE; the content proof asks 'did the
+        // repaint reproduce the state it loaded?'. Both pass honestly when the tab's own
+        // state is carrying a DIFFERENT workflow's graph — which is the reported failure.
+        // Comparing the two artefacts already in hand is the one check nobody made.
+        try {
+          const diskParsed = typeof onDiskContent === "string" ? JSON.parse(onDiskContent) : onDiskContent;
+          canvasDivergence = canvasFileDivergence({
+            diskNodes: diskParsed?.nodes,
+            canvasNodes: app?.graph?._nodes ?? app?.graph?.nodes,
+          });
+        } catch {
+          // An unparseable file is 'could not compare', which the helper already means
+          // by leaving `comparable` false — never a divergence claim.
+          canvasDivergence = null;
+        }
         staleInfo = decideOpenStaleness({
           wasOpen,
           // EITHER signal counts as unsaved work: the flag as it reads NOW, and the snapshot
@@ -13332,6 +13354,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // / no baseline) and must NOT claim fresh (codex P2). `reloaded` says whether this
       // call actually re-read the file: true = the canvas now shows the on-disk version;
       // false = it still shows the loaded version and the caller must act.
+      // #968 — a canvas that shares NO node ids with its own file. Its own key, not folded
+      // into stale_hint: staleness is about the FILE changing, this is about the CANVAS not
+      // being the file's graph at all, and a caller may hit one without the other.
+      ...(canvasFileDivergenceNote(canvasDivergence, target.path)
+        ? { canvas_file_divergence: canvasFileDivergenceNote(canvasDivergence, target.path) }
+        : {}),
       ...(staleInfo.stale === true
         ? {
             stale: true,
