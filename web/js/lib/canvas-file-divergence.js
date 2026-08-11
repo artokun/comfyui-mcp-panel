@@ -12,11 +12,12 @@
 //     the file.
 //
 // So this compares the two artefacts already in hand. The signal is node IDENTITY, not
-// content: edits move, add and delete nodes, they do not replace the entire id set. A dirty
-// tab whose canvas shares NO ids with its own file is not what editing looks like.
+// content: incremental editing usually keeps most ids, so a dirty tab whose canvas shares
+// NO ids with its own file is not what editing looks like. (Not an absolute — a whole-graph
+// paste before saving looks the same, which is why this discloses rather than decides.)
 //
 // DISCLOSURE, NOT PROOF, and the distinction is load-bearing. A user can clear a tab and
-// build something new before saving, which is also disjoint. So nothing here decides whether
+// rebuild, or paste an entire graph in, before saving — both are also disjoint (codex). So nothing here decides whether
 // a command may run — it exists so a reply stops claiming "no missing work to redo" about a
 // canvas it has just been shown to share nothing with. A refusal built on this would be a
 // wrong-graph refusal of its own.
@@ -90,9 +91,9 @@ export function canvasFileDivergenceNote(divergence, path) {
   return (
     `WARNING — this canvas shares NO node ids with its own file${where}: ` +
     `${divergence.canvasCount} node(s) on the canvas, ${divergence.diskCount} in the file, ` +
-    `0 in common. Editing moves, adds and deletes nodes; it does not replace every id, so ` +
-    `this is what a canvas holding a DIFFERENT workflow looks like. It is not proof — ` +
-    `clearing this tab and building something new before saving would look the same. ` +
+    `0 in common. Incremental editing usually keeps most ids, so zero overlap is what a ` +
+    `canvas holding a DIFFERENT workflow looks like. It is NOT proof — clearing this tab ` +
+    `and rebuilding, or pasting an entire graph in, before saving would look the same. ` +
     `Before trusting a read or making an edit here, confirm which graph you have: ` +
     `panel_load_workflow re-reads the file, and is the recovery reported to work.`
   );

@@ -98,8 +98,14 @@ test("#968 the note says what it compared and what it does NOT establish", () =>
   assert.match(note, /workflows\/B\.json/);
   assert.match(note, /3 node\(s\) on the canvas, 2 in the file, 0 in common/);
   // The alternative reading is NAMED, not dismissed — people do clear tabs and rebuild.
-  assert.match(note, /It is not proof/);
-  assert.match(note, /clearing this tab and building something new/);
+  assert.match(note, /It is NOT proof/);
+  // Codex named a second legitimate zero-overlap flow — pasting a whole graph in before
+  // saving — so the note names both rather than only the one I had thought of.
+  assert.match(note, /clearing this tab and rebuilding, or pasting an entire graph in/);
+  // Not an absolute claim about editing (codex): "usually keeps most ids", not "never
+  // replaces every id" — the mechanism does not establish the stronger form.
+  assert.match(note, /Incremental editing usually keeps most ids/);
+  assert.ok(!/does not replace every id/.test(note));
   // And the recovery that the reporter confirmed works.
   assert.match(note, /panel_load_workflow re-reads the file/);
   // It must not claim to know which workflow the canvas actually holds.
