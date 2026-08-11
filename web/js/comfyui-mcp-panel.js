@@ -4166,15 +4166,19 @@ const FALLBACK_MODELS = [
   { value: "opus", displayName: "Opus", description: "most capable", supportsEffort: true },
 ];
 // Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
+// GETTERS, not values: this object is built at MODULE scope, which runs before
+// loadCatalog() resolves, so a plain tr() call here would freeze English into the
+// object for the life of the page. `small` is the sub-label under each row in the
+// Effort picker and is just as visible as `label`.
 const EFFORT_META = {
-  none: { get label() { return tr("panel.none", "None"); }, small: "no reasoning" },
-  minimal: { get label() { return tr("panel.minimal", "Minimal"); }, small: "fastest" },
-  low: { get label() { return tr("panel.low", "Low"); }, small: "quick" },
-  medium: { get label() { return tr("panel.medium", "Medium"); }, small: "default" },
-  high: { get label() { return tr("panel.high", "High"); }, small: "thorough" },
-  xhigh: { get label() { return tr("panel.extra_high", "Extra high"); }, small: "deep" },
-  max: { get label() { return tr("panel.max", "Max"); }, small: "exhaustive" },
-  ultra: { get label() { return tr("panel.ultra", "Ultra"); }, small: "4 parallel agents" },
+  none: { get label() { return tr("panel.none", "None"); }, get small() { return tr("panel.no_reasoning", "no reasoning"); } },
+  minimal: { get label() { return tr("panel.minimal", "Minimal"); }, get small() { return tr("panel.fastest", "fastest"); } },
+  low: { get label() { return tr("panel.low", "Low"); }, get small() { return tr("panel.quick", "quick"); } },
+  medium: { get label() { return tr("panel.medium", "Medium"); }, get small() { return tr("panel.default", "default"); } },
+  high: { get label() { return tr("panel.high", "High"); }, get small() { return tr("panel.thorough", "thorough"); } },
+  xhigh: { get label() { return tr("panel.extra_high", "Extra high"); }, get small() { return tr("panel.deep", "deep"); } },
+  max: { get label() { return tr("panel.max", "Max"); }, get small() { return tr("panel.exhaustive", "exhaustive"); } },
+  ultra: { get label() { return tr("panel.ultra", "Ultra"); }, get small() { return tr("panel.4_parallel_agents", "4 parallel agents"); } },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
@@ -19620,18 +19624,28 @@ function buildPanel() {
   emptyTitle.className = "cmcp-empty-title";
   emptyTitle.textContent = tr("panel.your_agent_is_at_your_canvas", "Your agent is at your canvas");
   const emptyBody = document.createElement("div");
-  emptyBody.textContent =
-    "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.";
+  emptyBody.textContent = tr(
+    "panel.build_and_edit_the_live_graph_generate",
+    "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.",
+  );
   empty.append(emptyIcon, emptyTitle, emptyBody);
 
   // Example prompts surface the agent's newer capabilities and prefill the
   // composer on click. `input` is assigned later in this closure; the click
   // handlers run long after, so referencing it is safe.
+  // TRANSLATED on purpose: the chip is read by the HUMAN ("here's what you can ask"),
+  // and clicking it only prefills the composer — the text becomes the user's OWN
+  // message, which they can still edit before sending. Every backend we support is
+  // multilingual, so a Korean user sending a Korean prompt is the correct outcome; a
+  // Korean user staring at four English suggestions is the bug this exists to fix.
   const EXAMPLES = [
-    { icon: "pi-volume-up", text: "Generate a 30s lofi piano track" },
-    { icon: "pi-sliders-h", text: "Build a Flux txt2img graph and run it" },
-    { icon: "pi-exclamation-triangle", text: "Run the workflow and tell me if it errors" },
-    { icon: "pi-search", text: "Find a good Flux LoRA on Civitai and add it" },
+    { icon: "pi-volume-up", text: tr("panel.generate_a_30s_lofi_piano_track", "Generate a 30s lofi piano track") },
+    { icon: "pi-sliders-h", text: tr("panel.build_a_flux_txt2img_graph_and", "Build a Flux txt2img graph and run it") },
+    {
+      icon: "pi-exclamation-triangle",
+      text: tr("panel.run_the_workflow_and_tell_me_if", "Run the workflow and tell me if it errors"),
+    },
+    { icon: "pi-search", text: tr("panel.find_a_good_flux_lora_on_civitai", "Find a good Flux LoRA on Civitai and add it") },
   ];
   const examplesBox = document.createElement("div");
   examplesBox.className = "cmcp-examples";
@@ -19660,38 +19674,57 @@ function buildPanel() {
   // user through installing + signing into a provider, and is shown ONLY when
   // NEITHER provider is ready (CLI on PATH + a login on disk). The moment one is
   // ready it hides and the panel auto-picks that provider (see applyReadiness).
+  //
+  // TRANSLATION BOUNDARY inside these objects: `install`/`login` are rendered by
+  // onboardCmd() as click-to-copy `<code>`, so a value that IS a shell command
+  // (`npm i -g …`, `winget install …`) stays VERBATIM — translating it would hand the
+  // user a command their shell rejects. Only the slots where we had no command to give
+  // and wrote a human instruction instead ("install the Antigravity CLI (agy)", "Set
+  // your OpenRouter API key in Settings › OpenRouter") are wrapped in tr(). The same
+  // values are also interpolated into the "help me set this up" agent prompt below,
+  // which is fine either way: the commands arrive unchanged, and every backend we
+  // support reads the prose in any language.
   const PROVIDER_SETUP = {
     claude: { label: tr("panel.claude", "Claude"), install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
     codex: { label: tr("panel.chatgpt", "ChatGPT"), install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: tr("panel.gemini", "Gemini"), install: "npm i -g @google/gemini-cli", login: "gemini" },
     // Google's Antigravity CLI (agy) — the individual-tier Google-subscription
     // path; auth lives in the OS keyring (no in-panel OAuth, no API-key slot).
-    antigravity: { label: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)"), install: "install the Antigravity CLI (agy)", login: "agy" },
+    antigravity: { label: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)"), install: tr("panel.install_the_antigravity_cli_agy", "install the Antigravity CLI (agy)"), login: "agy" },
     // pi.dev — a multi-provider coding CLI. "install" is the official installer;
     // "login" is configuring any provider (env key or `/login`). NOTE: pi has no
     // MCP, so a pi agent has no ComfyUI panel tools (see the ready banner).
-    pi: { label: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)"), install: "curl -fsSL https://pi.dev/install.sh | sh", login: "set a provider API key, or run `pi` then /login" },
-    grok: { label: tr("panel.grok", "Grok"), install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
-    kimi: { label: tr("panel.kimi", "Kimi"), install: "install the Kimi CLI (Moonshot)", login: "kimi" },
+    // `pi` and `/login` are things the user TYPES — held out as vars so no translation can
+    // reword them, same rule as the shell commands in the sibling `install` slots.
+    pi: { label: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)"), install: "curl -fsSL https://pi.dev/install.sh | sh", login: tr("panel.set_a_provider_api_key_or_run", "set a provider API key, or run `{cmd}` then {slashCmd}", { cmd: "pi", slashCmd: "/login" }) },
+    grok: { label: tr("panel.grok", "Grok"), install: tr("panel.install_the_grok_cli_grok_build", "install the Grok CLI (Grok Build / xAI)"), login: "grok" },
+    kimi: { label: tr("panel.kimi", "Kimi"), install: tr("panel.install_the_kimi_cli_moonshot", "install the Kimi CLI (Moonshot)"), login: "kimi" },
     // No CLI — "setup" is pasting a Moonshot platform API key (Kimi K3).
-    moonshot: { label: tr("panel.kimi_k3_moonshot_hosted", "Kimi K3 (Moonshot, hosted)"), install: "", login: "Set MOONSHOT_API_KEY via API Keys (▾ menu by “connected”)" },
+    // The three "paste an env key" hints share ONE key with an {envVar} hole: the only
+    // thing that differs between them is a literal that must never be translated, and a
+    // translator getting one sentence right instead of three near-identical ones is
+    // strictly less rope.
+    moonshot: { label: tr("panel.kimi_k3_moonshot_hosted", "Kimi K3 (Moonshot, hosted)"), install: "", login: tr("panel.set_envvar_via_api_keys", "Set {envVar} via API Keys (▾ menu by “connected”)", { envVar: "MOONSHOT_API_KEY" }) },
     // No CLI — "setup" is pasting a z.ai coding-plan API key (GLM).
-    glm: { label: tr("panel.glm_z_ai_coding_plan_hosted", "GLM (z.ai coding plan, hosted)"), install: "", login: "Set ZAI_API_KEY via API Keys (▾ menu by “connected”)" },
-    minimax: { label: tr("panel.minimax_hosted", "MiniMax (hosted)"), install: "", login: "Set MINIMAX_API_KEY via API Keys (▾ menu by “connected”)" },
+    glm: { label: tr("panel.glm_z_ai_coding_plan_hosted", "GLM (z.ai coding plan, hosted)"), install: "", login: tr("panel.set_envvar_via_api_keys", "Set {envVar} via API Keys (▾ menu by “connected”)", { envVar: "ZAI_API_KEY" }) },
+    minimax: { label: tr("panel.minimax_hosted", "MiniMax (hosted)"), install: "", login: tr("panel.set_envvar_via_api_keys", "Set {envVar} via API Keys (▾ menu by “connected”)", { envVar: "MINIMAX_API_KEY" }) },
     // No sign-in — "login" is pulling OUR FINE-TUNE: gemma4 QLoRA-trained on
     // 1,055 server-verified comfyui-mcp trajectories (hf.co/artokun/
     // gemma4-comfyui-mcp) — it knows this tool suite natively. :e2b fits
     // ~2 GB VRAM, :12b ~8 GB.
     ollama: { label: tr("panel.ollama_local_free_our_comfyui_fine_tune", "Ollama (local, free — our ComfyUI fine-tune)"), install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
     // No CLI — "setup" is pasting an OpenRouter API key (Settings › OpenRouter).
-    openrouter: { label: tr("panel.openrouter_hosted_1m_sota", "OpenRouter (hosted, 1M · SOTA)"), install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
+    openrouter: { label: tr("panel.openrouter_hosted_1m_sota", "OpenRouter (hosted, 1M · SOTA)"), install: "", login: tr("panel.set_your_openrouter_api_key_in_settings", "Set your OpenRouter API key in Settings › OpenRouter") },
     // No sign-in — "login" is starting the local server with a tool-calling model.
-    lmstudio: { label: tr("panel.lm_studio_local_free", "LM Studio (local, free)"), install: "winget install ElementLabs.LMStudio", login: "LM Studio → Developer → Start Server (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)" },
+    // The menu path is held out as a var: those are LM STUDIO's menu labels, and LM Studio
+    // ships an English UI. A translated path would send the user hunting for items that do
+    // not exist in the app they are looking at. Only our own hint around it moves.
+    lmstudio: { label: tr("panel.lm_studio_local_free", "LM Studio (local, free)"), install: "winget install ElementLabs.LMStudio", login: tr("panel.lm_studio_developer_start_server", "{menuPath} (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)", { menuPath: "LM Studio → Developer → Start Server" }) },
     // No sign-in — "login" is launching llama-server; --jinja is REQUIRED for tool calling.
     llamacpp: { label: tr("panel.llama_cpp_local_free", "llama.cpp (local, free)"), install: "winget install ggml.llamacpp", login: "llama-server -m model.gguf --jinja -c 16384" },
     // No CLI — "setup" is pointing the panel at any OpenAI-compatible /v1
     // (vLLM, DeepSeek, Together, Azure, a llama-server on another box…).
-    custom: { label: tr("panel.custom_endpoint_any_openai_compatible", "Custom endpoint (any OpenAI-compatible)"), install: "", login: "Set the base URL (and API key if needed) in Settings › Custom endpoint" },
+    custom: { label: tr("panel.custom_endpoint_any_openai_compatible", "Custom endpoint (any OpenAI-compatible)"), install: "", login: tr("panel.set_the_base_url_and_api_key", "Set the base URL (and API key if needed) in Settings › Custom endpoint") },
   };
   let anyReady = false;
   // (autoPickDone is module-scoped now — once per PAGE, not per mount, so workflow
@@ -19706,7 +19739,7 @@ function buildPanel() {
     code.textContent = cmd;
     code.title = tr("panel.click_to_copy", "Click to copy");
     code.addEventListener("click", () => {
-      navigator.clipboard?.writeText(cmd).then(() => appendSystem("Command copied."), () => {});
+      navigator.clipboard?.writeText(cmd).then(() => appendSystem(tr("panel.command_copied", "Command copied.")), () => {});
     });
     return code;
   }
@@ -19718,8 +19751,10 @@ function buildPanel() {
     title.textContent = tr("panel.sign_in_to_an_ai_provider_to", "Sign in to an AI provider to use the agent");
     const sub = document.createElement("div");
     sub.className = "cmcp-onboard-sub";
-    sub.textContent =
-      "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
+    sub.textContent = tr(
+      "panel.the_agent_runs_on_your_machine_on",
+      "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.",
+    );
     onboard.append(title, sub);
     for (const id of ["claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
@@ -19740,7 +19775,9 @@ function buildPanel() {
       }
       const s2 = document.createElement("div");
       s2.className = "cmcp-onboard-step";
-      s2.textContent = st.cli ? "Sign in" : "2. Sign in";
+      // Two keys, not one with a "2. " prefix glued on: the step number belongs to the
+      // sentence in languages that reorder or re-punctuate an ordinal.
+      s2.textContent = st.cli ? tr("panel.sign_in", "Sign in") : tr("panel.2_sign_in", "2. Sign in");
       col.append(s2, onboardCmd(meta.login));
       onboard.appendChild(col);
     }
@@ -19816,8 +19853,11 @@ function buildPanel() {
         renderBackendChips(list);
         setAskPlaceholder(ready.backend);
         appendSystem(
-          `${prevLabel} isn't signed in — using ${BACKEND_LABELS[ready.backend] || ready.backend}. ` +
-            `Sign in to ${prevLabel} to switch back.`,
+          tr(
+            "panel.prev_isnt_signed_in_using_next",
+            "{prev} isn't signed in — using {next}. Sign in to {prev} to switch back.",
+            { prev: prevLabel, next: BACKEND_LABELS[ready.backend] || ready.backend },
+          ),
         );
       }
     } else {
@@ -19839,13 +19879,13 @@ function buildPanel() {
     // agent chat adds. Show the two setup paths inline and stop; no chat.
     if (id === "openrouter") {
       appendSystem(
-        `OpenRouter is a hosted API — no CLI, no login flow. Enable it by setting your API key (create one at https://openrouter.ai/keys):
-` +
-          `  • Settings → OpenRouter → “Set API key…” — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the OPENROUTER_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick OpenRouter here again and Connect.`,
+        tr(
+          "panel.openrouter_is_a_hosted_api_no_cli",
+          "OpenRouter is a hosted API — no CLI, no login flow. Enable it by setting your API key (create one at https://openrouter.ai/keys):\n" +
+            "  • Settings → OpenRouter → “Set API key…” — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the OPENROUTER_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick OpenRouter here again and Connect.",
+        ),
       );
       return;
     }
@@ -19853,13 +19893,13 @@ function buildPanel() {
     // OpenRouter: show the key-setup path inline and stop; no agent chat.
     if (id === "moonshot") {
       appendSystem(
-        `Kimi K3 (Moonshot) is a hosted API — no CLI, no login flow. Enable it by setting your Moonshot API key (create one at https://platform.moonshot.ai/console/api-keys):
-` +
-          `  • API Keys (▾ menu next to “connected”) → set MOONSHOT_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the MOONSHOT_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick Kimi K3 here again and Connect.`,
+        tr(
+          "panel.kimi_k3_moonshot_is_a_hosted_api",
+          "Kimi K3 (Moonshot) is a hosted API — no CLI, no login flow. Enable it by setting your Moonshot API key (create one at https://platform.moonshot.ai/console/api-keys):\n" +
+            "  • API Keys (▾ menu next to “connected”) → set MOONSHOT_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the MOONSHOT_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick Kimi K3 here again and Connect.",
+        ),
       );
       return;
     }
@@ -19867,13 +19907,13 @@ function buildPanel() {
     // as Moonshot/OpenRouter: show the key-setup path inline and stop; no agent chat.
     if (id === "glm") {
       appendSystem(
-        `GLM (z.ai) is a hosted coding-plan API — no CLI, no login flow. Enable it by setting your z.ai API key (create one in your z.ai dashboard at https://z.ai/manage-apikey/apikey-list):
-` +
-          `  • API Keys (▾ menu next to “connected”) → set ZAI_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the ZAI_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick GLM (z.ai) here again and Connect.`,
+        tr(
+          "panel.glm_z_ai_is_a_hosted_coding_plan_api",
+          "GLM (z.ai) is a hosted coding-plan API — no CLI, no login flow. Enable it by setting your z.ai API key (create one in your z.ai dashboard at https://z.ai/manage-apikey/apikey-list):\n" +
+            "  • API Keys (▾ menu next to “connected”) → set ZAI_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the ZAI_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick GLM (z.ai) here again and Connect.",
+        ),
       );
       return;
     }
@@ -19881,27 +19921,38 @@ function buildPanel() {
     // GLM/Moonshot/OpenRouter: show the key-setup path inline and stop; no agent chat.
     if (id === "minimax") {
       appendSystem(
-        `MiniMax is a hosted API — no CLI, no login flow. Enable it by setting your MiniMax API key (create one at https://platform.minimax.io/console/api-keys):
-` +
-          `  • API Keys (▾ menu next to “connected”) → set MINIMAX_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the MINIMAX_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick MiniMax here again and Connect.`,
+        tr(
+          "panel.minimax_is_a_hosted_api_no_cli",
+          "MiniMax is a hosted API — no CLI, no login flow. Enable it by setting your MiniMax API key (create one at https://platform.minimax.io/console/api-keys):\n" +
+            "  • API Keys (▾ menu next to “connected”) → set MINIMAX_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the MINIMAX_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick MiniMax here again and Connect.",
+        ),
       );
       return;
     }
+    // NOT translated, deliberately: this is a directive we compose FOR the agent, not a
+    // label the user reads to make a choice, and it embeds two shell commands in
+    // backticks. Agent-facing text stays English so the commands and the instruction
+    // around them can't drift apart in translation. The two notes below are ours to the
+    // user, so those do get translated.
     const prompt =
       `Help me set up the ${meta.label} backend so I can use it in this panel — I'm not signed in to it yet. ` +
       `Walk me through it for my OS: install the CLI (\`${meta.install}\`), sign in (\`${meta.login}\`), ` +
       `then in this panel pick ${meta.label} in the provider picker and click Connect. Give exact terminal commands.`;
     if (client.isConnected() && client.sendUserMessage(prompt)) {
-      appendSystem(`Asked the agent to help you set up ${meta.label}.`);
+      appendSystem(tr("panel.asked_the_agent_to_help_you_set_up", "Asked the agent to help you set up {label}.", { label: meta.label }));
     } else {
       input.value = prompt;
       input.focus();
       input.dispatchEvent(new Event("input"));
-      appendSystem(`Connect to a signed-in provider, then send this queued request to set up ${meta.label}.`);
+      appendSystem(
+        tr(
+          "panel.connect_to_a_signed_in_provider_then",
+          "Connect to a signed-in provider, then send this queued request to set up {label}.",
+          { label: meta.label },
+        ),
+      );
     }
   }
 
@@ -19921,7 +19972,14 @@ function buildPanel() {
   newMsgBtn.type = "button";
   newMsgBtn.className = "cmcp-newmsg";
   newMsgBtn.hidden = true;
-  newMsgBtn.innerHTML = '<i class="pi pi-arrow-down"></i> New messages';
+  // Built as nodes rather than innerHTML: the label is now catalog-sourced, and tr()
+  // returns TEXT, never markup — routing it through textContent keeps it that way even
+  // if a locale file ever picks up an angle bracket.
+  {
+    const arrow = document.createElement("i");
+    arrow.className = "pi pi-arrow-down";
+    newMsgBtn.append(arrow, document.createTextNode(" " + tr("panel.new_messages", "New messages")));
+  }
   newMsgBtn.addEventListener("click", () => {
     stickToBottom = true;
     newMsgBtn.hidden = true;
@@ -19982,7 +20040,9 @@ function buildPanel() {
       const pend = document.createElement("div");
       const head = document.createElement("div");
       head.className = "cmcp-tray-head";
-      head.textContent = `Pending · ${pendingList.length}`;
+      // {n}, not {count}: `count` switches tr() into plural-category lookup, and this is a
+      // bare tally next to a word that never inflects.
+      head.textContent = tr("panel.pending_n", "Pending · {n}", { n: pendingList.length });
       pend.appendChild(head);
       for (const [mid, entry] of pendingList) {
         const row = document.createElement("div");
@@ -20018,13 +20078,15 @@ function buildPanel() {
         row.append(
           handle,
           txt,
-          mkPendingAct("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
+          mkPendingAct("pi-pencil", tr("panel.edit_pull_back_to_the_composer", "Edit — pull back to the composer"), () => editMsg(mid)),
           mkPendingAct(
             "pi-send",
-            entry.state === "failed" ? "Resend now" : "Send now (interrupt the current turn)",
+            entry.state === "failed"
+              ? tr("panel.resend_now", "Resend now")
+              : tr("panel.send_now_interrupt_the_current_turn", "Send now (interrupt the current turn)"),
             () => sendNowMsg(mid),
           ),
-          mkPendingAct("pi-times", "Delete this message", () => deleteMsg(mid), true),
+          mkPendingAct("pi-times", tr("panel.delete_this_message", "Delete this message"), () => deleteMsg(mid), true),
         );
         pend.appendChild(row);
       }
@@ -20056,9 +20118,9 @@ function buildPanel() {
         meta.className = "cmcp-dl-meta";
         const speed = d && Number(d.bytes_per_sec) > 0 ? `${fmtBytes(Number(d.bytes_per_sec))}/s` : "";
         meta.textContent = failed
-          ? "failed"
+          ? tr("panel.failed_lowercase", "failed")
           : done
-            ? "done"
+            ? tr("panel.done_lowercase", "done")
             : [pct != null ? `${pct}%` : "…", speed].filter(Boolean).join(" · ");
         top.append(name, meta);
         row.appendChild(top);
@@ -20080,7 +20142,7 @@ function buildPanel() {
       const doneN = todoItems.filter((it) => it && it.status === "done").length;
       const head = document.createElement("div");
       head.className = "cmcp-tray-head";
-      head.textContent = `Plan · ${doneN}/${todoItems.length}`;
+      head.textContent = tr("panel.plan_done_total", "Plan · {done}/{total}", { done: doneN, total: todoItems.length });
       list.appendChild(head);
       for (const it of todoItems) {
         const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
@@ -20134,9 +20196,20 @@ function buildPanel() {
   // Placeholder + empty-state hero reflect the active backend ("Ask Claude…" /
   // "Ask ChatGPT…", "Claude is at your canvas" / "Ollama is at your canvas").
   function setAskPlaceholder(id) {
+    // `label` is a provider brand ("Claude", "Ollama") and is never translated — only the
+    // sentence around it moves, hence a {label} hole rather than a concatenation, which
+    // languages that put the verb last cannot reorder.
     const label = BACKEND_LABELS[id];
-    input.placeholder = `Ask ${label || "your agent"}… / for commands, @ for context`;
-    emptyTitle.textContent = `${label || "Your agent"} is at your canvas`;
+    input.placeholder = tr("panel.ask_label_for_commands_context", "Ask {label}… / for commands, @ for context", {
+      label: label || tr("panel.your_agent_inline", "your agent"),
+    });
+    // This runs on every backend switch and on first mount, so it is what the hero
+    // ACTUALLY ends up showing — the tr() at the empty-state construction above is
+    // overwritten here. Reuse that same key for the no-backend case so both paths land on
+    // one translated string instead of the hero silently reverting to English.
+    emptyTitle.textContent = label
+      ? tr("panel.label_is_at_your_canvas", "{label} is at your canvas", { label })
+      : tr("panel.your_agent_is_at_your_canvas", "Your agent is at your canvas");
   }
   setAskPlaceholder(selectedBackend);
   input.rows = 1;
@@ -20200,7 +20273,7 @@ function buildPanel() {
     const clamped = Math.max(0, Math.min(1, p > 1 ? p / 100 : p));
     ring.querySelector(".fg").setAttribute("stroke-dashoffset", String(RING_C * (1 - clamped)));
     const pct = Math.round(clamped * 100);
-    ringTitle.textContent = `Context window ~${pct}% used`;
+    ringTitle.textContent = tr("panel.context_window_pct_used", "Context window ~{pct}% used", { pct });
     ctxLabel.textContent = clamped > 0 ? `${pct}%` : "—";
   }
   // #381: the ring is persisted PER conversation, not globally. A single global
@@ -20321,15 +20394,18 @@ function buildPanel() {
   modelChip.append(modelChipLabel, modelChipEffort, modelChipCaret);
 
   function refreshModelChip() {
-    const name = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
+    const name = prefs.modelAuto ? tr("panel.auto", "Auto") : modelLabel(modelCatalog, prefs.model);
     modelChipLabel.textContent = name;
     modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
     // The name ellipsises in a narrow panel, so the hover has to carry the full
     // value — otherwise a truncated model id is unrecoverable without widening
     // the panel, which is the thing we're avoiding.
     modelChip.title =
-      `Model: ${name}${prefs.effort ? ` · effort: ${prefs.effort}` : ""}` +
-      "\nModel & reasoning effort for the background agent";
+      (prefs.effort
+        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: prefs.effort })
+        : tr("panel.model_name", "Model: {name}", { name })) +
+      "\n" +
+      tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
   }
 
   // Reconcile the ComfyUI Settings defaults with the panel's localStorage runtime.
@@ -20666,7 +20742,12 @@ function buildPanel() {
       // Seed the target provider's group so seedPrefsForBackendSwitch adopts this
       // model, then run the full switch flow (fresh orchestrator + session rules).
       if (SETTING_MODEL[m.provider]) setSetting(SETTING_MODEL[m.provider], m.id);
-      appendSystem(`Model → ${m.label} · switching to ${m.providerLabel}…`);
+      appendSystem(
+        tr("panel.model_arrow_switching_to_provider", "Model → {model} · switching to {provider}…", {
+          model: m.label,
+          provider: m.providerLabel,
+        }),
+      );
       void connectBackend(m.provider);
       return;
     }
@@ -20685,9 +20766,15 @@ function buildPanel() {
     refreshModelChip();
     client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
     if (prefs.effort && prefs.effort !== before) {
-      appendSystem(`Model → ${m.label}. Reasoning effort set to ${effortMeta(prefs.effort).label} (nearest level this model supports).`);
+      appendSystem(
+        tr(
+          "panel.model_arrow_reasoning_effort_set_to_nearest",
+          "Model → {model}. Reasoning effort set to {effort} (nearest level this model supports).",
+          { model: m.label, effort: effortMeta(prefs.effort).label },
+        ),
+      );
     } else {
-      appendSystem(`Model → ${m.label}.`);
+      appendSystem(tr("panel.model_arrow_model", "Model → {model}.", { model: m.label }));
     }
   }
 
@@ -20821,9 +20908,29 @@ function buildPanel() {
       renderModelWindow();
       if (isSearch) {
         modelEmpty.hidden = false;
+        // Two complete sentences rather than a stem plus an appended "." / hint: the
+        // "connect more" nudge fires on providerCount <= 1, which INCLUDES 0 — and 0 takes
+        // the plural "other" form in English, so the hint and the plural are independent
+        // axes. Folding them into one plural set would have dropped the nudge at 0.
+        const modelQ = modelQuery.trim();
         modelEmpty.textContent =
-          `No model matches “${modelQuery.trim()}” across ${providerCount} connected provider${providerCount === 1 ? "" : "s"}` +
-          (providerCount <= 1 ? " — connect more to search wider." : ".");
+          providerCount <= 1
+            ? tr(
+                "panel.no_model_matches_connect_more",
+                {
+                  one: "No model matches “{query}” across {count} connected provider — connect more to search wider.",
+                  other: "No model matches “{query}” across {count} connected providers — connect more to search wider.",
+                },
+                { query: modelQ, count: providerCount },
+              )
+            : tr(
+                "panel.no_model_matches",
+                {
+                  one: "No model matches “{query}” across {count} connected provider.",
+                  other: "No model matches “{query}” across {count} connected providers.",
+                },
+                { query: modelQ, count: providerCount },
+              );
         modelSearchCap.textContent = "";
       } else {
         // Empty query with nothing left to recommend (e.g. all models are recents).
@@ -20836,10 +20943,22 @@ function buildPanel() {
     modelEmpty.hidden = true;
     modelResults.style.display = "";
     modelSearchCap.textContent = isSearch
-      ? `${modelCurrentRows.length} result${modelCurrentRows.length === 1 ? "" : "s"}`
+      ? tr("panel.count_results", { one: "{count} result", other: "{count} results" }, { count: modelCurrentRows.length })
       : recentCount
-        ? "Recommended"
-        : `Recommended · ${modelCurrentRows.length} model${modelCurrentRows.length === 1 ? "" : "s"} across ${providerCount} provider${providerCount === 1 ? "" : "s"}`;
+        ? tr("panel.recommended", "Recommended")
+        : // Two independent counts in one sentence, and tr() pluralises on a single
+          // `count`. So the provider half is pluralised on its own and injected as a
+          // {providers} phrase — otherwise one of the two would silently take the other's
+          // plural rule. Built inside this branch: renderModelResults() runs on every
+          // keystroke and the other two branches never look at it.
+          tr(
+            "panel.recommended_count_models_across_providers",
+            { one: "Recommended · {count} model across {providers}", other: "Recommended · {count} models across {providers}" },
+            {
+              count: modelCurrentRows.length,
+              providers: tr("panel.count_providers", { one: "{count} provider", other: "{count} providers" }, { count: providerCount }),
+            },
+          );
     modelSizer.style.height = modelCurrentRows.length * MODEL_ROW_H + "px";
     renderModelWindow();
   }
@@ -20929,7 +21048,7 @@ function buildPanel() {
     // orchestrator on that backend's port → handshake repopulates Model + Effort).
     // Only shown when more than one provider is actually available.
     if (knownBackends.length > 1) {
-      section("Provider");
+      section(tr("panel.provider", "Provider"));
       const activeBackend = connectedBackend || selectedBackend;
       for (const b of knownBackends) {
         const id = b.backend;
@@ -20941,7 +21060,9 @@ function buildPanel() {
         const notReady = (backendReady[id] || b).ready === false;
         // A not-ready provider can't be connected — tapping it asks the working
         // agent to help you install/sign in instead of failing a connect.
-        const small = notReady ? `Tap to set up — ${hint}` : BACKEND_HINTS[id] || (id === activeBackend ? "connected" : b.running ? "running" : "");
+        const small = notReady
+          ? tr("panel.tap_to_set_up_hint", "Tap to set up — {hint}", { hint })
+          : BACKEND_HINTS[id] || (id === activeBackend ? tr("panel.connected_lowercase", "connected") : b.running ? tr("panel.running_lowercase", "running") : "");
         // cmcp-provider: the NAME never shrinks; a long hint truncates instead
         // (a long hint used to collapse "Ollama" to nothing). backendDisplayLabel
         // appends "(experimental)" for ToS-risk backends (e.g. Copilot) so picking
@@ -20962,7 +21083,11 @@ function buildPanel() {
         if (id !== activeBackend && row) {
           const off = document.createElement("i");
           off.className = "pi pi-times";
-          off.title = `Hide ${BACKEND_LABELS[id] || id} — you don't use it. Restore it from the "hidden" row below.`;
+          off.title = tr(
+            "panel.hide_provider_you_dont_use_it",
+            'Hide {provider} — you don\'t use it. Restore it from the "hidden" row below.',
+            { provider: BACKEND_LABELS[id] || id },
+          );
           off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:0.7rem;flex:none;";
           off.addEventListener("mousedown", (mev) => {
             // Swallow the row's pick handler — this gesture only hides.
@@ -20979,8 +21104,14 @@ function buildPanel() {
       if (hiddenIds.length) {
         item(
           {
-            label: `${hiddenIds.length} provider${hiddenIds.length === 1 ? "" : "s"} hidden`,
-            small: `${hiddenIds.map((id) => BACKEND_LABELS[id] || id).join(", ")} — tap to show`,
+            label: tr(
+              "panel.count_providers_hidden",
+              { one: "{count} provider hidden", other: "{count} providers hidden" },
+              { count: hiddenIds.length },
+            ),
+            small: tr("panel.names_tap_to_show", "{names} — tap to show", {
+              names: hiddenIds.map((id) => BACKEND_LABELS[id] || id).join(", "),
+            }),
             cls: "cmcp-provider",
           },
           false,
@@ -20996,14 +21127,14 @@ function buildPanel() {
     // search widget is a persistent node re-parented here; renderModelResults()
     // repaints its rows for the current query. Picking a row selects the model AND
     // its provider (a cross-provider pick routes through the switch flow).
-    section("Model");
+    section(tr("panel.model", "Model"));
     modelSearchInput.value = modelQuery;
     modelPop.appendChild(modelSearchWrap);
     renderModelResults();
 
     const efforts = effortsForModel(prefs.model);
     if (efforts.length) {
-      section("Effort");
+      section(tr("panel.effort", "Effort"));
       for (const id of efforts) {
         const meta = effortMeta(id);
         item(meta, id === prefs.effort, () => {
@@ -21015,7 +21146,11 @@ function buildPanel() {
           refreshModelChip();
           modelPop.hidden = true;
           client?.sendFrame?.({ type: "set_options", effort: id });
-          appendSystem(`Effort → ${meta.label}. Continuing this chat at the new effort…`);
+          appendSystem(
+            tr("panel.effort_arrow_continuing_this_chat", "Effort → {effort}. Continuing this chat at the new effort…", {
+              effort: meta.label,
+            }),
+          );
         });
       }
     }
@@ -21074,11 +21209,17 @@ function buildPanel() {
       if (snapped !== before && prefs.userSet) {
         if (snapped) {
           appendSystem(
-            `Reasoning effort set to ${effortMeta(snapped).label} for ${modelLabel(modelCatalog, prefs.model)} (nearest level this model supports).`,
+            tr(
+              "panel.reasoning_effort_set_to_effort_for_model",
+              "Reasoning effort set to {effort} for {model} (nearest level this model supports).",
+              { effort: effortMeta(snapped).label, model: modelLabel(modelCatalog, prefs.model) },
+            ),
           );
         } else {
           appendSystem(
-            `${modelLabel(modelCatalog, prefs.model)} has no reasoning-effort control; effort cleared.`,
+            tr("panel.model_has_no_reasoning_effort_control", "{model} has no reasoning-effort control; effort cleared.", {
+              model: modelLabel(modelCatalog, prefs.model),
+            }),
           );
         }
       }
@@ -21128,9 +21269,9 @@ function buildPanel() {
   const spacer = document.createElement("span");
   spacer.className = "cmcp-spacer";
 
-  const attachBtn = iconBtn("pi-paperclip", "Attach an image, video, workflow (.json), or text file");
-  const micBtn = iconBtn("pi-microphone", "Dictate (browser speech recognition)");
-  const sendBtn = iconBtn("pi-send", "Send (Enter)");
+  const attachBtn = iconBtn("pi-paperclip", tr("panel.attach_an_image_video_workflow_json_or", "Attach an image, video, workflow (.json), or text file"));
+  const micBtn = iconBtn("pi-microphone", tr("panel.dictate_browser_speech_recognition", "Dictate (browser speech recognition)"));
+  const sendBtn = iconBtn("pi-send", tr("panel.send_enter", "Send (Enter)"));
   sendBtn.type = "submit";
 
   const fileInput = document.createElement("input");
@@ -21159,8 +21300,8 @@ function buildPanel() {
     b.append(i, span);
     return b;
   }
-  const deafenBtn = toolbarBtn("pi-volume-up", "Deafen");
-  const blindBtn = toolbarBtn("pi-eye", "Blind");
+  const deafenBtn = toolbarBtn("pi-volume-up", tr("panel.deafen", "Deafen"));
+  const blindBtn = toolbarBtn("pi-eye", tr("panel.blind", "Blind"));
   // Icon-only (user request): the glyph + tint + tooltip carry the state; the
   // label span stays in the DOM (visually hidden) for screen readers.
   deafenBtn.classList.add("cmcp-toolbtn-iconic");
@@ -21191,23 +21332,40 @@ function buildPanel() {
   function reflectFeedGates() {
     deafenSlash.style.display = AGENT_MUTED ? "" : "none";
     deafenBtn.classList.toggle("gate-on-deafen", AGENT_MUTED);
-    deafenBtn.querySelector("span").textContent = AGENT_MUTED ? "Deafened" : "Deafen";
+    deafenBtn.querySelector("span").textContent = AGENT_MUTED
+      ? tr("panel.deafened", "Deafened")
+      : tr("panel.deafen", "Deafen");
     deafenBtn.title = AGENT_MUTED
-      ? "Agent feed: DEAFENED — no renders, images, errors, or canvas events reach any agent right now. " +
-        "Messages you type still go through normally. Click to restore the live feed."
-      : "Agent feed: live. The agent automatically hears about canvas activity — finished renders, " +
-        "execution errors, graph changes. Click to DEAFEN: the agent hears nothing until you undeafen " +
-        "(your typed messages still work). Use it to work on the canvas without the agent reacting.";
+      ? tr(
+          "panel.agent_feed_deafened",
+          "Agent feed: DEAFENED — no renders, images, errors, or canvas events reach any agent right now. " +
+            "Messages you type still go through normally. Click to restore the live feed.",
+        )
+      : tr(
+          "panel.agent_feed_live",
+          "Agent feed: live. The agent automatically hears about canvas activity — finished renders, " +
+            "execution errors, graph changes. Click to DEAFEN: the agent hears nothing until you undeafen " +
+            "(your typed messages still work). Use it to work on the canvas without the agent reacting.",
+        );
     const bi = blindBtn.querySelector(".pi");
     bi.className = `pi ${AGENT_BLIND ? "pi-eye-slash" : "pi-eye"}`;
     blindBtn.classList.toggle("gate-on-blind", AGENT_BLIND);
-    blindBtn.querySelector("span").textContent = AGENT_BLIND ? "Blind" : "Blind";
+    // Unlike Deafen/Deafened, both Blind states read "Blind" — the icon and tint carry
+    // the state. One key, not two identical ones, so a translator isn't asked to make a
+    // distinction the English doesn't make either.
+    blindBtn.querySelector("span").textContent = tr("panel.blind", "Blind");
     blindBtn.title = AGENT_BLIND
-      ? "Image feed: BLIND — the agent still gets text notifications about renders and results, but " +
-        "NEVER receives the image pixels. Click to allow images again."
-      : "Image feed: on — the agent can receive the actual pixels of finished renders (to verify its " +
-        "work, judge quality, etc.). Click for BLIND mode: it keeps getting text notifications and " +
-        "results but never the images — for content you'd rather no cloud model ever sees.";
+      ? tr(
+          "panel.image_feed_blind",
+          "Image feed: BLIND — the agent still gets text notifications about renders and results, but " +
+            "NEVER receives the image pixels. Click to allow images again.",
+        )
+      : tr(
+          "panel.image_feed_on",
+          "Image feed: on — the agent can receive the actual pixels of finished renders (to verify its " +
+            "work, judge quality, etc.). Click for BLIND mode: it keeps getting text notifications and " +
+            "results but never the images — for content you'd rather no cloud model ever sees.",
+        );
     try {
       const fg = ring.querySelector(".fg");
       if (fg) fg.style.stroke = AGENT_MUTED ? "#e5484d" : "";
@@ -21243,7 +21401,10 @@ function buildPanel() {
       _blindAckPending = setTimeout(() => {
         _blindAckPending = null;
         appendSystem(
-          "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+          tr(
+            "panel.the_orchestrator_didnt_acknowledge_the_blind_change",
+            "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+          ),
         );
       }, 6000);
     }
@@ -21441,7 +21602,7 @@ function buildPanel() {
   // `comfyui_target` frames (wired below). The pod runs our template → full parity.
   let _runpodStatus = null; // last runpod_status frame
   let _comfyuiTarget = null; // last comfyui_target frame
-  const runpodBtn = toolbarBtn("pi-circle", "Local");
+  const runpodBtn = toolbarBtn("pi-circle", tr("panel.local", "Local"));
   runpodBtn.querySelector(".pi").remove();
   runpodBtn.title = tr("panel.runpod_run_this_session_on_a_cloud", "RunPod — run this session on a cloud GPU (deploy / start / stop / connect), or switch back to local.");
   {
@@ -21492,12 +21653,31 @@ function buildPanel() {
     runpodBtn.style.color = alertCount > 0 ? "#f59e0b" : onPod ? "#60a5fa" : "";
     const gpu = s && s.watching && s.gpu ? ` · ${s.gpu}` : "";
     const cost = s && s.watching && s.cost_per_hr != null ? ` · $${Number(s.cost_per_hr).toFixed(3)}/hr` : "";
+    // The reason lookup stays INSIDE the guard: _runpodAlerts is empty in the common
+    // case and `[...values()][0]` would throw on it.
     const alertNote = alertCount > 0
-      ? ` ⚠ ${alertCount} pod alert${alertCount > 1 ? "s" : ""}: ${[..._runpodAlerts.keys()].join(", ")} — auto-connect ${[..._runpodAlerts.values()][0].reason === "superseded" ? "superseded" : "timed out"}, still billing. Click to manage/stop.`
+      ? " " +
+        tr(
+          "panel.pod_alerts_auto_connect_still_billing",
+          {
+            one: "⚠ {count} pod alert: {pods} — auto-connect {reason}, still billing. Click to manage/stop.",
+            other: "⚠ {count} pod alerts: {pods} — auto-connect {reason}, still billing. Click to manage/stop.",
+          },
+          {
+            count: alertCount,
+            pods: [..._runpodAlerts.keys()].join(", "),
+            reason:
+              [..._runpodAlerts.values()][0].reason === "superseded"
+                ? tr("panel.superseded", "superseded")
+                : tr("panel.timed_out", "timed out"),
+          },
+        )
       : "";
+    // {gpu}/{cost} are pre-rendered " · …" fragments, so the sentence around them can be
+    // reordered freely by a translator without the data moving with it.
     runpodBtn.title = (onPod
-      ? `Rendering on RunPod${gpu}${cost} — click to manage the pod or switch back to local.`
-      : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).") + alertNote;
+      ? tr("panel.rendering_on_runpod_click_to_manage", "Rendering on RunPod{gpu}{cost} — click to manage the pod or switch back to local.", { gpu, cost })
+      : tr("panel.rendering_locally_on_this_machine", "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).")) + alertNote;
   }
   runpodBtn.addEventListener("click", () => toggleSidePanelTab("local", () => openRunpod()));
   // Expose for the bridge callbacks (defined outside this closure). Status/target

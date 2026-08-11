@@ -214,9 +214,17 @@ export function tr(key, fallback, vars) {
   out = out ?? "";
 
   if (vars) {
-    for (const [k, v] of Object.entries(vars)) {
-      out = out.split(`{${k}}`).join(String(v));
-    }
+    // ONE pass over the template, not one pass PER variable. A sequential loop re-scans
+    // text it has already substituted, so a value that itself contains `{otherVar}` gets
+    // treated as a placeholder by a later iteration. That is reachable with user input:
+    // typing `{count}` into the model search box rendered
+    // `No model matches “3” across 3 connected providers.` — the user's own query silently
+    // replaced by the provider count, because `{query}` was substituted before `{count}`.
+    // Values are INSERTED, never re-interpreted; an unknown `{hole}` is left verbatim,
+    // exactly as the per-variable loop left it.
+    out = out.replace(/\{([a-zA-Z0-9_]+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : whole,
+    );
   }
   return out;
 }
