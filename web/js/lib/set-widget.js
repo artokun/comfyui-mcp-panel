@@ -16,8 +16,6 @@
 //   3. applyWidgetWrite with the resolved-target registry guard, which runs
 //      BEFORE value coercion and any mutation/callback.
 
-import { captureSerializedNode, writeLeftNoSerializedTrace, nonPersistingWriteNote } from "./write-persistence.js";
-
 import {
   applyWidgetWrite,
   WidgetWriteError,
@@ -360,34 +358,13 @@ export async function runSetWidget(
   // resolveWidgetWrite — a real widget whose own name contains a dot still wins, and a
   // dotted form is only interpreted when no exact widget matches — so the split can
   // never silently misroute to a different widget.
-  // #983 — what the node SERIALIZES, either side of the write. A write can read back
-  // correctly and still persist nothing: some custom widgets are a VIEW, and a save or a
-  // queued prompt is built from the serialized form, not from the live widget object.
-  // Captured here rather than searched for afterwards, because looking for the VALUE in
-  // the serialized form cannot survive a transforming serializer or a value that lands in
-  // `properties` — a comparison of the whole form before and after is immune to both.
-  let persistenceProbe = null;
-  // DIRECT WRITES ONLY (codex). For a PROMOTED write the value that serializes at queue
-  // time can live on the OUTER subgraph's rail widget rather than the inner node the
-  // mutation lands on — so an unchanged inner form would not mean the write vanished, and
-  // reporting it would be exactly the definitive-negative-from-a-partial-view that got the
-  // previous attempt reverted. A nested promotion has intermediates this code cannot
-  // enumerate with confidence either. The reported case is a direct write; the promoted
-  // case gets no claim rather than a wrong one.
-  const probeNode = isResolvedPromotion ? null : node;
   const write = (extra = {}) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
     assertTargetStillCurrentNow();
-    const before = probeNode ? captureSerializedNode(probeNode) : null;
-    // RE-ASSERTED, because `serialize()` above is plugin-overridable and can run arbitrary
-    // code — a getter or a toJSON could switch canvases synchronously, which is precisely
-    // what the check before it exists to prevent (codex). The invariant is 'nothing
-    // uncontrolled runs between the check and the mutation', and a probe is uncontrolled.
-    if (probeNode) assertTargetStillCurrentNow();
-    const applied = applyWidgetWrite(node, widgetName, value, {
+    return applyWidgetWrite(node, widgetName, value, {
       resolveSource,
       canvas,
       beforeChange,
@@ -397,18 +374,6 @@ export async function runSetWidget(
       promotedResolution,
       ...extra,
     });
-    // AFTER the mutation, same node, same method. Either capture being absent means no
-    // comparison happened, which the reader below treats as no claim.
-    persistenceProbe = probeNode
-      ? {
-          before,
-          after: captureSerializedNode(probeNode),
-          nodeId: probeNode?.id ?? null,
-          nodeType: typeof probeNode?.type === "string" ? probeNode.type : null,
-          widget: widgetName,
-        }
-      : null;
-    return applied;
   };
 
   // #558: the value widget being written may be governed by a non-`fixed`
@@ -461,20 +426,6 @@ export async function runSetWidget(
   // and the caller would then "retry" a write that already happened. Refuse before the
   // action; DISCLOSE after it. So the advisory is computed inside a guard, and its
   // failure downgrades to a disclosed gap, never to a failed write.
-  // #983 — a SEPARATE field from `warning`, so a control_after_generate advisory and a
-  // persistence disclosure can never displace one another: they are different facts and
-  // a caller may need both.
-  const withPersistence = (result) => {
-    try {
-      const p = persistenceProbe;
-      if (!p || !writeLeftNoSerializedTrace(p.before, p.after)) return result;
-      return { ...result, persisted: false, persistence_warning: nonPersistingWriteNote(p) };
-    } catch {
-      // A disclosure must never turn a write that already happened into a failure.
-      return result;
-    }
-  };
-
   const withWarning = (result) => {
     try {
       const warnNode = authTarget ?? resolvedTargetNode;
@@ -536,7 +487,7 @@ export async function runSetWidget(
   };
 
   try {
-    return withPersistence(withWarning({ set: write() }));
+    return withWarning({ set: write() });
   } catch (err) {
     // Only a COMBO rejection is EVER retryable — every other WidgetWriteError
     // (numeric/boolean/promotion/composite/stuck-check) fails closed immediately.
@@ -570,7 +521,7 @@ export async function runSetWidget(
         /* refresh best-effort; fall through to re-raise the original rejection */
       }
       try {
-        return withPersistence(withWarning({ set: write(), refreshed: true }));
+        return withWarning({ set: write(), refreshed: true });
       } catch (retryErr) {
         if (!(retryErr instanceof WidgetWriteError)) throw retryErr;
         // A NON-combo failure on the retry is terminal — fail closed loudly.
@@ -589,7 +540,7 @@ export async function runSetWidget(
     // #387: server-confirmed upload asset (e.g. a subfolder-nested LoadImage image).
     if (await tryUploadAssetAccept()) {
       try {
-        return withPersistence(withWarning({ set: write(), refreshed: true, server_confirmed: true }));
+        return withWarning({ set: write(), refreshed: true, server_confirmed: true });
       } catch (confErr) {
         if (confErr instanceof WidgetWriteError) {
           throw new Error(
@@ -638,13 +589,11 @@ export async function runSetWidget(
         concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
       )
     ) {
-      return withPersistence(
-        withWarning({
-          set: write({ acceptEmptyComboOptions: true }),
-          ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
-          empty_option_list: true,
-        }),
-      );
+      return withWarning({
+        set: write({ acceptEmptyComboOptions: true }),
+        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+        empty_option_list: true,
+      });
     }
 
     // No recovery succeeded — refuse honestly with the freshest rejection.
