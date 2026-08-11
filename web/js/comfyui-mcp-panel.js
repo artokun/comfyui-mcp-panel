@@ -6875,6 +6875,56 @@ function makeShellCommandBlock(baseCmd) {
   return wrap;
 }
 
+/**
+ * USER-HIDDEN notes from the orchestrator, waiting to ride the agent's next turn.
+ *
+ * Same delivery mechanism as manualChangeBanner/validationBanner — prepended to the
+ * agent-facing text while the visible bubble stays exactly what the user typed. What is
+ * new is the SOURCE: those two are computed panel-side, these arrive as `agent_note`
+ * frames from the orchestrator.
+ *
+ * Bounded, because the queue drains only when the user next speaks and an orchestrator
+ * in a retry loop could otherwise push forever. The OLDEST are dropped: a stale sync
+ * failure matters less than the current one, and the count is disclosed so the agent
+ * knows the list is partial rather than silently truncated.
+ */
+const HIDDEN_NOTE_CAP = 8;
+let hiddenAgentNotes = [];
+let hiddenAgentNotesDropped = 0;
+
+function queueHiddenAgentNote(text) {
+  const t = typeof text === "string" ? text.trim() : "";
+  if (!t) return;
+  // Identical notices repeat on every reconnect attempt; carrying ten copies of one
+  // lock error into the turn wastes the agent's context to say one thing.
+  if (hiddenAgentNotes.includes(t)) return;
+  hiddenAgentNotes.push(t);
+  while (hiddenAgentNotes.length > HIDDEN_NOTE_CAP) {
+    hiddenAgentNotes.shift();
+    hiddenAgentNotesDropped += 1;
+  }
+}
+
+/** Drain the queue into a turn prefix, or "" when there is nothing to say. */
+function takeHiddenAgentNotes() {
+  if (!hiddenAgentNotes.length) return "";
+  const notes = hiddenAgentNotes;
+  const dropped = hiddenAgentNotesDropped;
+  hiddenAgentNotes = [];
+  hiddenAgentNotesDropped = 0;
+  // The lead-in is the whole contract: without it an agent quite reasonably answers
+  // "as the message above explains…" about something the user cannot see, which is
+  // more confusing than having printed it in the first place.
+  return (
+    `[The user cannot see this message — it is orchestrator status for you alone. ` +
+    `Do NOT refer to it as something they said or can read. Act on it if it is relevant ` +
+    `to what they asked; otherwise carry on and stay silent about it.]\n` +
+    notes.map((n) => `• ${n}`).join("\n") +
+    (dropped ? `\n(${dropped} older note(s) dropped — this list is partial.)` : "") +
+    `\n\n`
+  );
+}
+
 function manualChangeBanner() {
   if (!lastAgentGraph) return "";
   let curr, live;
@@ -17076,6 +17126,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           clearTimeout(pend.timer);
           pend.resolve(msg);
         }
+        return;
+      }
+      // A USER-HIDDEN note for the agent. Deliberately handled BEFORE `say` and with
+      // its own `return`: nothing here may reach onSay, because the entire point is
+      // that the user never sees it.
+      //
+      // These are the operational walls of text — a failed panel auto-sync and its
+      // lock-recovery instructions, for example. The agent needs them; a person
+      // reading a chat about their image does not, and printing one mid-conversation
+      // reads like the assistant lost its place.
+      if (msg && msg.type === "agent_note" && msg.text != null) {
+        queueHiddenAgentNote(coerceMessageText(msg.text));
         return;
       }
       if (msg && msg.type === "say" && msg.text != null) {
@@ -28880,6 +28942,11 @@ function buildPanel() {
     };
     // Surface any MANUAL canvas edits the user made since the agent's last turn,
     // prepended to the agent-facing text only (the visible `text` is untouched).
+    // Orchestrator status the user must not see (failed panel auto-sync, lock
+    // recovery, …). Delivered the same way as the banners below — prepended to the
+    // agent-facing text only, so the visible bubble stays what the user typed.
+    const hiddenNotes = takeHiddenAgentNotes();
+    if (hiddenNotes) sendText = hiddenNotes + sendText;
     const changeBanner = manualChangeBanner();
     if (changeBanner) sendText = changeBanner + sendText;
     // Surface ComfyUI's own pre-run validation errors (missing models,
