@@ -57,10 +57,35 @@ export function saveReplyIdentity(identity, { savedAs = false } = {}) {
     ...(savedAs
       ? {
           workflow_instance_changed: true,
+          // #978 — RE-FENCING MAY NOT BE ENOUGH, and saying only "re-fence" stranded a
+          // reporter who did it correctly and was still refused. ComfyUI's own store moves
+          // the active pointer without repainting: `workflowStore.openWorkflow` does not
+          // call `loadGraphData` (only `workflowService.openWorkflow` does), and the
+          // Save-As adapter documents this as the reason it persists the copy from the
+          // SOURCE tab. So this save does not ASK for a repaint — which is all that is
+          // established here. Whether the canvas still holds the source graph WHEN THE
+          // CALLER READS THIS is not observed: a user switching tabs, or a reconnect
+          // restoring one, can repaint during the save's awaits. If it was not repainted,
+          // the graph fence compares the live root's identity against the active
+          // workflow's and refuses — correctly, because the canvas really is the other
+          // workflow's — and `panel_open_workflow` is what brings the copy onto it.
+          // WHAT IS ESTABLISHED is that the save did not ASK for a repaint (codex): it
+          // activates through the store, and nothing here observes the root at reply
+          // time. A user switching tabs, or a reconnect restoring one, could repaint the
+          // copy during the save's awaits — so the consequence is stated conditionally
+          // rather than asserted. Naming the cause of a refusal a caller may be about to
+          // hit is the whole value; claiming the refusal will happen is not supported.
+          canvas_repaint_not_requested: true,
           workflow_instance_note:
-            "Save-As made a DIFFERENT workflow active. A session still fenced to the " +
+            "Save-As made a DIFFERENT workflow active, so a session still fenced to the " +
             "previous instance will have every following command refused with \"workflow " +
-            "instance mismatch\" — re-fence it to the workflow_uuid reported here.",
+            "instance mismatch\" — re-fence it to the workflow_uuid reported here. That " +
+            "may not be enough for GRAPH tools: this save activates the copy WITHOUT " +
+            "asking for a canvas repaint, so unless something else repainted it, the " +
+            "canvas still holds the source workflow's graph. If a graph command is then " +
+            "refused for a root-workflow-uuid mismatch, that is why, and it is refusing " +
+            "correctly. Open the saved workflow (panel_open_workflow) to put it on the " +
+            "canvas before reading or editing the graph (#978).",
         }
       : {}),
   };
