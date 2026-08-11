@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-08-11
+
+### Fixed
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
 ## [0.14.3] - 2026-08-11
 
 > #1339: a batch of ten came back as ten identical images, with nothing said about it. The
