@@ -429,8 +429,13 @@ import {
   savedWorkflowHandle,
   savedWorkflowRoute,
 } from "./lib/bridge-route.js";
-import {
+// P0: this import previously sat INSIDE the specifier list below, which is a
+// SyntaxError in an ES module — and this file loads as one, so the whole panel failed
+// to construct. `node --check panel.js` does NOT catch it (Node parses a bare .js as
+// CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
+// here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection } from "./lib/i18n.js";
+import {
   adoptRebootRuns,
   decodeRebootMarker,
   isRealBridgeDrop,

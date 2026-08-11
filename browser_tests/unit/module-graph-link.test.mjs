@@ -13,6 +13,11 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 // --- Mirror comfyui-mcp-panel.js imports (the panel's own module edges) -------------
 import {
@@ -101,6 +106,31 @@ test("panel ↔ disconnect-verify.js module edge links (#668)", () => {
   assert.equal(typeof snapshotGraphState, "function");
   assert.equal(typeof describeInputLink, "function");
   assert.equal(typeof verifyDisconnect, "function");
+});
+
+/**
+ * The half this file's header says --check DOES cover — except that it only covers it
+ * when the file is checked AS A MODULE, and nothing in the repo was doing that.
+ *
+ * The panel is served to the browser as an ES module (`type="module"`). `node --check
+ * web/js/comfyui-mcp-panel.js` parses a bare `.js` as CommonJS and reports OK on source
+ * that no browser can load — which is exactly how an `import` statement inserted INSIDE
+ * another import's specifier list shipped on this branch, taking the entire panel down
+ * with `SyntaxError: Unexpected reserved word` at module scope. Nothing else caught it:
+ * every unit test reads the source as TEXT or evals a slice of it, and Playwright cannot
+ * run without a live ComfyUI.
+ *
+ * So: check it the way the browser reads it. The copy is what makes the check a MODULE
+ * parse rather than a script parse; without the .mjs extension this test would pass over
+ * the very defect it exists to catch.
+ */
+test("the panel bundle parses as an ES MODULE, which is how the browser loads it", () => {
+  const src = join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js");
+  const asModule = join(mkdtempSync(join(tmpdir(), "cmcp-parse-")), "panel.mjs");
+  writeFileSync(asModule, readFileSync(src));
+  const res = spawnSync(process.execPath, ["--check", asModule], { encoding: "utf8" });
+  rmSync(dirname(asModule), { recursive: true, force: true });
+  assert.equal(res.status, 0, `panel is not a parseable ES module:\n${res.stderr}`);
 });
 
 test("set-widget.js ↔ widget-write.js / node-resolve.js module edges link", () => {
