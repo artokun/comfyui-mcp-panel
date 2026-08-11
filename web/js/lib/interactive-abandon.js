@@ -4,7 +4,7 @@
 // blocks on a HUMAN. When the connection that asked drops, the card is retired
 // (its controls are disabled and it says why) but its promise was deliberately
 // left unresolved: resolving it with an ANSWER would fabricate one, and the
-// panel's rule is that a reply of this kind does not cross a reconnect.
+// panel's rule is that a reply CARRYING one does not cross a reconnect.
 //
 // Leaving it unresolved has its own cost, and that cost is what this module is
 // for. The executor stays suspended on `await onAsk(...)` forever, so:
@@ -21,9 +21,31 @@
 // The fix is a value that is NOT an answer. Retiring a card resolves its promise
 // with the sentinel below; the executor recognizes it and fails the command
 // explicitly, which settles the ledger through the ordinary error path. Nothing
-// is fabricated — the reply says the question was withdrawn unanswered — and the
-// reply is undeliverable on the socket that died, so it takes the existing
-// lost-reply path exactly like any other late answer.
+// is fabricated — the reply says the question was withdrawn unanswered.
+//
+// WHERE THE TEXT BELOW IS ACTUALLY READ, measured against the orchestrator rather
+// than assumed (codex). In the ordinary disconnect this reply does NOT reach the
+// caller, and this module does not pretend otherwise:
+//
+//   * the old socket's close already removed the pending rid and rejected the call
+//     with the bridge's own OUTCOME-UNKNOWN error, before anything from the panel
+//     could arrive;
+//
+//   * the journal replay on the fresh socket then finds no pending rid. The
+//     bridge's late-answer buffer for `ask_user` keeps `msg.ok` replies only, so a
+//     payload-free FAILURE is dropped there; `request_secret` has no late route at
+//     all.
+//
+// So the value of settling is the LEDGER, not this prose: the entry becomes
+// evictable, and a REDELIVERY of that rid — which does still reach the handler and
+// is answered from the ledger — gets this text instead of silence. That is the
+// only path on which a caller reads it, and it is worth having: the alternative is
+// a second outcome-unknown with no timeout of the panel's own to end it.
+//
+// The reply is journaled by the existing lost-reply path like any other
+// undelivered outcome. Unlike an ANSWER, it is safe to replay across a reconnect —
+// it carries no user input — which is why `redactSensitiveReply` was narrowed to
+// replies that actually carry one.
 //
 // A SYMBOL, not a string: the "Other…" field lets a user type any text they
 // like, and a sentinel a human can type is a sentinel a human can forge. The
@@ -50,8 +72,10 @@ export function isAbandonedInteractive(value) {
  * States only what the mechanism establishes: the card is gone, nothing was
  * answered, and the answer cannot arrive later. It does NOT claim the user saw
  * the card, ignored it, or declined — the panel cannot know any of that. The
- * remedy names the current connection because a reply of this kind is never
- * replayed across a reconnect.
+ * remedy names the current connection because the ANSWER to a withdrawn card is
+ * never replayed across a reconnect, so re-asking is the only way to get one.
+ *
+ * See the header for the one path a caller actually reads this on.
  */
 export function abandonedInteractiveError(cmd) {
   const what = cmd === "request_secret" ? "secret request" : "question";

@@ -151,6 +151,23 @@ test("#952 a reply that CARRIES the answer is still redacted — both commands",
   assert.equal(redactSensitiveReply(graph, "graph_add_node"), graph);
 });
 
+test("#952 (codex) the module says where this reply is read — it is NOT the disconnected caller", () => {
+  // The first draft implied the caller would read "the question was withdrawn". Measured
+  // against the orchestrator, they do not: the old socket's close already rejected the
+  // call with the bridge's own outcome-unknown error, the journal replay finds no pending
+  // rid, and the bridge's late-answer buffer for `ask_user` keeps `msg.ok` replies only —
+  // so a payload-free failure is dropped there, and `request_secret` has no late route at
+  // all. The settle is worth doing for the LEDGER; the prose is read on a redelivery.
+  const src = readFileSync(new URL("../../web/js/lib/interactive-abandon.js", import.meta.url), "utf8");
+  assert.match(src, /does NOT reach the\s*(?:\/\/\s*)?caller/, "the limit is stated, not implied");
+  assert.match(src, /keeps `msg\.ok` replies only/, "and names the specific orchestrator behaviour");
+  assert.match(src, /REDELIVERY of that rid/, "and the one path that does read it");
+  assert.ok(
+    !/the caller (?:learns|is told|sees) (?:that )?the card was withdrawn/i.test(src),
+    "no claim that the disconnected caller receives this",
+  );
+});
+
 test("#952 source: retirement disables the card AND ends its command, in that order", () => {
   const src = readFileSync(PANEL, "utf8");
   const start = src.indexOf("function retireInteractiveCardsFromPreviousSockets()");
