@@ -6,6 +6,35 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-08-11
+
+> #1339: a batch of ten came back as ten identical images, with nothing said about it. The
+> warning that exists for exactly this looked for ComfyUI's own `control_after_generate`
+> widget — and rgthree's Seed node DELETES that widget, so the most widely used custom seed
+> node was invisible to it.
+
+### Fixed
+
+- a batch that will reuse one seed now says so when the seed comes from an rgthree Seed node.
+
+### Changed
+
+- it reports the thing that actually decides the outcome: whether the node is ARMED (its
+  seed widget holding `-1`, `-2` or `-3`) or holds a concrete number that is submitted
+  verbatim for every item. It stays quiet when the node genuinely varies — measured, an
+  armed node gets a fresh seed per item even in a scoped batch, so the older warning's
+  reasoning does not apply to it and is not reused.
+- an armed node can still repeat when its `randomMin`/`randomMax` properties — or the seed
+  widget's step — admit a single value. Measured over 200 draws, `min=0 max=5 step=100`
+  returns ONE value while `min < max` looks perfectly healthy. That case is named too, with
+  the remedy that fits it.
+- a muted or bypassed seed node is not named, since it contributes nothing to the run.
+
+### Notes
+
+- your seeds are never rewritten. This says what will happen; it does not change your values.
+
+
 ## [0.14.2] - 2026-08-11
 
 > #1062: asking the agent to add `SaveGLB` always failed. It is the only core node that
