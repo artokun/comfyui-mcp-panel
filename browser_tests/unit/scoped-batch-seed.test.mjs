@@ -230,6 +230,20 @@ test("#1339 — an ARMED rgthree seed says NOTHING", () => {
   }
 });
 
+test("#1339 — a seed CONVERTED TO AN INPUT is not reported as fixed", () => {
+  // The widget keeps a stale number when the seed is driven by a link, so calling it
+  // "fixed for all N items" would be a confident wrong claim about a node that may well be
+  // varying — the same error, pointed at a different node.
+  const driven = {
+    ...rgthreeSeed(649, 12345),
+    inputs: [{ name: "seed", link: 42 }],
+  };
+  assert.deepEqual(findRgthreeSeedNodes([driven]), []);
+  // …and an UNLINKED input entry (the shape after disconnecting) still reads the widget.
+  const unlinked = { ...rgthreeSeed(649, 12345), inputs: [{ name: "seed", link: null }] };
+  assert.equal(findRgthreeSeedNodes([unlinked]).length, 1);
+});
+
 test("#1339 — silent for a batch of one, where a repeated seed is not a surprise", () => {
   const found = findRgthreeSeedNodes([rgthreeSeed(649, 12345)]);
   assert.equal(rgthreeFixedSeedNote(found, 1), "");

@@ -221,6 +221,16 @@ export function findRgthreeSeedNodes(nodes) {
       const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
       const seedWidget = widgets.find((w) => w?.name === "seed");
       if (!seedWidget) continue;
+      // A SEED CONVERTED TO AN INPUT IS NOT THIS WIDGET'S VALUE. When the seed is driven
+      // by a link — a Primitive with its own control_after_generate, another extension's
+      // sampler-scheduler, anything — the widget keeps a stale number that says nothing
+      // about what will be submitted. Reporting that number as "fixed for all N items"
+      // would be a confident, checkable, WRONG claim about a node that is in fact varying,
+      // which is the error this whole issue is about. Nothing is established, so nothing
+      // is said.
+      const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
+      const driven = inputs.some((inp) => inp?.name === "seed" && inp?.link != null);
+      if (driven) continue;
       const raw = Number(seedWidget.value);
       if (!Number.isFinite(raw)) continue;
       const mode = RGTHREE_SPECIAL_SEEDS.get(raw) ?? null;
