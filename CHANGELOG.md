@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-08-11
+
+> #968: opening one workflow could silently give it a DIFFERENT workflow's graph — and
+> every check said it was fine, honestly. This is the cause, found and fixed.
+
+### Fixed
+- switching to a workflow no longer copies the previous tab's graph into it. The panel
+  switched tabs, then took a snapshot of the canvas, then repainted — and the snapshot ran
+  while the canvas still showed the tab you were leaving. So the workflow you opened had the
+  OTHER one's graph written into its unsaved state, was marked as edited, and was then
+  repainted from exactly that. Every check afterwards compared the canvas to that state and
+  agreed, because by then they genuinely matched. Only the file on disk disagreed, which is
+  why reloading from disk was the one thing that fixed it.
+
+### Changed
+- the snapshot is now skipped when the canvas provably belongs to another workflow. When it
+  provably belongs to the one being opened — the ordinary case, and the one the snapshot was
+  added for — nothing changes at all.
+- one case is knowingly not covered: a canvas the panel has never tagged cannot be attributed
+  to anyone, so it is still snapshotted as before. Guessing there would mean either
+  overwriting your live edits or writing the wrong graph, and neither is worth doing on a
+  guess.
+
+
 ## [0.14.4] - 2026-08-11
 
 ### Fixed
