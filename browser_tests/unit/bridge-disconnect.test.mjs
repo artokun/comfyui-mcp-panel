@@ -12,7 +12,7 @@ const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", imp
 
 function bridgeStatusHandler() {
   const source = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
-  const start = source.indexOf("const client = createBridgeClient({\n    onStatus(state) {");
+  const start = source.indexOf("const client = createBridgeClient({\n    onStatus(state, socketId) {");
   assert.notEqual(start, -1, "could not locate the bridge status callback");
   const end = source.indexOf("\n    onSay(", start);
   assert.notEqual(end, -1, "could not locate the callback following onStatus");

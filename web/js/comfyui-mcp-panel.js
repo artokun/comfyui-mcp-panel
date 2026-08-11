@@ -16062,7 +16062,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // readiness probe, which can be wrong (e.g. a CLI the orchestrator's PATH
     // can't see). try/catch guards the case where the card isn't built yet.
     if (s === "connected") { try { onboard.hidden = true; } catch {} }
-    onStatus(s);
+    // #952 — the SOCKET this status is about. `"connected"` re-fires on every
+    // re-handshake, so the string alone cannot distinguish a replacement connection
+    // from the live one saying hello again; the id can, and a consumer that ignores
+    // the argument behaves exactly as before.
+    onStatus(s, sock?.__cmcpSocketId ?? null);
   }
   // FIX 1/2 — STEADY status + cold-start patience. While we're actively (auto)
   // reconnecting we hold the pill on a steady "connecting"; a terminal
@@ -16118,6 +16122,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       handshakeTimer = null;
     }
   }
+  let socketSeq = 0;
   function markConnected() {
     handshakeDone = true;
     handshakenSock = sock;
@@ -16317,6 +16322,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       return;
     }
     sock = thisSock;
+    // #952 — a SOCKET identity for the UI. `"connected"` is emitted on every
+    // re-handshake (every `models` frame calls markConnected, and a workflow change
+    // re-hellos the LIVE socket), so the status string cannot tell a replacement
+    // connection from the same one saying hello again — and a UI that treats each as a
+    // replacement would retire question cards that are still perfectly answerable
+    // (codex). This id changes only when a WebSocket is constructed.
+    thisSock.__cmcpSocketId = ++socketSeq;
     // Stamp the socket with the bridge it belongs to, so a replay onto it can be checked
     // against the entry's origin rather than against the mutable current `url`.
     try {
@@ -22848,28 +22860,31 @@ function buildPanel() {
   /**
    * #952 — cards painted on a connection that has since been replaced.
    *
-   * `bridgeConnectSeq` counts CONNECTS, not status changes: a card records the value at
-   * paint time, and a later connect retires everything painted before it. That is a
-   * positive fact — a new connection exists — rather than an inference from a transient
-   * "connecting" blip, and it needs no bridge epoch plumbed into the UI.
+   * KEYED ON THE SOCKET, not on the status string (codex). `"connected"` is emitted on
+   * every RE-HANDSHAKE — each `models` frame calls `markConnected`, and a workflow change
+   * re-hellos the LIVE socket — so counting those would retire question cards that are
+   * still perfectly answerable, which is worse than the duplicate this fixes. The client
+   * mints an id per WebSocket and hands it to `onStatus`; a card records the id that was
+   * live when it was painted, and only a DIFFERENT id retires it.
    *
    * Deliberately NOT resolving the card's promise. The command that painted it already
    * failed with an unknown outcome on the socket that dropped; resolving here would send
    * an answer nowhere, and the panel's own rule is that a reply of this kind does not
    * cross a reconnect. The card stops LOOKING answerable, and says why.
    */
-  let bridgeConnectSeq = 0;
+  /** The socket id the UI currently believes it is talking to (#952). */
+  let liveSocketId = null;
   const liveInteractiveCards = new Set();
 
   function registerInteractiveCard(entry) {
-    const record = { paintedOnConnect: bridgeConnectSeq, ...entry };
+    const record = { paintedOnSocket: liveSocketId, ...entry };
     liveInteractiveCards.add(record);
     return () => liveInteractiveCards.delete(record);
   }
 
-  function retireInteractiveCardsFromPreviousConnections() {
+  function retireInteractiveCardsFromPreviousSockets() {
     for (const record of [...liveInteractiveCards]) {
-      if (record.paintedOnConnect >= bridgeConnectSeq) continue;
+      if (record.paintedOnSocket === liveSocketId) continue;
       liveInteractiveCards.delete(record);
       try {
         record.retire?.();
@@ -22881,7 +22896,7 @@ function buildPanel() {
   }
 
   /** Turn a live interactive card into a dead one: no controls, and a reason. */
-  function retireInteractiveCard(card, { alreadyAnswered, what } = {}) {
+  function retireInteractiveCard(card, { alreadyAnswered, what, detail } = {}) {
     try {
       if (typeof alreadyAnswered === "function" && alreadyAnswered()) return;
       if (!card || !card.isConnected) return;
@@ -22896,7 +22911,8 @@ function buildPanel() {
       note.style.cssText = "font-size:0.68rem;opacity:0.8;margin-top:0.4rem;";
       note.textContent =
         `The connection that asked this ${what ?? "question"} dropped, so an answer here can no ` +
-        `longer reach the agent. If it asked again, answer the newer card.`;
+        `longer reach the agent. ` +
+        (detail ?? "If it asked again, answer the newer card.");
       card.appendChild(note);
     } catch {
       /* presentation only — never break a reconnect */
@@ -23031,6 +23047,23 @@ function buildPanel() {
     log.appendChild(card);
     scrollLog();
     setTimeout(() => input.focus(), 0);
+    // #952 — the SECRET card needs this more than the question card does (codex). It is
+    // a live password field whose reply has nowhere to go once its connection is
+    // replaced, and it can still display "Token saved" — telling a user their token was
+    // stored when nothing received it. Same retirement, different words: never suggest
+    // typing the value somewhere else, because the whole point of this card is that the
+    // value reaches the orchestrator through an input the agent never sees.
+    const unregisterSecret = registerInteractiveCard({
+      retire: () =>
+        retireInteractiveCard(card, {
+          alreadyAnswered: () => done,
+          what: "secret request",
+          detail:
+            "Nothing was sent and nothing was stored. Wait for the agent to ask again on " +
+            "the new connection — do not paste the value into the chat.",
+        }),
+    });
+    promise.then(unregisterSecret, unregisterSecret);
     return promise;
   }
 
@@ -24639,15 +24672,16 @@ function buildPanel() {
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
   const client = createBridgeClient({
-    onStatus(state) {
+    onStatus(state, socketId) {
       statusText.textContent = state;
-      // #952 — a CONNECT retires interactive cards painted on an earlier connection.
-      // Counting connects rather than reacting to "connecting"/"disconnected" keeps this
-      // on a positive fact: a new connection exists, so anything asked on the previous one
-      // can no longer deliver an answer.
-      if (state === "connected") {
-        bridgeConnectSeq += 1;
-        retireInteractiveCardsFromPreviousConnections();
+      // #952 — a card painted on a connection that has since been REPLACED can no longer
+      // deliver an answer. The trigger is the socket's identity, not the status string:
+      // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
+      // change re-hellos the live socket), so keying on it would retire cards that are
+      // still perfectly answerable (codex).
+      if (state === "connected" && socketId != null && socketId !== liveSocketId) {
+        liveSocketId = socketId;
+        retireInteractiveCardsFromPreviousSockets();
       }
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       // Connection status does NOT drive this box's visibility. It's a

@@ -105,13 +105,19 @@ test("#952 retirement is presentation only — a hostile card cannot break a rec
   assert.doesNotThrow(() => retire(fakeCard(), { alreadyAnswered: () => { throw new Error("boom"); } }));
 });
 
-test("#952 source guard: a CONNECT retires earlier cards, and nothing resolves their promise", () => {
+test("#952 (codex) source guard: a DIFFERENT SOCKET retires cards, and nothing resolves their promise", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  // The trigger is a positive fact — a new connection exists — not a "connecting" blip.
-  assert.match(src, /if \(state === "connected"\) \{\r?\n\s*bridgeConnectSeq \+= 1;/, "counted on connect");
-  assert.match(src, /retireInteractiveCardsFromPreviousConnections\(\);/);
-  const sweep = namedFunctionSource(src, "retireInteractiveCardsFromPreviousConnections");
-  assert.match(sweep, /if \(record\.paintedOnConnect >= bridgeConnectSeq\) continue;/, "only EARLIER cards");
+  // `"connected"` re-fires on every re-handshake — each `models` frame calls markConnected,
+  // and a workflow change re-hellos the LIVE socket — so keying on the status string would
+  // retire cards that are still perfectly answerable. The socket's identity can tell them
+  // apart; the string cannot.
+  assert.match(src, /socketId != null && socketId !== liveSocketId/, "a DIFFERENT socket");
+  assert.match(src, /retireInteractiveCardsFromPreviousSockets\(\);/);
+  assert.ok(!/bridgeConnectSeq/.test(src), "the status-counting trigger must not come back");
+  assert.match(src, /thisSock\.__cmcpSocketId = \+\+socketSeq;/, "minted once per WebSocket");
+  assert.match(src, /onStatus\(s, sock\?\.__cmcpSocketId \?\? null\)/, "and handed to the UI");
+  const sweep = namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets");
+  assert.match(sweep, /if \(record\.paintedOnSocket === liveSocketId\) continue;/, "only cards from another socket");
   // Resolving would send an answer to a socket that is gone, and the panel's own rule is
   // that a reply of this kind does not cross a reconnect.
   assert.ok(!/resolveFn|resolve\(/.test(sweep), "the sweep must not answer anything");
@@ -125,4 +131,35 @@ test("#952 source guard: a question card registers itself and unregisters when a
   assert.match(paint, /const unregister = registerInteractiveCard\(\{/, "registered at paint");
   assert.match(paint, /alreadyAnswered: \(\) => done,/, "so an answered card is skipped");
   assert.match(paint, /promise\.then\(unregister, unregister\)/, "and dropped once it settles, either way");
+});
+
+test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () => {
+  // It matters more here than for a question: a live password field whose reply has
+  // nowhere to go can still display "Token saved", telling a user their token was stored
+  // when nothing received it.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const paint = namedFunctionSource(src, "paintSecret");
+  assert.match(paint, /const unregisterSecret = registerInteractiveCard\(\{/, "registered at paint");
+  assert.match(paint, /what: "secret request"/);
+  assert.match(paint, /Nothing was sent and nothing was stored/, "no false 'saved' impression survives");
+  assert.match(paint, /do not paste the value into the chat/, "never redirect a secret into the transcript");
+  assert.match(paint, /promise\.then\(unregisterSecret, unregisterSecret\)/);
+  // The question card's advice would be actively wrong here.
+  assert.ok(!/answer the newer card/.test(paint), "a secret card must not reuse the question wording");
+});
+
+test("#952 (codex) the retirement note takes the caller's detail, and defaults for a question", () => {
+  const card = fakeCard();
+  retire(card, {
+    alreadyAnswered: () => false,
+    what: "secret request",
+    detail: "Nothing was sent and nothing was stored. Wait for the agent to ask again.",
+  });
+  assert.match(card._children[0].textContent, /connection that asked this secret request dropped/);
+  assert.match(card._children[0].textContent, /Nothing was sent and nothing was stored/);
+  assert.doesNotMatch(card._children[0].textContent, /answer the newer card/);
+
+  const q = fakeCard();
+  retire(q, { alreadyAnswered: () => false });
+  assert.match(q._children[0].textContent, /If it asked again, answer the newer card\./, "the default stands");
 });
