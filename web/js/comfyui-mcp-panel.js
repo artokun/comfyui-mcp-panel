@@ -13056,9 +13056,6 @@ const GRAPH_TOOL_EXECUTORS = {
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
     let canvasDivergence = null; // #968
-    // #968 — the workflow whose graph is painted on the canvas at the moment we switch.
-    // Set synchronously immediately before `s.openWorkflow(target)`; see the note there.
-    let canvasOwnerBeforeSwitch = null;
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -13083,14 +13080,6 @@ const GRAPH_TOOL_EXECUTORS = {
         // command rather than reporting it as a move nobody made. A claim that is never
         // followed by a move is discarded by the next observation.
         claimActiveWorkflowMove(MOVE_CAUSES.OPEN_EXECUTOR, `workflow_open ${workflowTabId(target) || ""}`.trim());
-        // #968 — WHOSE canvas is mounted, read SYNCHRONOUSLY before the pointer moves.
-        // After the await, `activeWorkflow` is the target and this fact is unrecoverable:
-        // the store keeps no "what was painted" pointer. The capture below needs it,
-        // because a switch leaves the PREVIOUS tab's graph on the canvas and capturing it
-        // into the target writes another workflow's graph into this one. Identity is
-        // compared through the store's reactive proxies, so match on the tab id / path
-        // rather than `===` (a raw object is not `===` its own proxy).
-        canvasOwnerBeforeSwitch = s?.activeWorkflow ?? null;
         await s.openWorkflow(target);
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
@@ -13198,24 +13187,45 @@ const GRAPH_TOOL_EXECUTORS = {
           // this only ever REMOVES a capture we can prove is reading someone else's canvas.
           // When the target IS already the painted tab (the `wasOpen`/already-current case
           // #874 was written for) the binding is "bound" and the capture runs unchanged.
-          // TWO independent refusals, because they cover different gaps.
+          // The question is ONLY "is the mounted canvas this target's graph?", and it must
+          // be answered with POSITIVE proof, because BOTH answers can destroy data:
+          // capturing a foreign canvas writes another workflow's graph into this one
+          // (#968), and skipping a legitimate capture lets the repaint below overwrite live
+          // canvas work with a stale snapshot (#874). There is no safe default, so this
+          // never guesses from "did the pointer move" — that says nothing about who owns
+          // the canvas, and an earlier draft of this fix got both directions wrong with it
+          // (codex).
           //
-          // (a) the PRE-SWITCH OWNER is decisive and needs no tagging: if some OTHER
-          //     workflow was active when we moved the pointer, its graph is what is
-          //     mounted, full stop. This is the case the #708 oracle cannot always see —
-          //     it reads a uuid tag off the root graph, and an untagged canvas yields
-          //     "unknown", which captures. Comparing tab ids avoids the raw-vs-proxy
-          //     identity trap the store's reactivity sets.
-          // (b) the #708 oracle still runs, and catches a canvas that drifted while the
-          //     pointer never moved — the pre-switch owner would say "same tab" there and
-          //     see nothing wrong.
-          const priorOwnerId = canvasOwnerBeforeSwitch
-            ? workflowTabId(canvasOwnerBeforeSwitch) || canvasOwnerBeforeSwitch.path || null
-            : null;
-          const targetOwnerId = workflowTabId(target) || target.path || null;
-          const switchedTabs = !!priorOwnerId && !!targetOwnerId && priorOwnerId !== targetOwnerId;
+          //   "bound"   — the root graph carries THIS workflow's identity tag. Proof. This
+          //               is the already-current case #874 was written for, and it captures
+          //               exactly as it always did.
+          //   "foreign" — the root positively belongs to another workflow. Skip.
+          //   "unknown" — no usable tag. Fall back to node IDENTITY, the same comparison
+          //               the divergence disclosure uses: a canvas sharing ids with this
+          //               target's own state is this target's canvas. Incremental editing
+          //               keeps most ids, so overlap is strong evidence of ownership.
+          //
+          // `comparable:false` (either side empty) is NOT ownership, so it skips: an empty
+          // target with a populated canvas is precisely the reproduction — the empty tab
+          // came back holding the other workflow's seven nodes.
+          //
+          // KNOWN RESIDUAL, stated rather than hidden: an untagged root whose ids have
+          // ALL turned over — clearing a tab and rebuilding it from scratch before saving —
+          // reads as unowned, so its capture is skipped and the repaint restores the older
+          // state. That needs no tag AND a total id turnover AND an unsaved rebuild, and it
+          // is the same shape the divergence helper documents as indistinguishable. The
+          // alternative is keeping a capture that writes a foreign graph into the tab.
           const captureBinding = describeLiveCanvasBinding(target);
-          if (!switchedTabs && captureBinding !== "foreign") {
+          let canvasIsTargets = captureBinding === "bound";
+          if (captureBinding === "unknown") {
+            const targetState = target.changeTracker?.activeState ?? target.activeState;
+            const overlap = canvasFileDivergence({
+              diskNodes: targetState?.nodes,
+              canvasNodes: app?.graph?._nodes ?? app?.graph?.nodes,
+            });
+            canvasIsTargets = overlap.comparable && !overlap.disjoint;
+          }
+          if (canvasIsTargets) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
               // otherwise have `activeState` read before the capture landed — the silent
