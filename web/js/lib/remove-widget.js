@@ -169,7 +169,21 @@ export function runRemoveWidget(node, widgetName, opts = {}) {
 
   beforeChange?.();
   try {
-    if (typeof node.removeWidget === "function") node.removeWidget(index);
+    // PASS THE WIDGET, NOT THE INDEX. LGraphNode.removeWidget takes the widget OBJECT:
+    // it does `indexOf(arg)` and throws "Widget not found on this node" when that misses,
+    // so an index argument threw on every call and removed nothing.
+    //
+    // I had evidence and misread it. rgthree's `configure()` does
+    // `while (this.widgets?.length) this.removeWidget(0)`, and I took that as proof the
+    // signature is index-based. It is legacy code written against an older litegraph;
+    // on the current frontend that line throws too. A call that happens to exist is not
+    // a contract — the method's own source is.
+    //
+    // There is no fallback path. removeWidget lives on LGraphNode.prototype, so
+    // `typeof === "function"` is unconditionally true and a `splice` branch behind that
+    // test is unreachable code that reads like a safety net. If the method is ever
+    // genuinely absent, the verification below reports it honestly instead.
+    if (typeof node.removeWidget === "function") node.removeWidget(widget);
     else node.widgets.splice(index, 1);
   } finally {
     afterChange?.();

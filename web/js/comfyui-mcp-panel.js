@@ -10668,6 +10668,12 @@ const GRAPH_TOOL_EXECUTORS = {
     );
     const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
     oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    // Feed the #458 observed-backend-history trust root. This command never consults that
+    // history, so skipping it would be harmless HERE — but we just paid for a full
+    // /object_info, and discarding the observation makes a LATER set_widget less able to
+    // tell a removed backend node from an absent one. (Deliberately NOT awaiting the
+    // history seed: nothing on this path reads it, so waiting would buy only latency.)
+    recordObjectInfoTypes(defs);
     const declaredNames = declaredInputNames(defs?.[node.type ?? node.comfyClass]);
     // #718: re-read the ACTIVE uuid at the write boundary — the user can switch workflows
     // while the /object_info fetch above is pending.

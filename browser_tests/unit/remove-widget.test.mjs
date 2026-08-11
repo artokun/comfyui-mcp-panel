@@ -17,9 +17,39 @@ import {
   runRemoveWidget,
 } from "../../web/js/lib/remove-widget.js";
 
+/**
+ * LGraphNode.removeWidget, transcribed from the running frontend (1.48.7):
+ *
+ *   removeWidget(e){
+ *     if(!this.widgets) throw Error("removeWidget called on node without widgets");
+ *     let t=this.widgets.indexOf(e);
+ *     if(t===-1) throw Error("Widget not found on this node");
+ *     …
+ *     this.widgets.splice(t,1)
+ *   }
+ *
+ * IT TAKES THE WIDGET OBJECT. My first version of this file hand-built an INDEX-based
+ * double — `node.removeWidget = (i) => node.widgets.splice(i, 1)` — and asserted the index
+ * it received. Fifteen tests passed against a production code path that threw
+ * "Widget not found on this node" on every single invocation and removed nothing.
+ *
+ * That is the failure mode a double invites: it pins what I believed the frontend does.
+ * Transcribing the real signature (including both throws) is what makes the suite able to
+ * catch this class at all, so every test below installs THIS one.
+ */
+function installRealRemoveWidget(node) {
+  node.removeWidget = function (w) {
+    if (!this.widgets) throw new Error("removeWidget called on node without widgets");
+    const t = this.widgets.indexOf(w);
+    if (t === -1) throw new Error("Widget not found on this node");
+    this.widgets.splice(t, 1);
+  };
+  return node;
+}
+
 /** A Power Lora Loader as it actually appears: rows the def does not declare. */
 function powerLoraNode() {
-  return {
+  return installRealRemoveWidget({
     id: 35,
     type: "Power Lora Loader (rgthree)",
     inputs: [],
@@ -28,7 +58,7 @@ function powerLoraNode() {
       { name: "lora_2", value: { on: true, lora: "b.safetensors", strength: 1, strengthTwo: null } },
       { name: "lora_3", value: { on: false, lora: "c.safetensors", strength: 1, strengthTwo: null } },
     ],
-  };
+  });
 }
 
 const LORA_DEF = { input: { required: { model: ["MODEL"], clip: ["CLIP"] }, optional: {} } };
@@ -101,15 +131,31 @@ test("afterChange still runs when the removal throws — the undo envelope never
   assert.deepEqual(calls, ["before", "after"]);
 });
 
-test("the node's OWN removeWidget is preferred when it exists", () => {
+test("the node's own removeWidget is called with the WIDGET, not its index", () => {
+  // The regression test for the P0. An index reaches the real method as an argument its
+  // indexOf() cannot find, so it throws "Widget not found on this node" and removes
+  // nothing — while a double that accepts an index reports a pass.
   const node = powerLoraNode();
+  const target = node.widgets[2];
   const seen = [];
-  node.removeWidget = (i) => {
-    seen.push(i);
-    node.widgets.splice(i, 1);
+  const real = node.removeWidget.bind(node);
+  node.removeWidget = (w) => {
+    seen.push(w);
+    real(w);
   };
   runRemoveWidget(node, "lora_3", { declaredNames: LORA_DECLARED });
-  assert.deepEqual(seen, [2]);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], target, "removeWidget must receive the widget object itself");
+  assert.deepEqual(node.widgets.map((w) => w.name), ["lora_1", "lora_2"]);
+});
+
+test("an index-passing implementation would THROW against the real signature", () => {
+  // Pins the frontend contract itself, so this file cannot drift back to believing
+  // removeWidget is index-based. rgthree's configure() calls removeWidget(0) — legacy
+  // code against an older litegraph, and the evidence I originally misread.
+  const node = powerLoraNode();
+  assert.throws(() => node.removeWidget(0), /Widget not found on this node/);
+  assert.equal(node.widgets.length, 3, "nothing may be removed by a failed call");
 });
 
 test("a removeWidget that silently NO-OPS is reported as a failure, not a success", () => {
@@ -117,7 +163,7 @@ test("a removeWidget that silently NO-OPS is reported as a failure, not a succes
   // that we reported as success is the worst outcome available: the agent moves on
   // believing the row is gone and the user is looking at it.
   const node = powerLoraNode();
-  node.removeWidget = () => {};
+  node.removeWidget = () => {};  // accepts anything, removes nothing
   assert.throws(
     () => runRemoveWidget(node, "lora_2", { declaredNames: LORA_DECLARED }),
     /still on node 35 .*Nothing was changed/s,
