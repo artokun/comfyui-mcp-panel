@@ -16277,6 +16277,63 @@ function redactBridgeUrl(u) {
 // stamped on its receiving socket: a retained predecessor-process rid is
 // unknown in the new epoch and therefore fails open instead of replaying or
 // rejecting a prior session's command.
+// #646 — a duplicate delivery must not wait FOREVER on an in-flight original.
+//
+// The ledger records a command IN-FLIGHT at begin() and completes it at settleRid(). An
+// in-flight entry is never evicted, deliberately: dropping an unsettled command would let
+// its replay double-apply a mutation. So an executor that never returns leaves a redelivery
+// awaiting a promise that can never resolve, and the panel sends NOTHING — the caller sees
+// a timeout instead of an error, which is the reported shape.
+//
+// Bounded HERE, in a helper that returns an ordinary reply, so the handler keeps exactly the
+// statement shape #508 and #694 pin: one await, then the existing rid-rewrite and send. A
+// new branch in that region is what those guards forbid, and they are right to.
+//
+// The ORIGINAL entry is never settled by this. Answering "failed" for a command that may
+// still be running is how a caller retries into the double-apply the ledger exists to stop.
+// The margin subtracted from the caller's OWN deadline, so the reply lands before they
+// give up rather than after. Small relative to any real command timeout.
+const DUPLICATE_AWAIT_MARGIN_MS = 1500;
+function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
+  // NO GUESS. A bound is applied only when the frame told us how long the caller will wait
+  // (codex): the orchestrator computes a per-command timeout at ui-bridge.ts:3632 but does
+  // not put it in the frame at :4003, so today this is usually absent and the await stays
+  // exactly as unbounded as it is on main. Any fixed number would be a guess about another
+  // process's contract — and a guess that is too high changes nothing (25s cannot rescue a
+  // 20s deadline), while one that is too low reports 'still running' for a merely slow
+  // command. It also disposes of ask_user/request_secret without a special case: they carry
+  // deadlines long enough that a bound derived from them does not fire early. That is the
+  // ORCHESTRATOR's contract, not something this file enforces or can verify (codex).
+  // EVERY usable deadline gets a bound, including one at or below the margin (codex): a
+  // 1000ms timeout is neither absent nor invalid, and falling through to unbounded there
+  // would be a silent gap exactly where the caller gives up soonest. Below the margin the
+  // budget is half the deadline, which still lands before it.
+  const budget = !Number.isFinite(callerTimeoutMs) || callerTimeoutMs <= 0
+    ? null
+    : callerTimeoutMs > DUPLICATE_AWAIT_MARGIN_MS
+      ? callerTimeoutMs - DUPLICATE_AWAIT_MARGIN_MS
+      : Math.floor(callerTimeoutMs / 2);
+  if (budget === null) return Promise.resolve(prior);
+  return Promise.race([
+    Promise.resolve(prior),
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            rid,
+            ok: false,
+            error:
+              "This request id is STILL RUNNING in the panel and has not produced an outcome after " +
+              Math.round(budget / 1000) +
+              "s. This delivery was a DUPLICATE of it, so nothing new was started and nothing was " +
+              "applied twice. DO NOT RETRY: the original may still complete, and re-issuing it is how " +
+              "one mutation becomes two. Read the graph to see whether it took effect.",
+          }),
+        budget,
+      ),
+    ),
+  ]);
+}
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
 
 // #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
@@ -16889,7 +16946,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         if (priorRidReply !== undefined) {
           let dupReply;
           try {
-            dupReply = await priorRidReply;
+            dupReply = await awaitDuplicateReply(priorRidReply, msg.rid, msg.timeout_ms);
           } catch {
             return; // ledger promises never reject — defensive only
           }
