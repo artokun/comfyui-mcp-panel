@@ -455,6 +455,66 @@ def _start_hint(port, comfyui_url=None):
 # It never spawns or kills a process (Comfy Registry security standards) — see
 # the module docstring.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# #584 — a reload that keeps running the OLD panel JS.
+#
+# Reproduced on a dev machine while shipping #753: after editing the panel source,
+# ``location.reload()`` brought the page back with the extension registered, the panel
+# rendered — and the OLD code running. Fetching the same URL returned the NEW bytes while
+# the live stylesheet still held the OLD rules. That is the shape reported here: an
+# installed 0.11.38 with a tab running 0.11.34, surviving a ComfyUI restart and a frontend
+# reload, cleared only by Ctrl+Shift+R.
+#
+# A stale module is invisible from inside the page — it compares equal to itself and every
+# consistency check it can run passes. The only place it can be prevented is the response
+# headers.
+#
+# ``no-cache``, deliberately NOT ``no-store``: the browser may keep the file, but must ask
+# before reusing it. ComfyUI already answers with an ETag derived from mtime+size, so an
+# unchanged file still gets a 304 with no body and costs one conditional request; a changed
+# one can no longer be served from cache without asking. The cost is bounded by our own
+# module count; the failure it removes is a tab that silently runs a build the user
+# replaced.
+#
+# Scoped to this pack's own assets. Nothing else ComfyUI serves is touched.
+# ---------------------------------------------------------------------------
+_ASSET_PREFIX = "/extensions/comfyui-mcp-panel/"
+
+
+def _install_no_cache_middleware(web):
+    try:
+        from server import PromptServer  # type: ignore
+
+        app = PromptServer.instance.app
+    except Exception as _e:  # pragma: no cover - headless host
+        _log("asset revalidation not installed (no app): {}".format(_e))
+        return False
+
+    @web.middleware
+    async def _revalidate_panel_assets(request, handler):
+        response = await handler(request)
+        try:
+            if request.path.startswith(_ASSET_PREFIX):
+                # Never overwrite a header the host set deliberately.
+                if not response.headers.get("Cache-Control"):
+                    response.headers["Cache-Control"] = "no-cache"
+        except Exception:  # pragma: no cover - a header must never break a response
+            pass
+        return response
+
+    try:
+        # aiohttp FREEZES middlewares once the app starts. Custom nodes are imported
+        # during server setup, before run_app, so this normally succeeds — but a host
+        # that imports packs later would raise, and a cache header is never worth
+        # failing to load the panel over.
+        app.middlewares.append(_revalidate_panel_assets)
+    except Exception as _e:  # pragma: no cover - frozen app / exotic host
+        _log("asset revalidation not installed: {}".format(_e))
+        return False
+    _log("panel assets set to revalidate (Cache-Control: no-cache)")
+    return True
+
+
 def _register_routes():
     try:
         from server import PromptServer  # type: ignore
@@ -673,6 +733,8 @@ def _register_routes():
             },
             status=503,
         )
+
+    _install_no_cache_middleware(web)
 
     _log("agent panel routes registered (read-only; orchestrator runs out-of-band)")
 
