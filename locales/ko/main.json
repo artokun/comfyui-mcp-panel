@@ -776,7 +776,17 @@
       "workflow_separate_chat_histories": "워크플로우 — 개별 대화 기록",
       "workflow_snapshot": "워크플로우 스냅숏",
       "working": "작업 중…",
-      "your_agent_inline": "에이전트"
+      "your_agent_inline": "에이전트",
+      "status_connected": "연결됨",
+      "status_connecting": "연결 중…",
+      "status_disconnected": "연결 끊김",
+      "new_chat": "새 대화",
+      "chat_history": "대화 기록",
+      "connect_to_backend_to_load_models": "{backend}에 연결하면 모델 목록을 불러옵니다",
+      "saved_not_available_for_this_backend": "{saved} (이 백엔드에서는 사용할 수 없음)",
+      "saved_suffix": "{saved} (저장됨)",
+      "context_used_cost": "컨텍스트 약 {pct}% 사용 · ${cost}",
+      "friendly_api_key": "{friendly} API 키"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "노드까지 실행 범위가 적용되지 않아 대기열에 아무것도 추가되지 않았습니다"
@@ -989,7 +999,8 @@
       "the_agent_panel_could_not_start": "에이전트 패널을 시작하지 못했습니다.",
       "building_the_panel_threw_so_nothing_was": "패널을 구성하는 중 오류가 발생해 아무것도 표시되지 않았습니다. 이는 패널 자체의 결함이며 연결 문제가 아닙니다. ComfyUI나 팩을 다시 설치해도 해결되지 않습니다. 아래 내용은 실제로 관찰된 정보일 뿐, 원인에 대한 진단이 아닙니다.",
       "please_report_this_at_with_the_text": "위 내용과 함께 사용 중인 ComfyUI 프런트엔드 버전, 브라우저 정보를 {url}에 보고해 주세요.",
-      "the_failure_produced_no_message": "(오류 메시지가 없습니다)"
+      "the_failure_produced_no_message": "(오류 메시지가 없습니다)",
+      "version_line": "패널 {panel} · ComfyUI 프런트엔드 {frontend}"
     },
     "filter": {
       "filters": "필터"

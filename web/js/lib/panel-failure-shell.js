@@ -122,7 +122,7 @@ export function buildPanelFailureShell(doc, err, info = {}) {
 
     const dl = doc.createElement("div");
     dl.setAttribute("style", STYLE.dl);
-    dl.textContent = `panel ${r.panelVersion} · ComfyUI frontend ${r.frontendVersion}`;
+    dl.textContent = tr("failure_shell.version_line", "panel {panel} · ComfyUI frontend {frontend}", { panel: r.panelVersion, frontend: r.frontendVersion });
     wrap.appendChild(dl);
 
     const w = doc.createElement("div");

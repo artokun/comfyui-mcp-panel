@@ -701,3 +701,37 @@ test("right-to-left languages are flagged", () => {
   assert.ok(!isRTL("ko"));
   assert.ok(!isRTL("en"));
 });
+
+test("every connection status token has a translated label", () => {
+  // The status pill renders a state TOKEN (`emitStatus("connected")`), not a literal at the
+  // display site — so no literal scan can see it, and `connected` reached the screen in
+  // English while coverage read 100%. STATUS_LABEL fixes that, but only for the tokens it
+  // lists: add a fourth status and it silently renders the raw token again.
+  //
+  // So pin both sides. Keys must be LITERAL (a key built as `panel.status_${state}` is
+  // invisible to the extractor, which is why the catalog validator rejected the first
+  // attempt), and every token emitStatus can emit must appear in the map.
+  const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
+
+  const emitted = [...src.matchAll(/emitStatus\("([a-z]+)"\)/g)].map((m) => m[1]);
+  assert.ok(emitted.length >= 3, "expected emitStatus call sites");
+
+  const mapAt = src.indexOf("const STATUS_LABEL = {");
+  assert.notEqual(mapAt, -1, "STATUS_LABEL must exist — the status pill translates through it");
+  const map = src.slice(mapAt, src.indexOf("};", mapAt));
+  const covered = [...map.matchAll(/(\w+):\s*\(\)\s*=>\s*tr\("([^"]+)"/g)].map((m) => ({ token: m[1], key: m[2] }));
+
+  const missing = [...new Set(emitted)].filter((t) => !covered.some((c) => c.token === t));
+  assert.deepEqual(missing, [], "these status tokens render untranslated — add them to STATUS_LABEL");
+
+  // And the render site must go through the map, not rebuild a key at runtime.
+  //
+  // Scoped to the onStatus handler, not the whole file, for two reasons: a whole-file
+  // doesNotMatch dumps 1.6MB into the failure output, and a COMMENT explaining the rejected
+  // shape would trip it — which is exactly what happened on the first run.
+  const onStatusAt = src.indexOf("onStatus(state, socketId)");
+  assert.notEqual(onStatusAt, -1, "onStatus handler must exist");
+  const handler = src.slice(onStatusAt, onStatusAt + 1400).replace(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(handler, /tr\(\s*`/, "status keys must be literal, not assembled at runtime");
+  assert.match(handler, /STATUS_LABEL\[state\]/, "the status pill must render through STATUS_LABEL");
+});
