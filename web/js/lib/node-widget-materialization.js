@@ -175,15 +175,23 @@ export function unavailableRequiredWidgetReport(
   // reproduce the very error this fixes one level down.
   const socketDeclared = new Set();
   const widgetDeclared = new Set();
+  // #1062 (codex) — types for which EVERY carrying input resolves to a widget the core
+  // frontend builds natively (`widgetType ?? type` naming a primitive). Held to the same
+  // "every, not some" discipline as socketDeclared directly below, and for the same reason:
+  // one input's native hint must not waive a sibling that needs a real constructor.
+  const nativeWidgetDeclared = new Set();
+  const nonNativeDeclared = new Set();
   const inputsByType = new Map();
   for (const [name, spec] of Object.entries(required)) {
     const type = inputWidgetType(spec);
     if (!type) continue;
     (inputDeclaredAsSocket(spec) ? socketDeclared : widgetDeclared).add(type);
+    (inputDeclaresNativeWidgetType(spec) ? nativeWidgetDeclared : nonNativeDeclared).add(type);
     if (!inputsByType.has(type)) inputsByType.set(type, []);
     inputsByType.get(type).push(name);
   }
   for (const type of widgetDeclared) socketDeclared.delete(type);
+  for (const type of nonNativeDeclared) nativeWidgetDeclared.delete(type);
 
   const report = [];
   for (const [type, inputs] of inputsByType) {
@@ -191,12 +199,25 @@ export function unavailableRequiredWidgetReport(
     // ComfyUI's own `INT:seed` / `INT:noise_seed` keys and any union a pack chooses to
     // register — so the whole string is checked first, before it is decomposed.
     if (typeof widgetConstructors?.[type] === "function") continue;
+    // #1062 (codex) — a NATIVE widget hint resolves without any registration, so there is
+    // nothing here a retry could be waiting for. Checked before the member analysis because
+    // it is a statement about the INPUT's own resolution, independent of what the declared
+    // type's members are or whether anything outputs them.
+    if (nativeWidgetDeclared.has(type)) continue;
     const members = declaredTypeMembers(type);
     if (!members.length) continue;
     // Every member is a datatype no widget constructor will ever appear for: a built-in
     // connection type, or one the CURRENT backend declares as some node's output.
+    // #1062 — `isCore3dFileType` is a THIRD way for a member to be proven a link datatype,
+    // alongside the built-in allowlist and the live output proof. It exists because the
+    // output proof cannot see a core datatype that no INSTALLED node happens to emit; see
+    // its own comment. The quantifier is still `every` — a proven member never vouches for
+    // an unproven one.
     const linkProven = members.every(
-      (member) => SAFE_SOCKET_TYPES.has(member) || knownSocketTypes?.has?.(member) === true,
+      (member) =>
+        SAFE_SOCKET_TYPES.has(member) ||
+        isCore3dFileType(member) ||
+        knownSocketTypes?.has?.(member) === true,
     );
     // A SINGLE built-in connection datatype is waived on the type alone. Unchanged from
     // before this fix, and sound for the same reason it was then: ComfyUI registers no
@@ -343,6 +364,79 @@ export function isCoreDynamicV3Type(type) {
 }
 
 /**
+ * #1062 — ComfyUI's core 3D FILE-FORMAT datatypes.
+ *
+ * These are link datatypes that OFTEN NOTHING INSTALLED OUTPUTS, which is the specific
+ * blind spot in the output-proof oracle: `knownSocketTypes` proves a type is a link
+ * datatype by finding some node that emits it, so a datatype that is real but simply has
+ * no producer on THIS install is indistinguishable from an unregistered custom widget.
+ *
+ * That is not hypothetical, it is the whole of #1062. Core `SaveGLB` declares
+ * `mesh: ("MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,
+ * FILE_3D_USDZ,FILE_3D_PLY,FILE_3D_SPLAT,FILE_3D_SPZ,FILE_3D_KSPLAT,FILE_3D_SPLAT_ANY,
+ * FILE_3D_POINT_CLOUD_ANY,FILE_3D", {tooltip})`. Measured against a live ComfyUI 0.31 with
+ * 4183 node definitions: SEVEN of those members are emitted by some node
+ * (MESH, FILE_3D_GLB, FILE_3D_OBJ, FILE_3D_FBX, FILE_3D_SPLAT_ANY,
+ * FILE_3D_POINT_CLOUD_ANY, FILE_3D) and SEVEN are emitted by nothing at all
+ * (FILE_3D_GLTF, FILE_3D_STL, FILE_3D_USDZ, FILE_3D_PLY, FILE_3D_SPLAT, FILE_3D_SPZ,
+ * FILE_3D_KSPLAT) — a union naming formats ComfyUI can WRITE but that no installed node
+ * PRODUCES. So `linkProven` was false, and SaveGLB — the only core node that writes a
+ * .glb — could not be placed on the canvas at all.
+ *
+ * WHY NOT #1062'S OWN PROPOSED FIX (`every` -> `some` over the members): because a proven
+ * member must not vouch for an unproven one. An empty config counts as socket-shaped, so
+ * the input-level bar cannot catch `("MESH,ZIPN_STYLE_GALLERY", {})` — only `every` does,
+ * and `some` would admit that node while silently skipping a widget that never registered
+ * (#580's false accept). That invariant is pinned by its own test and is UNCHANGED here:
+ * the quantifier stays `every`. What changes is what a member can be proven BY.
+ *
+ * AN EXPLICIT SET, NOT A `FILE_3D_*` PREFIX — deliberately the opposite choice from
+ * `COMFY_*_V3` above, because the two namespaces have opposite ownership. `COMFY_*_V3` is
+ * ComfyUI's reserved prefix, so covering the family is right and enumerating it would rot.
+ * `FILE_3D_*` is not reserved: a pack is free to invent `FILE_3D_ACME`, and a prefix rule
+ * would launder exactly the unregistered custom member the invariant above exists to
+ * refuse. This is a closed list of the 13 members ComfyUI core ships — verified against the
+ * shipped 1.50.3 frontend, where all 13 appear in the `dataTypes` translation tables (one
+ * entry per locale) and NONE appears as a widget constructor. A future core format is a
+ * one-line addition and fails closed until then, which is the safe direction.
+ *
+ * The caller still requires the input to declare itself socket-shaped, so a node using one
+ * of these types while declaring widget-value keys keeps waiting for its constructor.
+ */
+const CORE_3D_FILE_TYPES = new Set([
+  "FILE_3D",
+  "FILE_3D_FBX",
+  "FILE_3D_GLB",
+  "FILE_3D_GLTF",
+  "FILE_3D_KSPLAT",
+  "FILE_3D_OBJ",
+  "FILE_3D_PLY",
+  "FILE_3D_POINT_CLOUD_ANY",
+  "FILE_3D_SPLAT",
+  "FILE_3D_SPLAT_ANY",
+  "FILE_3D_SPZ",
+  "FILE_3D_STL",
+  "FILE_3D_USDZ",
+]);
+
+/**
+ * EXACT match, no normalisation (codex). Trimming and upper-casing looked like tidiness and
+ * was a hole in the closed-list claim above: every other registry here keys on the declared
+ * spelling verbatim — the widget-constructor lookup and `knownSocketTypes` both do — so a
+ * required input declared `file_3d_gltf`, or a single-member `" FILE_3D_GLTF "`, is a
+ * DIFFERENT identifier from the core type everywhere else in this module. Normalising here
+ * would have let those be waived as proven core sockets, which is precisely the laundering
+ * the explicit set exists to prevent, and would additionally have made the refusal text
+ * claim the backend declares that exact spelling as a link datatype when it does not.
+ *
+ * Union members arrive already trimmed from `declaredTypeMembers`; a single type does not,
+ * and that asymmetry is the store's, not ours to paper over.
+ */
+export function isCore3dFileType(type) {
+  return typeof type === "string" && CORE_3D_FILE_TYPES.has(type);
+}
+
+/**
  * Whether a required input DECLARES itself as a link socket rather than a prompt value.
  *
  * This is the input-level half of the #626 waiver, and it is a POSITIVE reading of the
@@ -354,6 +448,44 @@ export function isCoreDynamicV3Type(type) {
  * Deliberately NOT inferred from the type: the same datatype can be a widget on one node
  * and a socket on another, which is exactly why the output-side evidence was insufficient.
  */
+/**
+ * #1062 (codex re-review) — whether an input's `widgetType` hint names a widget the CORE
+ * FRONTEND IMPLEMENTS ITSELF.
+ *
+ * The companion to putting `widgetType` in WIDGET_VALUE_CONFIG_KEYS. That key correctly says
+ * "this input is a widget, not a socket", which is what stops an unregistered custom widget
+ * from being waived as a link. But it is not the whole ruling, and taking it as the whole
+ * ruling was a false REFUSAL — the exact mirror of the accept it fixed.
+ *
+ * ComfyUI resolves the widget as `widgetType ?? type`, so `("FILE_3D_GLTF", {widgetType:
+ * "STRING"})` renders a NATIVE STRING widget. Nothing registers a constructor for
+ * FILE_3D_GLTF and nothing ever will, so refusing it waits on evidence that cannot arrive
+ * (#796) — the same failure #788 fixed for `("FLOAT,INT", {widgetType: "FLOAT"})`, which
+ * this file already documents. The difference is only that #788 read the resolution off the
+ * declared TYPE and this reads it off the hint, which is the half that actually wins.
+ *
+ * A NON-primitive hint is unchanged and still fails closed: `{widgetType: "ACME_GALLERY"}`
+ * genuinely needs a constructor no core frontend provides, and that is the case the key-list
+ * addition exists to catch.
+ */
+function inputDeclaresNativeWidgetType(spec) {
+  if (!Array.isArray(spec)) return false;
+  const config = spec[1];
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  // EXACT match against the primitive set, deliberately NOT via isPrimitiveWidgetType
+  // (codex). That helper trims and upper-cases, which is right where it is used — the #788
+  // waiver feeds it union MEMBERS, and whitespace around a comma is the store's syntax
+  // rather than part of the identifier. Here the value is an identifier the frontend looks
+  // up verbatim, so normalising would waive `"string"` and `" STRING "` as native widgets
+  // when ComfyUI would resolve neither, granting the waiver to a name that is not the
+  // primitive. Same exact-spelling discipline as isCore3dFileType, and for the same reason.
+  //
+  // Left isPrimitiveWidgetType untouched rather than tightening it globally: it predates
+  // this and #788 depends on its current behaviour, so narrowing it here is the change that
+  // is actually justified by the evidence.
+  return typeof config.widgetType === "string" && PRIMITIVE_WIDGET_TYPES.has(config.widgetType);
+}
+
 export function inputDeclaredAsSocket(spec) {
   if (!Array.isArray(spec)) return false;
   // A legacy combo (choices as the first tuple item) is always a widget — it exists to
@@ -390,6 +522,21 @@ const WIDGET_VALUE_CONFIG_KEYS = [
   "video_upload",
   "audio_upload",
   "placeholder",
+  // #1062 (codex) — `widgetType` is the strongest widget declaration of all, and it was
+  // missing. It is not a value like the keys above; it is the input naming the widget it
+  // renders as, which the stock frontend resolves with `widgetType ?? type` (verified in
+  // the shipped bundle, and already documented by the #788 case
+  // `("FLOAT,INT", {widgetType: "FLOAT", …})`).
+  //
+  // Its absence was latent rather than harmless: an input declaring ONLY `widgetType` — no
+  // `default`, no range — counted as socket-shaped, so `socketDeclared` held it and the
+  // input-level bar waved it through. Nothing reached that state before, because such a
+  // type still had to clear `linkProven` and an unproduced datatype never did. Adding the
+  // core-3D proof removed that accidental second lock, which is what surfaced this:
+  // `("FILE_3D_GLTF", {widgetType: "STRING"})` would have been added as a socket while
+  // genuinely being a STRING widget — a node with neither a widget value nor a link, which
+  // is exactly #580's false accept.
+  "widgetType",
 ];
 
 /**
