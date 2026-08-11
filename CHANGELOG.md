@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.8] - 2026-08-11
+
+> #968: three reports of the panel saying a tab was bound to the workflow you asked for
+> while the canvas held a DIFFERENT workflow's graph — once queueing the wrong one. Every
+> check reported healthy, and every check was telling the truth.
+
+### Added
+- `panel_open_workflow` on an already-open tab now compares the file it just read against
+  the canvas, and says so when they share **no node ids at all**. In the report that was 44
+  nodes on screen against 40 in the file with none in common — which is not what editing
+  looks like.
+
+### Changed
+- it is a DISCLOSURE, not a refusal. Clearing a tab and rebuilding, or pasting a whole graph
+  in before saving, look the same from here, so the note names those alternatives and leaves
+  the judgement to you. A refusal built on that ambiguity would be a wrong-graph refusal of
+  its own — the same class of harm as the bug.
+- why nothing caught this before: the repaint loads from the tab's own state and proves the
+  canvas against **that state**, while the staleness check compares the file against the
+  tab's **baseline**. Both pass honestly when the tab's own state is carrying another
+  workflow's graph. Nobody compared the file to the canvas, even though that code path had
+  already read the file.
+
+
 ## [0.13.7] - 2026-08-11
 
 > artokun/comfyui-mcp#938: an agent could WRITE a dynamic widget row and could delete the
