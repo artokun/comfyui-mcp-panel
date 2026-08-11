@@ -151,7 +151,32 @@ for (const file of FILES) {
       continue;
     }
 
-    const parsed = schema.safeParse(withoutPlurals(target));
+    // MISSING keys are reported, not failed.
+    //
+    // This was originally a hard error, on the reasoning that a half-translated file looks
+    // fine to whoever reads English. True — but it makes incompleteness unreachable as a
+    // state, and a trial merge proved the consequence: once the conversion units land,
+    // English has 410 keys and every other language has 246, so EVERY merge is red until all
+    // twelve languages are finished. No language could ever be added incrementally either.
+    //
+    // `tr()` already falls back per key, so a missing key renders correct English — the
+    // honest description is "incomplete", not "broken". What stays a hard error is anything
+    // WRONG: a key English does not have, an empty string, a lost {placeholder}, or a plural
+    // category the language does not use. Those are defects at any completion level.
+    // Coverage is printed on every run so incompleteness is visible rather than silent.
+    const targetFlatEarly = flat(target);
+    const missingKeys = [...sourceFlat.keys()].filter((k) => !pluralSplit(k) && !targetFlatEarly.has(k));
+    const forSchema = withoutPlurals(target);
+    for (const k of missingKeys) {
+      // Fill missing keys with the English text purely so the SHAPE check can run and find
+      // real defects in the keys that ARE present. Nothing is written to disk.
+      const parts = k.split('.');
+      let cur = forSchema;
+      for (const p of parts.slice(0, -1)) cur = cur[p] ??= {};
+      cur[parts.at(-1)] = sourceFlat.get(k);
+    }
+
+    const parsed = schema.safeParse(forSchema);
     if (!parsed.success) {
       for (const issue of parsed.error.issues.slice(0, 12)) {
         const at = issue.path.join('.') || '(root)';
@@ -188,6 +213,9 @@ for (const file of FILES) {
       // Plural variants are compared by base above; a per-key comparison here would flag
       // every legitimately-absent English category as a mismatch.
       if (pluralSplit(key)) continue;
+      // A key this language has not reached yet renders English via tr()'s fallback. It is
+      // counted in coverage below, not checked for placeholder parity against itself.
+      if (!targetFlat.has(key)) continue;
       const tr = targetFlat.get(key);
       if (holes(en) !== holes(tr)) {
         note(`${locale}/${file} @ ${key}: placeholders differ — English has [${holes(en) || 'none'}], ${locale} has [${holes(tr) || 'none'}]`);
@@ -198,14 +226,23 @@ for (const file of FILES) {
       }
     }
     if (!placeholderBad) {
-      const pct = Math.round(((sourceFlat.size - untranslated) / sourceFlat.size) * 100);
-      console.log(`  ✓ ${locale}/${file} — ${sourceFlat.size} keys, ${pct}% translated`);
+      // Coverage counts a key as untranslated if it is ABSENT or byte-identical to English.
+      // Both render English to the user, so both are the same thing from where they sit.
+      const total = [...sourceFlat.keys()].filter((k) => !pluralSplit(k)).length;
+      const done = total - missingKeys.length - untranslated;
+      const pct = total ? Math.round((done / total) * 100) : 100;
+      const gap = missingKeys.length ? `, ${missingKeys.length} not yet translated (renders English)` : '';
+      console.log(`  ✓ ${locale}/${file} — ${done}/${total} keys, ${pct}%${gap}`);
     }
   }
 }
 
 if (failures) {
-  console.error(`\n${failures} problem(s). Translations must match ${SOURCE} exactly.`);
+  console.error(
+    `\n${failures} problem(s). A translation may be INCOMPLETE — missing keys fall back to ` +
+      `English — but it may not be WRONG: no unknown keys, no empty strings, no lost ` +
+      `{placeholders}, and only the plural categories the language actually uses.`,
+  );
   process.exit(1);
 }
 console.log('\nlocales OK');
