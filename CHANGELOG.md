@@ -6,6 +6,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-11
+
+> #1062: asking the agent to add `SaveGLB` always failed. It is the only core node that
+> writes a `.glb`, so while this was broken you could not build an image-to-3D or
+> text-to-3D workflow through the panel at all.
+
+### Fixed
+- `SaveGLB` can be added again. Its `mesh` input accepts a list of 3D formats, and the panel
+  refused to place the node unless it could prove every single one was a real connection
+  type. Seven of the fourteen are formats ComfyUI can WRITE that nothing on your machine
+  PRODUCES — so the proof could never be found, on any install, and retrying or refreshing
+  the node list could not help. ComfyUI's core 3D file formats now count as connection
+  types on their own.
+
+### Changed
+- the check that this relaxes is the one that stops a node being added when an input needs a
+  widget that never loaded, so it was loosened narrowly and in one direction only: the list
+  of 3D formats is a fixed set of the 13 ComfyUI ships, not a `FILE_3D_*` pattern. A custom
+  node inventing its own `FILE_3D_…` type is still held to the same proof as before, and an
+  input that asks for a real widget still waits for it.
+- an input that names the widget it draws as (`widgetType`) is now correctly treated as a
+  widget rather than a connection — a gap found while making the above safe, which could
+  have let a node be added with neither a value nor a connection on a required input. Where
+  that name is one of the four built-in kinds, it needs nothing loaded and no longer waits.
+
+
 ## [0.14.1] - 2026-08-11
 
 > #1066, the other half: 0.13.9 stopped a URL-derived tab from building an unwritable
