@@ -13056,6 +13056,9 @@ const GRAPH_TOOL_EXECUTORS = {
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
     let canvasDivergence = null; // #968
+    // #968 — the workflow whose graph is painted on the canvas at the moment we switch.
+    // Set synchronously immediately before `s.openWorkflow(target)`; see the note there.
+    let canvasOwnerBeforeSwitch = null;
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -13080,6 +13083,14 @@ const GRAPH_TOOL_EXECUTORS = {
         // command rather than reporting it as a move nobody made. A claim that is never
         // followed by a move is discarded by the next observation.
         claimActiveWorkflowMove(MOVE_CAUSES.OPEN_EXECUTOR, `workflow_open ${workflowTabId(target) || ""}`.trim());
+        // #968 — WHOSE canvas is mounted, read SYNCHRONOUSLY before the pointer moves.
+        // After the await, `activeWorkflow` is the target and this fact is unrecoverable:
+        // the store keeps no "what was painted" pointer. The capture below needs it,
+        // because a switch leaves the PREVIOUS tab's graph on the canvas and capturing it
+        // into the target writes another workflow's graph into this one. Identity is
+        // compared through the store's reactive proxies, so match on the tab id / path
+        // rather than `===` (a raw object is not `===` its own proxy).
+        canvasOwnerBeforeSwitch = s?.activeWorkflow ?? null;
         await s.openWorkflow(target);
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
@@ -13150,16 +13161,72 @@ const GRAPH_TOOL_EXECUTORS = {
           //
           // Best-effort. A frontend without `checkState` behaves exactly as before —
           // this must never be the thing that fails an open.
-          try {
-            // AWAITED (codex). A frontend whose tracker captures asynchronously would
-            // otherwise have `activeState` read before the capture landed — the silent
-            // revert intact, and a late rejection escaping this try/catch to become an
-            // unhandled rejection. Awaiting a non-promise is free, so the synchronous
-            // trackers this ships against are unaffected.
-            await target.changeTracker?.checkState?.();
-          } catch {
-            // A tracker that refuses to capture leaves the stale snapshot in place,
-            // which is today's behaviour, not a new failure.
+          // #968 — ONLY when the canvas is PROVEN to be this workflow's. This capture is
+          // the silent wrong-graph edit, and it is worth being exact about why, because
+          // the intent above is right and only the PLACEMENT is wrong.
+          //
+          // We arrive here having just moved the pointer (`s.openWorkflow(target)`) and
+          // NOT yet repainted — the repaint reads `activeState` a few lines below. So on
+          // a switch FROM another tab the configuration is:
+          //
+          //   activeWorkflow      = target          (the pointer moved)
+          //   app.rootGraph       = the OTHER tab   (nothing has repainted yet)
+          //
+          // `checkState()` calls ComfyUI's `captureCanvasState()`, which serializes
+          // `app.rootGraph` into the ACTIVE tracker's `activeState`. Its two guards both
+          // assume the pointer and the canvas agree: `ChangeTracker.isLoadingGraph` is
+          // false (nothing is loading — this is our own switch, not `loadGraphData`), and
+          // `isActiveTracker(target)` is true (target genuinely IS active). Both pass, and
+          // the previous tab's graph lands in TARGET's state.
+          //
+          // The repaint below then faithfully reproduces that state, and the content proof
+          // compares the canvas against the same poisoned state and PASSES. Every binding
+          // surface afterwards reports healthy and is telling the truth — the canvas really
+          // does match the workflow object's state. The object's state is what is wrong.
+          // Only a read of the FILE disagrees, which is why `panel_load_workflow` was the
+          // one recovery reporters found.
+          //
+          // Reproduced live: pointer moved to an empty tab while a 7-node canvas was
+          // mounted, one `checkState()`, and the empty tab came back holding 7 nodes,
+          // `isModified: true`, and the OTHER workflow's `activeState.id`. No reconnect, no
+          // concurrency — which is what the reports without a reconnect storm were telling
+          // us all along.
+          //
+          // The guard is the #708 oracle, already used for exactly this hazard on the SAVE
+          // path: a positive, durable identity conflict refuses the capture. "unknown"
+          // still captures, so older frontends and first observation behave as before —
+          // this only ever REMOVES a capture we can prove is reading someone else's canvas.
+          // When the target IS already the painted tab (the `wasOpen`/already-current case
+          // #874 was written for) the binding is "bound" and the capture runs unchanged.
+          // TWO independent refusals, because they cover different gaps.
+          //
+          // (a) the PRE-SWITCH OWNER is decisive and needs no tagging: if some OTHER
+          //     workflow was active when we moved the pointer, its graph is what is
+          //     mounted, full stop. This is the case the #708 oracle cannot always see —
+          //     it reads a uuid tag off the root graph, and an untagged canvas yields
+          //     "unknown", which captures. Comparing tab ids avoids the raw-vs-proxy
+          //     identity trap the store's reactivity sets.
+          // (b) the #708 oracle still runs, and catches a canvas that drifted while the
+          //     pointer never moved — the pre-switch owner would say "same tab" there and
+          //     see nothing wrong.
+          const priorOwnerId = canvasOwnerBeforeSwitch
+            ? workflowTabId(canvasOwnerBeforeSwitch) || canvasOwnerBeforeSwitch.path || null
+            : null;
+          const targetOwnerId = workflowTabId(target) || target.path || null;
+          const switchedTabs = !!priorOwnerId && !!targetOwnerId && priorOwnerId !== targetOwnerId;
+          const captureBinding = describeLiveCanvasBinding(target);
+          if (!switchedTabs && captureBinding !== "foreign") {
+            try {
+              // AWAITED (codex). A frontend whose tracker captures asynchronously would
+              // otherwise have `activeState` read before the capture landed — the silent
+              // revert intact, and a late rejection escaping this try/catch to become an
+              // unhandled rejection. Awaiting a non-promise is free, so the synchronous
+              // trackers this ships against are unaffected.
+              await target.changeTracker?.checkState?.();
+            } catch {
+              // A tracker that refuses to capture leaves the stale snapshot in place,
+              // which is today's behaviour, not a new failure.
+            }
           }
           // `activeWorkflowNodeCount` deliberately accepts both tracker-owned and flat
           // activeState shapes. Use that SAME state source here: otherwise a frontend
