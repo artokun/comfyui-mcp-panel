@@ -18676,37 +18676,120 @@ function ensureStyles() {
   styleInjected = true;
 }
 
-/** Human-readable one-liner for an executed agent command. */
+/** Human-readable one-liner for an executed agent command.
+ *
+ * TRANSLATED — and this is the panel's REFERENCE IMPLEMENTATION for counted text, so the
+ * conventions other units copy are stated here once:
+ *
+ *  1. NO `n === 1 ? "" : "s"`. English is the odd one out: of the twelve languages ComfyUI
+ *     ships, Korean/Japanese/Chinese have ONE plural form, Russian four, Arabic six. A
+ *     counted string therefore passes `{ count }` plus an OBJECT fallback
+ *     (`{ one: "…{count} node", other: "…{count} nodes" }`) and lets `tr` ask
+ *     `Intl.PluralRules` which form the ACTIVE language wants. The English pair stays at
+ *     the call site, so the code still reads as prose and an untranslated locale still
+ *     renders correct English.
+ *
+ *  2. `count` is a RESERVED placeholder name — a NUMERIC `count` is precisely what switches
+ *     `tr` into plural lookup. A number that is only interpolated (a node id, a batch
+ *     multiplier) must be named something else, or it silently starts selecting forms.
+ *
+ *  3. One key carries ONE count. "Auto-arranged N nodes (M columns)" has two independent
+ *     plural axes, so it is two keys concatenated; no single key can hold both.
+ *
+ * Optional trailing clauses stay their own keys and are appended with `+`, mirroring how the
+ * English template literals composed them — a translator gets a whole clause, never a
+ * stray "s". `detail:` values that carry raw tool/callback error text are deliberately NOT
+ * translated: that text is the machine's words, not ours.
+ */
 function describeCommand(cmd, msg, reply) {
-  if (!reply.ok) return { icon: "pi-exclamation-triangle", text: `${cmd} failed`, detail: reply.error };
+  // `reply.error` is raw tool-error text — passed through untouched, never translated.
+  if (!reply.ok)
+    return { icon: "pi-exclamation-triangle", text: tr("panel.command_failed", "{cmd} failed", { cmd }), detail: reply.error };
   const r = reply.result ?? {};
   switch (cmd) {
     case "graph_get_state":
-      return { icon: "pi-eye", text: `Read graph — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
+      return {
+        icon: "pi-eye",
+        text: tr(
+          "panel.read_graph_nodes",
+          { one: "Read graph — {count} node", other: "Read graph — {count} nodes" },
+          { count: r.node_count },
+        ),
+      };
     case "graph_serialize":
-      return { icon: "pi-copy", text: `Captured canvas — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
+      return {
+        icon: "pi-copy",
+        text: tr(
+          "panel.captured_canvas_nodes",
+          { one: "Captured canvas — {count} node", other: "Captured canvas — {count} nodes" },
+          { count: r.node_count },
+        ),
+      };
     case "graph_add_node":
-      return { icon: "pi-plus-circle", text: `Added ${r.added?.type ?? "node"} (id ${r.added?.id})` };
+      return {
+        icon: "pi-plus-circle",
+        // `{type}` normally holds a node CLASS name (an untranslatable identifier like
+        // "KSampler"); `panel.a_node` is only the generic noun for the defensive case where
+        // the reply named no type at all — shared with graph_remove_node so the two lines
+        // cannot disagree about what to call an unnamed node.
+        text: tr("panel.added_node", "Added {type} (id {id})", {
+          type: r.added?.type ?? tr("panel.a_node", "node"),
+          id: r.added?.id,
+        }),
+      };
     case "graph_remove_node": {
       const cb = r.cleaned_boundary_slots;
       const cleaned = [...(cb?.inputs ?? []), ...(cb?.outputs ?? [])].filter(Boolean);
-      const suffix = cleaned.length ? ` — cleaned orphaned boundary ${cleaned.length === 1 ? "slot" : "slots"} ${cleaned.join(", ")}` : "";
-      return { icon: "pi-minus-circle", text: `Removed ${r.removed?.type ?? "node"} (id ${r.removed?.id})${suffix}` };
+      // The count drives the FORM ("slot"/"slots") without being rendered — the slot names
+      // are what the user reads. That is exactly why the category has to come from Intl:
+      // there is no "s" here to bolt on, and a language may inflect the noun differently.
+      const suffix = cleaned.length
+        ? tr(
+            "panel.removed_node_cleaned_slots",
+            {
+              one: " — cleaned orphaned boundary slot {slots}",
+              other: " — cleaned orphaned boundary slots {slots}",
+            },
+            { count: cleaned.length, slots: cleaned.join(", ") },
+          )
+        : "";
+      return {
+        icon: "pi-minus-circle",
+        text:
+          tr("panel.removed_node", "Removed {type} (id {id})", {
+            type: r.removed?.type ?? tr("panel.a_node", "node"),
+            id: r.removed?.id,
+          }) + suffix,
+      };
     }
     case "graph_clear":
       return {
         icon: "pi-eraser",
-        text: `Cleared canvas — removed ${r.cleared} node${r.cleared === 1 ? "" : "s"} (one Ctrl+Z restores all)`,
+        text: tr(
+          "panel.cleared_canvas_nodes",
+          {
+            one: "Cleared canvas — removed {count} node (one Ctrl+Z restores all)",
+            other: "Cleared canvas — removed {count} nodes (one Ctrl+Z restores all)",
+          },
+          { count: r.cleared },
+        ),
       };
     case "graph_connect":
       return {
         icon: "pi-link",
         text:
-          `Connected ${r.connected?.from?.node_id}.${r.connected?.from?.output} → ${r.connected?.to?.node_id}.${r.connected?.to?.input}` +
-          (r.connected?.auto_matched ? " (auto-matched)" : ""),
+          tr("panel.connected_slots", "Connected {from} → {to}", {
+            from: `${r.connected?.from?.node_id}.${r.connected?.from?.output}`,
+            to: `${r.connected?.to?.node_id}.${r.connected?.to?.input}`,
+          }) + (r.connected?.auto_matched ? tr("panel.connected_auto_matched", " (auto-matched)") : ""),
       };
     case "graph_disconnect":
-      return { icon: "pi-times-circle", text: `Disconnected ${r.disconnected?.node_id}.${r.disconnected?.input}` };
+      return {
+        icon: "pi-times-circle",
+        text: tr("panel.disconnected_slot", "Disconnected {slot}", {
+          slot: `${r.disconnected?.node_id}.${r.disconnected?.input}`,
+        }),
+      };
     case "graph_set_widget": {
       // #314: an LTXDirector timeline_data write was routed through the node's own
       // re-hydration, which also regenerated the derived prompt/length widgets.
@@ -18715,9 +18798,17 @@ function describeCommand(cmd, msg, reply) {
         return {
           icon: "pi-sliders-h",
           text:
-            `Drove LTXDirector timeline on node ${r.ltx_timeline.node_id}` +
-            (seg != null ? ` (${seg} segment${seg === 1 ? "" : "s"})` : "") +
-            ` — UI re-synced, derived prompt/length widgets regenerated`,
+            tr("panel.drove_ltx_timeline", "Drove LTXDirector timeline on node {node_id}", {
+              node_id: r.ltx_timeline.node_id,
+            }) +
+            (seg != null
+              ? tr(
+                  "panel.ltx_timeline_segments",
+                  { one: " ({count} segment)", other: " ({count} segments)" },
+                  { count: seg },
+                )
+              : "") +
+            tr("panel.ltx_timeline_resynced", " — UI re-synced, derived prompt/length widgets regenerated"),
         };
       }
       // #366: a promoted-subgraph write is only truly applied when the parent RAIL
@@ -18742,102 +18833,249 @@ function describeCommand(cmd, msg, reply) {
       // the callback programmatically and that alone can be why it threw.
       const writeDisclosed = typeof r.set?.write_warning === "string";
       const threwInNodeCallback = r.set?.write_warning_source === "widget_callback";
+      // One base clause for every variant, so a translated warning line can never drift
+      // from the plain one — the disclosure is appended, exactly as the English did.
+      const setLine = tr("panel.set_widget", "Set {widget} = {value} on node {node_id}", {
+        widget: r.set?.widget,
+        value: JSON.stringify(r.set?.value),
+        node_id: r.set?.node_id,
+      });
+      const wasPrevious = tr("panel.was_previous_value", "was {value}", {
+        value: JSON.stringify(r.set?.previous),
+      });
       return railStale
         ? {
             icon: "pi-exclamation-triangle",
-            text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id} — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)`,
-            detail: `was ${JSON.stringify(r.set?.previous)}`,
+            text:
+              setLine +
+              tr(
+                "panel.set_widget_rail_not_synced",
+                " — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)",
+              ),
+            detail: wasPrevious,
           }
         : {
             icon: writeDisclosed ? "pi-exclamation-triangle" : "pi-sliders-h",
             text:
-              `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
+              setLine +
               (writeDisclosed
                 ? threwInNodeCallback
-                  ? ` — value verified in effect; the exception came from invoking the widget's own callback, so its side effects may not have run`
-                  : ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
+                  ? tr(
+                      "panel.set_widget_threw_in_widget_callback",
+                      " — value verified in effect; the exception came from invoking the widget's own callback, so its side effects may not have run",
+                    )
+                  : tr(
+                      "panel.set_widget_threw_while_applying",
+                      " — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed",
+                    )
                 : ""),
-            detail: `was ${JSON.stringify(r.set?.previous)}`,
+            detail: wasPrevious,
           };
     }
     case "graph_get_subgraph":
       return {
         icon: "pi-sitemap",
-        text: `Read subgraph “${r.subgraph_of?.title}” — ${r.node_count} node${r.node_count === 1 ? "" : "s"}`,
+        text: tr(
+          "panel.read_subgraph_nodes",
+          { one: "Read subgraph “{title}” — {count} node", other: "Read subgraph “{title}” — {count} nodes" },
+          { count: r.node_count, title: r.subgraph_of?.title },
+        ),
       };
     case "graph_promote_widget":
       return r.demoted
-        ? { icon: "pi-arrow-down", text: `Un-promoted “${r.demoted}” from the subgraph node` }
-        : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
+        ? {
+            icon: "pi-arrow-down",
+            text: tr("panel.unpromoted_widget", "Un-promoted “{name}” from the subgraph node", { name: r.demoted }),
+          }
+        : {
+            icon: "pi-arrow-up",
+            text: tr("panel.promoted_widget", "Promoted “{name}” to the subgraph node", { name: r.promoted }),
+          };
     case "graph_edit_node": {
       const edited = r.edited ?? [];
-      const suffix = edited.length === 1 ? `node ${edited[0]?.after?.node_id}` : `${edited.length} nodes`;
-      return { icon: "pi-pencil", text: `Edited ${suffix} presentation` };
+      // TWO DIFFERENT CLAIMS, not two grammatical numbers — so this branches on the DATA
+      // (`length === 1`) and picks between two keys, rather than hiding the choice in a
+      // one/other pair. A plural category is NOT a count: `Intl.PluralRules("ru").select(21)`
+      // is "one", and Arabic routes n=2 to "two", so a `one:` form that names `edited[0]`
+      // would report a 21-node batch as a single edit of the first node. The banned pattern
+      // is English GRAMMAR hard-coded in JS; choosing which fact to state is not that, and
+      // the batch line below is still a real plural.
+      return {
+        icon: "pi-pencil",
+        text:
+          edited.length === 1
+            ? tr("panel.edited_one_node_presentation", "Edited node {node_id} presentation", {
+                node_id: edited[0]?.after?.node_id,
+              })
+            : tr(
+                "panel.edited_nodes_presentation",
+                { one: "Edited {count} node presentation", other: "Edited {count} nodes presentation" },
+                { count: edited.length },
+              ),
+      };
     }
     case "graph_move_node":
-      return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+      return {
+        icon: "pi-arrows-alt",
+        text: tr("panel.moved_node_to", "Moved node {node_id} to [{pos}]", {
+          node_id: r.moved?.node_id,
+          pos: r.moved?.to?.map(Math.round),
+        }),
+      };
     case "graph_resize_node":
-      return { icon: "pi-expand", text: `Resized node ${r.resized?.node_id} to [${r.resized?.to?.map(Math.round)}]` };
+      return {
+        icon: "pi-expand",
+        text: tr("panel.resized_node_to", "Resized node {node_id} to [{size}]", {
+          node_id: r.resized?.node_id,
+          size: r.resized?.to?.map(Math.round),
+        }),
+      };
     case "graph_set_title":
-      return { icon: "pi-pencil", text: `Renamed node ${r.node_id}` };
+      return { icon: "pi-pencil", text: tr("panel.renamed_node", "Renamed node {node_id}", { node_id: r.node_id }) };
     case "graph_set_node_collapsed":
-      return { icon: r.collapsed ? "pi-minus-circle" : "pi-plus-circle", text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}` };
+      // Two WHOLE sentences, not a verb spliced into a shared frame: "Collapsed"/"Expanded"
+      // is the head of the clause, and plenty of languages put the verb somewhere English
+      // does not — a `${verb} node ${id}` template hands the translator a fixed word order
+      // they cannot fix.
+      return {
+        icon: r.collapsed ? "pi-minus-circle" : "pi-plus-circle",
+        text: r.collapsed
+          ? tr("panel.collapsed_node", "Collapsed node {node_id}", { node_id: r.node_id })
+          : tr("panel.expanded_node", "Expanded node {node_id}", { node_id: r.node_id }),
+      };
     case "graph_set_node_color":
-      return { icon: "pi-palette", text: `Set node ${r.node_id} colors` };
-    case "graph_set_node_property":
+      return { icon: "pi-palette", text: tr("panel.set_node_colors", "Set node {node_id} colors", { node_id: r.node_id }) };
+    case "graph_set_node_property": {
+      const setLine = tr("panel.set_node_property", "Set property {name} = {value} on node {node_id}", {
+        name: r.set?.name,
+        value: JSON.stringify(r.set?.to),
+        node_id: r.set?.node_id,
+      });
+      const wasPrevious = tr("panel.was_previous_value", "was {value}", { value: JSON.stringify(r.set?.from) });
       return r.live_effect_error
         ? {
             icon: "pi-exclamation-triangle",
-            text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id} — WARNING: the node's onPropertyChanged callback failed, so the live effect may not have applied`,
-            detail: `was ${JSON.stringify(r.set?.from)} — ${r.live_effect_error}`,
+            text:
+              setLine +
+              tr(
+                "panel.set_node_property_live_effect_failed",
+                " — WARNING: the node's onPropertyChanged callback failed, so the live effect may not have applied",
+              ),
+            // The callback's own exception text is the machine's words: appended raw so the
+            // user can search for it verbatim, never run through the catalog.
+            detail: `${wasPrevious} — ${r.live_effect_error}`,
           }
-        : {
-            icon: "pi-sliders-h",
-            text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id}`,
-            detail: `was ${JSON.stringify(r.set?.from)}`,
-          };
+        : { icon: "pi-sliders-h", text: setLine, detail: wasPrevious };
+    }
     case "graph_auto_layout":
+      // TWO independent counts in one English sentence, so TWO keys: `tr` resolves exactly
+      // one plural category per call, and nodes and columns pluralise separately.
       return {
         icon: "pi-th-large",
-        text: `Auto-arranged ${r.node_count} node${r.node_count === 1 ? "" : "s"} (${r.columns} column${r.columns === 1 ? "" : "s"})`,
+        text:
+          tr(
+            "panel.auto_arranged_nodes",
+            { one: "Auto-arranged {count} node", other: "Auto-arranged {count} nodes" },
+            { count: r.node_count },
+          ) +
+          tr(
+            "panel.auto_arranged_columns",
+            { one: " ({count} column)", other: " ({count} columns)" },
+            { count: r.columns },
+          ),
       };
     case "graph_create_group": {
       const extra = r.group?.extra_node_ids?.length ?? 0;
       const suffix = extra
-        ? ` — ⚠ ${extra} unrelated node${extra === 1 ? "" : "s"} also enclosed (geometric)`
+        ? tr(
+            "panel.group_extra_nodes_enclosed",
+            {
+              one: " — ⚠ {count} unrelated node also enclosed (geometric)",
+              other: " — ⚠ {count} unrelated nodes also enclosed (geometric)",
+            },
+            { count: extra },
+          )
         : "";
-      return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})${suffix}` };
+      return {
+        icon: "pi-clone",
+        text:
+          tr("panel.created_group", "Created group “{title}” (id {id})", {
+            title: r.group?.title,
+            id: r.group?.id,
+          }) + suffix,
+      };
     }
     case "graph_move_group": {
       // Say what came WITH the box. A move that carried nothing is exactly the
       // "only the box moved" symptom (#408), so it must be visible on the card
       // rather than hidden behind an unqualified "Moved group".
       const m = r.moved;
+      // Each carried kind is its own counted phrase. These are NOT shared with the
+      // identically-worded findings list in graph_get_errors below, even though English
+      // renders both the same: this list sits after "with", that one after "Found errors —",
+      // and an inflected language wants different cases in the two positions (Russian's
+      // instrumental after "с" vs the nominative in a bare list). Two keys with the same
+      // English cost nothing — i18n-build-en only rejects one KEY carrying two texts.
       const carried = [
-        ...(m?.nodes ? [`${m.nodes} node${m.nodes === 1 ? "" : "s"}`] : []),
-        ...(m?.groups ? [`${m.groups} nested group${m.groups === 1 ? "" : "s"}`] : []),
-        ...(m?.reroutes ? [`${m.reroutes} reroute${m.reroutes === 1 ? "" : "s"}`] : []),
+        ...(m?.nodes ? [tr("panel.n_carried_nodes", { one: "{count} node", other: "{count} nodes" }, { count: m.nodes })] : []),
+        ...(m?.groups
+          ? [tr("panel.n_carried_nested_groups", { one: "{count} nested group", other: "{count} nested groups" }, { count: m.groups })]
+          : []),
+        ...(m?.reroutes
+          ? [tr("panel.n_carried_reroutes", { one: "{count} reroute", other: "{count} reroutes" }, { count: m.reroutes })]
+          : []),
       ].join(", ");
       return {
         icon: "pi-arrows-alt",
-        text: `Moved group ${r.group?.id} (“${r.group?.title}”)${carried ? ` with ${carried}` : " — box only"}`,
+        text:
+          tr("panel.moved_group", "Moved group {id} (“{title}”)", { id: r.group?.id, title: r.group?.title }) +
+          (carried
+            ? tr("panel.moved_group_with", " with {carried}", { carried })
+            : tr("panel.moved_group_box_only", " — box only")),
       };
     }
     case "graph_edit_group":
-      return { icon: "pi-pencil", text: `Edited group ${r.group?.id} (“${r.group?.title}”)` };
+      return {
+        icon: "pi-pencil",
+        text: tr("panel.edited_group", "Edited group {id} (“{title}”)", { id: r.group?.id, title: r.group?.title }),
+      };
     case "graph_remove_group":
-      return { icon: "pi-minus-circle", text: `Removed group “${r.removed?.title}”` };
+      return {
+        icon: "pi-minus-circle",
+        text: tr("panel.removed_group", "Removed group “{title}”", { title: r.removed?.title }),
+      };
     case "graph_move_rail":
-      return { icon: "pi-arrows-h", text: `Moved ${r.rail} rail to [${r.pos?.map(Math.round)}]` };
+      return {
+        icon: "pi-arrows-h",
+        text: tr("panel.moved_rail_to", "Moved {rail} rail to [{pos}]", {
+          rail: r.rail,
+          pos: r.pos?.map(Math.round),
+        }),
+      };
     case "graph_set_node_mode":
       return {
         icon: r.mode === "active" ? "pi-play-circle" : r.mode === "mute" ? "pi-volume-off" : "pi-ban",
-        text: `Set node ${r.node_id} to ${r.mode}${r.previous_mode && r.previous_mode !== r.mode ? ` (was ${r.previous_mode})` : ""}`,
+        text:
+          tr("panel.set_node_mode", "Set node {node_id} to {mode}", { node_id: r.node_id, mode: r.mode }) +
+          (r.previous_mode && r.previous_mode !== r.mode
+            ? tr("panel.set_node_mode_was", " (was {previous})", { previous: r.previous_mode })
+            : ""),
       };
     case "graph_screenshot":
-      return { icon: "pi-camera", text: `Captured workflow image (${r.width}×${r.height})` };
+      // `width`/`height` are plain numbers, NOT named `count` — see rule 2 in the header:
+      // a numeric `count` var would switch this string into plural lookup by accident.
+      return {
+        icon: "pi-camera",
+        text: tr("panel.captured_workflow_image", "Captured workflow image ({width}×{height})", {
+          width: r.width,
+          height: r.height,
+        }),
+      };
     case "graph_canvas":
-      return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
+      return {
+        icon: "pi-window-maximize",
+        text: tr("panel.canvas_action", "Canvas: {action}", { action: r.canvas?.action?.replace(/_/g, " ") }),
+      };
     case "graph_run":
       return r.queued
         ? {
@@ -18848,13 +19086,26 @@ function describeCommand(cmd, msg, reply) {
             // silent about it. Ownership is NOT asserted — see the result fields.
             icon: r.disabled_outputs_in_graph?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
-              `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
-              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : "") +
+              tr("panel.queued_workflow", "Queued workflow") +
+              // `{n}`, not `{count}`: the batch multiplier is a number the sentence merely
+              // shows. Naming it `count` would switch this key into plural lookup.
+              (r.batch_count > 1 ? tr("panel.queued_workflow_batch", " ×{n}", { n: r.batch_count }) : "") +
+              (r.ran_to_node != null
+                ? tr("panel.queued_workflow_to_node", " → node {node_id}", { node_id: r.ran_to_node })
+                : "") +
               // Ownership-neutral here too: the label says what was OBSERVED in an
               // accepted prompt, not that this run queued it. A concurrent queue
               // action would otherwise be reported as this run's doing.
               (r.disabled_outputs_in_graph?.length
-                ? ` — WARNING: this workflow has ${r.disabled_outputs_in_graph.length} output node${r.disabled_outputs_in_graph.length === 1 ? "" : "s"} inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them`
+                ? tr(
+                    "panel.queued_workflow_disabled_outputs",
+                    {
+                      one: " — WARNING: this workflow has {count} output node inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them",
+                      other:
+                        " — WARNING: this workflow has {count} output nodes inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them",
+                    },
+                    { count: r.disabled_outputs_in_graph.length },
+                  )
                 : ""),
             ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }
@@ -18863,13 +19114,22 @@ function describeCommand(cmd, msg, reply) {
             // run-to-node rejection returns { error } (no node_errors); a normal
             // validation failure returns { node_errors }. Handle both — guard the
             // JSON.stringify so an undefined node_errors can't throw here.
-            text: r.error ? "Run blocked" : "Run blocked by node errors",
+            text: r.error
+              ? tr("panel.run_blocked", "Run blocked")
+              : tr("panel.run_blocked_by_node_errors", "Run blocked by node errors"),
+            // Raw validation output — the machine's words, deliberately untranslated.
             detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
     case "graph_find_nodes":
+      // The TOTAL drives the plural; the match count carries its own "+" truncation marker,
+      // so it is interpolated as text rather than as a second count.
       return {
         icon: "pi-search",
-        text: `Found ${r.count}${r.truncated ? "+" : ""} of ${r.total} node${r.total === 1 ? "" : "s"}`,
+        text: tr(
+          "panel.found_nodes",
+          { one: "Found {found} of {count} node", other: "Found {found} of {count} nodes" },
+          { count: r.total, found: `${r.count}${r.truncated ? "+" : ""}` },
+        ),
       };
     case "graph_get_errors": {
       // Label from the COMPLETE error surface, not just raw validation/exec fields:
@@ -18889,32 +19149,57 @@ function describeCommand(cmd, msg, reply) {
         return counts.unchecked
           ? {
               icon: "pi-info-circle",
-              text: `Checked errors — none found (${counts.unchecked} node${counts.unchecked === 1 ? "" : "s"} could not be checked)`,
+              text: tr(
+                "panel.checked_errors_none_unchecked",
+                {
+                  one: "Checked errors — none found ({count} node could not be checked)",
+                  other: "Checked errors — none found ({count} nodes could not be checked)",
+                },
+                { count: counts.unchecked },
+              ),
             }
-          : { icon: "pi-info-circle", text: "Checked errors — none" };
+          : { icon: "pi-info-circle", text: tr("panel.checked_errors_none", "Checked errors — none") };
       }
       const parts = [];
       if (counts.erroredNodes)
-        parts.push(`${counts.erroredNodes} node${counts.erroredNodes === 1 ? "" : "s"}`);
+        parts.push(
+          tr("panel.n_errored_nodes", { one: "{count} node", other: "{count} nodes" }, { count: counts.erroredNodes }),
+        );
       if (counts.missingAssets)
-        parts.push(`${counts.missingAssets} missing asset${counts.missingAssets === 1 ? "" : "s"}`);
+        parts.push(
+          tr(
+            "panel.n_missing_assets",
+            { one: "{count} missing asset", other: "{count} missing assets" },
+            { count: counts.missingAssets },
+          ),
+        );
       // Kept as its own category rather than folded into missing assets: these were
       // established from the server's CURRENT /object_info, not the load-time scan,
       // and the list mixes absent files with values outside the offered options.
       if (counts.unavailable)
-        parts.push(`${counts.unavailable} unavailable widget value${counts.unavailable === 1 ? "" : "s"}`);
+        parts.push(
+          tr(
+            "panel.n_unavailable_widget_values",
+            { one: "{count} unavailable widget value", other: "{count} unavailable widget values" },
+            { count: counts.unavailable },
+          ),
+        );
       return {
         icon: "pi-exclamation-triangle",
-        text: parts.length ? `Found errors — ${parts.join(", ")}` : "Read execution errors",
+        text: parts.length
+          ? tr("panel.found_errors", "Found errors — {findings}", { findings: parts.join(", ") })
+          : tr("panel.read_execution_errors", "Read execution errors"),
       };
     }
     case "free_vram":
-      return { icon: "pi-bolt", text: "Unloaded models — freed VRAM" };
+      return { icon: "pi-bolt", text: tr("panel.unloaded_models_freed_vram", "Unloaded models — freed VRAM") };
     case "workflow_save":
-      return { icon: "pi-save", text: `Saved “${r.workflow}”` };
+      return { icon: "pi-save", text: tr("panel.saved_workflow", "Saved “{workflow}”", { workflow: r.workflow }) };
     case "workflow_save_as":
-      return { icon: "pi-save", text: `Saved as “${r.workflow}”` };
+      return { icon: "pi-save", text: tr("panel.saved_workflow_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
     default:
+      // `cmd` is the raw tool name (an identifier) and the detail is the raw reply payload —
+      // neither is prose, so neither is translated.
       return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
   }
 }

@@ -224,6 +224,9 @@ export function tr(key, fallback, vars) {
  * as `Created group "7" (id 7)` — the user's own title destroyed by the next variable's turn.
  * ComfyUI widget values carry braces routinely (dynamic-prompt syntax), so this is ordinary
  * data, not a crafted input. A single pass never revisits what it just wrote.
+ *
+ * The function replacer is also load-bearing: a plain string replacement would expand
+ * `$&` / `$1` occurring inside a substituted VALUE. Values are data and must stay literal.
  */
 function interpolate(str, vars) {
   if (!vars || !str) return str;

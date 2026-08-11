@@ -34,6 +34,7 @@ import {
   refreshNodeArea,
 } from "../../web/js/lib/group-geometry.js";
 import { clipOutlineTitle } from "../../web/js/lib/graph-read.js";
+import { tr } from "../../web/js/lib/i18n.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -120,13 +121,21 @@ function realMoveGroup(graph, overrides = {}) {
   );
 }
 
-/** The real shipped activity-card label for a graph_move_group reply. */
-const realMoveGroupLabel = new Function(
+/** The real shipped activity-card label for a graph_move_group reply.
+ *
+ *  The label is TRANSLATED, so the extracted source closes over `tr` — the REAL one from
+ *  the shipped i18n lib, not a stub. With no catalog loaded `tr` returns the English
+ *  fallback written at the call site, so the assertions below still pin the exact English
+ *  wording; handing it a fake that echoed its fallback would prove nothing about the code
+ *  the panel actually runs, and would keep passing if the call site stopped translating. */
+const moveGroupLabelFn = new Function(
   "r",
+  "tr",
   `"use strict";
    switch ("graph_move_group") { ${moveGroupLabelSrc} }
    return null;`,
 );
+const realMoveGroupLabel = (r) => moveGroupLabelFn(r, tr);
 
 // ---- LiteGraph-shaped doubles ---------------------------------------------
 
