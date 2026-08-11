@@ -6,6 +6,261 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.8] - 2026-08-11
+
+> #968: three reports of the panel saying a tab was bound to the workflow you asked for
+> while the canvas held a DIFFERENT workflow's graph — once queueing the wrong one. Every
+> check reported healthy, and every check was telling the truth.
+
+### Added
+- `panel_open_workflow` on an already-open tab now compares the file it just read against
+  the canvas, and says so when they share **no node ids at all**. In the report that was 44
+  nodes on screen against 40 in the file with none in common — which is not what editing
+  looks like.
+
+### Changed
+- it is a DISCLOSURE, not a refusal. Clearing a tab and rebuilding, or pasting a whole graph
+  in before saving, look the same from here, so the note names those alternatives and leaves
+  the judgement to you. A refusal built on that ambiguity would be a wrong-graph refusal of
+  its own — the same class of harm as the bug.
+- why nothing caught this before: the repaint loads from the tab's own state and proves the
+  canvas against **that state**, while the staleness check compares the file against the
+  tab's **baseline**. Both pass honestly when the tab's own state is carrying another
+  workflow's graph. Nobody compared the file to the canvas, even though that code path had
+  already read the file.
+
+
+## [0.13.7] - 2026-08-11
+
+> artokun/comfyui-mcp#938: an agent could WRITE a dynamic widget row and could delete the
+> whole NODE, but had no way to delete one row — the add/remove affordance is a canvas-drawn
+> button it cannot click.
+
+### Added
+
+- `graph_remove_widget` removes ONE dynamic widget row (rgthree Power Lora Loader `lora_N`,
+  Impact/Inspire list rows). Undoable with Ctrl+Z.
+
+### Fixed
+
+- the remaining rows are NOT renumbered. `lora_N` is a monotonic id, not a position:
+  `configure()` re-mints the names from serialized ORDER on every load, and the backend
+  reads `**kwargs` filtered by name prefix, so gaps never reach it. The reply lists the
+  remaining names, because an agent that assumed renumbering would address the wrong row.
+
+### Changed
+
+- removal is refused, with the specific reason, for an input the BACKEND declares (it would
+  change what is sent at queue time), a frontend-generated control widget, a widget whose
+  input slot currently has a link, and a subgraph container's promoted widgets. Node
+  definitions that could not be READ are reported as unknown rather than treated as
+  "declares nothing" — the difference between those two is the only thing separating a row
+  from a KSampler's `steps`.
+
+### Fixed
+- a DUPLICATE delivery of a request the panel is already running no longer waits forever on
+  it (#646). The command ledger marks a command in-flight and never evicts that entry —
+  dropping an unsettled command would let a replay apply the same mutation twice — so an
+  executor that never returned left every redelivery awaiting a promise that could not
+  resolve, and the panel answered nothing at all. The duplicate now gets a real answer:
+  still running, nothing was applied twice, do not retry, read the graph to see whether it
+  took effect.
+- that wait is bounded by the CALLER's own deadline, never by a number the panel invents. A
+  fixed timeout is wrong in both directions — too high rescues nobody, too low reports
+  "still running" for a command that was merely slow. The panel cannot see that deadline
+  today, so absent it the behaviour is unchanged; this half activates when the orchestrator
+  sends the timeout it already computes.
+
+
+## [0.13.6] - 2026-08-11
+
+> #968: three reports of the panel saying "bound to the requested workflow" while graph
+> commands kept hitting the previous one — once queueing the wrong workflow outright. They
+> have not converged because, after the fact, a stale binding and a fresh one look identical.
+
+### Added
+- a workflow-instance refusal now reports **what last moved the active workflow**, when
+  anything did. If a panel command made the move it is named. If nothing claimed it, the
+  refusal says so — and says plainly that this does NOT prove the panel was uninvolved,
+  because not every command can register a claim. What it does establish either way is that
+  a binding taken before that move is stale.
+
+### Changed
+- it decides nothing, deliberately. No refusal becomes an acceptance, and a refusal with no
+  move to report is byte-for-byte what it was. Widening trust on an entry route nobody has
+  identified is how a refusal turns into the silent wrong-graph edit this issue is about.
+- ruled out along the way, and recorded on the issue: `panel_open_workflow` forces the canvas
+  repaint itself and verifies it, both of its skip paths fail closed, and the report where
+  the wrong workflow was queued ran on a build that already had both protections. So the
+  binding is correct when it is made, and something re-points the tab afterwards.
+
+
+## [0.13.5] - 2026-08-11
+
+> #1369: `panel_add_node` applied a node definition's declared default over a widget's
+> value whenever the two differed. For a COMBO whose option list does not CONTAIN that
+> default, the "correction" wrote a value the node cannot accept — and reported success.
+
+### Fixed
+
+- a stale-schema "correction" no longer rewrites a valid COMBO widget to a value the node
+  cannot accept (#1369). The live KJNodes def is
+  `"sage_attention": [["disabled","auto",...], {"default": false}]` — the widget held a
+  valid `"disabled"` and was overwritten with `false`.
+- when a declared default is absent from that same definition's option list, the existing
+  value is KEPT and the refusal recorded, rather than written and called a correction.
+
+### Changed
+
+- verified against this machine's live ComfyUI (4183 node types): of 1105 combo inputs
+  carrying a default, 1083 corrections still apply and 22 are refused. The 22 are the
+  reported KJNodes case plus model-filename defaults naming files not installed here,
+  which ComfyUI's own `validate_inputs` would reject as well. No valid default was
+  refused — the direction that would have quietly disabled the correction entirely.
+
+## [0.13.4] - 2026-08-10
+
+> #584: a ComfyUI tab that keeps running OLD panel JS after a reload, so the orchestrator
+> sees a stale version and refuses graph writes. This is a backstop for hosts that leave the
+> door open — not a cure, and the notes below say exactly which.
+
+### Fixed
+- the pack now gives its own `/extensions/comfyui-mcp-panel/` assets a cache policy on hosts
+  that set none, matching the value current ComfyUI already applies to every extension.
+  Older ComfyUI builds serve extension files with an ETag from mtime+size and no policy,
+  which is the shape that lets a replaced file keep being served from cache.
+
+### Changed
+- **Measured before claiming**: ComfyUI 0.31.1 already sends `Cache-Control: no-store` for
+  every `/extensions/` path, so on current builds this changes nothing. The staleness
+  reproduced while developing 0.13.3 turned out not to be a cache at all — it was a reload
+  cancelled by ComfyUI's unsaved-changes prompt.
+- A first attempt used a weaker header and was described as a no-op. It was not: this pack's
+  middleware runs INSIDE ComfyUI's own, so the host's `setdefault` preserved the weaker
+  value and the panel's assets ended up with a LOOSER policy than every other pack's. The
+  shipped version matches the host's value, so that inversion cannot happen.
+
+
+## [0.13.3] - 2026-08-10
+
+> #753: the panel's text was small and the obvious fix did nothing. Overriding
+> `.cmcp-root { font-size }` scaled almost nothing, because every inner size was `rem` —
+> resolved against the PAGE root, not the panel.
+
+### Added
+- **`--cmcp-fs`, one variable that scales the panel's text.** Set it on `:root` or
+  `.cmcp-root` in a user stylesheet (default `0.8125rem`) and every panel font size follows,
+  including the CivitAI explorer, the Apps tab and the modals. Measured: overriding it to
+  1.5x moves 2110 of 2476 rendered elements by exactly that.
+- It does NOT scale spacing, icons, or the handful of elements that carry a fixed pixel
+  size, and the setting's tooltip now says so rather than promising more.
+
+### Changed
+- 214 inner font sizes became `calc(var(--cmcp-fs, 0.8125rem) * k)`, each reproducing its
+  original pixel size at the default — verified element by element against a capture of the
+  panel taken before the change, with no drift beyond sub-pixel rounding.
+- The "Panel UI scale (%)" setting is unchanged and is still the way to scale the panel as a
+  whole. Its tooltip used to explain why a stylesheet override could not work; that trap is
+  gone, so it now names the knob that does.
+
+### Fixed
+- the status caret set its size through a JS assignment rather than a stylesheet rule, so it
+  had been missed by every sweep. It scales with the rest now.
+
+
+## [0.13.2] - 2026-08-10
+
+> #945: the panel could not tell one workflow OBJECT from another without looking at the
+> canvas — so two guards that decide whether an identity belongs to a copy were deciding
+> nothing at all.
+
+### Fixed
+- a workflow that is not the one on screen can now be asked for its own identity (#945).
+  The three fields that lookup used are absent on current ComfyUI, so it answered null
+  every time, and both fork guards behind it short-circuited on their first line. It now
+  falls back to the workflow's own captured state — but only for a workflow that is NOT
+  mounted, and the reason for that restriction is the whole of this fix: for the workflow
+  on screen, that field is a clone of the live canvas, so reading it there would answer
+  "whose identity is this?" with "whatever is on screen", which is precisely what the
+  caller asked it not to do.
+- the mounted check compares identity the way the rest of the panel does, rather than with
+  `===`. ComfyUI hands out reactive proxies in some places and raw objects in others, and
+  the path that matters most here unwraps deliberately — measured on this machine, the
+  active workflow IS a proxy whose raw target is a different object, so a strict comparison
+  would have let the canvas back in with no race required.
+
+### Changed
+- where identity is WRITTEN is untouched. Embedding into the workflow's captured state
+  moves where identity persists — it stops reaching the graph that a save serializes — and
+  was reverted once for exactly that. Reading a field is not writing it.
+
+
+## [0.13.1] - 2026-08-10
+
+> The other half of #952. A question card whose connection was replaced already stopped
+> looking answerable in 0.13.0; the command behind it, however, was left waiting forever.
+
+### Fixed
+- withdrawing an interactive card now ENDS the command behind it (#952). `panel_ask` and
+  the secret request are the only commands whose executor blocks on a person, and retiring
+  their card deliberately did not resolve its promise — so the executor stayed suspended,
+  its entry in the command ledger stayed in flight, and entries in flight are never
+  evicted, by design. Every withdrawn question kept a slot for the life of the tab and held
+  the ledger's bound out of reach; a duplicate delivery of that request id then waited on a
+  promise that could never resolve, and the panel answered nothing at all. Retirement now
+  settles the command explicitly, as a failure that fabricates no answer.
+- a payload-free failure for those two commands is no longer rewritten as "the panel
+  collected the response, but the connection dropped" when nothing was collected. Replies
+  that actually carry the person's own input are redacted exactly as before.
+
+### Changed
+- a correction to this project's own notes on #952, recorded because the plan rested on it:
+  the orchestrator mints its session epoch once per PROCESS, so a tab reconnecting to the
+  same process keeps its ledger scope. The earlier claim that a reconnect lands in a new
+  scope and fails open into a duplicate card was wrong; that only happens across an
+  orchestrator restart.
+
+
+## [0.13.0] - 2026-08-10
+
+> A panel connected to a ComfyUI the orchestrator cannot reach — a tunnel, a proxy URL, a
+> loopback-only host — could not convert its own live canvas. Anything that pairs a captured
+> graph with node definitions took the graph from the panel and the definitions from
+> whatever COMFYUI_URL points at, which is the same machine locally and a different one
+> remotely.
+
+### Added
+- the panel can now serve the node definitions of the ComfyUI it is actually looking at,
+  fetched by the browser that is already talking to it (#1006). That is the panel half of
+  the fix; the orchestrator side dispatches to it.
+- the reply names which ComfyUI answered, and refuses rather than returning a partial
+  schema — a conversion run on half a schema produces a wrong answer, not a smaller one.
+- the payload is large (4183 node types on the machine this was built against), so a caller
+  can pass back a fingerprint and be told the type set is unchanged instead of receiving it
+  again. The reply says what that does not cover: a combo list or a widget name can change
+  without changing which types exist.
+
+### Fixed
+- mark a question card whose connection dropped, instead of leaving two live ones (#952) (#1027)
+- a created tab must leave a fence its own commands can pass (#1019) (#1025)
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.2 (#1028)
+- 0.12.1 (#1026)
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.12.2] - 2026-08-10
 
 > When the panel loses its connection while the agent is waiting on a question, the card

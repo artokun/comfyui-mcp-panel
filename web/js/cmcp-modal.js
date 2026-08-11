@@ -72,7 +72,7 @@ export function toast(msg, { ms = 3500 } = {}) {
   // whole explorer just closed after a successful load).
   t.style.cssText = "position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);" +
     "max-width:min(38rem,90vw);text-align:center;background:var(--p-surface-800,#27272a);" +
-    "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:.82rem;" +
+    "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0092);" +
     "box-shadow:0 4px 16px rgba(0,0,0,.5)";
   document.body.appendChild(t);
   setTimeout(() => t.remove(), ms);
@@ -84,12 +84,12 @@ function injectModalCss() {
   _mdlCss = true;
   const css = `
 .cmcp-mdl{display:flex;flex-direction:column;gap:.85rem;}
-.cmcp-mdl-msg{font-size:.85rem;line-height:1.55;white-space:pre-wrap;color:var(--p-text-color,#fafafa);}
+.cmcp-mdl-msg{font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);line-height:1.55;white-space:pre-wrap;color:var(--p-text-color,#fafafa);}
 .cmcp-mdl-field{display:flex;flex-direction:column;gap:.3rem;}
-.cmcp-mdl-label{font-size:.72rem;font-weight:600;opacity:.8;text-transform:uppercase;letter-spacing:.03em;}
+.cmcp-mdl-label{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);font-weight:600;opacity:.8;text-transform:uppercase;letter-spacing:.03em;}
 .cmcp-mdl-field input,.cmcp-mdl-field textarea{padding:.5rem .6rem;border-radius:8px;
   border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-surface-950,#111113);
-  color:var(--p-text-color,#fafafa);font:inherit;font-size:.85rem;box-sizing:border-box;width:100%;}
+  color:var(--p-text-color,#fafafa);font:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);box-sizing:border-box;width:100%;}
 .cmcp-mdl-field input:focus,.cmcp-mdl-field textarea:focus{outline:none;border-color:var(--p-primary-color,#60a5fa);}
 .cmcp-mdl-field textarea{resize:vertical;min-height:4.5rem;}
 .cmcp-mdl-btns{display:flex;justify-content:flex-end;gap:.5rem;margin-top:.15rem;}

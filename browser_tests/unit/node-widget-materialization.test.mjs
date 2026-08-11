@@ -524,14 +524,17 @@ test("#626: graph_add_node actually CONSUMES the reconciliation and discloses it
   assert.match(src, /applyCurrentDefWidgetValues,/, "imported");
   assert.match(
     src,
-    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef\);/,
+    // The optional third arg is #1369's rejected-corrections out-param. Kept optional
+    // here so this pins the WIRING — called on the created node with the CURRENT def —
+    // rather than an argument count, which is what made it fail on an unrelated change.
+    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef(, correctionOut)?\);/,
     "called on the created node with the CURRENT def",
   );
   assert.match(src, /added\.schema_value_corrections = valueCorrections;/, "disclosed on the result");
   // …and it must run BEFORE the node is added to the graph, or the graph briefly holds
   // the stale value and an undo step captures it.
   assert.ok(
-    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);") <
+    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef") <
       src.indexOf("      graph.add(node);"),
     "reconciliation must precede graph.add",
   );
@@ -703,6 +706,41 @@ test("#695: a union registered under its own key in the widget registry is a wid
   // registers a constructor for the union itself keeps it.
   const def = { input: { required: { value: ["IMAGE,MASK", {}] } } };
   assert.deepEqual(unavailableRequiredWidgetReport(def, { "IMAGE,MASK": () => {} }, new Set(), def), []);
+});
+
+test("#695/#1062: a socket-shaped union hiding an unproven CUSTOM member stays blocked", () => {
+  // Recast (codex) to state the invariant this protects, rather than an incidental reading
+  // of a file-format union — which is what made #1062 look like an oversight when it is an
+  // intentional false negative.
+  //
+  // THE INVARIANT: a proven socket member must not LAUNDER an unregistered,
+  // output-unproven custom member into an accepted node. An EMPTY config makes it concrete,
+  // because `{}` counts as socket-shaped — so `socketDeclared` contains the union and the
+  // input-level bar cannot catch it. Only requiring EVERY member to be proven does.
+  //
+  // This is why #1062's one-word `every` -> `some` is unsafe: `MESH` alone would admit the
+  // node below and silently skip a widget that never registered (#580's false accept).
+  const custom = { input: { required: { thing: ["MESH,ZIPN_STYLE_GALLERY", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["MESH"]), custom),
+    ["MESH,ZIPN_STYLE_GALLERY"],
+    "a proven MESH does not vouch for an unregistered custom member",
+  );
+  // Either proof clears it: a constructor registered under the exact union key...
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(
+      custom,
+      { "MESH,ZIPN_STYLE_GALLERY": () => {} },
+      new Set(["MESH"]),
+      custom,
+    ),
+    [],
+  );
+  // ...or output proof for EVERY member.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["MESH", "ZIPN_STYLE_GALLERY"]), custom),
+    [],
+  );
 });
 
 test("#695: a union with ONE unproven member still fails closed", () => {

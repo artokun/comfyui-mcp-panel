@@ -151,11 +151,24 @@ test("onChange applies immediately and is NOT gated on settingsArmed", () => {
   );
 });
 
-test("the tooltip tells the user why their stylesheet override did not work", () => {
-  // The reported confusion was not just "text is small" — it was that the
-  // obvious fix silently does nothing. A setting that does not explain that
-  // leaves the next person to rediscover it.
+test("the tooltip names the knob that now DOES work, and what it does not cover", () => {
+  // The original confusion was that the obvious fix silently did nothing, and the
+  // tooltip existed to say so. #753 removed the trap: every inner font size is
+  // calc(var(--cmcp-fs) * k), so there is a working knob to name instead of a dead end
+  // to warn about. The warning must not survive the thing it warned about — a tooltip
+  // that still says overrides do not work is now the misleading one.
   const entry = PANEL.slice(PANEL.indexOf("id: SETTING_UI_SCALE"), PANEL.indexOf("id: SETTING_STALL_S"));
-  assert.match(entry, /rem/);
-  assert.match(entry, /font-size/);
+  assert.match(entry, /--cmcp-fs/, "names the variable");
+  assert.match(entry, /0\.8125rem/, "and its default, so a user can compute a target");
+  assert.ok(
+    !/does NOT \?" \+/.test(entry) && !/most text ignores it/.test(entry),
+    "the retracted claim that overrides cannot work is gone",
+  );
+  // It scales TEXT. Spacing is still rem on purpose, and saying otherwise would have
+  // users expect a denser panel that never arrives.
+  assert.match(entry, /does not scale spacing, icons, or/);
+  // ...and the fixed-pixel elements. A tooltip promising "every panel font size" would be
+  // wrong: a training caption and a few rules carry literal px (codex).
+  assert.match(entry, /fixed pixel size/);
+  assert.ok(!/scales every panel font/.test(entry), "no absolute claim");
 });

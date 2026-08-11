@@ -111,6 +111,17 @@ export const SENSITIVE_RESULT_CMDS = new Set(["request_secret", "ask_user"]);
  *  tells the caller to re-request on the current connection. */
 export function redactSensitiveReply(reply, cmd) {
   if (!reply || !SENSITIVE_RESULT_CMDS.has(cmd)) return reply;
+  // #952 — redact what CARRIES the user's input, not every reply for these commands.
+  // A payload-free FAILURE has no private content in it: its `error` is panel-authored
+  // (the build cannot display questions; the card was fenced; the card was withdrawn
+  // unanswered). Rewriting those with the text below asserted something false — that
+  // "the panel collected the response" — about a command where nothing was collected,
+  // which is exactly the misreport #952 is about. The rule is mechanical rather than a
+  // judgement about which errors are safe: a reply is redacted if it succeeded or if it
+  // carries a `result` at all.
+  const carriesUserInput =
+    reply.ok !== false || Object.prototype.hasOwnProperty.call(reply, "result");
+  if (!carriesUserInput) return reply;
   return {
     rid: reply.rid,
     ok: false,

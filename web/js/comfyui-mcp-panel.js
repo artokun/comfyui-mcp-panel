@@ -176,6 +176,7 @@ import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -192,6 +193,7 @@ import {
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
+import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
@@ -336,6 +338,19 @@ import {
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
+import {
+  canvasFileDivergence,
+  canvasFileDivergenceNote,
+} from "./lib/canvas-file-divergence.js";
+import {
+  MOVE_CAUSES,
+  createActiveWorkflowProvenance,
+} from "./lib/active-workflow-provenance.js";
+import {
+  INTERACTIVE_ABANDONED,
+  abandonedInteractiveError,
+  isAbandonedInteractive,
+} from "./lib/interactive-abandon.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
   OPEN_DISK_READ_BUDGET_MS,
@@ -967,7 +982,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.12.2";
+const PANEL_VERSION = "0.13.8";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -1963,15 +1978,73 @@ function workflowOwnedExtra(wf = activeWorkflowRef()) {
   return candidate && typeof candidate === "object" ? candidate : null;
 }
 
+/**
+ * #945 — the READ carrier for `allowGraph: false`, and deliberately NOT the write
+ * one.
+ *
+ * `workflowOwnedExtra` above answers null on every frontend observed here, so the
+ * two fork guards behind it arbitrate a value they never receive. The uuid is on
+ * the workflow object — one field away, in `activeState.extra`.
+ *
+ * NOT FOR THE ACTIVE WORKFLOW, and that restriction is the whole design (codex).
+ * `activeState` is a getter onto `changeTracker.activeState`, and for the workflow
+ * that is CURRENTLY MOUNTED the tracker fills it from `captureCanvasState()`, which
+ * clones `app.rootGraph.serialize()` — so on the active tab this field IS the live
+ * canvas's identity wearing a different name. Reading it there would satisfy
+ * `allowGraph: false` with exactly the mounted-root authority that flag exists to
+ * refuse, and nothing would look wrong.
+ *
+ * My own measurement did not catch that: with three workflows open on 0.31.1 /
+ * frontend 1.48.7, each NON-ACTIVE workflow's `activeState.extra` carried its OWN
+ * uuid (30dfba50…, 2d7fa288…) while the active one's matched `app.graph.extra`
+ * (e66e531b…) — which reads as "distinct from the canvas" only if you never look at
+ * the active row.
+ *
+ * So the rung applies to a workflow that is NOT mounted — and "not mounted" is
+ * decided with `sameWorkflowObject`, never `===` (codex r2). The workflow service
+ * hands out Vue PROXIES in its computed lists while raw objects flow through the
+ * uuid stores, and the active binding path unwraps deliberately: the graph fence
+ * calls `workflowOwnsRootUuidTag(activeWorkflowRef())`, which re-enters here with
+ * `rawWorkflowObject(w)`. A strict comparison against the proxy would be false for
+ * the mounted workflow's own raw target, and the exclusion would let exactly the
+ * canvas state back in through the back door. `sameWorkflowObject` also matches on
+ * the shared `changeTracker` object, which is what `activeState` reads from, so two
+ * references to the same tracker cannot disagree about whether it is mounted.
+ *
+ * With that comparison, a non-mounted workflow's tracker state is the capture from
+ * when it was last live: its own, with no mounted root consulted. The active
+ * workflow keeps answering null here, exactly as before, because for it there is no
+ * workflow-owned carrier distinguishable from the canvas.
+ *
+ * THE WRITE IS NOT REPOINTED. Embedding into `activeState.extra` moves where
+ * identity persists — it stops reaching `app.graph.extra`, which is what a save
+ * serializes — and was reverted once for exactly that. Reading a field is not
+ * writing it, so the revert's reason is preserved rather than re-argued: this
+ * function has no callers that mutate what it returns.
+ */
+function workflowOwnedExtraForRead(wf = activeWorkflowRef()) {
+  const owned = workflowOwnedExtra(wf);
+  if (owned) return owned;
+  // The mounted workflow's tracker state is a clone of the live root, so it is not a
+  // workflow-owned answer at all. Absent `wf` defaults to the active one, which lands
+  // here too — an unspecified workflow must never be answered from the canvas.
+  const active = activeWorkflowRef();
+  if (!wf || sameWorkflowObject(wf, active)) return null;
+  const state = wf?.activeState?.extra;
+  return state && typeof state === "object" ? state : null;
+}
+
 function embeddedWorkflowUuid(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
-  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtraForRead(wf);
   const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const id = ns?.[WORKFLOW_UUID_FIELD];
   return typeof id === "string" && id ? id : null;
 }
 
 function embeddedWorkflowPath(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
-  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  // Same carrier as the uuid — they are recorded together in one namespace, so
+  // reading them from different places could answer about two different workflows.
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtraForRead(wf);
   const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
   return typeof path === "string" && path ? path : null;
@@ -2431,7 +2504,11 @@ function noteWorkflowInstanceMismatch() {
  *  The leading `workflow instance mismatch:` token is preserved deliberately: it
  *  is what readers and existing reports recognise this refusal by. Only the claim
  *  about causation changes. */
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null } = {}) {
+// #968 — `movedNote` is INJECTED, never read from the recorder here: this function is pure
+// and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
+// exist. One line on purpose (see above). Appended, never substituted — the refusal's own
+// reasoning survives; the note only says WHY the active workflow is not what was expected.
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -2443,7 +2520,7 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
   const compared = expected
     ? `this command was issued for workflow instance ${expected}, and ${canvasSays}`
     : `this command carries no workflow-instance stamp, and ${canvasSays}`;
-  return (
+  const base = (
     `workflow instance mismatch: ${compared}. Nothing was applied.\n\n` +
     `That is the comparison, not the cause — the panel observed only that the two ` +
     `identities differ. It can mean the workflow was switched or replaced after the ` +
@@ -2468,6 +2545,8 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
+  const movedLine = typeof movedNote === "string" && movedNote.trim() ? movedNote.trim() : null;
+  return movedLine ? `${base}\n\n${movedLine}` : base;
 }
 
 function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
@@ -3231,7 +3310,7 @@ function makeSettingSelect() {
   sel.className = "p-inputtext p-component";
   sel.style.cssText =
     "padding:0.3rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-    "background:var(--p-surface-900,#18181b);color:var(--p-text-color,#e4e4e7);font-size:0.8rem;min-width:14rem;";
+    "background:var(--p-surface-900,#18181b);color:var(--p-text-color,#e4e4e7);font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);min-width:14rem;";
   return sel;
 }
 /** (Re)populate a backend's Default-model <select>: an "Auto" option, then that
@@ -3471,6 +3550,17 @@ function comfyuiUrlForConnect() {
 // (window.location) — so the agent auto-targets whatever ComfyUI is open (local or
 // a RunPod proxy) with zero config. The orchestrator retargets to it and decides
 // local vs remote mode from the host, so a bare `--panel-orchestrator` just works.
+// #1006 — the origin the page's own `api` client talks to, which is the one that
+// answers a /object_info fetch made through it. Deliberately NOT the Remote-URL
+// override: that is what the orchestrator should target, not a claim about who served
+// a request the browser already made.
+function pageComfyOrigin() {
+  try {
+    return window.location.origin || null;
+  } catch {
+    return null;
+  }
+}
 function comfyuiUrlForAgent() {
   const override = remoteUrlSetting();
   if (override) return override;
@@ -3568,9 +3658,9 @@ function panelSettingsList() {
       btn.textContent = TOKEN_BUTTON_LABEL[id]?.() ?? `Set ${friendly} ${noun}…`;
       btn.style.cssText =
         "padding:0.3rem 0.7rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-        "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:0.8rem;white-space:nowrap;";
+        "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
       const status = document.createElement("span");
-      status.style.cssText = "font-size:0.72rem;opacity:0.8;";
+      status.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);opacity:0.8;";
       const refresh = () => {
         const at = lsGet(SECRET_SET_AT_PREFIX + envKey);
         if (at) {
@@ -3726,7 +3816,7 @@ function panelSettingsList() {
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         return a;
       },
     },
@@ -3752,7 +3842,7 @@ function panelSettingsList() {
         b.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);cursor:pointer;font-size:0.8rem;white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         b.addEventListener("click", () => {
           // Open the panel first — painting into a transcript the user cannot see is the
           // same failure as not painting at all. openSidebarTab() is the same activate the
@@ -3796,7 +3886,7 @@ function panelSettingsList() {
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         return a;
       },
     },
@@ -3829,7 +3919,7 @@ function panelSettingsList() {
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         return a;
       },
     },
@@ -3851,7 +3941,7 @@ function panelSettingsList() {
         btn.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-primary-color,#8b5cf6);background:var(--p-primary-color,#8b5cf6);" +
-          "color:#fff;font-size:0.8rem;white-space:nowrap;cursor:pointer;";
+          "color:#fff;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;cursor:pointer;";
         btn.addEventListener("click", async () => {
           const diag = [
             "--- comfyui-mcp panel diagnostics ---",
@@ -4075,7 +4165,7 @@ function panelSettingsList() {
           "⚠️ Beta — the app changes rapidly and builds may break between updates. " +
             "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
         );
-        note.style.cssText = "font-size:0.75rem;opacity:0.75;line-height:1.35;";
+        note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);opacity:0.75;line-height:1.35;";
         const row = document.createElement("div");
         row.style.cssText = "display:flex;gap:0.5rem;flex-wrap:wrap;";
         const linkBtn = (label, url) => {
@@ -4084,7 +4174,7 @@ function panelSettingsList() {
           a.style.cssText =
             "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
             "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-            "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+            "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
           if (url) {
             a.href = url;
             a.target = "_blank";
@@ -4116,9 +4206,11 @@ function panelSettingsList() {
       tooltip:
         "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
         "to read on a high-DPI or large display. 100% is the default; 100-250. Applies immediately, to " +
-        "every open panel. Note that overriding `.cmcp-root { font-size }` in a user stylesheet does NOT " +
-        "work: the panel's inner sizes are `rem`, which resolve against the page root rather than the " +
-        "panel, so most text ignores it. This setting is the supported way to scale the panel.",
+        "every open panel. For text, the panel also exposes a CSS variable: setting `--cmcp-fs` " +
+        "(default 0.8125rem) on `:root` or `.cmcp-root` in a user stylesheet scales the panel's font " +
+        "sizes, including the CivitAI, Apps and modal surfaces. It does not scale spacing, icons, or " +
+        "the handful of elements that carry a fixed pixel size. This setting is still the supported " +
+        "way to scale the panel as a whole.",
       type: "slider",
       attrs: { min: PANEL_UI_SCALE_MIN, max: PANEL_UI_SCALE_MAX, step: 5 },
       defaultValue: 100,
@@ -7075,7 +7167,7 @@ function makeShellCommandBlock(baseCmd) {
     b.className = "cmcp-btn";
     b.dataset.shell = s.key;
     b.textContent = s.label;
-    b.style.cssText = "font-size:0.72rem;padding:0.12rem 0.45rem;";
+    b.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);padding:0.12rem 0.45rem;";
     b.addEventListener("click", () => { selected = s.key; render(); copy(forms[s.key]); });
     pills.appendChild(b);
   }
@@ -7083,6 +7175,56 @@ function makeShellCommandBlock(baseCmd) {
   wrap.append(pills, code);
   render();
   return wrap;
+}
+
+/**
+ * USER-HIDDEN notes from the orchestrator, waiting to ride the agent's next turn.
+ *
+ * Same delivery mechanism as manualChangeBanner/validationBanner — prepended to the
+ * agent-facing text while the visible bubble stays exactly what the user typed. What is
+ * new is the SOURCE: those two are computed panel-side, these arrive as `agent_note`
+ * frames from the orchestrator.
+ *
+ * Bounded, because the queue drains only when the user next speaks and an orchestrator
+ * in a retry loop could otherwise push forever. The OLDEST are dropped: a stale sync
+ * failure matters less than the current one, and the count is disclosed so the agent
+ * knows the list is partial rather than silently truncated.
+ */
+const HIDDEN_NOTE_CAP = 8;
+let hiddenAgentNotes = [];
+let hiddenAgentNotesDropped = 0;
+
+function queueHiddenAgentNote(text) {
+  const t = typeof text === "string" ? text.trim() : "";
+  if (!t) return;
+  // Identical notices repeat on every reconnect attempt; carrying ten copies of one
+  // lock error into the turn wastes the agent's context to say one thing.
+  if (hiddenAgentNotes.includes(t)) return;
+  hiddenAgentNotes.push(t);
+  while (hiddenAgentNotes.length > HIDDEN_NOTE_CAP) {
+    hiddenAgentNotes.shift();
+    hiddenAgentNotesDropped += 1;
+  }
+}
+
+/** Drain the queue into a turn prefix, or "" when there is nothing to say. */
+function takeHiddenAgentNotes() {
+  if (!hiddenAgentNotes.length) return "";
+  const notes = hiddenAgentNotes;
+  const dropped = hiddenAgentNotesDropped;
+  hiddenAgentNotes = [];
+  hiddenAgentNotesDropped = 0;
+  // The lead-in is the whole contract: without it an agent quite reasonably answers
+  // "as the message above explains…" about something the user cannot see, which is
+  // more confusing than having printed it in the first place.
+  return (
+    `[The user cannot see this message — it is orchestrator status for you alone. ` +
+    `Do NOT refer to it as something they said or can read. Act on it if it is relevant ` +
+    `to what they asked; otherwise carry on and stay silent about it.]\n` +
+    notes.map((n) => `• ${n}`).join("\n") +
+    (dropped ? `\n(${dropped} older note(s) dropped — this list is partial.)` : "") +
+    `\n\n`
+  );
 }
 
 function manualChangeBanner() {
@@ -8454,6 +8596,70 @@ const GRAPH_TOOL_EXECUTORS = {
     const { rootGraph } = getGraphCtx();
     const workflow = rootGraph.serialize();
     return { workflow, node_count: workflow?.nodes?.length ?? 0 };
+  },
+
+  // #1006 — THIS TAB'S OWN ComfyUI node definitions.
+  //
+  // Anything that pairs a panel-captured graph with node definitions reads the graph
+  // from the connected panel and the definitions from the orchestrator's global client,
+  // which resolves COMFYUI_URL. Same machine locally; TWO machines for a remote panel —
+  // so a remote panel cannot convert its own live canvas at all.
+  //
+  // Fetching the tab's observed origin from the orchestrator instead was considered and
+  // rejected on the issue: in a tunnel or loopback-only topology the BROWSER is the only
+  // thing that can reach that ComfyUI, so it trades one silent failure for a narrower
+  // one — and it adds an outbound fetch to an origin the connected tab chose. The
+  // browser is by definition able to reach this host: it is already talking to it.
+  //
+  // `if_none_match` is how this stays affordable. The payload is large (4183 types on
+  // the install this was written against), so a caller passes back the fingerprint it
+  // holds and gets `unchanged: true` with no payload when the TYPE SET still matches.
+  // What that does and does not establish is stated in the reply, not implied.
+  async graph_get_object_info({ if_none_match } = {}) {
+    const { defs, failures } = await fetchWholeObjectInfo({
+      getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+      fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+    });
+    // THE ORIGIN THAT ACTUALLY ANSWERED (codex). `comfyuiUrlForAgent()` prefers a
+    // user-set Remote-URL override, but this fetch goes through the page's own `api`
+    // client — so on an install where those differ, reporting the override would
+    // attribute the schema to a host that served nothing.
+    const served_by = pageComfyOrigin();
+    if (!defs) {
+      // FAIL CLOSED and say what was tried. A conversion that proceeds on a missing
+      // schema produces a wrong answer, so this never returns a partial map.
+      return {
+        ok: false,
+        served_by,
+        reason: "object_info_unavailable",
+        detail:
+          "This panel could not obtain a usable /object_info from the ComfyUI it is " +
+          "connected to." + objectInfoOracleFailureNote(failures),
+      };
+    }
+    const fingerprint = objectInfoFingerprint(defs);
+    if (objectInfoUnchanged(if_none_match, fingerprint)) {
+      return {
+        ok: true,
+        served_by,
+        unchanged: true,
+        fingerprint,
+        node_type_count: Object.keys(defs).length,
+        note:
+          "The TYPE SET is unchanged since the fingerprint you passed, so the payload is " +
+          "omitted. That does not establish that individual definitions are identical — a " +
+          "combo list, a widget name or a new input on an existing node can change without " +
+          "changing which types exist. Re-read without if_none_match if you need those " +
+          "(#1006).",
+      };
+    }
+    return {
+      ok: true,
+      served_by,
+      fingerprint,
+      node_type_count: Object.keys(defs).length,
+      object_info: defs,
+    };
   },
 
   graph_get_state() {
@@ -9894,7 +10100,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // value that is not the current definition's). Reconcile against currentDef BEFORE
     // the node reaches the graph, and DISCLOSE every correction — a silent fix is still
     // a value the caller did not ask for.
-    const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);
+    const correctionOut = {};
+    const valueCorrections = applyCurrentDefWidgetValues(node, currentDef, correctionOut);
     // No await follows this validation. Re-read the graph/workflow now so a
     // tab or subgraph switch during the async preflight cannot commit to the
     // graph captured at command start.
@@ -9909,6 +10116,7 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     const added = summarizeNode(node);
+    const rejectedCorrections = correctionOut.rejected ?? [];
     if (valueCorrections.length) {
       added.schema_value_corrections = valueCorrections;
       added.warning =
@@ -9916,8 +10124,29 @@ const GRAPH_TOOL_EXECUTORS = {
         `this tab loaded). ${valueCorrections.length} widget value${valueCorrections.length === 1 ? " was" : "s were"} ` +
         `taken from the backend's CURRENT definition instead of the stale one: ` +
         `${valueCorrections.map((c) => `"${c.name}" ${JSON.stringify(c.from)} → ${JSON.stringify(c.to)}`).join(", ")}. ` +
-        `The node is valid to queue, but reload the ComfyUI tab to pick up the updated definition ` +
-        `before editing it further.`;
+        // #1369 — this used to end "The node is valid to queue". It was not: a COMBO had
+        // been rewritten to a value outside its own option list and ComfyUI refused the
+        // run. Correcting values does not amount to validating the node, and certifying
+        // it SUPPRESSES the check the caller would otherwise do — which is what made a
+        // recoverable bad value into a wasted render. Say what was actually done.
+        `Each corrected value was checked against the current definition (a COMBO value ` +
+        `outside its own option list is refused, not applied), but that is not a full ` +
+        `validation of the node — queue it and read the result. Reload the ComfyUI tab to ` +
+        `pick up the updated definition before editing it further.`;
+    }
+    if (rejectedCorrections.length) {
+      // Surfaced even when nothing else was corrected: the node is usable, and the
+      // caller should still know its schema contradicts itself, because the next
+      // confusing thing that node does will look unrelated.
+      added.schema_rejected_corrections = rejectedCorrections;
+      added.warning =
+        `${added.warning ? `${added.warning} ` : ""}` +
+        `NOTE: "${class_type}" declares ${rejectedCorrections.length} default(s) its own option ` +
+        `list does not contain — ` +
+        `${rejectedCorrections.map((r) => `"${r.name}" default ${JSON.stringify(r.proposed)} not in its options; kept ${JSON.stringify(r.kept)}`).join(", ")}. ` +
+        `That is a defect in the node pack, not in your graph. The kept value is a real ` +
+        `member of the list; applying the declared default would have made the node ` +
+        `unqueueable.`;
     }
     return { added };
   },
@@ -10679,6 +10908,50 @@ const GRAPH_TOOL_EXECUTORS = {
       /* best-effort visual cleanup — never fail the write over it */
     }
     return result;
+  },
+
+  // artokun/comfyui-mcp#938: remove ONE dynamic widget row (rgthree Power Lora Loader
+  // `lora_N`, Impact/Inspire list rows). Their add/remove affordance is a DOM-level custom
+  // widget an agent cannot click, so the rows were un-removable from an agent session —
+  // set_widget can only overwrite a row's value, remove_node deletes the whole node.
+  //
+  // The go/no-go needs the BACKEND's declared inputs, because deleting a declared input is
+  // not a layout tweak: it changes what is sent at queue time. Read through the same burst
+  // cache graph_set_widget uses (#716 — a full /object_info is megabytes on a large
+  // install), and when the read FAILS, refuse and say so rather than treating an unreadable
+  // def as "declares nothing" (#796).
+  async graph_remove_widget({ node_id, widget, workflow_uuid }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    let oracleFailures = [];
+    const outcome = await objectInfoCache.read(async () =>
+      fetchWholeObjectInfo({
+        getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+        fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+      }),
+    );
+    const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
+    oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    // Feed the #458 observed-backend-history trust root. This command never consults that
+    // history, so skipping it would be harmless HERE — but we just paid for a full
+    // /object_info, and discarding the observation makes a LATER set_widget less able to
+    // tell a removed backend node from an absent one. (Deliberately NOT awaiting the
+    // history seed: nothing on this path reads it, so waiting would buy only latency.)
+    recordObjectInfoTypes(defs);
+    const declaredNames = declaredInputNames(defs?.[node.type ?? node.comfyClass]);
+    // #718: re-read the ACTIVE uuid at the write boundary — the user can switch workflows
+    // while the /object_info fetch above is pending.
+    assertActiveWorkflowCommandTarget({
+      cmd: "graph_remove_widget",
+      [WORKFLOW_UUID_FIELD]: workflow_uuid,
+    });
+    return runRemoveWidget(node, widget, {
+      declaredNames,
+      objectInfoNote: objectInfoOracleFailureNote(oracleFailures),
+      beforeChange: () => graph.beforeChange(),
+      afterChange: () => graph.afterChange(),
+      setDirty: () => graph.setDirtyCanvas(true, true),
+    });
   },
 
   // #488: set a node's LiteGraph PROPERTY (the right-click → Properties panel), the
@@ -12430,6 +12703,10 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
     try {
+      // #968 r2 — NOT claimed here. #606/#708 reconstruct workflow_new from source and
+      // rebuild it in isolation, so an inserted call breaks 12 guards that exist for
+      // independent reasons. Recorded on the PR: this cause stays unwired until the
+      // claim can be staked somewhere those guards do not reach.
       await mgr.command.execute("Comfy.NewBlankWorkflow");
     } catch (err) {
       // The creation command itself threw. It may have got partway, and workflow_new is
@@ -12725,6 +13002,7 @@ const GRAPH_TOOL_EXECUTORS = {
     let onDiskContent = null;
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
+    let canvasDivergence = null; // #968
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -12745,11 +13023,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // guard age out mid-flight (see begin/endWorkflowReloadStep).
       beginWorkflowReloadStep(reloadGuardToken);
       try {
+        // #968 — claim this move BEFORE it happens, so the observer attributes it to this
+        // command rather than reporting it as a move nobody made. A claim that is never
+        // followed by a move is discarded by the next observation.
+        claimActiveWorkflowMove(MOVE_CAUSES.OPEN_EXECUTOR, `workflow_open ${workflowTabId(target) || ""}`.trim());
         await s.openWorkflow(target);
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
         // through failOpen below (outside the freeze) so the negative is journaled.
         openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+        // #968 r2 — the claim was staked before the switch; the switch did not happen, so
+        // release it rather than let a later move inherit this command's name.
+        claimActiveWorkflowMove(null, null);
       } finally {
         endWorkflowReloadStep(reloadGuardToken);
       }
@@ -13072,6 +13357,23 @@ const GRAPH_TOOL_EXECUTORS = {
         // and the reload decision below. (Interaction is frozen across this whole block, so
         // this is a belt-and-braces second line of defence, not the only one.)
         dirtyNow = !!target.isModified;
+        // #968 — the file is already read here, and nothing compared it to the CANVAS.
+        // decideOpenStaleness asks 'has the file changed since this tab loaded it?' by
+        // comparing disk against the tab's BASELINE; the content proof asks 'did the
+        // repaint reproduce the state it loaded?'. Both pass honestly when the tab's own
+        // state is carrying a DIFFERENT workflow's graph — which is the reported failure.
+        // Comparing the two artefacts already in hand is the one check nobody made.
+        try {
+          const diskParsed = typeof onDiskContent === "string" ? JSON.parse(onDiskContent) : onDiskContent;
+          canvasDivergence = canvasFileDivergence({
+            diskNodes: diskParsed?.nodes,
+            canvasNodes: app?.graph?._nodes ?? app?.graph?.nodes,
+          });
+        } catch {
+          // An unparseable file is 'could not compare', which the helper already means
+          // by leaving `comparable` false — never a divergence claim.
+          canvasDivergence = null;
+        }
         staleInfo = decideOpenStaleness({
           wasOpen,
           // EITHER signal counts as unsaved work: the flag as it reads NOW, and the snapshot
@@ -13279,6 +13581,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // / no baseline) and must NOT claim fresh (codex P2). `reloaded` says whether this
       // call actually re-read the file: true = the canvas now shows the on-disk version;
       // false = it still shows the loaded version and the caller must act.
+      // #968 — a canvas that shares NO node ids with its own file. Its own key, not folded
+      // into stale_hint: staleness is about the FILE changing, this is about the CANVAS not
+      // being the file's graph at all, and a caller may hit one without the other.
+      ...(canvasFileDivergenceNote(canvasDivergence, target.path)
+        ? { canvas_file_divergence: canvasFileDivergenceNote(canvasDivergence, target.path) }
+        : {}),
       ...(staleInfo.stale === true
         ? {
             stale: true,
@@ -16224,7 +16532,109 @@ function redactBridgeUrl(u) {
 // stamped on its receiving socket: a retained predecessor-process rid is
 // unknown in the new epoch and therefore fails open instead of replaying or
 // rejecting a prior session's command.
+// #646 — a duplicate delivery must not wait FOREVER on an in-flight original.
+//
+// The ledger records a command IN-FLIGHT at begin() and completes it at settleRid(). An
+// in-flight entry is never evicted, deliberately: dropping an unsettled command would let
+// its replay double-apply a mutation. So an executor that never returns leaves a redelivery
+// awaiting a promise that can never resolve, and the panel sends NOTHING — the caller sees
+// a timeout instead of an error, which is the reported shape.
+//
+// Bounded HERE, in a helper that returns an ordinary reply, so the handler keeps exactly the
+// statement shape #508 and #694 pin: one await, then the existing rid-rewrite and send. A
+// new branch in that region is what those guards forbid, and they are right to.
+//
+// The ORIGINAL entry is never settled by this. Answering "failed" for a command that may
+// still be running is how a caller retries into the double-apply the ledger exists to stop.
+// The margin subtracted from the caller's OWN deadline, so the reply lands before they
+// give up rather than after. Small relative to any real command timeout.
+const DUPLICATE_AWAIT_MARGIN_MS = 1500;
+function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
+  // NO GUESS. A bound is applied only when the frame told us how long the caller will wait
+  // (codex): the orchestrator computes a per-command timeout at ui-bridge.ts:3632 but does
+  // not put it in the frame at :4003, so today this is usually absent and the await stays
+  // exactly as unbounded as it is on main. Any fixed number would be a guess about another
+  // process's contract — and a guess that is too high changes nothing (25s cannot rescue a
+  // 20s deadline), while one that is too low reports 'still running' for a merely slow
+  // command. It also disposes of ask_user/request_secret without a special case: they carry
+  // deadlines long enough that a bound derived from them does not fire early. That is the
+  // ORCHESTRATOR's contract, not something this file enforces or can verify (codex).
+  // EVERY usable deadline gets a bound, including one at or below the margin (codex): a
+  // 1000ms timeout is neither absent nor invalid, and falling through to unbounded there
+  // would be a silent gap exactly where the caller gives up soonest. Below the margin the
+  // budget is half the deadline, which still lands before it.
+  const budget = !Number.isFinite(callerTimeoutMs) || callerTimeoutMs <= 0
+    ? null
+    : callerTimeoutMs > DUPLICATE_AWAIT_MARGIN_MS
+      ? callerTimeoutMs - DUPLICATE_AWAIT_MARGIN_MS
+      : Math.floor(callerTimeoutMs / 2);
+  if (budget === null) return Promise.resolve(prior);
+  return Promise.race([
+    Promise.resolve(prior),
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            rid,
+            ok: false,
+            error:
+              "This request id is STILL RUNNING in the panel and has not produced an outcome after " +
+              Math.round(budget / 1000) +
+              "s. This delivery was a DUPLICATE of it, so nothing new was started and nothing was " +
+              "applied twice. DO NOT RETRY: the original may still complete, and re-issuing it is how " +
+              "one mutation becomes two. Read the graph to see whether it took effect.",
+          }),
+        budget,
+      ),
+    ),
+  ]);
+}
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
+
+// #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
+// observation after the fact, which is why three reports of `bound` + wrong-graph have not
+// converged. DIAGNOSTIC ONLY: nothing below consults this to decide whether a command runs.
+const activeWorkflowMoves = createActiveWorkflowProvenance();
+// The panel's own moves are claimed by the executor that made them, and are consumed by the
+// observer so it does not double-report them as external.
+let _claimedNextMove = null;
+function claimActiveWorkflowMove(cause, detail) {
+  // A null cause RELEASES a claim (an open that failed before switching).
+  _claimedNextMove = cause ? { cause, detail: typeof detail === "string" ? detail : null } : null;
+}
+let _lastSeenActiveKey = null;
+function noteActiveWorkflowMove() {
+  try {
+    // #968 r2 (codex P1) — CONSUME the claim on every observation, not only when the key
+    // changed. A claim left pending by an open that failed, no-opped or was superseded
+    // would otherwise be applied to the NEXT different key, labelling an external move as
+    // panel-made — mislabelling exactly the case this exists to find.
+    const claim = _claimedNextMove;
+    _claimedNextMove = null;
+    // #968 r2 (codex P2) — a null active workflow is NO DESTINATION. `workflowTabId(null)`
+    // falls back to getTabId(), a browser-session id, so reading it here would report a
+    // move to a browser tab as though it were a workflow.
+    const active = activeWorkflowRef();
+    const key = active ? workflowTabId(active) || null : null;
+    if (key === _lastSeenActiveKey) return;
+    const from = _lastSeenActiveKey;
+    _lastSeenActiveKey = key;
+    if (!key) return; // nothing active — a destination-less move records nothing
+    activeWorkflowMoves.record({
+      // An UNCLAIMED move is the case #968 is hunting. It is recorded as UNKNOWN rather than
+      // as "not the panel": `workflow_new` cannot stake a claim (#606/#708 rebuild it in
+      // isolation), and one of the three reports entered through that very command, so
+      // excluding the panel here would be a false exclusion on a reported entry path.
+      cause: claim ? claim.cause : MOVE_CAUSES.UNKNOWN,
+      detail: claim ? claim.detail : null,
+      from,
+      to: key,
+      at: Date.now(),
+    });
+  } catch {
+    // A diagnostic must never break the path it observes.
+  }
+}
 
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
@@ -16791,7 +17201,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         if (priorRidReply !== undefined) {
           let dupReply;
           try {
-            dupReply = await priorRidReply;
+            dupReply = await awaitDuplicateReply(priorRidReply, msg.rid, msg.timeout_ms);
           } catch {
             return; // ledger promises never reject — defensive only
           }
@@ -16828,12 +17238,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // UI about this socket is suppressed once the patience window has been given up
             // on — so a UI-side belief can be stale exactly when it matters (codex r2).
             result = await onAsk(msg, thisSock.__cmcpSocketId ?? null);
+            // #952 — a card withdrawn by a reconnect resolves with a SENTINEL rather
+            // than staying pending forever. Thrown, so the ordinary error path builds
+            // the reply AND `settleRid` runs: without this the ledger keeps an
+            // un-evictable in-flight entry whose replay would await a promise that can
+            // never resolve, and answer nothing at all.
+            if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "request_secret") {
             // Secure secret entry. The pasted value rides back to the
             // orchestrator (which writes it to config) and is the tool's reply;
             // it is never surfaced to the agent's context or recorded to history.
             if (!onSecret) throw new Error("This panel build can't collect secrets.");
             result = await onSecret(msg, thisSock.__cmcpSocketId ?? null);
+            // #952 — same withdrawal, and the failure carries NO payload, so the
+            // undeliverable-reply path has nothing of the user's to redact.
+            if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "soft_reload") {
             // Agent-triggered soft reload. Reply FIRST (below), then bounce —
             // an "orchestrator" scope kills this very session, so the resume
@@ -17002,11 +17421,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // #607 — re-advertise the panel's CURRENT identity (re-hello) so the
               // recovery this message advertises actually reaches the orchestrator's
               // cached stamp; see noteWorkflowInstanceMismatch.
+              // #968 — observe before reporting: a move that happened since the previous
+              // command is exactly what makes this binding stale, and an unclaimed one is
+              // the case this issue is hunting.
+              noteActiveWorkflowMove();
               noteWorkflowInstanceMismatch();
               throw new Error(
                 workflowInstanceMismatchMessage({
                   commandUuid: dispatchCommandUuid,
                   activeUuid: dispatchActiveUuid,
+                  // #968 — what last moved the active workflow, if anything did. This is the
+                  // refusal a caller actually sees when a binding has gone stale.
+                  movedNote: activeWorkflowMoves.describeLast(),
                 }),
               );
             }
@@ -17213,6 +17639,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           clearTimeout(pend.timer);
           pend.resolve(msg);
         }
+        return;
+      }
+      // A USER-HIDDEN note for the agent. Deliberately handled BEFORE `say` and with
+      // its own `return`: nothing here may reach onSay, because the entire point is
+      // that the user never sees it.
+      //
+      // These are the operational walls of text — a failed panel auto-sync and its
+      // lock-recovery instructions, for example. The agent needs them; a person
+      // reading a chat about their image does not, and printing one mid-conversation
+      // reads like the assistant lost its place.
+      if (msg && msg.type === "agent_note" && msg.text != null) {
+        queueHiddenAgentNote(coerceMessageText(msg.text));
         return;
       }
       if (msg && msg.type === "say" && msg.text != null) {
@@ -17926,6 +18364,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 // ---------------------------------------------------------------------------
 
 const PANEL_CSS = `
+:root {
+  /* #753 — declared HERE as well as on .cmcp-root, because the sub-modal overlay,
+     the CivitAI lightbox and the media lightbox mount on <body>, OUTSIDE the panel
+     root. Without a :root declaration those surfaces resolve the variable to nothing
+     and drop every font-size that uses it. Override either one to scale the panel. */
+  --cmcp-fs: 0.8125rem;
+}
 .cmcp-root {
   display: flex; flex-direction: column; height: 100%; min-height: 0;
   /* #753 — a plain 100% is CORRECT under the UI-scale zoom, and dividing by the
@@ -17936,7 +18381,15 @@ const PANEL_CSS = `
      both ways. Do not re-add it. */
   position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
-  font-size: 0.8125rem; line-height: 1.5;
+  /* #753 — THE ONE KNOB. Every inner font size is calc(var(--cmcp-fs, 0.8125rem) * k), so a
+     change here scales all of them at once, at any nesting depth. An em unit was
+     tried
+     first and rejected: it resolves against the PARENT, so a rule inside a block
+     that sets its own size needs a different multiplier, and a rule used under two
+     different parents has no single correct value at all (measured: 529 drifted
+     elements, ~25 nested sites, 5 inexpressible rules). A variable is flat. */
+  --cmcp-fs: 0.8125rem;
+  font-size: var(--cmcp-fs, 0.8125rem); line-height: 1.5;
   color: var(--p-text-color, #fff);
   background: var(--p-content-background, #18181b);
 }
@@ -17950,7 +18403,7 @@ const PANEL_CSS = `
    header actions on a narrow sidebar. */
 .cmcp-logo { height: 20px; width: auto; max-width: 148px; flex: none; object-fit: contain; display: block; }
 .cmcp-status { display: flex; align-items: center; gap: 0.375rem; margin-left: auto;
-  font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); }
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--p-red-400, #f87171); flex: none; }
 .cmcp-dot.connected { background: var(--p-green-400, #4ade80); }
 .cmcp-dot.connecting { background: var(--p-yellow-400, #facc15); animation: cmcp-pulse 1.2s ease-in-out infinite; }
@@ -17971,12 +18424,12 @@ const PANEL_CSS = `
   background: transparent; border: none; cursor: pointer;
   border-radius: var(--p-border-radius-sm, 4px);
   padding: 0.25rem 0.5rem;
-  font: inherit; font-size: 0.6875rem;
+  font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   color: var(--p-text-muted-color, #a1a1aa);
   transition: background 0.15s, color 0.15s;
 }
 .cmcp-toolbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
-.cmcp-toolbtn .pi { font-size: 0.8125rem; }
+.cmcp-toolbtn .pi { font-size: var(--cmcp-fs, 0.8125rem); }
 .cmcp-toolbtn svg { width: 13px; height: 13px; display: block; }
 /* Icon-only variant (Deafen/Blind): the label span stays in the DOM — state
    copy still flows into it for screen readers / the find-icon logic — but is
@@ -17987,7 +18440,7 @@ const PANEL_CSS = `
   position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
 }
-.cmcp-toolbtn.cmcp-toolbtn-iconic .pi { font-size: 0.9375rem; }
+.cmcp-toolbtn.cmcp-toolbtn-iconic .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1538); }
 .cmcp-toolbtn.cmcp-toolbtn-iconic svg { width: 15px; height: 15px; }
 /* Active tab: the four surface buttons ARE the tab bar (issue #124) — the open
    one gets the themed toggled state (inverts light/dark via the primary tokens). */
@@ -18024,13 +18477,13 @@ const PANEL_CSS = `
 }
 .cmcp-settings > summary {
   padding: 0.5rem 0.75rem; cursor: pointer; user-select: none;
-  font-size: 0.75rem; font-weight: 600; color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); font-weight: 600; color: var(--p-text-muted-color, #a1a1aa);
   list-style: none; display: flex; align-items: center; gap: 0.375rem;
 }
 .cmcp-settings > summary::before { content: "▸"; transition: transform 0.15s; }
 .cmcp-settings[open] > summary::before { transform: rotate(90deg); }
 .cmcp-settings-body { padding: 0 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
-.cmcp-label { font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-label { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-input {
   width: 100%; box-sizing: border-box;
   padding: var(--p-form-field-padding-y, 0.5rem) var(--p-form-field-padding-x, 0.75rem);
@@ -18050,13 +18503,13 @@ const PANEL_CSS = `
 }
 .cmcp-btn:hover { opacity: 0.85; }
 .cmcp-btn:disabled { opacity: 0.4; cursor: default; }
-.cmcp-help { font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); line-height: 1.55; }
+.cmcp-help { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); line-height: 1.55; }
 .cmcp-cmd {
   display: block; margin-top: 0.25rem; padding: 0.375rem 0.5rem;
   background: var(--p-form-field-background, #09090b);
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-sm, 4px);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.6875rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   user-select: all; cursor: copy; color: var(--p-text-color, #fff);
   overflow-x: auto; white-space: nowrap;
 }
@@ -18075,12 +18528,12 @@ const PANEL_CSS = `
   margin: auto; text-align: center; max-width: 230px;
   color: var(--p-text-muted-color, #a1a1aa);
 }
-.cmcp-empty .pi { font-size: 1.75rem; display: block; margin-bottom: 0.5rem; opacity: 0.5; }
+.cmcp-empty .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 2.1538); display: block; margin-bottom: 0.5rem; opacity: 0.5; }
 .cmcp-empty-title { font-weight: 600; color: var(--p-text-color, #fff); margin-bottom: 0.25rem; }
 .cmcp-examples { display: flex; flex-direction: column; gap: 0.375rem; margin-top: 0.875rem; text-align: left; }
 .cmcp-example {
   display: flex; align-items: center; gap: 0.5rem; width: 100%; box-sizing: border-box;
-  padding: 0.4375rem 0.625rem; cursor: pointer; font: inherit; font-size: 0.75rem;
+  padding: 0.4375rem 0.625rem; cursor: pointer; font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   color: var(--p-text-color, #fff); text-align: left;
   background: var(--p-surface-800, #27272a);
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -18088,7 +18541,7 @@ const PANEL_CSS = `
   transition: border-color 0.15s, background 0.15s;
 }
 .cmcp-example:hover { border-color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
-.cmcp-example .pi { font-size: 0.8125rem; margin: 0; opacity: 1; color: var(--p-primary-color, #60a5fa); flex: none; }
+.cmcp-example .pi { font-size: var(--cmcp-fs, 0.8125rem); margin: 0; opacity: 1; color: var(--p-primary-color, #60a5fa); flex: none; }
 
 /* Provider onboarding card — shown only when NEITHER provider is signed in. */
 .cmcp-onboard {
@@ -18102,10 +18555,10 @@ const PANEL_CSS = `
    it or "onboard.hidden = true" won't actually hide the card. */
 .cmcp-onboard[hidden] { display: none; }
 .cmcp-onboard-title { font-weight: 600; color: var(--p-text-color, #fff); }
-.cmcp-onboard-sub { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); line-height: 1.4; }
+.cmcp-onboard-sub { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); line-height: 1.4; }
 .cmcp-onboard-col { display: flex; flex-direction: column; gap: 0.25rem; }
-.cmcp-onboard-prov { font-weight: 600; font-size: 0.8125rem; color: var(--p-text-color, #fff); margin-top: 0.25rem; }
-.cmcp-onboard-step { font-size: 0.7rem; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-onboard-prov { font-weight: 600; font-size: var(--cmcp-fs, 0.8125rem); color: var(--p-text-color, #fff); margin-top: 0.25rem; }
+.cmcp-onboard-step { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); color: var(--p-text-muted-color, #a1a1aa); }
 
 .cmcp-bubble {
   padding: 0.5rem 0.75rem; max-width: 92%;
@@ -18127,7 +18580,7 @@ const PANEL_CSS = `
   display: flex; align-items: center; justify-content: center;
   border: 1px solid var(--p-content-border-color, #3f3f46);
   background: var(--p-surface-800, #27272a); color: var(--p-text-muted-color, #a1a1aa);
-  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s; font-size: 0.7rem;
+  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615);
 }
 .cmcp-bubble.user:hover .cmcp-edit-btn { opacity: 1; }
 .cmcp-edit-btn:hover { color: var(--p-primary-color, #60a5fa); border-color: var(--p-primary-color, #60a5fa); }
@@ -18141,15 +18594,15 @@ const PANEL_CSS = `
   padding: 0.85rem; border-radius: 10px; background: var(--p-surface-900, #18181b);
   border: 1px solid var(--p-content-border-color, #3f3f46); box-shadow: 0 8px 30px rgba(0,0,0,0.5);
 }
-.cmcp-modal-title { font-weight: 600; font-size: 0.85rem; }
+.cmcp-modal-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462); }
 .cmcp-modal-text {
   width: 100%; box-sizing: border-box; resize: vertical; min-height: 3.5rem;
-  padding: 0.4rem 0.5rem; border-radius: 6px; font: inherit; font-size: 0.8rem;
+  padding: 0.4rem 0.5rem; border-radius: 6px; font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846);
   background: var(--p-surface-950, #111113); color: inherit;
   border: 1px solid var(--p-surface-500, #555);
 }
 .cmcp-modal-scopes { display: flex; flex-direction: column; gap: 0.3rem; }
-.cmcp-modal-scope { display: flex; gap: 0.4rem; align-items: flex-start; font-size: 0.72rem; cursor: pointer; }
+.cmcp-modal-scope { display: flex; gap: 0.4rem; align-items: flex-start; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); cursor: pointer; }
 .cmcp-modal-scope input { margin-top: 0.15rem; }
 .cmcp-modal-btns { display: flex; justify-content: flex-end; gap: 0.4rem; }
 .cmcp-btn-primary { background: var(--p-primary-color, #3a7bd5); color: #fff; border: none; }
@@ -18175,7 +18628,7 @@ const PANEL_CSS = `
 .cmcp-lightbox-nav {
   position: absolute; top: 50%; transform: translateY(-50%);
   width: 2.6rem; height: 2.6rem; border-radius: 50%; cursor: pointer;
-  font-size: 1.6rem; line-height: 1; display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.9692); line-height: 1; display: flex; align-items: center; justify-content: center;
   color: var(--p-text-color, #fafafa);
   background: rgba(0,0,0,0.45); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
@@ -18185,7 +18638,7 @@ const PANEL_CSS = `
 .cmcp-lightbox-close {
   position: absolute; top: 0.75rem; right: 0.75rem;
   width: 2.2rem; height: 2.2rem; border-radius: 50%; cursor: pointer;
-  font-size: 1.1rem; line-height: 1; display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.3538); line-height: 1; display: flex; align-items: center; justify-content: center;
   color: var(--p-text-color, #fafafa);
   background: rgba(0,0,0,0.45); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
@@ -18196,11 +18649,11 @@ const PANEL_CSS = `
   border-top: 1px solid var(--p-content-border-color, #3f3f46);
 }
 .cmcp-lightbox-caption {
-  font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .cmcp-lightbox-open {
-  flex: 0 0 auto; cursor: pointer; font-size: 0.72rem; padding: 0.3rem 0.6rem; border-radius: 6px;
+  flex: 0 0 auto; cursor: pointer; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); padding: 0.3rem 0.6rem; border-radius: 6px;
   color: var(--p-text-color, #fafafa);
   background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
@@ -18217,7 +18670,7 @@ const PANEL_CSS = `
 }
 .cmcp-media-expand, .cmcp-media-collapse {
   width: 1.8rem; height: 1.8rem; border-radius: 6px; cursor: pointer;
-  font-size: 0.95rem; line-height: 1; display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1692); line-height: 1; display: flex; align-items: center; justify-content: center;
   color: #fff; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.25);
   opacity: 0; transition: opacity 0.12s ease;
 }
@@ -18247,7 +18700,7 @@ const PANEL_CSS = `
 .cmcp-media-stub {
   display: none; align-items: center; gap: 0.4rem; cursor: pointer;
   min-height: 1.8rem; padding: 0.35rem 2.6rem 0.35rem 0.55rem; border-radius: 6px;
-  font-size: 0.7rem; color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); color: var(--p-text-muted-color, #a1a1aa);
   background: var(--p-content-hover-background, #2a2a2e);
   border: 1px dashed var(--p-content-border-color, #3f3f46);
 }
@@ -18265,7 +18718,7 @@ const PANEL_CSS = `
   padding: 0.5rem 0.6rem; background: var(--p-surface-800, #27272a);
 }
 .cmcp-file-open {
-  color: var(--p-primary-color, #60a5fa); text-decoration: none; font-size: 0.8rem;
+  color: var(--p-primary-color, #60a5fa); text-decoration: none; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846);
   word-break: break-all;
 }
 .cmcp-file-open:hover { text-decoration: underline; }
@@ -18289,7 +18742,7 @@ const PANEL_CSS = `
 .cmcp-msg-status {
   align-self: flex-end; max-width: 92%;
   margin: 0.0625rem 0.125rem 0.125rem;
-  font-size: 0.6875rem; color: var(--p-text-muted-color, #71717a);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #71717a);
   display: flex; gap: 0.375rem; align-items: center;
 }
 .cmcp-msg-status:empty { display: none; }
@@ -18307,11 +18760,11 @@ const PANEL_CSS = `
   border-radius: var(--p-border-radius-sm, 4px);
   transition: color 0.12s, background 0.12s;
 }
-.cmcp-msg-action .pi { font-size: 0.75rem; }
+.cmcp-msg-action .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); }
 .cmcp-msg-action:hover { color: var(--p-text-color, #fff); background: var(--p-surface-700, #3f3f46); }
 .cmcp-msg-status.failed .cmcp-msg-action:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   background: var(--p-form-field-background, #09090b);
   padding: 0.0625rem 0.25rem; border-radius: var(--p-border-radius-sm, 4px);
 }
@@ -18326,10 +18779,10 @@ const PANEL_CSS = `
 .cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 {
   margin: 0.625rem 0 0.25rem; font-weight: 600; line-height: 1.3;
 }
-.cmcp-bubble h1 { font-size: 1.05rem; }
-.cmcp-bubble h2 { font-size: 1rem; }
-.cmcp-bubble h3 { font-size: 0.9375rem; }
-.cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 { font-size: 0.875rem; }
+.cmcp-bubble h1 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.2923); }
+.cmcp-bubble h2 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.2308); }
+.cmcp-bubble h3 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1538); }
+.cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0769); }
 .cmcp-bubble a { color: var(--p-primary-color, #60a5fa); text-decoration: underline; }
 .cmcp-bubble blockquote {
   margin: 0.5rem 0; padding: 0.125rem 0 0.125rem 0.75rem;
@@ -18344,7 +18797,7 @@ const PANEL_CSS = `
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-md, 6px);
   overflow-x: auto; max-height: 20rem; overflow-y: auto;
-  font-size: 0.6875rem; line-height: 1.5; tab-size: 2;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); line-height: 1.5; tab-size: 2;
 }
 .cmcp-bubble.agent pre code, .cmcp-bubble.user pre code {
   background: none; padding: 0; border-radius: 0;
@@ -18370,7 +18823,7 @@ const PANEL_CSS = `
   transition: background 0.15s, color 0.15s;
 }
 .cmcp-code-tool:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
-.cmcp-code-tool .pi { font-size: 0.8rem; }
+.cmcp-code-tool .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); }
 .cmcp-code-tool.ok { color: #4ade80; }
 .cmcp-wrap-btn.on { color: var(--p-primary-color, #60a5fa); }
 .cmcp-wrap-btn.on:hover { color: var(--p-primary-color, #60a5fa); }
@@ -18386,7 +18839,7 @@ const PANEL_CSS = `
   display: none; align-items: center; justify-content: center;
   background: var(--p-surface-700, #3f3f46); border: none; border-radius: 4px;
   color: var(--p-text-muted-color, #a1a1aa); cursor: pointer;
-  font-size: 0.55rem; line-height: 1; z-index: 2; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.6769); line-height: 1; z-index: 2; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
   transition: background 0.12s, color 0.12s;
 }
 .cmcp-bubble code.cmcp-inline-code:hover .cmcp-inline-copy { display: flex; }
@@ -18396,7 +18849,7 @@ const PANEL_CSS = `
   /* Real table layout (NOT display:block) so the header row stays aligned with
      the body; fit the panel width and let long cells wrap instead of scrolling. */
   display: table; width: 100%; table-layout: fixed;
-  border-collapse: collapse; margin: 0.5rem 0; font-size: 0.6875rem;
+  border-collapse: collapse; margin: 0.5rem 0; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
 }
 .cmcp-bubble th, .cmcp-bubble td {
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -18409,21 +18862,21 @@ const PANEL_CSS = `
   display: inline-flex; align-items: center; gap: 0.35rem;
   padding: 0.3rem 0.75rem; border-radius: 999px; border: none; cursor: pointer;
   background: var(--p-primary-color, #2563eb); color: var(--p-primary-contrast-color, #fff);
-  font: inherit; font-size: 0.7rem; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
-.cmcp-newmsg .pi { font-size: 0.7rem; }
+.cmcp-newmsg .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); }
 /* The base rule sets display, which beats the UA [hidden] rule — so re-assert
    it or "newMsgBtn.hidden = true" won't actually hide the pill. */
 .cmcp-newmsg[hidden] { display: none; }
 .cmcp-tray {
   flex: none; margin: 0 0.5rem 0.25rem; padding: 0.4rem 0.55rem;
   background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
-  border-radius: 8px; max-height: 9rem; overflow-y: auto; font-size: 0.7rem;
+  border-radius: 8px; max-height: 9rem; overflow-y: auto; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615);
 }
 .cmcp-tray[hidden] { display: none; }
-.cmcp-tray-head { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
+.cmcp-tray-head { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7385); text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
 .cmcp-todo-item { display: flex; align-items: flex-start; gap: 0.4rem; padding: 0.12rem 0; line-height: 1.3; }
-.cmcp-todo-item .pi { font-size: 0.7rem; margin-top: 0.1rem; flex: none; }
+.cmcp-todo-item .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); margin-top: 0.1rem; flex: none; }
 .cmcp-todo-item.done { opacity: 0.55; }
 .cmcp-todo-item.done span { text-decoration: line-through; }
 .cmcp-todo-item.done .pi { color: var(--p-green-400, #4ade80); }
@@ -18438,11 +18891,11 @@ const PANEL_CSS = `
 .cmcp-pending-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-pending-item.failed .cmcp-pending-text { color: var(--p-red-300, #fca5a5); }
 .cmcp-pending-act { flex: none; width: 1.2rem; height: 1.2rem; padding: 0; border: none; background: transparent;
-  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: 0.7rem; }
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); }
 .cmcp-pending-act:hover { color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
 .cmcp-pending-act.danger:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-pending-handle { flex: none; width: 1rem; height: 1.2rem; display: flex; align-items: center; justify-content: center;
-  color: var(--p-text-muted-color, #71717a); cursor: grab; font-size: 0.65rem; opacity: 0.6; }
+  color: var(--p-text-muted-color, #71717a); cursor: grab; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8); opacity: 0.6; }
 .cmcp-pending-handle:hover { opacity: 1; color: var(--p-primary-color, #60a5fa); }
 .cmcp-pending-handle:active { cursor: grabbing; }
 .cmcp-pending-item.dragging { opacity: 0.4; }
@@ -18452,7 +18905,7 @@ const PANEL_CSS = `
 .cmcp-dl-item { padding: 0.18rem 0; }
 .cmcp-dl-top { display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline; }
 .cmcp-dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cmcp-dl-meta { flex: none; opacity: 0.7; font-size: 0.62rem; }
+.cmcp-dl-meta { flex: none; opacity: 0.7; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7631); }
 .cmcp-dl-bar { height: 4px; border-radius: 999px; background: var(--p-surface-700, #3f3f46); overflow: hidden; margin-top: 0.2rem; }
 .cmcp-dl-fill { height: 100%; background: var(--p-primary-color, #3a7bd5); transition: width 0.3s ease; }
 .cmcp-dl-item.done .cmcp-dl-fill { background: var(--p-green-400, #4ade80); }
@@ -18460,7 +18913,7 @@ const PANEL_CSS = `
 .cmcp-dl-bar.indet .cmcp-dl-fill { width: 30%; animation: cmcp-indet 1.1s ease-in-out infinite; }
 @keyframes cmcp-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .cmcp-sys {
-  align-self: center; font-size: 0.6875rem; font-style: italic;
+  align-self: center; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
   animation: cmcp-in 0.18s ease-out;
   /* Status lines quote URLs, paths and ids — strings with no spaces to break
@@ -18477,17 +18930,17 @@ const PANEL_CSS = `
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-left: 3px solid var(--p-primary-color, #60a5fa);
   border-radius: var(--p-border-radius-md, 6px);
-  font-size: 0.75rem;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   animation: cmcp-in 0.18s ease-out;
 }
 .cmcp-card.error { border-left-color: var(--p-red-400, #f87171); }
 .cmcp-card-head { display: flex; align-items: center; gap: 0.375rem; font-weight: 600; min-width: 0; }
-.cmcp-card-head .pi { font-size: 0.75rem; color: var(--p-primary-color, #60a5fa); flex: none; }
+.cmcp-card-head .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-primary-color, #60a5fa); flex: none; }
 .cmcp-card-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-card.error .cmcp-card-head .pi { color: var(--p-red-400, #f87171); }
 .cmcp-card-detail {
   margin-top: 0.25rem; color: var(--p-text-muted-color, #a1a1aa);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.6875rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   overflow-x: auto; white-space: pre-wrap; word-break: break-word;
   max-height: 7.5rem; overflow-y: auto;
 }
@@ -18501,7 +18954,7 @@ const PANEL_CSS = `
   border: 2px dashed var(--p-primary-color, #3b82f6);
   border-radius: 10px;
   background: color-mix(in srgb, var(--p-primary-color, #3b82f6) 16%, var(--p-surface-900, #18181b));
-  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: 0.85rem;
+  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462);
   pointer-events: none; animation: cmcp-in 0.12s ease-out;
 }
 .cmcp-dropzone.cmcp-show { display: flex; }
@@ -18512,7 +18965,7 @@ const PANEL_CSS = `
   background: var(--p-surface-800, #27272a);
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-lg, 8px);
-  color: var(--p-text-muted-color, #a1a1aa); font-size: 0.75rem;
+  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   animation: cmcp-in 0.18s ease-out;
 }
 .cmcp-thinking-dots { display: inline-flex; gap: 3px; }
@@ -18538,19 +18991,19 @@ const PANEL_CSS = `
 }
 .cmcp-think > summary {
   list-style: none; cursor: pointer; user-select: none;
-  padding: 0.3125rem 0.5rem; font-size: 0.6875rem; font-weight: 600;
+  padding: 0.3125rem 0.5rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); font-weight: 600;
   color: var(--p-text-muted-color, #a1a1aa);
   display: flex; align-items: center; gap: 0.375rem;
 }
 .cmcp-think > summary::-webkit-details-marker { display: none; }
 .cmcp-think > summary::before {
-  content: "\\25b8"; font-size: 0.625rem; transition: transform 0.15s;
+  content: "\\25b8"; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); transition: transform 0.15s;
 }
 .cmcp-think[open] > summary::before { transform: rotate(90deg); }
 .cmcp-think-body {
   max-height: 11rem; overflow-y: auto;
   padding: 0 0.5rem 0.4375rem 0.875rem;
-  font-size: 0.6875rem; line-height: 1.45;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); line-height: 1.45;
   color: var(--p-text-muted-color, #8a8a93);
   white-space: pre-wrap; word-break: break-word;
   font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -18595,19 +19048,19 @@ const PANEL_CSS = `
 .cmcp-iconbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
-.cmcp-iconbtn .pi { font-size: 0.875rem; }
+.cmcp-iconbtn .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0769); }
 /* #758 — the update notice. Sits in the transcript as a system line, so it inherits
    the panel's scale and scroll rather than becoming a modal the user must dismiss. */
 .cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
 .cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
 .cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
 .cmcp-whatsnew-list li { line-height: 1.45; }
-.cmcp-whatsnew-tag { display: inline-block; font-size: 0.58rem; text-transform: uppercase;
+.cmcp-whatsnew-tag { display: inline-block; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138); text-transform: uppercase;
   letter-spacing: 0.04em; opacity: 0.75; border: 1px solid currentColor; border-radius: 3px;
   padding: 0 0.22rem; margin-right: 0.15rem; vertical-align: baseline; }
-.cmcp-workflow-version { margin-top: 0.35rem; font-size: 0.58rem; opacity: 0.62;
+.cmcp-workflow-version { margin-top: 0.35rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138); opacity: 0.62;
   display: flex; gap: 0.3rem; align-items: center; }
-.cmcp-workflow-version .pi { font-size: 0.58rem; }
+.cmcp-workflow-version .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138); }
 /* ---- sidebar tab badge (these live OUTSIDE .cmcp-root, on the toolbar) ---- */
 /* (.cmcp-tab-logo — the logo-mark tab glyph — is NOT here: it must exist the
    moment registerSidebarTab() paints the toolbar, before the panel ever
@@ -18631,7 +19084,7 @@ const PANEL_CSS = `
 .cmcp-chip {
   display: flex; align-items: center; gap: 0.25rem;
   border: none; background: transparent; cursor: pointer;
-  color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: 0.6875rem;
+  color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
   white-space: nowrap; min-width: 0; overflow: hidden; flex: 0 1 auto;
 }
@@ -18653,13 +19106,13 @@ const PANEL_CSS = `
   background: var(--p-surface-700, #3f3f46);
   border: 1px solid var(--p-content-border-color, #52525b);
   border-radius: var(--p-border-radius-md, 6px);
-  color: var(--p-text-color, #fff); font: inherit; font-size: 0.6875rem;
+  color: var(--p-text-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   padding: 0.1875rem 0.25rem 0.1875rem 0.375rem; cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }
 .cmcp-attach-chip:hover { background: var(--p-surface-600, #52525b); }
 .cmcp-attach-chip.open { border-color: var(--p-primary-color, #60a5fa); }
-.cmcp-attach-chip > .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-attach-chip > .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-attach-meta { color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-attach-thumb { width: 1.125rem; height: 1.125rem; border-radius: 3px; object-fit: cover; flex: none; }
@@ -18669,7 +19122,7 @@ const PANEL_CSS = `
   border-radius: 3px; color: var(--p-text-muted-color, #a1a1aa);
 }
 .cmcp-attach-rm:hover { background: var(--p-surface-800, #27272a); color: var(--p-text-color, #fff); }
-.cmcp-attach-rm .pi { font-size: 0.625rem; }
+.cmcp-attach-rm .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); }
 .cmcp-attach-preview {
   background: var(--p-surface-900, #18181b);
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -18679,10 +19132,10 @@ const PANEL_CSS = `
 .cmcp-attach-preview pre {
   margin: 0; white-space: pre-wrap; word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.6875rem; line-height: 1.45; color: var(--p-text-color, #e4e4e7);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); line-height: 1.45; color: var(--p-text-color, #e4e4e7);
 }
 .cmcp-attach-preview img { max-width: 100%; max-height: 12rem; border-radius: 4px; display: block; }
-.cmcp-ctx { font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
+.cmcp-ctx { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
 .cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
 .cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
 .cmcp-ring .fg { stroke: var(--p-primary-color, #60a5fa); transition: stroke-dashoffset 0.3s; }
@@ -18698,11 +19151,11 @@ const PANEL_CSS = `
 .cmcp-popover-item {
   display: flex; align-items: center; gap: 0.5rem; width: 100%; box-sizing: border-box;
   padding: 0.375rem 0.5rem; border: none; background: transparent; cursor: pointer;
-  text-align: left; color: var(--p-text-color, #fff); font: inherit; font-size: 0.75rem;
+  text-align: left; color: var(--p-text-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   border-radius: var(--p-border-radius-sm, 4px);
 }
 .cmcp-popover-item.sel, .cmcp-popover-item:hover { background: var(--p-surface-700, #3f3f46); }
-.cmcp-popover-item .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-popover-item .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
 .cmcp-popover-item .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Hover-to-read: while revealing, drop the ellipsis so the tail is legible, and
@@ -18735,12 +19188,12 @@ const PANEL_CSS = `
 .cmcp-hist-search {
   min-width: 0; border: 1px solid var(--p-form-field-border-color, #52525b);
   border-radius: var(--p-border-radius-sm, 4px); background: var(--p-form-field-background, #09090b);
-  color: var(--p-form-field-color, #fff); font: inherit; font-size: 0.75rem; padding: 0.35rem 0.45rem;
+  color: var(--p-form-field-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); padding: 0.35rem 0.45rem;
 }
 .cmcp-hist-filter { grid-column: 1 / -1; display: flex; align-items: center; gap: 0.375rem;
-  color: var(--p-text-muted-color, #a1a1aa); font-size: 0.6875rem; }
+  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); }
 .cmcp-hist-list { max-height: min(58vh, 28rem); overflow-y: auto; padding: 0.25rem; }
-.cmcp-hist-group { padding: 0.35rem 0.5rem 0.2rem; font-size: 0.625rem; font-weight: 700;
+.cmcp-hist-group { padding: 0.35rem 0.5rem 0.2rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); font-weight: 700;
   text-transform: uppercase; letter-spacing: 0.04em; color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-hist-row { display: flex; align-items: stretch; gap: 0.125rem; }
 .cmcp-hist-row.active { background: color-mix(in srgb, var(--p-primary-color, #60a5fa) 13%, transparent); border-radius: 4px; }
@@ -18749,7 +19202,7 @@ const PANEL_CSS = `
 .cmcp-hist-row.foreign-workflow .cmcp-hist-open { cursor: not-allowed; }
 .cmcp-hist-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .cmcp-hist-meta .lbl { font-weight: 550; }
-.cmcp-hist-sub { color: var(--p-text-muted-color, #a1a1aa); font-size: 0.625rem;
+.cmcp-hist-sub { color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-hist-action {
   flex: none; width: 1.75rem; border: none; background: transparent; cursor: pointer;
@@ -18760,32 +19213,32 @@ const PANEL_CSS = `
 .cmcp-hist-action:focus-visible { opacity: 1; }
 .cmcp-hist-action:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
 .cmcp-hist-action.danger:hover { color: var(--p-red-400, #f87171); }
-.cmcp-hist-action .pi { font-size: 0.75rem; }
+.cmcp-hist-action .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); }
 .cmcp-hist-footer {
   margin-top: 0.25rem; padding: 0.5rem 0.375rem 0.125rem;
   border-top: 1px solid var(--p-content-border-color, #3f3f46);
 }
 .cmcp-hist-note {
   margin: 0 0 0.375rem; color: var(--p-text-muted-color, #a1a1aa);
-  font-size: 0.625rem; line-height: 1.35;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); line-height: 1.35;
 }
 .cmcp-hist-clear {
   display: flex; align-items: center; justify-content: center; gap: 0.375rem;
   width: 100%; padding: 0.3125rem 0.5rem; border-radius: var(--p-border-radius-sm, 4px);
   border: 1px solid color-mix(in srgb, var(--p-red-400, #f87171) 45%, transparent);
   background: transparent; color: var(--p-red-400, #f87171); cursor: pointer;
-  font: inherit; font-size: 0.6875rem;
+  font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
 }
 .cmcp-hist-clear:hover:not(:disabled) { background: color-mix(in srgb, var(--p-red-400, #f87171) 12%, transparent); }
 .cmcp-hist-clear:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Model/effort picker popover (anchored above the composer). */
-.cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: 0.625rem; font-weight: 600;
+.cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.04em; color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-pop-section:not(:first-child) { margin-top: 0.25rem; border-top: 1px solid var(--p-content-border-color, #3f3f46); padding-top: 0.375rem; }
 .cmcp-popover-item .check { flex: none; width: 1rem; text-align: center; margin-left: 0.375rem; color: var(--p-primary-color, #60a5fa); visibility: hidden; }
 .cmcp-popover-item .check.on { visibility: visible; }
-.cmcp-chip .pi-angle-down { font-size: 0.5625rem; opacity: 0.7; }
+.cmcp-chip .pi-angle-down { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.6923); opacity: 0.7; }
 .cmcp-chip .dim { opacity: 0.65; }
 /* Omni-search model picker (aggregates every connected provider's catalog into
    one virtualized, keyboard-navigable list). Row height is FIXED at 30px so the
@@ -18793,9 +19246,9 @@ const PANEL_CSS = `
 .cmcp-modelsearch { display: flex; flex-direction: column; }
 .cmcp-modelsearch-input { margin: 0.25rem 0.5rem; padding: 0.3rem 0.5rem; border-radius: 6px;
   border: 1px solid var(--p-content-border-color, #3f3f46); background: var(--p-surface-900, #18181b);
-  color: var(--p-text-color, #e4e4e7); font-size: 0.8rem; }
+  color: var(--p-text-color, #e4e4e7); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); }
 .cmcp-modelsearch-input:focus { outline: none; border-color: var(--p-focus-ring-color, #60a5fa); }
-.cmcp-modelsearch-cap { padding: 0.125rem 0.5rem 0.25rem; font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-modelsearch-cap { padding: 0.125rem 0.5rem 0.25rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-modelresults { position: relative; overflow-y: auto; max-height: 15rem; }
 .cmcp-modelsizer { position: relative; width: 100%; }
 .cmcp-modelrow { position: absolute; left: 0; right: 0; height: 30px; display: flex; align-items: center;
@@ -18803,19 +19256,19 @@ const PANEL_CSS = `
   text-align: left; cursor: pointer; box-sizing: border-box; }
 .cmcp-modelrow:hover, .cmcp-modelrow.active { background: var(--p-surface-700, #3f3f46); }
 .cmcp-modelrow .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cmcp-modelrow .sub { flex: none; color: var(--p-text-muted-color, #a1a1aa); font-size: 0.6875rem; overflow: hidden;
+.cmcp-modelrow .sub { flex: none; color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
-.cmcp-provtag { flex: none; font-size: 0.5625rem; text-transform: uppercase; letter-spacing: 0.03em;
+.cmcp-provtag { flex: none; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.6923); text-transform: uppercase; letter-spacing: 0.03em;
   padding: 0.05rem 0.35rem; border-radius: 999px; background: var(--p-surface-800, #27272a);
   color: var(--p-text-muted-color, #a1a1aa); border: 1px solid var(--p-content-border-color, #3f3f46); }
 .cmcp-modelrow .check { flex: none; width: 1rem; text-align: center; color: var(--p-primary-color, #60a5fa); visibility: hidden; }
 .cmcp-modelrow .check.on { visibility: visible; }
-.cmcp-modelempty { padding: 0.5rem; font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-modelempty { padding: 0.5rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); }
 /* Recently-used section (non-virtualized; bounded to the last few picks). Rows
    flow normally (override the absolute positioning the virtualized list uses). */
 .cmcp-modelrecents .cmcp-modelrow { position: static; }
 .cmcp-modelrecent-x { flex: none; margin-left: 0.15rem; padding: 0 0.2rem; background: none; border: none;
-  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; opacity: 0.55; font-size: 0.7rem; line-height: 1; }
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; opacity: 0.55; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); line-height: 1; }
 .cmcp-modelrecent-x:hover { opacity: 1; color: var(--p-text-color, #e4e4e7); }
 `;
 
@@ -19712,7 +20165,9 @@ function buildPanel() {
   statusText.textContent = "disconnected";
   const caret = document.createElement("i");
   caret.className = "pi pi-angle-down";
-  caret.style.fontSize = "0.625rem";
+  // #753 — assigned through style.fontSize rather than a `font-size:` declaration, so the
+  // conversion sweep could not see it (codex). 0.625/0.8125, same as every other value.
+  caret.style.fontSize = "calc(var(--cmcp-fs, 0.8125rem) * 0.7692)";
   status.append(dot, statusText, caret);
 
   function iconBtn(icon, titleText) {
@@ -21559,7 +22014,7 @@ function buildPanel() {
             'Hide {provider} — you don\'t use it. Restore it from the "hidden" row below.',
             { provider: BACKEND_LABELS[id] || id },
           );
-          off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:0.7rem;flex:none;";
+          off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);flex:none;";
           off.addEventListener("mousedown", (mev) => {
             // Swallow the row's pick handler — this gesture only hides.
             mev.preventDefault();
@@ -23069,7 +23524,7 @@ function buildPanel() {
     if (name) {
       const cap = document.createElement("div");
       cap.className = "cmcp-media-caption";
-      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
     }
@@ -23158,7 +23613,7 @@ function buildPanel() {
       holder._preFailCss = holder.style.cssText;
       holder.style.cssText +=
         ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
-        "color:var(--p-text-muted-color,#a1a1aa);font-size:0.75rem;";
+        "color:var(--p-text-muted-color,#a1a1aa);font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);";
       // Release the decode buffers the way unmountHolderVideo does — detaching alone is
       // not deterministic release, and unmount will skip this element once `_video` is
       // null, so this is the last chance to do it (codex).
@@ -23232,7 +23687,7 @@ function buildPanel() {
     if (name) {
       const cap = document.createElement("div");
       cap.className = "cmcp-media-caption";
-      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
     }
@@ -23269,7 +23724,7 @@ function buildPanel() {
     card.appendChild(audio);
     if (name) {
       const cap = document.createElement("div");
-      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
     }
@@ -23304,7 +23759,7 @@ function buildPanel() {
     a.textContent = name || tr("panel.open_file", "Open file");
     card.appendChild(a);
     const hint = document.createElement("div");
-    hint.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+    hint.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
     hint.textContent = tr("panel.the_panel_can_t_preview_this_file", "The panel can't preview this file type — open or download it.");
     card.appendChild(hint);
     log.appendChild(card);
@@ -23481,7 +23936,7 @@ function buildPanel() {
     if (msg.header) {
       const chip = document.createElement("div");
       chip.className = "cmcp-card-head";
-      chip.style.cssText = "text-transform:uppercase;font-size:0.6rem;letter-spacing:0.05em;opacity:0.7;";
+      chip.style.cssText = "text-transform:uppercase;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7385);letter-spacing:0.05em;opacity:0.7;";
       chip.textContent = coerceMessageText(msg.header);
       card.appendChild(chip);
     }
@@ -23493,11 +23948,27 @@ function buildPanel() {
 
     const selected = new Set();
     let done = false;
+    // #952 — SEPARATE from `done`, which means "the user answered". Retirement asks
+    // `alreadyAnswered: () => done` before disabling anything, so an abandon that set
+    // `done` would make the card skip its own retirement and stay live-looking.
+    let abandoned = false;
     let resolveFn;
     const promise = new Promise((res) => { resolveFn = res; });
 
+    // #952 — end the command WITHOUT answering it. The executor turns this sentinel
+    // into an explicit failure, which settles the rid ledger; leaving the promise
+    // pending instead is what stranded an un-evictable in-flight entry whose replay
+    // could never be answered.
+    const abandon = () => {
+      if (done || abandoned) return;
+      abandoned = true;
+      resolveFn(INTERACTIVE_ABANDONED);
+    };
+
     const finish = (answer) => {
-      if (done) return;
+      // `abandoned` too: the command behind this card has already been failed, so a
+      // late click must not resolve a promise whose reply was already sent.
+      if (done || abandoned) return;
       done = true;
       // Collapse the interactive card into a STATIC result — remove every button
       // and input so it no longer looks clickable / awaiting an answer.
@@ -23510,7 +23981,7 @@ function buildPanel() {
       const answerText = coerceMessageText(answer);
       if (questionText) {
         const q = document.createElement("div");
-        q.style.cssText = "font-size:0.72rem;opacity:0.65;";
+        q.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);opacity:0.65;";
         q.textContent = questionText;
         card.appendChild(q);
       }
@@ -23532,14 +24003,14 @@ function buildPanel() {
       b.className = "cmcp-opt";
       b.style.cssText =
         "text-align:left;padding:0.4rem 0.55rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-        "background:var(--p-surface-800,#2a2a2a);color:inherit;cursor:pointer;font-size:0.8rem;";
+        "background:var(--p-surface-800,#2a2a2a);color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
       const lbl = document.createElement("div");
       lbl.style.fontWeight = "600";
       lbl.textContent = coerceMessageText(opt.label ?? opt);
       b.appendChild(lbl);
       if (opt.description) {
         const d = document.createElement("div");
-        d.style.cssText = "font-size:0.7rem;opacity:0.7;margin-top:0.1rem;";
+        d.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);opacity:0.7;margin-top:0.1rem;";
         d.textContent = coerceMessageText(opt.description);
         b.appendChild(d);
       }
@@ -23565,7 +24036,7 @@ function buildPanel() {
     other.placeholder = tr("panel.other_type_your_own_answer", "Other… (type your own answer)");
     other.style.cssText =
       "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
+      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
     other.addEventListener("keydown", (e) => {
       if (isImeComposing(e)) return; // don't commit mid-IME-composition (#385)
       if (e.key === "Enter" && other.value.trim()) { e.preventDefault(); finish(other.value.trim()); }
@@ -23575,7 +24046,7 @@ function buildPanel() {
     const submit = document.createElement("button");
     submit.type = "button";
     submit.style.cssText =
-      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
+      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
     submit.textContent = multi ? tr("panel.submit", "Submit") : tr("panel.send", "Send");
     submit.addEventListener("click", () => {
@@ -23604,6 +24075,7 @@ function buildPanel() {
           alreadyAnswered: () => done,
           what: "question",
         }),
+      abandon,
     });
     promise.then(unregister, unregister);
     return promise;
@@ -23640,11 +24112,25 @@ function buildPanel() {
     for (const record of [...liveInteractiveCards]) {
       if (record.paintedOnSocket === liveSocketId) continue;
       liveInteractiveCards.delete(record);
+      // RETIRE FIRST, then abandon — and in SEPARATE try blocks, so neither step can
+      // be skipped by the other throwing. Order matters: retirement asks the card
+      // whether it was already answered, and abandonment is what makes that question
+      // unanswerable, so abandoning first would be indistinguishable from an answer
+      // to a future reader of either flag.
       try {
         record.retire?.();
       } catch {
         // A card that cannot be retired is left exactly as it was — never a thrown
         // error out of a connection callback.
+      }
+      // #952 — the DOM half above only stops the card LOOKING answerable. This half
+      // ends the command behind it: without it the executor stays suspended, its rid
+      // ledger entry stays in-flight forever (in-flight entries are never evicted),
+      // and a redelivery of that rid awaits a promise that can never resolve.
+      try {
+        record.abandon?.();
+      } catch {
+        // Same rule: a card whose command cannot be ended is exactly where it was.
       }
     }
   }
@@ -23662,7 +24148,7 @@ function buildPanel() {
       card.style.opacity = "0.6";
       const note = document.createElement("div");
       note.className = "cmcp-card-stale";
-      note.style.cssText = "font-size:0.68rem;opacity:0.8;margin-top:0.4rem;";
+      note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.8;margin-top:0.4rem;";
       // `what` and `detail` arrive already translated from the call sites — the caller
       // knows which kind of card it is, and a `{what}` hole lets each language place the
       // noun where its grammar wants it rather than mid-sentence as English does.
@@ -23713,7 +24199,7 @@ function buildPanel() {
     card.appendChild(head);
 
     const hint = document.createElement("div");
-    hint.style.cssText = "font-size:0.68rem;opacity:0.7;margin:0.2rem 0 0.4rem;";
+    hint.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.7;margin:0.2rem 0 0.4rem;";
     hint.textContent =
       msg.hint ||
       tr(
@@ -23723,8 +24209,21 @@ function buildPanel() {
     card.appendChild(hint);
 
     let done = false;
+    // #952 — see paintQuestion: distinct from `done`, because retirement asks
+    // `alreadyAnswered: () => done` and an abandon that set it would suppress the
+    // card's own retirement.
+    let abandoned = false;
     let resolveFn;
     const promise = new Promise((res) => { resolveFn = res; });
+
+    // #952 — end the command without producing a value. Nothing was typed, so the
+    // failure that the executor builds from this carries no payload at all: there is
+    // no secret for the undeliverable-reply path to have to redact.
+    const abandon = () => {
+      if (done || abandoned) return;
+      abandoned = true;
+      resolveFn(INTERACTIVE_ABANDONED);
+    };
 
     // #8 SIZING. The field is the whole point of this card, and it used to be the
     // first thing squeezed: on one unwrapped line the two buttons cannot shrink
@@ -23753,20 +24252,22 @@ function buildPanel() {
     input.placeholder = tr("panel.paste_token", "Paste token…");
     input.style.cssText =
       "flex:1 1 10rem;min-width:0;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
+      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
 
     // Show/record only a masked preview (first 4 … last 4) so the user can
     // confirm WHICH token without ever exposing the full value.
     const mask = (v) =>
       !v ? "" : v.length <= 8 ? "•".repeat(v.length) : `${v.slice(0, 4)}…${v.slice(-4)}`;
     const finish = (value) => {
-      if (done) return;
+      // `abandoned` too — a late submit must not resolve a promise whose command was
+      // already failed and replied to (#952).
+      if (done || abandoned) return;
       done = true;
       input.value = ""; // clear the field immediately
       card.replaceChildren();
       card.style.cssText = "border-left:3px solid var(--p-green-400,#4ade80);opacity:0.9;";
       const ok = document.createElement("div");
-      ok.style.cssText = "font-size:0.75rem;color:var(--p-green-400,#4ade80);";
+      ok.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);color:var(--p-green-400,#4ade80);";
       const m = mask(value);
       ok.textContent = value
         ? tr("panel.token_saved", "🔒 Token saved: {masked}", { masked: m })
@@ -23802,7 +24303,7 @@ function buildPanel() {
     // group spill the card at 320/280px. Stating the intent stops a future
     // "everything gets min-width:0" sweep from supplying the missing half.
     submit.style.cssText =
-      "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
+      "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
     submit.textContent = tr("panel.save", "Save");
     submit.addEventListener("click", () => finish(input.value.trim()));
@@ -23845,6 +24346,7 @@ function buildPanel() {
               "the new connection — do not paste the value into the chat.",
           ),
         }),
+      abandon,
     });
     promise.then(unregisterSecret, unregisterSecret);
     return promise;
@@ -29543,14 +30045,14 @@ function buildPanel() {
     canvas.style.cssText = "background:#fff;border-radius:8px;padding:8px;width:240px;height:240px;";
     canvas.hidden = true;
     const statusMsg = document.createElement("div");
-    statusMsg.style.cssText = "font-size:0.85rem;opacity:0.85;text-align:center;";
+    statusMsg.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);opacity:0.85;text-align:center;";
     const urlLine = document.createElement("div");
     urlLine.style.cssText =
-      "font-size:0.7rem;opacity:0.55;word-break:break-all;text-align:center;max-width:280px;";
+      "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);opacity:0.55;word-break:break-all;text-align:center;max-width:280px;";
     // #749 — the durability of THIS url, rendered where the user is looking at it.
     const durabilityLine = document.createElement("div");
     durabilityLine.style.cssText =
-      "font-size:0.72rem;line-height:1.35;text-align:left;max-width:280px;margin-top:0.15rem;";
+      "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);line-height:1.35;text-align:left;max-width:280px;margin-top:0.15rem;";
     durabilityLine.hidden = true;
     qrWrap.append(canvas, statusMsg, urlLine, durabilityLine);
 
@@ -29772,6 +30274,11 @@ function buildPanel() {
     };
     // Surface any MANUAL canvas edits the user made since the agent's last turn,
     // prepended to the agent-facing text only (the visible `text` is untouched).
+    // Orchestrator status the user must not see (failed panel auto-sync, lock
+    // recovery, …). Delivered the same way as the banners below — prepended to the
+    // agent-facing text only, so the visible bubble stays what the user typed.
+    const hiddenNotes = takeHiddenAgentNotes();
+    if (hiddenNotes) sendText = hiddenNotes + sendText;
     const changeBanner = manualChangeBanner();
     if (changeBanner) sendText = changeBanner + sendText;
     // Surface ComfyUI's own pre-run validation errors (missing models,
