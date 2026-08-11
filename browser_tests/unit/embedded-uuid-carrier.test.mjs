@@ -135,7 +135,7 @@ test("OBSERVATION (#945): the original three-rung chain yields nothing", () => {
   );
 });
 
-test("#945 FIXED: the READ carrier reaches it, so `allowGraph:false` is no longer null", () => {
+test("#945 FIXED: a NON-mounted workflow is reached, where `allowGraph:false` used to be null", () => {
   const wf = realComfyWorkflow();
   // Not the mounted one — see the codex P0 test below for why that distinction is the
   // whole design.
