@@ -191,7 +191,11 @@ test("module-scope config reads translations LAZILY, not at import time", () => 
     const rest = src.slice(start + 1);
     const endRel = rest.search(/\n(?:const|let|var|function|export|\/\*\*|\/\/ ─)/);
     const block = endRel === -1 ? rest : rest.slice(0, endRel);
-    const bare = block.split("\n").filter((l) => /\b(?:label|title|note|hint)\s*:\s*tr\(/.test(l));
+    // `desc` is in this list because FLOWS carries one: the field-name set has to track the
+    // fields these blocks actually declare, or an eager `desc: tr(...)` reads green.
+    // Scope, precisely: this catches the EAGER form. A field that stops calling tr() at all
+    // is not caught here — the backstop below only needs one getter anywhere in the block.
+    const bare = block.split("\n").filter((l) => /\b(?:label|title|note|hint|desc)\s*:\s*tr\(/.test(l));
     assert.deepEqual(
       bare,
       [],
