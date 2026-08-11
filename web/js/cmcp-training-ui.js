@@ -27,34 +27,34 @@ function injectCss() {
     .cmcp-tr-body { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 1rem; }
     .cmcp-tr-head { display:flex; align-items:center; gap:.75rem; padding:1rem 1.25rem .5rem;
       border-bottom: 1px solid var(--p-content-border-color, #3f3f46); }
-    .cmcp-tr-head h2 { margin:0; font-size:1.05rem; flex:1; }
-    .cmcp-tr-close { background:none; border:none; color:inherit; cursor:pointer; font-size:1.1rem; opacity:.7; }
+    .cmcp-tr-head h2 { margin:0; font-size:1.2923em; flex:1; }
+    .cmcp-tr-close { background:none; border:none; color:inherit; cursor:pointer; font-size:1.3538em; opacity:.7; }
     .cmcp-tr-close:hover { opacity:1; }
     .cmcp-tr-seg { display:flex; gap:0; margin:.75rem 1.25rem; border:1px solid var(--p-surface-500,#555); border-radius:999px; overflow:hidden; width:fit-content; flex:none; }
-    .cmcp-tr-seg button { border:none; background:transparent; color:inherit; padding:.4rem .9rem; cursor:pointer; font-size:.85rem; display:flex; align-items:center; gap:.4rem; }
+    .cmcp-tr-seg button { border:none; background:transparent; color:inherit; padding:.4rem .9rem; cursor:pointer; font-size:1.0462em; display:flex; align-items:center; gap:.4rem; }
     .cmcp-tr-seg button.active { background: var(--p-surface-700,#3f3f46); }
     .cmcp-tr-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:.75rem; padding:0 1.25rem 1rem; }
     @media (max-width: 640px) { .cmcp-tr-grid { grid-template-columns:repeat(2,1fr); } }
     .cmcp-tr-card { background:var(--p-surface-800,#27272a); border:1px solid var(--p-surface-600,#3f3f46); border-radius:12px; padding:.75rem; display:flex; flex-direction:column; gap:.45rem; }
     .cmcp-tr-card.active { border-color: var(--p-primary-color,#94a3b8); }
-    .cmcp-tr-icon { aspect-ratio:1.6; border-radius:10px; background:color-mix(in srgb, currentColor 8%, transparent); display:flex; align-items:center; justify-content:center; font-size:1.6rem; opacity:.8; }
-    .cmcp-tr-card select { background:var(--p-surface-900,#18181b); color:inherit; border:1px solid var(--p-surface-600,#52525b); border-radius:6px; padding:.25rem .4rem; font-size:.8rem; width:100%; }
-    .cmcp-tr-card h3 { margin:0; font-size:.9rem; }
-    .cmcp-tr-card p { margin:0; font-size:.78rem; opacity:.65; line-height:1.35; flex:1; }
-    .cmcp-tr-badge { align-self:flex-start; font-size:.72rem; padding:.1rem .5rem; border-radius:999px; background:color-mix(in srgb, currentColor 10%, transparent); opacity:.75; }
+    .cmcp-tr-icon { aspect-ratio:1.6; border-radius:10px; background:color-mix(in srgb, currentColor 8%, transparent); display:flex; align-items:center; justify-content:center; font-size:1.9692em; opacity:.8; }
+    .cmcp-tr-card select { background:var(--p-surface-900,#18181b); color:inherit; border:1px solid var(--p-surface-600,#52525b); border-radius:6px; padding:.25rem .4rem; font-size:0.9846em; width:100%; }
+    .cmcp-tr-card h3 { margin:0; font-size:1.1077em; }
+    .cmcp-tr-card p { margin:0; font-size:0.96em; opacity:.65; line-height:1.35; flex:1; }
+    .cmcp-tr-badge { align-self:flex-start; font-size:0.8862em; padding:.1rem .5rem; border-radius:999px; background:color-mix(in srgb, currentColor 10%, transparent); opacity:.75; }
     .cmcp-tr-badge.ok { background: color-mix(in srgb, #22c55e 18%, transparent); opacity:1; }
     .cmcp-tr-badge.err { background: color-mix(in srgb, #ef4444 18%, transparent); opacity:1; }
     .cmcp-tr-badge.warn { background: color-mix(in srgb, #eab308 18%, transparent); opacity:1; }
-    .cmcp-tr-foot { padding:0 1.25rem 1rem; font-size:.8rem; opacity:.55; }
+    .cmcp-tr-foot { padding:0 1.25rem 1rem; font-size:0.9846em; opacity:.55; }
     .cmcp-tr-section { padding: .25rem 1.25rem; display:flex; flex-direction:column; gap:.6rem; }
     .cmcp-tr-row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; }
-    .cmcp-tr-row > label { font-size:.8rem; opacity:.75; min-width:6.5rem; }
+    .cmcp-tr-row > label { font-size:0.9846em; opacity:.75; min-width:6.5rem; }
     .cmcp-tr-input, .cmcp-tr-section input[type=text], .cmcp-tr-section input[type=number] {
       background:var(--p-surface-800,#27272a); border:1px solid var(--p-surface-600,#52525b);
-      border-radius:8px; padding:.45rem .7rem; color:inherit; font-size:.85rem; flex:1; min-width:0; }
-    .cmcp-tr-hint { font-size:.75rem; opacity:.55; margin:0; }
+      border-radius:8px; padding:.45rem .7rem; color:inherit; font-size:1.0462em; flex:1; min-width:0; }
+    .cmcp-tr-hint { font-size:0.9231em; opacity:.55; margin:0; }
     .cmcp-tr-btn { background:var(--p-surface-700,#3f3f46); border:1px solid var(--p-surface-600,#52525b);
-      color:inherit; border-radius:8px; padding:.45rem .9rem; cursor:pointer; font-size:.85rem; }
+      color:inherit; border-radius:8px; padding:.45rem .9rem; cursor:pointer; font-size:1.0462em; }
     .cmcp-tr-btn:hover { filter:brightness(1.2); }
     .cmcp-tr-btn:disabled { opacity:.45; cursor:not-allowed; }
     .cmcp-tr-btn.primary { background:var(--p-primary-color,#64748b); border-color:transparent; color:#fff; }
@@ -63,30 +63,30 @@ function injectCss() {
     .cmcp-tr-pick { position:relative; aspect-ratio:1; border-radius:8px; overflow:hidden; cursor:pointer; border:2px solid transparent; background:var(--p-surface-900,#18181b); }
     .cmcp-tr-pick img { width:100%; height:100%; object-fit:cover; display:block; }
     .cmcp-tr-pick.sel { border-color: var(--p-primary-color,#94a3b8); }
-    .cmcp-tr-pick .mark { position:absolute; top:4px; right:4px; background:rgba(0,0,0,.65); border-radius:999px; width:20px; height:20px; display:flex; align-items:center; justify-content:center; font-size:.7rem; }
+    .cmcp-tr-pick .mark { position:absolute; top:4px; right:4px; background:rgba(0,0,0,.65); border-radius:999px; width:20px; height:20px; display:flex; align-items:center; justify-content:center; font-size:0.8615em; }
     .cmcp-tr-pick.sel .mark { background:var(--p-primary-color,#64748b); color:#fff; }
     .cmcp-tr-drop { border:2px dashed var(--p-surface-600,#52525b); border-radius:12px; padding:1.5rem; text-align:center; opacity:.8; cursor:pointer; }
     .cmcp-tr-drop.over { border-color: var(--p-primary-color,#94a3b8); opacity:1; }
     .cmcp-tr-tray { display:flex; gap:.4rem; flex-wrap:wrap; }
     .cmcp-tr-chip { position:relative; width:44px; height:44px; border-radius:6px; background-size:cover; background-position:center; }
-    .cmcp-tr-chip button { position:absolute; top:-6px; right:-6px; width:16px; height:16px; border-radius:999px; border:none; background:#ef4444; color:#fff; font-size:.65rem; line-height:1; cursor:pointer; }
+    .cmcp-tr-chip button { position:absolute; top:-6px; right:-6px; width:16px; height:16px; border-radius:999px; border:none; background:#ef4444; color:#fff; font-size:0.8em; line-height:1; cursor:pointer; }
     .cmcp-tr-labelgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:.75rem; }
     .cmcp-tr-labelitem { background:var(--p-surface-800,#27272a); border-radius:10px; padding:.5rem; display:flex; flex-direction:column; gap:.4rem; }
     .cmcp-tr-labelitem .thumb { aspect-ratio:1; border-radius:8px; background-size:cover; background-position:center; }
-    .cmcp-tr-labelitem textarea { background:var(--p-surface-900,#18181b); border:1px solid var(--p-surface-600,#52525b); border-radius:6px; color:inherit; font-size:.78rem; padding:.35rem .5rem; resize:vertical; min-height:2.6rem; width:100%; box-sizing:border-box; }
+    .cmcp-tr-labelitem textarea { background:var(--p-surface-900,#18181b); border:1px solid var(--p-surface-600,#52525b); border-radius:6px; color:inherit; font-size:0.96em; padding:.35rem .5rem; resize:vertical; min-height:2.6rem; width:100%; box-sizing:border-box; }
     .cmcp-tr-steps { display:flex; gap:.35rem; margin:.6rem 1.25rem 0; flex:none; }
-    .cmcp-tr-steps span { font-size:.72rem; padding:.15rem .6rem; border-radius:999px; background:color-mix(in srgb, currentColor 8%, transparent); opacity:.55; }
+    .cmcp-tr-steps span { font-size:0.8862em; padding:.15rem .6rem; border-radius:999px; background:color-mix(in srgb, currentColor 8%, transparent); opacity:.55; }
     .cmcp-tr-steps span.on { opacity:1; background:var(--p-surface-700,#3f3f46); }
     .cmcp-tr-progress { height:10px; border-radius:999px; background:var(--p-surface-800,#27272a); overflow:hidden; }
     .cmcp-tr-progress > div { height:100%; background:var(--p-primary-color,#64748b); transition:width .4s; }
-    .cmcp-tr-log { background:var(--p-surface-900,#18181b); border-radius:8px; padding:.5rem .7rem; font-family:monospace; font-size:.72rem; max-height:140px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; opacity:.85; }
+    .cmcp-tr-log { background:var(--p-surface-900,#18181b); border-radius:8px; padding:.5rem .7rem; font-family:monospace; font-size:0.8862em; max-height:140px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; opacity:.85; }
     .cmcp-tr-samples { display:flex; gap:.5rem; flex-wrap:wrap; }
     .cmcp-tr-samples img { width:120px; height:120px; object-fit:cover; border-radius:8px; cursor:pointer; }
     .cmcp-tr-jobrow { display:flex; align-items:center; gap:.6rem; padding:.5rem .25rem; border-bottom:1px solid var(--p-surface-700,#3f3f46); cursor:pointer; }
     .cmcp-tr-jobrow:hover { background:color-mix(in srgb, currentColor 4%, transparent); }
-    .cmcp-tr-jobrow .name { flex:1; font-size:.85rem; }
-    .cmcp-tr-jobrow .meta { font-size:.75rem; opacity:.6; }
-    .cmcp-tr-preflight { display:flex; gap:1rem; flex-wrap:wrap; font-size:.78rem; }
+    .cmcp-tr-jobrow .name { flex:1; font-size:1.0462em; }
+    .cmcp-tr-jobrow .meta { font-size:0.9231em; opacity:.6; }
+    .cmcp-tr-preflight { display:flex; gap:1rem; flex-wrap:wrap; font-size:0.96em; }
     .cmcp-tr-preflight span b { font-weight:600; }
     /* Agent-driven "glow" — shared class name with the CivitAI modal; generic here
        so it applies to step chips + field wrappers, not just cards. */
