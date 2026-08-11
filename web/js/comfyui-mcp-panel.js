@@ -2511,6 +2511,8 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
+  const note = typeof movedNote === "string" && movedNote.trim() ? movedNote.trim() : null;
+  return note ? `${base}\n\n${note}` : base;
 }
 
 function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
