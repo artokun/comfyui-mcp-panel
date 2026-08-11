@@ -3081,7 +3081,34 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", antigravity: "Antigravity (Google)", pi: "Pi (pi.dev)", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
+//
+// GETTERS, not values. This is module scope: it is evaluated at IMPORT time, long before
+// setup() has awaited loadCatalog(), so a plain `claude: tr(...)` would capture the English
+// fallback permanently and no catalog could ever change it. Reading through a getter defers
+// the lookup to the moment the label is actually needed — which, for every one of these, is
+// when the Settings dialog renders (see the `get category()` accessors in panelSettingsList).
+//
+// PRODUCT NAMES STAY IN LATIN SCRIPT in every language — "Claude", "Gemini", "Ollama",
+// "llama.cpp" are what the vendors call themselves and what a user searches for. Only the
+// parenthetical QUALIFIER ("local", "Google subscription") is translatable, matching the
+// convention already set in locales/ko/main.json ("Ollama (로컬, 무료 …)", "LM Studio (로컬…)").
+const BACKEND_SECTION = {
+  get claude() { return tr("panel.claude", "Claude"); },
+  get codex() { return tr("panel.chatgpt_codex", "ChatGPT (Codex)"); },
+  get gemini() { return tr("panel.gemini", "Gemini"); },
+  get antigravity() { return tr("panel.antigravity_google", "Antigravity (Google)"); },
+  get pi() { return tr("panel.pi_pi_dev", "Pi (pi.dev)"); },
+  get grok() { return tr("panel.grok", "Grok"); },
+  get kimi() { return tr("panel.kimi", "Kimi"); },
+  get moonshot() { return tr("panel.kimi_k3", "Kimi K3"); },
+  get glm() { return tr("panel.glm_z_ai", "GLM (z.ai)"); },
+  get minimax() { return tr("panel.minimax", "MiniMax"); },
+  get ollama() { return tr("panel.ollama_local", "Ollama (local)"); },
+  get openrouter() { return tr("panel.openrouter", "OpenRouter"); },
+  get lmstudio() { return tr("panel.lm_studio_local", "LM Studio (local)"); },
+  get llamacpp() { return tr("panel.llama_cpp_local", "llama.cpp (local)"); },
+  get custom() { return tr("panel.custom_endpoint", "Custom endpoint"); },
+};
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
 const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
@@ -3215,7 +3242,7 @@ function populateModelSelect(sel, backend) {
 function effortComboOptions(backend) {
   const scale = BACKEND_EFFORTS[backend] || ALL_EFFORTS;
   return [
-    { value: "", text: "Model default" },
+    { value: "", text: tr("panel.model_default", "Model default") },
     ...scale.map((id) => ({ value: id, text: effortMeta(id).label })),
   ];
 }
@@ -3427,14 +3454,30 @@ function localComfyuiPathForAgent() {
 // Build the settings list registered on the extension. Defined as a function so
 // it can close over the module-level hooks/helpers above.
 function panelSettingsList() {
-  const cat = (sub, name) => ["Comfy MCP Agent", sub, name];
+  // The Settings dialog's grouping path: [category, subCategory, leaf]. ComfyUI reads only
+  // the first two (settingStore.getSettingInfo) — the third is a tree key nobody renders,
+  // so it stays in English on purpose rather than costing a translation key for nothing.
+  //
+  // WHY EVERY CALL SITE WRAPS THIS IN `get category()`: panelSettingsList() runs while
+  // app.registerExtension(...) is being CONSTRUCTED — synchronously, before the extension's
+  // own async setup() has awaited loadCatalog(). Anything translated eagerly here freezes in
+  // English for the life of the tab. ComfyUI re-reads `setting.category` when the dialog
+  // renders (SettingGroup.vue / useSettingUI.ts), which is always long after the catalog has
+  // landed, so a getter is both sufficient and the only thing that works.
+  const cat = (sub, name) => [tr("panel.comfy_mcp_agent", "Comfy MCP Agent"), sub, name];
   // A BUTTON-type setting: ComfyUI supports a custom `type` render function that
   // returns an HTMLElement (cg-use-everywhere uses the same trick for its About
   // row). We render a button + a masked set/not-set indicator.
-  const tokenSetting = (id, envKey, friendly, sortOrder, section = "API tokens", noun = "token") => ({
+  //
+  // `backendKey` names a BACKEND_SECTION entry rather than passing its label, because a
+  // label argument would read that getter here — at construction time — and re-freeze the
+  // English string the getters exist to avoid. Null means the shared "API tokens" section.
+  const tokenSetting = (id, envKey, friendly, sortOrder, backendKey = null, noun = "token") => ({
     id,
     name: `${friendly} ${noun}`,
-    category: cat(section, friendly),
+    get category() {
+      return cat(backendKey ? BACKEND_SECTION[backendKey] : tr("panel.api_tokens", "API tokens"), friendly);
+    },
     sortOrder,
     tooltip:
       `Securely store your ${friendly} API ${noun}. Opens a masked input; the value goes straight to the ` +
@@ -3500,7 +3543,7 @@ function panelSettingsList() {
   const modelSetting = (backend, sortOrder) => ({
     id: SETTING_MODEL[backend],
     name: "Default model",
-    category: cat(BACKEND_SECTION[backend], "Default model"),
+    get category() { return cat(BACKEND_SECTION[backend], "Default model"); },
     sortOrder,
     tooltip:
       `Default model for the ${BACKEND_TEXT[backend]} background agent, chosen from the models fetched for ` +
@@ -3538,7 +3581,7 @@ function panelSettingsList() {
   const effortSetting = (backend, sortOrder) => ({
     id: SETTING_EFFORT[backend],
     name: "Default reasoning effort",
-    category: cat(BACKEND_SECTION[backend], "Default reasoning effort"),
+    get category() { return cat(BACKEND_SECTION[backend], "Default reasoning effort"); },
     sortOrder,
     tooltip:
       ((BACKEND_EFFORTS[backend] || ALL_EFFORTS).length
@@ -3546,7 +3589,11 @@ function panelSettingsList() {
           `(${backend === "codex" ? "none–ultra" : "low–max"}). 'Model default' leaves it unset.`
         : `${BACKEND_TEXT[backend]} exposes no reasoning-effort control; leave this at 'Model default'.`),
     type: "combo",
-    options: effortComboOptions(backend),
+    // Lazy for the same reason as everything else here — and this one is load-bearing
+    // twice over: effortMeta()'s labels are ALREADY getter-backed (EFFORT_META), so
+    // calling effortComboOptions() eagerly at construction time would read every one of
+    // those getters before the catalog existed and silently undo them.
+    get options() { return effortComboOptions(backend); },
     defaultValue: "",
     onChange: (v) => {
       if (suppressSettingOnChange || !settingsArmed) return;
@@ -3562,7 +3609,7 @@ function panelSettingsList() {
   const bridgeUrlSetting = (backend, sortOrder) => ({
     id: SETTING_BRIDGE_URL[backend],
     name: "Bridge URL",
-    category: cat(BACKEND_SECTION[backend], "Bridge URL"),
+    get category() { return cat(BACKEND_SECTION[backend], "Bridge URL"); },
     sortOrder,
     tooltip:
       `WebSocket URL of the ${BACKEND_TEXT[backend]} panel orchestrator bridge. Default ` +
@@ -3583,7 +3630,7 @@ function panelSettingsList() {
       // trick as the token buttons); no persisted value.
       id: "comfyui-mcp.starGithub",
       name: "Star on GitHub",
-      category: cat("About", "Star on GitHub"),
+      get category() { return cat(tr("panel.about", "About"), "Star on GitHub"); },
       sortOrder: 200,
       tooltip:
         "Enjoying the ComfyUI Agent Panel? A GitHub star genuinely helps. Opens the repo in a new tab.",
@@ -3607,7 +3654,7 @@ function panelSettingsList() {
       // #758 — an in-product route to the release notes, not "go read a file on GitHub".
       id: "comfyui-mcp.whatsNew",
       name: "What's new",
-      category: cat("About", "What's new"),
+      get category() { return cat(tr("panel.about", "About"), "What's new"); },
       sortOrder: 199,
       tooltip:
         "Show recent changes in the panel transcript — what shipped in this version and the ones before it. " +
@@ -3644,7 +3691,7 @@ function panelSettingsList() {
     {
       id: "comfyui-mcp.readDocs",
       name: "Documentation",
-      category: cat("About", "Documentation"),
+      get category() { return cat(tr("panel.about", "About"), "Documentation"); },
       sortOrder: 199.5,
       // Names the DESTINATION, not the mechanism. This row renders into ComfyUI's
       // own Settings dialog, which is OUTSIDE the sidebar root that wireExternalLinks
@@ -3672,7 +3719,7 @@ function panelSettingsList() {
       // A link row — "💬 Join the Discord" (community). Same render-fn pattern.
       id: "comfyui-mcp.joinDiscord",
       name: "Community",
-      category: cat("About", "Community"),
+      get category() { return cat(tr("panel.about", "About"), "Community"); },
       sortOrder: 199,
       tooltip: tr("panel.join_the_comfyui_mcp_discord_announcements_tips", "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab."),
       type: () => {
@@ -3695,7 +3742,7 @@ function panelSettingsList() {
       // remote pods). Distinct, warmer-colored button so it reads as "support".
       id: "comfyui-mcp.getHelp",
       name: "Need help?",
-      category: cat("About", "Need help?"),
+      get category() { return cat(tr("panel.about", "About"), "Need help?"); },
       sortOrder: 198,
       tooltip:
         "Stuck? This copies a short diagnostics summary (panel version, backend, ComfyUI, OS) to your clipboard and opens the Discord — paste it into your message so we can help fast.",
@@ -3738,7 +3785,7 @@ function panelSettingsList() {
     {
       id: SETTING_BACKEND,
       name: "Default agent backend",
-      category: cat("General", "Default agent backend"),
+      get category() { return cat(tr("panel.general", "General"), "Default agent backend"); },
       sortOrder: 150,
       tooltip:
         "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
@@ -3746,23 +3793,34 @@ function panelSettingsList() {
         "panel's backend (and which group below seeds the runtime); you can still switch live in the model " +
         "picker (a live switch is session-only and does NOT change this default).",
       type: "combo",
-      options: [
-        { value: "claude", text: "Claude" },
-        { value: "codex", text: "ChatGPT" },
-        { value: "gemini", text: "Gemini" },
-        { value: "antigravity", text: "Antigravity (Google subscription)" },
-        { value: "pi", text: "Pi (pi.dev · multi-provider CLI)" },
-        { value: "grok", text: "Grok" },
-        { value: "kimi", text: "Kimi" },
-        { value: "moonshot", text: "Kimi K3" },
-        { value: "glm", text: "GLM (z.ai)" },
-        { value: "minimax", text: "MiniMax" },
-        { value: "ollama", text: "Ollama (local)" },
-        { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
-        { value: "lmstudio", text: "LM Studio (local)" },
-        { value: "llamacpp", text: "llama.cpp (local)" },
-        { value: "custom", text: "Custom endpoint (OpenAI-compatible)" },
-      ],
+      // A GETTER for the same reason `category` is one: ComfyUI reads `setting.options`
+      // when the dialog renders (SettingItem.vue's `formItem` computed), so deferring the
+      // lookup is what lets these arrive translated. `value` is the WIRE value and is never
+      // touched — only `text` is displayed, so translating it cannot change what is stored.
+      get options() {
+        return [
+          { value: "claude", text: tr("panel.claude", "Claude") },
+          { value: "codex", text: tr("panel.chatgpt", "ChatGPT") },
+          { value: "gemini", text: tr("panel.gemini", "Gemini") },
+          { value: "antigravity", text: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)") },
+          // Comma, not the middot this row used to carry: the panel already ships this exact
+          // label — translated in every locale — for the same product elsewhere. Matching it
+          // reuses that translation instead of minting a near-duplicate key whose only
+          // difference is punctuation, which is a string translators would have to be told
+          // apart by eye.
+          { value: "pi", text: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)") },
+          { value: "grok", text: tr("panel.grok", "Grok") },
+          { value: "kimi", text: tr("panel.kimi", "Kimi") },
+          { value: "moonshot", text: tr("panel.kimi_k3", "Kimi K3") },
+          { value: "glm", text: tr("panel.glm_z_ai", "GLM (z.ai)") },
+          { value: "minimax", text: tr("panel.minimax", "MiniMax") },
+          { value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") },
+          { value: "openrouter", text: tr("panel.openrouter_1m_sota", "OpenRouter (1M · SOTA)") },
+          { value: "lmstudio", text: tr("panel.lm_studio_local", "LM Studio (local)") },
+          { value: "llamacpp", text: tr("panel.llama_cpp_local", "llama.cpp (local)") },
+          { value: "custom", text: tr("panel.custom_endpoint_openai_compatible", "Custom endpoint (OpenAI-compatible)") },
+        ];
+      },
       defaultValue: "claude",
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -3772,18 +3830,20 @@ function panelSettingsList() {
     {
       id: SETTING_CHAT_SCOPE,
       name: "Chat conversation scope",
-      category: cat("General", "Chat conversation scope"),
+      get category() { return cat(tr("panel.general", "General"), "Chat conversation scope"); },
       sortOrder: 146,
       tooltip:
         "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, " +
         "identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the " +
         "current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts.",
       type: "combo",
-      options: [
-        { value: "panel", text: "Panel — one chat across workflows" },
-        { value: "workflow", text: "Workflow — separate chat histories" },
-        { value: "ask", text: "Ask whenever the workflow changes" },
-      ],
+      get options() {
+        return [
+          { value: "panel", text: tr("panel.panel_one_chat_across_workflows", "Panel — one chat across workflows") },
+          { value: "workflow", text: tr("panel.workflow_separate_chat_histories", "Workflow — separate chat histories") },
+          { value: "ask", text: tr("panel.ask_whenever_the_workflow_changes", "Ask whenever the workflow changes") },
+        ];
+      },
       defaultValue: getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel",
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -3793,7 +3853,7 @@ function panelSettingsList() {
     {
       id: SETTING_AUTOCONNECT,
       name: "Auto-connect on load",
-      category: cat("General", "Auto-connect on load"),
+      get category() { return cat(tr("panel.general", "General"), "Auto-connect on load"); },
       sortOrder: 145,
       tooltip:
         "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
@@ -3808,7 +3868,7 @@ function panelSettingsList() {
     {
       id: SETTING_LANGUAGE,
       name: "Panel language",
-      category: cat("General", "Panel language"),
+      get category() { return cat(tr("panel.general", "General"), "Panel language"); },
       sortOrder: 146,
       tooltip:
         "Language for the panel's own text. Detect follows ComfyUI's language setting, so changing ComfyUI's " +
@@ -3816,8 +3876,16 @@ function panelSettingsList() {
         "Takes effect when the panel is reopened or reloaded.",
       type: "combo",
       // Same codes and the same self-named labels ComfyUI uses, so the two dropdowns can
-      // never disagree about what "ko" means or read as two different products.
-      options: [{ value: "", text: "Detect (follow ComfyUI)" }, ...LOCALES.map((l) => ({ value: l.code, text: l.text }))],
+      // never disagree about what "ko" means or read as two different products. Only the
+      // Detect row is translated: LOCALES[].text is each language written in ITSELF, which
+      // is the whole point — a user who cannot read the current UI language still finds
+      // their own — so translating those would defeat the list.
+      get options() {
+        return [
+          { value: "", text: tr("panel.detect_follow_comfyui", "Detect (follow ComfyUI)") },
+          ...LOCALES.map((l) => ({ value: l.code, text: l.text })),
+        ];
+      },
       defaultValue: "",
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -3831,7 +3899,7 @@ function panelSettingsList() {
     {
       id: SETTING_MOBILE_BETA,
       name: "Control via Mobile app (beta)",
-      category: cat("Mobile app (beta)", "Control via Mobile app (beta)"),
+      get category() { return cat(tr("panel.mobile_app_beta", "Mobile app (beta)"), "Control via Mobile app (beta)"); },
       sortOrder: 144,
       tooltip:
         "Show the Remote-control pairing button (QR) in the panel header and the beta app download links below. " +
@@ -3847,7 +3915,7 @@ function panelSettingsList() {
     {
       id: SETTING_FLAG_APPS,
       name: "Show Apps",
-      category: cat("Features", "Show Apps"),
+      get category() { return cat(tr("panel.features", "Features"), "Show Apps"); },
       sortOrder: 147,
       tooltip:
         "Show the Apps button in the toolbar — the micro-app layer (convert a workflow into a one-click app, " +
@@ -3862,7 +3930,7 @@ function panelSettingsList() {
     {
       id: SETTING_FLAG_TRAINING,
       name: "Show Training",
-      category: cat("Features", "Show Training"),
+      get category() { return cat(tr("panel.features", "Features"), "Show Training"); },
       sortOrder: 148,
       tooltip:
         "Show the Training button in the toolbar — the LoRA training wizard (dataset gather/label/launch/monitor). " +
@@ -3877,7 +3945,7 @@ function panelSettingsList() {
     {
       id: SETTING_FLAG_RUNPOD,
       name: "Show RunPod / Local",
-      category: cat("Features", "Show RunPod / Local"),
+      get category() { return cat(tr("panel.features", "Features"), "Show RunPod / Local"); },
       sortOrder: 149,
       tooltip:
         "Show the RunPod / Local host button in the toolbar — deploy/start/stop/connect a cloud GPU pod, or switch " +
@@ -3895,7 +3963,7 @@ function panelSettingsList() {
       // channel's invite URL constant is still empty.
       id: "comfyui-mcp.mobileAppLinks",
       name: "Get the beta app",
-      category: cat("Mobile app (beta)", "Get the beta app"),
+      get category() { return cat(tr("panel.mobile_app_beta", "Mobile app (beta)"), "Get the beta app"); },
       sortOrder: 143,
       tooltip:
         "Tester downloads for the ComfyUI MCP mobile app. iOS installs via Apple TestFlight; Android via Firebase " +
@@ -3940,7 +4008,7 @@ function panelSettingsList() {
     {
       id: SETTING_UI_SCALE,
       name: "Panel UI scale (%)",
-      category: cat("General", "Panel UI scale (%)"),
+      get category() { return cat(tr("panel.general", "General"), "Panel UI scale (%)"); },
       sortOrder: 143,
       tooltip:
         "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
@@ -3962,7 +4030,7 @@ function panelSettingsList() {
     {
       id: SETTING_STALL_S,
       name: "Render stall warning (seconds)",
-      category: cat("General", "Render stall warning (seconds)"),
+      get category() { return cat(tr("panel.general", "General"), "Render stall warning (seconds)"); },
       sortOrder: 142,
       tooltip:
         "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged " +
@@ -3982,7 +4050,7 @@ function panelSettingsList() {
     {
       id: SETTING_REMOTE_URL,
       name: "Remote ComfyUI URL (advanced)",
-      category: cat("General", "Remote ComfyUI URL (advanced)"),
+      get category() { return cat(tr("panel.general", "General"), "Remote ComfyUI URL (advanced)"); },
       sortOrder: 143,
       tooltip:
         "Point the AGENT at a remote ComfyUI instead of this machine — e.g. a RunPod pod at " +
@@ -4004,7 +4072,7 @@ function panelSettingsList() {
       // now the only mode). Advanced: only needed for a non-default port.
       id: SETTING_BRIDGE,
       name: "Bridge URL (advanced)",
-      category: cat("General", "Bridge URL (advanced)"),
+      get category() { return cat(tr("panel.general", "General"), "Bridge URL (advanced)"); },
       sortOrder: 141,
       tooltip:
         "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider " +
@@ -4020,7 +4088,7 @@ function panelSettingsList() {
     {
       id: SETTING_FOCUS_FOLLOW,
       name: "Zoom to agent edits",
-      category: cat("General", "Zoom to agent edits"),
+      get category() { return cat(tr("panel.general", "General"), "Zoom to agent edits"); },
       sortOrder: 140,
       tooltip:
         "When the agent changes a node's value, smoothly zoom the canvas to that node (with padding) so you watch " +
@@ -4071,7 +4139,7 @@ function panelSettingsList() {
     {
       id: SETTING_PREFERRED_MODELS,
       name: "Preferred models",
-      category: cat(BACKEND_SECTION.ollama, "Preferred models"),
+      get category() { return cat(BACKEND_SECTION.ollama, "Preferred models"); },
       sortOrder: 68,
       tooltip:
         "Your own favorite models, comma-separated — Ollama tags (artokun/gemma4-comfyui-mcp:e4b — our ComfyUI fine-tune, gemma4:12b, qwen3:4b) and/or OpenRouter ids " +
@@ -4087,7 +4155,7 @@ function panelSettingsList() {
     {
       id: SETTING_OLLAMA_API,
       name: "Endpoint type",
-      category: cat(BACKEND_SECTION.ollama, "Endpoint type"),
+      get category() { return cat(BACKEND_SECTION.ollama, "Endpoint type"); },
       sortOrder: 66,
       tooltip:
         "How the Ollama backend talks to its endpoint. 'Ollama (local)' uses the native /api/chat on your local " +
@@ -4095,10 +4163,12 @@ function panelSettingsList() {
         "etc. (set the base URL below; the API key comes from the orchestrator's env, e.g. OPENROUTER_API_KEY). " +
         "Applies to NEW sessions — Disconnect then Connect after changing.",
       type: "combo",
-      options: [
-        { value: "ollama", text: "Ollama (local)" },
-        { value: "openai", text: "OpenAI-compatible (OpenRouter, vLLM, …)" },
-      ],
+      get options() {
+        return [
+          { value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") },
+          { value: "openai", text: tr("panel.openai_compatible_openrouter_vllm", "OpenAI-compatible (OpenRouter, vLLM, …)") },
+        ];
+      },
       defaultValue: "ollama",
       onChange: () => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -4108,7 +4178,7 @@ function panelSettingsList() {
     {
       id: SETTING_OLLAMA_BASE_URL,
       name: "Endpoint base URL",
-      category: cat(BACKEND_SECTION.ollama, "Endpoint base URL"),
+      get category() { return cat(BACKEND_SECTION.ollama, "Endpoint base URL"); },
       sortOrder: 64,
       tooltip:
         "Base URL for the endpoint above. Leave BLANK for local Ollama (http://127.0.0.1:11434). For " +
@@ -4125,12 +4195,12 @@ function panelSettingsList() {
     modelSetting("openrouter", 62),
     modelSetting("lmstudio", 63),
     modelSetting("llamacpp", 64),
-    tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, BACKEND_SECTION.openrouter, "API key"),
+    tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, "openrouter", "API key"),
     // ---- Custom endpoint (issue #162: any OpenAI-compatible server) ----
     {
       id: SETTING_CUSTOM_BASE_URL,
       name: "Endpoint base URL",
-      category: cat(BACKEND_SECTION.custom, "Endpoint base URL"),
+      get category() { return cat(BACKEND_SECTION.custom, "Endpoint base URL"); },
       sortOrder: 60,
       tooltip:
         "Any OpenAI-compatible endpoint — vLLM, DeepSeek, Together, Azure OpenAI, a llama-server on another " +
@@ -4144,7 +4214,7 @@ function panelSettingsList() {
       },
     },
     modelSetting("custom", 59),
-    tokenSetting(SETTING_TOKEN_CUSTOM, "COMFYUI_MCP_CUSTOM_API_KEY", "Custom endpoint", 58, BACKEND_SECTION.custom, "API key"),
+    tokenSetting(SETTING_TOKEN_CUSTOM, "COMFYUI_MCP_CUSTOM_API_KEY", "Custom endpoint", 58, "custom", "API key"),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),

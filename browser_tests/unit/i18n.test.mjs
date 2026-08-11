@@ -163,6 +163,159 @@ test("the language setting offers Detect plus every shipped language", () => {
   assert.match(row, /LOCALES\.map/, "options must derive from LOCALES, not a duplicate list");
 });
 
+/**
+ * Read a panel source with line endings NORMALISED. The working tree is CRLF here
+ * (core.autocrlf=true on Windows), so a `\n}\n` boundary silently never matches and every
+ * "is it inside this function?" check quietly widens to the rest of the file — a guard that
+ * still passes, while no longer testing what it names.
+ */
+const readSource = (p) => readFileSync(join(ROOT, p), "utf8").replace(/\r\n/g, "\n");
+
+/**
+ * Slice `function <name>() { ... }` out of a source file, bounded by the closing brace in
+ * column 0. Text-level, because the panel module registers itself on import and cannot be
+ * loaded in node — the same reason the startup test above reads source.
+ */
+function functionBody(src, name) {
+  const at = src.indexOf(`\nfunction ${name}() {`);
+  assert.notEqual(at, -1, `${name}() must still exist`);
+  const rest = src.slice(at + 1);
+  const end = rest.indexOf("\n}\n");
+  assert.notEqual(end, -1, `${name}() must end with a column-0 brace for this scan to be bounded`);
+  const body = rest.slice(0, end);
+  // A scan that silently captured the whole file would pass every "no eager X" check below
+  // for the wrong reason, and fail on unrelated code elsewhere.
+  assert.ok(body.length < src.length / 2, `${name}() scan is unbounded — it captured ${body.length} of ${src.length} chars`);
+  return body;
+}
+
+test("the Settings dialog's own labels are read LAZILY, not when the block is built", () => {
+  // WHY THIS IS NOT THE SAME AS THE MODULE-SCOPE GUARD BELOW: panelSettingsList() is a
+  // FUNCTION, so the usual rule ("inside a function, a plain tr() is fine — it runs after
+  // the catalog loads") reads as satisfied. It is not. This particular function is called
+  // while `app.registerExtension({ settings: panelSettingsList() })` is being constructed —
+  // synchronously, before that same extension's `async setup()` gets to await
+  // loadCatalog(). Anything translated eagerly in here is English for the life of the tab,
+  // and it looks completely correct to an English-reading reviewer.
+  //
+  // ComfyUI re-reads `setting.category` and `setting.options` when the dialog RENDERS
+  // (SettingGroup.vue, SettingItem.vue's `formItem` computed), so getters are both
+  // necessary and sufficient.
+  const src = readSource("web/js/comfyui-mcp-panel.js");
+  const body = functionBody(src, "panelSettingsList");
+
+  const eagerCategories = body.split("\n").filter((l) => /^\s*category:\s/.test(l));
+  assert.deepEqual(
+    eagerCategories,
+    [],
+    "every settings row must use `get category() { return cat(...) }` — a plain `category:` freezes English",
+  );
+
+  const eagerOptions = body.split("\n").filter((l) => /^\s*options:\s/.test(l));
+  assert.deepEqual(
+    eagerOptions,
+    [],
+    "every combo must use `get options() { return [...] }` — a plain `options:` freezes English",
+  );
+
+  // And the getters must actually be there: a block that simply stopped declaring
+  // categories/options would pass both checks above by having nothing to find.
+  assert.ok(
+    (body.match(/get category\(\) \{/g) || []).length >= 20,
+    "the settings rows should still declare their categories, via getters",
+  );
+  assert.ok(
+    (body.match(/get options\(\) \{/g) || []).length >= 4,
+    "the combo rows should still declare their options, via getters",
+  );
+
+  // No combo option may still carry a bare literal label. The getters above make a row
+  // CAPABLE of translating; this is what says every row in it actually does — including the
+  // one-off "Detect (follow ComfyUI)", which no per-setting test would otherwise cover.
+  const bareOptionLabels = body
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => /\{ value: .*, text: "/.test(l));
+  assert.deepEqual(bareOptionLabels, [], "combo option labels must go through tr()");
+
+  // The sub-category label must be read INSIDE the getter. `cat(BACKEND_SECTION.ollama, …)`
+  // written outside one would fire that getter at construction time and re-freeze English —
+  // the failure the getters exist to prevent, reintroduced one level up.
+  for (const line of body.split("\n")) {
+    if (!/BACKEND_SECTION\./.test(line)) continue;
+    assert.match(line, /get category\(\) \{/, `BACKEND_SECTION read outside a getter: ${line.trim()}`);
+  }
+});
+
+test("translating a combo changes only its TEXT, never the value that gets stored", () => {
+  // The one way this whole unit could corrupt data: ComfyUI persists `option.value` and
+  // shows `option.text`, so a translation that reached `value` would write "Ollama (로컬)"
+  // into comfy.settings.json as the backend id. Locked here as an exact list, because the
+  // damage is invisible until a Korean user's panel refuses to connect.
+  const src = readSource("web/js/comfyui-mcp-panel.js");
+  const body = functionBody(src, "panelSettingsList");
+  const at = body.indexOf("id: SETTING_BACKEND");
+  assert.notEqual(at, -1, "the default-backend setting must still exist");
+  const block = body.slice(at, body.indexOf("defaultValue:", at));
+  const values = [...block.matchAll(/\{ value: "([^"]*)", text:/g)].map((m) => m[1]);
+  assert.deepEqual(values, [
+    "claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
+  ]);
+  // Every one of those labels must go through tr() — a bare string here is a row that
+  // stays English in all 12 languages while its neighbours translate.
+  assert.equal((block.match(/text: tr\(/g) || []).length, values.length);
+});
+
+test("EVERY backend section label is a getter — not most of them", () => {
+  // BACKEND_SECTION deliberately does NOT go in MODULE_SCOPE_CONFIGS below: that guard
+  // looks for `label:`/`title:`-shaped fields and asserts the block contains *a* getter, so
+  // with 15 keys it stays green while 14 of them silently revert to eager strings. Measured
+  // per key instead — the failure this is protecting against is one provider going English,
+  // not the whole table.
+  const src = readSource("web/js/comfyui-mcp-panel.js");
+  const at = src.indexOf("\nconst BACKEND_SECTION = {");
+  assert.notEqual(at, -1, "BACKEND_SECTION must still be declared at module scope");
+  const block = src.slice(at + 1, src.indexOf("\n};", at) + 3);
+
+  const getters = [...block.matchAll(/^\s*get (\w+)\(\) \{ return tr\(/gm)].map((m) => m[1]);
+  assert.deepEqual(getters, [
+    "claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
+  ], "every backend must resolve its section label lazily, through tr()");
+
+  // Nothing may sneak back in as a plain property: `claude: "Claude"` or `claude: tr(...)`
+  // both evaluate at import time, when the catalog is still empty.
+  const eager = block.split("\n").filter((l) => /^\s*\w+:\s/.test(l));
+  assert.deepEqual(eager, [], "a plain property here is read at import time and freezes English");
+});
+
+test("a settings row's section label is still deferred one level down", () => {
+  // The composition the guard above enforces, proven to behave. `cat()` takes the sub-label
+  // as an ARGUMENT, so the whole point is that the argument is evaluated inside the getter
+  // and not when the row object is built.
+  const BACKEND_SECTION = {
+    get ollama() { return tr("panel.ollama_local", "Ollama (local)"); },
+  };
+  const cat = (sub, name) => [tr("panel.comfy_mcp_agent", "Comfy MCP Agent"), sub, name];
+
+  __setCatalogForTest("ko", {});
+  const row = {
+    id: "comfyui-mcp.ollama.api",
+    get category() { return cat(BACKEND_SECTION.ollama, "Endpoint type"); },
+    get options() { return [{ value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") }]; },
+  };
+  // Built before the catalog exists — exactly when registerExtension() builds the real one.
+  assert.deepEqual(row.category, ["Comfy MCP Agent", "Ollama (local)", "Endpoint type"]);
+
+  __setCatalogForTest("ko", {
+    panel: { comfy_mcp_agent: "Comfy MCP 에이전트", ollama_local: "Ollama (로컬)" },
+  });
+  assert.deepEqual(row.category, ["Comfy MCP 에이전트", "Ollama (로컬)", "Endpoint type"]);
+  assert.equal(row.options[0].text, "Ollama (로컬)");
+  assert.equal(row.options[0].value, "ollama", "the stored value never moves");
+});
+
 test("module-scope config reads translations LAZILY, not at import time", () => {
   // The defect this guards: `const TABS = [{ label: tr("x", "Tabs") }]` at module scope runs
   // at IMPORT time — before setup() awaits loadCatalog() — so it captures the English
