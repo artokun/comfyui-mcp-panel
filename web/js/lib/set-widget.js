@@ -367,14 +367,26 @@ export async function runSetWidget(
   // the serialized form cannot survive a transforming serializer or a value that lands in
   // `properties` — a comparison of the whole form before and after is immune to both.
   let persistenceProbe = null;
+  // DIRECT WRITES ONLY (codex). For a PROMOTED write the value that serializes at queue
+  // time can live on the OUTER subgraph's rail widget rather than the inner node the
+  // mutation lands on — so an unchanged inner form would not mean the write vanished, and
+  // reporting it would be exactly the definitive-negative-from-a-partial-view that got the
+  // previous attempt reverted. A nested promotion has intermediates this code cannot
+  // enumerate with confidence either. The reported case is a direct write; the promoted
+  // case gets no claim rather than a wrong one.
+  const probeNode = isResolvedPromotion ? null : node;
   const write = (extra = {}) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
     assertTargetStillCurrentNow();
-    const probeNode = resolvedTargetNode ?? node;
-    const before = captureSerializedNode(probeNode);
+    const before = probeNode ? captureSerializedNode(probeNode) : null;
+    // RE-ASSERTED, because `serialize()` above is plugin-overridable and can run arbitrary
+    // code — a getter or a toJSON could switch canvases synchronously, which is precisely
+    // what the check before it exists to prevent (codex). The invariant is 'nothing
+    // uncontrolled runs between the check and the mutation', and a probe is uncontrolled.
+    if (probeNode) assertTargetStillCurrentNow();
     const applied = applyWidgetWrite(node, widgetName, value, {
       resolveSource,
       canvas,
@@ -387,13 +399,15 @@ export async function runSetWidget(
     });
     // AFTER the mutation, same node, same method. Either capture being absent means no
     // comparison happened, which the reader below treats as no claim.
-    persistenceProbe = {
-      before,
-      after: captureSerializedNode(probeNode),
-      nodeId: probeNode?.id ?? null,
-      nodeType: typeof probeNode?.type === "string" ? probeNode.type : null,
-      widget: writeTargetWidgetName ?? widgetName,
-    };
+    persistenceProbe = probeNode
+      ? {
+          before,
+          after: captureSerializedNode(probeNode),
+          nodeId: probeNode?.id ?? null,
+          nodeType: typeof probeNode?.type === "string" ? probeNode.type : null,
+          widget: widgetName,
+        }
+      : null;
     return applied;
   };
 

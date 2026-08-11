@@ -29,6 +29,13 @@
  * 0.4 ms. Two per-node captures per write is ~0.1–0.2 ms, against a write path that
  * already awaits an /object_info oracle measured at 818 ms cold.
  *
+ * DIRECT WRITES ONLY. For a PROMOTED write the value that serializes at queue time can
+ * live on the OUTER subgraph rail rather than the inner node the mutation lands on, so an
+ * unchanged inner form would not mean the write vanished (codex). A nested promotion has
+ * intermediates the write path cannot enumerate with confidence either. Those writes get
+ * NO claim rather than a wrong one — which is the same rule that reverted the previous
+ * attempt, applied to this one before it shipped.
+ *
  * DISCLOSURE, NEVER REFUSAL, which the issue settled: a non-persisting write can still have
  * run the widget's callback and done something real, so refusing would break legitimate
  * side-effect writes.

@@ -138,7 +138,13 @@ test("#983 the note reports persistence, and explicitly not effect", () => {
 
 test("#983 source guard: disclosure, never refusal, and a field of its own", () => {
   const src = readFileSync(new URL("../../web/js/lib/set-widget.js", import.meta.url), "utf8");
-  assert.match(src, /const before = captureSerializedNode\(probeNode\);/, "captured BEFORE the write");
+  assert.match(src, /const before = probeNode \? captureSerializedNode\(probeNode\) : null;/, "captured BEFORE the write");
+  // DIRECT writes only: for a PROMOTED write the value can serialize on the OUTER rail, so
+  // an unchanged inner form would not mean the write vanished (codex).
+  assert.match(src, /const probeNode = isResolvedPromotion \? null : node;/, "no claim for a promoted write");
+  // The probe runs plugin-overridable code, so the current-target check is re-asserted
+  // before the mutation — the invariant is that nothing uncontrolled runs in between.
+  assert.match(src, /if \(probeNode\) assertTargetStillCurrentNow\(\);/, "the fence is restored after the probe");
   assert.match(src, /after: captureSerializedNode\(probeNode\),/, "and after");
   assert.match(src, /persisted: false, persistence_warning: nonPersistingWriteNote\(p\)/, "reported");
   // A separate field: a control_after_generate advisory and a persistence disclosure are
