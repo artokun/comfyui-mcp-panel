@@ -132,5 +132,5 @@ test("WIRING: resolveNode asks WHAT the id is before reporting it missing", asyn
     "the rail branch must precede the generic miss",
   );
   // And it stays diagnostics-only: resolution is still the current graph alone.
-  assert.ok(body.includes("graph.getNodeById(Number(nodeId))"));
+  assert.ok(body.includes("graph.getNodeById(canonicalNodeId(nodeId))"));
 });
