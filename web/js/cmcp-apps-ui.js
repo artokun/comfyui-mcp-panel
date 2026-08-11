@@ -125,8 +125,11 @@ function injectStyle() {
 .cmcp-deps-status{flex:0 0 auto;font-size:0.96em;display:flex;align-items:center;gap:0.4rem;max-width:55%;
   justify-content:flex-end;text-align:right;}
 .cmcp-deps-ok{color:var(--p-green-400,#4ade80);font-weight:600;white-space:nowrap;}
-.cmcp-deps-status .cmcp-btn{padding:0.28rem 0.6rem;font-size:0.9108em;}
-.cmcp-deps-muted{opacity:0.6;font-size:0.9108em;}
+/* #753 — parent .cmcp-deps-status is 12.48px, not the 13px root (codex). */
+.cmcp-deps-status .cmcp-btn{padding:0.28rem 0.6rem;font-size:0.9487em;}
+/* #753 — renders BOTH inside the 12.48px status element and directly in a row, so no
+   single em reproduces both. Absolute, like the other two-context rules (codex). */
+.cmcp-deps-muted{opacity:0.6;font-size:0.74rem;}
 .cmcp-deps-err{color:#f87171;font-size:0.8862em;}
 .cmcp-deps-note{font-size:0.8369em;opacity:0.6;line-height:1.4;}
 .cmcp-deps-spin{width:0.85rem;height:0.85rem;flex:0 0 auto;border:2px solid rgba(255,255,255,0.22);

@@ -174,7 +174,8 @@ function injectCss() {
     background: transparent; color: var(--p-text-color,#fafafa); cursor: pointer;
     text-align: left; font-size: 0.96em; }
   .cmcp-cv-creator:hover { background: var(--p-surface-800,#27272a); }
-  .cmcp-cv-creator .sub { margin-left: auto; font-size: 0.8369em; flex-shrink: 0;
+  /* #753 — parent .cmcp-cv-creator is 12.48px, not the 13px root (codex). */
+  .cmcp-cv-creator .sub { margin-left: auto; font-size: 0.8718em; flex-shrink: 0;
     color: var(--p-text-muted-color,#a1a1aa); }
   .cmcp-cv-dd { position: relative; width: 100%; }
   .cmcp-cv-ddpanel { position: absolute; z-index: 6; left: 0; right: 0; top: calc(100% + .25rem);
@@ -200,7 +201,8 @@ function injectCss() {
     font-size: 0.8862em; color: var(--p-text-muted-color,#a1a1aa);
     background: var(--p-surface-900,#18181b);
     border-top: 1px solid var(--p-content-border-color,#3f3f46); }
-  .cmcp-cv-ddclear { background: transparent; border: none; cursor: pointer; font-size: 0.8862em;
+  /* #753 — sits inside the 11.52px .cmcp-cv-ddfoot, so it matches its parent (codex). */
+  .cmcp-cv-ddclear { background: transparent; border: none; cursor: pointer; font-size: 1em;
     padding: 0; color: var(--p-primary-color,#3a7bd5); }
   .cmcp-cv-lb-prompt { font-size: 0.96em; white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;

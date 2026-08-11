@@ -3974,9 +3974,12 @@ function panelSettingsList() {
       tooltip:
         "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
         "to read on a high-DPI or large display. 100% is the default; 100-250. Applies immediately, to " +
-        "every open panel. Note that overriding `.cmcp-root { font-size }` in a user stylesheet does NOT " +
-        "work: the panel's inner sizes are `rem`, which resolve against the page root rather than the " +
-        "panel, so most text ignores it. This setting is the supported way to scale the panel.",
+        "every open panel. Since 0.13.3 the panel's inner FONT sizes are `em`, so overriding " +
+        "`.cmcp-root { font-size }` in a user stylesheet does now scale most panel text. Two things it " +
+        "still will not scale: spacing (padding and gaps are `rem` on purpose — as `em` they compound " +
+        "through nesting), and the surfaces that mount outside the panel root (the CivitAI explorer, " +
+        "Apps and their modals), which are anchored so they render correctly wherever they mount. This " +
+        "setting remains the supported way to scale the panel as a whole.",
       type: "slider",
       attrs: { min: PANEL_UI_SCALE_MIN, max: PANEL_UI_SCALE_MAX, step: 5 },
       defaultValue: 100,
