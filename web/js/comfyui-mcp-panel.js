@@ -1944,15 +1944,48 @@ function workflowOwnedExtra(wf = activeWorkflowRef()) {
   return candidate && typeof candidate === "object" ? candidate : null;
 }
 
+/**
+ * #945 — the READ carrier for `allowGraph: false`, and deliberately NOT the write
+ * one.
+ *
+ * `workflowOwnedExtra` above answers null on every frontend observed here, so the
+ * two fork guards behind it arbitrate a value they never receive. The uuid is on
+ * the workflow object — one field away, in `activeState.extra`.
+ *
+ * MEASURED before adding it, because the whole point of `allowGraph: false` is to
+ * refuse the live canvas's identity for a workflow object, and a carrier that is
+ * secretly the canvas would defeat that silently. On 0.31.1 / frontend 1.48.7 with
+ * three workflows open, each NON-ACTIVE workflow's `activeState.extra` carried its
+ * OWN uuid (30dfba50…, 2d7fa288…), distinct from the canvas's (e66e531b…, which is
+ * what `app.graph.extra` held). It tracks the workflow, not the screen — so it
+ * satisfies the contract this parameter exists to enforce.
+ *
+ * THE WRITE IS NOT REPOINTED. Embedding into `activeState.extra` moves where
+ * identity persists — it stops reaching `app.graph.extra`, which is what a save
+ * serializes — and was reverted once for exactly that. Reading a field is not
+ * writing it, so the revert's reason is preserved rather than re-argued: this
+ * function has no callers that mutate what it returns.
+ */
+function workflowOwnedExtraForRead(wf = activeWorkflowRef()) {
+  const owned = workflowOwnedExtra(wf);
+  if (owned) return owned;
+  // Last, not first: an older build that really does carry one of the three fields
+  // above keeps answering from it, so this only fills the gap where they are absent.
+  const state = wf?.activeState?.extra;
+  return state && typeof state === "object" ? state : null;
+}
+
 function embeddedWorkflowUuid(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
-  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtraForRead(wf);
   const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const id = ns?.[WORKFLOW_UUID_FIELD];
   return typeof id === "string" && id ? id : null;
 }
 
 function embeddedWorkflowPath(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
-  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  // Same carrier as the uuid — they are recorded together in one namespace, so
+  // reading them from different places could answer about two different workflows.
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtraForRead(wf);
   const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
   return typeof path === "string" && path ? path : null;

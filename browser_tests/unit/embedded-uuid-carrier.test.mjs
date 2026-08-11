@@ -50,6 +50,7 @@
 // production chain, and it fails if the chain changes.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -57,16 +58,28 @@ import {
   shouldForkEmbeddedWorkflowUuid,
 } from "../../web/js/lib/workflow-chat-identity.js";
 
-/** The candidate chain, exactly as `workflowOwnedExtra` implements it. */
+/** The candidate chain, exactly as `workflowOwnedExtra` implements it. This is now
+ *  the WRITE-side helper only: the embed write still goes through it, unchanged. */
 const workflowOwnedExtra = (wf) => {
   const candidate = wf?.extra || wf?.workflow?.extra || wf?.data?.extra;
   return candidate && typeof candidate === "object" ? candidate : null;
 };
-const embeddedUuid = (wf) => {
-  const ns = workflowOwnedExtra(wf)?.comfyui_mcp;
-  const id = ns?.workflow_uuid;
+/** The READ carrier, exactly as `workflowOwnedExtraForRead` implements it: the same
+ *  chain, with `activeState.extra` behind it. Ordered so an older build that really
+ *  does carry one of the three original fields keeps answering from it. */
+const workflowOwnedExtraForRead = (wf) => {
+  const owned = workflowOwnedExtra(wf);
+  if (owned) return owned;
+  const state = wf?.activeState?.extra;
+  return state && typeof state === "object" ? state : null;
+};
+const uuidFrom = (extra) => {
+  const id = extra?.comfyui_mcp?.workflow_uuid;
   return typeof id === "string" && id ? id : null;
 };
+const embeddedUuid = (wf) => uuidFrom(workflowOwnedExtra(wf));
+/** What `embeddedWorkflowUuid(wf, {allowGraph:false})` now resolves. */
+const embeddedUuidRead = (wf) => uuidFrom(workflowOwnedExtraForRead(wf));
 
 /** The real shape, from ComfyUI 0.31.1 / frontend 1.44.19. `activeState` is a
  *  getter onto the change tracker, which is where the uuid actually lives. */
@@ -104,11 +117,12 @@ test("the helper DOES work when a workflow-owned carrier is present", () => {
   assert.equal(embeddedUuid({ extra: "not-an-object" }), null);
 });
 
-test("OBSERVATION (#945): the real ComfyWorkflow shape yields nothing", () => {
-  // Recorded, not required. The uuid is genuinely present on this object — it is
-  // just not on any rung the chain looks at, so `allowGraph:false` cannot see it.
+test("OBSERVATION (#945): the original three-rung chain yields nothing", () => {
+  // Recorded, not required. The uuid is genuinely present on this object — it is just
+  // not on any rung THAT chain looks at. Still true, and still what the WRITE side goes
+  // through, which is why the embed write does not land on the workflow object.
   const wf = realComfyWorkflow();
-  assert.equal(workflowOwnedExtra(wf), null, "no rung of the chain matches the real class");
+  assert.equal(workflowOwnedExtra(wf), null, "no rung of the original chain matches the real class");
   assert.equal(embeddedUuid(wf), null);
   // The uuid IS there, one field over. This is the whole of #945 in two lines.
   assert.equal(
@@ -117,12 +131,80 @@ test("OBSERVATION (#945): the real ComfyWorkflow shape yields nothing", () => {
   );
 });
 
-test("so both fork guards are handed null, and decide nothing", () => {
-  // They read as live guards. Both call sites pass `embeddedUuid: embedded`,
-  // where `embedded` is `embeddedWorkflowUuid(wf, { allowGraph: false })` —
-  // permanently null — so both short-circuit on their first line, whatever they
-  // were written to prevent. Pinning it makes the dead branch visible in the
-  // suite rather than only in a comment.
+test("#945 FIXED: the READ carrier reaches it, so `allowGraph:false` is no longer null", () => {
+  const wf = realComfyWorkflow();
+  assert.equal(embeddedUuidRead(wf), "ff7890d8-1111-4111-8111-111111111111");
+  // Through the real getter, not a planted own-property: `activeState` delegates to
+  // `changeTracker.activeState`, so a build that stops populating the tracker goes back
+  // to null rather than to a stale value.
+  wf.changeTracker.activeState = null;
+  assert.equal(embeddedUuidRead(wf), null, "no tracker state → no identity, not a guess");
+
+  // Same SHAPE check as the original chain, so the two rungs cannot disagree about what
+  // counts as a carrier. A non-object here reads as no carrier rather than being handed
+  // on: today a string would fall out as null one line later anyway, but that is the
+  // reader's accident, not this function's contract.
+  for (const bad of ["not-an-object", 42, true]) {
+    assert.equal(workflowOwnedExtraForRead({ activeState: { extra: bad } }), null, String(bad));
+  }
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(src, /const state = wf\?\.activeState\?\.extra;\r?\n\s*return state && typeof state === "object" \? state : null;/, "production applies the same check");
+});
+
+test("#945 the original rungs still WIN — the new one only fills the gap", () => {
+  // Order matters: a build that really does carry `wf.extra` must keep answering from
+  // it. Putting `activeState` first would silently change which field decides on any
+  // frontend where both exist, and they can disagree.
+  const wf = realComfyWorkflow("from-active-state-1111-4111-8111-111111111111");
+  wf.extra = { comfyui_mcp: { workflow_uuid: "from-wf-extra" } };
+  assert.equal(embeddedUuidRead(wf), "from-wf-extra");
+  delete wf.extra;
+  assert.equal(embeddedUuidRead(wf), "from-active-state-1111-4111-8111-111111111111");
+});
+
+test("#945 the READ carrier is not the live canvas — it tracks the WORKFLOW", () => {
+  // The point of `allowGraph:false` is to refuse the canvas's identity for a workflow
+  // object, so a carrier that were secretly the canvas would defeat it silently.
+  // Measured on 0.31.1 / frontend 1.48.7 with three workflows open: each NON-ACTIVE
+  // workflow's `activeState.extra` held its OWN uuid (30dfba50…, 2d7fa288…), distinct
+  // from `app.graph.extra` (e66e531b…, the active one).
+  const background = realComfyWorkflow("30dfba50-4c01-4c40-a4c2-72a47e12269c");
+  const active = realComfyWorkflow("e66e531b-a4ca-4bee-8a11-12df34b830e2");
+  assert.notEqual(embeddedUuidRead(background), embeddedUuidRead(active));
+  assert.equal(embeddedUuidRead(background), "30dfba50-4c01-4c40-a4c2-72a47e12269c");
+});
+
+test("#945 the WRITE was deliberately not repointed", () => {
+  // Embedding into `activeState.extra` moves where identity PERSISTS — it stops reaching
+  // `app.graph.extra`, which is what a save serializes — and was reverted once for
+  // exactly that. Reading a field is not writing it, so the revert's reason survives this
+  // change. Pinned on the source, since that is the only place the asymmetry is visible.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const uuidFn = src.slice(
+    src.indexOf("function embeddedWorkflowUuid("),
+    src.indexOf("function persistWorkflowAliases("),
+  );
+  assert.match(uuidFn, /workflowOwnedExtraForRead\(wf\)/, "both readers use the extended carrier");
+  assert.equal(
+    (uuidFn.match(/workflowOwnedExtraForRead\(wf\)/g) ?? []).length,
+    2,
+    "uuid AND path — reading them from different carriers could answer about two workflows",
+  );
+  // Every place that MUTATES what it got back still uses the original chain.
+  assert.ok(src.includes("const extra = workflowOwnedExtra(wf);"), "write site unchanged");
+  assert.ok(
+    !/const extra = workflowOwnedExtraForRead\(wf\);[\s\S]{0,400}?extra\[WORKFLOW_META_NAMESPACE\] =/.test(src),
+    "nothing writes into the read carrier",
+  );
+});
+
+test("BEFORE #945: handed null, both fork guards decide nothing", () => {
+  // Kept as the null CONTRACT, not as a description of the frontend any more. Both
+  // call sites pass `embeddedUuid: embedded`, and before this fix `embedded` was
+  // permanently null on the observed frontend, so both short-circuited on their first
+  // line whatever they were written to prevent. With the read carrier extended they
+  // now receive the workflow's own uuid — see the FIXED test above — but null must
+  // still be answered this way on a build that genuinely carries no identity.
   //
   // NOTE ON PARAMETER NAMES: an earlier draft of this file passed `embedded:`,
   // which these functions do not read, so the assertions passed for the wrong
@@ -218,11 +300,21 @@ test("SOURCE: the modelled chain is the one production actually reads", async ()
     /const candidate = wf\?\.extra \|\| wf\?\.workflow\?\.extra \|\| wf\?\.data\?\.extra;/,
     "the carrier chain changed — update the model above, and re-check #945's conclusion",
   );
-  // The call site that feeds the fork guards a permanently-null value.
+  // The call site that feeds the fork guards. No longer permanently null (#945): the
+  // read carrier behind it now reaches `activeState.extra`, which is where the uuid is.
   assert.match(
     src,
     /const embedded = embeddedWorkflowUuid\(wf, \{ allowGraph: false \}\);/,
     "the guards are no longer fed from the workflow-owned carrier",
+  );
+  // …and the read carrier itself, which this file reimplements as
+  // `workflowOwnedExtraForRead`. Its ORDER is the assertion that matters: the original
+  // three rungs first, `activeState.extra` only behind them — a build carrying both
+  // would otherwise start deciding on a different field without anything failing.
+  assert.match(
+    src,
+    /const owned = workflowOwnedExtra\(wf\);\r?\n\s*if \(owned\) return owned;[\s\S]{0,300}?const state = wf\?\.activeState\?\.extra;/,
+    "the read carrier's order changed — re-check which field decides identity",
   );
   // Both guards still read the value under the name the tests use, so a rename
   // cannot make these assertions pass by not applying.
