@@ -17928,7 +17928,8 @@ const PANEL_CSS = `
   position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   /* #753 — THE ONE KNOB. Every inner font size is calc(var(--cmcp-fs) * k), so a
-     change here scales all of them at once, at any nesting depth. `em` was tried
+     change here scales all of them at once, at any nesting depth. An em unit was
+     tried
      first and rejected: it resolves against the PARENT, so a rule inside a block
      that sets its own size needs a different multiplier, and a rule used under two
      different parents has no single correct value at all (measured: 529 drifted
