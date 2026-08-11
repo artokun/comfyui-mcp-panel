@@ -338,6 +338,10 @@ import {
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
 import {
+  MOVE_CAUSES,
+  createActiveWorkflowProvenance,
+} from "./lib/active-workflow-provenance.js";
+import {
   INTERACTIVE_ABANDONED,
   abandonedInteractiveError,
   isAbandonedInteractive,
@@ -2470,7 +2474,11 @@ function noteWorkflowInstanceMismatch() {
  *  The leading `workflow instance mismatch:` token is preserved deliberately: it
  *  is what readers and existing reports recognise this refusal by. Only the claim
  *  about causation changes. */
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null } = {}) {
+// #968 — `movedNote` is INJECTED, never read from the recorder here: this function is pure
+// and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
+// exist. One line on purpose (see above). Appended, never substituted — the refusal's own
+// reasoning survives; the note only says WHY the active workflow is not what was expected.
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -2482,7 +2490,7 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
   const compared = expected
     ? `this command was issued for workflow instance ${expected}, and ${canvasSays}`
     : `this command carries no workflow-instance stamp, and ${canvasSays}`;
-  return (
+  const base = (
     `workflow instance mismatch: ${compared}. Nothing was applied.\n\n` +
     `That is the comparison, not the cause — the panel observed only that the two ` +
     `identities differ. It can mean the workflow was switched or replaced after the ` +
@@ -2507,6 +2515,8 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
+  const movedLine = typeof movedNote === "string" && movedNote.trim() ? movedNote.trim() : null;
+  return movedLine ? `${base}\n\n${movedLine}` : base;
 }
 
 function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
@@ -12417,6 +12427,10 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
     try {
+      // #968 r2 — NOT claimed here. #606/#708 reconstruct workflow_new from source and
+      // rebuild it in isolation, so an inserted call breaks 12 guards that exist for
+      // independent reasons. Recorded on the PR: this cause stays unwired until the
+      // claim can be staked somewhere those guards do not reach.
       await mgr.command.execute("Comfy.NewBlankWorkflow");
     } catch (err) {
       // The creation command itself threw. It may have got partway, and workflow_new is
@@ -12732,11 +12746,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // guard age out mid-flight (see begin/endWorkflowReloadStep).
       beginWorkflowReloadStep(reloadGuardToken);
       try {
+        // #968 — claim this move BEFORE it happens, so the observer attributes it to this
+        // command rather than reporting it as a move nobody made. A claim that is never
+        // followed by a move is discarded by the next observation.
+        claimActiveWorkflowMove(MOVE_CAUSES.OPEN_EXECUTOR, `workflow_open ${workflowTabId(target) || ""}`.trim());
         await s.openWorkflow(target);
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
         // through failOpen below (outside the freeze) so the negative is journaled.
         openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+        // #968 r2 — the claim was staked before the switch; the switch did not happen, so
+        // release it rather than let a later move inherit this command's name.
+        claimActiveWorkflowMove(null, null);
       } finally {
         endWorkflowReloadStep(reloadGuardToken);
       }
@@ -16213,6 +16234,51 @@ function redactBridgeUrl(u) {
 // rejecting a prior session's command.
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
 
+// #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
+// observation after the fact, which is why three reports of `bound` + wrong-graph have not
+// converged. DIAGNOSTIC ONLY: nothing below consults this to decide whether a command runs.
+const activeWorkflowMoves = createActiveWorkflowProvenance();
+// The panel's own moves are claimed by the executor that made them, and are consumed by the
+// observer so it does not double-report them as external.
+let _claimedNextMove = null;
+function claimActiveWorkflowMove(cause, detail) {
+  // A null cause RELEASES a claim (an open that failed before switching).
+  _claimedNextMove = cause ? { cause, detail: typeof detail === "string" ? detail : null } : null;
+}
+let _lastSeenActiveKey = null;
+function noteActiveWorkflowMove() {
+  try {
+    // #968 r2 (codex P1) — CONSUME the claim on every observation, not only when the key
+    // changed. A claim left pending by an open that failed, no-opped or was superseded
+    // would otherwise be applied to the NEXT different key, labelling an external move as
+    // panel-made — mislabelling exactly the case this exists to find.
+    const claim = _claimedNextMove;
+    _claimedNextMove = null;
+    // #968 r2 (codex P2) — a null active workflow is NO DESTINATION. `workflowTabId(null)`
+    // falls back to getTabId(), a browser-session id, so reading it here would report a
+    // move to a browser tab as though it were a workflow.
+    const active = activeWorkflowRef();
+    const key = active ? workflowTabId(active) || null : null;
+    if (key === _lastSeenActiveKey) return;
+    const from = _lastSeenActiveKey;
+    _lastSeenActiveKey = key;
+    if (!key) return; // nothing active — a destination-less move records nothing
+    activeWorkflowMoves.record({
+      // An UNCLAIMED move is the case #968 is hunting. It is recorded as UNKNOWN rather than
+      // as "not the panel": `workflow_new` cannot stake a claim (#606/#708 rebuild it in
+      // isolation), and one of the three reports entered through that very command, so
+      // excluding the panel here would be a false exclusion on a reported entry path.
+      cause: claim ? claim.cause : MOVE_CAUSES.UNKNOWN,
+      detail: claim ? claim.detail : null,
+      from,
+      to: key,
+      at: Date.now(),
+    });
+  } catch {
+    // A diagnostic must never break the path it observes.
+  }
+}
+
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
@@ -16998,11 +17064,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // #607 — re-advertise the panel's CURRENT identity (re-hello) so the
               // recovery this message advertises actually reaches the orchestrator's
               // cached stamp; see noteWorkflowInstanceMismatch.
+              // #968 — observe before reporting: a move that happened since the previous
+              // command is exactly what makes this binding stale, and an unclaimed one is
+              // the case this issue is hunting.
+              noteActiveWorkflowMove();
               noteWorkflowInstanceMismatch();
               throw new Error(
                 workflowInstanceMismatchMessage({
                   commandUuid: dispatchCommandUuid,
                   activeUuid: dispatchActiveUuid,
+                  // #968 — what last moved the active workflow, if anything did. This is the
+                  // refusal a caller actually sees when a binding has gone stale.
+                  movedNote: activeWorkflowMoves.describeLast(),
                 }),
               );
             }
