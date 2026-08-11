@@ -338,6 +338,10 @@ import {
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
 import {
+  MOVE_CAUSES,
+  createActiveWorkflowProvenance,
+} from "./lib/active-workflow-provenance.js";
+import {
   INTERACTIVE_ABANDONED,
   abandonedInteractiveError,
   isAbandonedInteractive,
@@ -12709,6 +12713,10 @@ const GRAPH_TOOL_EXECUTORS = {
       // guard age out mid-flight (see begin/endWorkflowReloadStep).
       beginWorkflowReloadStep(reloadGuardToken);
       try {
+        // #968 — claim this move BEFORE it happens, so the observer attributes it to this
+        // command rather than reporting it as a move nobody made. A claim that is never
+        // followed by a move is discarded by the next observation.
+        claimActiveWorkflowMove(MOVE_CAUSES.OPEN_EXECUTOR, `workflow_open ${workflowTabId(target) || ""}`.trim());
         await s.openWorkflow(target);
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
@@ -16189,6 +16197,40 @@ function redactBridgeUrl(u) {
 // unknown in the new epoch and therefore fails open instead of replaying or
 // rejecting a prior session's command.
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
+
+// #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
+// observation after the fact, which is why three reports of `bound` + wrong-graph have not
+// converged. DIAGNOSTIC ONLY: nothing below consults this to decide whether a command runs.
+const activeWorkflowMoves = createActiveWorkflowProvenance();
+// The panel's own moves are claimed by the executor that made them, and are consumed by the
+// observer so it does not double-report them as external.
+let _claimedNextMove = null;
+function claimActiveWorkflowMove(cause, detail) {
+  _claimedNextMove = { cause, detail: typeof detail === "string" ? detail : null };
+}
+let _lastSeenActiveKey = null;
+function noteActiveWorkflowMove() {
+  try {
+    const key = workflowTabId(activeWorkflowRef()) || null;
+    if (key === _lastSeenActiveKey) return;
+    const from = _lastSeenActiveKey;
+    _lastSeenActiveKey = key;
+    if (!key) return; // nothing active — a destination-less move records nothing
+    const claim = _claimedNextMove;
+    _claimedNextMove = null;
+    activeWorkflowMoves.record({
+      // An UNCLAIMED move is the case #968 is hunting: a tab click, a reconnect restore, a
+      // file reopened at a new path. Defaulting to `external` is what makes it visible.
+      cause: claim ? claim.cause : MOVE_CAUSES.EXTERNAL,
+      detail: claim ? claim.detail : null,
+      from,
+      to: key,
+      at: Date.now(),
+    });
+  } catch {
+    // A diagnostic must never break the path it observes.
+  }
+}
 
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
