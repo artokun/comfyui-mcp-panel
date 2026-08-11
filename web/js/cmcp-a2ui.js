@@ -42,6 +42,14 @@ const capped = (v, n) => str(v) && v.length <= n;
 /**
  * Validate + normalize a raw card spec. Returns { ok:true, spec } with defaults
  * applied, or { ok:false, errors:[...] }. Never throws.
+ *
+ * NOT TRANSLATED, deliberately. These read as user-facing because
+ * renderA2UIFailCard puts them on screen, but every one of them names a field of
+ * the A2UI wire schema (`components array is required`, `duplicate id "x"`) and
+ * the audience is whoever is writing the agent that emitted the bad card. They are
+ * also the text a user pastes into a bug report; translating them would mean the
+ * maintainer receives a Korean rendering of a schema violation and cannot grep for
+ * it. The card's own chrome around them (title, "tap to view raw") IS translated.
  */
 export function validateA2UISpec(raw) {
   const errors = [];
@@ -661,7 +669,19 @@ export function renderA2UIFailCard(rawText, errors) {
   el.appendChild(t);
   const why = document.createElement("div");
   why.className = "cmcp-a2ui-text";
-  why.textContent = (errors && errors.length ? errors.slice(0, 3).join("; ") : "could not render") + " — tap to view raw";
+  // `{reason}` rather than translating " — tap to view raw" as a trailing
+  // fragment: the panel ships ar/fa, and an RTL sentence does not necessarily put
+  // the affordance AFTER the reason. Interpolating lets the translator place both
+  // halves; concatenating would have pinned the order to English's.
+  //
+  // The reason itself is either validateA2UISpec's developer diagnostics (left in
+  // English on purpose — see the note on those messages) or this generic stand-in
+  // for the case where the card failed with no errors to report.
+  const reason =
+    errors && errors.length
+      ? errors.slice(0, 3).join("; ")
+      : tr("a2ui.could_not_render", "could not render");
+  why.textContent = tr("a2ui.tap_to_view_raw", "{reason} — tap to view raw", { reason });
   why.style.cursor = "pointer";
   const pre = document.createElement("pre");
   pre.textContent = typeof rawText === "string" ? rawText : JSON.stringify(rawText, null, 2);
