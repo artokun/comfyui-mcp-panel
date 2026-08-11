@@ -9,6 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -233,6 +234,59 @@ test("plurals pick the category the language actually uses", () => {
   // A catalog with only `_other` still resolves for a language that wants `_one`.
   __setCatalogForTest("en", { panel: { n_other: "{count} nodes" } });
   assert.equal(tr("panel.n", enForms, { count: 1 }), "1 nodes");
+});
+
+test("regenerating English is a ROUND TRIP — it never loses a converted key", () => {
+  // The defect this locks down: the extractor's context patterns anchor on the code PRECEDING
+  // a literal, so once a site became `.textContent = tr("panel.save", "Save")` nothing matched
+  // it. Extraction fell from 264 candidates to 1, and `npm run i18n:build` would have
+  // overwritten a 247-key catalog with 1 key — then the gate would fail every language with
+  // ~246 "unknown key" errors. Conversion must be a round trip, not a one-way door.
+  const out = execFileSync("node", ["scripts/i18n-extract.mjs", "--json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 1 << 26,
+  });
+  const converted = JSON.parse(out).filter((c) => c.converted);
+  const committed = readJson("locales/en/main.json");
+  const flat = (o, p = "", m = new Map()) => {
+    for (const [k, v] of Object.entries(o)) {
+      const key = p ? `${p}.${k}` : k;
+      if (v && typeof v === "object") flat(v, key, m);
+      else m.set(key, v);
+    }
+    return m;
+  };
+  const inCatalog = flat(committed.comfyuiMcpPanel);
+  const missing = converted.filter((c) => !inCatalog.has(c.key));
+  assert.deepEqual(
+    missing.map((c) => `${c.key} (${c.file}:${c.line})`),
+    [],
+    "every tr() call site must be readable back into the English catalog — run `npm run i18n:build`",
+  );
+  // And the reverse: a catalog key with no call site is dead vocabulary.
+  const called = new Set(converted.map((c) => c.key));
+  assert.deepEqual(
+    [...inCatalog.keys()].filter((k) => !called.has(k)),
+    [],
+    "these catalog keys have no tr() call site — stale after a revert or rename",
+  );
+});
+
+test("RTL is actually WIRED, not just implemented", () => {
+  // `isRTL`/`applyDirection` existed and were exported but never called by anything, while
+  // ar and fa shipped in the language dropdown — so an Arabic user got a left-to-right panel
+  // and every unit test stayed green. An exported-but-uncalled function is indistinguishable
+  // from a working feature until someone speaks the language.
+  const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
+  assert.match(src, /import \{[^}]*applyDirection[^}]*\} from "\.\/lib\/i18n\.js"/, "applyDirection must be imported");
+  const at = src.indexOf('root.className = "cmcp-root"');
+  assert.notEqual(at, -1, "the panel root must still be created in buildPanel()");
+  assert.match(
+    src.slice(at, at + 900),
+    /applyDirection\(root\)/,
+    "every panel root must get its direction set where it is created, or RTL languages lay out wrongly",
+  );
 });
 
 test("right-to-left languages are flagged", () => {

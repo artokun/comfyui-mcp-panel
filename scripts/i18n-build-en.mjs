@@ -11,9 +11,17 @@ import path from 'path';
 import { execSync } from 'child_process';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const candidates = JSON.parse(
+const all = JSON.parse(
   execSync('node scripts/i18n-extract.mjs --json', { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 })
 );
+
+// ONLY already-converted `tr("key", "English")` sites become catalog entries. The extractor
+// also reports PROPOSALS for strings that are still bare literals; those are a to-do list for
+// a human, not vocabulary. Emitting them would add keys no code ever looks up, and — because
+// the gate demands exact parity — would instantly fail every translated language for keys
+// that do not exist yet.
+const candidates = all.filter((c) => c.converted);
+const proposals = all.length - candidates.length;
 
 // key -> text, de-duplicated. Identical text under the same key is the common case
 // (the same label rendered from two places) and collapses to one entry.
@@ -41,3 +49,6 @@ fs.mkdirSync(outDir, { recursive: true });
 const out = { comfyuiMcpPanel: nested };
 fs.writeFileSync(path.join(outDir, 'main.json'), JSON.stringify(out, null, 2) + '\n');
 console.log(`wrote locales/en/main.json — ${flat.size} keys`);
+if (proposals) {
+  console.log(`${proposals} string(s) still unconverted — run \`npm run i18n:extract\` to list them`);
+}
