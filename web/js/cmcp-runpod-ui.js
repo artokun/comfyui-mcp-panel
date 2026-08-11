@@ -37,12 +37,12 @@ function injectStyle() {
 .cmcp-rp-modal{max-width:min(480px,92vw)!important;width:auto;}
 .cmcp-rp-body{display:flex;flex-direction:column;gap:0.75rem;min-width:min(440px,90vw);max-width:520px;}
 .cmcp-rp-host{display:flex;align-items:center;gap:0.5rem;padding:0.55rem 0.7rem;border-radius:8px;
-  font-size:1.0462em;font-weight:600;border:1px solid var(--p-content-border-color,#3f3f46);}
+  font-size:calc(var(--cmcp-fs) * 1.0462);font-weight:600;border:1px solid var(--p-content-border-color,#3f3f46);}
 .cmcp-rp-host.local{background:rgba(34,197,94,0.10);color:#22c55e;border-color:rgba(34,197,94,0.35);}
 .cmcp-rp-host.pod{background:rgba(59,130,246,0.12);color:#60a5fa;border-color:rgba(59,130,246,0.40);}
 .cmcp-rp-dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:0 0 auto;}
 .cmcp-rp-card{border:1px solid var(--p-content-border-color,#3f3f46);border-radius:8px;padding:0.7rem;
-  display:flex;flex-direction:column;gap:0.35rem;font-size:1.0092em;}
+  display:flex;flex-direction:column;gap:0.35rem;font-size:calc(var(--cmcp-fs) * 1.0092);}
 .cmcp-rp-row{display:flex;justify-content:space-between;gap:0.75rem;}
 .cmcp-rp-row .k{opacity:0.6;}
 .cmcp-rp-row .v{font-variant-numeric:tabular-nums;text-align:right;}
@@ -52,19 +52,19 @@ function injectStyle() {
 .cmcp-rp-connect{display:flex;gap:0.4rem;}
 .cmcp-rp-connect input,.cmcp-rp-podselect{flex:1 1 auto;min-width:0;padding:0.4rem 0.55rem;border-radius:6px;
   border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-inputtext-background,#18181b);
-  color:inherit;font-size:1.0092em;}
+  color:inherit;font-size:calc(var(--cmcp-fs) * 1.0092);}
 .cmcp-rp-connect input{font-family:ui-monospace,monospace;}
 .cmcp-rp-podselect{cursor:pointer;}
 .cmcp-rp-refresh{flex:0 0 auto;min-width:auto;padding:0.4rem 0.6rem;}
-.cmcp-rp-log{font-size:0.96em;opacity:0.85;min-height:1.1em;white-space:pre-wrap;word-break:break-word;}
+.cmcp-rp-log{font-size:calc(var(--cmcp-fs) * 0.96);opacity:0.85;min-height:1.1em;white-space:pre-wrap;word-break:break-word;}
 .cmcp-rp-log.busy{opacity:0.6;}
 .cmcp-rp-log.err{color:#f87171;}
-.cmcp-rp-credit{font-size:0.8615em;opacity:0.5;}
+.cmcp-rp-credit{font-size:calc(var(--cmcp-fs) * 0.8615);opacity:0.5;}
 .cmcp-rp-credit a{color:inherit;}
-.cmcp-rp-muted{font-size:0.9231em;opacity:0.6;}
+.cmcp-rp-muted{font-size:calc(var(--cmcp-fs) * 0.9231);opacity:0.6;}
 /* The unified side-panel shell (cmcp-sidepanel-ui.js) owns the overlay + dock +
    slide; the Local tab centers this body in the shared card. */
-.cmcp-rp-title{font-weight:600;font-size:1.0462em;}
+.cmcp-rp-title{font-weight:600;font-size:calc(var(--cmcp-fs) * 1.0462);}
 `;
   const el = document.createElement("style");
   el.textContent = css;
