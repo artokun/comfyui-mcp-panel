@@ -6923,7 +6923,11 @@ function makeShellCommandBlock(baseCmd) {
     b.className = "cmcp-btn";
     b.dataset.shell = s.key;
     b.textContent = s.label;
-    b.style.cssText = "font-size:0.8862em;padding:0.12rem 0.45rem;";
+    // #753 — 1.0472em, not the 0.8862em the other `.cmcp-btn` sites use. These pills render
+    // inside the 11px code-block tools row rather than at the 13px root, and em resolves
+    // against the PARENT: the shared value rendered them at 9.75px instead of 11.52px.
+    // Measured on the page, not derived from the stylesheet.
+    b.style.cssText = "font-size:1.0472em;padding:0.12rem 0.45rem;";
     b.addEventListener("click", () => { selected = s.key; render(); copy(forms[s.key]); });
     pills.appendChild(b);
   }
