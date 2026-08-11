@@ -1,0 +1,72 @@
+/**
+ * #1006 — a stable identity for a served `/object_info`, so a consumer can cache it and a
+ * later call can say "unchanged" instead of shipping the payload again.
+ *
+ * WHY A FINGERPRINT AND NOT A VERSION. There is no version to read: `/object_info` carries
+ * no generation counter, and the panel cannot see when a pack was installed on the machine
+ * it is talking to. What it CAN do is describe the answer it just got, cheaply and
+ * deterministically, so two answers can be compared.
+ *
+ * WHAT IT COVERS, and this is the whole claim: the set of TYPE NAMES. Two payloads with
+ * the same fingerprint have the same types; they may still differ INSIDE a definition — a
+ * changed combo list, a renamed widget, a new input on an existing node. A caller that
+ * needs those must re-read rather than trust the fingerprint, and the reply says so rather
+ * than leaving it implied. Hashing the whole 5MB payload would answer that question too and
+ * costs far more than the fetch it saves; the type set is what a conversion keys on.
+ */
+
+/** FNV-1a over a string. Small, dependency-free, and stable across runs — this is a cache
+ *  key, never a security primitive. */
+function fnv1a(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    // The classic 32-bit multiply, kept in range without BigInt.
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * A fingerprint of the TYPE NAMES in an `/object_info` payload.
+ *
+ * Returns null for anything that is not a usable schema map — a caller must not be handed a
+ * fingerprint for a payload it cannot use, because that is exactly the value it would then
+ * compare against later and wrongly believe nothing had changed.
+ */
+export function objectInfoFingerprint(defs) {
+  try {
+    if (!defs || typeof defs !== "object" || Array.isArray(defs)) return null;
+    const names = Object.keys(defs);
+    if (!names.length) return null;
+    // SORTED, because key order is not part of the answer: the same install can serve the
+    // same types in a different order and that must not read as a change.
+    names.sort();
+    // JSON-ENCODED, not joined on a delimiter. A join is not injective — any separator can
+    // occur inside a node type name, and two different type sets hashing alike is exactly
+    // the collision a cache key must not have. (An earlier cut used a NUL separator, which
+    // the repo's own control-character guard rejected from shipped source, correctly.)
+    return `t${names.length}-${fnv1a(JSON.stringify(names)).toString(36)}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does a caller's cached fingerprint still describe this payload?
+ *
+ * Both must be present and equal. An absent or unreadable fingerprint on either side is
+ * NOT a match — the point of this is to skip sending a payload, and skipping it on a
+ * comparison that never happened would hand the caller a stale schema while telling it
+ * nothing changed.
+ */
+export function objectInfoUnchanged(previousFingerprint, currentFingerprint) {
+  // THE TWO GUARDS COVER FOR EACH OTHER, and neither can be killed alone by mutation:
+  // with one removed, the equality still rejects an absent value against a real one.
+  // What they catch TOGETHER is two absent values, which are equal to each other —
+  // `objectInfoUnchanged("", "")` would answer true and a caller would skip re-reading a
+  // schema it never had. Kept as two because they state a rule about each side.
+  if (typeof previousFingerprint !== "string" || !previousFingerprint) return false;
+  if (typeof currentFingerprint !== "string" || !currentFingerprint) return false;
+  return previousFingerprint === currentFingerprint;
+}
