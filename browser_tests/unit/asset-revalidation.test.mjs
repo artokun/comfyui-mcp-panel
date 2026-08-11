@@ -13,9 +13,11 @@
  * by ComfyUI's unsaved-changes prompt; the code updated only once I suppressed that and
  * navigated. Without the header measurement this would have shipped blaming the cache.
  *
- * A stale module still cannot be detected from inside the page — it compares equal to
- * itself and every consistency check it can run passes — so where a host DOES leave the
- * door open, headers are the only place to close it.
+ * A stale module cannot detect ITSELF — it compares equal to itself and every internal
+ * consistency check passes. It can still be caught from outside: the pack's
+ * `/comfyui_mcp_panel/version` route reports the INSTALLED version for the running JS to
+ * compare against, which is how #584/#611 surface it today. Headers are the only place to
+ * PREVENT it where a host leaves the door open.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -31,15 +33,15 @@ const middleware = (() => {
   return INIT.slice(start, end === -1 ? undefined : end);
 })();
 
-test("#584 panel assets are told to REVALIDATE, not to skip the cache", () => {
-  // no-cache: the browser may keep the file but must ask before reusing it.
-  assert.match(middleware, /"Cache-Control"\] = "no-cache"/);
-  // no-store would forbid caching entirely and re-download every module on every load, for
-  // a pack that ships 100+ of them. Revalidation costs a conditional request and answers
-  // 304 when nothing changed — ComfyUI already serves an ETag from mtime+size.
-  assert.ok(!/no-store/.test(middleware), "never no-store — that is a different, worse trade");
+test("#584 the header MATCHES the host policy — it must never be weaker", () => {
+  // The defect this replaced: a middleware appended here runs INSIDE ComfyUI's own
+  // `cache_control`, so ours finishes first and the host's `setdefault` then PRESERVES our
+  // value. Setting the weaker `no-cache` downgraded the host's `no-store` on every panel
+  // asset — the opposite of the intent, and invisible to an 'is the header absent' check,
+  // because the outer middleware has not run yet (codex).
+  assert.match(middleware, /"Cache-Control"\] = "no-store"/);
+  assert.ok(!/= "no-cache"/.test(middleware), "no weaker value than the host would apply");
 });
-
 test("#584 it is scoped to THIS pack's assets", () => {
   assert.match(INIT, /_ASSET_PREFIX = "\/extensions\/comfyui-mcp-panel\/"/);
   assert.match(middleware, /request\.path\.startswith\(_ASSET_PREFIX\)/);
@@ -87,15 +89,17 @@ test("#584 the installer is actually CALLED during registration", () => {
   assert.ok(call > 0 && log > call, "installed before the completion log");
 });
 
-test("#584 the comment records the MEASUREMENT, including the theory it killed", () => {
+test("#584 the comment records the MEASUREMENTS, including the two claims they killed", () => {
   const header = INIT.slice(INIT.indexOf("# #584 —"), INIT.indexOf("_ASSET_PREFIX ="));
-  // The header measurement is the load-bearing fact: it is what rules the cache out on
-  // this version, and what makes this a backstop rather than a fix.
-  assert.match(header, /ALREADY answers `Cache-Control: no-store`/);
-  assert.match(header, /this middleware is a no-op/, "says plainly it does nothing here");
-  // And the retraction, because the wrong theory is the more useful thing to record.
-  assert.match(header, /A CORRECTION worth recording/);
-  assert.match(header, /CANCELLED by ComfyUI's unsaved-changes prompt/);
-  // It must not claim to fix the reported symptom on a host that already sets the header.
+  // (1) the host already has a policy on the version measured, so the cache is not the
+  //     mechanism there — this is a backstop, not a cure.
+  assert.match(header, /already answers `Cache-Control: no-store`/);
+  // (2) the retraction that matters most: setting a WEAKER value did not no-op, it
+  //     downgraded the host, because our middleware finishes before the host's setdefault.
+  assert.match(header, /DOWNGRADED the host's policy/);
+  assert.match(header, /runs INSIDE the host's own `cache_control`/);
+  // and the reproduction that turned out not to be a cache at all
+  assert.match(header, /CANCELLED by ComfyUI's\s*(?:#\s*)?unsaved-changes prompt/);
+  // It must not claim to cure the reported symptom.
   assert.ok(!/guarantees|can never be stale|fixes #584/i.test(header));
 });

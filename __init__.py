@@ -456,26 +456,30 @@ def _start_hint(port, comfyui_url=None):
 # the module docstring.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# #584 — a BACKSTOP for hosts that do not already stop the browser reusing panel JS.
+# #584 — a BACKSTOP for hosts that set no cache policy for extension assets.
 #
-# Measured against the running server (ComfyUI 0.31.1) before claiming anything: every
-# /extensions/ path ALREADY answers `Cache-Control: no-store` — ours and other packs' alike
-# — so on this version the HTTP cache is not the mechanism, and this middleware is a no-op.
-# It only ever acts where the host sets no cache header at all, which is the shape ComfyUI's
-# own e0982a71 describes for older builds: an aiohttp ETag from mtime+size, a 304, stale
-# content served.
+# MEASURED, and the measurement killed two of my own claims in turn.
 #
-# A CORRECTION worth recording, because it was my own working theory. While shipping #753 I
-# saw the page come back running OLD code after `location.reload()` and read it as a cache.
-# It was not: the reload was being CANCELLED by ComfyUI's unsaved-changes prompt, and the
-# code only updated once I suppressed that and navigated. The header measurement above is
-# what ruled the cache out; without it this comment would still be blaming the wrong thing.
+# First: ComfyUI 0.31.1 already answers `Cache-Control: no-store` on every `/extensions/`
+# path — ours and other packs' alike — so the HTTP cache is not the mechanism there. (What
+# I had actually reproduced while shipping #753 was a reload CANCELLED by ComfyUI's
+# unsaved-changes prompt, which is not a cache at all.)
 #
-# `no-cache`, deliberately NOT `no-store`: the browser may keep the file, but must ask before
-# reusing it. Where an ETag exists an unchanged file still answers 304 with no body, so the
-# cost is one conditional request per module rather than a re-download.
+# Second, and the reason this sets `no-store` rather than the `no-cache` it first used
+# (codex): a middleware appended here runs INSIDE the host's own `cache_control`, so ours
+# finishes first. ComfyUI's applies `setdefault("Cache-Control", "no-store")` — which
+# PRESERVES whatever we already put there. Setting the weaker `no-cache` therefore did not
+# no-op on 0.31.1 as claimed; it DOWNGRADED the host's policy on every panel asset. Only
+# checking 'is the header absent' cannot see that, because the outer middleware has not
+# run yet.
 #
-# Scoped to this pack's own assets, and it never overwrites a header the host set.
+# Matching the host's own value removes the inversion by construction: where ComfyUI sets a
+# policy the result is identical, and where a host sets none (older builds — see ComfyUI's
+# e0982a71: an aiohttp ETag from mtime+size, a 304, stale content served) the asset gets
+# the same policy the current host would have given it. This pack does not get to invent a
+# weaker rule for its own files than the server applies to everyone else's.
+#
+# Scoped to this pack's own assets, and it still never overwrites a header already present.
 # ---------------------------------------------------------------------------
 _ASSET_PREFIX = "/extensions/comfyui-mcp-panel/"
 
@@ -496,7 +500,7 @@ def _install_no_cache_middleware(web):
             if request.path.startswith(_ASSET_PREFIX):
                 # Never overwrite a header the host set deliberately.
                 if not response.headers.get("Cache-Control"):
-                    response.headers["Cache-Control"] = "no-cache"
+                    response.headers["Cache-Control"] = "no-store"
         except Exception:  # pragma: no cover - a header must never break a response
             pass
         return response
@@ -510,7 +514,7 @@ def _install_no_cache_middleware(web):
     except Exception as _e:  # pragma: no cover - frozen app / exotic host
         _log("asset revalidation not installed: {}".format(_e))
         return False
-    _log("panel assets set to revalidate (Cache-Control: no-cache)")
+    _log("panel assets given a cache policy where the host set none (Cache-Control: no-store)")
     return True
 
 
