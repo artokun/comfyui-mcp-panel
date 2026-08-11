@@ -195,8 +195,16 @@ export function unavailableRequiredWidgetReport(
     if (!members.length) continue;
     // Every member is a datatype no widget constructor will ever appear for: a built-in
     // connection type, or one the CURRENT backend declares as some node's output.
+    // #1062 — `isCore3dFileType` is a THIRD way for a member to be proven a link datatype,
+    // alongside the built-in allowlist and the live output proof. It exists because the
+    // output proof cannot see a core datatype that no INSTALLED node happens to emit; see
+    // its own comment. The quantifier is still `every` — a proven member never vouches for
+    // an unproven one.
     const linkProven = members.every(
-      (member) => SAFE_SOCKET_TYPES.has(member) || knownSocketTypes?.has?.(member) === true,
+      (member) =>
+        SAFE_SOCKET_TYPES.has(member) ||
+        isCore3dFileType(member) ||
+        knownSocketTypes?.has?.(member) === true,
     );
     // A SINGLE built-in connection datatype is waived on the type alone. Unchanged from
     // before this fix, and sound for the same reason it was then: ComfyUI registers no
@@ -340,6 +348,66 @@ const CORE_DYNAMIC_V3_TYPE_RE = /^COMFY_[A-Z0-9]+_V3$/;
 
 export function isCoreDynamicV3Type(type) {
   return typeof type === "string" && CORE_DYNAMIC_V3_TYPE_RE.test(type);
+}
+
+/**
+ * #1062 — ComfyUI's core 3D FILE-FORMAT datatypes.
+ *
+ * These are link datatypes that OFTEN NOTHING INSTALLED OUTPUTS, which is the specific
+ * blind spot in the output-proof oracle: `knownSocketTypes` proves a type is a link
+ * datatype by finding some node that emits it, so a datatype that is real but simply has
+ * no producer on THIS install is indistinguishable from an unregistered custom widget.
+ *
+ * That is not hypothetical, it is the whole of #1062. Core `SaveGLB` declares
+ * `mesh: ("MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,
+ * FILE_3D_USDZ,FILE_3D_PLY,FILE_3D_SPLAT,FILE_3D_SPZ,FILE_3D_KSPLAT,FILE_3D_SPLAT_ANY,
+ * FILE_3D_POINT_CLOUD_ANY,FILE_3D", {tooltip})`. Measured against a live ComfyUI 0.31 with
+ * 4183 node definitions: SEVEN of those members are emitted by some node
+ * (MESH, FILE_3D_GLB, FILE_3D_OBJ, FILE_3D_FBX, FILE_3D_SPLAT_ANY,
+ * FILE_3D_POINT_CLOUD_ANY, FILE_3D) and SEVEN are emitted by nothing at all
+ * (FILE_3D_GLTF, FILE_3D_STL, FILE_3D_USDZ, FILE_3D_PLY, FILE_3D_SPLAT, FILE_3D_SPZ,
+ * FILE_3D_KSPLAT) — a union naming formats ComfyUI can WRITE but that no installed node
+ * PRODUCES. So `linkProven` was false, and SaveGLB — the only core node that writes a
+ * .glb — could not be placed on the canvas at all.
+ *
+ * WHY NOT #1062'S OWN PROPOSED FIX (`every` -> `some` over the members): because a proven
+ * member must not vouch for an unproven one. An empty config counts as socket-shaped, so
+ * the input-level bar cannot catch `("MESH,ZIPN_STYLE_GALLERY", {})` — only `every` does,
+ * and `some` would admit that node while silently skipping a widget that never registered
+ * (#580's false accept). That invariant is pinned by its own test and is UNCHANGED here:
+ * the quantifier stays `every`. What changes is what a member can be proven BY.
+ *
+ * AN EXPLICIT SET, NOT A `FILE_3D_*` PREFIX — deliberately the opposite choice from
+ * `COMFY_*_V3` above, because the two namespaces have opposite ownership. `COMFY_*_V3` is
+ * ComfyUI's reserved prefix, so covering the family is right and enumerating it would rot.
+ * `FILE_3D_*` is not reserved: a pack is free to invent `FILE_3D_ACME`, and a prefix rule
+ * would launder exactly the unregistered custom member the invariant above exists to
+ * refuse. This is a closed list of the 13 members ComfyUI core ships — verified against the
+ * shipped 1.50.3 frontend, where all 13 appear in the `dataTypes` translation tables (one
+ * entry per locale) and NONE appears as a widget constructor. A future core format is a
+ * one-line addition and fails closed until then, which is the safe direction.
+ *
+ * The caller still requires the input to declare itself socket-shaped, so a node using one
+ * of these types while declaring widget-value keys keeps waiting for its constructor.
+ */
+const CORE_3D_FILE_TYPES = new Set([
+  "FILE_3D",
+  "FILE_3D_FBX",
+  "FILE_3D_GLB",
+  "FILE_3D_GLTF",
+  "FILE_3D_KSPLAT",
+  "FILE_3D_OBJ",
+  "FILE_3D_PLY",
+  "FILE_3D_POINT_CLOUD_ANY",
+  "FILE_3D_SPLAT",
+  "FILE_3D_SPLAT_ANY",
+  "FILE_3D_SPZ",
+  "FILE_3D_STL",
+  "FILE_3D_USDZ",
+]);
+
+export function isCore3dFileType(type) {
+  return typeof type === "string" && CORE_3D_FILE_TYPES.has(type.trim().toUpperCase());
 }
 
 /**

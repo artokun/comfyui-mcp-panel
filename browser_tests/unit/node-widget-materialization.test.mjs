@@ -744,22 +744,96 @@ test("#695/#1062: a socket-shaped union hiding an unproven CUSTOM member stays b
 });
 
 test("#695: a union with ONE unproven member still fails closed", () => {
-  // SaveGaussianSplat.model_3d = FILE_3D_SPLAT_ANY,FILE_3D_PLY,… — proving some members
-  // is not proving the type, so the guard is not weakened into "any member counts".
-  const def = { input: { required: { model_3d: ["FILE_3D_SPLAT_ANY,FILE_3D_PLY", {}] } } };
+  // Proving SOME members is not proving the type, so the guard is not weakened into "any
+  // member counts". #1062 re-targeted the EXAMPLE without touching the RULE: this used to
+  // use SaveGaussianSplat's ("FILE_3D_SPLAT_ANY,FILE_3D_PLY"), and both of those are now
+  // proven core 3D file datatypes — so the pair no longer demonstrates an unproven member.
+  // The quantifier under test is unchanged; only a genuinely unproven member can show it.
+  const def = { input: { required: { model_3d: ["ACME_SPLAT_ANY,ACME_PLY", {}] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(["ACME_SPLAT_ANY"]), def), [
+    "ACME_SPLAT_ANY,ACME_PLY",
+  ]);
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["FILE_3D_SPLAT_ANY"]), def),
-    ["FILE_3D_SPLAT_ANY,FILE_3D_PLY"],
-  );
-  assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(
-      def,
-      {},
-      new Set(["FILE_3D_SPLAT_ANY", "FILE_3D_PLY"]),
-      def,
-    ),
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["ACME_SPLAT_ANY", "ACME_PLY"]), def),
     [],
   );
+});
+
+test("#1062: core SaveGLB is addable — a 3D file union names formats nothing installed OUTPUTS", () => {
+  // The reported dead end, with the declaration read verbatim from a live ComfyUI
+  // /object_info. SaveGLB is the only core node that writes a .glb, so while this failed,
+  // no image-to-3D or text-to-3D graph could be built with panel tools at all.
+  //
+  // Only MESH is passed as output-proven here, and that is the real measurement rather
+  // than a convenience: on a live 4183-node install, seven of these members are emitted by
+  // some node and seven (GLTF, STL, USDZ, PLY, SPLAT, SPZ, KSPLAT) are emitted by nothing.
+  // The union is a list of formats ComfyUI can WRITE, not a list of things it produces.
+  const saveGlb = {
+    input: {
+      required: {
+        mesh: [
+          "MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,FILE_3D_USDZ," +
+            "FILE_3D_PLY,FILE_3D_SPLAT,FILE_3D_SPZ,FILE_3D_KSPLAT,FILE_3D_SPLAT_ANY," +
+            "FILE_3D_POINT_CLOUD_ANY,FILE_3D",
+          { tooltip: "Mesh or 3D file to save" },
+        ],
+        filename_prefix: ["STRING", { default: "3d/ComfyUI", multiline: false }],
+      },
+    },
+  };
+  // `filename_prefix` is an ordinary STRING widget, so the live frontend's own constructor
+  // is supplied for it — that is what the real call site passes. Leaving it out would make
+  // this a test about STRING registration rather than about the union.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(saveGlb, { STRING: () => {} }, new Set(["MESH"]), saveGlb),
+    [],
+    "SaveGLB is addable without waiting for a widget that never registers",
+  );
+  // The union is what was blocking: with the SAME registry, an unproven CUSTOM member in
+  // its place still fails closed, so this is not passing because the registry got richer.
+  const custom = {
+    input: {
+      required: {
+        mesh: ["MESH,ZIPN_STYLE_GALLERY", { tooltip: "x" }],
+        filename_prefix: ["STRING", { default: "3d/ComfyUI", multiline: false }],
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, { STRING: () => {} }, new Set(["MESH"]), custom),
+    ["MESH,ZIPN_STYLE_GALLERY"],
+  );
+});
+
+test("#1062 #580 INTACT: the 3D waiver is a CLOSED list, not a FILE_3D_* prefix", () => {
+  // The whole risk of this fix is laundering: `FILE_3D_*` is NOT a reserved namespace the
+  // way `COMFY_*_V3` is, so a pack can invent one. A prefix rule would admit it and skip a
+  // widget that never registered — the exact #580 false accept the `every` quantifier
+  // exists to prevent. An invented member must therefore still block, even sitting beside
+  // a core sibling and a proven MESH.
+  const acme = { input: { required: { thing: ["MESH,FILE_3D_GLB,FILE_3D_ACME", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(acme, {}, new Set(["MESH"]), acme),
+    ["MESH,FILE_3D_GLB,FILE_3D_ACME"],
+    "an invented FILE_3D_ACME is not vouched for by its core-looking neighbours",
+  );
+  // Output proof still clears it, exactly as for any other custom datatype.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(acme, {}, new Set(["MESH", "FILE_3D_ACME"]), acme),
+    [],
+  );
+});
+
+test("#1062: a core 3D file input declaring a WIDGET value still waits for its constructor", () => {
+  // The type-level waiver never overrides the input-level bar. A declaration carrying
+  // widget-value keys is a widget that ACCEPTS those links, not a socket — the same ruling
+  // #626/#788 reached for ("FLOAT,INT", {widgetType, default, …}).
+  const widgetish = {
+    input: { required: { mesh: ["MESH,FILE_3D_GLB", { default: "none", options: ["none"] }] } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(widgetish, {}, new Set(["MESH"]), widgetish), [
+    "MESH,FILE_3D_GLB",
+  ]);
 });
 
 test("#695: the report names the stuck INPUT and which of the two causes it is", () => {
