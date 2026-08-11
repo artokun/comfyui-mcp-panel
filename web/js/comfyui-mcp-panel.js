@@ -337,6 +337,11 @@ import {
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
+import {
+  INTERACTIVE_ABANDONED,
+  abandonedInteractiveError,
+  isAbandonedInteractive,
+} from "./lib/interactive-abandon.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
   OPEN_DISK_READ_BUDGET_MS,
@@ -16677,12 +16682,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // UI about this socket is suppressed once the patience window has been given up
             // on — so a UI-side belief can be stale exactly when it matters (codex r2).
             result = await onAsk(msg, thisSock.__cmcpSocketId ?? null);
+            // #952 — a card withdrawn by a reconnect resolves with a SENTINEL rather
+            // than staying pending forever. Thrown, so the ordinary error path builds
+            // the reply AND `settleRid` runs: without this the ledger keeps an
+            // un-evictable in-flight entry whose replay would await a promise that can
+            // never resolve, and answer nothing at all.
+            if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "request_secret") {
             // Secure secret entry. The pasted value rides back to the
             // orchestrator (which writes it to config) and is the tool's reply;
             // it is never surfaced to the agent's context or recorded to history.
             if (!onSecret) throw new Error("This panel build can't collect secrets.");
             result = await onSecret(msg, thisSock.__cmcpSocketId ?? null);
+            // #952 — same withdrawal, and the failure carries NO payload, so the
+            // undeliverable-reply path has nothing of the user's to redact.
+            if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "soft_reload") {
             // Agent-triggered soft reload. Reply FIRST (below), then bounce —
             // an "orchestrator" scope kills this very session, so the resume
@@ -22826,11 +22840,27 @@ function buildPanel() {
 
     const selected = new Set();
     let done = false;
+    // #952 — SEPARATE from `done`, which means "the user answered". Retirement asks
+    // `alreadyAnswered: () => done` before disabling anything, so an abandon that set
+    // `done` would make the card skip its own retirement and stay live-looking.
+    let abandoned = false;
     let resolveFn;
     const promise = new Promise((res) => { resolveFn = res; });
 
+    // #952 — end the command WITHOUT answering it. The executor turns this sentinel
+    // into an explicit failure, which settles the rid ledger; leaving the promise
+    // pending instead is what stranded an un-evictable in-flight entry whose replay
+    // could never be answered.
+    const abandon = () => {
+      if (done || abandoned) return;
+      abandoned = true;
+      resolveFn(INTERACTIVE_ABANDONED);
+    };
+
     const finish = (answer) => {
-      if (done) return;
+      // `abandoned` too: the command behind this card has already been failed, so a
+      // late click must not resolve a promise whose reply was already sent.
+      if (done || abandoned) return;
       done = true;
       // Collapse the interactive card into a STATIC result — remove every button
       // and input so it no longer looks clickable / awaiting an answer.
@@ -22937,6 +22967,7 @@ function buildPanel() {
           alreadyAnswered: () => done,
           what: "question",
         }),
+      abandon,
     });
     promise.then(unregister, unregister);
     return promise;
@@ -22973,11 +23004,25 @@ function buildPanel() {
     for (const record of [...liveInteractiveCards]) {
       if (record.paintedOnSocket === liveSocketId) continue;
       liveInteractiveCards.delete(record);
+      // RETIRE FIRST, then abandon — and in SEPARATE try blocks, so neither step can
+      // be skipped by the other throwing. Order matters: retirement asks the card
+      // whether it was already answered, and abandonment is what makes that question
+      // unanswerable, so abandoning first would be indistinguishable from an answer
+      // to a future reader of either flag.
       try {
         record.retire?.();
       } catch {
         // A card that cannot be retired is left exactly as it was — never a thrown
         // error out of a connection callback.
+      }
+      // #952 — the DOM half above only stops the card LOOKING answerable. This half
+      // ends the command behind it: without it the executor stays suspended, its rid
+      // ledger entry stays in-flight forever (in-flight entries are never evicted),
+      // and a redelivery of that rid awaits a promise that can never resolve.
+      try {
+        record.abandon?.();
+      } catch {
+        // Same rule: a card whose command cannot be ended is exactly where it was.
       }
     }
   }
@@ -23038,8 +23083,21 @@ function buildPanel() {
     card.appendChild(hint);
 
     let done = false;
+    // #952 — see paintQuestion: distinct from `done`, because retirement asks
+    // `alreadyAnswered: () => done` and an abandon that set it would suppress the
+    // card's own retirement.
+    let abandoned = false;
     let resolveFn;
     const promise = new Promise((res) => { resolveFn = res; });
+
+    // #952 — end the command without producing a value. Nothing was typed, so the
+    // failure that the executor builds from this carries no payload at all: there is
+    // no secret for the undeliverable-reply path to have to redact.
+    const abandon = () => {
+      if (done || abandoned) return;
+      abandoned = true;
+      resolveFn(INTERACTIVE_ABANDONED);
+    };
 
     // #8 SIZING. The field is the whole point of this card, and it used to be the
     // first thing squeezed: on one unwrapped line the two buttons cannot shrink
@@ -23075,7 +23133,9 @@ function buildPanel() {
     const mask = (v) =>
       !v ? "" : v.length <= 8 ? "•".repeat(v.length) : `${v.slice(0, 4)}…${v.slice(-4)}`;
     const finish = (value) => {
-      if (done) return;
+      // `abandoned` too — a late submit must not resolve a promise whose command was
+      // already failed and replied to (#952).
+      if (done || abandoned) return;
       done = true;
       input.value = ""; // clear the field immediately
       card.replaceChildren();
@@ -23155,6 +23215,7 @@ function buildPanel() {
             "Nothing was sent and nothing was stored. Wait for the agent to ask again on " +
             "the new connection — do not paste the value into the chat.",
         }),
+      abandon,
     });
     promise.then(unregisterSecret, unregisterSecret);
     return promise;
