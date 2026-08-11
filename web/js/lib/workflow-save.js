@@ -1340,7 +1340,19 @@ function isExternalWorkflowPath(path) {
   // directory and is still outside the managed /userdata store. A managed store path is
   // always relative "workflows/…" (no drive letter, no leading separator), so this
   // never touches the everyday save path.
-  return /^[a-zA-Z]:/.test(raw) || /^[\\/]/.test(raw);
+  // #1066 — a URL is external too, and it was the one shape both tests missed. ComfyUI
+  // mints a TEMPORARY workflow whose path is the URL an asset was opened from
+  // (`workflows/http://127.0.0.1:8188/api/view?filename=…`), and renaming that tab replaces
+  // only the FILENAME — so the URL survives as the tab's DIRECTORY. It has no leading
+  // separator, and its colon sits at index 4 rather than 1, so neither test above fires:
+  // the directory was accepted verbatim and the save built
+  // `workflows/http://127.0.0.1:8188/api/Name.json`, which /userdata rejects with a 500.
+  // The tab could not be saved under ANY name.
+  //
+  // A scheme is checked rather than the literal "http", so file:, blob: and data: are
+  // covered by the same rule. Requiring "//" after the colon keeps this away from an
+  // ordinary Windows drive letter, which the first test already owns.
+  return /^[a-zA-Z]:/.test(raw) || /^[\\/]/.test(raw) || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw);
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
