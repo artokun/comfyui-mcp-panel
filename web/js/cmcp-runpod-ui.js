@@ -84,21 +84,43 @@ function toolText(res) {
   if (Array.isArray(r)) return r.map((c) => (c && c.text) || "").join("");
   if (r && Array.isArray(r.content)) return r.content.map((c) => (c && c.text) || "").join("");
   if (typeof r === "string") return r;
-  return res.ok === false ? "The action failed." : "Done.";
+  // Only reached when the frame carried no text of its own; the tool's own prose is
+  // the orchestrator's to translate, these two are ours.
+  return res.ok === false
+    ? tr("runpod_ui.the_action_failed", "The action failed.")
+    : tr("runpod_ui.done", "Done.");
 }
 
+// Durations are translated as WHOLE forms ("{hours}h {minutes}m"), not as a number
+// glued to a translated unit. A language that writes the unit before the number, or
+// joins them without a space, has to move both parts — a per-unit key would freeze
+// our English word order into every translation.
 function fmtUptime(sec) {
   if (!sec || sec <= 0) return "—";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  return h > 0
+    ? tr("runpod_ui.uptime_hours_minutes", "{hours}h {minutes}m", { hours: h, minutes: m })
+    : tr("runpod_ui.uptime_minutes", "{minutes}m", { minutes: m });
 }
 function fmtCountdown(sec) {
   if (sec == null) return null;
-  if (sec <= 0) return "now";
+  if (sec <= 0) return tr("runpod_ui.now", "now");
   const m = Math.floor(sec / 60);
   const s = sec % 60;
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  return m > 0
+    ? tr("runpod_ui.countdown_minutes_seconds", "{minutes}m {seconds}s", { minutes: m, seconds: s })
+    : tr("runpod_ui.countdown_seconds", "{seconds}s", { seconds: s });
+}
+
+/**
+ * "$0.690/hr". The currency symbol and the three-decimal format are deliberately NOT
+ * translated: RunPod bills in USD and quotes three decimals, so re-rendering that as a
+ * local currency or a local decimal separator would misstate what the user is charged.
+ * Only the "per hour" unit is translatable.
+ */
+function fmtCost(perHr) {
+  return tr("runpod_ui.cost_per_hour", "${cost}/hr", { cost: Number(perHr).toFixed(3) });
 }
 
 /** Content-provider factory for the Local/RunPod tab of the unified side panel.
@@ -134,11 +156,13 @@ export function createLocalContent(ctx, shell, opts = {}) {
   connectRow.className = "cmcp-rp-connect";
   const podSelect = document.createElement("select");
   podSelect.className = "cmcp-rp-podselect";
-  podSelect.append(new Option("Loading pods…", ""));
+  podSelect.append(new Option(tr("runpod_ui.loading_pods", "Loading pods…"), ""));
+  // "↻" is a glyph, not prose — nothing to translate, and the accessible name is the
+  // `title` below.
   const refreshBtn = mkBtn("↻");
   refreshBtn.title = tr("runpod_ui.refresh_pod_list", "Refresh pod list");
   refreshBtn.classList.add("cmcp-rp-refresh");
-  const connectBtn = mkBtn("Connect", "primary");
+  const connectBtn = mkBtn(tr("runpod_ui.connect", "Connect"), "primary");
   connectRow.append(podSelect, refreshBtn, connectBtn);
 
   // Manual-ID row (hidden unless "paste a pod ID…" is chosen in the dropdown).
@@ -166,10 +190,10 @@ export function createLocalContent(ctx, shell, opts = {}) {
   // Action buttons.
   const actions = document.createElement("div");
   actions.className = "cmcp-rp-actions";
-  const startBtn = mkBtn("Start");
-  const stopBtn = mkBtn("Stop");
-  const localBtn = mkBtn("Use Local");
-  const deployBtn = mkBtn("Deploy new pod", "primary");
+  const startBtn = mkBtn(tr("runpod_ui.start", "Start"));
+  const stopBtn = mkBtn(tr("runpod_ui.stop", "Stop"));
+  const localBtn = mkBtn(tr("runpod_ui.use_local", "Use Local"));
+  const deployBtn = mkBtn(tr("runpod_ui.deploy_new_pod", "Deploy new pod"), "primary");
   actions.append(startBtn, stopBtn, localBtn, deployBtn);
 
   const linkRow = document.createElement("div");
@@ -185,7 +209,25 @@ export function createLocalContent(ctx, shell, opts = {}) {
 
   const credit = document.createElement("div");
   credit.className = "cmcp-rp-credit";
-  credit.innerHTML = `Pod control inspired by <a href="${GPU_CLI_URL}" target="_blank" rel="noopener">gpu-cli.sh</a>.`;
+  // Assembled from nodes instead of one innerHTML string. The anchor — href, target,
+  // rel="noopener" — is built here, so the only thing a catalog entry contributes is
+  // text; no translation can put markup into the DOM, and no translator can break the
+  // link by mistyping a tag. `{link}` is a POSITION marker, not a `vars` value (it is
+  // deliberately not passed to tr, so it survives interpolation and we split on it):
+  // languages order "inspired by X" differently, and a fixed prose-then-link split
+  // would force our word order on all of them.
+  const creditLink = document.createElement("a");
+  creditLink.href = GPU_CLI_URL;
+  creditLink.target = "_blank";
+  creditLink.rel = "noopener";
+  creditLink.textContent = "gpu-cli.sh";
+  const creditParts = tr(
+    "runpod_ui.pod_control_inspired_by_link",
+    "Pod control inspired by {link}.",
+  ).split("{link}");
+  // A translation that dropped {link} yields a single part; append the anchor anyway
+  // rather than silently losing the attribution.
+  credit.append(creditParts[0], creditLink, ...creditParts.slice(1));
 
   body.append(title, host, card, connectRow, manualRow, actions, linkRow, log, credit);
 
@@ -231,17 +273,26 @@ export function createLocalContent(ctx, shell, opts = {}) {
       }
       const want = preselect || selectedPodId();
       podSelect.innerHTML = "";
-      podSelect.append(new Option(rows.length ? "— select a pod —" : "no pods yet — deploy one below", ""));
+      podSelect.append(
+        new Option(
+          rows.length
+            ? tr("runpod_ui.select_a_pod", "— select a pod —")
+            : tr("runpod_ui.no_pods_yet_deploy_one_below", "no pods yet — deploy one below"),
+          "",
+        ),
+      );
       for (const r of rows) {
+        // Untranslated on purpose: every piece is RunPod's own data — the pod name the
+        // user typed, the API's status enum (RUNNING/EXITED), and the GPU model.
         podSelect.append(new Option(`${r.name} — ${r.status}${r.gpu ? " · " + r.gpu : ""}`, r.id));
       }
-      podSelect.append(new Option("＋ paste a pod ID…", "__manual__"));
+      podSelect.append(new Option(tr("runpod_ui.paste_a_pod_id", "＋ paste a pod ID…"), "__manual__"));
       if (want && rows.some((r) => r.id === want)) podSelect.value = want;
       else if (rows.length === 1) podSelect.value = rows[0].id;
     } catch (err) {
       podSelect.innerHTML = "";
-      podSelect.append(new Option("couldn't list pods", ""));
-      podSelect.append(new Option("＋ paste a pod ID…", "__manual__"));
+      podSelect.append(new Option(tr("runpod_ui.couldn_t_list_pods", "couldn't list pods"), ""));
+      podSelect.append(new Option(tr("runpod_ui.paste_a_pod_id", "＋ paste a pod ID…"), "__manual__"));
     }
     manualRow.style.display = podSelect.value === "__manual__" ? "flex" : "none";
   }
@@ -261,9 +312,11 @@ export function createLocalContent(ctx, shell, opts = {}) {
     host.classList.toggle("local", !onPod);
     host.classList.toggle("pod", onPod);
     if (onPod && s && s.watching) {
-      const bits = [s.name || s.pod_id || "RunPod pod"];
+      // `s.name` / `s.pod_id` / `s.gpu` are RunPod's own values and stay verbatim; only
+      // the last-resort label when the frame carries neither is ours to translate.
+      const bits = [s.name || s.pod_id || tr("runpod_ui.runpod_pod", "RunPod pod")];
       if (s.gpu) bits.push(s.gpu);
-      if (s.cost_per_hr != null) bits.push(`$${Number(s.cost_per_hr).toFixed(3)}/hr`);
+      if (s.cost_per_hr != null) bits.push(fmtCost(s.cost_per_hr));
       hostText.textContent = tr("runpod_ui.rendering_on_runpod", "Rendering on RunPod · ") + bits.join(" · ");
     } else if (onPod) {
       hostText.textContent = tr("runpod_ui.rendering_on_a_remote_pod", "Rendering on a remote pod");
@@ -274,25 +327,42 @@ export function createLocalContent(ctx, shell, opts = {}) {
     // Status card.
     card.innerHTML = "";
     if (s && s.watching && s.pod_id) {
-      addRow(card, "Pod", `${s.name || "(unnamed)"}  ${s.pod_id}`);
-      addRow(card, "Status", s.status || "—");
-      if (s.gpu) addRow(card, "GPU", s.gpu);
-      if (s.cost_per_hr != null) addRow(card, "Cost", `$${Number(s.cost_per_hr).toFixed(3)}/hr`);
-      if (s.uptime_seconds != null) addRow(card, "Uptime", fmtUptime(s.uptime_seconds));
-      if (s.gpu_util != null) addRow(card, "GPU / VRAM", `${s.gpu_util}% / ${s.vram_util ?? "—"}%`);
+      // addRow(parent, LABEL, VALUE, mono, vClass): args 2 and 3 are rendered text and
+      // are translated; the trailing "cmcp-rp-warn" below is a CSS CLASS and must not be.
+      // Values that come off the wire (pod id, status enum, GPU model, the ComfyUI URL)
+      // stay verbatim — only the labels and our own prose are translated.
+      addRow(card, tr("runpod_ui.pod", "Pod"), `${s.name || tr("runpod_ui.unnamed", "(unnamed)")}  ${s.pod_id}`);
+      addRow(card, tr("runpod_ui.status", "Status"), s.status || "—");
+      if (s.gpu) addRow(card, tr("runpod_ui.gpu", "GPU"), s.gpu);
+      if (s.cost_per_hr != null) addRow(card, tr("runpod_ui.cost", "Cost"), fmtCost(s.cost_per_hr));
+      if (s.uptime_seconds != null) addRow(card, tr("runpod_ui.uptime", "Uptime"), fmtUptime(s.uptime_seconds));
+      if (s.gpu_util != null) addRow(card, tr("runpod_ui.gpu_vram", "GPU / VRAM"), `${s.gpu_util}% / ${s.vram_util ?? "—"}%`);
+      // "ComfyUI" is the product's name, not a word — it is the same in every locale.
       if (s.comfyui_url) addRow(card, "ComfyUI", s.comfyui_url, true);
       const cd = fmtCountdown(s.autostop_in_seconds);
       if (cd && s.autostop_minutes) {
-        addRow(card, "Auto-stop", `idle — stops in ${cd}`, false, "cmcp-rp-warn");
+        addRow(
+          card,
+          tr("runpod_ui.auto_stop", "Auto-stop"),
+          tr("runpod_ui.idle_stops_in", "idle — stops in {time}", { time: cd }),
+          false,
+          "cmcp-rp-warn",
+        );
       } else if (s.autostop_minutes) {
-        addRow(card, "Auto-stop", `after ${s.autostop_minutes}m idle`);
+        addRow(
+          card,
+          tr("runpod_ui.auto_stop", "Auto-stop"),
+          tr("runpod_ui.after_minutes_idle", "after {minutes}m idle", { minutes: s.autostop_minutes }),
+        );
       }
     } else {
       const empty = document.createElement("div");
       empty.className = "cmcp-rp-muted";
-      empty.textContent =
+      empty.textContent = tr(
+        "runpod_ui.no_pod_being_watched_deploy_a_new",
         "No pod being watched. Deploy a new pod, or paste a pod ID and Connect. " +
-        "The pod runs our template, so the agent can set up your exact nodes, LoRAs and models on it.";
+          "The pod runs our template, so the agent can set up your exact nodes, LoRAs and models on it.",
+      );
       card.append(empty);
     }
 
@@ -342,15 +412,19 @@ export function createLocalContent(ctx, shell, opts = {}) {
   connectBtn.addEventListener("click", () => {
     const id = selectedPodId();
     if (!id) {
-      setLog("Pick a pod from the list first (or deploy a new one).", "err");
+      setLog(tr("runpod_ui.pick_a_pod_from_the_list_first", "Pick a pod from the list first (or deploy a new one)."), "err");
       return;
     }
-    run("Connecting to " + id, () => callTool("runpod", { action: "connect", pod_id: id }));
+    // The pod id is a var, not concatenation: a language that puts the object first
+    // needs to move it, which "prefix + id" would not allow.
+    run(tr("runpod_ui.connecting_to_pod", "Connecting to {id}", { id }), () =>
+      callTool("runpod", { action: "connect", pod_id: id }),
+    );
   });
   startBtn.addEventListener("click", () => {
     const id = currentPodId();
     if (!id) {
-      setLog("No pod selected — paste a pod ID, or Deploy a new one.", "err");
+      setLog(tr("runpod_ui.no_pod_selected_paste_a_pod_id", "No pod selected — paste a pod ID, or Deploy a new one."), "err");
       return;
     }
     // PRE-EXISTING, not a consolidation regression: the orchestrator's direct-call
@@ -361,15 +435,21 @@ export function createLocalContent(ctx, shell, opts = {}) {
     // the wording of the refusal changes here. Making them work again is a product
     // decision (route through an agent turn, or scope admission to a confirmed
     // click), deliberately NOT taken in this migration step.
-    run("Starting " + id, () => callTool("runpod", { action: "start", pod_id: id }));
+    run(tr("runpod_ui.starting_pod", "Starting {id}", { id }), () =>
+      callTool("runpod", { action: "start", pod_id: id }),
+    );
   });
   stopBtn.addEventListener("click", () => {
     const id = watchedPodId();
     if (!id) return;
-    run("Stopping " + id, () => callTool("runpod", { action: "stop", pod_id: id }));
+    run(tr("runpod_ui.stopping_pod", "Stopping {id}", { id }), () =>
+      callTool("runpod", { action: "stop", pod_id: id }),
+    );
   });
   localBtn.addEventListener("click", () => {
-    run("Switching to local ComfyUI", () => callTool("runpod", { action: "use_local" }));
+    run(tr("runpod_ui.switching_to_local_comfyui", "Switching to local ComfyUI"), () =>
+      callTool("runpod", { action: "use_local" }),
+    );
   });
   // Confirm must be two DISTINCT human decisions, not one gesture. Arming opens
   // a short cool-down that ignores confirm clicks (rapid double-click), and a
@@ -394,7 +474,15 @@ export function createLocalContent(ctx, shell, opts = {}) {
       deployArmedAt = Date.now();
       const gen = ++deployArmGen;
       deployBtn.textContent = tr("runpod_ui.deploy_this_bills_click_to_confirm", "Deploy — this bills. Click to confirm");
-      setLog("A new pod bills per running GPU-second (~$0.30–0.70/hr). It idle-auto-stops; Stop ends GPU billing (disk storage still bills until you terminate the pod in the console).", "");
+      // The price range is USD, as RunPod quotes it — a translated panel must not
+      // restate someone's bill in a currency they are not charged in.
+      setLog(
+        tr(
+          "runpod_ui.a_new_pod_bills_per_running_gpu",
+          "A new pod bills per running GPU-second (~$0.30–0.70/hr). It idle-auto-stops; Stop ends GPU billing (disk storage still bills until you terminate the pod in the console).",
+        ),
+        "",
+      );
       setTimeout(() => {
         // Only disarm the arming that scheduled this timer — a newer arm (e.g.
         // after a deploy completes and re-arms) must not be cleared by an old one.
@@ -411,7 +499,9 @@ export function createLocalContent(ctx, shell, opts = {}) {
     deployArmGen++; // invalidate the pending disarm timer for this arming
     deployBtn.dataset.armed = "0";
     deployBtn.textContent = tr("runpod_ui.deploy_new_pod", "Deploy new pod");
-    run("Deploying a new pod", () => callTool("runpod", { action: "create" }, { timeout: 120000 })).then((ok) => {
+    run(tr("runpod_ui.deploying_a_new_pod", "Deploying a new pod"), () =>
+      callTool("runpod", { action: "create" }, { timeout: 120000 }),
+    ).then((ok) => {
       if (ok) loadPods(); // show the new pod in the dropdown
     });
   });
