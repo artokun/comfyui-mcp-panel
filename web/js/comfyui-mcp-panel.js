@@ -16062,7 +16062,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // readiness probe, which can be wrong (e.g. a CLI the orchestrator's PATH
     // can't see). try/catch guards the case where the card isn't built yet.
     if (s === "connected") { try { onboard.hidden = true; } catch {} }
-    onStatus(s);
+    // #952 — the SOCKET this status is about. `"connected"` re-fires on every
+    // re-handshake, so the string alone cannot distinguish a replacement connection
+    // from the live one saying hello again; the id can, and a consumer that ignores
+    // the argument behaves exactly as before.
+    onStatus(s, sock?.__cmcpSocketId ?? null);
   }
   // FIX 1/2 — STEADY status + cold-start patience. While we're actively (auto)
   // reconnecting we hold the pill on a steady "connecting"; a terminal
@@ -16118,6 +16122,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       handshakeTimer = null;
     }
   }
+  let socketSeq = 0;
   function markConnected() {
     handshakeDone = true;
     handshakenSock = sock;
@@ -16317,6 +16322,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       return;
     }
     sock = thisSock;
+    // #952 — a SOCKET identity for the UI. `"connected"` is emitted on every
+    // re-handshake (every `models` frame calls markConnected, and a workflow change
+    // re-hellos the LIVE socket), so the status string cannot tell a replacement
+    // connection from the same one saying hello again — and a UI that treats each as a
+    // replacement would retire question cards that are still perfectly answerable
+    // (codex). This id changes only when a WebSocket is constructed.
+    thisSock.__cmcpSocketId = ++socketSeq;
     // Stamp the socket with the bridge it belongs to, so a replay onto it can be checked
     // against the entry's origin rather than against the mutable current `url`.
     try {
@@ -16583,13 +16595,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // chat (UI scope) and block on the user's pick. The chosen string
             // becomes the tool result the agent receives.
             if (!onAsk) throw new Error("This panel build can't display questions.");
-            result = await onAsk(msg);
+            // #952 — the card is tied to the socket that ASKED, taken from the frame's own
+            // socket rather than from whatever the UI currently believes is live. A command
+            // is accepted before the handshake, and the open status that would have told the
+            // UI about this socket is suppressed once the patience window has been given up
+            // on — so a UI-side belief can be stale exactly when it matters (codex r2).
+            result = await onAsk(msg, thisSock.__cmcpSocketId ?? null);
           } else if (msg.cmd === "request_secret") {
             // Secure secret entry. The pasted value rides back to the
             // orchestrator (which writes it to config) and is the tool's reply;
             // it is never surfaced to the agent's context or recorded to history.
             if (!onSecret) throw new Error("This panel build can't collect secrets.");
-            result = await onSecret(msg);
+            result = await onSecret(msg, thisSock.__cmcpSocketId ?? null);
           } else if (msg.cmd === "soft_reload") {
             // Agent-triggered soft reload. Reply FIRST (below), then bounce —
             // an "orchestrator" scope kills this very session, so the resume
@@ -22711,7 +22728,7 @@ function buildPanel() {
    * An always-present "Other…" field lets the user answer freely. Returns the
    * chosen string (comma-joined for multi-select) — the agent's tool result.
    */
-  function paintQuestion(msg) {
+  function paintQuestion(msg, paintedOnSocket = null) {
     clearEmpty();
     const opts = Array.isArray(msg.options) ? msg.options : [];
     const multi = !!msg.multi_select;
@@ -22828,7 +22845,89 @@ function buildPanel() {
 
     log.appendChild(card);
     scrollLog();
+    // #952 — REGISTER THE CARD AGAINST THE CONNECTION THAT PAINTED IT. A reply of this
+    // kind is deliberately not replayed across a reconnect, so once this connection is
+    // replaced the card cannot deliver an answer to anyone — while still looking exactly
+    // as clickable as a newer card asking the same thing. The orchestrator's own message
+    // has to warn "the user may see two … tell them which one to answer"; the panel is
+    // the side that can just say it.
+    // #952 — tracked ONLY when a command painted it. A card with no command behind it
+    // has no socket to be orphaned by, and retiring it would disable something that
+    // still works (codex r3).
+    const unregister = paintedOnSocket == null ? () => {} : registerInteractiveCard({
+      paintedOnSocket,
+      retire: () =>
+        retireInteractiveCard(card, {
+          alreadyAnswered: () => done,
+          what: "question",
+        }),
+    });
+    promise.then(unregister, unregister);
     return promise;
+  }
+
+  /**
+   * #952 — cards painted on a connection that has since been replaced.
+   *
+   * KEYED ON THE SOCKET, not on the status string (codex). `"connected"` is emitted on
+   * every RE-HANDSHAKE — each `models` frame calls `markConnected`, and a workflow change
+   * re-hellos the LIVE socket — so counting those would retire question cards that are
+   * still perfectly answerable, which is worse than the duplicate this fixes. The client
+   * mints an id per WebSocket and hands it to `onStatus`; a card records the id that was
+   * live when it was painted, and only a DIFFERENT id retires it.
+   *
+   * Deliberately NOT resolving the card's promise. The command that painted it already
+   * failed with an unknown outcome on the socket that dropped; resolving here would send
+   * an answer nowhere, and the panel's own rule is that a reply of this kind does not
+   * cross a reconnect. The card stops LOOKING answerable, and says why.
+   */
+  /** The socket id the UI currently believes it is talking to (#952). */
+  let liveSocketId = null;
+  const liveInteractiveCards = new Set();
+
+  function registerInteractiveCard(entry) {
+    // Every entry names the socket its COMMAND arrived on; a card with no command
+    // behind it is never registered, so there is no belief-based fallback here.
+    const record = { paintedOnSocket: null, ...entry };
+    liveInteractiveCards.add(record);
+    return () => liveInteractiveCards.delete(record);
+  }
+
+  function retireInteractiveCardsFromPreviousSockets() {
+    for (const record of [...liveInteractiveCards]) {
+      if (record.paintedOnSocket === liveSocketId) continue;
+      liveInteractiveCards.delete(record);
+      try {
+        record.retire?.();
+      } catch {
+        // A card that cannot be retired is left exactly as it was — never a thrown
+        // error out of a connection callback.
+      }
+    }
+  }
+
+  /** Turn a live interactive card into a dead one: no controls, and a reason. */
+  function retireInteractiveCard(card, { alreadyAnswered, what, detail } = {}) {
+    try {
+      if (typeof alreadyAnswered === "function" && alreadyAnswered()) return;
+      if (!card || !card.isConnected) return;
+      for (const el of card.querySelectorAll("button, input, textarea, select")) {
+        el.disabled = true;
+        el.style.opacity = "0.5";
+        el.style.cursor = "not-allowed";
+      }
+      card.style.opacity = "0.6";
+      const note = document.createElement("div");
+      note.className = "cmcp-card-stale";
+      note.style.cssText = "font-size:0.68rem;opacity:0.8;margin-top:0.4rem;";
+      note.textContent =
+        `The connection that asked this ${what ?? "question"} dropped, so an answer here can no ` +
+        `longer reach the agent. ` +
+        (detail ?? "If it asked again, answer the newer card.");
+      card.appendChild(note);
+    } catch {
+      /* presentation only — never break a reconnect */
+    }
   }
 
   /**
@@ -22839,7 +22938,7 @@ function buildPanel() {
    * over the bridge to the orchestrator (which writes it to config); it never
    * enters the agent's context.
    */
-  function paintSecret(msg) {
+  function paintSecret(msg, paintedOnSocket = null) {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card cmcp-secret";
@@ -22959,6 +23058,29 @@ function buildPanel() {
     log.appendChild(card);
     scrollLog();
     setTimeout(() => input.focus(), 0);
+    // #952 — the SECRET card needs this more than the question card does (codex). It is
+    // a live password field whose reply has nowhere to go once its connection is
+    // replaced, and it can still display "Token saved" — telling a user their token was
+    // stored when nothing received it. Same retirement, different words: never suggest
+    // typing the value somewhere else, because the whole point of this card is that the
+    // value reaches the orchestrator through an input the agent never sees.
+    // #952 — command-originated cards only. The Settings "Set … token" buttons paint
+    // this same card with no command behind them, and that card is agent-free: after a
+    // reconnect it can still send its set_secret on the current socket, so retiring it
+    // would disable a working control and tell the user to wait for a request that is
+    // never coming (codex r3).
+    const unregisterSecret = paintedOnSocket == null ? () => {} : registerInteractiveCard({
+      paintedOnSocket,
+      retire: () =>
+        retireInteractiveCard(card, {
+          alreadyAnswered: () => done,
+          what: "secret request",
+          detail:
+            "Nothing was sent and nothing was stored. Wait for the agent to ask again on " +
+            "the new connection — do not paste the value into the chat.",
+        }),
+    });
+    promise.then(unregisterSecret, unregisterSecret);
     return promise;
   }
 
@@ -24567,8 +24689,22 @@ function buildPanel() {
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
   const client = createBridgeClient({
-    onStatus(state) {
+    onStatus(state, socketId) {
       statusText.textContent = state;
+      // #952 — a card painted on a connection that has since been REPLACED can no longer
+      // deliver an answer. The trigger is the socket's identity, not the status string:
+      // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
+      // change re-hellos the live socket), so keying on it would retire cards that are
+      // still perfectly answerable (codex).
+      // ADOPT AS SOON AS THE SOCKET EXISTS, RETIRE ONLY ONCE IT HAS HANDSHAKEN (codex r2).
+      // A command frame is accepted before the handshake, so an interactive card CAN be
+      // painted on a socket whose id the UI has not adopted yet — and it would then look
+      // like it belonged to the PREVIOUS connection and be retired the moment this one
+      // finished handshaking, killing a card that is perfectly live. Adoption happens on
+      // the open status that carries the new id; the sweep waits for `connected`, which is
+      // the point at which the previous connection is definitively replaced.
+      if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
+      if (state === "connected") retireInteractiveCardsFromPreviousSockets();
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       // Connection status does NOT drive this box's visibility. It's a
       // dropdown: the user opens it and the user closes it (trigger, click
@@ -24685,11 +24821,11 @@ function buildPanel() {
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
-    onAsk(msg) {
+    onAsk(msg, socketId) {
       // Fence FIRST: a card from a turn this tab no longer owns must not paint,
       // and must not revive the working indicator on its way past either.
       fenceInteractiveCard("ask_user");
-      const p = paintQuestion(msg);
+      const p = paintQuestion(msg, socketId);
       bumpThinking();
       noteActivity(); // a panel_ask frame is real turn activity → reset the clock
       return p;
@@ -24845,7 +24981,7 @@ function buildPanel() {
       setThinkingTokens(tokens);
     },
     // The agent called panel_request_secret — collect a token securely.
-    onSecret(msg) {
+    onSecret(msg, socketId) {
       // If this secure request was kicked off from a Settings "Set … token" button,
       // record a (non-secret) "set at" marker once a non-empty value is submitted so
       // the Settings indicator can show set/not-set. Only the timestamp is stored.
@@ -24859,7 +24995,7 @@ function buildPanel() {
       // no longer owns must not get a masked input painted into the conversation
       // that happens to be on screen — see lib/interactive-card-fence.js.
       fenceInteractiveCard("request_secret");
-      const p = paintSecret(msg);
+      const p = paintSecret(msg, socketId);
       bumpThinking();
       if (req) {
         p.then((value) => {

@@ -235,7 +235,10 @@ test("an unknown reason still produces a refusal, never an empty or partial stri
 
 /** Pull one 4-space-indented object-literal method out of the panel source. */
 function extractMethod(name) {
-  const re = new RegExp(`\\n {4}${name}\\(msg\\) \\{[\\s\\S]*?\\n {4}\\},`);
+  // #952 threaded the painting socket id through these callbacks, so they take a second
+  // parameter now. Matched on the NAME and an open paren, so a later parameter cannot
+  // break a guard that is about the fence rather than the signature.
+  const re = new RegExp(`\\n {4}${name}\\(msg[^)]*\\) \\{[\\s\\S]*?\\n {4}\\},`);
   const m = panelSrc.match(re);
   assert.ok(m, `could not locate ${name} in the panel source`);
   return m[0];
