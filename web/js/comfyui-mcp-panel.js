@@ -12018,7 +12018,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
     const replyIdentity = saveProducedIdentity(producedRecord, true);
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: true }) };
+    // #978 — the DISCLOSURE follows what the save actually did, not this handler's name
+    // (codex). Asked to save an unsaved tab, the adapter classifies it `first_save`: the
+    // successor is identity-CONTINUOUS with the temporary predecessor, so the root's
+    // pre-save uuid already IS the active workflow's and no fence is about to refuse.
+    // Telling that caller to re-fence and to re-open the workflow would send them fixing
+    // something that is not broken.
+    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------

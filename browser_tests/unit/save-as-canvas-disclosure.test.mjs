@@ -40,8 +40,14 @@ test("#978 a Save-As reply says the canvas was NOT repainted, and names the reme
   const reply = saveReplyIdentity(IDENTITY, { savedAs: true });
   assert.equal(reply.workflow_uuid, IDENTITY.uuid, "the identity to re-fence to is still reported");
   assert.equal(reply.workflow_instance_changed, true);
-  assert.equal(reply.canvas_not_repainted, true, "the fact a caller cannot otherwise observe");
-  assert.match(reply.workflow_instance_note, /still holds the source workflow's graph/);
+  assert.equal(reply.canvas_repaint_not_requested, true, "the fact a caller cannot otherwise observe");
+  assert.match(reply.workflow_instance_note, /canvas still holds the source workflow's graph/);
+  // CONDITIONAL, because nothing here observes the root at reply time (codex): a user or
+  // a reconnect could repaint the copy during the save's awaits. What is established is
+  // that the save did not ASK for a repaint.
+  assert.match(reply.workflow_instance_note, /unless something else repainted it/, "stated conditionally");
+  assert.match(reply.workflow_instance_note, /If a graph command is then refused/, "conditional consequence");
+  assert.doesNotMatch(reply.workflow_instance_note, /and a graph command is refused for/, "never asserts it will happen");
   // The whole instruction, not just the tool name: an earlier assertion matched
   // `/panel_open_workflow/` alone and survived a mutation that replaced "Open the saved"
   // with "Do nothing", because the parenthesised tool name was still there.
@@ -50,14 +56,14 @@ test("#978 a Save-As reply says the canvas was NOT repainted, and names the reme
     /Open the saved workflow \(panel_open_workflow\) to put it on the canvas/,
     "the one call that fixes it, as an instruction",
   );
-  assert.match(reply.workflow_instance_note, /That alone is not enough for GRAPH tools/, "re-fencing is not sufficient");
+  assert.match(reply.workflow_instance_note, /That may not be enough for GRAPH tools/, "re-fencing may not suffice");
 });
 
 test("#978 an IN-PLACE save says none of it — nothing changed about which canvas is live", () => {
   const reply = saveReplyIdentity(IDENTITY, { savedAs: false });
   assert.equal(reply.workflow_uuid, IDENTITY.uuid);
   assert.equal("workflow_instance_changed" in reply, false);
-  assert.equal("canvas_not_repainted" in reply, false);
+  assert.equal("canvas_repaint_not_requested" in reply, false);
   assert.equal("workflow_instance_note" in reply, false);
 });
 
@@ -87,4 +93,32 @@ test("#978 the unsound root stamp is NOT in the panel", () => {
   // canvas. Removed in review; this keeps it removed.
   const panel = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.ok(!/stampRootForProducedSave/.test(panel), "a save must not claim a canvas it did not repaint");
+});
+
+test("#978 (codex r2) a FIRST SAVE gets none of the Save-As warnings", () => {
+  // Asked to save an unsaved tab, the adapter classifies it `first_save`: the successor is
+  // identity-CONTINUOUS with the temporary predecessor, so the root's pre-save uuid already
+  // IS the active workflow's and no fence is about to refuse. Telling that caller to
+  // re-fence and re-open would send them fixing something that is not broken.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const handler = src.slice(src.indexOf("async workflow_save_as({"));
+  const body = handler.slice(0, handler.indexOf("\n  workflow_list()"));
+  assert.match(
+    body,
+    /saveReplyIdentity\(replyIdentity, \{ savedAs: !!outcome\.saved_as \}\)/,
+    "the disclosure follows what the save DID, not the handler's name",
+  );
+  assert.ok(!/saveReplyIdentity\(replyIdentity, \{ savedAs: true \}\)/.test(body), "an unconditional true must not come back");
+  // …and the shape that produces: a first save reads exactly like an in-place one.
+  const firstSave = saveReplyIdentity(IDENTITY, { savedAs: false });
+  assert.equal("canvas_repaint_not_requested" in firstSave, false);
+  assert.equal("workflow_instance_changed" in firstSave, false);
+});
+
+test("#978 (codex r2) the flag names what the SAVE did, not what the canvas is", () => {
+  // `canvas_not_repainted` asserted a state nothing observed at reply time. The flag now
+  // names the save's own behaviour, which is what this code can actually establish.
+  const reply = saveReplyIdentity(IDENTITY, { savedAs: true });
+  assert.equal("canvas_not_repainted" in reply, false, "the unobservable claim is gone");
+  assert.equal(reply.canvas_repaint_not_requested, true);
 });
