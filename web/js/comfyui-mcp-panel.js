@@ -193,6 +193,7 @@ import {
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
+import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
@@ -10678,6 +10679,50 @@ const GRAPH_TOOL_EXECUTORS = {
     return result;
   },
 
+  // artokun/comfyui-mcp#938: remove ONE dynamic widget row (rgthree Power Lora Loader
+  // `lora_N`, Impact/Inspire list rows). Their add/remove affordance is a DOM-level custom
+  // widget an agent cannot click, so the rows were un-removable from an agent session —
+  // set_widget can only overwrite a row's value, remove_node deletes the whole node.
+  //
+  // The go/no-go needs the BACKEND's declared inputs, because deleting a declared input is
+  // not a layout tweak: it changes what is sent at queue time. Read through the same burst
+  // cache graph_set_widget uses (#716 — a full /object_info is megabytes on a large
+  // install), and when the read FAILS, refuse and say so rather than treating an unreadable
+  // def as "declares nothing" (#796).
+  async graph_remove_widget({ node_id, widget, workflow_uuid }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    let oracleFailures = [];
+    const outcome = await objectInfoCache.read(async () =>
+      fetchWholeObjectInfo({
+        getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+        fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+      }),
+    );
+    const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
+    oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    // Feed the #458 observed-backend-history trust root. This command never consults that
+    // history, so skipping it would be harmless HERE — but we just paid for a full
+    // /object_info, and discarding the observation makes a LATER set_widget less able to
+    // tell a removed backend node from an absent one. (Deliberately NOT awaiting the
+    // history seed: nothing on this path reads it, so waiting would buy only latency.)
+    recordObjectInfoTypes(defs);
+    const declaredNames = declaredInputNames(defs?.[node.type ?? node.comfyClass]);
+    // #718: re-read the ACTIVE uuid at the write boundary — the user can switch workflows
+    // while the /object_info fetch above is pending.
+    assertActiveWorkflowCommandTarget({
+      cmd: "graph_remove_widget",
+      [WORKFLOW_UUID_FIELD]: workflow_uuid,
+    });
+    return runRemoveWidget(node, widget, {
+      declaredNames,
+      objectInfoNote: objectInfoOracleFailureNote(oracleFailures),
+      beforeChange: () => graph.beforeChange(),
+      afterChange: () => graph.afterChange(),
+      setDirty: () => graph.setDirtyCanvas(true, true),
+    });
+  },
+
   // #488: set a node's LiteGraph PROPERTY (the right-click → Properties panel), the
   // counterpart to graph_set_widget which only reaches `widgets`. Many custom nodes are
   // configured entirely through node.properties — e.g. the rgthree Fast Groups Bypasser's
@@ -19032,6 +19077,15 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-pencil", text: `Renamed node ${r.node_id}` };
     case "graph_set_node_collapsed":
       return { icon: r.collapsed ? "pi-minus-circle" : "pi-plus-circle", text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}` };
+    case "graph_remove_widget":
+      // Name the REMAINING rows, not a count: the rows are deliberately not renumbered
+      // (artokun/comfyui-mcp#938), so "3 rows left" would leave the user — and the agent
+      // reading its own transcript — assuming lora_2 became lora_1.
+      return {
+        icon: "pi-minus-circle",
+        text: `Removed widget ${r.removed?.widget} from node ${r.removed?.node_id} (one Ctrl+Z restores it)`,
+        detail: `was ${JSON.stringify(r.removed?.previous_value)} — remaining: ${(r.remaining_widgets ?? []).join(", ") || "none"}`,
+      };
     case "graph_set_node_color":
       return { icon: "pi-palette", text: `Set node ${r.node_id} colors` };
     case "graph_set_node_property":
