@@ -686,17 +686,20 @@ export function cachedCatalogueNoMatch(query, catalogueSize, route) {
   const size = typeof catalogueSize === "number" && Number.isFinite(catalogueSize) ? catalogueSize : null;
   if (mode !== "cache") return {};
   return {
-    catalogue_mode: "cache",
+    // REQUESTED, not served (codex). Naming this `catalogue_mode` asserted where the
+    // bytes came from, which is the one thing this code cannot see: the parameter is what
+    // the panel ASKED for, and nothing in the answer says whether Manager honoured it.
+    requested_mode: "cache",
     no_match_note:
-      `No pack in the catalogue matched${q ? ` "${q}"` : ""}, and the catalogue that was ` +
-      `searched is ComfyUI-Manager's CACHED copy${size == null ? "" : ` (${size} packs)`} — ` +
-      "this search asked for mode=cache, so it reflects whatever that cache last held. A " +
-      "pack published after the cache was last refreshed will not appear here, and this " +
-      "result cannot tell you which of the two you are looking at. The panel makes no " +
-      "claim about the cache's age: nothing in Manager's response says when it was " +
-      "fetched, or whether it came from the network, the on-disk cache or the copy " +
-      "bundled with Manager (#890). If the pack is recent, refresh the cache from the " +
-      "Manager UI and search again before concluding it does not exist.",
+      `No pack in the catalogue matched${q ? ` "${q}"` : ""}${
+        size == null ? "" : `, out of ${size} packs searched`
+      }. This request asked ComfyUI-Manager for mode=cache. What the response came FROM is ` +
+      "not something the panel can tell: Manager does not report whether it honoured that " +
+      "parameter, when the data was fetched, or whether it served the network, its on-disk " +
+      "cache or the copy bundled with the Manager package (#890). So this result cannot " +
+      "distinguish \"no such pack\" from \"a pack too recent for whatever list was " +
+      "searched\". If the pack is recent, refresh Manager's cache from its UI and search " +
+      "again before concluding it does not exist.",
   };
 }
 
