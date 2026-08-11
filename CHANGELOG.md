@@ -6,6 +6,46 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-10
+
+> A panel connected to a ComfyUI the orchestrator cannot reach — a tunnel, a proxy URL, a
+> loopback-only host — could not convert its own live canvas. Anything that pairs a captured
+> graph with node definitions took the graph from the panel and the definitions from
+> whatever COMFYUI_URL points at, which is the same machine locally and a different one
+> remotely.
+
+### Added
+- the panel can now serve the node definitions of the ComfyUI it is actually looking at,
+  fetched by the browser that is already talking to it (#1006). That is the panel half of
+  the fix; the orchestrator side dispatches to it.
+- the reply names which ComfyUI answered, and refuses rather than returning a partial
+  schema — a conversion run on half a schema produces a wrong answer, not a smaller one.
+- the payload is large (4183 node types on the machine this was built against), so a caller
+  can pass back a fingerprint and be told the type set is unchanged instead of receiving it
+  again. The reply says what that does not cover: a combo list or a widget name can change
+  without changing which types exist.
+
+### Fixed
+- mark a question card whose connection dropped, instead of leaving two live ones (#952) (#1027)
+- a created tab must leave a fence its own commands can pass (#1019) (#1025)
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.2 (#1028)
+- 0.12.1 (#1026)
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.12.2] - 2026-08-10
 
 > When the panel loses its connection while the agent is waiting on a question, the card
