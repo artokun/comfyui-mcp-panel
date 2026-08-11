@@ -38,7 +38,7 @@ import { saveReplyIdentity } from "../../web/js/lib/save-reply-identity.js";
 
 const IDENTITY = { uuid: "99999999-8888-4777-8666-555555555555", routingKey: "wf:workflows/copy.json" };
 
-test("#978 a Save-As reply says the canvas was NOT repainted, and names the remedy", () => {
+test("#978 a Save-As reply says no repaint was REQUESTED, conditions the rest, and names the remedy", () => {
   const reply = saveReplyIdentity(IDENTITY, { savedAs: true });
   assert.equal(reply.workflow_uuid, IDENTITY.uuid, "the identity to re-fence to is still reported");
   assert.equal(reply.workflow_instance_changed, true);
