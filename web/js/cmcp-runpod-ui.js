@@ -91,26 +91,38 @@ function toolText(res) {
     : tr("runpod_ui.done", "Done.");
 }
 
-// Durations are translated as WHOLE forms ("{hours}h {minutes}m"), not as a number
-// glued to a translated unit. A language that writes the unit before the number, or
-// joins them without a space, has to move both parts — a per-unit key would freeze
-// our English word order into every translation.
+/**
+ * Durations are built from SINGLE-unit pieces, each pluralised on its own `count`,
+ * and then joined by a translatable pattern.
+ *
+ * A combined "{hours}h {minutes}m" key cannot be pluralised at all: `tr` carries one
+ * `count` per string, and that string has two numbers. Splitting gives every unit the
+ * plural category its language actually uses — Russian needs 1 минута / 2 минуты /
+ * 5 минут, which no shared form covers — while `duration_pair` still lets a
+ * translation reorder or re-punctuate the pair.
+ *
+ * The English `one` and `other` forms are identical because "h"/"m"/"s" are
+ * abbreviations that do not inflect. They are still written out as a plural pair so a
+ * translator who spells the unit out has both forms to fill in; collapsing them to a
+ * plain string would silently deny that.
+ */
+const hoursText = (n) => tr("runpod_ui.duration_hours", { one: "{count}h", other: "{count}h" }, { count: n });
+const minutesText = (n) => tr("runpod_ui.duration_minutes", { one: "{count}m", other: "{count}m" }, { count: n });
+const secondsText = (n) => tr("runpod_ui.duration_seconds", { one: "{count}s", other: "{count}s" }, { count: n });
+const joinDuration = (first, second) => tr("runpod_ui.duration_pair", "{first} {second}", { first, second });
+
 function fmtUptime(sec) {
   if (!sec || sec <= 0) return "—";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
-  return h > 0
-    ? tr("runpod_ui.uptime_hours_minutes", "{hours}h {minutes}m", { hours: h, minutes: m })
-    : tr("runpod_ui.uptime_minutes", "{minutes}m", { minutes: m });
+  return h > 0 ? joinDuration(hoursText(h), minutesText(m)) : minutesText(m);
 }
 function fmtCountdown(sec) {
   if (sec == null) return null;
   if (sec <= 0) return tr("runpod_ui.now", "now");
   const m = Math.floor(sec / 60);
   const s = sec % 60;
-  return m > 0
-    ? tr("runpod_ui.countdown_minutes_seconds", "{minutes}m {seconds}s", { minutes: m, seconds: s })
-    : tr("runpod_ui.countdown_seconds", "{seconds}s", { seconds: s });
+  return m > 0 ? joinDuration(minutesText(m), secondsText(s)) : secondsText(s);
 }
 
 /**
@@ -352,7 +364,14 @@ export function createLocalContent(ctx, shell, opts = {}) {
         addRow(
           card,
           tr("runpod_ui.auto_stop", "Auto-stop"),
-          tr("runpod_ui.after_minutes_idle", "after {minutes}m idle", { minutes: s.autostop_minutes }),
+          // Counted, so it takes `count` and a plural pair — this is the one duration
+          // string that is prose rather than an abbreviation, so it is the one most
+          // likely to be spelled out ("after 1 minute idle") in translation.
+          tr(
+            "runpod_ui.after_minutes_idle",
+            { one: "after {count}m idle", other: "after {count}m idle" },
+            { count: s.autostop_minutes },
+          ),
         );
       }
     } else {
