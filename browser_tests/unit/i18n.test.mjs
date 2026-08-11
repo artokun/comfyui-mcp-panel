@@ -126,11 +126,19 @@ test("a non-2xx body is never parsed as a catalog", async () => {
 
 test("every shipped locale file matches the English key set exactly", () => {
   const en = readJson("locales/en/main.json");
+  // Plural siblings are excluded, and have to be: the categories a counted string takes are a
+  // property of the LANGUAGE, not of the catalog. English declares `_one`/`_other`; Korean,
+  // Japanese and Chinese use only `_other`, and Russian needs `_few`/`_many` that English will
+  // never have. Comparing them here made a correct Korean file fail as "missing keys", and the
+  // only way to pass would have been to add a `_one` form Korean grammar does not have. The
+  // per-language categories ARE checked — by scripts/i18n-check.mjs, against Intl.PluralRules,
+  // which is the only thing that knows the CLDR answer.
+  const isPluralForm = (key) => /_(?:zero|one|two|few|many|other)$/.test(key);
   const flat = (o, p = "", out = new Set()) => {
     for (const [k, v] of Object.entries(o)) {
       const key = p ? `${p}.${k}` : k;
       if (v && typeof v === "object") flat(v, key, out);
-      else out.add(key);
+      else if (!isPluralForm(key)) out.add(key);
     }
     return out;
   };
@@ -414,6 +422,34 @@ test("regenerating English is a ROUND TRIP — it never loses a converted key", 
     [],
     "these catalog keys have no tr() call site — stale after a revert or rename",
   );
+});
+
+test("the extractor reads a PLURAL call site back, placeholders and all", () => {
+  // The round-trip test above cannot see this defect, and that is the point. The plural
+  // reader took `rest.indexOf("}")` as the end of the forms object — but every plural form
+  // contains a `{count}` placeholder, so the first `}` is the one closing `{count}` inside
+  // the literal. The body arrived cut off mid-string, neither `one` nor `other` matched, and
+  // the site produced ZERO candidates. Zero candidates is invisible to a round trip: there is
+  // no key for it to demand and no catalog entry for it to orphan, so every plural string in
+  // the panel would stay English in every language with the entire suite green.
+  const out = execFileSync("node", ["scripts/i18n-extract.mjs", "--json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 1 << 26,
+  });
+  const plural = JSON.parse(out).filter((c) => c.converted && /_(?:zero|one|two|few|many|other)$/.test(c.key));
+  assert.ok(plural.length > 0, "no plural call site was read back — the forms object is not being parsed");
+  // Both categories of each base, and the placeholder has to survive: a form that lost its
+  // `{count}` renders the number nowhere, which no shape check would notice.
+  const bases = new Set(plural.map((c) => c.key.replace(/_(?:zero|one|two|few|many|other)$/, "")));
+  for (const base of bases) {
+    const forms = plural.filter((c) => c.key.startsWith(`${base}_`));
+    assert.ok(
+      forms.some((c) => c.key.endsWith("_one")) && forms.some((c) => c.key.endsWith("_other")),
+      `${base}: English declares one/other, so both must be extracted (got ${forms.map((f) => f.key).join(", ")})`,
+    );
+    for (const f of forms) assert.match(f.text, /\{count\}/, `${f.key} lost its {count} placeholder`);
+  }
 });
 
 test("RTL is actually WIRED, not just implemented", () => {
