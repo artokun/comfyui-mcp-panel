@@ -6,6 +6,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-08-11
+
+> #968: three reports of the panel saying "bound to the requested workflow" while graph
+> commands kept hitting the previous one — once queueing the wrong workflow outright. They
+> have not converged because, after the fact, a stale binding and a fresh one look identical.
+
+### Added
+- a workflow-instance refusal now reports **what last moved the active workflow**, when
+  anything did. If a panel command made the move it is named. If nothing claimed it, the
+  refusal says so — and says plainly that this does NOT prove the panel was uninvolved,
+  because not every command can register a claim. What it does establish either way is that
+  a binding taken before that move is stale.
+
+### Changed
+- it decides nothing, deliberately. No refusal becomes an acceptance, and a refusal with no
+  move to report is byte-for-byte what it was. Widening trust on an entry route nobody has
+  identified is how a refusal turns into the silent wrong-graph edit this issue is about.
+- ruled out along the way, and recorded on the issue: `panel_open_workflow` forces the canvas
+  repaint itself and verifies it, both of its skip paths fail closed, and the report where
+  the wrong workflow was queued ran on a build that already had both protections. So the
+  binding is correct when it is made, and something re-points the tab afterwards.
+
+
 ## [0.13.5] - 2026-08-11
 
 > #1369: `panel_add_node` applied a node definition's declared default over a widget's
