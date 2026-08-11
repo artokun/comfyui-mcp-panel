@@ -33,6 +33,21 @@ All notable changes to this project are documented here. This project adheres to
   "declares nothing" — the difference between those two is the only thing separating a row
   from a KSampler's `steps`.
 
+### Fixed
+- a DUPLICATE delivery of a request the panel is already running no longer waits forever on
+  it (#646). The command ledger marks a command in-flight and never evicts that entry —
+  dropping an unsettled command would let a replay apply the same mutation twice — so an
+  executor that never returned left every redelivery awaiting a promise that could not
+  resolve, and the panel answered nothing at all. The duplicate now gets a real answer:
+  still running, nothing was applied twice, do not retry, read the graph to see whether it
+  took effect.
+- that wait is bounded by the CALLER's own deadline, never by a number the panel invents. A
+  fixed timeout is wrong in both directions — too high rescues nobody, too low reports
+  "still running" for a command that was merely slow. The panel cannot see that deadline
+  today, so absent it the behaviour is unchanged; this half activates when the orchestrator
+  sends the timeout it already computes.
+
+
 ## [0.13.6] - 2026-08-11
 
 > #968: three reports of the panel saying "bound to the requested workflow" while graph
