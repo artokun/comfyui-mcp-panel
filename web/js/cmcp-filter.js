@@ -32,7 +32,7 @@ function injectFilterCss() {
   _cssInjected = true;
   const css = `
   .cmcp-cv-filters { display: flex; flex-direction: column; gap: .7rem; }
-  .cmcp-cv-flabel { font-size: calc(var(--cmcp-fs) * 0.8615); text-transform: uppercase; letter-spacing: .04em;
+  .cmcp-cv-flabel { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); text-transform: uppercase; letter-spacing: .04em;
     color: var(--p-text-muted-color,#a1a1aa); width: 100%; }
   `;
   const style = document.createElement("style");

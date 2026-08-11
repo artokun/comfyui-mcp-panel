@@ -47,10 +47,10 @@ function injectCss() {
   .cmcp-cv-head { display: flex; align-items: center; gap: .5rem; padding: .6rem .7rem;
     border-bottom: 1px solid var(--p-content-border-color, #3f3f46); flex-wrap: wrap; }
   .cmcp-cv-tabs { display: flex; gap: .25rem; flex-wrap: wrap; }
-  .cmcp-sp-title { font-weight: 600; font-size: calc(var(--cmcp-fs) * 1.0462); color: var(--p-text-color, #fafafa); padding: 0 .25rem; }
+  .cmcp-sp-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462); color: var(--p-text-color, #fafafa); padding: 0 .25rem; }
   .cmcp-cv-tab { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .55rem;
     border-radius: 8px; border: 1px solid transparent; background: transparent;
-    color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; font-size: calc(var(--cmcp-fs) * 0.9846); }
+    color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); }
   /* Active tab uses the ComfyUI/PrimeVue theme primary so it inverts correctly in
      light + dark (precedent: .cmcp-btn primary). */
   .cmcp-cv-tab.active { background: var(--p-primary-color, #3a7bd5);
@@ -66,7 +66,7 @@ function injectCss() {
     background: var(--p-primary-color, #3a7bd5); }
   .cmcp-cv-body { position: relative; flex: 1; overflow-y: auto; padding: .6rem; }
   .cmcp-cv-frow { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
-  .cmcp-cv-chip { padding: .25rem .5rem; border-radius: 999px; font-size: calc(var(--cmcp-fs) * 0.9231); cursor: pointer;
+  .cmcp-cv-chip { padding: .25rem .5rem; border-radius: 999px; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); cursor: pointer;
     border: 1px solid var(--p-content-border-color,#3f3f46); background: transparent; color: var(--p-text-color,#fafafa); }
   .cmcp-cv-chip.on { background: var(--p-primary-color,#3a7bd5); border-color: transparent; color:#fff; }
   /* Agent-driven "glow" — shared across every surface (steps, cards, fields). */

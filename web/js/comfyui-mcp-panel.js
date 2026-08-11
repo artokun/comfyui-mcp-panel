@@ -3220,7 +3220,7 @@ function makeSettingSelect() {
   sel.className = "p-inputtext p-component";
   sel.style.cssText =
     "padding:0.3rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-    "background:var(--p-surface-900,#18181b);color:var(--p-text-color,#e4e4e7);font-size:calc(var(--cmcp-fs) * 0.9846);min-width:14rem;";
+    "background:var(--p-surface-900,#18181b);color:var(--p-text-color,#e4e4e7);font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);min-width:14rem;";
   return sel;
 }
 /** (Re)populate a backend's Default-model <select>: an "Auto" option, then that
@@ -3497,9 +3497,9 @@ function panelSettingsList() {
       btn.textContent = `Set ${friendly} ${noun}…`;
       btn.style.cssText =
         "padding:0.3rem 0.7rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-        "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;";
+        "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
       const status = document.createElement("span");
-      status.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.8862);opacity:0.8;";
+      status.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);opacity:0.8;";
       const refresh = () => {
         const at = lsGet(SECRET_SET_AT_PREFIX + envKey);
         if (at) {
@@ -3644,7 +3644,7 @@ function panelSettingsList() {
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         return a;
       },
     },
@@ -3668,7 +3668,7 @@ function panelSettingsList() {
         b.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         b.addEventListener("click", () => {
           // Open the panel first — painting into a transcript the user cannot see is the
           // same failure as not painting at all. openSidebarTab() is the same activate the
@@ -3712,7 +3712,7 @@ function panelSettingsList() {
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         return a;
       },
     },
@@ -3732,7 +3732,7 @@ function panelSettingsList() {
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;";
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
         return a;
       },
     },
@@ -3754,7 +3754,7 @@ function panelSettingsList() {
         btn.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-primary-color,#8b5cf6);background:var(--p-primary-color,#8b5cf6);" +
-          "color:#fff;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;cursor:pointer;";
+          "color:#fff;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;cursor:pointer;";
         btn.addEventListener("click", async () => {
           const diag = [
             "--- comfyui-mcp panel diagnostics ---",
@@ -3932,7 +3932,7 @@ function panelSettingsList() {
         note.textContent =
           "⚠️ Beta — the app changes rapidly and builds may break between updates. " +
           "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.";
-        note.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.9231);opacity:0.75;line-height:1.35;";
+        note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);opacity:0.75;line-height:1.35;";
         const row = document.createElement("div");
         row.style.cssText = "display:flex;gap:0.5rem;flex-wrap:wrap;";
         const linkBtn = (label, url) => {
@@ -3941,7 +3941,7 @@ function panelSettingsList() {
           a.style.cssText =
             "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
             "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-            "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs) * 0.9846);white-space:nowrap;";
+            "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
           if (url) {
             a.href = url;
             a.target = "_blank";
@@ -6924,7 +6924,7 @@ function makeShellCommandBlock(baseCmd) {
     b.className = "cmcp-btn";
     b.dataset.shell = s.key;
     b.textContent = s.label;
-    b.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.8862);padding:0.12rem 0.45rem;";
+    b.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);padding:0.12rem 0.45rem;";
     b.addEventListener("click", () => { selected = s.key; render(); copy(forms[s.key]); });
     pills.appendChild(b);
   }
@@ -17927,7 +17927,7 @@ const PANEL_CSS = `
      both ways. Do not re-add it. */
   position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
-  /* #753 — THE ONE KNOB. Every inner font size is calc(var(--cmcp-fs) * k), so a
+  /* #753 — THE ONE KNOB. Every inner font size is calc(var(--cmcp-fs, 0.8125rem) * k), so a
      change here scales all of them at once, at any nesting depth. An em unit was
      tried
      first and rejected: it resolves against the PARENT, so a rule inside a block
@@ -17935,7 +17935,7 @@ const PANEL_CSS = `
      different parents has no single correct value at all (measured: 529 drifted
      elements, ~25 nested sites, 5 inexpressible rules). A variable is flat. */
   --cmcp-fs: 0.8125rem;
-  font-size: var(--cmcp-fs); line-height: 1.5;
+  font-size: var(--cmcp-fs, 0.8125rem); line-height: 1.5;
   color: var(--p-text-color, #fff);
   background: var(--p-content-background, #18181b);
 }
@@ -17949,7 +17949,7 @@ const PANEL_CSS = `
    header actions on a narrow sidebar. */
 .cmcp-logo { height: 20px; width: auto; max-width: 148px; flex: none; object-fit: contain; display: block; }
 .cmcp-status { display: flex; align-items: center; gap: 0.375rem; margin-left: auto;
-  font-size: calc(var(--cmcp-fs) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--p-red-400, #f87171); flex: none; }
 .cmcp-dot.connected { background: var(--p-green-400, #4ade80); }
 .cmcp-dot.connecting { background: var(--p-yellow-400, #facc15); animation: cmcp-pulse 1.2s ease-in-out infinite; }
@@ -17970,12 +17970,12 @@ const PANEL_CSS = `
   background: transparent; border: none; cursor: pointer;
   border-radius: var(--p-border-radius-sm, 4px);
   padding: 0.25rem 0.5rem;
-  font: inherit; font-size: calc(var(--cmcp-fs) * 0.8462);
+  font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   color: var(--p-text-muted-color, #a1a1aa);
   transition: background 0.15s, color 0.15s;
 }
 .cmcp-toolbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
-.cmcp-toolbtn .pi { font-size: var(--cmcp-fs); }
+.cmcp-toolbtn .pi { font-size: var(--cmcp-fs, 0.8125rem); }
 .cmcp-toolbtn svg { width: 13px; height: 13px; display: block; }
 /* Icon-only variant (Deafen/Blind): the label span stays in the DOM — state
    copy still flows into it for screen readers / the find-icon logic — but is
@@ -17986,7 +17986,7 @@ const PANEL_CSS = `
   position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
 }
-.cmcp-toolbtn.cmcp-toolbtn-iconic .pi { font-size: calc(var(--cmcp-fs) * 1.1538); }
+.cmcp-toolbtn.cmcp-toolbtn-iconic .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1538); }
 .cmcp-toolbtn.cmcp-toolbtn-iconic svg { width: 15px; height: 15px; }
 /* Active tab: the four surface buttons ARE the tab bar (issue #124) — the open
    one gets the themed toggled state (inverts light/dark via the primary tokens). */
@@ -18023,13 +18023,13 @@ const PANEL_CSS = `
 }
 .cmcp-settings > summary {
   padding: 0.5rem 0.75rem; cursor: pointer; user-select: none;
-  font-size: calc(var(--cmcp-fs) * 0.9231); font-weight: 600; color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); font-weight: 600; color: var(--p-text-muted-color, #a1a1aa);
   list-style: none; display: flex; align-items: center; gap: 0.375rem;
 }
 .cmcp-settings > summary::before { content: "▸"; transition: transform 0.15s; }
 .cmcp-settings[open] > summary::before { transform: rotate(90deg); }
 .cmcp-settings-body { padding: 0 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
-.cmcp-label { font-size: calc(var(--cmcp-fs) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-label { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-input {
   width: 100%; box-sizing: border-box;
   padding: var(--p-form-field-padding-y, 0.5rem) var(--p-form-field-padding-x, 0.75rem);
@@ -18049,13 +18049,13 @@ const PANEL_CSS = `
 }
 .cmcp-btn:hover { opacity: 0.85; }
 .cmcp-btn:disabled { opacity: 0.4; cursor: default; }
-.cmcp-help { font-size: calc(var(--cmcp-fs) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); line-height: 1.55; }
+.cmcp-help { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); line-height: 1.55; }
 .cmcp-cmd {
   display: block; margin-top: 0.25rem; padding: 0.375rem 0.5rem;
   background: var(--p-form-field-background, #09090b);
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-sm, 4px);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs) * 0.8462);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   user-select: all; cursor: copy; color: var(--p-text-color, #fff);
   overflow-x: auto; white-space: nowrap;
 }
@@ -18074,12 +18074,12 @@ const PANEL_CSS = `
   margin: auto; text-align: center; max-width: 230px;
   color: var(--p-text-muted-color, #a1a1aa);
 }
-.cmcp-empty .pi { font-size: calc(var(--cmcp-fs) * 2.1538); display: block; margin-bottom: 0.5rem; opacity: 0.5; }
+.cmcp-empty .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 2.1538); display: block; margin-bottom: 0.5rem; opacity: 0.5; }
 .cmcp-empty-title { font-weight: 600; color: var(--p-text-color, #fff); margin-bottom: 0.25rem; }
 .cmcp-examples { display: flex; flex-direction: column; gap: 0.375rem; margin-top: 0.875rem; text-align: left; }
 .cmcp-example {
   display: flex; align-items: center; gap: 0.5rem; width: 100%; box-sizing: border-box;
-  padding: 0.4375rem 0.625rem; cursor: pointer; font: inherit; font-size: calc(var(--cmcp-fs) * 0.9231);
+  padding: 0.4375rem 0.625rem; cursor: pointer; font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   color: var(--p-text-color, #fff); text-align: left;
   background: var(--p-surface-800, #27272a);
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -18087,7 +18087,7 @@ const PANEL_CSS = `
   transition: border-color 0.15s, background 0.15s;
 }
 .cmcp-example:hover { border-color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
-.cmcp-example .pi { font-size: var(--cmcp-fs); margin: 0; opacity: 1; color: var(--p-primary-color, #60a5fa); flex: none; }
+.cmcp-example .pi { font-size: var(--cmcp-fs, 0.8125rem); margin: 0; opacity: 1; color: var(--p-primary-color, #60a5fa); flex: none; }
 
 /* Provider onboarding card — shown only when NEITHER provider is signed in. */
 .cmcp-onboard {
@@ -18101,10 +18101,10 @@ const PANEL_CSS = `
    it or "onboard.hidden = true" won't actually hide the card. */
 .cmcp-onboard[hidden] { display: none; }
 .cmcp-onboard-title { font-weight: 600; color: var(--p-text-color, #fff); }
-.cmcp-onboard-sub { font-size: calc(var(--cmcp-fs) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); line-height: 1.4; }
+.cmcp-onboard-sub { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); line-height: 1.4; }
 .cmcp-onboard-col { display: flex; flex-direction: column; gap: 0.25rem; }
-.cmcp-onboard-prov { font-weight: 600; font-size: var(--cmcp-fs); color: var(--p-text-color, #fff); margin-top: 0.25rem; }
-.cmcp-onboard-step { font-size: calc(var(--cmcp-fs) * 0.8615); color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-onboard-prov { font-weight: 600; font-size: var(--cmcp-fs, 0.8125rem); color: var(--p-text-color, #fff); margin-top: 0.25rem; }
+.cmcp-onboard-step { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); color: var(--p-text-muted-color, #a1a1aa); }
 
 .cmcp-bubble {
   padding: 0.5rem 0.75rem; max-width: 92%;
@@ -18126,7 +18126,7 @@ const PANEL_CSS = `
   display: flex; align-items: center; justify-content: center;
   border: 1px solid var(--p-content-border-color, #3f3f46);
   background: var(--p-surface-800, #27272a); color: var(--p-text-muted-color, #a1a1aa);
-  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s; font-size: calc(var(--cmcp-fs) * 0.8615);
+  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615);
 }
 .cmcp-bubble.user:hover .cmcp-edit-btn { opacity: 1; }
 .cmcp-edit-btn:hover { color: var(--p-primary-color, #60a5fa); border-color: var(--p-primary-color, #60a5fa); }
@@ -18140,15 +18140,15 @@ const PANEL_CSS = `
   padding: 0.85rem; border-radius: 10px; background: var(--p-surface-900, #18181b);
   border: 1px solid var(--p-content-border-color, #3f3f46); box-shadow: 0 8px 30px rgba(0,0,0,0.5);
 }
-.cmcp-modal-title { font-weight: 600; font-size: calc(var(--cmcp-fs) * 1.0462); }
+.cmcp-modal-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462); }
 .cmcp-modal-text {
   width: 100%; box-sizing: border-box; resize: vertical; min-height: 3.5rem;
-  padding: 0.4rem 0.5rem; border-radius: 6px; font: inherit; font-size: calc(var(--cmcp-fs) * 0.9846);
+  padding: 0.4rem 0.5rem; border-radius: 6px; font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846);
   background: var(--p-surface-950, #111113); color: inherit;
   border: 1px solid var(--p-surface-500, #555);
 }
 .cmcp-modal-scopes { display: flex; flex-direction: column; gap: 0.3rem; }
-.cmcp-modal-scope { display: flex; gap: 0.4rem; align-items: flex-start; font-size: calc(var(--cmcp-fs) * 0.8862); cursor: pointer; }
+.cmcp-modal-scope { display: flex; gap: 0.4rem; align-items: flex-start; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); cursor: pointer; }
 .cmcp-modal-scope input { margin-top: 0.15rem; }
 .cmcp-modal-btns { display: flex; justify-content: flex-end; gap: 0.4rem; }
 .cmcp-btn-primary { background: var(--p-primary-color, #3a7bd5); color: #fff; border: none; }
@@ -18174,7 +18174,7 @@ const PANEL_CSS = `
 .cmcp-lightbox-nav {
   position: absolute; top: 50%; transform: translateY(-50%);
   width: 2.6rem; height: 2.6rem; border-radius: 50%; cursor: pointer;
-  font-size: calc(var(--cmcp-fs) * 1.9692); line-height: 1; display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.9692); line-height: 1; display: flex; align-items: center; justify-content: center;
   color: var(--p-text-color, #fafafa);
   background: rgba(0,0,0,0.45); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
@@ -18184,7 +18184,7 @@ const PANEL_CSS = `
 .cmcp-lightbox-close {
   position: absolute; top: 0.75rem; right: 0.75rem;
   width: 2.2rem; height: 2.2rem; border-radius: 50%; cursor: pointer;
-  font-size: calc(var(--cmcp-fs) * 1.3538); line-height: 1; display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.3538); line-height: 1; display: flex; align-items: center; justify-content: center;
   color: var(--p-text-color, #fafafa);
   background: rgba(0,0,0,0.45); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
@@ -18195,11 +18195,11 @@ const PANEL_CSS = `
   border-top: 1px solid var(--p-content-border-color, #3f3f46);
 }
 .cmcp-lightbox-caption {
-  font-size: calc(var(--cmcp-fs) * 0.9231); color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .cmcp-lightbox-open {
-  flex: 0 0 auto; cursor: pointer; font-size: calc(var(--cmcp-fs) * 0.8862); padding: 0.3rem 0.6rem; border-radius: 6px;
+  flex: 0 0 auto; cursor: pointer; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); padding: 0.3rem 0.6rem; border-radius: 6px;
   color: var(--p-text-color, #fafafa);
   background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
 }
@@ -18216,7 +18216,7 @@ const PANEL_CSS = `
 }
 .cmcp-media-expand, .cmcp-media-collapse {
   width: 1.8rem; height: 1.8rem; border-radius: 6px; cursor: pointer;
-  font-size: calc(var(--cmcp-fs) * 1.1692); line-height: 1; display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1692); line-height: 1; display: flex; align-items: center; justify-content: center;
   color: #fff; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.25);
   opacity: 0; transition: opacity 0.12s ease;
 }
@@ -18246,7 +18246,7 @@ const PANEL_CSS = `
 .cmcp-media-stub {
   display: none; align-items: center; gap: 0.4rem; cursor: pointer;
   min-height: 1.8rem; padding: 0.35rem 2.6rem 0.35rem 0.55rem; border-radius: 6px;
-  font-size: calc(var(--cmcp-fs) * 0.8615); color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); color: var(--p-text-muted-color, #a1a1aa);
   background: var(--p-content-hover-background, #2a2a2e);
   border: 1px dashed var(--p-content-border-color, #3f3f46);
 }
@@ -18264,7 +18264,7 @@ const PANEL_CSS = `
   padding: 0.5rem 0.6rem; background: var(--p-surface-800, #27272a);
 }
 .cmcp-file-open {
-  color: var(--p-primary-color, #60a5fa); text-decoration: none; font-size: calc(var(--cmcp-fs) * 0.9846);
+  color: var(--p-primary-color, #60a5fa); text-decoration: none; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846);
   word-break: break-all;
 }
 .cmcp-file-open:hover { text-decoration: underline; }
@@ -18288,7 +18288,7 @@ const PANEL_CSS = `
 .cmcp-msg-status {
   align-self: flex-end; max-width: 92%;
   margin: 0.0625rem 0.125rem 0.125rem;
-  font-size: calc(var(--cmcp-fs) * 0.8462); color: var(--p-text-muted-color, #71717a);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #71717a);
   display: flex; gap: 0.375rem; align-items: center;
 }
 .cmcp-msg-status:empty { display: none; }
@@ -18306,11 +18306,11 @@ const PANEL_CSS = `
   border-radius: var(--p-border-radius-sm, 4px);
   transition: color 0.12s, background 0.12s;
 }
-.cmcp-msg-action .pi { font-size: calc(var(--cmcp-fs) * 0.9231); }
+.cmcp-msg-action .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); }
 .cmcp-msg-action:hover { color: var(--p-text-color, #fff); background: var(--p-surface-700, #3f3f46); }
 .cmcp-msg-status.failed .cmcp-msg-action:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs) * 0.9231);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   background: var(--p-form-field-background, #09090b);
   padding: 0.0625rem 0.25rem; border-radius: var(--p-border-radius-sm, 4px);
 }
@@ -18325,10 +18325,10 @@ const PANEL_CSS = `
 .cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 {
   margin: 0.625rem 0 0.25rem; font-weight: 600; line-height: 1.3;
 }
-.cmcp-bubble h1 { font-size: calc(var(--cmcp-fs) * 1.2923); }
-.cmcp-bubble h2 { font-size: calc(var(--cmcp-fs) * 1.2308); }
-.cmcp-bubble h3 { font-size: calc(var(--cmcp-fs) * 1.1538); }
-.cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 { font-size: calc(var(--cmcp-fs) * 1.0769); }
+.cmcp-bubble h1 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.2923); }
+.cmcp-bubble h2 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.2308); }
+.cmcp-bubble h3 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1538); }
+.cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0769); }
 .cmcp-bubble a { color: var(--p-primary-color, #60a5fa); text-decoration: underline; }
 .cmcp-bubble blockquote {
   margin: 0.5rem 0; padding: 0.125rem 0 0.125rem 0.75rem;
@@ -18343,7 +18343,7 @@ const PANEL_CSS = `
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-md, 6px);
   overflow-x: auto; max-height: 20rem; overflow-y: auto;
-  font-size: calc(var(--cmcp-fs) * 0.8462); line-height: 1.5; tab-size: 2;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); line-height: 1.5; tab-size: 2;
 }
 .cmcp-bubble.agent pre code, .cmcp-bubble.user pre code {
   background: none; padding: 0; border-radius: 0;
@@ -18369,7 +18369,7 @@ const PANEL_CSS = `
   transition: background 0.15s, color 0.15s;
 }
 .cmcp-code-tool:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
-.cmcp-code-tool .pi { font-size: calc(var(--cmcp-fs) * 0.9846); }
+.cmcp-code-tool .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); }
 .cmcp-code-tool.ok { color: #4ade80; }
 .cmcp-wrap-btn.on { color: var(--p-primary-color, #60a5fa); }
 .cmcp-wrap-btn.on:hover { color: var(--p-primary-color, #60a5fa); }
@@ -18385,7 +18385,7 @@ const PANEL_CSS = `
   display: none; align-items: center; justify-content: center;
   background: var(--p-surface-700, #3f3f46); border: none; border-radius: 4px;
   color: var(--p-text-muted-color, #a1a1aa); cursor: pointer;
-  font-size: calc(var(--cmcp-fs) * 0.6769); line-height: 1; z-index: 2; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.6769); line-height: 1; z-index: 2; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
   transition: background 0.12s, color 0.12s;
 }
 .cmcp-bubble code.cmcp-inline-code:hover .cmcp-inline-copy { display: flex; }
@@ -18395,7 +18395,7 @@ const PANEL_CSS = `
   /* Real table layout (NOT display:block) so the header row stays aligned with
      the body; fit the panel width and let long cells wrap instead of scrolling. */
   display: table; width: 100%; table-layout: fixed;
-  border-collapse: collapse; margin: 0.5rem 0; font-size: calc(var(--cmcp-fs) * 0.8462);
+  border-collapse: collapse; margin: 0.5rem 0; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
 }
 .cmcp-bubble th, .cmcp-bubble td {
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -18408,21 +18408,21 @@ const PANEL_CSS = `
   display: inline-flex; align-items: center; gap: 0.35rem;
   padding: 0.3rem 0.75rem; border-radius: 999px; border: none; cursor: pointer;
   background: var(--p-primary-color, #2563eb); color: var(--p-primary-contrast-color, #fff);
-  font: inherit; font-size: calc(var(--cmcp-fs) * 0.8615); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
-.cmcp-newmsg .pi { font-size: calc(var(--cmcp-fs) * 0.8615); }
+.cmcp-newmsg .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); }
 /* The base rule sets display, which beats the UA [hidden] rule — so re-assert
    it or "newMsgBtn.hidden = true" won't actually hide the pill. */
 .cmcp-newmsg[hidden] { display: none; }
 .cmcp-tray {
   flex: none; margin: 0 0.5rem 0.25rem; padding: 0.4rem 0.55rem;
   background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
-  border-radius: 8px; max-height: 9rem; overflow-y: auto; font-size: calc(var(--cmcp-fs) * 0.8615);
+  border-radius: 8px; max-height: 9rem; overflow-y: auto; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615);
 }
 .cmcp-tray[hidden] { display: none; }
-.cmcp-tray-head { font-size: calc(var(--cmcp-fs) * 0.7385); text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
+.cmcp-tray-head { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7385); text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
 .cmcp-todo-item { display: flex; align-items: flex-start; gap: 0.4rem; padding: 0.12rem 0; line-height: 1.3; }
-.cmcp-todo-item .pi { font-size: calc(var(--cmcp-fs) * 0.8615); margin-top: 0.1rem; flex: none; }
+.cmcp-todo-item .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); margin-top: 0.1rem; flex: none; }
 .cmcp-todo-item.done { opacity: 0.55; }
 .cmcp-todo-item.done span { text-decoration: line-through; }
 .cmcp-todo-item.done .pi { color: var(--p-green-400, #4ade80); }
@@ -18437,11 +18437,11 @@ const PANEL_CSS = `
 .cmcp-pending-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-pending-item.failed .cmcp-pending-text { color: var(--p-red-300, #fca5a5); }
 .cmcp-pending-act { flex: none; width: 1.2rem; height: 1.2rem; padding: 0; border: none; background: transparent;
-  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: calc(var(--cmcp-fs) * 0.8615); }
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); }
 .cmcp-pending-act:hover { color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
 .cmcp-pending-act.danger:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-pending-handle { flex: none; width: 1rem; height: 1.2rem; display: flex; align-items: center; justify-content: center;
-  color: var(--p-text-muted-color, #71717a); cursor: grab; font-size: calc(var(--cmcp-fs) * 0.8); opacity: 0.6; }
+  color: var(--p-text-muted-color, #71717a); cursor: grab; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8); opacity: 0.6; }
 .cmcp-pending-handle:hover { opacity: 1; color: var(--p-primary-color, #60a5fa); }
 .cmcp-pending-handle:active { cursor: grabbing; }
 .cmcp-pending-item.dragging { opacity: 0.4; }
@@ -18451,7 +18451,7 @@ const PANEL_CSS = `
 .cmcp-dl-item { padding: 0.18rem 0; }
 .cmcp-dl-top { display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline; }
 .cmcp-dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cmcp-dl-meta { flex: none; opacity: 0.7; font-size: calc(var(--cmcp-fs) * 0.7631); }
+.cmcp-dl-meta { flex: none; opacity: 0.7; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7631); }
 .cmcp-dl-bar { height: 4px; border-radius: 999px; background: var(--p-surface-700, #3f3f46); overflow: hidden; margin-top: 0.2rem; }
 .cmcp-dl-fill { height: 100%; background: var(--p-primary-color, #3a7bd5); transition: width 0.3s ease; }
 .cmcp-dl-item.done .cmcp-dl-fill { background: var(--p-green-400, #4ade80); }
@@ -18459,7 +18459,7 @@ const PANEL_CSS = `
 .cmcp-dl-bar.indet .cmcp-dl-fill { width: 30%; animation: cmcp-indet 1.1s ease-in-out infinite; }
 @keyframes cmcp-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .cmcp-sys {
-  align-self: center; font-size: calc(var(--cmcp-fs) * 0.8462); font-style: italic;
+  align-self: center; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
   animation: cmcp-in 0.18s ease-out;
   /* Status lines quote URLs, paths and ids — strings with no spaces to break
@@ -18476,17 +18476,17 @@ const PANEL_CSS = `
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-left: 3px solid var(--p-primary-color, #60a5fa);
   border-radius: var(--p-border-radius-md, 6px);
-  font-size: calc(var(--cmcp-fs) * 0.9231);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   animation: cmcp-in 0.18s ease-out;
 }
 .cmcp-card.error { border-left-color: var(--p-red-400, #f87171); }
 .cmcp-card-head { display: flex; align-items: center; gap: 0.375rem; font-weight: 600; min-width: 0; }
-.cmcp-card-head .pi { font-size: calc(var(--cmcp-fs) * 0.9231); color: var(--p-primary-color, #60a5fa); flex: none; }
+.cmcp-card-head .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-primary-color, #60a5fa); flex: none; }
 .cmcp-card-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-card.error .cmcp-card-head .pi { color: var(--p-red-400, #f87171); }
 .cmcp-card-detail {
   margin-top: 0.25rem; color: var(--p-text-muted-color, #a1a1aa);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs) * 0.8462);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   overflow-x: auto; white-space: pre-wrap; word-break: break-word;
   max-height: 7.5rem; overflow-y: auto;
 }
@@ -18500,7 +18500,7 @@ const PANEL_CSS = `
   border: 2px dashed var(--p-primary-color, #3b82f6);
   border-radius: 10px;
   background: color-mix(in srgb, var(--p-primary-color, #3b82f6) 16%, var(--p-surface-900, #18181b));
-  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: calc(var(--cmcp-fs) * 1.0462);
+  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462);
   pointer-events: none; animation: cmcp-in 0.12s ease-out;
 }
 .cmcp-dropzone.cmcp-show { display: flex; }
@@ -18511,7 +18511,7 @@ const PANEL_CSS = `
   background: var(--p-surface-800, #27272a);
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-lg, 8px);
-  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs) * 0.9231);
+  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   animation: cmcp-in 0.18s ease-out;
 }
 .cmcp-thinking-dots { display: inline-flex; gap: 3px; }
@@ -18537,19 +18537,19 @@ const PANEL_CSS = `
 }
 .cmcp-think > summary {
   list-style: none; cursor: pointer; user-select: none;
-  padding: 0.3125rem 0.5rem; font-size: calc(var(--cmcp-fs) * 0.8462); font-weight: 600;
+  padding: 0.3125rem 0.5rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); font-weight: 600;
   color: var(--p-text-muted-color, #a1a1aa);
   display: flex; align-items: center; gap: 0.375rem;
 }
 .cmcp-think > summary::-webkit-details-marker { display: none; }
 .cmcp-think > summary::before {
-  content: "\\25b8"; font-size: calc(var(--cmcp-fs) * 0.7692); transition: transform 0.15s;
+  content: "\\25b8"; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); transition: transform 0.15s;
 }
 .cmcp-think[open] > summary::before { transform: rotate(90deg); }
 .cmcp-think-body {
   max-height: 11rem; overflow-y: auto;
   padding: 0 0.5rem 0.4375rem 0.875rem;
-  font-size: calc(var(--cmcp-fs) * 0.8462); line-height: 1.45;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); line-height: 1.45;
   color: var(--p-text-muted-color, #8a8a93);
   white-space: pre-wrap; word-break: break-word;
   font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -18594,19 +18594,19 @@ const PANEL_CSS = `
 .cmcp-iconbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
-.cmcp-iconbtn .pi { font-size: calc(var(--cmcp-fs) * 1.0769); }
+.cmcp-iconbtn .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0769); }
 /* #758 — the update notice. Sits in the transcript as a system line, so it inherits
    the panel's scale and scroll rather than becoming a modal the user must dismiss. */
 .cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
 .cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
 .cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
 .cmcp-whatsnew-list li { line-height: 1.45; }
-.cmcp-whatsnew-tag { display: inline-block; font-size: calc(var(--cmcp-fs) * 0.7138); text-transform: uppercase;
+.cmcp-whatsnew-tag { display: inline-block; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138); text-transform: uppercase;
   letter-spacing: 0.04em; opacity: 0.75; border: 1px solid currentColor; border-radius: 3px;
   padding: 0 0.22rem; margin-right: 0.15rem; vertical-align: baseline; }
-.cmcp-workflow-version { margin-top: 0.35rem; font-size: calc(var(--cmcp-fs) * 0.7138); opacity: 0.62;
+.cmcp-workflow-version { margin-top: 0.35rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138); opacity: 0.62;
   display: flex; gap: 0.3rem; align-items: center; }
-.cmcp-workflow-version .pi { font-size: calc(var(--cmcp-fs) * 0.7138); }
+.cmcp-workflow-version .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138); }
 /* ---- sidebar tab badge (these live OUTSIDE .cmcp-root, on the toolbar) ---- */
 /* (.cmcp-tab-logo — the logo-mark tab glyph — is NOT here: it must exist the
    moment registerSidebarTab() paints the toolbar, before the panel ever
@@ -18630,7 +18630,7 @@ const PANEL_CSS = `
 .cmcp-chip {
   display: flex; align-items: center; gap: 0.25rem;
   border: none; background: transparent; cursor: pointer;
-  color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: calc(var(--cmcp-fs) * 0.8462);
+  color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
   white-space: nowrap; min-width: 0; overflow: hidden; flex: 0 1 auto;
 }
@@ -18652,13 +18652,13 @@ const PANEL_CSS = `
   background: var(--p-surface-700, #3f3f46);
   border: 1px solid var(--p-content-border-color, #52525b);
   border-radius: var(--p-border-radius-md, 6px);
-  color: var(--p-text-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs) * 0.8462);
+  color: var(--p-text-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
   padding: 0.1875rem 0.25rem 0.1875rem 0.375rem; cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }
 .cmcp-attach-chip:hover { background: var(--p-surface-600, #52525b); }
 .cmcp-attach-chip.open { border-color: var(--p-primary-color, #60a5fa); }
-.cmcp-attach-chip > .pi { font-size: calc(var(--cmcp-fs) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-attach-chip > .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-attach-meta { color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-attach-thumb { width: 1.125rem; height: 1.125rem; border-radius: 3px; object-fit: cover; flex: none; }
@@ -18668,7 +18668,7 @@ const PANEL_CSS = `
   border-radius: 3px; color: var(--p-text-muted-color, #a1a1aa);
 }
 .cmcp-attach-rm:hover { background: var(--p-surface-800, #27272a); color: var(--p-text-color, #fff); }
-.cmcp-attach-rm .pi { font-size: calc(var(--cmcp-fs) * 0.7692); }
+.cmcp-attach-rm .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); }
 .cmcp-attach-preview {
   background: var(--p-surface-900, #18181b);
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -18678,10 +18678,10 @@ const PANEL_CSS = `
 .cmcp-attach-preview pre {
   margin: 0; white-space: pre-wrap; word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: calc(var(--cmcp-fs) * 0.8462); line-height: 1.45; color: var(--p-text-color, #e4e4e7);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); line-height: 1.45; color: var(--p-text-color, #e4e4e7);
 }
 .cmcp-attach-preview img { max-width: 100%; max-height: 12rem; border-radius: 4px; display: block; }
-.cmcp-ctx { font-size: calc(var(--cmcp-fs) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
+.cmcp-ctx { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
 .cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
 .cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
 .cmcp-ring .fg { stroke: var(--p-primary-color, #60a5fa); transition: stroke-dashoffset 0.3s; }
@@ -18697,11 +18697,11 @@ const PANEL_CSS = `
 .cmcp-popover-item {
   display: flex; align-items: center; gap: 0.5rem; width: 100%; box-sizing: border-box;
   padding: 0.375rem 0.5rem; border: none; background: transparent; cursor: pointer;
-  text-align: left; color: var(--p-text-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs) * 0.9231);
+  text-align: left; color: var(--p-text-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
   border-radius: var(--p-border-radius-sm, 4px);
 }
 .cmcp-popover-item.sel, .cmcp-popover-item:hover { background: var(--p-surface-700, #3f3f46); }
-.cmcp-popover-item .pi { font-size: calc(var(--cmcp-fs) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-popover-item .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
 .cmcp-popover-item .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Hover-to-read: while revealing, drop the ellipsis so the tail is legible, and
@@ -18734,12 +18734,12 @@ const PANEL_CSS = `
 .cmcp-hist-search {
   min-width: 0; border: 1px solid var(--p-form-field-border-color, #52525b);
   border-radius: var(--p-border-radius-sm, 4px); background: var(--p-form-field-background, #09090b);
-  color: var(--p-form-field-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs) * 0.9231); padding: 0.35rem 0.45rem;
+  color: var(--p-form-field-color, #fff); font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); padding: 0.35rem 0.45rem;
 }
 .cmcp-hist-filter { grid-column: 1 / -1; display: flex; align-items: center; gap: 0.375rem;
-  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs) * 0.8462); }
+  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); }
 .cmcp-hist-list { max-height: min(58vh, 28rem); overflow-y: auto; padding: 0.25rem; }
-.cmcp-hist-group { padding: 0.35rem 0.5rem 0.2rem; font-size: calc(var(--cmcp-fs) * 0.7692); font-weight: 700;
+.cmcp-hist-group { padding: 0.35rem 0.5rem 0.2rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); font-weight: 700;
   text-transform: uppercase; letter-spacing: 0.04em; color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-hist-row { display: flex; align-items: stretch; gap: 0.125rem; }
 .cmcp-hist-row.active { background: color-mix(in srgb, var(--p-primary-color, #60a5fa) 13%, transparent); border-radius: 4px; }
@@ -18748,7 +18748,7 @@ const PANEL_CSS = `
 .cmcp-hist-row.foreign-workflow .cmcp-hist-open { cursor: not-allowed; }
 .cmcp-hist-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .cmcp-hist-meta .lbl { font-weight: 550; }
-.cmcp-hist-sub { color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs) * 0.7692);
+.cmcp-hist-sub { color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-hist-action {
   flex: none; width: 1.75rem; border: none; background: transparent; cursor: pointer;
@@ -18759,32 +18759,32 @@ const PANEL_CSS = `
 .cmcp-hist-action:focus-visible { opacity: 1; }
 .cmcp-hist-action:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
 .cmcp-hist-action.danger:hover { color: var(--p-red-400, #f87171); }
-.cmcp-hist-action .pi { font-size: calc(var(--cmcp-fs) * 0.9231); }
+.cmcp-hist-action .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); }
 .cmcp-hist-footer {
   margin-top: 0.25rem; padding: 0.5rem 0.375rem 0.125rem;
   border-top: 1px solid var(--p-content-border-color, #3f3f46);
 }
 .cmcp-hist-note {
   margin: 0 0 0.375rem; color: var(--p-text-muted-color, #a1a1aa);
-  font-size: calc(var(--cmcp-fs) * 0.7692); line-height: 1.35;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); line-height: 1.35;
 }
 .cmcp-hist-clear {
   display: flex; align-items: center; justify-content: center; gap: 0.375rem;
   width: 100%; padding: 0.3125rem 0.5rem; border-radius: var(--p-border-radius-sm, 4px);
   border: 1px solid color-mix(in srgb, var(--p-red-400, #f87171) 45%, transparent);
   background: transparent; color: var(--p-red-400, #f87171); cursor: pointer;
-  font: inherit; font-size: calc(var(--cmcp-fs) * 0.8462);
+  font: inherit; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462);
 }
 .cmcp-hist-clear:hover:not(:disabled) { background: color-mix(in srgb, var(--p-red-400, #f87171) 12%, transparent); }
 .cmcp-hist-clear:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Model/effort picker popover (anchored above the composer). */
-.cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: calc(var(--cmcp-fs) * 0.7692); font-weight: 600;
+.cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.04em; color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-pop-section:not(:first-child) { margin-top: 0.25rem; border-top: 1px solid var(--p-content-border-color, #3f3f46); padding-top: 0.375rem; }
 .cmcp-popover-item .check { flex: none; width: 1rem; text-align: center; margin-left: 0.375rem; color: var(--p-primary-color, #60a5fa); visibility: hidden; }
 .cmcp-popover-item .check.on { visibility: visible; }
-.cmcp-chip .pi-angle-down { font-size: calc(var(--cmcp-fs) * 0.6923); opacity: 0.7; }
+.cmcp-chip .pi-angle-down { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.6923); opacity: 0.7; }
 .cmcp-chip .dim { opacity: 0.65; }
 /* Omni-search model picker (aggregates every connected provider's catalog into
    one virtualized, keyboard-navigable list). Row height is FIXED at 30px so the
@@ -18792,9 +18792,9 @@ const PANEL_CSS = `
 .cmcp-modelsearch { display: flex; flex-direction: column; }
 .cmcp-modelsearch-input { margin: 0.25rem 0.5rem; padding: 0.3rem 0.5rem; border-radius: 6px;
   border: 1px solid var(--p-content-border-color, #3f3f46); background: var(--p-surface-900, #18181b);
-  color: var(--p-text-color, #e4e4e7); font-size: calc(var(--cmcp-fs) * 0.9846); }
+  color: var(--p-text-color, #e4e4e7); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); }
 .cmcp-modelsearch-input:focus { outline: none; border-color: var(--p-focus-ring-color, #60a5fa); }
-.cmcp-modelsearch-cap { padding: 0.125rem 0.5rem 0.25rem; font-size: calc(var(--cmcp-fs) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-modelsearch-cap { padding: 0.125rem 0.5rem 0.25rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-modelresults { position: relative; overflow-y: auto; max-height: 15rem; }
 .cmcp-modelsizer { position: relative; width: 100%; }
 .cmcp-modelrow { position: absolute; left: 0; right: 0; height: 30px; display: flex; align-items: center;
@@ -18802,19 +18802,19 @@ const PANEL_CSS = `
   text-align: left; cursor: pointer; box-sizing: border-box; }
 .cmcp-modelrow:hover, .cmcp-modelrow.active { background: var(--p-surface-700, #3f3f46); }
 .cmcp-modelrow .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cmcp-modelrow .sub { flex: none; color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs) * 0.8462); overflow: hidden;
+.cmcp-modelrow .sub { flex: none; color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
-.cmcp-provtag { flex: none; font-size: calc(var(--cmcp-fs) * 0.6923); text-transform: uppercase; letter-spacing: 0.03em;
+.cmcp-provtag { flex: none; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.6923); text-transform: uppercase; letter-spacing: 0.03em;
   padding: 0.05rem 0.35rem; border-radius: 999px; background: var(--p-surface-800, #27272a);
   color: var(--p-text-muted-color, #a1a1aa); border: 1px solid var(--p-content-border-color, #3f3f46); }
 .cmcp-modelrow .check { flex: none; width: 1rem; text-align: center; color: var(--p-primary-color, #60a5fa); visibility: hidden; }
 .cmcp-modelrow .check.on { visibility: visible; }
-.cmcp-modelempty { padding: 0.5rem; font-size: calc(var(--cmcp-fs) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-modelempty { padding: 0.5rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); color: var(--p-text-muted-color, #a1a1aa); }
 /* Recently-used section (non-virtualized; bounded to the last few picks). Rows
    flow normally (override the absolute positioning the virtualized list uses). */
 .cmcp-modelrecents .cmcp-modelrow { position: static; }
 .cmcp-modelrecent-x { flex: none; margin-left: 0.15rem; padding: 0 0.2rem; background: none; border: none;
-  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; opacity: 0.55; font-size: calc(var(--cmcp-fs) * 0.8615); line-height: 1; }
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; opacity: 0.55; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); line-height: 1; }
 .cmcp-modelrecent-x:hover { opacity: 1; color: var(--p-text-color, #e4e4e7); }
 `;
 
@@ -21139,7 +21139,7 @@ function buildPanel() {
           const off = document.createElement("i");
           off.className = "pi pi-times";
           off.title = `Hide ${BACKEND_LABELS[id] || id} — you don't use it. Restore it from the "hidden" row below.`;
-          off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.8615);flex:none;";
+          off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);flex:none;";
           off.addEventListener("mousedown", (mev) => {
             // Swallow the row's pick handler — this gesture only hides.
             mev.preventDefault();
@@ -22556,7 +22556,7 @@ function buildPanel() {
     if (name) {
       const cap = document.createElement("div");
       cap.className = "cmcp-media-caption";
-      cap.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
     }
@@ -22642,7 +22642,7 @@ function buildPanel() {
       holder._preFailCss = holder.style.cssText;
       holder.style.cssText +=
         ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
-        "color:var(--p-text-muted-color,#a1a1aa);font-size:calc(var(--cmcp-fs) * 0.9231);";
+        "color:var(--p-text-muted-color,#a1a1aa);font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);";
       // Release the decode buffers the way unmountHolderVideo does — detaching alone is
       // not deterministic release, and unmount will skip this element once `_video` is
       // null, so this is the last chance to do it (codex).
@@ -22716,7 +22716,7 @@ function buildPanel() {
     if (name) {
       const cap = document.createElement("div");
       cap.className = "cmcp-media-caption";
-      cap.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
     }
@@ -22753,7 +22753,7 @@ function buildPanel() {
     card.appendChild(audio);
     if (name) {
       const cap = document.createElement("div");
-      cap.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
       cap.textContent = name;
       card.appendChild(cap);
     }
@@ -22788,7 +22788,7 @@ function buildPanel() {
     a.textContent = name || "Open file";
     card.appendChild(a);
     const hint = document.createElement("div");
-    hint.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+    hint.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
     hint.textContent = "The panel can't preview this file type — open or download it.";
     card.appendChild(hint);
     log.appendChild(card);
@@ -22965,7 +22965,7 @@ function buildPanel() {
     if (msg.header) {
       const chip = document.createElement("div");
       chip.className = "cmcp-card-head";
-      chip.style.cssText = "text-transform:uppercase;font-size:calc(var(--cmcp-fs) * 0.7385);letter-spacing:0.05em;opacity:0.7;";
+      chip.style.cssText = "text-transform:uppercase;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7385);letter-spacing:0.05em;opacity:0.7;";
       chip.textContent = coerceMessageText(msg.header);
       card.appendChild(chip);
     }
@@ -23009,7 +23009,7 @@ function buildPanel() {
       const answerText = coerceMessageText(answer);
       if (questionText) {
         const q = document.createElement("div");
-        q.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.8862);opacity:0.65;";
+        q.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);opacity:0.65;";
         q.textContent = questionText;
         card.appendChild(q);
       }
@@ -23031,14 +23031,14 @@ function buildPanel() {
       b.className = "cmcp-opt";
       b.style.cssText =
         "text-align:left;padding:0.4rem 0.55rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-        "background:var(--p-surface-800,#2a2a2a);color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.9846);";
+        "background:var(--p-surface-800,#2a2a2a);color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
       const lbl = document.createElement("div");
       lbl.style.fontWeight = "600";
       lbl.textContent = coerceMessageText(opt.label ?? opt);
       b.appendChild(lbl);
       if (opt.description) {
         const d = document.createElement("div");
-        d.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.8615);opacity:0.7;margin-top:0.1rem;";
+        d.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);opacity:0.7;margin-top:0.1rem;";
         d.textContent = coerceMessageText(opt.description);
         b.appendChild(d);
       }
@@ -23064,7 +23064,7 @@ function buildPanel() {
     other.placeholder = "Other… (type your own answer)";
     other.style.cssText =
       "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs) * 0.9846);";
+      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
     other.addEventListener("keydown", (e) => {
       if (isImeComposing(e)) return; // don't commit mid-IME-composition (#385)
       if (e.key === "Enter" && other.value.trim()) { e.preventDefault(); finish(other.value.trim()); }
@@ -23074,7 +23074,7 @@ function buildPanel() {
     const submit = document.createElement("button");
     submit.type = "button";
     submit.style.cssText =
-      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.9846);" +
+      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
     submit.textContent = multi ? "Submit" : "Send";
     submit.addEventListener("click", () => {
@@ -23176,7 +23176,7 @@ function buildPanel() {
       card.style.opacity = "0.6";
       const note = document.createElement("div");
       note.className = "cmcp-card-stale";
-      note.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.8369);opacity:0.8;margin-top:0.4rem;";
+      note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.8;margin-top:0.4rem;";
       note.textContent =
         `The connection that asked this ${what ?? "question"} dropped, so an answer here can no ` +
         `longer reach the agent. ` +
@@ -23213,7 +23213,7 @@ function buildPanel() {
     card.appendChild(head);
 
     const hint = document.createElement("div");
-    hint.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.8369);opacity:0.7;margin:0.2rem 0 0.4rem;";
+    hint.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.7;margin:0.2rem 0 0.4rem;";
     hint.textContent =
       msg.hint || "Sent straight to your config — never shown to the agent and never saved to chat history.";
     card.appendChild(hint);
@@ -23262,7 +23262,7 @@ function buildPanel() {
     input.placeholder = "Paste token…";
     input.style.cssText =
       "flex:1 1 10rem;min-width:0;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs) * 0.9846);";
+      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
 
     // Show/record only a masked preview (first 4 … last 4) so the user can
     // confirm WHICH token without ever exposing the full value.
@@ -23277,7 +23277,7 @@ function buildPanel() {
       card.replaceChildren();
       card.style.cssText = "border-left:3px solid var(--p-green-400,#4ade80);opacity:0.9;";
       const ok = document.createElement("div");
-      ok.style.cssText = "font-size:calc(var(--cmcp-fs) * 0.9231);color:var(--p-green-400,#4ade80);";
+      ok.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);color:var(--p-green-400,#4ade80);";
       const m = mask(value);
       ok.textContent = value ? `🔒 Token saved: ${m}` : "Skipped — no token entered.";
       card.appendChild(ok);
@@ -23310,7 +23310,7 @@ function buildPanel() {
     // group spill the card at 320/280px. Stating the intent stops a future
     // "everything gets min-width:0" sweep from supplying the missing half.
     submit.style.cssText =
-      "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.9846);" +
+      "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
     submit.textContent = "Save";
     submit.addEventListener("click", () => finish(input.value.trim()));
@@ -23320,7 +23320,7 @@ function buildPanel() {
     skip.type = "button";
     skip.style.cssText =
       "flex:none;padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
-      "background:transparent;color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs) * 0.9846);";
+      "background:transparent;color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
     skip.textContent = "Skip";
     skip.addEventListener("click", () => finish(""));
     btns.appendChild(skip);
@@ -28789,14 +28789,14 @@ function buildPanel() {
     canvas.style.cssText = "background:#fff;border-radius:8px;padding:8px;width:240px;height:240px;";
     canvas.hidden = true;
     const statusMsg = document.createElement("div");
-    statusMsg.style.cssText = "font-size:calc(var(--cmcp-fs) * 1.0462);opacity:0.85;text-align:center;";
+    statusMsg.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);opacity:0.85;text-align:center;";
     const urlLine = document.createElement("div");
     urlLine.style.cssText =
-      "font-size:calc(var(--cmcp-fs) * 0.8615);opacity:0.55;word-break:break-all;text-align:center;max-width:280px;";
+      "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);opacity:0.55;word-break:break-all;text-align:center;max-width:280px;";
     // #749 — the durability of THIS url, rendered where the user is looking at it.
     const durabilityLine = document.createElement("div");
     durabilityLine.style.cssText =
-      "font-size:calc(var(--cmcp-fs) * 0.8862);line-height:1.35;text-align:left;max-width:280px;margin-top:0.15rem;";
+      "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);line-height:1.35;text-align:left;max-width:280px;margin-top:0.15rem;";
     durabilityLine.hidden = true;
     qrWrap.append(canvas, statusMsg, urlLine, durabilityLine);
 
