@@ -6,6 +6,39 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-10
+
+> Searching for a custom node pack and getting "no matches" reads as "that pack does not
+> exist". It can equally mean the list that was searched predates the pack: a machine whose
+> network blocks the registry does not get an empty catalogue from ComfyUI-Manager, it gets
+> a full one that may be months old, and nothing in the answer distinguishes the two.
+
+### Fixed
+- a node search that matches nothing now says how many packs it searched, that the request
+  asked Manager for its cached copy, and — explicitly — that Manager does not report
+  whether it honoured that, when the data was fetched, or whether it came from the network,
+  the on-disk cache or the copy bundled with Manager (#890). So the result stops implying a
+  pack does not exist when what it actually shows is that it was not in the list searched.
+- the panel deliberately makes no guess about staleness. Measured on a working install, the
+  served catalogue is not the bundled map (5583 packs against 4884, sharing about 1800
+  entries), so the obvious "is this the bundled copy" test would never fire — it would ship
+  as a check that always passes and quietly reassures.
+- a search that finds something is unchanged, and an empty catalogue keeps its existing
+  stronger answer: nothing was searched at all.
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.11.99] - 2026-08-10
 
 > After a Save-As, graph tools could keep refusing even for an agent that did exactly what
