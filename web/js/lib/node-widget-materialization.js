@@ -175,15 +175,23 @@ export function unavailableRequiredWidgetReport(
   // reproduce the very error this fixes one level down.
   const socketDeclared = new Set();
   const widgetDeclared = new Set();
+  // #1062 (codex) — types for which EVERY carrying input resolves to a widget the core
+  // frontend builds natively (`widgetType ?? type` naming a primitive). Held to the same
+  // "every, not some" discipline as socketDeclared directly below, and for the same reason:
+  // one input's native hint must not waive a sibling that needs a real constructor.
+  const nativeWidgetDeclared = new Set();
+  const nonNativeDeclared = new Set();
   const inputsByType = new Map();
   for (const [name, spec] of Object.entries(required)) {
     const type = inputWidgetType(spec);
     if (!type) continue;
     (inputDeclaredAsSocket(spec) ? socketDeclared : widgetDeclared).add(type);
+    (inputDeclaresNativeWidgetType(spec) ? nativeWidgetDeclared : nonNativeDeclared).add(type);
     if (!inputsByType.has(type)) inputsByType.set(type, []);
     inputsByType.get(type).push(name);
   }
   for (const type of widgetDeclared) socketDeclared.delete(type);
+  for (const type of nonNativeDeclared) nativeWidgetDeclared.delete(type);
 
   const report = [];
   for (const [type, inputs] of inputsByType) {
@@ -191,6 +199,11 @@ export function unavailableRequiredWidgetReport(
     // ComfyUI's own `INT:seed` / `INT:noise_seed` keys and any union a pack chooses to
     // register — so the whole string is checked first, before it is decomposed.
     if (typeof widgetConstructors?.[type] === "function") continue;
+    // #1062 (codex) — a NATIVE widget hint resolves without any registration, so there is
+    // nothing here a retry could be waiting for. Checked before the member analysis because
+    // it is a statement about the INPUT's own resolution, independent of what the declared
+    // type's members are or whether anything outputs them.
+    if (nativeWidgetDeclared.has(type)) continue;
     const members = declaredTypeMembers(type);
     if (!members.length) continue;
     // Every member is a datatype no widget constructor will ever appear for: a built-in
@@ -435,6 +448,33 @@ export function isCore3dFileType(type) {
  * Deliberately NOT inferred from the type: the same datatype can be a widget on one node
  * and a socket on another, which is exactly why the output-side evidence was insufficient.
  */
+/**
+ * #1062 (codex re-review) — whether an input's `widgetType` hint names a widget the CORE
+ * FRONTEND IMPLEMENTS ITSELF.
+ *
+ * The companion to putting `widgetType` in WIDGET_VALUE_CONFIG_KEYS. That key correctly says
+ * "this input is a widget, not a socket", which is what stops an unregistered custom widget
+ * from being waived as a link. But it is not the whole ruling, and taking it as the whole
+ * ruling was a false REFUSAL — the exact mirror of the accept it fixed.
+ *
+ * ComfyUI resolves the widget as `widgetType ?? type`, so `("FILE_3D_GLTF", {widgetType:
+ * "STRING"})` renders a NATIVE STRING widget. Nothing registers a constructor for
+ * FILE_3D_GLTF and nothing ever will, so refusing it waits on evidence that cannot arrive
+ * (#796) — the same failure #788 fixed for `("FLOAT,INT", {widgetType: "FLOAT"})`, which
+ * this file already documents. The difference is only that #788 read the resolution off the
+ * declared TYPE and this reads it off the hint, which is the half that actually wins.
+ *
+ * A NON-primitive hint is unchanged and still fails closed: `{widgetType: "ACME_GALLERY"}`
+ * genuinely needs a constructor no core frontend provides, and that is the case the key-list
+ * addition exists to catch.
+ */
+function inputDeclaresNativeWidgetType(spec) {
+  if (!Array.isArray(spec)) return false;
+  const config = spec[1];
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  return isPrimitiveWidgetType(config.widgetType);
+}
+
 export function inputDeclaredAsSocket(spec) {
   if (!Array.isArray(spec)) return false;
   // A legacy combo (choices as the first tuple item) is always a widget — it exists to

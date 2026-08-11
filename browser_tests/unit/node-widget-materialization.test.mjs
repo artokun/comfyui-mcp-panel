@@ -830,24 +830,58 @@ test("#1062 #580 (codex): a bare `widgetType` is a WIDGET declaration, not a soc
   // was inert while an unproduced datatype could never clear `linkProven`; adding the
   // core-3D proof removed that accidental second lock. Without this, the node below is
   // added as a socket while genuinely being a STRING widget: neither value nor link.
-  const hint = { input: { required: { mesh: ["FILE_3D_GLTF", { widgetType: "STRING" }] } } };
+  // A NON-primitive hint needs a constructor no core frontend provides, and is the case
+  // that must fail closed. This is the actual false accept: without `widgetType` in the
+  // key list it was socket-shaped and waived as a link.
+  const custom = { input: { required: { mesh: ["FILE_3D_GLTF", { widgetType: "ACME_GALLERY" }] } } };
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(hint, {}, new Set(), hint),
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(), custom),
     ["FILE_3D_GLTF"],
-    "an input naming the widget it renders as is not a socket",
+    "an input naming a CUSTOM widget it renders as is not a socket",
   );
-  // Its own constructor still clears it, like any other widget.
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(hint, { FILE_3D_GLTF: () => {} }, new Set(), hint),
+    unavailableRequiredCustomWidgetTypes(custom, { FILE_3D_GLTF: () => {} }, new Set(), custom),
     [],
+    "its own constructor still clears it, like any other widget",
   );
-  // And the same hint on a UNION is a widget too — the #788 ruling, now enforced by the
-  // key list rather than by that union happening to also carry `default`.
+  // The same hint on a UNION is a widget too — the #788 ruling, now enforced by the key
+  // list rather than by that union happening to also carry `default`.
   const union = {
-    input: { required: { mesh: ["MESH,FILE_3D_GLB", { widgetType: "STRING" }] } },
+    input: { required: { mesh: ["MESH,FILE_3D_GLB", { widgetType: "ACME_GALLERY" }] } },
   };
   assert.deepEqual(unavailableRequiredCustomWidgetTypes(union, {}, new Set(["MESH"]), union), [
     "MESH,FILE_3D_GLB",
+  ]);
+});
+
+test("#1062 (codex re-review): a PRIMITIVE `widgetType` hint resolves natively — never refused", () => {
+  // The over-correction the first fix introduced, caught on re-review. ComfyUI resolves
+  // `widgetType ?? type`, so this renders a NATIVE STRING widget. Nothing registers a
+  // constructor for FILE_3D_GLTF and nothing ever will, so refusing it waits on evidence
+  // that cannot arrive (#796) — the same failure #788 fixed, read off the hint instead of
+  // off the declared type.
+  const native = { input: { required: { mesh: ["FILE_3D_GLTF", { widgetType: "STRING" }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(native, {}, new Set(), native),
+    [],
+    "a native primitive widget needs no registration",
+  );
+  // Independent of the declared type entirely — an unproven CUSTOM type with a primitive
+  // hint resolves the same way, because the hint is the half that wins.
+  const acme = { input: { required: { thing: ["ZIPN_STYLE_GALLERY", { widgetType: "INT" }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(acme, {}, new Set(), acme), []);
+  // "Every, not some": a sibling input on the same type that needs a REAL constructor is
+  // not waived by its native-hinted neighbour.
+  const mixed = {
+    input: {
+      required: {
+        a: ["ZIPN_STYLE_GALLERY", { widgetType: "INT" }],
+        b: ["ZIPN_STYLE_GALLERY", { default: "none" }],
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(mixed, {}, new Set(), mixed), [
+    "ZIPN_STYLE_GALLERY",
   ]);
 });
 
