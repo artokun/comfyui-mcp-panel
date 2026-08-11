@@ -41,7 +41,14 @@ test("#111 Settings → About has a docs row that opens the docs site", () => {
   const at = SRC.indexOf('id: "comfyui-mcp.readDocs"');
   assert.notEqual(at, -1, "the About section must have a docs row");
   const row = SRC.slice(at, at + 1200);
-  assert.match(row, /category: cat\("About"/, "it belongs to About, beside Star/Discord/Need-help");
+  // `get category()`, not `category:` — the section label is translated, and the Settings
+  // block is built before the locale catalog loads, so it has to be read lazily (see
+  // browser_tests/unit/i18n.test.mjs). The row's SECTION is what this asserts either way.
+  assert.match(
+    row,
+    /get category\(\)[\s\S]{0,80}?cat\(tr\("panel\.about"/,
+    "it belongs to About, beside Star/Discord/Need-help",
+  );
   // The tooltip names the DESTINATION, never the mechanism. This row renders into
   // ComfyUI's own Settings dialog, outside the sidebar root that wireExternalLinks
   // delegates on, so the anchor's native target=_blank is the whole mechanism —
