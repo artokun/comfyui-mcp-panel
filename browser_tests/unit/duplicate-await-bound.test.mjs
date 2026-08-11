@@ -37,25 +37,25 @@ function namedFunctionSource(src, name) {
 const buildHelper = () => {
   const fn = namedFunctionSource(SRC, "awaitDuplicateReply");
   assert.ok(fn, "awaitDuplicateReply not found");
-  const ms = SRC.match(/const DUPLICATE_AWAIT_MS = (\d+);/);
-  assert.ok(ms, "DUPLICATE_AWAIT_MS not found");
-  // Rebuilt with a tiny bound so the timeout path is testable in milliseconds.
-  return new Function(`const DUPLICATE_AWAIT_MS = 20; ${fn}; return awaitDuplicateReply;`)();
+  const margin = SRC.match(/const DUPLICATE_AWAIT_MARGIN_MS = (\d+);/);
+  assert.ok(margin, "DUPLICATE_AWAIT_MARGIN_MS not found");
+  // Rebuilt with a tiny margin so a millisecond-scale caller deadline still leaves a budget.
+  return new Function(`const DUPLICATE_AWAIT_MARGIN_MS = 5; ${fn}; return awaitDuplicateReply;`)();
 };
 
 test("#646 a settled original is returned UNCHANGED — the bound never rewrites a real reply", async () => {
   const awaitDuplicateReply = buildHelper();
   const settled = { rid: "orig", ok: true, result: { node_id: 7 } };
-  assert.equal(await awaitDuplicateReply(settled, "dup"), settled, "same object, not a copy");
+  assert.equal(await awaitDuplicateReply(settled, "dup", 50), settled, "same object, not a copy");
   // And an in-flight one that DOES settle in time still wins the race.
   const soon = new Promise((r) => setTimeout(() => r(settled), 1));
-  assert.equal(await awaitDuplicateReply(soon, "dup"), settled);
+  assert.equal(await awaitDuplicateReply(soon, "dup", 50), settled);
 });
 
 test("#646 an original that never settles yields an HONEST reply instead of silence", async () => {
   const awaitDuplicateReply = buildHelper();
   const never = new Promise(() => {}); // the stranded in-flight entry
-  const reply = await awaitDuplicateReply(never, "dup-rid");
+  const reply = await awaitDuplicateReply(never, "dup-rid", 25);
 
   assert.equal(reply.rid, "dup-rid", "correlated to the DUPLICATE's rid, which is what the caller waits on");
   assert.equal(reply.ok, false);
@@ -79,10 +79,10 @@ test("#646 the ORIGINAL entry is never settled by the bound", async () => {
     // Nothing calls this — the point is that the helper does not either.
     settledWith = resolve;
   });
-  await awaitDuplicateReply(never, "dup");
+  await awaitDuplicateReply(never, "dup", 25);
   assert.ok(typeof settledWith === "function", "the original's resolver was captured");
   // Still pending: racing it again with a short timer must time out a second time.
-  const again = await awaitDuplicateReply(never, "dup2");
+  const again = await awaitDuplicateReply(never, "dup2", 25);
   assert.equal(again.rid, "dup2");
   assert.equal(again.ok, false);
 });
@@ -92,7 +92,7 @@ test("#646 the handler keeps the statement shape #508 and #694 pin", () => {
   // so the handler still has one await followed by the existing rid-rewrite and send. An
   // earlier attempt put a still-in-flight BRANCH in that region and failed both guards —
   // correctly, since #508 exists so a superseded early-return cannot precede the reply write.
-  assert.match(SRC, /dupReply = await awaitDuplicateReply\(priorRidReply, msg\.rid\);/);
+  assert.match(SRC, /dupReply = await awaitDuplicateReply\(priorRidReply, msg\.rid, msg\.timeout_ms\);/);
   const at = SRC.indexOf("dupReply = await awaitDuplicateReply");
   const after = SRC.slice(at, at + 700);
   // No branch introduced between the await and the reply write.
@@ -100,12 +100,32 @@ test("#646 the handler keeps the statement shape #508 and #694 pin", () => {
   assert.match(after, /const outReply = retryOfHit \? \{ \.\.\.dupReply, rid: msg\.rid \} : dupReply;/);
 });
 
-test("#646 the bound is longer than a fast reply and shorter than silence", () => {
-  const ms = Number(SRC.match(/const DUPLICATE_AWAIT_MS = (\d+);/)[1]);
-  // Above the orchestrator's short command timeouts (6s was in the report), so a merely SLOW
-  // duplicate still receives the real reply rather than this notice...
-  assert.ok(ms > 6000, `bound ${ms}ms must exceed a short command timeout`);
-  // ...and at or under the long ones (20s in the report), so a wedged executor produces an
-  // error rather than the silence this fixes.
-  assert.ok(ms >= 20000 && ms <= 30000, `bound ${ms}ms must land in the wedge-detecting range`);
+test("#646 NO GUESS: with no deadline in the frame, the await is exactly as unbounded as before", async () => {
+  // The defect that killed the first version: a fixed 25s bound could not rescue a caller who
+  // gives up at 20s, and a lower one would report "still running" for a merely slow command.
+  // The panel cannot see the caller's deadline — the orchestrator computes it
+  // (ui-bridge.ts:3632) and does not put it in the frame (:4003) — so absent that field this
+  // must change NOTHING rather than guess.
+  const awaitDuplicateReply = buildHelper();
+  const never = new Promise(() => {});
+  const raced = await Promise.race([
+    awaitDuplicateReply(never, "dup", undefined).then(() => "answered"),
+    new Promise((r) => setTimeout(() => r("still waiting"), 40)),
+  ]);
+  assert.equal(raced, "still waiting", "no deadline → no bound → today's behaviour");
+  for (const bad of [null, 0, -1, NaN, "20000", {}]) {
+    const r = await Promise.race([
+      awaitDuplicateReply(never, "dup", bad).then(() => "answered"),
+      new Promise((res) => setTimeout(() => res("still waiting"), 30)),
+    ]);
+    assert.equal(r, "still waiting", `unusable deadline ${String(bad)} must not synthesize a bound`);
+  }
+});
+
+test("#646 the bound is the CALLER's deadline minus a margin, not a number of our own", () => {
+  assert.match(SRC, /const DUPLICATE_AWAIT_MARGIN_MS = \d+;/);
+  assert.ok(!/DUPLICATE_AWAIT_MS/.test(SRC), "no fixed bound survives");
+  assert.match(SRC, /callerTimeoutMs - DUPLICATE_AWAIT_MARGIN_MS/);
+  // Reads the frame's field, so it activates the moment the orchestrator sends it.
+  assert.match(SRC, /msg\.timeout_ms/);
 });

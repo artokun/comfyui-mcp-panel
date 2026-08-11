@@ -16246,8 +16246,23 @@ function redactBridgeUrl(u) {
 //
 // The ORIGINAL entry is never settled by this. Answering "failed" for a command that may
 // still be running is how a caller retries into the double-apply the ledger exists to stop.
-const DUPLICATE_AWAIT_MS = 25000;
-function awaitDuplicateReply(prior, rid) {
+// The margin subtracted from the caller's OWN deadline, so the reply lands before they
+// give up rather than after. Small relative to any real command timeout.
+const DUPLICATE_AWAIT_MARGIN_MS = 1500;
+function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
+  // NO GUESS. A bound is applied only when the frame told us how long the caller will wait
+  // (codex): the orchestrator computes a per-command timeout at ui-bridge.ts:3632 but does
+  // not put it in the frame at :4003, so today this is usually absent and the await stays
+  // exactly as unbounded as it is on main. Any fixed number would be a guess about another
+  // process's contract — and a guess that is too high changes nothing (25s cannot rescue a
+  // 20s deadline), while one that is too low reports 'still running' for a merely slow
+  // command. It also disposes of ask_user/request_secret without a special case: they carry
+  // long or absent deadlines, so a short bound never fires for them.
+  const budget =
+    Number.isFinite(callerTimeoutMs) && callerTimeoutMs > DUPLICATE_AWAIT_MARGIN_MS
+      ? callerTimeoutMs - DUPLICATE_AWAIT_MARGIN_MS
+      : null;
+  if (budget === null) return Promise.resolve(prior);
   return Promise.race([
     Promise.resolve(prior),
     new Promise((resolve) =>
@@ -16258,12 +16273,12 @@ function awaitDuplicateReply(prior, rid) {
             ok: false,
             error:
               "This request id is STILL RUNNING in the panel and has not produced an outcome after " +
-              Math.round(DUPLICATE_AWAIT_MS / 1000) +
+              Math.round(budget / 1000) +
               "s. This delivery was a DUPLICATE of it, so nothing new was started and nothing was " +
               "applied twice. DO NOT RETRY: the original may still complete, and re-issuing it is how " +
               "one mutation becomes two. Read the graph to see whether it took effect.",
           }),
-        DUPLICATE_AWAIT_MS,
+        budget,
       ),
     ),
   ]);
@@ -16880,7 +16895,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         if (priorRidReply !== undefined) {
           let dupReply;
           try {
-            dupReply = await awaitDuplicateReply(priorRidReply, msg.rid);
+            dupReply = await awaitDuplicateReply(priorRidReply, msg.rid, msg.timeout_ms);
           } catch {
             return; // ledger promises never reject — defensive only
           }
