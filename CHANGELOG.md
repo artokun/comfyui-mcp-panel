@@ -6,6 +6,41 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-08-10
+
+> When the panel loses its connection while the agent is waiting on a question, the card
+> stays on screen and stays clickable — but its answer can no longer reach anyone. If the
+> agent asks again after reconnecting you get two identical questions, one of which does
+> nothing, and until now the panel left you to work out which.
+
+### Fixed
+- a question card whose connection has been replaced is now visibly retired: its buttons
+  stop working and it says the connection dropped and to answer the newer card (#952).
+- the same for a secret request, with wording that never sends you to paste a token into
+  the chat — that card exists so the value reaches the orchestrator through a masked input
+  the agent never sees.
+- a card is only retired when the connection that ASKED for it has actually been replaced.
+  A reconnect that lands on the same socket, or a re-handshake (which happens routinely),
+  leaves a live card alone — as does the Settings token field, which has no agent behind
+  it and still works after a reconnect.
+- a created tab must leave a fence its own commands can pass (#1019) (#1025)
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.1 (#1026)
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.12.1] - 2026-08-10
 
 > When a command is refused because it targets a different workflow than the canvas, the
