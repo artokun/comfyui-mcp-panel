@@ -1340,19 +1340,33 @@ function isExternalWorkflowPath(path) {
   // directory and is still outside the managed /userdata store. A managed store path is
   // always relative "workflows/…" (no drive letter, no leading separator), so this
   // never touches the everyday save path.
-  // #1066 — a URL is external too, and it was the one shape both tests missed. ComfyUI
-  // mints a TEMPORARY workflow whose path is the URL an asset was opened from
-  // (`workflows/http://127.0.0.1:8188/api/view?filename=…`), and renaming that tab replaces
-  // only the FILENAME — so the URL survives as the tab's DIRECTORY. It has no leading
-  // separator, and its colon sits at index 4 rather than 1, so neither test above fires:
-  // the directory was accepted verbatim and the save built
-  // `workflows/http://127.0.0.1:8188/api/Name.json`, which /userdata rejects with a 500.
-  // The tab could not be saved under ANY name.
-  //
-  // A scheme is checked rather than the literal "http", so file:, blob: and data: are
-  // covered by the same rule. Requiring "//" after the colon keeps this away from an
-  // ordinary Windows drive letter, which the first test already owns.
-  return /^[a-zA-Z]:/.test(raw) || /^[\\/]/.test(raw) || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw);
+  return /^[a-zA-Z]:/.test(raw) || /^[\\/]/.test(raw);
+}
+
+/** #1066 — a URL-DERIVED workflow path, which is a different thing from an external file.
+ *
+ *  ComfyUI mints a TEMPORARY workflow whose path is the URL an asset was opened from:
+ *  `workflows/http://127.0.0.1:8188/api/view?filename=x.png&type=output&…`. Renaming that
+ *  tab replaces only the FILENAME, so the URL survives as the tab's DIRECTORY — and the
+ *  managed `workflows/` prefix is RETAINED, which is why this is not anchored. An earlier
+ *  attempt anchored it at position 0 and therefore never fired on the reported value.
+ *
+ *  WHY A SEPARATE PREDICATE, rather than widening isExternalWorkflowPath (codex): that one
+ *  also gates the low-level root-copy route, whose whole premise is that the source is a
+ *  REAL existing file being copied — it records `save-as-copy` and refuses outright when the
+ *  copy API is missing, to avoid moving or destroying the original. A URL source is not a
+ *  file at all; there is nothing to copy and nothing to destroy. Classifying it as external
+ *  would keep the tab unsaveable by a different route, which is what the reporter observed:
+ *  their first successful save came only from treating the URL source as never persisted.
+ *
+ *  Requiring "//" keeps this off an ordinary Windows drive letter and off a folder
+ *  legitimately named "notes:draft". Opaque schemes (`blob:`, `data:`) are deliberately NOT
+ *  matched: catching them needs a bare `scheme:`, which would hit real folder names, and the
+ *  reported shape is hierarchical. On POSIX a managed directory could syntactically contain
+ *  "://" — accepted knowingly, because such a directory cannot round-trip through /userdata
+ *  anyway, and a save redirected to the workflows root is recoverable where a 500 is not. */
+function isUrlDerivedWorkflowPath(path) {
+  return /[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(String(path || ""));
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
@@ -1361,7 +1375,10 @@ function isExternalWorkflowPath(path) {
  *  user workflows root (#285). Defaults to the workflows root. */
 function directoryOf(wf) {
   const dir = String(wf?.directory || "").replace(/[\\/]+$/, "");
-  if (!dir || isExternalWorkflowPath(dir)) return `${WORKFLOWS_ROOT}/`;
+  // #1066 — a URL-derived directory is redirected too. It is not a writable managed
+  // folder, and accepting it verbatim built `workflows/http://…/Name.json`, which
+  // /userdata rejects with a 500 — leaving the tab unsaveable under ANY name.
+  if (!dir || isExternalWorkflowPath(dir) || isUrlDerivedWorkflowPath(dir)) return `${WORKFLOWS_ROOT}/`;
   return `${dir}/`;
 }
 
