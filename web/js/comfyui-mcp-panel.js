@@ -16241,8 +16241,10 @@ function noteActiveWorkflowMove() {
     _lastSeenActiveKey = key;
     if (!key) return; // nothing active — a destination-less move records nothing
     activeWorkflowMoves.record({
-      // An UNCLAIMED move is the case #968 is hunting: a tab click, a reconnect restore, a
-      // file reopened at a new path. Defaulting to `external` is what makes it visible.
+      // An UNCLAIMED move is the case #968 is hunting. It is recorded as UNKNOWN rather than
+      // as "not the panel": `workflow_new` cannot stake a claim (#606/#708 rebuild it in
+      // isolation), and one of the three reports entered through that very command, so
+      // excluding the panel here would be a false exclusion on a reported entry path.
       cause: claim ? claim.cause : MOVE_CAUSES.UNKNOWN,
       detail: claim ? claim.detail : null,
       from,
