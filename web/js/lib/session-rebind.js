@@ -324,6 +324,15 @@ export function buildHelloPayload({
     // newer orchestrator fail closed for an older bundle that only fences at
     // initial dispatch.
     enforces_workflow_stamp_at_write: true,
+    // Advertise that this build understands `agent_note` — an orchestrator frame that is
+    // delivered to the AGENT ONLY and never rendered as a chat bubble.
+    //
+    // It must be a capability rather than an assumption. An older panel silently ignores
+    // an unknown frame type, so an orchestrator that switched unconditionally would make
+    // these notices vanish for everyone who has not updated — trading a wall of text for
+    // no text at all, which is the worse failure. The orchestrator keeps using `say` when
+    // this flag is absent.
+    accepts_agent_notes: true,
   };
   // #709 — a browser-tab-scoped identity, deliberately separate from the
   // workflow routing id. `tab_id` is normally a workflow path and can therefore
