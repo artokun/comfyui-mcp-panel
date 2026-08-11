@@ -65,11 +65,11 @@
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "リモート ComfyUI の URL（上級）",
-    "tooltip": "エージェントの向き先をこのマシンではなくリモートの ComfyUI にします — 例: https://xxxxxxxx-8188.proxy.runpod.net の RunPod ポッド。ローカルの ComfyUI を使う場合は空欄のままにしてください（既定）。設定すると、エージェントのツール（キュー、モデル、履歴、アップロード）はリモートのサーバーを対象にし、ローカル専用ツール（download_model / インストーラーパック / モデルスキャン）は無効になります。オーケストレーターの次回起動時に適用されるため、変更するには切断してから接続し直してください。目の前のキャンバスは、ブラウザーで開いた ComfyUI に従ったままです。"
+    "tooltip": "エージェントの向き先をこのマシンではなくリモートの ComfyUI にします — 例: https://xxxxxxxx-8188.proxy.runpod.net の RunPod ポッド。ローカルの ComfyUI を使う場合は空欄のままにしてください（既定）。設定すると、エージェントのツール（キュー、モデル、履歴、アップロード）はリモートのサーバーを対象にし、ローカル専用ツール（ download_model / インストーラーパック / モデルスキャン）は無効になります。オーケストレーターの次回起動時に適用されるため、変更するには切断してから接続し直してください。目の前のキャンバスは、ブラウザーで開いた ComfyUI に従ったままです。"
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "ブリッジ URL（上級）",
-    "tooltip": "パネルのオーケストレーターブリッジの WebSocket URL です — 現在は 1 つのブリッジがすべてのプロバイダーを受け持ちます（既定 ws://127.0.0.1:9180）。オーケストレーターを既定以外のポート（COMFYUI_MCP_BRIDGE_PORT）で起動する場合にのみ変更してください。次回の接続時に適用されます。"
+    "tooltip": "パネルのオーケストレーターブリッジの WebSocket URL です — 現在は 1 つのブリッジがすべてのプロバイダーを受け持ちます（既定 ws://127.0.0.1:9180）。オーケストレーターを既定以外のポート（ COMFYUI_MCP_BRIDGE_PORT ）で起動する場合にのみ変更してください。次回の接続時に適用されます。"
   },
   "comfyui-mcp_zoomToAction": {
     "name": "エージェントの編集にズーム",
@@ -81,7 +81,7 @@
   },
   "comfyui-mcp_ollama_api": {
     "name": "エンドポイントの種類",
-    "tooltip": "Ollama バックエンドがエンドポイントと通信する方法です。「Ollama (local)」はローカルの Ollama のネイティブな /api/chat を使います。「OpenAI-compatible」は /chat/completions を話すので、OpenRouter、vLLM、LM Studio、DeepSeek などに使ってください（ベース URL は下で設定し、API キーはオーケストレーターの環境変数（例: OPENROUTER_API_KEY）から取得します）。新しいセッションから適用されるため、変更後は切断してから接続し直してください。"
+    "tooltip": "Ollama バックエンドがエンドポイントと通信する方法です。「Ollama (local)」はローカルの Ollama のネイティブな /api/chat を使います。「OpenAI-compatible」は /chat/completions を話すので、OpenRouter、vLLM、LM Studio、DeepSeek などに使ってください（ベース URL は下で設定し、API キーはオーケストレーターの環境変数（例: OPENROUTER_API_KEY ）から取得します）。新しいセッションから適用されるため、変更後は切断してから接続し直してください。"
   },
   "comfyui-mcp_ollama_baseUrl": {
     "name": "エンドポイントのベース URL",

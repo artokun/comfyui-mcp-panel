@@ -281,6 +281,12 @@
       "civitai_api": "CivitAI API",
       "civitai_download": "CivitAI download"
     },
+    "failure_shell": {
+      "building_the_panel_threw_so_nothing_was": "Building the panel threw, so nothing was rendered. This is a fault in the panel itself — it is NOT a connection problem, and reinstalling ComfyUI or the pack will not change it. The details below are what was actually observed; nothing here is a diagnosis of the cause.",
+      "please_report_this_at_with_the_text": "Please report this at {url} with the text above, your ComfyUI frontend version, and your browser.",
+      "the_agent_panel_could_not_start": "The agent panel could not start.",
+      "the_failure_produced_no_message": "(the failure produced no message)"
+    },
     "filter": {
       "filters": "Filters"
     },
@@ -290,12 +296,6 @@
     "modal": {
       "confirm": "Confirm",
       "ok": "OK"
-    },
-    "panel_failure_shell": {
-      "building_the_panel_threw_so_nothing_was": "Building the panel threw, so nothing was rendered. This is a fault in the panel itself — it is NOT a connection problem, and reinstalling ComfyUI or the pack will not change it. The details below are what was actually observed; nothing here is a diagnosis of the cause.",
-      "please_report_this_at_with_the_text": "Please report this at {url} with the text above, your ComfyUI frontend version, and your browser.",
-      "the_agent_panel_could_not_start": "The agent panel could not start.",
-      "the_failure_produced_no_message": "(the failure produced no message)"
     },
     "panel": {
       "1_install_the_cli": "1. Install the CLI",
@@ -608,6 +608,7 @@
       "ok_carry_this_chat_to_the_new": "OK: carry this chat to the new canvas.\\nCancel: open this workflow's separate chat history.",
       "ollama_local": "Ollama (local)",
       "ollama_local_free_our_comfyui_fine_tune": "Ollama (local, free — our ComfyUI fine-tune)",
+      "one_chat_across_workflows": "Panel — one chat across workflows",
       "open_before_resuming_this_chat": "Open {workflow} before resuming this chat",
       "open_file": "Open file",
       "open_in_a_new_browser_tab": "Open in a new browser tab",
@@ -625,8 +626,6 @@
       "other_type_your_own_answer": "Other… (type your own answer)",
       "output": "output",
       "pair_from_anywhere_via_an_encrypted_tunnel": "pair from anywhere via an encrypted tunnel",
-      "panel_one_chat_across_workflows": "Panel — one chat across workflows",
-      "panel_wide_conversations": "Panel-wide conversations",
       "paste_key": "paste key",
       "paste_token": "Paste token…",
       "paste_your_token": "Paste your token",
@@ -720,8 +719,6 @@
       "save": "Save",
       "save_failed": "save failed",
       "saved": "Saved ✓",
-      "saved_workflow": "Saved “{workflow}”",
-      "saved_workflow_as": "Saved as “{workflow}”",
       "saving": "Saving…",
       "scan_with_your_phone_camera_or_the": "Scan with your phone camera or the app",
       "search_chat_history": "Search chat history",
@@ -823,7 +820,10 @@
       "voice_input_is_not_supported_in_this": "Voice input is not supported in this browser",
       "waiting_for_approval": "Waiting for approval…",
       "was_previous_value": "was {value}",
+      "wide_conversations": "Panel-wide conversations",
       "workflow": "workflow · {version}",
+      "workflow_saved": "Saved “{workflow}”",
+      "workflow_saved_as": "Saved as “{workflow}”",
       "workflow_separate_chat_histories": "Workflow — separate chat histories",
       "workflow_snapshot": "Workflow snapshot",
       "working": "Working…",

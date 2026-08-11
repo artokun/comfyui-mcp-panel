@@ -65,11 +65,11 @@
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "远程 ComfyUI 地址（高级）",
-    "tooltip": "让智能体面向远程 ComfyUI 而不是本机 —— 例如位于 https://xxxxxxxx-8188.proxy.runpod.net 的 RunPod Pod。留空则驱动本地 ComfyUI（默认）。设置后，智能体的工具（队列、模型、历史、上传）都会指向远程服务器，而仅限本地的工具（download_model / 安装包 / 模型扫描）会被禁用。在编排器下次启动时生效 —— 要修改请先断开再连接。你眼前的画布仍然跟随你在浏览器里打开的那个 ComfyUI。"
+    "tooltip": "让智能体面向远程 ComfyUI 而不是本机 —— 例如位于 https://xxxxxxxx-8188.proxy.runpod.net 的 RunPod Pod。留空则驱动本地 ComfyUI（默认）。设置后，智能体的工具（队列、模型、历史、上传）都会指向远程服务器，而仅限本地的工具（ download_model / 安装包 / 模型扫描）会被禁用。在编排器下次启动时生效 —— 要修改请先断开再连接。你眼前的画布仍然跟随你在浏览器里打开的那个 ComfyUI。"
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "桥接地址（高级）",
-    "tooltip": "面板编排器桥接的 WebSocket 地址 —— 现在一个桥接服务于所有服务商（默认 ws://127.0.0.1:9180）。只有当你在非默认端口（COMFYUI_MCP_BRIDGE_PORT）上启动编排器时才需要修改。下次连接时生效。"
+    "tooltip": "面板编排器桥接的 WebSocket 地址 —— 现在一个桥接服务于所有服务商（默认 ws://127.0.0.1:9180）。只有当你在非默认端口（ COMFYUI_MCP_BRIDGE_PORT ）上启动编排器时才需要修改。下次连接时生效。"
   },
   "comfyui-mcp_zoomToAction": {
     "name": "缩放到智能体的改动",
@@ -81,7 +81,7 @@
   },
   "comfyui-mcp_ollama_api": {
     "name": "端点类型",
-    "tooltip": "Ollama 后端与其端点通信的方式。“Ollama (local)”使用本地 Ollama 原生的 /api/chat。“OpenAI-compatible”使用 /chat/completions —— 适用于 OpenRouter、vLLM、LM Studio、DeepSeek 等（在下方设置基础地址；API 密钥来自编排器的环境变量，例如 OPENROUTER_API_KEY）。对新会话生效 —— 修改后请先断开再连接。"
+    "tooltip": "Ollama 后端与其端点通信的方式。“Ollama (local)”使用本地 Ollama 原生的 /api/chat。“OpenAI-compatible”使用 /chat/completions —— 适用于 OpenRouter、vLLM、LM Studio、DeepSeek 等（在下方设置基础地址；API 密钥来自编排器的环境变量，例如 OPENROUTER_API_KEY ）。对新会话生效 —— 修改后请先断开再连接。"
   },
   "comfyui-mcp_ollama_baseUrl": {
     "name": "端点基础地址",

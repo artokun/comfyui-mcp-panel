@@ -99,7 +99,7 @@
       "queue_this_app_on_your_connected_runpod": "在已连接的 RunPod 实例上将该应用加入队列（在 RunPod 面板中连接）。",
       "queued": "排队中…",
       "queued_on_pod": "已加入实例队列",
-      "queued_on_pod_prompt_id": "已加入实例队列（prompt_id {id}）",
+      "queued_on_pod_prompt_id": "已加入实例队列（ prompt_id {id}）",
       "queueing": "加入队列中…",
       "queueing_on_pod": "在实例上加入队列中…",
       "registry_error": "注册表错误：{error}",
@@ -166,9 +166,6 @@
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "无法连接 ComfyUI-Manager（内置管理器是否已启用？）"
-    },
-    "panel_failure_shell": {
-      "the_agent_panel_could_not_start": "智能体面板无法启动。"
     },
     "panel": {
       "1_install_the_cli": "1. 安装 CLI",
@@ -355,7 +352,7 @@
       "1_2_h_on_a_4090_the": "在 4090 上约 1–2 小时。可实际使用的成品。",
       "10_min_on_a_4090_proves_the": "在 4090 上约 10 分钟 —— 只验证流程，不是可用的 LoRA。",
       "custom": "自定义",
-      "e_g_aria_character": "例如：aria_character",
+      "e_g_aria_character": "例如： aria_character",
       "e_g_ohwx_a_rare_token_not": "例如：ohwx —— 一个罕见词元，而非真实单词",
       "edit_every_parameter_yourself": "自行编辑每一项参数。",
       "fix_the_custom_parameters_first_every_field": "请先修正自定义参数 —— 每个字段都需要正数值。",
@@ -374,6 +371,9 @@
       "upload_unavailable_no_bridge_helper": "无法上传（缺少桥接助手）。",
       "video_action": "视频动作",
       "video_character": "视频角色"
+    },
+    "failure_shell": {
+      "the_agent_panel_could_not_start": "智能体面板无法启动。"
     }
   }
 }

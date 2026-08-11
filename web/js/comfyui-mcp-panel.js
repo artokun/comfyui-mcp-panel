@@ -4027,7 +4027,7 @@ function panelSettingsList() {
       type: "combo",
       get options() {
         return [
-          { value: "panel", text: tr("panel.panel_one_chat_across_workflows", "Panel — one chat across workflows") },
+          { value: "panel", text: tr("panel.one_chat_across_workflows", "Panel — one chat across workflows") },
           { value: "workflow", text: tr("panel.workflow_separate_chat_histories", "Workflow — separate chat histories") },
           { value: "ask", text: tr("panel.ask_whenever_the_workflow_changes", "Ask whenever the workflow changes") },
         ];
@@ -19801,9 +19801,9 @@ function describeCommand(cmd, msg, reply) {
     case "free_vram":
       return { icon: "pi-bolt", text: tr("panel.unloaded_models_freed_vram", "Unloaded models — freed VRAM") };
     case "workflow_save":
-      return { icon: "pi-save", text: tr("panel.saved_workflow", "Saved “{workflow}”", { workflow: r.workflow }) };
+      return { icon: "pi-save", text: tr("panel.workflow_saved", "Saved “{workflow}”", { workflow: r.workflow }) };
     case "workflow_save_as":
-      return { icon: "pi-save", text: tr("panel.saved_workflow_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
+      return { icon: "pi-save", text: tr("panel.workflow_saved_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
     default:
       // `cmd` is the raw tool name (an identifier) and the detail is the raw reply payload —
       // neither is prose, so neither is translated.
@@ -25328,7 +25328,7 @@ function buildPanel() {
     histPop.append(tools, listEl);
 
     function friendlyWorkflowName(t) {
-      if (t.workflowKey === "panel:global") return tr("panel.panel_wide_conversations", "Panel-wide conversations");
+      if (t.workflowKey === "panel:global") return tr("panel.wide_conversations", "Panel-wide conversations");
       return t.workflowTitle || t.workflowKey?.replace(/^workflow:|^wf:/, "") || tr("panel.unknown_workflow", "Unknown workflow");
     }
 

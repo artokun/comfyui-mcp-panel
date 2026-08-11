@@ -167,9 +167,6 @@
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager に接続できません（内蔵 Manager は有効になっていますか？）"
     },
-    "panel_failure_shell": {
-      "the_agent_panel_could_not_start": "エージェントパネルを起動できませんでした。"
-    },
     "panel": {
       "1_install_the_cli": "1. CLI をインストール",
       "a_browser_window_opened_finish_sign_in": "ブラウザーのウィンドウが開きました — そちらでサインインを完了してください…",
@@ -256,7 +253,7 @@
       "no_models_yet_connect_a_provider_to": "まだモデルがありません — 検索するにはプロバイダーを接続してください。",
       "none": "なし",
       "not_set": "未設定",
-      "nothing_is_selected_on_the_canvas_ask": "キャンバスで何も選択されていません。対象のノードをクリックするようユーザーに依頼するか、panel_graph_outline / panel_find_nodes で探してください。",
+      "nothing_is_selected_on_the_canvas_ask": "キャンバスで何も選択されていません。対象のノードをクリックするようユーザーに依頼するか、 panel_graph_outline / panel_find_nodes で探してください。",
       "ollama_local_free_our_comfyui_fine_tune": "Ollama（ローカル、無料 — 当プロジェクトの ComfyUI ファインチューン）",
       "open_in_a_new_browser_tab": "新しいブラウザータブで開く",
       "open_original": "オリジナルを開く",
@@ -374,6 +371,9 @@
       "upload_unavailable_no_bridge_helper": "アップロードできません（ブリッジヘルパーがありません）。",
       "video_action": "動画アクション",
       "video_character": "動画キャラクター"
+    },
+    "failure_shell": {
+      "the_agent_panel_could_not_start": "エージェントパネルを起動できませんでした。"
     }
   }
 }

@@ -63,22 +63,50 @@ function isProbablyNotProse(s) {
   return false;
 }
 
-/** A stable, readable key: <fileslug>.<textslug>. */
+/**
+ * A stable, readable key: <fileslug>.<textslug>.
+ *
+ * Two rules below exist because `check-tool-vocabulary` treats every underscored token
+ * beginning with the panel prefix as a possible tool reference. A tool named in PROSE escapes
+ * the call-site scan, so such a token that is NOT a real tool reaches the model as an
+ * instruction to call something that does not exist. Auto-generated keys walked straight into
+ * it twice: a source filename beginning with that prefix became an area of the same shape,
+ * and a string whose first word repeated its own area produced a doubled slug. Neither was a
+ * tool; both were indistinguishable from one to any text scan.
+ *
+ * (Deliberately described rather than illustrated — spelling the offending tokens out here
+ * would trip the very gate this comment is about, which is itself the point.)
+ */
 function makeKey(file, text) {
-  const fileSlug = path
+  let fileSlug = path
     .basename(file, '.js')
     .replace(/^cmcp-/, '')
     .replace(/^comfyui-mcp-/, '')
     .replace(/[^a-zA-Z0-9]+/g, '_');
-  const textSlug = text
+  // An AREA may not look like a panel tool. The bare prefix alone is fine — it is the
+  // dotted namespace and is never flattened into an identifier — but prefix+suffix is not.
+  if (/^panel_./.test(fileSlug)) fileSlug = fileSlug.replace(/^panel_/, '');
+  // First seven words, taken with a single match rather than split/slice/rejoin.
+  //
+  // Not stylistic. `check-tool-vocabulary` rejects any shape that stitches an identifier
+  // together from fragments, because such a shape can evaluate to a real tool name at runtime
+  // while leaving no contiguous token for a text scan to find. This builder could only ever
+  // produce a catalog key, but the gate cannot know that, and narrowing a safety net to suit
+  // one caller is the wrong trade — so the caller changed instead.
+  //
+  // (Described, not illustrated: the gate reads comments too, so writing the banned shape
+  // here would trip it. That is the third time this batch that prose tripped a scanner —
+  // worth remembering that a comment is code as far as these gates are concerned.)
+  const normalized = text
     .toLowerCase()
     .replace(/\{[^}]*\}/g, '')
     .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .split('_')
-    .filter(Boolean)
-    .slice(0, 7)
-    .join('_');
+    .replace(/^_+|_+$/g, '');
+  const textSlug = (normalized.match(/^(?:[a-z0-9]+_){0,6}[a-z0-9]+/) ?? [''])[0]
+    // Drop a leading repeat of the area. A string starting with its own area name produced
+    // a doubled slug whose flattened form reads as a tool identifier — and it was redundant
+    // anyway, since the area already carries that word.
+    .replace(new RegExp(`^${fileSlug}_`), '');
   return `${fileSlug}.${textSlug || 'text'}`;
 }
 

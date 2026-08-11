@@ -47,7 +47,7 @@ export function panelFailureReport(err, info = {}) {
       ? `${err.name}: ${err.message}`
       : typeof err === "string" && err
         ? err
-        : tr("panel_failure_shell.the_failure_produced_no_message", "(the failure produced no message)");
+        : tr("failure_shell.the_failure_produced_no_message", "(the failure produced no message)");
   const stack = err instanceof Error && typeof err.stack === "string" ? err.stack : "";
   // `body` and `where` are the two sentences that actually do the work of #779 —
   // ruling out the reinstall, and saying where to send it — so they are the last
@@ -57,9 +57,9 @@ export function panelFailureReport(err, info = {}) {
   // keeps its whole sentence as the fallback, concatenation and all; only `title:`
   // (a single literal) had been converted before.
   return {
-    title: tr("panel_failure_shell.the_agent_panel_could_not_start", "The agent panel could not start."),
+    title: tr("failure_shell.the_agent_panel_could_not_start", "The agent panel could not start."),
     body: tr(
-      "panel_failure_shell.building_the_panel_threw_so_nothing_was",
+      "failure_shell.building_the_panel_threw_so_nothing_was",
       "Building the panel threw, so nothing was rendered. This is a fault in the panel " +
         "itself — it is NOT a connection problem, and reinstalling ComfyUI or the pack will " +
         "not change it. The details below are what was actually observed; nothing here is a " +
@@ -77,7 +77,7 @@ export function panelFailureReport(err, info = {}) {
     // #779 whose whole job is telling the user where to send the report, so
     // losing it re-creates the defect for every language but English.
     where: tr(
-      "panel_failure_shell.please_report_this_at_with_the_text",
+      "failure_shell.please_report_this_at_with_the_text",
       "Please report this at {url} with the text above, your ComfyUI frontend " +
         "version, and your browser.",
       { url: "https://github.com/artokun/comfyui-mcp-panel/issues" },
