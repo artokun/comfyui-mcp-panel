@@ -214,9 +214,23 @@ export function tr(key, fallback, vars) {
   out = out ?? "";
 
   if (vars) {
-    for (const [k, v] of Object.entries(vars)) {
-      out = out.split(`{${k}}`).join(String(v));
-    }
+    // ONE pass over the TEMPLATE, not one pass per variable.
+    //
+    // A `split/join` chain per key substitutes in object-key order, so a value that happens
+    // to contain a placeholder belonging to a LATER key gets that placeholder expanded too —
+    // the panel's activity cards interpolate user data (`Created group “{title}” (id {id})`,
+    // `Set {widget} = {value} on node {node_id}`), and ComfyUI's own dynamic-prompt syntax
+    // puts braces in widget values routinely. Measured before this was a regex: a group
+    // titled "{id}" rendered as `Created group “7” (id 7)`, silently replacing the user's
+    // title with an unrelated field.
+    //
+    // Reading each `{name}` out of the template makes a substituted value inert. The
+    // function replacer is also what keeps `$&`/`$1` inside a value literal, matching the
+    // old split/join behaviour — a string replacement would have expanded them. An unknown
+    // placeholder is left verbatim, exactly as before.
+    out = out.replace(/\{([a-zA-Z0-9_]+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : whole,
+    );
   }
   return out;
 }
