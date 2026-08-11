@@ -22,13 +22,20 @@ import { createCivitaiContent } from "./cmcp-civitai-ui.js";
 import { createAppsContent } from "./cmcp-apps-ui.js";
 import { createTrainingContent } from "./cmcp-training-ui.js";
 import { createLocalContent } from "./cmcp-runpod-ui.js";
+import { tr } from "./lib/i18n.js";
 
 // key → content factory + tab presentation. Order = tab-bar order.
+//
+// `label` is a GETTER, not a value. This array is built at MODULE SCOPE, which runs at import
+// time — before setup() has awaited loadCatalog() — so a plain `label: tr(...)` would capture
+// the English fallback permanently and no translation could ever appear, however complete the
+// catalog was. A getter defers the lookup to the moment the label is read (line ~313), by
+// which point the catalog is loaded. Every consumer still just reads `.label`.
 const TABS = [
-  { key: "civitai", label: "CivitAI", icon: "pi-images", factory: createCivitaiContent },
-  { key: "apps", label: "Apps", icon: "pi-th-large", factory: createAppsContent },
-  { key: "training", label: "Training", icon: "pi-bolt", factory: createTrainingContent },
-  { key: "local", label: "RunPod", icon: "pi-server", factory: createLocalContent },
+  { key: "civitai", get label() { return tr("sidepanel_ui.civitai", "CivitAI"); }, icon: "pi-images", factory: createCivitaiContent },
+  { key: "apps", get label() { return tr("sidepanel_ui.apps", "Apps"); }, icon: "pi-th-large", factory: createAppsContent },
+  { key: "training", get label() { return tr("sidepanel_ui.training", "Training"); }, icon: "pi-bolt", factory: createTrainingContent },
+  { key: "local", get label() { return tr("sidepanel_ui.runpod", "RunPod"); }, icon: "pi-server", factory: createLocalContent },
 ];
 // Legacy per-surface alias classes applied to the modal while that tab is active.
 const ALIAS = { civitai: "cmcp-civitai-modal", training: "cmcp-tr-modal", apps: "cmcp-apps-modal" };
@@ -146,7 +153,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
   const titleEl = el("div", "cmcp-sp-title");
   const closeBtn = el("button", "cmcp-cv-iconbtn");
   closeBtn.innerHTML = '<i class="pi pi-times"></i>';
-  closeBtn.title = "Close";
+  closeBtn.title = tr("sidepanel_ui.close", "Close");
   closeBtn.style.marginLeft = "auto";
   head.append(titleEl, closeBtn);
 
@@ -156,7 +163,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
   // body's own input[type=text] fields (e.g. training's dataset-name/trigger,
   // which specs locate positionally).
   searchEl.type = "search";
-  searchEl.placeholder = "Search…";
+  searchEl.placeholder = tr("sidepanel_ui.search", "Search…");
   const extras = el("div", "cmcp-cv-frow"); // content-provided subnav content
   extras.style.flex = "1 1 auto";
   subnav.append(searchEl, extras);

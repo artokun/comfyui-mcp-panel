@@ -1,3 +1,4 @@
+import { tr } from "./i18n.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -895,7 +896,7 @@ const SCOPE_DROPPED_RESPONSE = () =>
     JSON.stringify({
       error: {
         type: "partial_execution_scope_dropped",
-        message: "run-to-node scope was not applied; nothing was queued",
+        message: tr("run_scope_guard.run_to_node_scope_was_not_applied", "run-to-node scope was not applied; nothing was queued"),
       },
     }),
     { status: 400, headers: { "Content-Type": "application/json" } },

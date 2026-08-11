@@ -21,14 +21,19 @@ import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
 import { coerceMessageText } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
+import { tr } from "./lib/i18n.js";
 
+// `label` is a GETTER: this array is built at module scope, which runs at IMPORT time —
+// before setup() awaits loadCatalog() — so a plain value would freeze the English fallback
+// forever and no translation could ever render. Deferring the lookup to read-time fixes it
+// without touching a single consumer.
 const TABS = [
-  { key: "images", label: "Images", icon: "pi-image", media: "image" },
-  { key: "videos", label: "Videos", icon: "pi-video", media: "video" },
-  { key: "checkpoints", label: "Checkpoints", icon: "pi-box", model: "Checkpoint" },
-  { key: "loras", label: "LoRAs", icon: "pi-sliders-h", model: "LORA" },
-  { key: "workflows", label: "Workflows", icon: "pi-share-alt", model: "Workflows" },
-  { key: "favorites", label: "Favorites", icon: "pi-heart", media: "image", fav: true },
+  { key: "images", get label() { return tr("civitai_ui.images", "Images"); }, icon: "pi-image", media: "image" },
+  { key: "videos", get label() { return tr("civitai_ui.videos", "Videos"); }, icon: "pi-video", media: "video" },
+  { key: "checkpoints", get label() { return tr("civitai_ui.checkpoints", "Checkpoints"); }, icon: "pi-box", model: "Checkpoint" },
+  { key: "loras", get label() { return tr("civitai_ui.loras", "LoRAs"); }, icon: "pi-sliders-h", model: "LORA" },
+  { key: "workflows", get label() { return tr("civitai_ui.workflows", "Workflows"); }, icon: "pi-share-alt", model: "Workflows" },
+  { key: "favorites", get label() { return tr("civitai_ui.favorites", "Favorites"); }, icon: "pi-heart", media: "image", fav: true },
 ];
 
 const SUBFOLDER = {
@@ -244,6 +249,18 @@ export function graphDirtyForConfirm(ctx) {
   }
 }
 
+/** The one-line verdict on a post's embedded graph, shown in both the lightbox
+ *  side pane and the standalone generation-info sheet. Factored out when these
+ *  three strings were translated: the two copies were byte-identical, and three
+ *  keys duplicated across two call sites is three chances for them to drift.
+ *  A plain `tr()` is correct — this runs per render, long after the catalog loads. */
+function embeddedWorkflowNote(wf) {
+  if (!wf) return tr("civitai_ui.no_embedded_workflow", "No embedded workflow");
+  if (wf.format === "ui") return tr("civitai_ui.embedded_comfyui_workflow", "✓ Embedded ComfyUI workflow");
+  return tr("civitai_ui.embedded_graph_is_api_format_only_it",
+    "Embedded graph is API-format only — it can't load onto the canvas, but Save keeps its JSON.");
+}
+
 /** Serialize result rows — `state.items` (media) or `state.models` (models) —
  *  to the agent's `civitai_results` contract shape: id, kind, title, creator,
  *  baseModel/type, stats, prompt, media URL(s), and `gated`. Metadata + URLs
@@ -454,7 +471,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     makeFilterButton({ onOpen: () => toggleFilters(), title: null });
   const acctBtn = el("button", "cmcp-cv-iconbtn");
   acctBtn.innerHTML = '<i class="pi pi-user"></i>';
-  acctBtn.title = "CivitAI account";
+  acctBtn.title = tr("civitai_ui.civitai_account", "CivitAI account");
   acctBtn.addEventListener("click", () => accountFlow());
 
   // Civitai sub-tabs (images / videos / checkpoints / …) — mounted in the shell
@@ -463,15 +480,28 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   const subTabsWrap = el("div", "cmcp-cv-tabs");
   for (const t of TABS) {
     const b = el("button", "cmcp-cv-tab");
-    b.innerHTML = `<i class="pi ${t.icon}"></i><span>${t.label}</span>`;
+    // The label goes in as TEXT rather than through innerHTML. `lib/i18n.js` documents
+    // that `tr()` "returns a string and never HTML, so it introduces no injection
+    // path" — true of the helper, but only true of a call site that writes text, and
+    // this was the one that wrote markup. `/i18n` merges EVERY installed pack's
+    // main.json, so a label is a string another pack can influence. Same DOM as the
+    // template it replaces: `el()` sets className and textContent.
+    b.append(el("i", `pi ${t.icon}`), el("span", null, t.label));
     b.addEventListener("click", () => { state.tab = t.key; syncTabs(); reload(); });
     b._key = t.key;
     subTabsWrap.appendChild(b);
   }
 
   // Favorites media-type chips (shown only on the Favorites sub-tab).
+  // Built INSIDE this function, which runs long after setup() awaited the catalog,
+  // so a plain tr() is correct here — unlike module-scope TABS above, which needs
+  // getters. "Images"/"Videos" reuse the sub-tab labels' keys: identical English.
   const favChips = el("div", "cmcp-cv-frow");
-  for (const [label, val] of [["All", "all"], ["Images", "image"], ["Videos", "video"]]) {
+  for (const [label, val] of [
+    [tr("civitai_ui.all", "All"), "all"],
+    [tr("civitai_ui.images", "Images"), "image"],
+    [tr("civitai_ui.videos", "Videos"), "video"],
+  ]) {
     const chip = el("button", "cmcp-cv-chip", label);
     chip._fv = val;
     chip.addEventListener("click", () => {
@@ -549,7 +579,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     if (state.loading || state.done) return;
     const req = ++state.reqId;
     setLoading(true);
-    sentinel.textContent = "Loading…";
+    sentinel.textContent = tr("civitai_ui.loading", "Loading…");
     // keyword × creator on model tabs matches client-side (API quirk — see
     // fetchModels): even after its bounded page-chase a load can come back
     // empty with more pages left. That must not dead-end the list — the
@@ -561,7 +591,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const t = tabDef();
       if (t.fav) {
         if (!state.signedIn) {
-          sentinel.textContent = "Sign in to see your favorites.";
+          sentinel.textContent = tr("civitai_ui.sign_in_to_see_your_favorites", "Sign in to see your favorites.");
           // Distinct agent-facing status so an empty favorites feed isn't read as
           // "you have no favourites" when the real cause is a signed-out session (#375).
           state.favoritesStatus = "signed_out";
@@ -695,11 +725,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       if (stalled) {
         // Explicit affordance instead of a silent dead end.
         sentinel.textContent = "";
-        const more = el("button", "cmcp-btn", "No matches yet — keep searching");
+        const more = el("button", "cmcp-btn",
+          tr("civitai_ui.no_matches_yet_keep_searching", "No matches yet — keep searching"));
         more.addEventListener("click", () => loadMore());
         sentinel.appendChild(more);
       } else if (state.done && !grid.children.length) {
-        sentinel.textContent = "No results.";
+        sentinel.textContent = tr("civitai_ui.no_results", "No results.");
       } else {
         sentinel.textContent = "";
         // Under-filled top-up (every tab): a page that doesn't overflow the
@@ -714,7 +745,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       }
     } catch (e) {
       if (req === state.reqId) {
-        sentinel.textContent = "CivitAI error: " + (e.message || e);
+        sentinel.textContent = tr("civitai_ui.civitai_error", "CivitAI error: ") + (e.message || e);
         // Record the failure so the agent-facing panel_civitai_results can report
         // a distinct error state instead of an indistinguishable total:0 (#190);
         // kind:"transport" marks a failure where no HTTP response was received
@@ -805,13 +836,21 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         const on = _liked.get(it.id) === true;
         likeBtn.classList.toggle("on", on);
         likeBtn.innerHTML = `<i class="pi ${on ? "pi-heart-fill" : "pi-heart"}"></i>`;
-        likeBtn.title = !state.signedIn ? "Sign in to CivitAI to like" : on ? "Unlike on CivitAI" : "Like on CivitAI";
+        likeBtn.title = !state.signedIn
+          ? tr("civitai_ui.sign_in_to_civitai_to_like", "Sign in to CivitAI to like")
+          : on
+            ? tr("civitai_ui.unlike_on_civitai", "Unlike on CivitAI")
+            : tr("civitai_ui.like_on_civitai", "Like on CivitAI");
       };
       paintLike();
       card.addEventListener("mouseenter", paintLike); // resync after lightbox toggles
       likeBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        if (!state.signedIn) { toast("Sign in to CivitAI to like — opening sign-in…"); accountFlow(); return; }
+        if (!state.signedIn) {
+          toast(tr("civitai_ui.sign_in_to_civitai_to_like_opening", "Sign in to CivitAI to like — opening sign-in…"));
+          accountFlow();
+          return;
+        }
         void toggleLike(it, paintLike);
       });
       card.appendChild(likeBtn);
@@ -828,7 +867,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     img.loading = "lazy"; img.src = m.coverUrl;
     img.addEventListener("error", () => { card.style.display = "none"; });
     card.append(img, el("span", "cmcp-cv-badge", m.type));
-    if (owned(m.fileName)) card.appendChild(el("span", "cmcp-cv-owned", "✓ In library"));
+    if (owned(m.fileName)) card.appendChild(el("span", "cmcp-cv-owned", tr("civitai_ui.in_library", "✓ In library")));
     const foot = el("div", "cmcp-cv-cardfoot", `${m.name}\n${m.baseModel || ""} · ⬇ ${m.downloadCount ?? "?"}`);
     foot.style.whiteSpace = "pre-line";
     card.appendChild(foot);
@@ -859,14 +898,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       _liked.set(it.id, !next); paint();
       const msg = String(e.message || e);
       toast(msg.includes("403")
-        ? "CivitAI permissions changed -- use the account button to sign out and back in."
-        : "Like failed: " + msg);
+        ? tr("civitai_ui.civitai_permissions_changed_use_the_account_button",
+          "CivitAI permissions changed -- use the account button to sign out and back in.")
+        : tr("civitai_ui.like_failed", "Like failed: {error}", { error: msg }));
       return;
     }
     const col = likesCollection();
     if (col?.id) {
       client.setImageInCollection(it.id, col.id, next).catch((e) =>
-        toast(`Couldn't update collection "${col.name}": ` + (e.message || e)));
+        toast(tr("civitai_ui.couldn_t_update_collection", "Couldn't update collection \"{name}\": {error}",
+          { name: col.name, error: e.message || e })));
     }
   }
 
@@ -902,7 +943,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     const nextBtn = el("button", "cmcp-cv-lb-nav", "›"); nextBtn.style.right = ".6rem";
     prevBtn.addEventListener("click", () => step(-1));
     nextBtn.addEventListener("click", () => step(1));
-    const closeBtn2 = mk("pi-times", closeLb, "Close (Esc)");
+    const closeBtn2 = mk("pi-times", closeLb, tr("civitai_ui.close_esc", "Close (Esc)"));
     closeBtn2.classList.add("cmcp-cv-lb-close");
 
     async function genFor(it) {
@@ -939,8 +980,15 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       // right: identity + actions immediately, generation info when it arrives
       side.innerHTML = "";
       const titleRow = el("div", "cmcp-cv-lb-title");
+      // Anonymous posts fall back to "CivitAI <kind>". Two whole keys rather than
+      // interpolating `it.type` — that field is the API's wire value ("image"/"video")
+      // and splicing it into a translated sentence would leave an English word inside
+      // a Korean title.
+      const kindLabel = it.type === "video"
+        ? tr("civitai_ui.civitai_video", "CivitAI video")
+        : tr("civitai_ui.civitai_image", "CivitAI image");
       titleRow.appendChild(el("span", null,
-        `${it.type === "video" ? "🎬" : "🖼"} ${it.author ? "@" + it.author : "CivitAI " + it.type}`));
+        `${it.type === "video" ? "🎬" : "🖼"} ${it.author ? "@" + it.author : kindLabel}`));
       {
         // Like toggle — the same tRPC mutation the CivitAI site fires
         // (reaction.toggle; calling it again un-likes). Optimistic flip,
@@ -952,11 +1000,19 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           const on = _liked.get(it.id) === true;
           likeBtn.classList.toggle("on", on);
           likeBtn.innerHTML = `<i class="pi ${on ? "pi-heart-fill" : "pi-heart"}"></i>`;
-          likeBtn.title = !state.signedIn ? "Sign in to CivitAI to like" : on ? "Unlike on CivitAI" : "Like on CivitAI";
+          likeBtn.title = !state.signedIn
+            ? tr("civitai_ui.sign_in_to_civitai_to_like", "Sign in to CivitAI to like")
+            : on
+              ? tr("civitai_ui.unlike_on_civitai", "Unlike on CivitAI")
+              : tr("civitai_ui.like_on_civitai", "Like on CivitAI");
         };
         paintLike();
         likeBtn.addEventListener("click", () => {
-          if (!state.signedIn) { toast("Sign in to CivitAI to like — opening sign-in…"); accountFlow(); return; }
+          if (!state.signedIn) {
+            toast(tr("civitai_ui.sign_in_to_civitai_to_like_opening", "Sign in to CivitAI to like — opening sign-in…"));
+            accountFlow();
+            return;
+          }
           void toggleLike(it, paintLike);
         });
         titleRow.appendChild(likeBtn);
@@ -967,7 +1023,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
 
       const actions = el("div", "cmcp-cv-actions");
       if (it.author) {
-        const moreBtn = el("button", "cmcp-btn", `See more from @${it.author}`);
+        const moreBtn = el("button", "cmcp-btn",
+          tr("civitai_ui.see_more_from", "See more from @{creator}", { creator: it.author }));
         moreBtn.addEventListener("click", () => {
           closeLb();
           seeMoreFromCreator(it.author);
@@ -976,52 +1033,51 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       }
       side.appendChild(actions);
       const genBox = el("div");
-      genBox.appendChild(el("div", "cmcp-cv-lb-muted", "Loading generation info…"));
+      genBox.appendChild(el("div", "cmcp-cv-lb-muted",
+        tr("civitai_ui.loading_generation_info", "Loading generation info…")));
       side.appendChild(genBox);
 
       genFor(it).then((gen) => {
         if (seq !== renderSeq) return; // user already paged on
         // actions need the gen payload (caption/workflow), so they land here
         const shareBtn = el("button", "cmcp-btn cmcp-btn-primary",
-          ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
+          ctx.isMuted() ? tr("civitai_ui.save_reference_to_inputs", "Save reference to inputs") : tr("civitai_ui.share_with_agent", "Share with agent"));
         shareBtn.addEventListener("click", () => shareImage(it, gen));
         actions.appendChild(shareBtn);
         const wf = CivitaiClient.comfyGraphInfo(gen.meta);
         if (wf) {
           if (wf.format === "ui") {
-            const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
-            loadBtn.title = "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).";
+            const loadBtn = el("button", "cmcp-btn", tr("civitai_ui.load_onto_canvas", "Load onto canvas"));
+            loadBtn.title = tr("civitai_ui.replace_the_current_canvas_with_this_post", "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).");
             loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph, closeLb); });
             actions.appendChild(loadBtn);
             // Same loadable-workflow condition as "Load onto canvas": load the graph,
             // then jump to the Apps tab's convert view seeded from the live canvas.
-            const appBtn = el("button", "cmcp-btn", "Create App from workflow");
-            appBtn.title = "Load this workflow onto the canvas and package it as a one-click app.";
+            const appBtn = el("button", "cmcp-btn", tr("civitai_ui.create_app_from_workflow", "Create App from workflow"));
+            appBtn.title = tr("civitai_ui.load_this_workflow_onto_the_canvas_and", "Load this workflow onto the canvas and package it as a one-click app.");
             appBtn.addEventListener("click", () => {
               void createAppFromWorkflow(() => loadOntoCanvas(wf.graph, closeLb, { keepPanelOpen: true }));
             });
             actions.appendChild(appBtn);
           }
-          const saveBtn = el("button", "cmcp-btn", "Save workflow");
+          const saveBtn = el("button", "cmcp-btn", tr("civitai_ui.save_workflow", "Save workflow"));
           saveBtn.addEventListener("click", () => saveWorkflow(it, wf.graph));
           actions.appendChild(saveBtn);
         }
         genBox.innerHTML = "";
-        genBox.appendChild(el("div", "cmcp-cv-lb-muted",
-          !wf ? "No embedded workflow"
-          : wf.format === "ui" ? "✓ Embedded ComfyUI workflow"
-          : "Embedded graph is API-format only — it can't load onto the canvas, but Save keeps its JSON."));
+        genBox.appendChild(el("div", "cmcp-cv-lb-muted", embeddedWorkflowNote(wf)));
         if (gen.meta?.prompt) {
-          genBox.appendChild(el("div", "cmcp-cv-flabel", "Prompt"));
+          // Distinct from `civitai_ui.prompt` ("Prompt: "), which is a sentence prefix.
+          genBox.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.prompt_label", "Prompt")));
           genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.prompt));
         }
         if (gen.meta?.negativePrompt) {
-          genBox.appendChild(el("div", "cmcp-cv-flabel", "Negative"));
+          genBox.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.negative", "Negative")));
           genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.negativePrompt));
         }
         const params = CivitaiClient.params(gen.meta);
         if (params.length) {
-          genBox.appendChild(el("div", "cmcp-cv-flabel", "Parameters"));
+          genBox.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.parameters", "Parameters")));
           const grid2 = el("div", "cmcp-cv-lb-params");
           for (const [k, val] of params) {
             grid2.appendChild(el("span", "k", k));
@@ -1032,10 +1088,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       }).catch((e) => {
         if (seq !== renderSeq) return;
         genBox.innerHTML = "";
-        genBox.appendChild(el("div", "cmcp-cv-lb-muted", "No generation data: " + (e.message || e)));
+        genBox.appendChild(el("div", "cmcp-cv-lb-muted",
+          tr("civitai_ui.no_generation_data", "No generation data: {error}", { error: e.message || e })));
         // sharing works without gen data — caption just has no settings
         const shareBtn = el("button", "cmcp-btn cmcp-btn-primary",
-          ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
+          ctx.isMuted() ? tr("civitai_ui.save_reference_to_inputs", "Save reference to inputs") : tr("civitai_ui.share_with_agent", "Share with agent"));
         shareBtn.addEventListener("click", () => shareImage(it, { meta: {} }));
         actions.appendChild(shareBtn);
       });
@@ -1064,31 +1121,32 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
 
   // ── generation info + share/save (mute-aware) ────────────────────────
   async function showGenInfo(it) {
-    const sheet = openSubModal("Generation info");
-    sheet.body.appendChild(el("div", "cmcp-cv-loading", "Loading…"));
+    const sheet = openSubModal(tr("civitai_ui.generation_info", "Generation info"));
+    sheet.body.appendChild(el("div", "cmcp-cv-loading", tr("civitai_ui.loading", "Loading…")));
     let gen;
     try { gen = await client.getGenerationData(it.id); }
-    catch (e) { sheet.body.innerHTML = ""; sheet.body.appendChild(el("div", null, "No data: " + e.message)); return; }
+    catch (e) {
+      sheet.body.innerHTML = "";
+      sheet.body.appendChild(el("div", null, tr("civitai_ui.no_data", "No data: {error}", { error: e.message })));
+      return;
+    }
     sheet.body.innerHTML = "";
     const wf = CivitaiClient.comfyGraphInfo(gen.meta);
-    sheet.body.appendChild(el("div", null,
-      !wf ? "No embedded workflow"
-      : wf.format === "ui" ? "✓ Embedded ComfyUI workflow"
-      : "Embedded graph is API-format only — it can't load onto the canvas, but Save keeps its JSON."));
+    sheet.body.appendChild(el("div", null, embeddedWorkflowNote(wf)));
 
     const actions = el("div", "cmcp-cv-actions");
     const shareBtn = el("button", "cmcp-btn cmcp-btn-primary",
-      ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
+      ctx.isMuted() ? tr("civitai_ui.save_reference_to_inputs", "Save reference to inputs") : tr("civitai_ui.share_with_agent", "Share with agent"));
     shareBtn.addEventListener("click", () => shareImage(it, gen));
     actions.appendChild(shareBtn);
     if (wf) {
       if (wf.format === "ui") {
-        const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
-        loadBtn.title = "Replace the current canvas with this example's embedded ComfyUI workflow (Ctrl+Z undoes it).";
+        const loadBtn = el("button", "cmcp-btn", tr("civitai_ui.load_onto_canvas", "Load onto canvas"));
+        loadBtn.title = tr("civitai_ui.replace_the_current_canvas_with_this_example", "Replace the current canvas with this example's embedded ComfyUI workflow (Ctrl+Z undoes it).");
         loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph); });
         actions.appendChild(loadBtn);
       }
-      const saveBtn = el("button", "cmcp-btn", "Save workflow");
+      const saveBtn = el("button", "cmcp-btn", tr("civitai_ui.save_workflow", "Save workflow"));
       saveBtn.addEventListener("click", () => saveWorkflow(it, wf.graph));
       actions.appendChild(saveBtn);
     }
@@ -1101,10 +1159,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     }
     if (gen.meta?.prompt) {
       const p = el("div"); p.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);margin-top:.5rem;white-space:pre-wrap";
-      p.textContent = "Prompt: " + coerceMessageText(gen.meta.prompt); sheet.body.appendChild(p);
+      p.textContent = tr("civitai_ui.prompt", "Prompt: ") + coerceMessageText(gen.meta.prompt); sheet.body.appendChild(p);
     }
   }
 
+  // NOT translated, deliberately: every line below is a PROMPT addressed to the
+  // agent, not UI copy. It is composed alongside English tool names and parameter
+  // labels ("Prompt:", "Steps", "CFG scale" straight off CivitAI's payload), and
+  // handing the model a half-translated instruction is a regression in the one
+  // thing it has to get right. Same rule as the monolith's own reconnect nudges.
+  // The human-facing confirmations around it (the toasts) ARE translated.
   function buildCaption(gen) {
     const m = gen.meta || {};
     const lines = [
@@ -1125,7 +1189,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const name = `civitai_ref_${it.id}.${it.type === "video" ? "mp4" : "jpeg"}`;
       const ref = await ctx.uploadBlobToInput(blob, name);
       if (ctx.isMuted()) {
-        toast(`Saved ${name} to ComfyUI inputs.`);
+        toast(tr("civitai_ui.saved_to_comfyui_inputs", "Saved {name} to ComfyUI inputs.", { name }));
       } else {
         const caption = buildCaption(gen);
         ctx.sendUserMessage(
@@ -1133,22 +1197,24 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           undefined, [ref],
         );
         ctx.bringChatForward();
-        toast("Shared with the agent.");
+        toast(tr("civitai_ui.shared_with_the_agent", "Shared with the agent."));
       }
       // Hand-off is done (either variant) — close the explorer so the chat/agent
       // is visible. Only on SUCCESS; a failed share (below) leaves it open to
       // retry. The toast is body-mounted (survives the close) so the confirmation
       // stays on screen. close() is idempotent + tears down the lightbox/sheets.
       close();
-    } catch (e) { toast("Share failed: " + e.message); }
+    } catch (e) { toast(tr("civitai_ui.share_failed", "Share failed: {error}", { error: e.message })); }
   }
 
   async function saveWorkflow(it, graph) {
     try {
       const res = await ctx.callTool("save_workflow",
         { action: "save", filename: `civitai_${it.id}.json`, workflow: graph }, { timeout: 60000 });
-      toast(res.ok ? "Workflow saved to your machine." : "Save failed: " + (res.error || "?"));
-    } catch (e) { toast("Save failed: " + e.message); }
+      toast(res.ok
+        ? tr("civitai_ui.workflow_saved_to_your_machine", "Workflow saved to your machine.")
+        : tr("civitai_ui.save_failed", "Save failed: {error}", { error: res.error || "?" }));
+    } catch (e) { toast(tr("civitai_ui.save_failed", "Save failed: {error}", { error: e.message })); }
   }
 
   // ── load a UI-format workflow onto the live canvas ───────────────────
@@ -1163,24 +1229,29 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
    *  Returns true when it loaded. */
   async function loadOntoCanvas(graph, beforeClose, opts = {}) {
     if (typeof ctx.loadGraph !== "function") {
-      toast("This panel build can't load onto the canvas.");
+      toast(tr("civitai_ui.this_panel_build_can_t_load_onto", "This panel build can't load onto the canvas."));
       return false;
     }
+    // Two keys joined by the blank line rather than one key holding "\n\n": a
+    // translator editing a single value is one stray keystroke away from losing the
+    // paragraph break, and the question and the warning translate independently.
     if (graphDirtyForConfirm(ctx) && !window.confirm(
-      "Load this workflow onto the canvas?\n\n" +
-      "Your current workflow has unsaved changes that will be replaced (Ctrl+Z undoes the load).",
+      tr("civitai_ui.load_this_workflow_onto_the_canvas", "Load this workflow onto the canvas?") + "\n\n" +
+      tr("civitai_ui.your_current_workflow_has_unsaved_changes_that",
+        "Your current workflow has unsaved changes that will be replaced (Ctrl+Z undoes the load)."),
     )) return false;
     let res;
     try {
       res = await ctx.loadGraph(graph);
     } catch (e) {
-      toast("Couldn't load workflow: " + (e.message || e));
+      toast(tr("civitai_ui.couldn_t_load_workflow", "Couldn't load workflow: {error}", { error: e.message || e }));
       return false;
     }
     // Defend against a silent no-op: if the load reported zero nodes the graph
     // didn't actually land — don't dismiss the explorer as if it succeeded.
     if (!res || !res.node_count) {
-      toast("The workflow loaded empty (0 nodes) — nothing was placed on the canvas.");
+      toast(tr("civitai_ui.the_workflow_loaded_empty_0_nodes_nothing",
+        "The workflow loaded empty (0 nodes) — nothing was placed on the canvas."));
       return false;
     }
     if (beforeClose) { try { beforeClose(); } catch { /* already gone */ } }
@@ -1188,7 +1259,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     // keepPanelOpen: the create-app-from-workflow flow hops to the Apps tab next,
     // so the side-panel must stay up; a plain load closes the whole explorer.
     if (!opts.keepPanelOpen) close();
-    toast(`Workflow loaded onto the canvas — ${res.node_count} node${res.node_count === 1 ? "" : "s"}. Ctrl+Z undoes it.`);
+    // Counted: `{count}` drives Intl.PluralRules, so Russian gets one/few/many and
+    // Korean a single form — neither is reachable from an inline `=== 1 ? "" : "s"`.
+    toast(tr("civitai_ui.workflow_loaded", {
+      one: "Workflow loaded onto the canvas — {count} node. Ctrl+Z undoes it.",
+      other: "Workflow loaded onto the canvas — {count} nodes. Ctrl+Z undoes it.",
+    }, { count: res.node_count }));
     return true;
   }
 
@@ -1205,9 +1281,9 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     if (!loaded) return; // load failed / was cancelled — stay put (toast already shown)
     try {
       if (typeof shell.switchTab === "function") shell.switchTab("apps", { view: "convert" });
-      else toast("This panel build can't open the Apps tab.");
+      else toast(tr("civitai_ui.this_panel_build_can_t_open_the", "This panel build can't open the Apps tab."));
     } catch (e) {
-      toast("Couldn't open the Apps tab: " + (e.message || e));
+      toast(tr("civitai_ui.couldn_t_open_the_apps_tab", "Couldn't open the Apps tab: {error}", { error: e.message || e }));
     }
   }
 
@@ -1223,7 +1299,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   async function loadVersionWorkflow(version, file, opts = {}) {
     const setStatus = opts.setStatus || (() => {});
     const say = (msg, kind = "err") => { setStatus(msg, kind); toast(msg); };
-    setStatus("Fetching workflow…", "info");
+    setStatus(tr("civitai_ui.fetching_workflow", "Fetching workflow…"), "info");
     let bytes;
     try {
       bytes = await client.downloadVersionFile(version.id, file);
@@ -1233,14 +1309,17 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         // redirects the download to /login). The account button is the way in;
         // offer it right here so the hint is actionable, not just informative.
         say(state.signedIn
-          ? "CivitAI refused this download — this file may need early access or a purchase. Try the account (👤) button to re-check your sign-in."
-          : "This workflow is gated — sign in to CivitAI (the account 👤 button) to download it, then try again.", "warn");
+          ? tr("civitai_ui.civitai_refused_this_download_this_file_may",
+            "CivitAI refused this download — this file may need early access or a purchase. Try the account (👤) button to re-check your sign-in.")
+          : tr("civitai_ui.this_workflow_is_gated_sign_in_to",
+            "This workflow is gated — sign in to CivitAI (the account 👤 button) to download it, then try again."), "warn");
         if (!state.signedIn && opts.signIn) {
-          setStatus("This workflow is gated — opening CivitAI sign-in…", "warn");
+          setStatus(tr("civitai_ui.this_workflow_is_gated_opening_civitai_sign",
+            "This workflow is gated — opening CivitAI sign-in…"), "warn");
           try { opts.signIn(); } catch { /* account flow unavailable */ }
         }
       } else {
-        say("Download failed: " + (e.message || e));
+        say(tr("civitai_ui.download_failed", "Download failed: {error}", { error: e.message || e }));
       }
       return;
     }
@@ -1258,15 +1337,19 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       // "not a zip" then really means "we got a login page, not the file".
       const notZip = /not a zip/i.test(String(e.message || e));
       say(notZip
-        ? "Couldn't read the download — CivitAI may require sign-in for this file (account 👤 button)."
-        : "Couldn't read the workflow file: " + (e.message || e), notZip ? "warn" : "err");
+        ? tr("civitai_ui.couldn_t_read_the_download_civitai_may",
+          "Couldn't read the download — CivitAI may require sign-in for this file (account 👤 button).")
+        : tr("civitai_ui.couldn_t_read_the_workflow_file",
+          "Couldn't read the workflow file: {error}", { error: e.message || e }), notZip ? "warn" : "err");
       return;
     }
     const uis = candidates.filter((c) => c.format === "ui");
     if (!uis.length) {
       say(candidates.length
-        ? "This file only holds an API-format graph — it can't load as an editable canvas workflow. Ask the agent to run it instead."
-        : "No ComfyUI workflow found in that file.", "warn");
+        ? tr("civitai_ui.this_file_only_holds_an_api_format",
+          "This file only holds an API-format graph — it can't load as an editable canvas workflow. Ask the agent to run it instead.")
+        : tr("civitai_ui.no_comfyui_workflow_found_in_that_file",
+          "No ComfyUI workflow found in that file."), "warn");
       return;
     }
     setStatus("", "info"); // clear before a successful load closes the explorer
@@ -1279,13 +1362,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     // several workflows in one archive — let the user pick.
     return await new Promise((resolve) => {
       let picking = false; // a pick is in flight — its closeSubModals teardown must not resolve false
-      const picker = openSubModal("Pick a workflow to load", () => { if (!picking) resolve(false); });
+      const picker = openSubModal(tr("civitai_ui.pick_a_workflow_to_load", "Pick a workflow to load"),
+        () => { if (!picking) resolve(false); });
       const list = el("div", "cmcp-cv-creators");
       list.style.maxHeight = "24rem";
       for (const c of uis) {
         const b = el("button", "cmcp-cv-creator");
         b.appendChild(el("span", null, c.name));
-        b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
+        b.appendChild(el("span", "sub", tr("civitai_ui.n_nodes", {
+          one: "{count} node", other: "{count} nodes",
+        }, { count: c.graph.nodes.length })));
         b.addEventListener("click", () => {
           picking = true;
           loadOntoCanvas(c.graph, undefined, { keepPanelOpen }).then((ok) => {
@@ -1302,10 +1388,14 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   // ── model detail ─────────────────────────────────────────────────────
   async function openModelDetail(m) {
     const sheet = openSubModal(m.name);
-    sheet.body.appendChild(el("div", "cmcp-cv-loading", "Loading…"));
+    sheet.body.appendChild(el("div", "cmcp-cv-loading", tr("civitai_ui.loading", "Loading…")));
     let detail;
     try { detail = await client.fetchModelDetail(m.id, { levels: state.filters.browsingLevels }); }
-    catch (e) { sheet.body.innerHTML = ""; sheet.body.appendChild(el("div", null, "Error: " + e.message)); return; }
+    catch (e) {
+      sheet.body.innerHTML = "";
+      sheet.body.appendChild(el("div", null, tr("civitai_ui.error", "Error: {error}", { error: e.message })));
+      return;
+    }
     sheet.body.innerHTML = "";
     let version = detail.versions[0];
 
@@ -1320,8 +1410,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const dl = el("div", "cmcp-cv-actions");
       const have = owned(version.fileName);
       const dlBtn = el("button", "cmcp-btn cmcp-btn-primary",
-        have ? "✓ In library — re-download"
-             : (ctx.isMuted() ? "Download to my machine" : "Ask agent to download"));
+        have ? tr("civitai_ui.in_library_re_download", "✓ In library — re-download")
+             : (ctx.isMuted()
+               ? tr("civitai_ui.download_to_my_machine", "Download to my machine")
+               : tr("civitai_ui.ask_agent_to_download", "Ask agent to download")));
       dlBtn.addEventListener("click", () => pickModel(detail, version));
       dl.appendChild(dlBtn);
       // Workflow files (.json, or the zip wrapper civitai puts around Workflows
@@ -1339,19 +1431,28 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       };
       for (const f of wfFiles) {
         const b = el("button", "cmcp-btn",
-          wfFiles.length > 1 ? `Load onto canvas — ${f.name}` : "Load workflow onto canvas");
+          wfFiles.length > 1
+            ? tr("civitai_ui.load_onto_canvas_named", "Load onto canvas — {name}", { name: f.name })
+            : tr("civitai_ui.load_workflow_onto_canvas", "Load workflow onto canvas"));
         const size = f.sizeKB != null
           ? (f.sizeKB >= 1024 ? (f.sizeKB / 1024).toFixed(1) + " MB" : Math.max(1, Math.round(f.sizeKB)) + " KB")
           : null;
-        b.title = `Download ${f.name}${size ? ` (${size})` : ""} and load it onto the canvas (Ctrl+Z undoes it).`;
+        // Filename and size compose OUTSIDE the sentence: both are literals CivitAI
+        // supplies, and a translator must be free to move `{file}` where their
+        // grammar puts an object without also owning the "name (size)" formatting.
+        const fileLabel = `${f.name}${size ? ` (${size})` : ""}`;
+        b.title = tr("civitai_ui.download_and_load_it_onto_the_canvas",
+          "Download {file} and load it onto the canvas (Ctrl+Z undoes it).", { file: fileLabel });
         b.addEventListener("click", () => { void loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow() }); });
         dl.appendChild(b);
         // Same loadable-workflow condition as "Load onto canvas" (every wfFile is
         // loadable): load the SELECTED version's workflow with the panel kept open,
         // then hop to the Apps convert view seeded from the now-loaded canvas.
         const appB = el("button", "cmcp-btn",
-          wfFiles.length > 1 ? `Create App — ${f.name}` : "Create App from workflow");
-        appB.title = "Download this workflow, load it onto the canvas, and package it as a one-click app.";
+          wfFiles.length > 1
+            ? tr("civitai_ui.create_app_named", "Create App — {name}", { name: f.name })
+            : tr("civitai_ui.create_app_from_workflow", "Create App from workflow"));
+        appB.title = tr("civitai_ui.download_this_workflow_load_it_onto_the", "Download this workflow, load it onto the canvas, and package it as a one-click app.");
         appB.addEventListener("click", () => {
           void createAppFromWorkflow(
             () => loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow(), keepPanelOpen: true }),
@@ -1360,12 +1461,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         dl.appendChild(appB);
       }
       if (have) {
-        const note = el("span", null, "You already have this file locally.");
+        const note = el("span", null, tr("civitai_ui.you_already_have_this_file_locally", "You already have this file locally."));
         note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);color:#4ade80;align-self:center";
         dl.appendChild(note);
       }
       if (detail.creator) {
-        const moreBtn = el("button", "cmcp-btn", `See more from @${detail.creator}`);
+        const moreBtn = el("button", "cmcp-btn",
+          tr("civitai_ui.see_more_from", "See more from @{creator}", { creator: detail.creator }));
         moreBtn.addEventListener("click", () => {
           sheet.close();
           seeMoreFromCreator(detail.creator, { toModelTab: true });
@@ -1391,7 +1493,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           c.addEventListener("click", () => showGenInfo(ex));
           carousel.appendChild(c);
         });
-        detailBody.appendChild(el("div", "cmcp-cv-flabel", "Examples"));
+        detailBody.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.examples", "Examples")));
         detailBody.appendChild(carousel);
       }
     };
@@ -1417,20 +1519,24 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   async function pickModel(detail, version) {
     const subfolder = SUBFOLDER[detail.type] || "checkpoints";
     if (ctx.isMuted()) {
-      toast("Downloading…");
+      toast(tr("civitai_ui.downloading", "Downloading…"));
       try {
         const res = await ctx.callTool("download_model",
           { action: "download_civitai", model_id: detail.id, model_version_id: version.id, target_subfolder: subfolder },
           { timeout: 20 * 60000 });
-        toast(res.ok ? "Downloaded to your machine." : "Download failed: " + (res.error || "?"));
-      } catch (e) { toast("Download error: " + e.message); }
+        toast(res.ok
+          ? tr("civitai_ui.downloaded_to_your_machine", "Downloaded to your machine.")
+          : tr("civitai_ui.download_failed", "Download failed: {error}", { error: res.error || "?" }));
+      } catch (e) { toast(tr("civitai_ui.download_error", "Download error: {error}", { error: e.message })); }
     } else {
+      // The request itself stays English — see buildCaption: it is a prompt for the
+      // agent, carrying wire ids and the API's own `detail.type` ("Checkpoint"/"LORA").
       ctx.sendUserMessage(
         `Please download the CivitAI ${detail.type} "${detail.name}"` +
         (version.name ? ` (version "${version.name}")` : "") +
         ` — model_id ${detail.id}, version ${version.id} — into ${subfolder}, then we'll use it.`);
       ctx.bringChatForward();
-      toast("Asked the agent to download it.");
+      toast(tr("civitai_ui.asked_the_agent_to_download_it", "Asked the agent to download it."));
     }
   }
 
@@ -1463,7 +1569,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     // cancel the pending debounce and invalidate any lookup already in
     // flight so its completion early-returns instead of touching the
     // detached nodes.
-    const sheet = openSubModal("Filters", () => {
+    const sheet = openSubModal(tr("civitai_ui.filters", "Filters"), () => {
       clearTimeout(crTimer); crTimer = null;
       crReq++;
     });
@@ -1481,14 +1587,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const chipRow = (label, options, isOn, onToggle) =>
         filterChipRow(wrap, label, options, isOn, (v) => { onToggle(v); renderSheet(); update(); });
 
-      chipRow("Time period", PERIODS.map((p) => ({ label: p, value: p })),
+      // Only the ROW headings are translated. The chip labels are CivitAI's own query
+      // values echoed back as their own label (`{ label: p, value: p }`) — translating
+      // one would translate the other and send e.g. "주" as the `period` parameter.
+      chipRow(tr("civitai_ui.time_period", "Time period"), PERIODS.map((p) => ({ label: p, value: p })),
         (v) => f.period === v, (v) => { f.period = v; });
       const sorts = isModelTab() ? MODEL_SORTS : IMAGE_SORTS;
-      chipRow("Sort", sorts.map((s) => ({ label: s, value: s })),
+      chipRow(tr("civitai_ui.sort", "Sort"), sorts.map((s) => ({ label: s, value: s })),
         (v) => (isModelTab() ? f.modelSort : f.imageSort) === v,
         (v) => { if (isModelTab()) f.modelSort = v; else f.imageSort = v; });
-      // browsing levels — ALL selectable, no sign-in gate
-      chipRow("Browsing level", LEVELS.map((l) => ({ label: l.label, value: l.level })),
+      // browsing levels — ALL selectable, no sign-in gate. `l.label` is a content-rating
+      // code (PG / PG-13 / R / X / XXX); those are international and stay English.
+      chipRow(tr("civitai_ui.browsing_level", "Browsing level"), LEVELS.map((l) => ({ label: l.label, value: l.level })),
         (v) => f.browsingLevels.includes(v),
         (v) => {
           const i = f.browsingLevels.indexOf(v);
@@ -1497,7 +1607,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         });
 
       // base model omni-search
-      wrap.appendChild(el("div", "cmcp-cv-flabel", "Base model"));
+      wrap.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.base_model", "Base model")));
       const pills = el("div", "cmcp-cv-frow");
       // Rebuilt in place rather than via renderSheet(), so toggling a model
       // does not tear down the dropdown mid-selection (see toggleModel).
@@ -1522,7 +1632,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const dd = el("div", "cmcp-cv-dd");
       const ddId = `cmcp-cv-bm-${Math.random().toString(36).slice(2, 8)}`;
       const bmSearch = el("input", "cmcp-cv-search");
-      bmSearch.placeholder = "Search base models…";
+      bmSearch.placeholder = tr("civitai_ui.search_base_models", "Search base models…");
       bmSearch.setAttribute("role", "combobox");
       bmSearch.setAttribute("aria-expanded", "false");
       bmSearch.setAttribute("aria-controls", ddId);
@@ -1578,12 +1688,14 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         listbox.id = ddId;
         listbox.setAttribute("role", "listbox");
         listbox.setAttribute("aria-multiselectable", "true");
-        listbox.setAttribute("aria-label", "Base model");
+        listbox.setAttribute("aria-label", tr("civitai_ui.base_model", "Base model"));
         bmPanel.appendChild(listbox);
         const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, query));
+        // Section headings, not values — the base-model NAMES inside each group are
+        // CivitAI's own spellings and stay as-is.
         const groups = [
-          ["Current", hits.filter((x) => ACTIVE_BASE_MODELS.has(x))],
-          ["Legacy", hits.filter((x) => !ACTIVE_BASE_MODELS.has(x))],
+          [tr("civitai_ui.current", "Current"), hits.filter((x) => ACTIVE_BASE_MODELS.has(x))],
+          [tr("civitai_ui.legacy", "Legacy"), hits.filter((x) => !ACTIVE_BASE_MODELS.has(x))],
         ];
         for (const [label, items] of groups) {
           if (!items.length) continue;
@@ -1621,7 +1733,9 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         }
         if (!bmOpts.length) {
           // Not an option — belongs in the panel, outside the listbox.
-          bmPanel.appendChild(el("div", "cmcp-cv-ddempty", `No base model matches “${bmSearch.value.trim()}”.`));
+          bmPanel.appendChild(el("div", "cmcp-cv-ddempty",
+            tr("civitai_ui.no_base_model_matches", "No base model matches “{query}”.",
+              { query: bmSearch.value.trim() })));
         }
         // Selected-count + clear, matching what ComfyUI's own multi-select
         // shows. With the list scrolled or filtered the chips above can be out
@@ -1629,9 +1743,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         // live — or to drop them without hunting each one down.
         if (f.baseModels.length) {
           const foot = el("div", "cmcp-cv-ddfoot");
-          foot.appendChild(el("span", null,
-            `${f.baseModels.length} selected`));
-          const clear = el("button", "cmcp-cv-ddclear", "Clear");
+          // English has one form here; Russian and Arabic do not, so it is counted.
+          foot.appendChild(el("span", null, tr("civitai_ui.n_selected", {
+            one: "{count} selected", other: "{count} selected",
+          }, { count: f.baseModels.length })));
+          // Its OWN key, not the panel-wide `panel.clear`, even though the English is
+          // identical. That key labels the credentials card's "clear this API key"
+          // button; a translator seeing only that context can legitimately render it
+          // ja "キーを消去" ("clear the key"), which would then mislabel THIS button —
+          // which clears base-model filters. Sharing a key shares the context too.
+          const clear = el("button", "cmcp-cv-ddclear", tr("civitai_ui.clear", "Clear"));
           clear.type = "button";
           // Left button only — right-clicking "Clear" would otherwise wipe every
           // selected model before the context menu even appeared.
@@ -1690,7 +1811,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       // TOP-CREATORS leaderboard (ranked, with stats); typing runs a debounced
       // (300ms) /v1/creators username search. Picking one threads `username`
       // through every feed/search/model query; no selection = everyone.
-      wrap.appendChild(el("div", "cmcp-cv-flabel", "Creator"));
+      wrap.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.creator", "Creator")));
       if (tabDef().fav) {
         // Favorites are "images YOU liked", from every creator — the tRPC
         // favorites feed has no creator param, so render the filter visibly
@@ -1699,25 +1820,26 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         box.style.opacity = ".6";
         if (f.username) {
           const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
-          pill.title = "Remove creator filter";
+          pill.title = tr("civitai_ui.remove_creator_filter", "Remove creator filter");
           pill.addEventListener("click", () => { setCreator(null); renderSheet(); update(); });
           box.appendChild(pill);
         }
         box.appendChild(el("div", "cmcp-cv-lb-muted",
-          "Ignored on the Favorites tab — favorites are the images you liked, from every creator."));
+          tr("civitai_ui.ignored_on_the_favorites_tab_favorites_are",
+            "Ignored on the Favorites tab — favorites are the images you liked, from every creator.")));
         wrap.appendChild(box);
       } else {
         const crPills = el("div", "cmcp-cv-frow");
         if (f.username) {
           const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
-          pill.title = "Remove creator filter";
+          pill.title = tr("civitai_ui.remove_creator_filter", "Remove creator filter");
           pill.addEventListener("click", () => { setCreator(null); renderSheet(); update(); });
           crPills.appendChild(pill);
         }
         const crSearch = el("input", "cmcp-cv-search");
         crSearch.placeholder = f.username
-          ? "Switch creator…"
-          : "All creators — search, or pick from the top";
+          ? tr("civitai_ui.switch_creator", "Switch creator…")
+          : tr("civitai_ui.all_creators_search_or_pick_from_the", "All creators — search, or pick from the top");
         const crNote = el("div", "cmcp-cv-lb-muted");
         crNote.style.display = "none";
         const crList = el("div", "cmcp-cv-creators");
@@ -1727,12 +1849,32 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
             const b = el("button", "cmcp-cv-creator");
             b.appendChild(el("span", null,
               c.position != null ? `#${c.position}  ${c.username}` : c.username));
+            // Counted, but the number the user READS is abbreviated ("1.2M"), and a
+            // plural category can't be derived from that string. So `count` carries the
+            // real total for Intl and `{n}` carries the abbreviation for display.
+            //
+            // Known residual, bounded and deliberate: once abbreviated, the category
+            // follows the TRUE total, not the displayed numeral. `compactCount(1001)`
+            // is "1K" while ru's rule for 1001 is `one`, so that row reads "1K
+            // загрузка" where the displayed "1K" wants the genitive. Getting this
+            // exactly right needs locale-aware compact formatting
+            // (Intl.NumberFormat notation:"compact"), which would also change the
+            // digits every existing row shows — a bigger change than this row is
+            // worth. Every count below 1000 displays in full and is exactly right,
+            // which is most creators; English is immune either way.
             const sub = c.position != null
               ? [
-                  c.downloads != null ? compactCount(c.downloads) + " downloads" : null,
-                  c.thumbsUp != null ? compactCount(c.thumbsUp) + " likes" : null,
+                  c.downloads != null
+                    ? tr("civitai_ui.n_downloads", { one: "{n} download", other: "{n} downloads" },
+                      { count: c.downloads, n: compactCount(c.downloads) })
+                    : null,
+                  c.thumbsUp != null
+                    ? tr("civitai_ui.n_likes", { one: "{n} like", other: "{n} likes" },
+                      { count: c.thumbsUp, n: compactCount(c.thumbsUp) })
+                    : null,
                 ].filter(Boolean).join(" · ")
-              : `${c.modelCount ?? 0} model${(c.modelCount ?? 0) === 1 ? "" : "s"}`;
+              : tr("civitai_ui.n_models", { one: "{count} model", other: "{count} models" },
+                { count: c.modelCount ?? 0 });
             if (sub) b.appendChild(el("span", "sub", sub));
             b.addEventListener("click", () => {
               setCreator(c.username);
@@ -1748,15 +1890,15 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           clearTimeout(crTimer); crTimer = null;
           const req = ++crReq;
           const cq = crSearch.value.trim();
-          crNote.style.display = ""; crNote.textContent = "Looking up creators…";
+          crNote.style.display = ""; crNote.textContent = tr("civitai_ui.looking_up_creators", "Looking up creators…");
           (cq ? client.searchCreators(cq) : topCreators())
             .then((matches) => {
               if (req !== crReq) return; // a newer lookup owns the list
               renderMatches(matches);
               crNote.style.display = matches.length ? "none" : "";
               crNote.textContent = cq
-                ? "No creators match."
-                : "Top creators unavailable right now.";
+                ? tr("civitai_ui.no_creators_match", "No creators match.")
+                : tr("civitai_ui.top_creators_unavailable_right_now", "Top creators unavailable right now.");
             })
             .catch(() => {
               // The leaderboard tRPC intermittently 401s bare user agents —
@@ -1765,8 +1907,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
               crList.innerHTML = "";
               crNote.style.display = "";
               crNote.textContent = cq
-                ? "Creator search failed — try again."
-                : "Top creators unavailable right now.";
+                ? tr("civitai_ui.creator_search_failed_try_again", "Creator search failed — try again.")
+                : tr("civitai_ui.top_creators_unavailable_right_now", "Top creators unavailable right now.");
             });
         };
         crSearch.addEventListener("input", () => {
@@ -1780,7 +1922,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         wrap.append(crPills, crSearch, crNote, crList);
       }
 
-      const reset = el("button", "cmcp-btn", "Reset filters");
+      const reset = el("button", "cmcp-btn", tr("civitai_ui.reset_filters", "Reset filters"));
       reset.addEventListener("click", () => {
         state.filters = {
           ...DEFAULT_FILTERS,
@@ -1825,24 +1967,25 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     if (state.signedIn) {
       // Account sheet: the "default likes folder" (a CivitAI collection every
       // like also lands in) + sign out. Signed-in no longer instant-signs-out.
-      const sheet = openSubModal("CivitAI account");
+      const sheet = openSubModal(tr("civitai_ui.civitai_account", "CivitAI account"));
       const wrap = el("div", "cmcp-cv-filters");
-      wrap.appendChild(el("div", null, "Signed in ✓"));
-      wrap.appendChild(el("div", "cmcp-cv-flabel", "Default likes collection"));
+      wrap.appendChild(el("div", null, tr("civitai_ui.signed_in", "Signed in ✓")));
+      wrap.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.default_likes_collection", "Default likes collection")));
       wrap.appendChild(el("div", "cmcp-cv-lb-muted",
-        "Every like is also saved into this collection on your CivitAI account (and removed when you unlike)."));
+        tr("civitai_ui.every_like_is_also_saved_into_this",
+          "Every like is also saved into this collection on your CivitAI account (and removed when you unlike).")));
       const row = el("div", "cmcp-cv-frow");
       const sel = document.createElement("select");
       sel.className = "cmcp-cv-search";
       sel.disabled = true;
-      sel.appendChild(new Option("Loading collections…", ""));
-      const newBtn = el("button", "cmcp-btn", "+ New…");
+      sel.appendChild(new Option(tr("civitai_ui.loading_collections", "Loading collections…"), ""));
+      const newBtn = el("button", "cmcp-btn", tr("civitai_ui.new", "+ New…"));
       row.append(sel, newBtn);
       wrap.appendChild(row);
       let colCache = [];
       const fillSelect = () => {
         sel.innerHTML = "";
-        sel.appendChild(new Option("(none — likes only)", ""));
+        sel.appendChild(new Option(tr("civitai_ui.none_likes_only", "(none — likes only)"), ""));
         const cur = likesCollection();
         for (const c of colCache) {
           const o = new Option(c.name, String(c.id));
@@ -1855,19 +1998,22 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         .then((cols) => { colCache = cols; fillSelect(); })
         .catch((e) => {
           sel.innerHTML = "";
-          sel.appendChild(new Option("Couldn't load collections", ""));
+          sel.appendChild(new Option(tr("civitai_ui.couldn_t_load_collections", "Couldn't load collections"), ""));
           if (String(e.message || e).includes("403")) {
             wrap.appendChild(el("div", "cmcp-cv-lb-muted",
-              "Your sign-in predates the collection permissions — sign out and back in to grant them."));
+              tr("civitai_ui.your_sign_in_predates_the_collection_permissions",
+                "Your sign-in predates the collection permissions — sign out and back in to grant them.")));
           }
         });
       sel.addEventListener("change", () => {
         const c = colCache.find((x) => String(x.id) === sel.value);
         setLikesCollection(c || null);
-        toast(c ? `Likes will also go to "${c.name}".` : "Likes won't be added to a collection.");
+        toast(c
+          ? tr("civitai_ui.likes_will_also_go_to", "Likes will also go to \"{name}\".", { name: c.name })
+          : tr("civitai_ui.likes_won_t_be_added_to_a", "Likes won't be added to a collection."));
       });
       newBtn.addEventListener("click", async () => {
-        const name = window.prompt("Name for the new CivitAI collection:");
+        const name = window.prompt(tr("civitai_ui.name_for_the_new_civitai_collection", "Name for the new CivitAI collection:"));
         if (!name || !name.trim()) return;
         newBtn.disabled = true;
         try {
@@ -1876,17 +2022,22 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           fillSelect();
           sel.value = String(c.id);
           setLikesCollection(c);
-          toast(`Created "${c.name}" — it's now your likes collection.`);
+          toast(tr("civitai_ui.created_it_s_now_your_likes_collection",
+            "Created \"{name}\" — it's now your likes collection.", { name: c.name }));
         } catch (e) {
-          toast("Create failed: " + (e.message || e));
+          toast(tr("civitai_ui.create_failed", "Create failed: {error}", { error: e.message || e }));
         } finally {
           newBtn.disabled = false;
         }
       });
-      const out = el("button", "cmcp-btn", "Sign out");
+      // Its own key rather than `panel.sign_out` — see the note on civitai_ui.clear.
+      // That one signs out of an AI provider; this one signs out of CivitAI, and the
+      // two need not share a verb in every language.
+      const out = el("button", "cmcp-btn", tr("civitai_ui.sign_out", "Sign out"));
       out.addEventListener("click", async () => {
         await ctx.api.fetchApi("/comfyui_mcp_panel/civitai/oauth/logout", { method: "POST" });
-        await refreshAuth(); sheet.close(); toast("Signed out of CivitAI.");
+        await refreshAuth(); sheet.close();
+        toast(tr("civitai_ui.signed_out_of_civitai", "Signed out of CivitAI."));
       });
       wrap.appendChild(out);
       sheet.body.appendChild(wrap);
@@ -1907,10 +2058,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         if (!isOpen) { if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; } return; }
         if (state.signedIn || ++tries > 120) {
           clearInterval(_oauthPollIv); _oauthPollIv = null;
-          if (state.signedIn) { toast("Signed in to CivitAI."); if (tabDef().fav) reload(); }
+          if (state.signedIn) {
+            toast(tr("civitai_ui.signed_in_to_civitai", "Signed in to CivitAI."));
+            if (tabDef().fav) reload();
+          }
         }
       }, 2000);
-    } catch (e) { toast("Sign-in failed: " + e.message); }
+    } catch (e) { toast(tr("civitai_ui.sign_in_failed", "Sign-in failed: {error}", { error: e.message })); }
   }
 
   // ── sub-modal + toast helpers ────────────────────────────────────────
@@ -2128,8 +2282,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   // ── content provider (the shell owns the chrome; this owns the body) ──────
   let _started = false;
   return {
-    key: "civitai", label: "Civitai", icon: "pi-images", driveKind: "civitai",
-    hasSearch: true, searchPlaceholder: "Search CivitAI…",
+    key: "civitai", label: tr("civitai_ui.civitai", "Civitai"), icon: "pi-images", driveKind: "civitai",
+    hasSearch: true, searchPlaceholder: tr("civitai_ui.search_civitai", "Search CivitAI…"),
     subnavExtras: () => [subTabsWrap, favChips, filterBtn, acctBtn],
     mount(bodyEl) {
       search.value = state.query;

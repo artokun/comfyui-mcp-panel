@@ -444,6 +444,12 @@ import {
   savedWorkflowHandle,
   savedWorkflowRoute,
 } from "./lib/bridge-route.js";
+// P0: this import previously sat INSIDE the specifier list below, which is a
+// SyntaxError in an ES module — and this file loads as one, so the whole panel failed
+// to construct. `node --check panel.js` does NOT catch it (Node parses a bare .js as
+// CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
+// here should be verified that way.
+import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -976,7 +982,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.13.9";
+const PANEL_VERSION = "0.14.0";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -992,9 +998,9 @@ let cmcpConsoleToken = null;
 // `copilot` is experimental (device-code, GitHub ToS risk) and only ever
 // sent with `allow_experimental: true`.
 const CMCP_OAUTH_PROVIDERS = [
-  { id: "codex", label: "ChatGPT (Codex)" },
-  { id: "grok", label: "Grok" },
-  { id: "copilot", label: "GitHub Copilot", experimental: true },
+  { id: "codex", get label() { return tr("panel.chatgpt_codex", "ChatGPT (Codex)"); } },
+  { id: "grok", get label() { return tr("panel.grok", "Grok"); } },
+  { id: "copilot", get label() { return tr("panel.github_copilot", "GitHub Copilot"); }, experimental: true },
 ];
 
 // Hooks the OAuth section of the credentials card (built on demand — see
@@ -1019,21 +1025,25 @@ function cmcpApiBase() {
 }
 function cmcpOpenCredentialsFrame(client) {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
-    alert("Connect the panel first — the credentials console isn't available yet.");
+    alert(tr("panel.connect_the_panel_first_the_credentials_console", "Connect the panel first — the credentials console isn't available yet."));
     return;
   }
   const backdrop = document.createElement("div");
   backdrop.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;";
   const card = document.createElement("div");
   card.style.cssText = "width:440px;max-width:92vw;max-height:88vh;overflow:auto;padding:1rem 1.1rem;border-radius:12px;background:#0f1115;color:#e8eaed;border:1px solid #2a2f3a;box-shadow:0 12px 48px rgba(0,0,0,.5);font:13px system-ui,sans-serif;";
+  // Translated text goes through esc2 like every other interpolation in this card.
+  // `/i18n` merges EVERY installed pack's catalog into one object (see lib/i18n.js note 1),
+  // so a translation is not a literal we control at build time — and two of the holes below
+  // sit INSIDE a double-quoted attribute, where an unescaped `"` would break out of it.
   card.innerHTML = `
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
-      <b style="flex:1;font-size:15px">API Keys</b>
+      <b style="flex:1;font-size:15px">${esc2(tr("panel.api_keys", "API Keys"))}</b>
       <span data-close style="cursor:pointer;font-size:18px;opacity:.6;line-height:1">✕</span>
     </div>
-    <div style="opacity:.6;font-size:11px;margin-bottom:10px">Stored locally on the backend, per instance. Values are write-only and never leave this machine.</div>
+    <div style="opacity:.6;font-size:11px;margin-bottom:10px">${esc2(tr("panel.stored_locally_on_the_backend_per_instance", "Stored locally on the backend, per instance. Values are write-only and never leave this machine."))}</div>
     <div data-err style="color:#f28b82;font-size:12px;margin-bottom:8px;display:none"></div>
-    <div data-list style="opacity:.7">Loading…</div>
+    <div data-list style="opacity:.7">${esc2(tr("panel.loading", "Loading…"))}</div>
     <div data-oauth style="margin-top:14px;padding-top:10px;border-top:1px solid #2a2f3a"></div>`;
   const close = () => {
     stopOauthPolling();
@@ -1052,14 +1062,14 @@ function cmcpOpenCredentialsFrame(client) {
     r.style.cssText = "margin-bottom:12px";
     r.innerHTML = `
       <label style="display:block;margin-bottom:4px">${esc2(s.label)}
-        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${s.set ? "set · " + esc2(s.masked || "") : "not set"}</span></label>
+        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${esc2(s.set ? tr("panel.set", "set · ") + (s.masked || "") : tr("panel.not_set", "not set"))}</span></label>
       <div style="display:flex;gap:6px">
         <input type="password" autocomplete="off" data-input
-               placeholder="${s.set ? "•••• set — type to replace" : "paste key"}"
+               placeholder="${esc2(s.set ? tr("panel.set_type_to_replace", "•••• set — type to replace") : tr("panel.paste_key", "paste key"))}"
                style="flex:1;padding:6px;background:#1a1a1a;border:1px solid #333;color:#ddd;border-radius:4px;box-sizing:border-box"/>
-        <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">Save</button>
-        <button data-clear title="Remove this key from the orchestrator's store"
-                style="padding:6px 10px;border-radius:4px;cursor:pointer;${s.set ? "" : "display:none"}">Clear</button>
+        <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">${esc2(tr("panel.save", "Save"))}</button>
+        <button data-clear title="${esc2(tr("panel.remove_this_key_from_the_orchestrator_s", "Remove this key from the orchestrator's store"))}"
+                style="padding:6px 10px;border-radius:4px;cursor:pointer;${s.set ? "" : "display:none"}">${esc2(tr("panel.clear", "Clear"))}</button>
       </div>
       ${s.help ? `<div data-help style="font-size:11px;opacity:.55;margin-top:4px;line-height:1.45">${esc2(s.help)}</div>` : ""}`;
     const input = r.querySelector("[data-input]");
@@ -1070,22 +1080,29 @@ function cmcpOpenCredentialsFrame(client) {
       const value = input.value.trim();
       if (!value) return;
       showErr("");
-      btn.disabled = true; btn.textContent = "Saving…";
+      btn.disabled = true; btn.textContent = tr("panel.saving", "Saving…");
       try {
         const resp = await fetch(cmcpApiBase(), {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, value }),
         });
         const d = await resp.json();
-        if (!resp.ok || !d.ok) throw new Error(d.error || "save failed");
+        // `d.error` is the orchestrator's own (English) reason; only OUR fallback is ours to
+        // translate — the server text is passed through untouched, as it always has been.
+        if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.save_failed", "save failed"));
         input.value = "";
-        badge.textContent = "set · " + (d.masked || "");
+        badge.textContent = tr("panel.set", "set · ") + (d.masked || "");
+        // Mirror the clear path, which resets this to the paste hint: the row has just gone
+        // from unset to set, so an emptied field still inviting a paste tells the user
+        // nothing was stored, one line under a badge saying it was. Surfaced by review of
+        // the i18n pass — the two branches were only ever half a pair.
+        input.placeholder = tr("panel.set_type_to_replace", "•••• set — type to replace");
         clearBtn.style.display = "";
-        btn.textContent = "Saved ✓";
-        setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 1400);
+        btn.textContent = tr("panel.saved", "Saved ✓");
+        setTimeout(() => { btn.textContent = tr("panel.save", "Save"); btn.disabled = false; }, 1400);
       } catch (e) {
         showErr(String((e && e.message) || e));
-        btn.textContent = "Save"; btn.disabled = false;
+        btn.textContent = tr("panel.save", "Save"); btn.disabled = false;
       }
     };
     // Revoke path (comfyui-mcp issue #203): POST {slot, clear:true} removes every
@@ -1093,21 +1110,21 @@ function cmcpOpenCredentialsFrame(client) {
     // overwritten, never removed, short of hand-editing panel-secrets.json.
     clearBtn.onclick = async () => {
       showErr("");
-      clearBtn.disabled = true; clearBtn.textContent = "Clearing…";
+      clearBtn.disabled = true; clearBtn.textContent = tr("panel.clearing", "Clearing…");
       try {
         const resp = await fetch(cmcpApiBase(), {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, clear: true }),
         });
         const d = await resp.json();
-        if (!resp.ok || !d.ok) throw new Error(d.error || "clear failed");
-        badge.textContent = "not set";
-        input.placeholder = "paste key";
+        if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.clear_failed", "clear failed"));
+        badge.textContent = tr("panel.not_set", "not set");
+        input.placeholder = tr("panel.paste_key", "paste key");
         clearBtn.style.display = "none";
-        clearBtn.textContent = "Clear"; clearBtn.disabled = false;
+        clearBtn.textContent = tr("panel.clear", "Clear"); clearBtn.disabled = false;
       } catch (e) {
         showErr(String((e && e.message) || e));
-        clearBtn.textContent = "Clear"; clearBtn.disabled = false;
+        clearBtn.textContent = tr("panel.clear", "Clear"); clearBtn.disabled = false;
       }
     };
     return r;
@@ -1117,13 +1134,19 @@ function cmcpOpenCredentialsFrame(client) {
     try {
       const resp = await fetch(cmcpApiBase());
       const d = await resp.json();
-      if (!resp.ok || !d.ok) throw new Error(d.error || "could not load");
+      if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.could_not_load", "could not load"));
       list.innerHTML = "";
       for (const s of (d.slots || [])) list.appendChild(row(s));
-      if (!list.children.length) list.textContent = "No credential slots.";
+      if (!list.children.length) list.textContent = tr("panel.no_credential_slots", "No credential slots.");
     } catch (e) {
       list.textContent = "";
-      showErr("Couldn't load credentials — reconnect the panel. (" + String((e && e.message) || e) + ")");
+      // One interpolated sentence rather than a concatenation: a translator needs the
+      // parenthetical to be movable, and several languages put it elsewhere in the clause.
+      showErr(tr(
+        "panel.couldn_t_load_credentials_reconnect_the_panel",
+        "Couldn't load credentials — reconnect the panel. ({error})",
+        { error: String((e && e.message) || e) },
+      ));
     }
   })();
 
@@ -1135,7 +1158,7 @@ function cmcpOpenCredentialsFrame(client) {
   const oauthSection = card.querySelector("[data-oauth]");
   const oauthHeader = document.createElement("div");
   oauthHeader.style.cssText = "font-weight:600;margin-bottom:8px;font-size:13px";
-  oauthHeader.textContent = "Sign in";
+  oauthHeader.textContent = tr("panel.sign_in", "Sign in");
   oauthSection.appendChild(oauthHeader);
   // Section-level error line (e.g. a failed oauth_status probe — Fix 2). Hidden
   // until there's something to say; textContent only, per XSS discipline.
@@ -1218,11 +1241,13 @@ function cmcpOpenCredentialsFrame(client) {
       info.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap";
       const who = document.createElement("span");
       who.style.cssText = "opacity:.75;font-size:12px";
-      who.textContent = state.accountLabel ? `Signed in as ${state.accountLabel}` : "Signed in";
+      who.textContent = state.accountLabel
+        ? tr("panel.signed_in_as", "Signed in as {label}", { label: state.accountLabel })
+        : tr("panel.signed_in", "Signed in");
       const signOutBtn = document.createElement("button");
       signOutBtn.type = "button";
       signOutBtn.className = "cmcp-btn";
-      signOutBtn.textContent = "Sign out";
+      signOutBtn.textContent = tr("panel.sign_out", "Sign out");
       signOutBtn.disabled = !!state.busy;
       signOutBtn.onclick = () => beginOauthSignout(p);
       info.append(who, signOutBtn);
@@ -1255,10 +1280,10 @@ function cmcpOpenCredentialsFrame(client) {
         copyBtn.type = "button";
         copyBtn.className = "cmcp-btn";
         copyBtn.style.cssText = "padding:2px 8px;font-size:11px";
-        copyBtn.textContent = "Copy URL";
+        copyBtn.textContent = tr("panel.copy_url", "Copy URL");
         copyBtn.onclick = () => {
           navigator.clipboard?.writeText(url).then(
-            () => { copyBtn.textContent = "Copied ✓"; setTimeout(() => { copyBtn.textContent = "Copy URL"; }, 1200); },
+            () => { copyBtn.textContent = tr("panel.copied", "Copied ✓"); setTimeout(() => { copyBtn.textContent = tr("panel.copy_url", "Copy URL"); }, 1200); },
             () => {},
           );
         };
@@ -1267,18 +1292,18 @@ function cmcpOpenCredentialsFrame(client) {
       rowEl.appendChild(urlRow);
       const waiting = document.createElement("div");
       waiting.style.cssText = "opacity:.65;font-size:11px";
-      waiting.textContent = "Waiting for approval…";
+      waiting.textContent = tr("panel.waiting_for_approval", "Waiting for approval…");
       rowEl.appendChild(waiting);
     } else if (state.status === "pending_loopback") {
       const waiting = document.createElement("div");
       waiting.style.cssText = "opacity:.75;font-size:12px";
-      waiting.textContent = "A browser window opened — finish sign-in there…";
+      waiting.textContent = tr("panel.a_browser_window_opened_finish_sign_in", "A browser window opened — finish sign-in there…");
       rowEl.appendChild(waiting);
     } else {
       const signInBtn = document.createElement("button");
       signInBtn.type = "button";
       signInBtn.className = "cmcp-btn";
-      signInBtn.textContent = `Sign in with ${p.label}`;
+      signInBtn.textContent = tr("panel.sign_in_with", "Sign in with {provider}", { provider: p.label });
       signInBtn.disabled = !!state.busy;
       signInBtn.onclick = () => beginOauthSignin(p);
       rowEl.appendChild(signInBtn);
@@ -1302,7 +1327,7 @@ function cmcpOpenCredentialsFrame(client) {
       ...(p.experimental ? { allow_experimental: true } : {}),
     });
     if (!ok) {
-      entry.state = { status: "signed_out", busy: false, error: "Not connected — reconnect the panel first." };
+      entry.state = { status: "signed_out", busy: false, error: tr("panel.not_connected_reconnect_the_panel_first", "Not connected — reconnect the panel first.") };
       paintOauthRow(p);
       return;
     }
@@ -1316,7 +1341,7 @@ function cmcpOpenCredentialsFrame(client) {
     paintOauthRow(p);
     const ok = client?.sendFrame?.({ type: "oauth_signout", provider: p.id });
     if (!ok) {
-      entry.state = { ...entry.state, busy: false, error: "Not connected — reconnect the panel first." };
+      entry.state = { ...entry.state, busy: false, error: tr("panel.not_connected_reconnect_the_panel_first", "Not connected — reconnect the panel first.") };
       paintOauthRow(p);
       return;
     }
@@ -1355,7 +1380,7 @@ function cmcpOpenCredentialsFrame(client) {
         // Fix 2: surface a failed status probe instead of ignoring it — put the
         // error on the section header row so the user isn't left staring at
         // stale/blank rows with no explanation.
-        oauthError(ack.message || "Couldn't load sign-in status.");
+        oauthError(ack.message || tr("panel.couldn_t_load_sign_in_status", "Couldn't load sign-in status."));
       }
       return;
     }
@@ -1365,7 +1390,7 @@ function cmcpOpenCredentialsFrame(client) {
       if (!p) return;
       const entry = oauthEntry(id);
       if (!ack.ok) {
-        entry.state = { status: "signed_out", busy: false, error: ack.message || "Sign-in failed." };
+        entry.state = { status: "signed_out", busy: false, error: ack.message || tr("panel.sign_in_failed", "Sign-in failed.") };
         paintOauthRow(p);
         return;
       }
@@ -1384,7 +1409,7 @@ function cmcpOpenCredentialsFrame(client) {
       if (!p) return;
       const entry = oauthEntry(id);
       if (!ack.ok) {
-        entry.state = { ...entry.state, busy: false, error: ack.message || "Sign-out failed." };
+        entry.state = { ...entry.state, busy: false, error: ack.message || tr("panel.sign_out_failed", "Sign-out failed.") };
       } else {
         entry.state = { status: "signed_out", busy: false, error: null };
       }
@@ -1406,11 +1431,11 @@ function cmcpOpenCredentialsFrame(client) {
   if (experimentalProviders.length) {
     const expHeader = document.createElement("div");
     expHeader.style.cssText = "font-weight:600;margin:10px 0 2px;font-size:12px;opacity:.85";
-    expHeader.textContent = "Experimental";
+    expHeader.textContent = tr("panel.experimental", "Experimental");
     oauthSection.appendChild(expHeader);
     const expNote = document.createElement("div");
     expNote.style.cssText = "opacity:.6;font-size:11px;margin-bottom:8px";
-    expNote.textContent = "Signs in as VS Code — against GitHub's Copilot API terms; use at your own risk.";
+    expNote.textContent = tr("panel.signs_in_as_vs_code_against_github", "Signs in as VS Code — against GitHub's Copilot API terms; use at your own risk.");
     oauthSection.appendChild(expNote);
     for (const p of experimentalProviders) {
       paintOauthRow(p);
@@ -3094,6 +3119,10 @@ const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 // leak in and make the panel dial a dead port.
 const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
+// Panel language. "" means Detect, which defers to ComfyUI's own `Comfy.Locale` and only
+// then to the browser — so the default behaviour is to follow the language the user already
+// chose for ComfyUI rather than to compete with it. An explicit value overrides that.
+const SETTING_LANGUAGE = "comfyui-mcp.language";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
 // #753 — the sidebar had no way to make its text bigger, and the obvious user
@@ -3155,12 +3184,58 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", antigravity: "Antigravity (Google)", pi: "Pi (pi.dev)", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
+//
+// GETTERS, not values. This is module scope: it is evaluated at IMPORT time, long before
+// setup() has awaited loadCatalog(), so a plain `claude: tr(...)` would capture the English
+// fallback permanently and no catalog could ever change it. Reading through a getter defers
+// the lookup to the moment the label is actually needed — which, for every one of these, is
+// when the Settings dialog renders (see the `get category()` accessors in panelSettingsList).
+//
+// PRODUCT NAMES STAY IN LATIN SCRIPT in every language — "Claude", "Gemini", "Ollama",
+// "llama.cpp" are what the vendors call themselves and what a user searches for. Only the
+// parenthetical QUALIFIER ("local", "Google subscription") is translatable, matching the
+// convention already set in locales/ko/main.json ("Ollama (로컬, 무료 …)", "LM Studio (로컬…)").
+const BACKEND_SECTION = {
+  get claude() { return tr("panel.claude", "Claude"); },
+  get codex() { return tr("panel.chatgpt_codex", "ChatGPT (Codex)"); },
+  get gemini() { return tr("panel.gemini", "Gemini"); },
+  get antigravity() { return tr("panel.antigravity_google", "Antigravity (Google)"); },
+  get pi() { return tr("panel.pi_pi_dev", "Pi (pi.dev)"); },
+  get grok() { return tr("panel.grok", "Grok"); },
+  get kimi() { return tr("panel.kimi", "Kimi"); },
+  get moonshot() { return tr("panel.kimi_k3", "Kimi K3"); },
+  get glm() { return tr("panel.glm_z_ai", "GLM (z.ai)"); },
+  get minimax() { return tr("panel.minimax", "MiniMax"); },
+  get ollama() { return tr("panel.ollama_local", "Ollama (local)"); },
+  get openrouter() { return tr("panel.openrouter", "OpenRouter"); },
+  get lmstudio() { return tr("panel.lm_studio_local", "LM Studio (local)"); },
+  get llamacpp() { return tr("panel.llama_cpp_local", "llama.cpp (local)"); },
+  get custom() { return tr("panel.custom_endpoint", "Custom endpoint"); },
+};
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
 const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
+
+// The BUTTON label for each token row, one translation key PER ROW.
+//
+// Not one interpolated `"Set {friendly} {noun}…"`: `friendly` and `noun` are English
+// constants from the call sites ("Custom endpoint", "API key"), so an interpolated label
+// would splice English fragments into a translated sentence and could never agree with the
+// fully translated row NAME that ComfyUI paints directly above it out of
+// locales/<lang>/settings.json. Written out so each key is greppable from the catalog too.
+//
+// Keyed by setting id, via COMPUTED keys off the SETTING_* constants rather than repeated
+// id literals — a typo'd literal would not throw, it would just never match and quietly
+// render English forever. The caller falls back to the English default, so adding a token
+// row without a label here degrades to English rather than rendering a blank button.
+const TOKEN_BUTTON_LABEL = {
+  [SETTING_TOKEN_OPENROUTER]: () => tr("panel.set_openrouter_api_key", "Set OpenRouter API key…"),
+  [SETTING_TOKEN_CUSTOM]: () => tr("panel.set_custom_endpoint_api_key", "Set Custom endpoint API key…"),
+  [SETTING_TOKEN_CIVITAI]: () => tr("panel.set_civitai_token", "Set CivitAI token…"),
+  [SETTING_TOKEN_HF]: () => tr("panel.set_huggingface_token", "Set HuggingFace token…"),
+};
 
 // Hooks the OPEN panel registers so the Settings dialog can drive the running
 // panel live. Null when no panel is mounted (settings still persist via ComfyUI;
@@ -3251,7 +3326,7 @@ function populateModelSelect(sel, backend) {
   sel.replaceChildren();
   const auto = document.createElement("option");
   auto.value = "";
-  auto.textContent = "Auto (let the agent pick)";
+  auto.textContent = tr("panel.auto_let_the_agent_pick", "Auto (let the agent pick)");
   sel.appendChild(auto);
   const seen = new Set([""]);
   if (rows) {
@@ -3289,7 +3364,7 @@ function populateModelSelect(sel, backend) {
 function effortComboOptions(backend) {
   const scale = BACKEND_EFFORTS[backend] || ALL_EFFORTS;
   return [
-    { value: "", text: "Model default" },
+    { value: "", text: tr("panel.model_default", "Model default") },
     ...scale.map((id) => ({ value: id, text: effortMeta(id).label })),
   ];
 }
@@ -3336,6 +3411,28 @@ function getSetting(id) {
     return app?.ui?.settings?.getSettingValue?.(id);
   } catch {
     return undefined;
+  }
+}
+/**
+ * Resolve the panel's language and load its catalog.
+ *
+ * Awaited before the sidebar tab is registered so the FIRST paint is already translated —
+ * loading afterwards would render English and then either flicker or, worse, sit there in
+ * English until something happened to re-render.
+ *
+ * Resolves rather than rejects on every failure: a panel that renders in English is fine,
+ * a panel whose startup threw is not.
+ */
+async function applyPanelLocale(explicit) {
+  try {
+    const locale = pickLocale({
+      ourSetting: explicit !== undefined ? explicit : getSetting(SETTING_LANGUAGE),
+      comfyLocale: getSetting("Comfy.Locale"),
+      navigatorLangs: globalThis.navigator?.languages || [globalThis.navigator?.language],
+    });
+    return await loadCatalog(locale, api);
+  } catch {
+    return null;
   }
 }
 /** Conversation ownership. The legacy boolean remains a read-only migration
@@ -3386,7 +3483,11 @@ function triggerSecret(envKey, friendly) {
       clearInterval(t);
       try {
         window.alert(
-          `Open the Agent panel, connect, then set the ${friendly} token again.`,
+          tr(
+            "panel.open_the_agent_panel_connect_then_set",
+            "Open the Agent panel, connect, then set the {name} token again.",
+            { name: friendly },
+          ),
         );
       } catch {
         /* alert unavailable (headless/embedded) — nothing else to do */
@@ -3489,18 +3590,58 @@ function localComfyuiPathForAgent() {
 
 // Build the settings list registered on the extension. Defined as a function so
 // it can close over the module-level hooks/helpers above.
+//
+// TRANSLATION — DO NOT WRAP `name:` / `tooltip:` IN tr().
+//
+// These rows are painted by ComfyUI's OWN Settings dialog, and SettingItem.vue looks each
+// row up as `settings.<id>.name` / `settings.<id>.tooltip` in the merged /i18n catalog —
+// where <id> is the setting id with DOTS replaced by underscores and hyphens PRESERVED
+// (`normalizeI18nKey`, verified against ComfyUI's own shipped `Comfy-Desktop_AutoUpdate`).
+// So `comfyui-mcp.defaultModel.claude` is translated by adding
+// `comfyui-mcp_defaultModel_claude` to locales/<lang>/settings.json — zero JavaScript.
+//
+// tr() here would be actively WRONG, not merely redundant: panelSettingsList() is
+// evaluated as an argument to app.registerExtension, which runs BEFORE setup() awaits the
+// catalog, so every tr() in this list resolves against an EMPTY catalog and freezes the
+// English fallback for the session. Text built inside a `type: () => …` render fn is the
+// opposite case — the fn runs when the dialog opens, the catalog is loaded by then, and
+// ComfyUI never looks at that text — so those DO use tr().
+//
+// The interpolated tooltips below (per-provider model/effort/token) therefore need one
+// fully-written literal per id in settings.json; ComfyUI's lookup has no placeholders.
 function panelSettingsList() {
-  const cat = (sub, name) => ["Comfy MCP Agent", sub, name];
+  // The Settings dialog's grouping path: [category, subCategory, leaf]. ComfyUI reads only
+  // the first two (settingStore.getSettingInfo) — the third is a tree key nobody renders,
+  // so it stays in English on purpose rather than costing a translation key for nothing.
+  //
+  // WHY EVERY CALL SITE WRAPS THIS IN `get category()`: panelSettingsList() runs while
+  // app.registerExtension(...) is being CONSTRUCTED — synchronously, before the extension's
+  // own async setup() has awaited loadCatalog(). Anything translated eagerly here freezes in
+  // English for the life of the tab. ComfyUI re-reads `setting.category` when the dialog
+  // renders (SettingGroup.vue / useSettingUI.ts), which is always long after the catalog has
+  // landed, so a getter is both sufficient and the only thing that works.
+  const cat = (sub, name) => [tr("panel.comfy_mcp_agent", "Comfy MCP Agent"), sub, name];
   // A BUTTON-type setting: ComfyUI supports a custom `type` render function that
   // returns an HTMLElement (cg-use-everywhere uses the same trick for its About
   // row). We render a button + a masked set/not-set indicator.
-  const tokenSetting = (id, envKey, friendly, sortOrder, section = "API tokens", noun = "token") => ({
+  //
+  // `backendKey` names a BACKEND_SECTION entry rather than passing its label, because a
+  // label argument would read that getter here — at construction time — and re-freeze the
+  // English string the getters exist to avoid. Null means the shared "API tokens" section.
+  const tokenSetting = (id, envKey, friendly, sortOrder, backendKey = null, noun = "token") => ({
     id,
     name: `${friendly} ${noun}`,
-    category: cat(section, friendly),
+    get category() {
+      return cat(backendKey ? BACKEND_SECTION[backendKey] : tr("panel.api_tokens", "API tokens"), friendly);
+    },
     sortOrder,
+    // `noun` is "token" for the two rows whose credential is called a token, and "API key"
+    // for the two whose credential is called a key — so the key rows already carry "API"
+    // and a hardcoded one in front produced "your OpenRouter API API key". Prefixed only
+    // when it is missing, which keeps "your CivitAI API token" reading right.
     tooltip:
-      `Securely store your ${friendly} API ${noun}. Opens a masked input; the value goes straight to the ` +
+      `Securely store your ${friendly} ${noun.startsWith("API") ? noun : `API ${noun}`}. ` +
+      `Opens a masked input; the value goes straight to the ` +
       `orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, ` +
       `or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready).`,
     type: () => {
@@ -3509,7 +3650,12 @@ function panelSettingsList() {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "p-button p-component";
-      btn.textContent = `Set ${friendly} ${noun}…`;
+      // tr(), unlike the `name:`/`tooltip:` above — text built INSIDE a render fn never
+      // passes through ComfyUI's settings lookup, so settings.json cannot reach it. Safe
+      // to translate here because the fn runs when the dialog opens, long after setup()
+      // awaited the catalog; the sibling `tooltip:` is evaluated at REGISTRATION, which is
+      // why that one must stay a plain literal.
+      btn.textContent = TOKEN_BUTTON_LABEL[id]?.() ?? `Set ${friendly} ${noun}…`;
       btn.style.cssText =
         "padding:0.3rem 0.7rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
         "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
@@ -3519,12 +3665,19 @@ function panelSettingsList() {
         const at = lsGet(SECRET_SET_AT_PREFIX + envKey);
         if (at) {
           const d = new Date(Number(at));
+          // BOTH arms translated: the date-less arm is the same sentence with the one
+          // fact missing, so leaving it English would show a language seam exactly when
+          // the stored timestamp is unreadable.
+          //
+          // And the date is formatted in the PANEL's locale, not the browser's. Translating
+          // the sentence around it is what creates the need: a Korean panel in an en-US
+          // browser would otherwise read "🔒 8/10/2026 설정됨", half in each locale.
           status.textContent = Number.isFinite(d.getTime())
-            ? `🔒 set ${d.toLocaleDateString()}`
-            : "🔒 set";
+            ? tr("panel.locked_set_on", "🔒 set {date}", { date: d.toLocaleDateString(currentLocale()) })
+            : tr("panel.locked_set", "🔒 set");
           status.style.color = "var(--p-green-400,#4ade80)";
         } else {
-          status.textContent = "not set";
+          status.textContent = tr("panel.not_set", "not set");
           status.style.color = "var(--p-text-muted-color,#a1a1aa)";
         }
       };
@@ -3563,7 +3716,7 @@ function panelSettingsList() {
   const modelSetting = (backend, sortOrder) => ({
     id: SETTING_MODEL[backend],
     name: "Default model",
-    category: cat(BACKEND_SECTION[backend], "Default model"),
+    get category() { return cat(BACKEND_SECTION[backend], "Default model"); },
     sortOrder,
     tooltip:
       `Default model for the ${BACKEND_TEXT[backend]} background agent, chosen from the models fetched for ` +
@@ -3601,7 +3754,7 @@ function panelSettingsList() {
   const effortSetting = (backend, sortOrder) => ({
     id: SETTING_EFFORT[backend],
     name: "Default reasoning effort",
-    category: cat(BACKEND_SECTION[backend], "Default reasoning effort"),
+    get category() { return cat(BACKEND_SECTION[backend], "Default reasoning effort"); },
     sortOrder,
     tooltip:
       ((BACKEND_EFFORTS[backend] || ALL_EFFORTS).length
@@ -3609,7 +3762,11 @@ function panelSettingsList() {
           `(${backend === "codex" ? "none–ultra" : "low–max"}). 'Model default' leaves it unset.`
         : `${BACKEND_TEXT[backend]} exposes no reasoning-effort control; leave this at 'Model default'.`),
     type: "combo",
-    options: effortComboOptions(backend),
+    // Lazy for the same reason as everything else here — and this one is load-bearing
+    // twice over: effortMeta()'s labels are ALREADY getter-backed (EFFORT_META), so
+    // calling effortComboOptions() eagerly at construction time would read every one of
+    // those getters before the catalog existed and silently undo them.
+    get options() { return effortComboOptions(backend); },
     defaultValue: "",
     onChange: (v) => {
       if (suppressSettingOnChange || !settingsArmed) return;
@@ -3625,7 +3782,7 @@ function panelSettingsList() {
   const bridgeUrlSetting = (backend, sortOrder) => ({
     id: SETTING_BRIDGE_URL[backend],
     name: "Bridge URL",
-    category: cat(BACKEND_SECTION[backend], "Bridge URL"),
+    get category() { return cat(BACKEND_SECTION[backend], "Bridge URL"); },
     sortOrder,
     tooltip:
       `WebSocket URL of the ${BACKEND_TEXT[backend]} panel orchestrator bridge. Default ` +
@@ -3646,7 +3803,7 @@ function panelSettingsList() {
       // trick as the token buttons); no persisted value.
       id: "comfyui-mcp.starGithub",
       name: "Star on GitHub",
-      category: cat("About", "Star on GitHub"),
+      get category() { return cat(tr("panel.about", "About"), "Star on GitHub"); },
       sortOrder: 200,
       tooltip:
         "Enjoying the ComfyUI Agent Panel? A GitHub star genuinely helps. Opens the repo in a new tab.",
@@ -3655,7 +3812,7 @@ function panelSettingsList() {
         a.href = "https://github.com/artokun/comfyui-mcp-panel";
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = "⭐ Star comfyui-mcp-panel on GitHub";
+        a.textContent = tr("panel.star_comfyui_mcp_panel_on_github", "⭐ Star comfyui-mcp-panel on GitHub");
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3670,7 +3827,7 @@ function panelSettingsList() {
       // #758 — an in-product route to the release notes, not "go read a file on GitHub".
       id: "comfyui-mcp.whatsNew",
       name: "What's new",
-      category: cat("About", "What's new"),
+      get category() { return cat(tr("panel.about", "About"), "What's new"); },
       sortOrder: 199,
       tooltip:
         "Show recent changes in the panel transcript — what shipped in this version and the ones before it. " +
@@ -3679,7 +3836,9 @@ function panelSettingsList() {
       type: () => {
         const b = document.createElement("button");
         b.type = "button";
-        b.textContent = `📋 Show what's new in ${PANEL_VERSION}`;
+        b.textContent = tr("panel.show_whats_new_in_version", "📋 Show what's new in {version}", {
+          version: PANEL_VERSION,
+        });
         b.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3707,7 +3866,7 @@ function panelSettingsList() {
     {
       id: "comfyui-mcp.readDocs",
       name: "Documentation",
-      category: cat("About", "Documentation"),
+      get category() { return cat(tr("panel.about", "About"), "Documentation"); },
       sortOrder: 199.5,
       // Names the DESTINATION, not the mechanism. This row renders into ComfyUI's
       // own Settings dialog, which is OUTSIDE the sidebar root that wireExternalLinks
@@ -3723,7 +3882,7 @@ function panelSettingsList() {
         a.href = DOCS_URL;
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = "📖 Read the docs";
+        a.textContent = tr("panel.read_the_docs", "📖 Read the docs");
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3735,15 +3894,28 @@ function panelSettingsList() {
       // A link row — "💬 Join the Discord" (community). Same render-fn pattern.
       id: "comfyui-mcp.joinDiscord",
       name: "Community",
-      category: cat("About", "Community"),
+      get category() { return cat(tr("panel.about", "About"), "Community"); },
       sortOrder: 199,
-      tooltip: "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab.",
+      // A PLAIN literal, deliberately — every other `name:`/`tooltip:` in this list is
+      // translated by ComfyUI itself out of locales/<lang>/settings.json (it looks up
+      // `settings.comfyui-mcp_joinDiscord.tooltip`), with no JS involved. Wrapping this
+      // one in tr() routed it through OUR catalog instead, so the same row's name and
+      // tooltip came from two different files — and the tr() value would be resolved once
+      // at registration, before the catalog has loaded, which is why the mechanism has to
+      // stay uniform rather than merely consistent-looking.
+      //
+      // KEEP THE STRING ON ITS OWN LINE. scripts/i18n-extract.mjs proposes any literal
+      // preceded by `tooltip:` on the SAME line, so `tooltip: "…"` would be re-proposed
+      // and `i18n-apply --write` would silently re-wrap it in tr() — exactly the mis-route
+      // being removed here. Every other tooltip in this list escapes for the same reason.
+      tooltip:
+        "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab.",
       type: () => {
         const a = document.createElement("a");
         a.href = DISCORD_INVITE_URL;
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = "💬 Join the Discord";
+        a.textContent = tr("panel.join_the_discord", "💬 Join the Discord");
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3758,14 +3930,14 @@ function panelSettingsList() {
       // remote pods). Distinct, warmer-colored button so it reads as "support".
       id: "comfyui-mcp.getHelp",
       name: "Need help?",
-      category: cat("About", "Need help?"),
+      get category() { return cat(tr("panel.about", "About"), "Need help?"); },
       sortOrder: 198,
       tooltip:
         "Stuck? This copies a short diagnostics summary (panel version, backend, ComfyUI, OS) to your clipboard and opens the Discord — paste it into your message so we can help fast.",
       type: () => {
         const btn = document.createElement("button");
         btn.type = "button";
-        btn.textContent = "🆘 Need help? Contact me on Discord";
+        btn.textContent = tr("panel.need_help_contact_me_on_discord", "🆘 Need help? Contact me on Discord");
         btn.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-primary-color,#8b5cf6);background:var(--p-primary-color,#8b5cf6);" +
@@ -3786,8 +3958,8 @@ function panelSettingsList() {
           ].join("\n");
           try {
             await navigator.clipboard.writeText(diag);
-            btn.textContent = "✅ Diagnostics copied — paste them in Discord";
-            setTimeout(() => { btn.textContent = "🆘 Need help? Contact me on Discord"; }, 4000);
+            btn.textContent = tr("panel.diagnostics_copied_paste_them_in_discord", "✅ Diagnostics copied — paste them in Discord");
+            setTimeout(() => { btn.textContent = tr("panel.need_help_contact_me_on_discord", "🆘 Need help? Contact me on Discord"); }, 4000);
           } catch {
             // clipboard blocked (permissions/insecure context) — still open Discord;
             // the user can describe the issue manually.
@@ -3801,7 +3973,7 @@ function panelSettingsList() {
     {
       id: SETTING_BACKEND,
       name: "Default agent backend",
-      category: cat("General", "Default agent backend"),
+      get category() { return cat(tr("panel.general", "General"), "Default agent backend"); },
       sortOrder: 150,
       tooltip:
         "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
@@ -3809,23 +3981,34 @@ function panelSettingsList() {
         "panel's backend (and which group below seeds the runtime); you can still switch live in the model " +
         "picker (a live switch is session-only and does NOT change this default).",
       type: "combo",
-      options: [
-        { value: "claude", text: "Claude" },
-        { value: "codex", text: "ChatGPT" },
-        { value: "gemini", text: "Gemini" },
-        { value: "antigravity", text: "Antigravity (Google subscription)" },
-        { value: "pi", text: "Pi (pi.dev · multi-provider CLI)" },
-        { value: "grok", text: "Grok" },
-        { value: "kimi", text: "Kimi" },
-        { value: "moonshot", text: "Kimi K3" },
-        { value: "glm", text: "GLM (z.ai)" },
-        { value: "minimax", text: "MiniMax" },
-        { value: "ollama", text: "Ollama (local)" },
-        { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
-        { value: "lmstudio", text: "LM Studio (local)" },
-        { value: "llamacpp", text: "llama.cpp (local)" },
-        { value: "custom", text: "Custom endpoint (OpenAI-compatible)" },
-      ],
+      // A GETTER for the same reason `category` is one: ComfyUI reads `setting.options`
+      // when the dialog renders (SettingItem.vue's `formItem` computed), so deferring the
+      // lookup is what lets these arrive translated. `value` is the WIRE value and is never
+      // touched — only `text` is displayed, so translating it cannot change what is stored.
+      get options() {
+        return [
+          { value: "claude", text: tr("panel.claude", "Claude") },
+          { value: "codex", text: tr("panel.chatgpt", "ChatGPT") },
+          { value: "gemini", text: tr("panel.gemini", "Gemini") },
+          { value: "antigravity", text: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)") },
+          // Comma, not the middot this row used to carry: the panel already ships this exact
+          // label — translated in every locale — for the same product elsewhere. Matching it
+          // reuses that translation instead of minting a near-duplicate key whose only
+          // difference is punctuation, which is a string translators would have to be told
+          // apart by eye.
+          { value: "pi", text: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)") },
+          { value: "grok", text: tr("panel.grok", "Grok") },
+          { value: "kimi", text: tr("panel.kimi", "Kimi") },
+          { value: "moonshot", text: tr("panel.kimi_k3", "Kimi K3") },
+          { value: "glm", text: tr("panel.glm_z_ai", "GLM (z.ai)") },
+          { value: "minimax", text: tr("panel.minimax", "MiniMax") },
+          { value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") },
+          { value: "openrouter", text: tr("panel.openrouter_1m_sota", "OpenRouter (1M · SOTA)") },
+          { value: "lmstudio", text: tr("panel.lm_studio_local", "LM Studio (local)") },
+          { value: "llamacpp", text: tr("panel.llama_cpp_local", "llama.cpp (local)") },
+          { value: "custom", text: tr("panel.custom_endpoint_openai_compatible", "Custom endpoint (OpenAI-compatible)") },
+        ];
+      },
       defaultValue: "claude",
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -3835,18 +4018,20 @@ function panelSettingsList() {
     {
       id: SETTING_CHAT_SCOPE,
       name: "Chat conversation scope",
-      category: cat("General", "Chat conversation scope"),
+      get category() { return cat(tr("panel.general", "General"), "Chat conversation scope"); },
       sortOrder: 146,
       tooltip:
         "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, " +
         "identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the " +
         "current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts.",
       type: "combo",
-      options: [
-        { value: "panel", text: "Panel — one chat across workflows" },
-        { value: "workflow", text: "Workflow — separate chat histories" },
-        { value: "ask", text: "Ask whenever the workflow changes" },
-      ],
+      get options() {
+        return [
+          { value: "panel", text: tr("panel.one_chat_across_workflows", "Panel — one chat across workflows") },
+          { value: "workflow", text: tr("panel.workflow_separate_chat_histories", "Workflow — separate chat histories") },
+          { value: "ask", text: tr("panel.ask_whenever_the_workflow_changes", "Ask whenever the workflow changes") },
+        ];
+      },
       defaultValue: getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel",
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -3856,7 +4041,7 @@ function panelSettingsList() {
     {
       id: SETTING_AUTOCONNECT,
       name: "Auto-connect on load",
-      category: cat("General", "Auto-connect on load"),
+      get category() { return cat(tr("panel.general", "General"), "Auto-connect on load"); },
       sortOrder: 145,
       tooltip:
         "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
@@ -3869,9 +4054,40 @@ function panelSettingsList() {
       },
     },
     {
+      id: SETTING_LANGUAGE,
+      name: "Panel language",
+      get category() { return cat(tr("panel.general", "General"), "Panel language"); },
+      sortOrder: 146,
+      tooltip:
+        "Language for the panel's own text. Detect follows ComfyUI's language setting, so changing ComfyUI's " +
+        "language changes the panel too. Anything not yet translated falls back to English. " +
+        "Takes effect when the panel is reopened or reloaded.",
+      type: "combo",
+      // Same codes and the same self-named labels ComfyUI uses, so the two dropdowns can
+      // never disagree about what "ko" means or read as two different products. Only the
+      // Detect row is translated: LOCALES[].text is each language written in ITSELF, which
+      // is the whole point — a user who cannot read the current UI language still finds
+      // their own — so translating those would defeat the list.
+      get options() {
+        return [
+          { value: "", text: tr("panel.detect_follow_comfyui", "Detect (follow ComfyUI)") },
+          ...LOCALES.map((l) => ({ value: l.code, text: l.text })),
+        ];
+      },
+      defaultValue: "",
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        // Re-fetch under the new language now so the next render is already translated.
+        // Deliberately NOT a live re-render: the panel builds plain DOM, so retranslating
+        // in place would mean rebuilding a tree that may hold an in-flight run, an open
+        // modal, or half-typed composer text. The tooltip says so rather than pretending.
+        void applyPanelLocale(v);
+      },
+    },
+    {
       id: SETTING_MOBILE_BETA,
       name: "Control via Mobile app (beta)",
-      category: cat("Mobile app (beta)", "Control via Mobile app (beta)"),
+      get category() { return cat(tr("panel.mobile_app_beta", "Mobile app (beta)"), "Control via Mobile app (beta)"); },
       sortOrder: 144,
       tooltip:
         "Show the Remote-control pairing button (QR) in the panel header and the beta app download links below. " +
@@ -3887,7 +4103,7 @@ function panelSettingsList() {
     {
       id: SETTING_FLAG_APPS,
       name: "Show Apps",
-      category: cat("Features", "Show Apps"),
+      get category() { return cat(tr("panel.features", "Features"), "Show Apps"); },
       sortOrder: 147,
       tooltip:
         "Show the Apps button in the toolbar — the micro-app layer (convert a workflow into a one-click app, " +
@@ -3902,7 +4118,7 @@ function panelSettingsList() {
     {
       id: SETTING_FLAG_TRAINING,
       name: "Show Training",
-      category: cat("Features", "Show Training"),
+      get category() { return cat(tr("panel.features", "Features"), "Show Training"); },
       sortOrder: 148,
       tooltip:
         "Show the Training button in the toolbar — the LoRA training wizard (dataset gather/label/launch/monitor). " +
@@ -3917,7 +4133,7 @@ function panelSettingsList() {
     {
       id: SETTING_FLAG_RUNPOD,
       name: "Show RunPod / Local",
-      category: cat("Features", "Show RunPod / Local"),
+      get category() { return cat(tr("panel.features", "Features"), "Show RunPod / Local"); },
       sortOrder: 149,
       tooltip:
         "Show the RunPod / Local host button in the toolbar — deploy/start/stop/connect a cloud GPU pod, or switch " +
@@ -3935,7 +4151,7 @@ function panelSettingsList() {
       // channel's invite URL constant is still empty.
       id: "comfyui-mcp.mobileAppLinks",
       name: "Get the beta app",
-      category: cat("Mobile app (beta)", "Get the beta app"),
+      get category() { return cat(tr("panel.mobile_app_beta", "Mobile app (beta)"), "Get the beta app"); },
       sortOrder: 143,
       tooltip:
         "Tester downloads for the ComfyUI MCP mobile app. iOS installs via Apple TestFlight; Android via Firebase " +
@@ -3944,9 +4160,11 @@ function panelSettingsList() {
         const wrap = document.createElement("div");
         wrap.style.cssText = "display:flex;flex-direction:column;gap:0.4rem;max-width:26rem;";
         const note = document.createElement("div");
-        note.textContent =
+        note.textContent = tr(
+          "panel.beta_the_app_changes_rapidly_and_builds",
           "⚠️ Beta — the app changes rapidly and builds may break between updates. " +
-          "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.";
+            "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
+        );
         note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);opacity:0.75;line-height:1.35;";
         const row = document.createElement("div");
         row.style.cssText = "display:flex;gap:0.5rem;flex-wrap:wrap;";
@@ -3962,7 +4180,10 @@ function panelSettingsList() {
             a.target = "_blank";
             a.rel = "noopener noreferrer";
           } else {
-            a.textContent += " — coming soon";
+            // Appended, not interpolated, so the label above stays one translatable unit
+            // per platform; a language that needs the marker elsewhere in the phrase can
+            // fold it into its own label text.
+            a.textContent += tr("panel.coming_soon", " — coming soon");
             a.style.opacity = "0.45";
             a.style.pointerEvents = "none";
             a.setAttribute("aria-disabled", "true");
@@ -3970,8 +4191,8 @@ function panelSettingsList() {
           return a;
         };
         row.append(
-          linkBtn("🍎 iOS — TestFlight", MOBILE_IOS_TESTFLIGHT_URL),
-          linkBtn("🤖 Android — Firebase beta", MOBILE_ANDROID_FIREBASE_URL),
+          linkBtn(tr("panel.ios_testflight", "🍎 iOS — TestFlight"), MOBILE_IOS_TESTFLIGHT_URL),
+          linkBtn(tr("panel.android_firebase_beta", "🤖 Android — Firebase beta"), MOBILE_ANDROID_FIREBASE_URL),
         );
         wrap.append(note, row);
         return wrap;
@@ -3980,7 +4201,7 @@ function panelSettingsList() {
     {
       id: SETTING_UI_SCALE,
       name: "Panel UI scale (%)",
-      category: cat("General", "Panel UI scale (%)"),
+      get category() { return cat(tr("panel.general", "General"), "Panel UI scale (%)"); },
       sortOrder: 143,
       tooltip:
         "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
@@ -4004,7 +4225,7 @@ function panelSettingsList() {
     {
       id: SETTING_STALL_S,
       name: "Render stall warning (seconds)",
-      category: cat("General", "Render stall warning (seconds)"),
+      get category() { return cat(tr("panel.general", "General"), "Render stall warning (seconds)"); },
       sortOrder: 142,
       tooltip:
         "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged " +
@@ -4024,7 +4245,7 @@ function panelSettingsList() {
     {
       id: SETTING_REMOTE_URL,
       name: "Remote ComfyUI URL (advanced)",
-      category: cat("General", "Remote ComfyUI URL (advanced)"),
+      get category() { return cat(tr("panel.general", "General"), "Remote ComfyUI URL (advanced)"); },
       sortOrder: 143,
       tooltip:
         "Point the AGENT at a remote ComfyUI instead of this machine — e.g. a RunPod pod at " +
@@ -4046,7 +4267,7 @@ function panelSettingsList() {
       // now the only mode). Advanced: only needed for a non-default port.
       id: SETTING_BRIDGE,
       name: "Bridge URL (advanced)",
-      category: cat("General", "Bridge URL (advanced)"),
+      get category() { return cat(tr("panel.general", "General"), "Bridge URL (advanced)"); },
       sortOrder: 141,
       tooltip:
         "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider " +
@@ -4062,7 +4283,7 @@ function panelSettingsList() {
     {
       id: SETTING_FOCUS_FOLLOW,
       name: "Zoom to agent edits",
-      category: cat("General", "Zoom to agent edits"),
+      get category() { return cat(tr("panel.general", "General"), "Zoom to agent edits"); },
       sortOrder: 140,
       tooltip:
         "When the agent changes a node's value, smoothly zoom the canvas to that node (with padding) so you watch " +
@@ -4113,7 +4334,7 @@ function panelSettingsList() {
     {
       id: SETTING_PREFERRED_MODELS,
       name: "Preferred models",
-      category: cat(BACKEND_SECTION.ollama, "Preferred models"),
+      get category() { return cat(BACKEND_SECTION.ollama, "Preferred models"); },
       sortOrder: 68,
       tooltip:
         "Your own favorite models, comma-separated — Ollama tags (artokun/gemma4-comfyui-mcp:e4b — our ComfyUI fine-tune, gemma4:12b, qwen3:4b) and/or OpenRouter ids " +
@@ -4129,7 +4350,7 @@ function panelSettingsList() {
     {
       id: SETTING_OLLAMA_API,
       name: "Endpoint type",
-      category: cat(BACKEND_SECTION.ollama, "Endpoint type"),
+      get category() { return cat(BACKEND_SECTION.ollama, "Endpoint type"); },
       sortOrder: 66,
       tooltip:
         "How the Ollama backend talks to its endpoint. 'Ollama (local)' uses the native /api/chat on your local " +
@@ -4137,10 +4358,12 @@ function panelSettingsList() {
         "etc. (set the base URL below; the API key comes from the orchestrator's env, e.g. OPENROUTER_API_KEY). " +
         "Applies to NEW sessions — Disconnect then Connect after changing.",
       type: "combo",
-      options: [
-        { value: "ollama", text: "Ollama (local)" },
-        { value: "openai", text: "OpenAI-compatible (OpenRouter, vLLM, …)" },
-      ],
+      get options() {
+        return [
+          { value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") },
+          { value: "openai", text: tr("panel.openai_compatible_openrouter_vllm", "OpenAI-compatible (OpenRouter, vLLM, …)") },
+        ];
+      },
       defaultValue: "ollama",
       onChange: () => {
         if (suppressSettingOnChange || !settingsArmed) return;
@@ -4150,7 +4373,7 @@ function panelSettingsList() {
     {
       id: SETTING_OLLAMA_BASE_URL,
       name: "Endpoint base URL",
-      category: cat(BACKEND_SECTION.ollama, "Endpoint base URL"),
+      get category() { return cat(BACKEND_SECTION.ollama, "Endpoint base URL"); },
       sortOrder: 64,
       tooltip:
         "Base URL for the endpoint above. Leave BLANK for local Ollama (http://127.0.0.1:11434). For " +
@@ -4167,12 +4390,12 @@ function panelSettingsList() {
     modelSetting("openrouter", 62),
     modelSetting("lmstudio", 63),
     modelSetting("llamacpp", 64),
-    tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, BACKEND_SECTION.openrouter, "API key"),
+    tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, "openrouter", "API key"),
     // ---- Custom endpoint (issue #162: any OpenAI-compatible server) ----
     {
       id: SETTING_CUSTOM_BASE_URL,
       name: "Endpoint base URL",
-      category: cat(BACKEND_SECTION.custom, "Endpoint base URL"),
+      get category() { return cat(BACKEND_SECTION.custom, "Endpoint base URL"); },
       sortOrder: 60,
       tooltip:
         "Any OpenAI-compatible endpoint — vLLM, DeepSeek, Together, Azure OpenAI, a llama-server on another " +
@@ -4186,7 +4409,7 @@ function panelSettingsList() {
       },
     },
     modelSetting("custom", 59),
-    tokenSetting(SETTING_TOKEN_CUSTOM, "COMFYUI_MCP_CUSTOM_API_KEY", "Custom endpoint", 58, BACKEND_SECTION.custom, "API key"),
+    tokenSetting(SETTING_TOKEN_CUSTOM, "COMFYUI_MCP_CUSTOM_API_KEY", "Custom endpoint", 58, "custom", "API key"),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -4208,15 +4431,19 @@ const FALLBACK_MODELS = [
   { value: "opus", displayName: "Opus", description: "most capable", supportsEffort: true },
 ];
 // Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
+// GETTERS, not values: this object is built at MODULE scope, which runs before
+// loadCatalog() resolves, so a plain tr() call here would freeze English into the
+// object for the life of the page. `small` is the sub-label under each row in the
+// Effort picker and is just as visible as `label`.
 const EFFORT_META = {
-  none: { label: "None", small: "no reasoning" },
-  minimal: { label: "Minimal", small: "fastest" },
-  low: { label: "Low", small: "quick" },
-  medium: { label: "Medium", small: "default" },
-  high: { label: "High", small: "thorough" },
-  xhigh: { label: "Extra high", small: "deep" },
-  max: { label: "Max", small: "exhaustive" },
-  ultra: { label: "Ultra", small: "4 parallel agents" },
+  none: { get label() { return tr("panel.none", "None"); }, get small() { return tr("panel.no_reasoning", "no reasoning"); } },
+  minimal: { get label() { return tr("panel.minimal", "Minimal"); }, get small() { return tr("panel.fastest", "fastest"); } },
+  low: { get label() { return tr("panel.low", "Low"); }, get small() { return tr("panel.quick", "quick"); } },
+  medium: { get label() { return tr("panel.medium", "Medium"); }, get small() { return tr("panel.default", "default"); } },
+  high: { get label() { return tr("panel.high", "High"); }, get small() { return tr("panel.thorough", "thorough"); } },
+  xhigh: { get label() { return tr("panel.extra_high", "Extra high"); }, get small() { return tr("panel.deep", "deep"); } },
+  max: { get label() { return tr("panel.max", "Max"); }, get small() { return tr("panel.exhaustive", "exhaustive"); } },
+  ultra: { get label() { return tr("panel.ultra", "Ultra"); }, get small() { return tr("panel.4_parallel_agents", "4 parallel agents"); } },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
@@ -6902,9 +7129,9 @@ function connectCommand() {
 function makeShellCommandBlock(baseCmd) {
   const forms = { powershell: `cmd /c "${baseCmd}"`, cmd: baseCmd, unix: baseCmd };
   const shells = [
-    { key: "powershell", label: "PowerShell" },
-    { key: "cmd", label: "Command Prompt" },
-    { key: "unix", label: "macOS / Linux" },
+    { key: "powershell", label: tr("panel.powershell", "PowerShell") },
+    { key: "cmd", label: tr("panel.command_prompt", "Command Prompt") },
+    { key: "unix", label: tr("panel.macos_linux", "macOS / Linux") },
   ];
   const isWin = /win/i.test(navigator.platform || navigator.userAgent || "");
   let selected = isWin ? "powershell" : "unix";
@@ -6915,12 +7142,12 @@ function makeShellCommandBlock(baseCmd) {
   pills.style.cssText = "display:flex;gap:0.25rem;flex-wrap:wrap;";
   const code = document.createElement("code");
   code.className = "cmcp-cmd";
-  code.title = "Click to copy";
+  code.title = tr("panel.click_to_copy", "Click to copy");
 
   let flashTimer = null;
   const copy = (text) =>
     navigator.clipboard?.writeText(text).then(() => {
-      code.textContent = "Copied ✓";
+      code.textContent = tr("panel.copied", "Copied ✓");
       if (flashTimer) clearTimeout(flashTimer);
       flashTimer = setTimeout(() => { code.textContent = forms[selected]; }, 900);
     }, () => {});
@@ -8500,7 +8727,7 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(others.length ? { other_selected_items: others } : {}),
       ...(picked.length
         ? {}
-        : { hint: "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it." }),
+        : { get hint() { return tr("panel.nothing_is_selected_on_the_canvas_ask", "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it."); } }),
     };
   },
 
@@ -12191,7 +12418,7 @@ const GRAPH_TOOL_EXECUTORS = {
         reasons: reasons.get(String(n.id)) ?? [],
         ...(reasons.get(String(n.id))?.length
           ? {}
-          : { note: "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values." }),
+          : { note: tr("panel.flagged_by_litegraph_but_no_source_explained", "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values.") }),
       }));
 
     // "clean" must reflect EVERY surface, not just per-node/exec errors — a workflow
@@ -12239,7 +12466,7 @@ const GRAPH_TOOL_EXECUTORS = {
               ...summarizeNode(n),
               red_outline: true,
               reasons: [],
-              note: "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error.",
+              note: tr("panel.litegraph_still_shows_this_red_outline_but", "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error."),
             })),
             ...(staleRedFlags.length > MAX_STATE_NODES
               ? {
@@ -12286,7 +12513,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
       last_execution_error: boundExecFailurePayload(lastExecFailure),
       node_errors: nodeErrors,
-      ...(clean ? { note: "no errors recorded since the last execution start" } : {}),
+      ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
     };
   },
 
@@ -14315,7 +14542,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph, LG } = getGraphCtx();
     const GroupCls = LG.LGraphGroup;
     if (typeof GroupCls !== "function") throw new Error("LGraphGroup unavailable on this frontend");
-    const group = new GroupCls(typeof title === "string" && title ? title : "Group");
+    const group = new GroupCls(typeof title === "string" && title ? title : tr("panel.group", "Group"));
     // Resync every node's cached boundingRect to its live pos/size BEFORE we build
     // the box and compute membership. The box is derived from pos/size but
     // membership is tested boundingRect-first (nodeFocusBounds), so any stale
@@ -15208,7 +15435,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // only exists inside the skipped parent and navigated nowhere useful (#412).
   async graph_exit_subgraph() {
     const { app: comfyApp, graph, canvas, rootGraph } = getGraphCtx();
-    if (graph === rootGraph) return { viewing: { scope: "root" }, note: "already at root" };
+    if (graph === rootGraph) return { viewing: { scope: "root" }, note: tr("panel.already_at_root", "already at root") };
     if (typeof canvas.setGraph !== "function") {
       throw new Error("subgraph navigation unavailable on this frontend");
     }
@@ -16008,7 +16235,7 @@ const GRAPH_TOOL_EXECUTORS = {
           endpoint: route,
           method,
           ...rebootTargetFields(),
-          note: "connection dropped (server going down) — reboot initiated",
+          note: tr("panel.connection_dropped_server_going_down_reboot_initiated", "connection dropped (server going down) — reboot initiated"),
         };
       }
     }
@@ -19056,37 +19283,120 @@ function ensureStyles() {
   styleInjected = true;
 }
 
-/** Human-readable one-liner for an executed agent command. */
+/** Human-readable one-liner for an executed agent command.
+ *
+ * TRANSLATED — and this is the panel's REFERENCE IMPLEMENTATION for counted text, so the
+ * conventions other units copy are stated here once:
+ *
+ *  1. NO `n === 1 ? "" : "s"`. English is the odd one out: of the twelve languages ComfyUI
+ *     ships, Korean/Japanese/Chinese have ONE plural form, Russian four, Arabic six. A
+ *     counted string therefore passes `{ count }` plus an OBJECT fallback
+ *     (`{ one: "…{count} node", other: "…{count} nodes" }`) and lets `tr` ask
+ *     `Intl.PluralRules` which form the ACTIVE language wants. The English pair stays at
+ *     the call site, so the code still reads as prose and an untranslated locale still
+ *     renders correct English.
+ *
+ *  2. `count` is a RESERVED placeholder name — a NUMERIC `count` is precisely what switches
+ *     `tr` into plural lookup. A number that is only interpolated (a node id, a batch
+ *     multiplier) must be named something else, or it silently starts selecting forms.
+ *
+ *  3. One key carries ONE count. "Auto-arranged N nodes (M columns)" has two independent
+ *     plural axes, so it is two keys concatenated; no single key can hold both.
+ *
+ * Optional trailing clauses stay their own keys and are appended with `+`, mirroring how the
+ * English template literals composed them — a translator gets a whole clause, never a
+ * stray "s". `detail:` values that carry raw tool/callback error text are deliberately NOT
+ * translated: that text is the machine's words, not ours.
+ */
 function describeCommand(cmd, msg, reply) {
-  if (!reply.ok) return { icon: "pi-exclamation-triangle", text: `${cmd} failed`, detail: reply.error };
+  // `reply.error` is raw tool-error text — passed through untouched, never translated.
+  if (!reply.ok)
+    return { icon: "pi-exclamation-triangle", text: tr("panel.command_failed", "{cmd} failed", { cmd }), detail: reply.error };
   const r = reply.result ?? {};
   switch (cmd) {
     case "graph_get_state":
-      return { icon: "pi-eye", text: `Read graph — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
+      return {
+        icon: "pi-eye",
+        text: tr(
+          "panel.read_graph_nodes",
+          { one: "Read graph — {count} node", other: "Read graph — {count} nodes" },
+          { count: r.node_count },
+        ),
+      };
     case "graph_serialize":
-      return { icon: "pi-copy", text: `Captured canvas — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
+      return {
+        icon: "pi-copy",
+        text: tr(
+          "panel.captured_canvas_nodes",
+          { one: "Captured canvas — {count} node", other: "Captured canvas — {count} nodes" },
+          { count: r.node_count },
+        ),
+      };
     case "graph_add_node":
-      return { icon: "pi-plus-circle", text: `Added ${r.added?.type ?? "node"} (id ${r.added?.id})` };
+      return {
+        icon: "pi-plus-circle",
+        // `{type}` normally holds a node CLASS name (an untranslatable identifier like
+        // "KSampler"); `panel.a_node` is only the generic noun for the defensive case where
+        // the reply named no type at all — shared with graph_remove_node so the two lines
+        // cannot disagree about what to call an unnamed node.
+        text: tr("panel.added_node", "Added {type} (id {id})", {
+          type: r.added?.type ?? tr("panel.a_node", "node"),
+          id: r.added?.id,
+        }),
+      };
     case "graph_remove_node": {
       const cb = r.cleaned_boundary_slots;
       const cleaned = [...(cb?.inputs ?? []), ...(cb?.outputs ?? [])].filter(Boolean);
-      const suffix = cleaned.length ? ` — cleaned orphaned boundary ${cleaned.length === 1 ? "slot" : "slots"} ${cleaned.join(", ")}` : "";
-      return { icon: "pi-minus-circle", text: `Removed ${r.removed?.type ?? "node"} (id ${r.removed?.id})${suffix}` };
+      // The count drives the FORM ("slot"/"slots") without being rendered — the slot names
+      // are what the user reads. That is exactly why the category has to come from Intl:
+      // there is no "s" here to bolt on, and a language may inflect the noun differently.
+      const suffix = cleaned.length
+        ? tr(
+            "panel.removed_node_cleaned_slots",
+            {
+              one: " — cleaned orphaned boundary slot {slots}",
+              other: " — cleaned orphaned boundary slots {slots}",
+            },
+            { count: cleaned.length, slots: cleaned.join(", ") },
+          )
+        : "";
+      return {
+        icon: "pi-minus-circle",
+        text:
+          tr("panel.removed_node", "Removed {type} (id {id})", {
+            type: r.removed?.type ?? tr("panel.a_node", "node"),
+            id: r.removed?.id,
+          }) + suffix,
+      };
     }
     case "graph_clear":
       return {
         icon: "pi-eraser",
-        text: `Cleared canvas — removed ${r.cleared} node${r.cleared === 1 ? "" : "s"} (one Ctrl+Z restores all)`,
+        text: tr(
+          "panel.cleared_canvas_nodes",
+          {
+            one: "Cleared canvas — removed {count} node (one Ctrl+Z restores all)",
+            other: "Cleared canvas — removed {count} nodes (one Ctrl+Z restores all)",
+          },
+          { count: r.cleared },
+        ),
       };
     case "graph_connect":
       return {
         icon: "pi-link",
         text:
-          `Connected ${r.connected?.from?.node_id}.${r.connected?.from?.output} → ${r.connected?.to?.node_id}.${r.connected?.to?.input}` +
-          (r.connected?.auto_matched ? " (auto-matched)" : ""),
+          tr("panel.connected_slots", "Connected {from} → {to}", {
+            from: `${r.connected?.from?.node_id}.${r.connected?.from?.output}`,
+            to: `${r.connected?.to?.node_id}.${r.connected?.to?.input}`,
+          }) + (r.connected?.auto_matched ? tr("panel.connected_auto_matched", " (auto-matched)") : ""),
       };
     case "graph_disconnect":
-      return { icon: "pi-times-circle", text: `Disconnected ${r.disconnected?.node_id}.${r.disconnected?.input}` };
+      return {
+        icon: "pi-times-circle",
+        text: tr("panel.disconnected_slot", "Disconnected {slot}", {
+          slot: `${r.disconnected?.node_id}.${r.disconnected?.input}`,
+        }),
+      };
     case "graph_set_widget": {
       // #314: an LTXDirector timeline_data write was routed through the node's own
       // re-hydration, which also regenerated the derived prompt/length widgets.
@@ -19095,9 +19405,17 @@ function describeCommand(cmd, msg, reply) {
         return {
           icon: "pi-sliders-h",
           text:
-            `Drove LTXDirector timeline on node ${r.ltx_timeline.node_id}` +
-            (seg != null ? ` (${seg} segment${seg === 1 ? "" : "s"})` : "") +
-            ` — UI re-synced, derived prompt/length widgets regenerated`,
+            tr("panel.drove_ltx_timeline", "Drove LTXDirector timeline on node {node_id}", {
+              node_id: r.ltx_timeline.node_id,
+            }) +
+            (seg != null
+              ? tr(
+                  "panel.ltx_timeline_segments",
+                  { one: " ({count} segment)", other: " ({count} segments)" },
+                  { count: seg },
+                )
+              : "") +
+            tr("panel.ltx_timeline_resynced", " — UI re-synced, derived prompt/length widgets regenerated"),
         };
       }
       // #366: a promoted-subgraph write is only truly applied when the parent RAIL
@@ -19122,111 +19440,249 @@ function describeCommand(cmd, msg, reply) {
       // the callback programmatically and that alone can be why it threw.
       const writeDisclosed = typeof r.set?.write_warning === "string";
       const threwInNodeCallback = r.set?.write_warning_source === "widget_callback";
+      // One base clause for every variant, so a translated warning line can never drift
+      // from the plain one — the disclosure is appended, exactly as the English did.
+      const setLine = tr("panel.set_widget", "Set {widget} = {value} on node {node_id}", {
+        widget: r.set?.widget,
+        value: JSON.stringify(r.set?.value),
+        node_id: r.set?.node_id,
+      });
+      const wasPrevious = tr("panel.was_previous_value", "was {value}", {
+        value: JSON.stringify(r.set?.previous),
+      });
       return railStale
         ? {
             icon: "pi-exclamation-triangle",
-            text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id} — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)`,
-            detail: `was ${JSON.stringify(r.set?.previous)}`,
+            text:
+              setLine +
+              tr(
+                "panel.set_widget_rail_not_synced",
+                " — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)",
+              ),
+            detail: wasPrevious,
           }
         : {
             icon: writeDisclosed ? "pi-exclamation-triangle" : "pi-sliders-h",
             text:
-              `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
+              setLine +
               (writeDisclosed
                 ? threwInNodeCallback
-                  ? ` — value verified in effect; the exception came from invoking the widget's own callback, so its side effects may not have run`
-                  : ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
+                  ? tr(
+                      "panel.set_widget_threw_in_widget_callback",
+                      " — value verified in effect; the exception came from invoking the widget's own callback, so its side effects may not have run",
+                    )
+                  : tr(
+                      "panel.set_widget_threw_while_applying",
+                      " — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed",
+                    )
                 : ""),
-            detail: `was ${JSON.stringify(r.set?.previous)}`,
+            detail: wasPrevious,
           };
     }
     case "graph_get_subgraph":
       return {
         icon: "pi-sitemap",
-        text: `Read subgraph “${r.subgraph_of?.title}” — ${r.node_count} node${r.node_count === 1 ? "" : "s"}`,
+        text: tr(
+          "panel.read_subgraph_nodes",
+          { one: "Read subgraph “{title}” — {count} node", other: "Read subgraph “{title}” — {count} nodes" },
+          { count: r.node_count, title: r.subgraph_of?.title },
+        ),
       };
     case "graph_promote_widget":
       return r.demoted
-        ? { icon: "pi-arrow-down", text: `Un-promoted “${r.demoted}” from the subgraph node` }
-        : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
+        ? {
+            icon: "pi-arrow-down",
+            text: tr("panel.unpromoted_widget", "Un-promoted “{name}” from the subgraph node", { name: r.demoted }),
+          }
+        : {
+            icon: "pi-arrow-up",
+            text: tr("panel.promoted_widget", "Promoted “{name}” to the subgraph node", { name: r.promoted }),
+          };
     case "graph_edit_node": {
       const edited = r.edited ?? [];
-      const suffix = edited.length === 1 ? `node ${edited[0]?.after?.node_id}` : `${edited.length} nodes`;
-      return { icon: "pi-pencil", text: `Edited ${suffix} presentation` };
+      // TWO DIFFERENT CLAIMS, not two grammatical numbers — so this branches on the DATA
+      // (`length === 1`) and picks between two keys, rather than hiding the choice in a
+      // one/other pair. A plural category is NOT a count: `Intl.PluralRules("ru").select(21)`
+      // is "one", and Arabic routes n=2 to "two", so a `one:` form that names `edited[0]`
+      // would report a 21-node batch as a single edit of the first node. The banned pattern
+      // is English GRAMMAR hard-coded in JS; choosing which fact to state is not that, and
+      // the batch line below is still a real plural.
+      return {
+        icon: "pi-pencil",
+        text:
+          edited.length === 1
+            ? tr("panel.edited_one_node_presentation", "Edited node {node_id} presentation", {
+                node_id: edited[0]?.after?.node_id,
+              })
+            : tr(
+                "panel.edited_nodes_presentation",
+                { one: "Edited {count} node presentation", other: "Edited {count} nodes presentation" },
+                { count: edited.length },
+              ),
+      };
     }
     case "graph_move_node":
-      return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
-    case "graph_resize_node":
-      return { icon: "pi-expand", text: `Resized node ${r.resized?.node_id} to [${r.resized?.to?.map(Math.round)}]` };
-    case "graph_set_title":
-      return { icon: "pi-pencil", text: `Renamed node ${r.node_id}` };
-    case "graph_set_node_collapsed":
-      return { icon: r.collapsed ? "pi-minus-circle" : "pi-plus-circle", text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}` };
-    case "graph_remove_widget":
-      // Name the REMAINING rows, not a count: the rows are deliberately not renumbered
-      // (artokun/comfyui-mcp#938), so "3 rows left" would leave the user — and the agent
-      // reading its own transcript — assuming lora_2 became lora_1.
       return {
-        icon: "pi-minus-circle",
-        text: `Removed widget ${r.removed?.widget} from node ${r.removed?.node_id} (one Ctrl+Z restores it)`,
-        detail: `was ${JSON.stringify(r.removed?.previous_value)} — remaining: ${(r.remaining_widgets ?? []).join(", ") || "none"}`,
+        icon: "pi-arrows-alt",
+        text: tr("panel.moved_node_to", "Moved node {node_id} to [{pos}]", {
+          node_id: r.moved?.node_id,
+          pos: r.moved?.to?.map(Math.round),
+        }),
+      };
+    case "graph_resize_node":
+      return {
+        icon: "pi-expand",
+        text: tr("panel.resized_node_to", "Resized node {node_id} to [{size}]", {
+          node_id: r.resized?.node_id,
+          size: r.resized?.to?.map(Math.round),
+        }),
+      };
+    case "graph_set_title":
+      return { icon: "pi-pencil", text: tr("panel.renamed_node", "Renamed node {node_id}", { node_id: r.node_id }) };
+    case "graph_set_node_collapsed":
+      // Two WHOLE sentences, not a verb spliced into a shared frame: "Collapsed"/"Expanded"
+      // is the head of the clause, and plenty of languages put the verb somewhere English
+      // does not — a `${verb} node ${id}` template hands the translator a fixed word order
+      // they cannot fix.
+      return {
+        icon: r.collapsed ? "pi-minus-circle" : "pi-plus-circle",
+        text: r.collapsed
+          ? tr("panel.collapsed_node", "Collapsed node {node_id}", { node_id: r.node_id })
+          : tr("panel.expanded_node", "Expanded node {node_id}", { node_id: r.node_id }),
       };
     case "graph_set_node_color":
-      return { icon: "pi-palette", text: `Set node ${r.node_id} colors` };
-    case "graph_set_node_property":
+      return { icon: "pi-palette", text: tr("panel.set_node_colors", "Set node {node_id} colors", { node_id: r.node_id }) };
+    case "graph_set_node_property": {
+      const setLine = tr("panel.set_node_property", "Set property {name} = {value} on node {node_id}", {
+        name: r.set?.name,
+        value: JSON.stringify(r.set?.to),
+        node_id: r.set?.node_id,
+      });
+      const wasPrevious = tr("panel.was_previous_value", "was {value}", { value: JSON.stringify(r.set?.from) });
       return r.live_effect_error
         ? {
             icon: "pi-exclamation-triangle",
-            text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id} — WARNING: the node's onPropertyChanged callback failed, so the live effect may not have applied`,
-            detail: `was ${JSON.stringify(r.set?.from)} — ${r.live_effect_error}`,
+            text:
+              setLine +
+              tr(
+                "panel.set_node_property_live_effect_failed",
+                " — WARNING: the node's onPropertyChanged callback failed, so the live effect may not have applied",
+              ),
+            // The callback's own exception text is the machine's words: appended raw so the
+            // user can search for it verbatim, never run through the catalog.
+            detail: `${wasPrevious} — ${r.live_effect_error}`,
           }
-        : {
-            icon: "pi-sliders-h",
-            text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id}`,
-            detail: `was ${JSON.stringify(r.set?.from)}`,
-          };
+        : { icon: "pi-sliders-h", text: setLine, detail: wasPrevious };
+    }
     case "graph_auto_layout":
+      // TWO independent counts in one English sentence, so TWO keys: `tr` resolves exactly
+      // one plural category per call, and nodes and columns pluralise separately.
       return {
         icon: "pi-th-large",
-        text: `Auto-arranged ${r.node_count} node${r.node_count === 1 ? "" : "s"} (${r.columns} column${r.columns === 1 ? "" : "s"})`,
+        text:
+          tr(
+            "panel.auto_arranged_nodes",
+            { one: "Auto-arranged {count} node", other: "Auto-arranged {count} nodes" },
+            { count: r.node_count },
+          ) +
+          tr(
+            "panel.auto_arranged_columns",
+            { one: " ({count} column)", other: " ({count} columns)" },
+            { count: r.columns },
+          ),
       };
     case "graph_create_group": {
       const extra = r.group?.extra_node_ids?.length ?? 0;
       const suffix = extra
-        ? ` — ⚠ ${extra} unrelated node${extra === 1 ? "" : "s"} also enclosed (geometric)`
+        ? tr(
+            "panel.group_extra_nodes_enclosed",
+            {
+              one: " — ⚠ {count} unrelated node also enclosed (geometric)",
+              other: " — ⚠ {count} unrelated nodes also enclosed (geometric)",
+            },
+            { count: extra },
+          )
         : "";
-      return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})${suffix}` };
+      return {
+        icon: "pi-clone",
+        text:
+          tr("panel.created_group", "Created group “{title}” (id {id})", {
+            title: r.group?.title,
+            id: r.group?.id,
+          }) + suffix,
+      };
     }
     case "graph_move_group": {
       // Say what came WITH the box. A move that carried nothing is exactly the
       // "only the box moved" symptom (#408), so it must be visible on the card
       // rather than hidden behind an unqualified "Moved group".
       const m = r.moved;
+      // Each carried kind is its own counted phrase. These are NOT shared with the
+      // identically-worded findings list in graph_get_errors below, even though English
+      // renders both the same: this list sits after "with", that one after "Found errors —",
+      // and an inflected language wants different cases in the two positions (Russian's
+      // instrumental after "с" vs the nominative in a bare list). Two keys with the same
+      // English cost nothing — i18n-build-en only rejects one KEY carrying two texts.
       const carried = [
-        ...(m?.nodes ? [`${m.nodes} node${m.nodes === 1 ? "" : "s"}`] : []),
-        ...(m?.groups ? [`${m.groups} nested group${m.groups === 1 ? "" : "s"}`] : []),
-        ...(m?.reroutes ? [`${m.reroutes} reroute${m.reroutes === 1 ? "" : "s"}`] : []),
+        ...(m?.nodes ? [tr("panel.n_carried_nodes", { one: "{count} node", other: "{count} nodes" }, { count: m.nodes })] : []),
+        ...(m?.groups
+          ? [tr("panel.n_carried_nested_groups", { one: "{count} nested group", other: "{count} nested groups" }, { count: m.groups })]
+          : []),
+        ...(m?.reroutes
+          ? [tr("panel.n_carried_reroutes", { one: "{count} reroute", other: "{count} reroutes" }, { count: m.reroutes })]
+          : []),
       ].join(", ");
       return {
         icon: "pi-arrows-alt",
-        text: `Moved group ${r.group?.id} (“${r.group?.title}”)${carried ? ` with ${carried}` : " — box only"}`,
+        text:
+          tr("panel.moved_group", "Moved group {id} (“{title}”)", { id: r.group?.id, title: r.group?.title }) +
+          (carried
+            ? tr("panel.moved_group_with", " with {carried}", { carried })
+            : tr("panel.moved_group_box_only", " — box only")),
       };
     }
     case "graph_edit_group":
-      return { icon: "pi-pencil", text: `Edited group ${r.group?.id} (“${r.group?.title}”)` };
+      return {
+        icon: "pi-pencil",
+        text: tr("panel.edited_group", "Edited group {id} (“{title}”)", { id: r.group?.id, title: r.group?.title }),
+      };
     case "graph_remove_group":
-      return { icon: "pi-minus-circle", text: `Removed group “${r.removed?.title}”` };
+      return {
+        icon: "pi-minus-circle",
+        text: tr("panel.removed_group", "Removed group “{title}”", { title: r.removed?.title }),
+      };
     case "graph_move_rail":
-      return { icon: "pi-arrows-h", text: `Moved ${r.rail} rail to [${r.pos?.map(Math.round)}]` };
+      return {
+        icon: "pi-arrows-h",
+        text: tr("panel.moved_rail_to", "Moved {rail} rail to [{pos}]", {
+          rail: r.rail,
+          pos: r.pos?.map(Math.round),
+        }),
+      };
     case "graph_set_node_mode":
       return {
         icon: r.mode === "active" ? "pi-play-circle" : r.mode === "mute" ? "pi-volume-off" : "pi-ban",
-        text: `Set node ${r.node_id} to ${r.mode}${r.previous_mode && r.previous_mode !== r.mode ? ` (was ${r.previous_mode})` : ""}`,
+        text:
+          tr("panel.set_node_mode", "Set node {node_id} to {mode}", { node_id: r.node_id, mode: r.mode }) +
+          (r.previous_mode && r.previous_mode !== r.mode
+            ? tr("panel.set_node_mode_was", " (was {previous})", { previous: r.previous_mode })
+            : ""),
       };
     case "graph_screenshot":
-      return { icon: "pi-camera", text: `Captured workflow image (${r.width}×${r.height})` };
+      // `width`/`height` are plain numbers, NOT named `count` — see rule 2 in the header:
+      // a numeric `count` var would switch this string into plural lookup by accident.
+      return {
+        icon: "pi-camera",
+        text: tr("panel.captured_workflow_image", "Captured workflow image ({width}×{height})", {
+          width: r.width,
+          height: r.height,
+        }),
+      };
     case "graph_canvas":
-      return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
+      return {
+        icon: "pi-window-maximize",
+        text: tr("panel.canvas_action", "Canvas: {action}", { action: r.canvas?.action?.replace(/_/g, " ") }),
+      };
     case "graph_run":
       return r.queued
         ? {
@@ -19237,13 +19693,26 @@ function describeCommand(cmd, msg, reply) {
             // silent about it. Ownership is NOT asserted — see the result fields.
             icon: r.disabled_outputs_in_graph?.length ? "pi-exclamation-triangle" : "pi-play",
             text:
-              `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
-              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : "") +
+              tr("panel.queued_workflow", "Queued workflow") +
+              // `{n}`, not `{count}`: the batch multiplier is a number the sentence merely
+              // shows. Naming it `count` would switch this key into plural lookup.
+              (r.batch_count > 1 ? tr("panel.queued_workflow_batch", " ×{n}", { n: r.batch_count }) : "") +
+              (r.ran_to_node != null
+                ? tr("panel.queued_workflow_to_node", " → node {node_id}", { node_id: r.ran_to_node })
+                : "") +
               // Ownership-neutral here too: the label says what was OBSERVED in an
               // accepted prompt, not that this run queued it. A concurrent queue
               // action would otherwise be reported as this run's doing.
               (r.disabled_outputs_in_graph?.length
-                ? ` — WARNING: this workflow has ${r.disabled_outputs_in_graph.length} output node${r.disabled_outputs_in_graph.length === 1 ? "" : "s"} inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them`
+                ? tr(
+                    "panel.queued_workflow_disabled_outputs",
+                    {
+                      one: " — WARNING: this workflow has {count} output node inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them",
+                      other:
+                        " — WARNING: this workflow has {count} output nodes inside a nested muted/bypassed subgraph; the measured ComfyUI build did not exclude them",
+                    },
+                    { count: r.disabled_outputs_in_graph.length },
+                  )
                 : ""),
             ...(r.disabled_outputs_note ? { detail: r.disabled_outputs_note } : {}),
           }
@@ -19252,13 +19721,22 @@ function describeCommand(cmd, msg, reply) {
             // run-to-node rejection returns { error } (no node_errors); a normal
             // validation failure returns { node_errors }. Handle both — guard the
             // JSON.stringify so an undefined node_errors can't throw here.
-            text: r.error ? "Run blocked" : "Run blocked by node errors",
+            text: r.error
+              ? tr("panel.run_blocked", "Run blocked")
+              : tr("panel.run_blocked_by_node_errors", "Run blocked by node errors"),
+            // Raw validation output — the machine's words, deliberately untranslated.
             detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
     case "graph_find_nodes":
+      // The TOTAL drives the plural; the match count carries its own "+" truncation marker,
+      // so it is interpolated as text rather than as a second count.
       return {
         icon: "pi-search",
-        text: `Found ${r.count}${r.truncated ? "+" : ""} of ${r.total} node${r.total === 1 ? "" : "s"}`,
+        text: tr(
+          "panel.found_nodes",
+          { one: "Found {found} of {count} node", other: "Found {found} of {count} nodes" },
+          { count: r.total, found: `${r.count}${r.truncated ? "+" : ""}` },
+        ),
       };
     case "graph_get_errors": {
       // Label from the COMPLETE error surface, not just raw validation/exec fields:
@@ -19278,32 +19756,57 @@ function describeCommand(cmd, msg, reply) {
         return counts.unchecked
           ? {
               icon: "pi-info-circle",
-              text: `Checked errors — none found (${counts.unchecked} node${counts.unchecked === 1 ? "" : "s"} could not be checked)`,
+              text: tr(
+                "panel.checked_errors_none_unchecked",
+                {
+                  one: "Checked errors — none found ({count} node could not be checked)",
+                  other: "Checked errors — none found ({count} nodes could not be checked)",
+                },
+                { count: counts.unchecked },
+              ),
             }
-          : { icon: "pi-info-circle", text: "Checked errors — none" };
+          : { icon: "pi-info-circle", text: tr("panel.checked_errors_none", "Checked errors — none") };
       }
       const parts = [];
       if (counts.erroredNodes)
-        parts.push(`${counts.erroredNodes} node${counts.erroredNodes === 1 ? "" : "s"}`);
+        parts.push(
+          tr("panel.n_errored_nodes", { one: "{count} node", other: "{count} nodes" }, { count: counts.erroredNodes }),
+        );
       if (counts.missingAssets)
-        parts.push(`${counts.missingAssets} missing asset${counts.missingAssets === 1 ? "" : "s"}`);
+        parts.push(
+          tr(
+            "panel.n_missing_assets",
+            { one: "{count} missing asset", other: "{count} missing assets" },
+            { count: counts.missingAssets },
+          ),
+        );
       // Kept as its own category rather than folded into missing assets: these were
       // established from the server's CURRENT /object_info, not the load-time scan,
       // and the list mixes absent files with values outside the offered options.
       if (counts.unavailable)
-        parts.push(`${counts.unavailable} unavailable widget value${counts.unavailable === 1 ? "" : "s"}`);
+        parts.push(
+          tr(
+            "panel.n_unavailable_widget_values",
+            { one: "{count} unavailable widget value", other: "{count} unavailable widget values" },
+            { count: counts.unavailable },
+          ),
+        );
       return {
         icon: "pi-exclamation-triangle",
-        text: parts.length ? `Found errors — ${parts.join(", ")}` : "Read execution errors",
+        text: parts.length
+          ? tr("panel.found_errors", "Found errors — {findings}", { findings: parts.join(", ") })
+          : tr("panel.read_execution_errors", "Read execution errors"),
       };
     }
     case "free_vram":
-      return { icon: "pi-bolt", text: "Unloaded models — freed VRAM" };
+      return { icon: "pi-bolt", text: tr("panel.unloaded_models_freed_vram", "Unloaded models — freed VRAM") };
     case "workflow_save":
-      return { icon: "pi-save", text: `Saved “${r.workflow}”` };
+      return { icon: "pi-save", text: tr("panel.workflow_saved", "Saved “{workflow}”", { workflow: r.workflow }) };
     case "workflow_save_as":
-      return { icon: "pi-save", text: `Saved as “${r.workflow}”` };
+      return { icon: "pi-save", text: tr("panel.workflow_saved_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
     default:
+      // `cmd` is the raw tool name (an identifier) and the detail is the raw reply payload —
+      // neither is prose, so neither is translated.
       return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
   }
 }
@@ -19564,6 +20067,11 @@ function buildPanel() {
   // workflow switch that re-mounts the sidebar), not only to one that is open
   // when the slider moves. Read it here, at the one place a root is created.
   applyPanelUiScale(getSetting(SETTING_UI_SCALE), root);
+  // Same reasoning as the scale above, for text direction: Arabic and Persian ship in the
+  // language dropdown, so a root that mounts in one of them has to lay out right-to-left.
+  // Scoped to OUR root on purpose — setting `dir` on documentElement would re-lay-out
+  // ComfyUI's canvas and every other extension's UI, which is not ours to do.
+  applyDirection(root);
   // A2UI seam (forward-compat, see spec): the chat surface width is a SINGLE piece
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.
@@ -19650,7 +20158,7 @@ function buildPanel() {
   const status = document.createElement("button");
   status.type = "button";
   status.className = "cmcp-status cmcp-status-btn";
-  status.title = "Connection";
+  status.title = tr("panel.connection", "Connection");
   const dot = document.createElement("span");
   dot.className = "cmcp-dot";
   const statusText = document.createElement("span");
@@ -19737,7 +20245,7 @@ function buildPanel() {
   }
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
-  backendLabel.textContent = "Agent backend";
+  backendLabel.textContent = tr("panel.agent_backend", "Agent backend");
   const backendChips = document.createElement("div");
   backendChips.className = "cmcp-backend-chips";
   backendChips.style.cssText =
@@ -19839,7 +20347,15 @@ function buildPanel() {
         chip.title = hint;
         chip.style.opacity = "0.55"; // dim a provider that isn't signed in yet
       } else if (b.running) {
-        chip.title = "Running";
+        chip.title = tr("panel.running", "Running");
+        // State lives in a data attribute, NOT in the visible tooltip. Two readers below
+        // (renderBackendChips, ~:25343 and ~:27134) reconstruct each chip's `running` flag
+        // from the DOM; when they read `title === "Running"` that comparison became
+        // permanently false the moment the tooltip was translated, silently losing the flag
+        // for every non-English user. Tests never caught it because they all run in English.
+        chip.dataset.running = "1";
+      } else {
+        delete chip.dataset.running;
       }
       if (id === selectedBackend) {
         chip.style.cssText =
@@ -19852,7 +20368,7 @@ function buildPanel() {
         // picking a ToS-risk provider is always a deliberate, informed act.
         chip.style.borderColor = "var(--p-orange-500,#f59e0b)";
         if (id !== selectedBackend) chip.style.color = "var(--p-orange-500,#f59e0b)";
-        if (!hint) chip.title = "Experimental — signs in as VS Code, against GitHub's Copilot API terms";
+        if (!hint) chip.title = tr("panel.experimental_signs_in_as_vs_code_against", "Experimental — signs in as VS Code, against GitHub's Copilot API terms");
       }
       chip.addEventListener("click", () => connectBackend(id));
       backendChips.appendChild(chip);
@@ -19876,7 +20392,7 @@ function buildPanel() {
 
   const urlLabel = document.createElement("label");
   urlLabel.className = "cmcp-label";
-  urlLabel.textContent = "Bridge URL";
+  urlLabel.textContent = tr("panel.bridge_url", "Bridge URL");
   const urlInput = document.createElement("input");
   urlInput.className = "cmcp-input";
   urlInput.type = "text";
@@ -19888,21 +20404,21 @@ function buildPanel() {
   const connectBtn = document.createElement("button");
   connectBtn.className = "cmcp-btn";
   connectBtn.type = "button";
-  connectBtn.textContent = "Connect";
+  connectBtn.textContent = tr("panel.connect", "Connect");
   connectBtn.style.cssText =
     "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
 
   const disconnectBtn = document.createElement("button");
   disconnectBtn.className = "cmcp-btn";
   disconnectBtn.type = "button";
-  disconnectBtn.textContent = "Disconnect";
+  disconnectBtn.textContent = tr("panel.disconnect", "Disconnect");
   disconnectBtn.hidden = true;
 
   const saveBtn = document.createElement("button");
   saveBtn.className = "cmcp-btn";
   saveBtn.type = "button";
-  saveBtn.textContent = "Reconnect";
-  saveBtn.title = "Re-open the bridge connection at the URL above";
+  saveBtn.textContent = tr("panel.reconnect", "Reconnect");
+  saveBtn.title = tr("panel.re_open_the_bridge_connection_at_the", "Re-open the bridge connection at the URL above");
   saveBtn.style.opacity = "0.8";
 
   // Opens the orchestrator's credentials console (API keys) in an in-panel
@@ -19911,8 +20427,8 @@ function buildPanel() {
   const apiKeysBtn = document.createElement("button");
   apiKeysBtn.className = "cmcp-btn";
   apiKeysBtn.type = "button";
-  apiKeysBtn.textContent = "API Keys";
-  apiKeysBtn.title = "Open the credentials console";
+  apiKeysBtn.textContent = tr("panel.api_keys", "API Keys");
+  apiKeysBtn.title = tr("panel.open_the_credentials_console", "Open the credentials console");
   apiKeysBtn.style.opacity = "0.8";
   apiKeysBtn.addEventListener("click", () => {
     settingsBox.hidden = true;
@@ -19925,8 +20441,8 @@ function buildPanel() {
   const promptsBtn = document.createElement("button");
   promptsBtn.className = "cmcp-btn";
   promptsBtn.type = "button";
-  promptsBtn.textContent = "Prompts";
-  promptsBtn.title = "Edit the agent's system prompts (persona, per-backend, Ask-AI)";
+  promptsBtn.textContent = tr("panel.prompts", "Prompts");
+  promptsBtn.title = tr("panel.edit_the_agent_s_system_prompts_persona", "Edit the agent's system prompts (persona, per-backend, Ask-AI)");
   promptsBtn.style.opacity = "0.8";
   promptsBtn.addEventListener("click", () => {
     if (!cmcpConsoleUrl || !cmcpConsoleToken) {
@@ -19991,7 +20507,7 @@ function buildPanel() {
     savePrefs(prefs);
   });
   const sbText = document.createElement("span");
-  sbText.textContent = "Show the agent a storyboard of generated videos";
+  sbText.textContent = tr("panel.show_the_agent_a_storyboard_of_generated", "Show the agent a storyboard of generated videos");
   sbWrap.append(sbToggle, sbText);
 
   advWrap.append(urlLabel, urlInput, sbWrap);
@@ -19999,7 +20515,7 @@ function buildPanel() {
   const advToggle = document.createElement("button");
   advToggle.type = "button";
   advToggle.className = "cmcp-link";
-  advToggle.textContent = "Advanced ▸";
+  advToggle.textContent = tr("panel.advanced", "Advanced ▸");
   advToggle.style.cssText =
     "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
   advToggle.addEventListener("click", () => {
@@ -20032,20 +20548,30 @@ function buildPanel() {
   emptyIcon.className = "pi pi-comments";
   const emptyTitle = document.createElement("div");
   emptyTitle.className = "cmcp-empty-title";
-  emptyTitle.textContent = "Your agent is at your canvas";
+  emptyTitle.textContent = tr("panel.your_agent_is_at_your_canvas", "Your agent is at your canvas");
   const emptyBody = document.createElement("div");
-  emptyBody.textContent =
-    "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.";
+  emptyBody.textContent = tr(
+    "panel.build_and_edit_the_live_graph_generate",
+    "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.",
+  );
   empty.append(emptyIcon, emptyTitle, emptyBody);
 
   // Example prompts surface the agent's newer capabilities and prefill the
   // composer on click. `input` is assigned later in this closure; the click
   // handlers run long after, so referencing it is safe.
+  // TRANSLATED on purpose: the chip is read by the HUMAN ("here's what you can ask"),
+  // and clicking it only prefills the composer — the text becomes the user's OWN
+  // message, which they can still edit before sending. Every backend we support is
+  // multilingual, so a Korean user sending a Korean prompt is the correct outcome; a
+  // Korean user staring at four English suggestions is the bug this exists to fix.
   const EXAMPLES = [
-    { icon: "pi-volume-up", text: "Generate a 30s lofi piano track" },
-    { icon: "pi-sliders-h", text: "Build a Flux txt2img graph and run it" },
-    { icon: "pi-exclamation-triangle", text: "Run the workflow and tell me if it errors" },
-    { icon: "pi-search", text: "Find a good Flux LoRA on Civitai and add it" },
+    { icon: "pi-volume-up", text: tr("panel.generate_a_30s_lofi_piano_track", "Generate a 30s lofi piano track") },
+    { icon: "pi-sliders-h", text: tr("panel.build_a_flux_txt2img_graph_and", "Build a Flux txt2img graph and run it") },
+    {
+      icon: "pi-exclamation-triangle",
+      text: tr("panel.run_the_workflow_and_tell_me_if", "Run the workflow and tell me if it errors"),
+    },
+    { icon: "pi-search", text: tr("panel.find_a_good_flux_lora_on_civitai", "Find a good Flux LoRA on Civitai and add it") },
   ];
   const examplesBox = document.createElement("div");
   examplesBox.className = "cmcp-examples";
@@ -20074,38 +20600,57 @@ function buildPanel() {
   // user through installing + signing into a provider, and is shown ONLY when
   // NEITHER provider is ready (CLI on PATH + a login on disk). The moment one is
   // ready it hides and the panel auto-picks that provider (see applyReadiness).
+  //
+  // TRANSLATION BOUNDARY inside these objects: `install`/`login` are rendered by
+  // onboardCmd() as click-to-copy `<code>`, so a value that IS a shell command
+  // (`npm i -g …`, `winget install …`) stays VERBATIM — translating it would hand the
+  // user a command their shell rejects. Only the slots where we had no command to give
+  // and wrote a human instruction instead ("install the Antigravity CLI (agy)", "Set
+  // your OpenRouter API key in Settings › OpenRouter") are wrapped in tr(). The same
+  // values are also interpolated into the "help me set this up" agent prompt below,
+  // which is fine either way: the commands arrive unchanged, and every backend we
+  // support reads the prose in any language.
   const PROVIDER_SETUP = {
-    claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
-    codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
-    gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
+    claude: { label: tr("panel.claude", "Claude"), install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
+    codex: { label: tr("panel.chatgpt", "ChatGPT"), install: "npm i -g @openai/codex", login: "codex login" },
+    gemini: { label: tr("panel.gemini", "Gemini"), install: "npm i -g @google/gemini-cli", login: "gemini" },
     // Google's Antigravity CLI (agy) — the individual-tier Google-subscription
     // path; auth lives in the OS keyring (no in-panel OAuth, no API-key slot).
-    antigravity: { label: "Antigravity (Google subscription)", install: "install the Antigravity CLI (agy)", login: "agy" },
+    antigravity: { label: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)"), install: tr("panel.install_the_antigravity_cli_agy", "install the Antigravity CLI (agy)"), login: "agy" },
     // pi.dev — a multi-provider coding CLI. "install" is the official installer;
     // "login" is configuring any provider (env key or `/login`). NOTE: pi has no
     // MCP, so a pi agent has no ComfyUI panel tools (see the ready banner).
-    pi: { label: "Pi (pi.dev, multi-provider CLI)", install: "curl -fsSL https://pi.dev/install.sh | sh", login: "set a provider API key, or run `pi` then /login" },
-    grok: { label: "Grok", install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
-    kimi: { label: "Kimi", install: "install the Kimi CLI (Moonshot)", login: "kimi" },
+    // `pi` and `/login` are things the user TYPES — held out as vars so no translation can
+    // reword them, same rule as the shell commands in the sibling `install` slots.
+    pi: { label: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)"), install: "curl -fsSL https://pi.dev/install.sh | sh", login: tr("panel.set_a_provider_api_key_or_run", "set a provider API key, or run `{cmd}` then {slashCmd}", { cmd: "pi", slashCmd: "/login" }) },
+    grok: { label: tr("panel.grok", "Grok"), install: tr("panel.install_the_grok_cli_grok_build", "install the Grok CLI (Grok Build / xAI)"), login: "grok" },
+    kimi: { label: tr("panel.kimi", "Kimi"), install: tr("panel.install_the_kimi_cli_moonshot", "install the Kimi CLI (Moonshot)"), login: "kimi" },
     // No CLI — "setup" is pasting a Moonshot platform API key (Kimi K3).
-    moonshot: { label: "Kimi K3 (Moonshot, hosted)", install: "", login: "Set MOONSHOT_API_KEY via API Keys (▾ menu by “connected”)" },
+    // The three "paste an env key" hints share ONE key with an {envVar} hole: the only
+    // thing that differs between them is a literal that must never be translated, and a
+    // translator getting one sentence right instead of three near-identical ones is
+    // strictly less rope.
+    moonshot: { label: tr("panel.kimi_k3_moonshot_hosted", "Kimi K3 (Moonshot, hosted)"), install: "", login: tr("panel.set_envvar_via_api_keys", "Set {envVar} via API Keys (▾ menu by “connected”)", { envVar: "MOONSHOT_API_KEY" }) },
     // No CLI — "setup" is pasting a z.ai coding-plan API key (GLM).
-    glm: { label: "GLM (z.ai coding plan, hosted)", install: "", login: "Set ZAI_API_KEY via API Keys (▾ menu by “connected”)" },
-    minimax: { label: "MiniMax (hosted)", install: "", login: "Set MINIMAX_API_KEY via API Keys (▾ menu by “connected”)" },
+    glm: { label: tr("panel.glm_z_ai_coding_plan_hosted", "GLM (z.ai coding plan, hosted)"), install: "", login: tr("panel.set_envvar_via_api_keys", "Set {envVar} via API Keys (▾ menu by “connected”)", { envVar: "ZAI_API_KEY" }) },
+    minimax: { label: tr("panel.minimax_hosted", "MiniMax (hosted)"), install: "", login: tr("panel.set_envvar_via_api_keys", "Set {envVar} via API Keys (▾ menu by “connected”)", { envVar: "MINIMAX_API_KEY" }) },
     // No sign-in — "login" is pulling OUR FINE-TUNE: gemma4 QLoRA-trained on
     // 1,055 server-verified comfyui-mcp trajectories (hf.co/artokun/
     // gemma4-comfyui-mcp) — it knows this tool suite natively. :e2b fits
     // ~2 GB VRAM, :12b ~8 GB.
-    ollama: { label: "Ollama (local, free — our ComfyUI fine-tune)", install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
+    ollama: { label: tr("panel.ollama_local_free_our_comfyui_fine_tune", "Ollama (local, free — our ComfyUI fine-tune)"), install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
     // No CLI — "setup" is pasting an OpenRouter API key (Settings › OpenRouter).
-    openrouter: { label: "OpenRouter (hosted, 1M · SOTA)", install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
+    openrouter: { label: tr("panel.openrouter_hosted_1m_sota", "OpenRouter (hosted, 1M · SOTA)"), install: "", login: tr("panel.set_your_openrouter_api_key_in_settings", "Set your OpenRouter API key in Settings › OpenRouter") },
     // No sign-in — "login" is starting the local server with a tool-calling model.
-    lmstudio: { label: "LM Studio (local, free)", install: "winget install ElementLabs.LMStudio", login: "LM Studio → Developer → Start Server (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)" },
+    // The menu path is held out as a var: those are LM STUDIO's menu labels, and LM Studio
+    // ships an English UI. A translated path would send the user hunting for items that do
+    // not exist in the app they are looking at. Only our own hint around it moves.
+    lmstudio: { label: tr("panel.lm_studio_local_free", "LM Studio (local, free)"), install: "winget install ElementLabs.LMStudio", login: tr("panel.lm_studio_developer_start_server", "{menuPath} (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)", { menuPath: "LM Studio → Developer → Start Server" }) },
     // No sign-in — "login" is launching llama-server; --jinja is REQUIRED for tool calling.
-    llamacpp: { label: "llama.cpp (local, free)", install: "winget install ggml.llamacpp", login: "llama-server -m model.gguf --jinja -c 16384" },
+    llamacpp: { label: tr("panel.llama_cpp_local_free", "llama.cpp (local, free)"), install: "winget install ggml.llamacpp", login: "llama-server -m model.gguf --jinja -c 16384" },
     // No CLI — "setup" is pointing the panel at any OpenAI-compatible /v1
     // (vLLM, DeepSeek, Together, Azure, a llama-server on another box…).
-    custom: { label: "Custom endpoint (any OpenAI-compatible)", install: "", login: "Set the base URL (and API key if needed) in Settings › Custom endpoint" },
+    custom: { label: tr("panel.custom_endpoint_any_openai_compatible", "Custom endpoint (any OpenAI-compatible)"), install: "", login: tr("panel.set_the_base_url_and_api_key", "Set the base URL (and API key if needed) in Settings › Custom endpoint") },
   };
   let anyReady = false;
   // (autoPickDone is module-scoped now — once per PAGE, not per mount, so workflow
@@ -20118,9 +20663,9 @@ function buildPanel() {
     const code = document.createElement("code");
     code.className = "cmcp-cmd";
     code.textContent = cmd;
-    code.title = "Click to copy";
+    code.title = tr("panel.click_to_copy", "Click to copy");
     code.addEventListener("click", () => {
-      navigator.clipboard?.writeText(cmd).then(() => appendSystem("Command copied."), () => {});
+      navigator.clipboard?.writeText(cmd).then(() => appendSystem(tr("panel.command_copied", "Command copied.")), () => {});
     });
     return code;
   }
@@ -20129,11 +20674,13 @@ function buildPanel() {
     onboard.replaceChildren();
     const title = document.createElement("div");
     title.className = "cmcp-onboard-title";
-    title.textContent = "Sign in to an AI provider to use the agent";
+    title.textContent = tr("panel.sign_in_to_an_ai_provider_to", "Sign in to an AI provider to use the agent");
     const sub = document.createElement("div");
     sub.className = "cmcp-onboard-sub";
-    sub.textContent =
-      "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
+    sub.textContent = tr(
+      "panel.the_agent_runs_on_your_machine_on",
+      "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.",
+    );
     onboard.append(title, sub);
     for (const id of ["claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
@@ -20149,12 +20696,14 @@ function buildPanel() {
       if (!st.cli) {
         const s1 = document.createElement("div");
         s1.className = "cmcp-onboard-step";
-        s1.textContent = "1. Install the CLI";
+        s1.textContent = tr("panel.1_install_the_cli", "1. Install the CLI");
         col.append(s1, onboardCmd(meta.install));
       }
       const s2 = document.createElement("div");
       s2.className = "cmcp-onboard-step";
-      s2.textContent = st.cli ? "Sign in" : "2. Sign in";
+      // Two keys, not one with a "2. " prefix glued on: the step number belongs to the
+      // sentence in languages that reorder or re-punctuate an ordinal.
+      s2.textContent = st.cli ? tr("panel.sign_in", "Sign in") : tr("panel.2_sign_in", "2. Sign in");
       col.append(s2, onboardCmd(meta.login));
       onboard.appendChild(col);
     }
@@ -20165,7 +20714,7 @@ function buildPanel() {
     runCol.className = "cmcp-onboard-col";
     const runProv = document.createElement("div");
     runProv.className = "cmcp-onboard-prov";
-    runProv.textContent = "Then start the agent (on this machine)";
+    runProv.textContent = tr("panel.then_start_the_agent_on_this_machine", "Then start the agent (on this machine)");
     runCol.appendChild(runProv);
     // No URL needed: the panel sends the ComfyUI host (window.location) in its
     // hello, so a bare `connect` auto-targets whatever ComfyUI is open. Offer the
@@ -20174,7 +20723,7 @@ function buildPanel() {
     runCol.append(makeShellCommandBlock(connectCommand()));
     const clickNote = document.createElement("div");
     clickNote.className = "cmcp-onboard-step";
-    clickNote.textContent = "…then click Connect above.";
+    clickNote.textContent = tr("panel.then_click_connect_above", "…then click Connect above.");
     runCol.appendChild(clickNote);
     onboard.appendChild(runCol);
   }
@@ -20230,8 +20779,11 @@ function buildPanel() {
         renderBackendChips(list);
         setAskPlaceholder(ready.backend);
         appendSystem(
-          `${prevLabel} isn't signed in — using ${BACKEND_LABELS[ready.backend] || ready.backend}. ` +
-            `Sign in to ${prevLabel} to switch back.`,
+          tr(
+            "panel.prev_isnt_signed_in_using_next",
+            "{prev} isn't signed in — using {next}. Sign in to {prev} to switch back.",
+            { prev: prevLabel, next: BACKEND_LABELS[ready.backend] || ready.backend },
+          ),
         );
       }
     } else {
@@ -20253,13 +20805,13 @@ function buildPanel() {
     // agent chat adds. Show the two setup paths inline and stop; no chat.
     if (id === "openrouter") {
       appendSystem(
-        `OpenRouter is a hosted API — no CLI, no login flow. Enable it by setting your API key (create one at https://openrouter.ai/keys):
-` +
-          `  • Settings → OpenRouter → “Set API key…” — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the OPENROUTER_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick OpenRouter here again and Connect.`,
+        tr(
+          "panel.openrouter_is_a_hosted_api_no_cli",
+          "OpenRouter is a hosted API — no CLI, no login flow. Enable it by setting your API key (create one at https://openrouter.ai/keys):\n" +
+            "  • Settings → OpenRouter → “Set API key…” — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the OPENROUTER_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick OpenRouter here again and Connect.",
+        ),
       );
       return;
     }
@@ -20267,13 +20819,13 @@ function buildPanel() {
     // OpenRouter: show the key-setup path inline and stop; no agent chat.
     if (id === "moonshot") {
       appendSystem(
-        `Kimi K3 (Moonshot) is a hosted API — no CLI, no login flow. Enable it by setting your Moonshot API key (create one at https://platform.moonshot.ai/console/api-keys):
-` +
-          `  • API Keys (▾ menu next to “connected”) → set MOONSHOT_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the MOONSHOT_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick Kimi K3 here again and Connect.`,
+        tr(
+          "panel.kimi_k3_moonshot_is_a_hosted_api",
+          "Kimi K3 (Moonshot) is a hosted API — no CLI, no login flow. Enable it by setting your Moonshot API key (create one at https://platform.moonshot.ai/console/api-keys):\n" +
+            "  • API Keys (▾ menu next to “connected”) → set MOONSHOT_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the MOONSHOT_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick Kimi K3 here again and Connect.",
+        ),
       );
       return;
     }
@@ -20281,13 +20833,13 @@ function buildPanel() {
     // as Moonshot/OpenRouter: show the key-setup path inline and stop; no agent chat.
     if (id === "glm") {
       appendSystem(
-        `GLM (z.ai) is a hosted coding-plan API — no CLI, no login flow. Enable it by setting your z.ai API key (create one in your z.ai dashboard at https://z.ai/manage-apikey/apikey-list):
-` +
-          `  • API Keys (▾ menu next to “connected”) → set ZAI_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the ZAI_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick GLM (z.ai) here again and Connect.`,
+        tr(
+          "panel.glm_z_ai_is_a_hosted_coding_plan_api",
+          "GLM (z.ai) is a hosted coding-plan API — no CLI, no login flow. Enable it by setting your z.ai API key (create one in your z.ai dashboard at https://z.ai/manage-apikey/apikey-list):\n" +
+            "  • API Keys (▾ menu next to “connected”) → set ZAI_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the ZAI_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick GLM (z.ai) here again and Connect.",
+        ),
       );
       return;
     }
@@ -20295,27 +20847,38 @@ function buildPanel() {
     // GLM/Moonshot/OpenRouter: show the key-setup path inline and stop; no agent chat.
     if (id === "minimax") {
       appendSystem(
-        `MiniMax is a hosted API — no CLI, no login flow. Enable it by setting your MiniMax API key (create one at https://platform.minimax.io/console/api-keys):
-` +
-          `  • API Keys (▾ menu next to “connected”) → set MINIMAX_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
-` +
-          `  • Or set the MINIMAX_API_KEY environment variable and (re)start the orchestrator.
-` +
-          `Then pick MiniMax here again and Connect.`,
+        tr(
+          "panel.minimax_is_a_hosted_api_no_cli",
+          "MiniMax is a hosted API — no CLI, no login flow. Enable it by setting your MiniMax API key (create one at https://platform.minimax.io/console/api-keys):\n" +
+            "  • API Keys (▾ menu next to “connected”) → set MINIMAX_API_KEY — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.\n" +
+            "  • Or set the MINIMAX_API_KEY environment variable and (re)start the orchestrator.\n" +
+            "Then pick MiniMax here again and Connect.",
+        ),
       );
       return;
     }
+    // NOT translated, deliberately: this is a directive we compose FOR the agent, not a
+    // label the user reads to make a choice, and it embeds two shell commands in
+    // backticks. Agent-facing text stays English so the commands and the instruction
+    // around them can't drift apart in translation. The two notes below are ours to the
+    // user, so those do get translated.
     const prompt =
       `Help me set up the ${meta.label} backend so I can use it in this panel — I'm not signed in to it yet. ` +
       `Walk me through it for my OS: install the CLI (\`${meta.install}\`), sign in (\`${meta.login}\`), ` +
       `then in this panel pick ${meta.label} in the provider picker and click Connect. Give exact terminal commands.`;
     if (client.isConnected() && client.sendUserMessage(prompt)) {
-      appendSystem(`Asked the agent to help you set up ${meta.label}.`);
+      appendSystem(tr("panel.asked_the_agent_to_help_you_set_up", "Asked the agent to help you set up {label}.", { label: meta.label }));
     } else {
       input.value = prompt;
       input.focus();
       input.dispatchEvent(new Event("input"));
-      appendSystem(`Connect to a signed-in provider, then send this queued request to set up ${meta.label}.`);
+      appendSystem(
+        tr(
+          "panel.connect_to_a_signed_in_provider_then",
+          "Connect to a signed-in provider, then send this queued request to set up {label}.",
+          { label: meta.label },
+        ),
+      );
     }
   }
 
@@ -20335,7 +20898,14 @@ function buildPanel() {
   newMsgBtn.type = "button";
   newMsgBtn.className = "cmcp-newmsg";
   newMsgBtn.hidden = true;
-  newMsgBtn.innerHTML = '<i class="pi pi-arrow-down"></i> New messages';
+  // Built as nodes rather than innerHTML: the label is now catalog-sourced, and tr()
+  // returns TEXT, never markup — routing it through textContent keeps it that way even
+  // if a locale file ever picks up an angle bracket.
+  {
+    const arrow = document.createElement("i");
+    arrow.className = "pi pi-arrow-down";
+    newMsgBtn.append(arrow, document.createTextNode(" " + tr("panel.new_messages", "New messages")));
+  }
   newMsgBtn.addEventListener("click", () => {
     stickToBottom = true;
     newMsgBtn.hidden = true;
@@ -20396,7 +20966,9 @@ function buildPanel() {
       const pend = document.createElement("div");
       const head = document.createElement("div");
       head.className = "cmcp-tray-head";
-      head.textContent = `Pending · ${pendingList.length}`;
+      // {n}, not {count}: `count` switches tr() into plural-category lookup, and this is a
+      // bare tally next to a word that never inflects.
+      head.textContent = tr("panel.pending_n", "Pending · {n}", { n: pendingList.length });
       pend.appendChild(head);
       for (const [mid, entry] of pendingList) {
         const row = document.createElement("div");
@@ -20405,7 +20977,7 @@ function buildPanel() {
         const handle = document.createElement("span");
         handle.className = "cmcp-pending-handle";
         handle.draggable = true;
-        handle.title = "Drag to reorder";
+        handle.title = tr("panel.drag_to_reorder", "Drag to reorder");
         handle.innerHTML = '<i class="pi pi-bars"></i>';
         handle.addEventListener("dragstart", (e) => {
           e.dataTransfer.setData("text/plain", mid);
@@ -20432,13 +21004,15 @@ function buildPanel() {
         row.append(
           handle,
           txt,
-          mkPendingAct("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
+          mkPendingAct("pi-pencil", tr("panel.edit_pull_back_to_the_composer", "Edit — pull back to the composer"), () => editMsg(mid)),
           mkPendingAct(
             "pi-send",
-            entry.state === "failed" ? "Resend now" : "Send now (interrupt the current turn)",
+            entry.state === "failed"
+              ? tr("panel.resend_now", "Resend now")
+              : tr("panel.send_now_interrupt_the_current_turn", "Send now (interrupt the current turn)"),
             () => sendNowMsg(mid),
           ),
-          mkPendingAct("pi-times", "Delete this message", () => deleteMsg(mid), true),
+          mkPendingAct("pi-times", tr("panel.delete_this_message", "Delete this message"), () => deleteMsg(mid), true),
         );
         pend.appendChild(row);
       }
@@ -20450,7 +21024,7 @@ function buildPanel() {
       dl.className = "cmcp-dl";
       const head = document.createElement("div");
       head.className = "cmcp-tray-head";
-      head.textContent = "Downloads";
+      head.textContent = tr("panel.downloads", "Downloads");
       dl.appendChild(head);
       for (const d of downloadItems) {
         const total = d && Number(d.total) > 0 ? Number(d.total) : 0;
@@ -20470,9 +21044,9 @@ function buildPanel() {
         meta.className = "cmcp-dl-meta";
         const speed = d && Number(d.bytes_per_sec) > 0 ? `${fmtBytes(Number(d.bytes_per_sec))}/s` : "";
         meta.textContent = failed
-          ? "failed"
+          ? tr("panel.failed_lowercase", "failed")
           : done
-            ? "done"
+            ? tr("panel.done_lowercase", "done")
             : [pct != null ? `${pct}%` : "…", speed].filter(Boolean).join(" · ");
         top.append(name, meta);
         row.appendChild(top);
@@ -20494,7 +21068,7 @@ function buildPanel() {
       const doneN = todoItems.filter((it) => it && it.status === "done").length;
       const head = document.createElement("div");
       head.className = "cmcp-tray-head";
-      head.textContent = `Plan · ${doneN}/${todoItems.length}`;
+      head.textContent = tr("panel.plan_done_total", "Plan · {done}/{total}", { done: doneN, total: todoItems.length });
       list.appendChild(head);
       for (const it of todoItems) {
         const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
@@ -20548,9 +21122,20 @@ function buildPanel() {
   // Placeholder + empty-state hero reflect the active backend ("Ask Claude…" /
   // "Ask ChatGPT…", "Claude is at your canvas" / "Ollama is at your canvas").
   function setAskPlaceholder(id) {
+    // `label` is a provider brand ("Claude", "Ollama") and is never translated — only the
+    // sentence around it moves, hence a {label} hole rather than a concatenation, which
+    // languages that put the verb last cannot reorder.
     const label = BACKEND_LABELS[id];
-    input.placeholder = `Ask ${label || "your agent"}… / for commands, @ for context`;
-    emptyTitle.textContent = `${label || "Your agent"} is at your canvas`;
+    input.placeholder = tr("panel.ask_label_for_commands_context", "Ask {label}… / for commands, @ for context", {
+      label: label || tr("panel.your_agent_inline", "your agent"),
+    });
+    // This runs on every backend switch and on first mount, so it is what the hero
+    // ACTUALLY ends up showing — the tr() at the empty-state construction above is
+    // overwritten here. Reuse that same key for the no-backend case so both paths land on
+    // one translated string instead of the hero silently reverting to English.
+    emptyTitle.textContent = label
+      ? tr("panel.label_is_at_your_canvas", "{label} is at your canvas", { label })
+      : tr("panel.your_agent_is_at_your_canvas", "Your agent is at your canvas");
   }
   setAskPlaceholder(selectedBackend);
   input.rows = 1;
@@ -20601,12 +21186,12 @@ function buildPanel() {
     ring.appendChild(c);
   }
   const ringTitle = document.createElementNS(SVG_NS, "title");
-  ringTitle.textContent = "Context window — fills as the agent reports usage";
+  ringTitle.textContent = tr("panel.context_window_fills_as_the_agent_reports", "Context window — fills as the agent reports usage");
   ring.appendChild(ringTitle);
   // Compact context-usage readout shown right after the ring.
   const ctxLabel = document.createElement("span");
   ctxLabel.className = "cmcp-ctx";
-  ctxLabel.title = "Context window used";
+  ctxLabel.title = tr("panel.context_window_used", "Context window used");
   const CTX_KEY = "comfyui-mcp.panel.ctxPct";
   ctxLabel.textContent = "—"; // until the first usage report
 
@@ -20614,7 +21199,7 @@ function buildPanel() {
     const clamped = Math.max(0, Math.min(1, p > 1 ? p / 100 : p));
     ring.querySelector(".fg").setAttribute("stroke-dashoffset", String(RING_C * (1 - clamped)));
     const pct = Math.round(clamped * 100);
-    ringTitle.textContent = `Context window ~${pct}% used`;
+    ringTitle.textContent = tr("panel.context_window_pct_used", "Context window ~{pct}% used", { pct });
     ctxLabel.textContent = clamped > 0 ? `${pct}%` : "—";
   }
   // #381: the ring is persisted PER conversation, not globally. A single global
@@ -20725,7 +21310,7 @@ function buildPanel() {
   modelChip.className = "cmcp-chip";
   // Initial title only — refreshModelChip() replaces it with the live model and
   // effort, since the name can be ellipsised at narrow widths.
-  modelChip.title = "Model & reasoning effort for the background agent";
+  modelChip.title = tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
   const modelChipLabel = document.createElement("span");
   modelChipLabel.className = "name";
   const modelChipEffort = document.createElement("span");
@@ -20735,15 +21320,18 @@ function buildPanel() {
   modelChip.append(modelChipLabel, modelChipEffort, modelChipCaret);
 
   function refreshModelChip() {
-    const name = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
+    const name = prefs.modelAuto ? tr("panel.auto", "Auto") : modelLabel(modelCatalog, prefs.model);
     modelChipLabel.textContent = name;
     modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
     // The name ellipsises in a narrow panel, so the hover has to carry the full
     // value — otherwise a truncated model id is unrecoverable without widening
     // the panel, which is the thing we're avoiding.
     modelChip.title =
-      `Model: ${name}${prefs.effort ? ` · effort: ${prefs.effort}` : ""}` +
-      "\nModel & reasoning effort for the background agent";
+      (prefs.effort
+        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: prefs.effort })
+        : tr("panel.model_name", "Model: {name}", { name })) +
+      "\n" +
+      tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
   }
 
   // Reconcile the ComfyUI Settings defaults with the panel's localStorage runtime.
@@ -20920,8 +21508,8 @@ function buildPanel() {
   const modelSearchInput = document.createElement("input");
   modelSearchInput.type = "text";
   modelSearchInput.className = "cmcp-modelsearch-input";
-  modelSearchInput.placeholder = "Search models across connected providers…";
-  modelSearchInput.setAttribute("aria-label", "Search models across connected providers");
+  modelSearchInput.placeholder = tr("panel.search_models_across_connected_providers", "Search models across connected providers…");
+  modelSearchInput.setAttribute("aria-label", tr("panel.search_models_across_connected_providers_2", "Search models across connected providers"));
   const modelSearchCap = document.createElement("div");
   modelSearchCap.className = "cmcp-modelsearch-cap";
   // Recently-used section (non-virtualized; bounded to RECENTS_CAP). Shown only in
@@ -21080,7 +21668,12 @@ function buildPanel() {
       // Seed the target provider's group so seedPrefsForBackendSwitch adopts this
       // model, then run the full switch flow (fresh orchestrator + session rules).
       if (SETTING_MODEL[m.provider]) setSetting(SETTING_MODEL[m.provider], m.id);
-      appendSystem(`Model → ${m.label} · switching to ${m.providerLabel}…`);
+      appendSystem(
+        tr("panel.model_arrow_switching_to_provider", "Model → {model} · switching to {provider}…", {
+          model: m.label,
+          provider: m.providerLabel,
+        }),
+      );
       void connectBackend(m.provider);
       return;
     }
@@ -21099,9 +21692,15 @@ function buildPanel() {
     refreshModelChip();
     client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
     if (prefs.effort && prefs.effort !== before) {
-      appendSystem(`Model → ${m.label}. Reasoning effort set to ${effortMeta(prefs.effort).label} (nearest level this model supports).`);
+      appendSystem(
+        tr(
+          "panel.model_arrow_reasoning_effort_set_to_nearest",
+          "Model → {model}. Reasoning effort set to {effort} (nearest level this model supports).",
+          { model: m.label, effort: effortMeta(prefs.effort).label },
+        ),
+      );
     } else {
-      appendSystem(`Model → ${m.label}.`);
+      appendSystem(tr("panel.model_arrow_model", "Model → {model}.", { model: m.label }));
     }
   }
 
@@ -21156,8 +21755,8 @@ function buildPanel() {
     const x = document.createElement("button");
     x.type = "button";
     x.className = "cmcp-modelrecent-x";
-    x.title = "Remove from recently used";
-    x.setAttribute("aria-label", "Remove from recently used");
+    x.title = tr("panel.remove_from_recently_used", "Remove from recently used");
+    x.setAttribute("aria-label", tr("panel.remove_from_recently_used", "Remove from recently used"));
     const xi = document.createElement("i");
     xi.className = "pi pi-times";
     x.appendChild(xi);
@@ -21187,7 +21786,7 @@ function buildPanel() {
     modelRecents.hidden = false;
     const h = document.createElement("div");
     h.className = "cmcp-pop-section";
-    h.textContent = "Recently used";
+    h.textContent = tr("panel.recently_used", "Recently used");
     modelRecents.appendChild(h);
     // Prefer the live aggregated row (fresh label/effort) when the provider is
     // connected; otherwise fall back to the stored display fields.
@@ -21235,14 +21834,34 @@ function buildPanel() {
       renderModelWindow();
       if (isSearch) {
         modelEmpty.hidden = false;
+        // Two complete sentences rather than a stem plus an appended "." / hint: the
+        // "connect more" nudge fires on providerCount <= 1, which INCLUDES 0 — and 0 takes
+        // the plural "other" form in English, so the hint and the plural are independent
+        // axes. Folding them into one plural set would have dropped the nudge at 0.
+        const modelQ = modelQuery.trim();
         modelEmpty.textContent =
-          `No model matches “${modelQuery.trim()}” across ${providerCount} connected provider${providerCount === 1 ? "" : "s"}` +
-          (providerCount <= 1 ? " — connect more to search wider." : ".");
+          providerCount <= 1
+            ? tr(
+                "panel.no_model_matches_connect_more",
+                {
+                  one: "No model matches “{query}” across {count} connected provider — connect more to search wider.",
+                  other: "No model matches “{query}” across {count} connected providers — connect more to search wider.",
+                },
+                { query: modelQ, count: providerCount },
+              )
+            : tr(
+                "panel.no_model_matches",
+                {
+                  one: "No model matches “{query}” across {count} connected provider.",
+                  other: "No model matches “{query}” across {count} connected providers.",
+                },
+                { query: modelQ, count: providerCount },
+              );
         modelSearchCap.textContent = "";
       } else {
         // Empty query with nothing left to recommend (e.g. all models are recents).
         modelEmpty.hidden = recentCount > 0;
-        if (!recentCount) modelEmpty.textContent = "No models yet — connect a provider to search.";
+        if (!recentCount) modelEmpty.textContent = tr("panel.no_models_yet_connect_a_provider_to", "No models yet — connect a provider to search.");
         modelSearchCap.textContent = "";
       }
       return;
@@ -21250,10 +21869,22 @@ function buildPanel() {
     modelEmpty.hidden = true;
     modelResults.style.display = "";
     modelSearchCap.textContent = isSearch
-      ? `${modelCurrentRows.length} result${modelCurrentRows.length === 1 ? "" : "s"}`
+      ? tr("panel.count_results", { one: "{count} result", other: "{count} results" }, { count: modelCurrentRows.length })
       : recentCount
-        ? "Recommended"
-        : `Recommended · ${modelCurrentRows.length} model${modelCurrentRows.length === 1 ? "" : "s"} across ${providerCount} provider${providerCount === 1 ? "" : "s"}`;
+        ? tr("panel.recommended", "Recommended")
+        : // Two independent counts in one sentence, and tr() pluralises on a single
+          // `count`. So the provider half is pluralised on its own and injected as a
+          // {providers} phrase — otherwise one of the two would silently take the other's
+          // plural rule. Built inside this branch: renderModelResults() runs on every
+          // keystroke and the other two branches never look at it.
+          tr(
+            "panel.recommended_count_models_across_providers",
+            { one: "Recommended · {count} model across {providers}", other: "Recommended · {count} models across {providers}" },
+            {
+              count: modelCurrentRows.length,
+              providers: tr("panel.count_providers", { one: "{count} provider", other: "{count} providers" }, { count: providerCount }),
+            },
+          );
     modelSizer.style.height = modelCurrentRows.length * MODEL_ROW_H + "px";
     renderModelWindow();
   }
@@ -21343,7 +21974,7 @@ function buildPanel() {
     // orchestrator on that backend's port → handshake repopulates Model + Effort).
     // Only shown when more than one provider is actually available.
     if (knownBackends.length > 1) {
-      section("Provider");
+      section(tr("panel.provider", "Provider"));
       const activeBackend = connectedBackend || selectedBackend;
       for (const b of knownBackends) {
         const id = b.backend;
@@ -21355,7 +21986,9 @@ function buildPanel() {
         const notReady = (backendReady[id] || b).ready === false;
         // A not-ready provider can't be connected — tapping it asks the working
         // agent to help you install/sign in instead of failing a connect.
-        const small = notReady ? `Tap to set up — ${hint}` : BACKEND_HINTS[id] || (id === activeBackend ? "connected" : b.running ? "running" : "");
+        const small = notReady
+          ? tr("panel.tap_to_set_up_hint", "Tap to set up — {hint}", { hint })
+          : BACKEND_HINTS[id] || (id === activeBackend ? tr("panel.connected_lowercase", "connected") : b.running ? tr("panel.running_lowercase", "running") : "");
         // cmcp-provider: the NAME never shrinks; a long hint truncates instead
         // (a long hint used to collapse "Ollama" to nothing). backendDisplayLabel
         // appends "(experimental)" for ToS-risk backends (e.g. Copilot) so picking
@@ -21376,7 +22009,11 @@ function buildPanel() {
         if (id !== activeBackend && row) {
           const off = document.createElement("i");
           off.className = "pi pi-times";
-          off.title = `Hide ${BACKEND_LABELS[id] || id} — you don't use it. Restore it from the "hidden" row below.`;
+          off.title = tr(
+            "panel.hide_provider_you_dont_use_it",
+            'Hide {provider} — you don\'t use it. Restore it from the "hidden" row below.',
+            { provider: BACKEND_LABELS[id] || id },
+          );
           off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);flex:none;";
           off.addEventListener("mousedown", (mev) => {
             // Swallow the row's pick handler — this gesture only hides.
@@ -21393,8 +22030,14 @@ function buildPanel() {
       if (hiddenIds.length) {
         item(
           {
-            label: `${hiddenIds.length} provider${hiddenIds.length === 1 ? "" : "s"} hidden`,
-            small: `${hiddenIds.map((id) => BACKEND_LABELS[id] || id).join(", ")} — tap to show`,
+            label: tr(
+              "panel.count_providers_hidden",
+              { one: "{count} provider hidden", other: "{count} providers hidden" },
+              { count: hiddenIds.length },
+            ),
+            small: tr("panel.names_tap_to_show", "{names} — tap to show", {
+              names: hiddenIds.map((id) => BACKEND_LABELS[id] || id).join(", "),
+            }),
             cls: "cmcp-provider",
           },
           false,
@@ -21410,14 +22053,14 @@ function buildPanel() {
     // search widget is a persistent node re-parented here; renderModelResults()
     // repaints its rows for the current query. Picking a row selects the model AND
     // its provider (a cross-provider pick routes through the switch flow).
-    section("Model");
+    section(tr("panel.model", "Model"));
     modelSearchInput.value = modelQuery;
     modelPop.appendChild(modelSearchWrap);
     renderModelResults();
 
     const efforts = effortsForModel(prefs.model);
     if (efforts.length) {
-      section("Effort");
+      section(tr("panel.effort", "Effort"));
       for (const id of efforts) {
         const meta = effortMeta(id);
         item(meta, id === prefs.effort, () => {
@@ -21429,7 +22072,11 @@ function buildPanel() {
           refreshModelChip();
           modelPop.hidden = true;
           client?.sendFrame?.({ type: "set_options", effort: id });
-          appendSystem(`Effort → ${meta.label}. Continuing this chat at the new effort…`);
+          appendSystem(
+            tr("panel.effort_arrow_continuing_this_chat", "Effort → {effort}. Continuing this chat at the new effort…", {
+              effort: meta.label,
+            }),
+          );
         });
       }
     }
@@ -21488,11 +22135,17 @@ function buildPanel() {
       if (snapped !== before && prefs.userSet) {
         if (snapped) {
           appendSystem(
-            `Reasoning effort set to ${effortMeta(snapped).label} for ${modelLabel(modelCatalog, prefs.model)} (nearest level this model supports).`,
+            tr(
+              "panel.reasoning_effort_set_to_effort_for_model",
+              "Reasoning effort set to {effort} for {model} (nearest level this model supports).",
+              { effort: effortMeta(snapped).label, model: modelLabel(modelCatalog, prefs.model) },
+            ),
           );
         } else {
           appendSystem(
-            `${modelLabel(modelCatalog, prefs.model)} has no reasoning-effort control; effort cleared.`,
+            tr("panel.model_has_no_reasoning_effort_control", "{model} has no reasoning-effort control; effort cleared.", {
+              model: modelLabel(modelCatalog, prefs.model),
+            }),
           );
         }
       }
@@ -21542,9 +22195,9 @@ function buildPanel() {
   const spacer = document.createElement("span");
   spacer.className = "cmcp-spacer";
 
-  const attachBtn = iconBtn("pi-paperclip", "Attach an image, video, workflow (.json), or text file");
-  const micBtn = iconBtn("pi-microphone", "Dictate (browser speech recognition)");
-  const sendBtn = iconBtn("pi-send", "Send (Enter)");
+  const attachBtn = iconBtn("pi-paperclip", tr("panel.attach_an_image_video_workflow_json_or", "Attach an image, video, workflow (.json), or text file"));
+  const micBtn = iconBtn("pi-microphone", tr("panel.dictate_browser_speech_recognition", "Dictate (browser speech recognition)"));
+  const sendBtn = iconBtn("pi-send", tr("panel.send_enter", "Send (Enter)"));
   sendBtn.type = "submit";
 
   const fileInput = document.createElement("input");
@@ -21573,8 +22226,8 @@ function buildPanel() {
     b.append(i, span);
     return b;
   }
-  const deafenBtn = toolbarBtn("pi-volume-up", "Deafen");
-  const blindBtn = toolbarBtn("pi-eye", "Blind");
+  const deafenBtn = toolbarBtn("pi-volume-up", tr("panel.deafen", "Deafen"));
+  const blindBtn = toolbarBtn("pi-eye", tr("panel.blind", "Blind"));
   // Icon-only (user request): the glyph + tint + tooltip carry the state; the
   // label span stays in the DOM (visually hidden) for screen readers.
   deafenBtn.classList.add("cmcp-toolbtn-iconic");
@@ -21605,23 +22258,40 @@ function buildPanel() {
   function reflectFeedGates() {
     deafenSlash.style.display = AGENT_MUTED ? "" : "none";
     deafenBtn.classList.toggle("gate-on-deafen", AGENT_MUTED);
-    deafenBtn.querySelector("span").textContent = AGENT_MUTED ? "Deafened" : "Deafen";
+    deafenBtn.querySelector("span").textContent = AGENT_MUTED
+      ? tr("panel.deafened", "Deafened")
+      : tr("panel.deafen", "Deafen");
     deafenBtn.title = AGENT_MUTED
-      ? "Agent feed: DEAFENED — no renders, images, errors, or canvas events reach any agent right now. " +
-        "Messages you type still go through normally. Click to restore the live feed."
-      : "Agent feed: live. The agent automatically hears about canvas activity — finished renders, " +
-        "execution errors, graph changes. Click to DEAFEN: the agent hears nothing until you undeafen " +
-        "(your typed messages still work). Use it to work on the canvas without the agent reacting.";
+      ? tr(
+          "panel.agent_feed_deafened",
+          "Agent feed: DEAFENED — no renders, images, errors, or canvas events reach any agent right now. " +
+            "Messages you type still go through normally. Click to restore the live feed.",
+        )
+      : tr(
+          "panel.agent_feed_live",
+          "Agent feed: live. The agent automatically hears about canvas activity — finished renders, " +
+            "execution errors, graph changes. Click to DEAFEN: the agent hears nothing until you undeafen " +
+            "(your typed messages still work). Use it to work on the canvas without the agent reacting.",
+        );
     const bi = blindBtn.querySelector(".pi");
     bi.className = `pi ${AGENT_BLIND ? "pi-eye-slash" : "pi-eye"}`;
     blindBtn.classList.toggle("gate-on-blind", AGENT_BLIND);
-    blindBtn.querySelector("span").textContent = AGENT_BLIND ? "Blind" : "Blind";
+    // Unlike Deafen/Deafened, both Blind states read "Blind" — the icon and tint carry
+    // the state. One key, not two identical ones, so a translator isn't asked to make a
+    // distinction the English doesn't make either.
+    blindBtn.querySelector("span").textContent = tr("panel.blind", "Blind");
     blindBtn.title = AGENT_BLIND
-      ? "Image feed: BLIND — the agent still gets text notifications about renders and results, but " +
-        "NEVER receives the image pixels. Click to allow images again."
-      : "Image feed: on — the agent can receive the actual pixels of finished renders (to verify its " +
-        "work, judge quality, etc.). Click for BLIND mode: it keeps getting text notifications and " +
-        "results but never the images — for content you'd rather no cloud model ever sees.";
+      ? tr(
+          "panel.image_feed_blind",
+          "Image feed: BLIND — the agent still gets text notifications about renders and results, but " +
+            "NEVER receives the image pixels. Click to allow images again.",
+        )
+      : tr(
+          "panel.image_feed_on",
+          "Image feed: on — the agent can receive the actual pixels of finished renders (to verify its " +
+            "work, judge quality, etc.). Click for BLIND mode: it keeps getting text notifications and " +
+            "results but never the images — for content you'd rather no cloud model ever sees.",
+        );
     try {
       const fg = ring.querySelector(".fg");
       if (fg) fg.style.stroke = AGENT_MUTED ? "#e5484d" : "";
@@ -21657,7 +22327,10 @@ function buildPanel() {
       _blindAckPending = setTimeout(() => {
         _blindAckPending = null;
         appendSystem(
-          "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+          tr(
+            "panel.the_orchestrator_didnt_acknowledge_the_blind_change",
+            "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+          ),
         );
       }, 6000);
     }
@@ -21775,7 +22448,7 @@ function buildPanel() {
   const openRunpod = () => openSidePanelTab("local");
   const civitaiBtn = toolbarBtn("pi-circle", "CivitAI");
   civitaiBtn.querySelector(".pi").remove();
-  civitaiBtn.title = "CivitAI explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
+  civitaiBtn.title = tr("panel.civitai_explorer_browse_and_pull_models_loras", "CivitAI explorer — browse and pull models, LoRAs, and workflows without leaving the panel.");
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
   // Clicking the already-open CivitAI tab toggles it closed.
   civitaiBtn.addEventListener("click", () => toggleSidePanelTab("civitai", () => openCivitai({ dock: true })));
@@ -21806,7 +22479,7 @@ function buildPanel() {
   // squares (mini-app launcher mark), currentColor like the neighbors.
   const appsBtn = toolbarBtn("pi-circle", "Apps");
   appsBtn.querySelector(".pi").remove();
-  appsBtn.title = "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.";
+  appsBtn.title = tr("panel.apps_one_click_micro_apps_built_from", "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.");
   appsBtn.addEventListener("click", () => toggleSidePanelTab("apps", () => openApps()));
   {
     const svgNs = "http://www.w3.org/2000/svg";
@@ -21829,7 +22502,7 @@ function buildPanel() {
   // Same side-panel treatment as the CivitAI browser; dumbbell mark via currentColor.
   const trainingBtn = toolbarBtn("pi-circle", "Training");
   trainingBtn.querySelector(".pi").remove();
-  trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
+  trainingBtn.title = tr("panel.lora_training_train_a_character_lora_locally", "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).");
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
   trainingBtn.addEventListener("click", () => toggleSidePanelTab("training", () => openTraining({ dock: true })));
   {
@@ -21855,9 +22528,9 @@ function buildPanel() {
   // `comfyui_target` frames (wired below). The pod runs our template → full parity.
   let _runpodStatus = null; // last runpod_status frame
   let _comfyuiTarget = null; // last comfyui_target frame
-  const runpodBtn = toolbarBtn("pi-circle", "Local");
+  const runpodBtn = toolbarBtn("pi-circle", tr("panel.local", "Local"));
   runpodBtn.querySelector(".pi").remove();
-  runpodBtn.title = "RunPod — run this session on a cloud GPU (deploy / start / stop / connect), or switch back to local.";
+  runpodBtn.title = tr("panel.runpod_run_this_session_on_a_cloud", "RunPod — run this session on a cloud GPU (deploy / start / stop / connect), or switch back to local.");
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -21897,21 +22570,40 @@ function buildPanel() {
     if (onPod && s && s.watching) {
       label.textContent = s.name || s.pod_id || "RunPod";
     } else if (onPod) {
-      label.textContent = "RunPod";
+      label.textContent = tr("panel.runpod", "RunPod");
     } else {
-      label.textContent = "Local";
+      label.textContent = tr("panel.local", "Local");
     }
     runpodBtn.classList.toggle("cmcp-runpod-onpod", onPod);
     const alertCount = _runpodAlerts.size;
     runpodBtn.style.color = alertCount > 0 ? "#f59e0b" : onPod ? "#60a5fa" : "";
     const gpu = s && s.watching && s.gpu ? ` · ${s.gpu}` : "";
     const cost = s && s.watching && s.cost_per_hr != null ? ` · $${Number(s.cost_per_hr).toFixed(3)}/hr` : "";
+    // The reason lookup stays INSIDE the guard: _runpodAlerts is empty in the common
+    // case and `[...values()][0]` would throw on it.
     const alertNote = alertCount > 0
-      ? ` ⚠ ${alertCount} pod alert${alertCount > 1 ? "s" : ""}: ${[..._runpodAlerts.keys()].join(", ")} — auto-connect ${[..._runpodAlerts.values()][0].reason === "superseded" ? "superseded" : "timed out"}, still billing. Click to manage/stop.`
+      ? " " +
+        tr(
+          "panel.pod_alerts_auto_connect_still_billing",
+          {
+            one: "⚠ {count} pod alert: {pods} — auto-connect {reason}, still billing. Click to manage/stop.",
+            other: "⚠ {count} pod alerts: {pods} — auto-connect {reason}, still billing. Click to manage/stop.",
+          },
+          {
+            count: alertCount,
+            pods: [..._runpodAlerts.keys()].join(", "),
+            reason:
+              [..._runpodAlerts.values()][0].reason === "superseded"
+                ? tr("panel.superseded", "superseded")
+                : tr("panel.timed_out", "timed out"),
+          },
+        )
       : "";
+    // {gpu}/{cost} are pre-rendered " · …" fragments, so the sentence around them can be
+    // reordered freely by a translator without the data moving with it.
     runpodBtn.title = (onPod
-      ? `Rendering on RunPod${gpu}${cost} — click to manage the pod or switch back to local.`
-      : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).") + alertNote;
+      ? tr("panel.rendering_on_runpod_click_to_manage", "Rendering on RunPod{gpu}{cost} — click to manage the pod or switch back to local.", { gpu, cost })
+      : tr("panel.rendering_locally_on_this_machine", "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).")) + alertNote;
   }
   runpodBtn.addEventListener("click", () => toggleSidePanelTab("local", () => openRunpod()));
   // Expose for the bridge callbacks (defined outside this closure). Status/target
@@ -21991,13 +22683,22 @@ function buildPanel() {
       historyPersistenceWarningCode = failure?.code || "history-persistence-unavailable";
       appendSystem(
         failure?.code === "history-canonical-unavailable-shadow-truncated"
-          ? "IndexedDB is unavailable. Only the newest 20 chats / 200 entries fit in the " +
-            "localStorage fallback; older history is still in this open tab but is not durably saved. " +
-            "Keep this tab open, restore browser storage, then send or edit once to retry."
+          ? tr(
+              "panel.indexeddb_is_unavailable_only_the_newest_20",
+              "IndexedDB is unavailable. Only the newest 20 chats / 200 entries fit in the " +
+                "localStorage fallback; older history is still in this open tab but is not durably saved. " +
+                "Keep this tab open, restore browser storage, then send or edit once to retry.",
+            )
           : failure?.code === "history-legacy-shadow-unavailable"
-            ? "Some legacy chat history has no IndexedDB copy and could not be saved to localStorage. " +
-              "Keep this tab open, free browser storage, then send or edit once to retry."
-            : "Chat history could not be saved. Keep this tab open, free browser storage, then send or edit once to retry.",
+            ? tr(
+                "panel.some_legacy_chat_history_has_no_indexeddb",
+                "Some legacy chat history has no IndexedDB copy and could not be saved to localStorage. " +
+                  "Keep this tab open, free browser storage, then send or edit once to retry.",
+              )
+            : tr(
+                "panel.chat_history_could_not_be_saved_keep",
+                "Chat history could not be saved. Keep this tab open, free browser storage, then send or edit once to retry.",
+              ),
       );
     },
   });
@@ -22418,6 +23119,19 @@ function buildPanel() {
     }
   }
 
+  /**
+   * "12 nodes" — the workflow-snapshot chip, shown on a user bubble and again on its
+   * history row. Counted, so it goes through the plural path: Russian needs four forms
+   * and Korean one, and `n === 1 ? "node" : "nodes"` is right in neither.
+   *
+   * A `function` declaration, not a `const` arrow: both callers are hoisted painters that
+   * the hydration path can reach before this line runs, and a TDZ error there would blank
+   * a bubble over a chip.
+   */
+  function nodeCountLabel(count) {
+    return tr("panel.nodes", { one: "{count} node", other: "{count} nodes" }, { count: Number(count) || 0 });
+  }
+
   function paintUser(text, opts = {}) {
     clearEmpty();
     const b = document.createElement("div");
@@ -22427,13 +23141,13 @@ function buildPanel() {
       const version = thread?.workflowVersions?.[opts.workflowVersion];
       const badge = document.createElement("span");
       badge.className = "cmcp-workflow-version";
-      badge.title = version?.path || version?.title || "Workflow snapshot";
+      badge.title = version?.path || version?.title || tr("panel.workflow_snapshot", "Workflow snapshot");
       badge.innerHTML = '<i class="pi pi-sitemap"></i>';
       badge.appendChild(
         document.createTextNode(
           version
-            ? `${version.nodeCount} nodes · ${version.hash}`
-            : `workflow · ${opts.workflowVersion}`,
+            ? `${nodeCountLabel(version.nodeCount)} · ${version.hash}`
+            : tr("panel.workflow", "workflow · {version}", { version: opts.workflowVersion }),
         ),
       );
       b.appendChild(badge);
@@ -22445,7 +23159,7 @@ function buildPanel() {
       const edit = document.createElement("button");
       edit.type = "button";
       edit.className = "cmcp-edit-btn";
-      edit.title = "Edit & roll back from this message";
+      edit.title = tr("panel.edit_roll_back_from_this_message", "Edit & roll back from this message");
       edit.innerHTML = '<i class="pi pi-pencil"></i>';
       const rewindAnchor = opts.rewindAnchor ?? null;
       edit.addEventListener("click", () => openRollbackModal({ mid: opts.mid, text, anchor: rewindAnchor }));
@@ -22557,14 +23271,15 @@ function buildPanel() {
       b.type = "button"; b.className = cls; b.innerHTML = html; if (title) b.title = title;
       return b;
     };
-    const prevBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-prev", "‹", "Previous");
-    const nextBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-next", "›", "Next");
-    const closeBtn = mkBtn("cmcp-lightbox-close", "✕", "Close (Esc)");
+    // The glyphs are punctuation, not words — only the tooltips are translated.
+    const prevBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-prev", "‹", tr("panel.previous", "Previous"));
+    const nextBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-next", "›", tr("panel.next", "Next"));
+    const closeBtn = mkBtn("cmcp-lightbox-close", "✕", tr("panel.close_esc", "Close (Esc)"));
     const caption = document.createElement("div");
     caption.className = "cmcp-lightbox-caption";
     const openBtn = document.createElement("button");
     openBtn.type = "button"; openBtn.className = "cmcp-lightbox-open";
-    openBtn.textContent = "Open original"; openBtn.title = "Open in a new browser tab";
+    openBtn.textContent = tr("panel.open_original", "Open original"); openBtn.title = tr("panel.open_in_a_new_browser_tab", "Open in a new browser tab");
 
     // Release any decoded <video> before it leaves the DOM (memory + stop audio).
     const releaseVideo = () => {
@@ -22696,6 +23411,19 @@ function buildPanel() {
    * these same painters.
    */
   function attachMediaCollapse(card, { url, kind, name, tools, onCollapse }) {
+    // FOUR whole sentences rather than `${verb} this ${kind}`. Gluing a verb to a noun
+    // is an English-only sentence shape: German wants "Dieses Bild ausblenden", Korean
+    // "이 이미지 숨기기", and a translator handed the two halves separately cannot reorder
+    // them. Each combination gets its own key so each language writes its own sentence.
+    const showHideTitle = (collapsed) =>
+      collapsed
+        ? kind === "video"
+          ? tr("panel.show_this_video", "Show this video")
+          : tr("panel.show_this_image", "Show this image")
+        : kind === "video"
+          ? tr("panel.hide_this_video", "Hide this video")
+          : tr("panel.hide_this_image", "Hide this image");
+
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "cmcp-media-collapse";
@@ -22708,24 +23436,26 @@ function buildPanel() {
     stub.className = "cmcp-media-stub";
     stub.setAttribute("role", "button");
     stub.tabIndex = 0;
-    stub.title = `Show this ${kind}`;
+    stub.title = showHideTitle(true);
     const icon = document.createElement("span");
     icon.setAttribute("aria-hidden", "true");
     icon.textContent = kind === "video" ? "🎬" : "🖼";
     const label = document.createElement("span");
     label.className = "cmcp-media-stub-name";
-    label.textContent = name || (kind === "video" ? "Video" : "Image");
+    // `name` is the agent's own caption/filename and stays exactly as it arrived; only
+    // the generic stand-in when there is no caption is ours to translate.
+    label.textContent = name || (kind === "video" ? tr("panel.video", "Video") : tr("panel.image", "Image"));
     const hint = document.createElement("span");
-    hint.textContent = "· hidden, click to show";
+    hint.textContent = tr("panel.hidden_click_to_show", "· hidden, click to show");
     stub.append(icon, label, hint);
     card.appendChild(stub);
 
     const apply = (collapsed) => {
       card.classList.toggle("cmcp-media-collapsed", collapsed);
       btn.textContent = collapsed ? "▸" : "▾";
-      const verb = collapsed ? "Show" : "Hide";
-      btn.title = `${verb} this ${kind}`;
-      btn.setAttribute("aria-label", `${verb} this ${kind}`);
+      const title = showHideTitle(collapsed);
+      btn.title = title;
+      btn.setAttribute("aria-label", title);
       btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
       if (collapsed) {
         try {
@@ -22783,7 +23513,7 @@ function buildPanel() {
     const tools = mediaToolsFor(card);
     const img = document.createElement("img");
     img.src = url;
-    img.alt = name || "output";
+    img.alt = name || tr("panel.output", "output"); // read aloud by screen readers
     img.loading = "lazy";
     // NO inline `display` — it would outrank the collapsed rule in the stylesheet
     // and the card would never actually hide (#818). `.cmcp-imgcard > img` sets it.
@@ -22875,8 +23605,11 @@ function buildPanel() {
       // the only one, and the other codes get a narrower sentence that claims no cause.
       const unsupported = v.error?.code === 4;
       holder.textContent = unsupported
-        ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
-        : "This video could not be loaded.";
+        ? tr(
+            "panel.this_browser_can_t_play_this_video",
+            "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM.",
+          )
+        : tr("panel.this_video_could_not_be_loaded", "This video could not be loaded.");
       holder._preFailCss = holder.style.cssText;
       holder.style.cssText +=
         ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
@@ -22937,8 +23670,8 @@ function buildPanel() {
     const expandBtn = document.createElement("button");
     expandBtn.type = "button";
     expandBtn.className = "cmcp-media-expand";
-    expandBtn.title = "View full size";
-    expandBtn.setAttribute("aria-label", "View full size");
+    expandBtn.title = tr("panel.view_full_size", "View full size");
+    expandBtn.setAttribute("aria-label", tr("panel.view_full_size", "View full size"));
     expandBtn.innerHTML = "⛶";
     expandBtn.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
     tools.appendChild(expandBtn);
@@ -23023,11 +23756,11 @@ function buildPanel() {
     a.target = "_blank";
     a.rel = "noopener noreferrer";
     if (name) a.download = name;
-    a.textContent = name || "Open file";
+    a.textContent = name || tr("panel.open_file", "Open file");
     card.appendChild(a);
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
-    hint.textContent = "The panel can't preview this file type — open or download it.";
+    hint.textContent = tr("panel.the_panel_can_t_preview_this_file", "The panel can't preview this file type — open or download it.");
     card.appendChild(hint);
     log.appendChild(card);
     scrollLog();
@@ -23091,7 +23824,7 @@ function buildPanel() {
     const reply = coerceMessageText(text);
     appendUser(reply, {});
     const ok = client?.sendUserMessage?.(reply);
-    if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
+    if (!ok) appendSystem(tr("panel.card_reply_couldn_t_be_sent_agent", "Card reply couldn't be sent — agent disconnected."));
   }
 
   /**
@@ -23173,7 +23906,7 @@ function buildPanel() {
       }
       log.appendChild(renderA2UIInert(m.spec, m.choice));
     } catch {
-      log.appendChild(renderA2UIFailCard(m?.spec, ["stored card failed to render"]));
+      log.appendChild(renderA2UIFailCard(m?.spec, [tr("panel.stored_card_failed_to_render", "stored card failed to render")]));
     }
   }
 
@@ -23209,7 +23942,8 @@ function buildPanel() {
     }
     const q = document.createElement("div");
     q.style.cssText = "font-weight:600;margin:0.15rem 0 0.5rem;";
-    renderRichText(q, coerceMessageText(msg.question) || "Pick one:");
+    // The agent's own question is never translated — only our stand-in when it sent none.
+    renderRichText(q, coerceMessageText(msg.question) || tr("panel.pick_one_prompt", "Pick one:"));
     card.appendChild(q);
 
     const selected = new Set();
@@ -23256,7 +23990,7 @@ function buildPanel() {
       a.textContent = `✓ ${answerText}`;
       card.appendChild(a);
       // Record as a plain card so a reload restores it as static text, not a widget.
-      record({ role: "card", icon: "pi-check", text: questionText || "Choice", detail: answerText });
+      record({ role: "card", icon: "pi-check", text: questionText || tr("panel.choice", "Choice"), detail: answerText });
       scrollLog();
       resolveFn(answer);
     };
@@ -23299,7 +24033,7 @@ function buildPanel() {
     otherRow.style.cssText = "display:flex;gap:0.3rem;margin-top:0.4rem;";
     const other = document.createElement("input");
     other.type = "text";
-    other.placeholder = "Other… (type your own answer)";
+    other.placeholder = tr("panel.other_type_your_own_answer", "Other… (type your own answer)");
     other.style.cssText =
       "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
@@ -23314,7 +24048,7 @@ function buildPanel() {
     submit.style.cssText =
       "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
-    submit.textContent = multi ? "Submit" : "Send";
+    submit.textContent = multi ? tr("panel.submit", "Submit") : tr("panel.send", "Send");
     submit.addEventListener("click", () => {
       if (done) return;
       if (other.value.trim()) finish(other.value.trim());
@@ -23415,10 +24149,22 @@ function buildPanel() {
       const note = document.createElement("div");
       note.className = "cmcp-card-stale";
       note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.8;margin-top:0.4rem;";
-      note.textContent =
-        `The connection that asked this ${what ?? "question"} dropped, so an answer here can no ` +
-        `longer reach the agent. ` +
-        (detail ?? "If it asked again, answer the newer card.");
+      // `what` and `detail` arrive already translated from the call sites — the caller
+      // knows which kind of card it is, and a `{what}` hole lets each language place the
+      // noun where its grammar wants it rather than mid-sentence as English does.
+      //
+      // The two sentences are JOINED here rather than the first one carrying a trailing
+      // space. Edge whitespace in a catalog value is silently droppable and `i18n-check`
+      // only validates holes, so a translator who trimmed it would glue two sentences
+      // together with no way to see why.
+      note.textContent = [
+        tr(
+          "panel.the_connection_that_asked_this_dropped_so",
+          "The connection that asked this {what} dropped, so an answer here can no longer reach the agent.",
+          { what: what ?? tr("panel.question", "question") },
+        ),
+        detail ?? tr("panel.if_it_asked_again_answer_the_newer", "If it asked again, answer the newer card."),
+      ].join(" ");
       card.appendChild(note);
     } catch {
       /* presentation only — never break a reconnect */
@@ -23446,14 +24192,20 @@ function buildPanel() {
     lock.className = "pi pi-lock";
     const t = document.createElement("span");
     t.style.fontWeight = "600";
-    t.textContent = msg.label || "Paste your token";
+    // `msg.label` / `msg.hint` are the agent's own words and pass through untouched; only
+    // the panel's stand-in for a card that supplied neither is translated.
+    t.textContent = msg.label || tr("panel.paste_your_token", "Paste your token");
     head.append(lock, t);
     card.appendChild(head);
 
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.7;margin:0.2rem 0 0.4rem;";
     hint.textContent =
-      msg.hint || "Sent straight to your config — never shown to the agent and never saved to chat history.";
+      msg.hint ||
+      tr(
+        "panel.sent_straight_to_your_config_never_shown",
+        "Sent straight to your config — never shown to the agent and never saved to chat history.",
+      );
     card.appendChild(hint);
 
     let done = false;
@@ -23497,7 +24249,7 @@ function buildPanel() {
     input.type = "password";
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = "Paste token…";
+    input.placeholder = tr("panel.paste_token", "Paste token…");
     input.style.cssText =
       "flex:1 1 10rem;min-width:0;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
@@ -23517,10 +24269,13 @@ function buildPanel() {
       const ok = document.createElement("div");
       ok.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);color:var(--p-green-400,#4ade80);";
       const m = mask(value);
-      ok.textContent = value ? `🔒 Token saved: ${m}` : "Skipped — no token entered.";
+      ok.textContent = value
+        ? tr("panel.token_saved", "🔒 Token saved: {masked}", { masked: m })
+        : tr("panel.skipped_no_token_entered", "Skipped — no token entered.");
       card.appendChild(ok);
-      // Record ONLY the masked preview — never the full value.
-      record({ role: "card", icon: "pi-lock", text: msg.label || "Token", detail: value ? `saved ${m}` : "skipped" });
+      // Record ONLY the masked preview — never the full value. `detail` stays English:
+      // it is a machine-shaped audit note ("saved ab…yz"), not a sentence.
+      record({ role: "card", icon: "pi-lock", text: msg.label || tr("panel.token", "Token"), detail: value ? `saved ${m}` : "skipped" });
       scrollLog();
       resolveFn(value || "");
     };
@@ -23550,7 +24305,7 @@ function buildPanel() {
     submit.style.cssText =
       "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
-    submit.textContent = "Save";
+    submit.textContent = tr("panel.save", "Save");
     submit.addEventListener("click", () => finish(input.value.trim()));
     btns.appendChild(submit);
 
@@ -23559,7 +24314,7 @@ function buildPanel() {
     skip.style.cssText =
       "flex:none;padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:transparent;color:inherit;cursor:pointer;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);";
-    skip.textContent = "Skip";
+    skip.textContent = tr("panel.skip", "Skip");
     skip.addEventListener("click", () => finish(""));
     btns.appendChild(skip);
     row.appendChild(btns);
@@ -23584,10 +24339,12 @@ function buildPanel() {
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
-          what: "secret request",
-          detail:
+          what: tr("panel.secret_request", "secret request"),
+          detail: tr(
+            "panel.nothing_was_sent_and_nothing_was_stored",
             "Nothing was sent and nothing was stored. Wait for the agent to ask again on " +
-            "the new connection — do not paste the value into the chat.",
+              "the new connection — do not paste the value into the chat.",
+          ),
         }),
       abandon,
     });
@@ -23675,8 +24432,8 @@ function buildPanel() {
     if (!statusEl) return;
     statusEl.className = "cmcp-msg-status " + state;
     statusEl.replaceChildren(
-      iconAction("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
-      iconAction("pi-times", "Cancel this message", () => deleteMsg(mid)),
+      iconAction("pi-pencil", tr("panel.edit_pull_back_to_the_composer", "Edit — pull back to the composer"), () => editMsg(mid)),
+      iconAction("pi-times", tr("panel.cancel_this_message", "Cancel this message"), () => deleteMsg(mid)),
     );
   }
 
@@ -23841,7 +24598,7 @@ function buildPanel() {
       if (v.ok) appendA2UICard(v.spec);
       else {
         log.appendChild(renderA2UIFailCard(s.raw, v.errors));
-        record({ role: "card", icon: "pi-exclamation-triangle", text: "Unsupported card", detail: v.errors[0] || "invalid a2ui spec" });
+        record({ role: "card", icon: "pi-exclamation-triangle", text: tr("a2ui.unsupported_card", "Unsupported card"), detail: v.errors[0] || "invalid a2ui spec" });
         scrollLog();
       }
     }
@@ -23934,7 +24691,7 @@ function buildPanel() {
     det.className = "cmcp-think";
     det.open = true;
     const sum = document.createElement("summary");
-    sum.textContent = "Thinking…";
+    sum.textContent = tr("panel.thinking", "Thinking…");
     const body = document.createElement("div");
     body.className = "cmcp-think-body";
     det.append(sum, body);
@@ -23963,7 +24720,7 @@ function buildPanel() {
       kickStreams(s);
     } else if (phase === "text") {
       const s = ensureStreamBubble(id);
-      collapseThinking(s, "See thinking"); // reply began → tuck the reasoning away
+      collapseThinking(s, tr("panel.see_thinking", "See thinking")); // reply began → tuck the reasoning away
       s.replyTarget += delta;
       s.replyEl.classList.add("streaming-cursor");
       kickStreams(s);
@@ -23976,7 +24733,7 @@ function buildPanel() {
     animating.delete(s);
     streamBubbles.delete(s.id);
     s.replyEl.classList.remove("streaming-cursor");
-    collapseThinking(s, "See thinking");
+    collapseThinking(s, tr("panel.see_thinking", "See thinking"));
     renderRichText(s.replyEl, s.commitText); // streamed plain text → final markdown
     s.el.classList.remove("streaming");
     record({ role: "agent", text: s.commitText }); // thinking is ephemeral
@@ -24070,9 +24827,17 @@ function buildPanel() {
       box.dataset.testid = 'panel-whats-new';
       const head = document.createElement('div');
       head.className = 'cmcp-whatsnew-head';
+      // Only the heading is ours. The entries below come from changelog.json, which is
+      // written in English at release time and has no translated counterpart to fetch.
       head.textContent = lastSeen
-        ? `Updated to ${PANEL_VERSION} (you were on ${lastSeen}) — what changed:`
-        : `ComfyUI Agent Panel ${PANEL_VERSION} — recent changes:`;
+        ? tr(
+            "panel.updated_to_you_were_on_what_changed",
+            "Updated to {version} (you were on {lastSeen}) — what changed:",
+            { version: PANEL_VERSION, lastSeen },
+          )
+        : tr("panel.comfyui_agent_panel_recent_changes", "ComfyUI Agent Panel {version} — recent changes:", {
+            version: PANEL_VERSION,
+          });
       box.appendChild(head);
       const list = document.createElement('ul');
       list.className = 'cmcp-whatsnew-list';
@@ -24242,7 +25007,11 @@ function buildPanel() {
     if (!followsPanel && !isThreadInScope(t, scopeKey)) {
       detachInvalidCurrentThread({ scopeKey, rebind: true });
       appendSystem(
-        `Blocked a chat from another workflow. Open "${t?.workflowTitle || "its owning workflow"}" before resuming it.`,
+        tr(
+          "panel.blocked_a_chat_from_another_workflow_open",
+          'Blocked a chat from another workflow. Open "{workflow}" before resuming it.',
+          { workflow: t?.workflowTitle || tr("panel.its_owning_workflow", "its owning workflow") },
+        ),
       );
       return false;
     }
@@ -24305,9 +25074,18 @@ function buildPanel() {
     const initial = currentWorkflowId == null;
     if (!initial && chatScopeMode() === "ask") {
       const name = wf?.filename || wfkey || wfid;
+      // Two keys, not one: the OK/Cancel body is the same in both branches of every
+      // future scope prompt, and splitting it keeps the question (which interpolates a
+      // filename) apart from the fixed explanation of the two buttons.
       askModeFollowsPanel = window.confirm(
-        `Continue the current Agent Panel conversation on "${name}"?\n\n` +
-          "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
+        tr("panel.continue_the_current_agent_panel_conversation_on", 'Continue the current Agent Panel conversation on "{name}"?', {
+          name,
+        }) +
+          "\n\n" +
+          tr(
+            "panel.ok_carry_this_chat_to_the_new",
+            "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
+          ),
       );
     }
     const followsPanel = historyScopeFollowsPanel();
@@ -24432,7 +25210,9 @@ function buildPanel() {
             `Your panel_* graph tools operate on THIS graph now; re-read it (panel_graph_outline) before ` +
             `assuming or editing anything, since earlier turns may refer to a different workflow.`,
         );
-        appendSystem(`Canvas → ${name} (same conversation).`);
+        // The armContext line just above is AGENT-facing and stays English; this one is
+        // the transcript note the human reads, so only this one is translated.
+        appendSystem(tr("panel.canvas_same_conversation", "Canvas → {name} (same conversation).", { name }));
       }
       return;
     }
@@ -24527,12 +25307,12 @@ function buildPanel() {
     const search = document.createElement("input");
     search.type = "search";
     search.className = "cmcp-hist-search";
-    search.placeholder = "Search chats…";
-    search.setAttribute("aria-label", "Search chat history");
+    search.placeholder = tr("panel.search_chats", "Search chats…");
+    search.setAttribute("aria-label", tr("panel.search_chat_history", "Search chat history"));
     search.dataset.testid = "history-search";
-    const exportBtn = iconBtn("pi-download", "Export all chat history");
+    const exportBtn = iconBtn("pi-download", tr("panel.export_all_chat_history", "Export all chat history"));
     exportBtn.dataset.testid = "history-export";
-    const importBtn = iconBtn("pi-upload", "Import chat history (merge)");
+    const importBtn = iconBtn("pi-upload", tr("panel.import_chat_history_merge", "Import chat history (merge)"));
     importBtn.dataset.testid = "history-import";
     const currentOnlyLabel = document.createElement("label");
     currentOnlyLabel.className = "cmcp-hist-filter";
@@ -24540,7 +25320,7 @@ function buildPanel() {
     currentOnly.type = "checkbox";
     currentOnly.checked = !historyScopeFollowsPanel();
     currentOnly.dataset.testid = "history-current-workflow";
-    currentOnlyLabel.append(currentOnly, document.createTextNode("Current workflow only"));
+    currentOnlyLabel.append(currentOnly, document.createTextNode(tr("panel.current_workflow_only", "Current workflow only")));
     tools.append(search, exportBtn, importBtn, currentOnlyLabel);
 
     const listEl = document.createElement("div");
@@ -24548,8 +25328,8 @@ function buildPanel() {
     histPop.append(tools, listEl);
 
     function friendlyWorkflowName(t) {
-      if (t.workflowKey === "panel:global") return "Panel-wide conversations";
-      return t.workflowTitle || t.workflowKey?.replace(/^workflow:|^wf:/, "") || "Unknown workflow";
+      if (t.workflowKey === "panel:global") return tr("panel.wide_conversations", "Panel-wide conversations");
+      return t.workflowTitle || t.workflowKey?.replace(/^workflow:|^wf:/, "") || tr("panel.unknown_workflow", "Unknown workflow");
     }
 
     function rowAction(icon, titleText, onClick, extraClass = "") {
@@ -24615,7 +25395,9 @@ function buildPanel() {
         const none = document.createElement("div");
         none.className = "cmcp-sys";
         none.style.padding = "0.75rem";
-        none.textContent = q ? "No chats match this search." : "No past chats in this scope yet.";
+        none.textContent = q
+          ? tr("panel.no_chats_match_this_search", "No chats match this search.")
+          : tr("panel.no_past_chats_in_this_scope_yet", "No past chats in this scope yet.");
         listEl.appendChild(none);
         return;
       }
@@ -24657,13 +25439,13 @@ function buildPanel() {
       const lbl = document.createElement("span");
       lbl.className = "lbl";
       const firstUser = t.msgs.find((m) => m.role === "user");
-      lbl.textContent = (t.title || firstUser?.text || "(no messages)").slice(0, 80);
+      lbl.textContent = (t.title || firstUser?.text || tr("panel.no_messages", "(no messages)")).slice(0, 80);
       const sub = document.createElement("span");
       sub.className = "cmcp-hist-sub";
       const latestVersion = Object.values(t.workflowVersions || {}).sort(
         (a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0),
       )[0];
-      sub.textContent = [t.provider, t.model, latestVersion ? `${latestVersion.nodeCount} nodes · ${latestVersion.hash}` : null]
+      sub.textContent = [t.provider, t.model, latestVersion ? `${nodeCountLabel(latestVersion.nodeCount)} · ${latestVersion.hash}` : null]
         .filter(Boolean)
         .join(" · ");
       meta.append(lbl, sub);
@@ -24680,12 +25462,19 @@ function buildPanel() {
       const legacyReadonly = t.legacyShadow === true;
       if (foreignWorkflow) {
         item.disabled = true;
-        item.title = `Open ${friendlyWorkflowName(t)} before resuming this chat`;
-        item.setAttribute("aria-label", `${lbl.textContent} — open that workflow before resuming`);
+        item.title = tr("panel.open_before_resuming_this_chat", "Open {workflow} before resuming this chat", {
+          workflow: friendlyWorkflowName(t),
+        });
+        item.setAttribute(
+          "aria-label",
+          tr("panel.open_that_workflow_before_resuming", "{title} — open that workflow before resuming", {
+            title: lbl.textContent,
+          }),
+        );
         row.classList.add("foreign-workflow");
       } else if (legacyReadonly) {
         item.disabled = true;
-        item.title = "A pre-upgrade copy kept for reference — it can't be resumed";
+        item.title = tr("panel.a_pre_upgrade_copy_kept_for_reference", "A pre-upgrade copy kept for reference — it can't be resumed");
         row.classList.add("foreign-workflow");
       }
       item.addEventListener("click", () => {
@@ -24694,20 +25483,31 @@ function buildPanel() {
         loadThread(t);
       });
 
-      const pin = rowAction(t.pinned ? "pi-bookmark-fill" : "pi-bookmark", t.pinned ? "Unpin chat" : "Pin chat", () => {
+      const pin = rowAction(t.pinned ? "pi-bookmark-fill" : "pi-bookmark", t.pinned ? tr("panel.unpin_chat", "Unpin chat") : tr("panel.pin_chat", "Pin chat"), () => {
         historyStore.reviseThread(t, { pinned: !t.pinned });
         persistThreads();
         paintList();
       }, t.pinned ? "on" : "");
-      const rename = rowAction("pi-pencil", "Rename chat", () => {
-        const next = window.prompt("Chat title", t.title || firstUser?.text || "New chat");
+      const rename = rowAction("pi-pencil", tr("panel.rename_chat", "Rename chat"), () => {
+        // The PROMPT is translated; the pre-filled default is not. "New chat" is the
+        // title this thread is already STORED under (see the record() path above), so
+        // translating it here would hand the user a different string than the row shows
+        // and write a locale-specific title into IndexedDB on OK.
+        //
+        // Not the same case as a `record({ text })` card entry, which IS translated at the
+        // point it is written: a transcript row is a record of what was ON SCREEN at that
+        // moment, and freezing its language is correct. A thread TITLE is live metadata
+        // re-rendered on every repaint, so a frozen one goes stale the moment the user
+        // switches language.
+        const next = window.prompt(tr("panel.chat_title", "Chat title"), t.title || firstUser?.text || "New chat");
         if (next == null) return;
         historyStore.reviseThread(t, { title: next.trim().slice(0, 160) || null });
         persistThreads();
         paintList();
       });
-      const del = rowAction("pi-trash", "Delete this chat", () => {
-        if (!window.confirm(`Delete chat "${t.title || firstUser?.text || "New chat"}"?`)) return;
+      const del = rowAction("pi-trash", tr("panel.delete_this_chat", "Delete this chat"), () => {
+        const title = t.title || firstUser?.text || "New chat";
+        if (!window.confirm(tr("panel.delete_chat", 'Delete chat "{title}"?', { title }))) return;
         const now = nextHistoryRevision();
         historyMeta.deletedThreads = historyMeta.deletedThreads || {};
         historyMeta.deletedThreads[t.id] = {
@@ -24754,7 +25554,9 @@ function buildPanel() {
         if (!file) return;
         try {
           if (file.size > CHAT_HISTORY_MAX_IMPORT_BYTES) {
-            throw new Error("Chat history import exceeds the 25 MB limit");
+            // Caught two lines below and shown to the user, so this message is UI text
+            // rather than a developer log — hence the translation.
+            throw new Error(tr("panel.chat_history_import_exceeds_the_25_mb", "Chat history import exceeds the 25 MB limit"));
           }
           const currentThreadId = thread?.id;
           const imported = historyStore.importPayload(await file.text(), threads, historyMeta);
@@ -24768,14 +25570,36 @@ function buildPanel() {
           }
           persistThreads();
           paintList();
+          // "chat(s)" / "alias(es)" was English hedging around a count. Both go through
+          // the plural path now, so a language with more (or fewer) forms than English
+          // gets a real sentence instead of a parenthesised suffix it cannot use.
           appendSystem(
-            `Merged ${imported.importedCount || 0} imported chat(s); existing history was preserved.` +
-            (imported.skippedAliasCount
-              ? ` ${imported.skippedAliasCount} extra workflow alias(es) were skipped at the storage limit.`
-              : ""),
+            tr(
+              "panel.merged_imported_chats_existing_history_was_preserved",
+              {
+                one: "Merged {count} imported chat; existing history was preserved.",
+                other: "Merged {count} imported chats; existing history was preserved.",
+              },
+              { count: imported.importedCount || 0 },
+            ) +
+              (imported.skippedAliasCount
+                ? " " +
+                  tr(
+                    "panel.extra_workflow_aliases_were_skipped_at_the",
+                    {
+                      one: "{count} extra workflow alias was skipped at the storage limit.",
+                      other: "{count} extra workflow aliases were skipped at the storage limit.",
+                    },
+                    { count: imported.skippedAliasCount },
+                  )
+                : ""),
           );
         } catch (error) {
-          appendSystem(`History import failed: ${coerceMessageText(error?.message || error)}`);
+          appendSystem(
+            tr("panel.history_import_failed", "History import failed: {error}", {
+              error: coerceMessageText(error?.message || error),
+            }),
+          );
         }
       }, { once: true });
       picker.click();
@@ -24789,36 +25613,43 @@ function buildPanel() {
     footer.className = "cmcp-hist-footer";
     const note = document.createElement("p");
     note.className = "cmcp-hist-note";
-    note.textContent = "Transcripts are stored in this browser using IndexedDB.";
+    note.textContent = tr("panel.transcripts_are_stored_in_this_browser_using", "Transcripts are stored in this browser using IndexedDB.");
     const clear = document.createElement("button");
     clear.type = "button";
     clear.className = "cmcp-hist-clear";
     clear.disabled = !threads.length;
-    clear.title = "Permanently clear chat history for every workflow in this browser";
+    clear.title = tr("panel.permanently_clear_chat_history_for_every_workflow", "Permanently clear chat history for every workflow in this browser");
     const clearIcon = document.createElement("i");
     clearIcon.className = "pi pi-trash";
     const clearLabel = document.createElement("span");
-    clearLabel.textContent = "Clear all history";
+    clearLabel.textContent = tr("panel.clear_all_history", "Clear all history");
     clear.append(clearIcon, clearLabel);
     clear.addEventListener("click", async () => {
       if (!threads.length) return;
       const confirmed = globalThis.confirm?.(
-        "Clear all Agent Panel chat history from this browser?\n\n" +
-        "This affects every workflow and open ComfyUI tab. It cannot be undone. " +
-        "Your workflows and their stable identities will not be deleted.",
+        tr("panel.clear_all_agent_panel_chat_history_from", "Clear all Agent Panel chat history from this browser?") +
+          "\n\n" +
+          tr(
+            "panel.this_affects_every_workflow_and_open_comfyui",
+            "This affects every workflow and open ComfyUI tab. It cannot be undone. " +
+              "Your workflows and their stable identities will not be deleted.",
+          ),
       );
       if (!confirmed) return;
       clear.disabled = true;
-      clearLabel.textContent = "Clearing…";
+      clearLabel.textContent = tr("panel.clearing", "Clearing…");
       const result = await historyStore.clearAll(threads, historyMeta);
       if (!result?.ok || !result.snapshot) {
         clear.disabled = false;
-        clearLabel.textContent = "Clear all history";
+        clearLabel.textContent = tr("panel.clear_all_history", "Clear all history");
         appendSystem(
           result?.code === "history-clear-canonical-unavailable"
-            ? "Chat history could not be cleared because IndexedDB is unavailable or blocked. " +
-              "Close other ComfyUI tabs and retry; in permanent private-storage mode, clear this site's browser data."
-            : "Chat history could not be cleared. Keep this tab open and try again.",
+            ? tr(
+                "panel.chat_history_could_not_be_cleared_because",
+                "Chat history could not be cleared because IndexedDB is unavailable or blocked. " +
+                  "Close other ComfyUI tabs and retry; in permanent private-storage mode, clear this site's browser data.",
+              )
+            : tr("panel.chat_history_could_not_be_cleared_keep", "Chat history could not be cleared. Keep this tab open and try again."),
         );
         return;
       }
@@ -24842,7 +25673,7 @@ function buildPanel() {
       ctxLabel.textContent = "—";
       client?.sendFrame?.({ type: "new_session" });
       histPop.hidden = true;
-      appendSystem("Chat history was cleared from this browser.");
+      appendSystem(tr("panel.chat_history_was_cleared_from_this_browser", "Chat history was cleared from this browser."));
     });
     footer.append(note, clear);
     histPop.appendChild(footer);
@@ -24863,6 +25694,10 @@ function buildPanel() {
   // including silent tool work where nothing posts to the chat — so it never
   // looks idle right before a big reply lands. Whimsical status words cycle so
   // it's clearly alive.
+  // DELIBERATELY NOT TRANSLATED. These are nonsense-word jokes ("Flibbertigibbeting",
+  // "Reticulating splines" — a SimCity gag), and a per-word key would ask a translator to
+  // render a pun they have no source for. A language that wants its own set of jokes needs
+  // its own LIST, not twelve translations of one; that is a bigger change than this pass.
   const WORK_WORDS = [
     "Flibbertigibbeting",
     "Reticulating splines",
@@ -24970,11 +25805,14 @@ function buildPanel() {
     // words. A running tool clears the token meter (setThinkingAction), so the
     // action label wins during silent tool phases rather than a stale count.
     let base;
-    if (thinkingReconnecting) base = "Reconnecting… (turn still running)";
-    else if (thinkingTokens > 0) base = `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`;
+    if (thinkingReconnecting) base = tr("panel.reconnecting_turn_still_running", "Reconnecting… (turn still running)");
+    else if (thinkingTokens > 0)
+      // NOT the plural path: `tokens` here is always a formatted string ("1.4k"), not a
+      // number, so there is no count for Intl to categorise.
+      base = tr("panel.thinking_tokens", "Thinking… ({tokens} tokens)", { tokens: fmtThinkTokens(thinkingTokens) });
     else if (thinkingAction) base = thinkingAction;
     else base = `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
-    thinkingLabel.textContent = `${base} (Esc or Ctrl+C to stop)`;
+    thinkingLabel.textContent = tr("panel.esc_or_ctrl_c_to_stop", "{status} (Esc or Ctrl+C to stop)", { status: base });
     workWordIdx += 1;
   }
   // Live extended-thinking token meter (from the orchestrator's thinking frame).
@@ -24993,7 +25831,9 @@ function buildPanel() {
     let s = String(name || "").trim();
     s = s.split(".").pop() || s; // drop a "panel." (etc.) namespace prefix
     s = s.replace(/^panel_/, "").replace(/_/g, " ").trim();
-    return s ? `Using ${s}…` : "Working…";
+    // `{tool}` stays English — it is a tool NAME off the wire ("query graph"), and there
+    // is no catalog of tool names to translate it against. The frame around it is ours.
+    return s ? tr("panel.using", "Using {tool}…", { tool: s }) : tr("panel.working", "Working…");
   }
   function setThinkingAction(name) {
     thinkingAction = humanizeAction(name);
@@ -25433,7 +26273,7 @@ function buildPanel() {
         log.appendChild(renderA2UIFailCard(msg.spec, v.errors));
         scrollLog();
         // Record a plain card so the fail chip survives reload (matches the fence path).
-        record({ role: "card", icon: "pi-exclamation-triangle", text: "Unsupported card", detail: v.errors[0] || "invalid a2ui spec" });
+        record({ role: "card", icon: "pi-exclamation-triangle", text: tr("a2ui.unsupported_card", "Unsupported card"), detail: v.errors[0] || "invalid a2ui spec" });
         throw new Error(`invalid a2ui spec: ${v.errors.slice(0, 5).join("; ")}`);
       }
       const card_id = appendA2UICard(v.spec);
@@ -25682,7 +26522,12 @@ function buildPanel() {
           sessionId: ssGet(SESSION_KEY),
         });
         ssSet(REBOOT_KEY, armedMarker);
-        appendSystem("Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.");
+        appendSystem(
+          tr(
+            "panel.restarting_comfyui_to_load_new_nodes_i",
+            "Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.",
+          ),
+        );
         // ssSet is best-effort (a full/blocked sessionStorage throws and is
         // swallowed). Verify the EXACT value landed, not merely that some marker is
         // present — a refused overwrite would leave a PREVIOUS reboot's marker,
@@ -25692,7 +26537,10 @@ function buildPanel() {
         if (ssGet(REBOOT_KEY) !== armedMarker) {
           ssSet(REBOOT_KEY, null); // better no marker than a stale one deciding this restart
           appendSystem(
-            "Heads up: this browser wouldn't let me save the restart marker, so I can't auto-resume after the restart — reconnect manually if the agent goes quiet.",
+            tr(
+              "panel.heads_up_this_browser_wouldn_t_let",
+              "Heads up: this browser wouldn't let me save the restart marker, so I can't auto-resume after the restart — reconnect manually if the agent goes quiet.",
+            ),
           );
         }
       }
@@ -25782,7 +26630,11 @@ function buildPanel() {
         const switched = connectedBackend !== null && connectedBackend !== backend;
         if (switched) {
           appendSystem(
-            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
+            tr(
+              "panel.switched_to_sessions_aren_t_shared_across",
+              "Switched to {backend} — sessions aren't shared across providers, so this starts a fresh chat.",
+              { backend: BACKEND_LABELS[backend] },
+            ),
           );
         }
         selectedBackend = backend;
@@ -25796,7 +26648,7 @@ function buildPanel() {
         renderBackendChips(
           Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
             backend: el.dataset.backend,
-            running: el.title === "Running",
+            running: el.dataset.running === "1",
           })),
         );
       }
@@ -25856,7 +26708,18 @@ function buildPanel() {
       // killing the in-flight reply). Let the user know so the picker selection
       // not taking effect *this* turn isn't a mystery.
       if (ack?.kind === "options" && ack.deferred) {
-        appendSystem(`Effort → ${ack.effort ?? "default"} — applies after the current turn finishes.`);
+        // "default" is a WORD the user reads, so it gets its own whole sentence rather
+        // than riding in as a placeholder — an English word interpolated into a
+        // translated frame ("努力 → default — …") is the defect this file works around
+        // for `action:` in the revert family, and here it is avoidable. `== null` keeps
+        // the old `??` semantics exactly: an empty-string effort still renders as one.
+        appendSystem(
+          ack.effort == null
+            ? tr("panel.effort_default_applies_after_the_current_turn", "Effort → default — applies after the current turn finishes.")
+            : tr("panel.effort_applies_after_the_current_turn_finishes", "Effort → {effort} — applies after the current turn finishes.", {
+                effort: ack.effort,
+              }),
+        );
         return;
       }
       // A "ready" ack PROVES this backend actually runs on the agent machine —
@@ -25888,7 +26751,7 @@ function buildPanel() {
         const origin = ssGet(SOFT_RELOAD_KEY);
         ssSet(SOFT_RELOAD_KEY, null);
         ssSet(MID_TASK_KEY, null); // deliberate reload — don't also fire the drop nudge
-        appendSystem("Agent reloaded — session resumed.");
+        appendSystem(tr("panel.agent_reloaded_session_resumed", "Agent reloaded — session resumed."));
         if (origin === "agent") {
           showThinking();
           client.sendUserMessage(
@@ -25908,7 +26771,7 @@ function buildPanel() {
         // would inject a spurious turn into a live session. A real ComfyUI restart
         // takes many seconds to come back, so a long gap since the drop = real.
         if (Date.now() - lastBridgeDownAt < 6000) return;
-        appendSystem("Reconnected — picking up where we left off.");
+        appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         client.sendUserMessage(
           "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
@@ -26109,7 +26972,9 @@ function buildPanel() {
         kind: "run_error",
         error: `A queued render failed while the connection was down (prompt ${promptId}).`,
       });
-      if (sent) appendSystem("A queued render failed while the connection was down.");
+      // The `error:` frame above is AGENT-facing and stays English; only this
+      // transcript line is read by the user.
+      if (sent) appendSystem(tr("panel.a_queued_render_failed_while_the_connection", "A queued render failed while the connection was down."));
       // A muted agent intentionally suppresses this (sendFrame also returns false);
       // reconcileKey already marked it delivered, so leave it. Only a genuine
       // transport failure re-pends so the next reconnect/retry re-delivers it.
@@ -26126,7 +26991,12 @@ function buildPanel() {
         `The workflow run you queued was cancelled while the connection was down (prompt ${promptId}). ` +
         `It did not crash; no action is required unless the cancellation was unintended.`;
       const sent = client.sendFrame({ type: "agent_event", kind: "executed", note });
-      if (sent) appendSystem(`Queued render was cancelled while disconnected (prompt ${promptId}).`);
+      if (sent)
+        appendSystem(
+          tr("panel.queued_render_was_cancelled_while_disconnected_prompt", "Queued render was cancelled while disconnected (prompt {promptId}).", {
+            promptId,
+          }),
+        );
       // Match terminal-error recovery: only a transport drop re-pends the
       // cancellation notice; an intentionally muted agent stays silent.
       else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
@@ -26144,7 +27014,9 @@ function buildPanel() {
           `Render status for prompt ${promptId} could not be confirmed after reconnecting ` +
           `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
       });
-      appendSystem(`Render status unknown for prompt ${promptId} — safe to requeue.`);
+      appendSystem(
+        tr("panel.render_status_unknown_for_prompt_safe_to", "Render status unknown for prompt {promptId} — safe to requeue.", { promptId }),
+      );
       // #585: give-up EVICTS the run from the recovery ledger, so unlike the
       // error/interrupted paths there is nothing to re-pend if this notice didn't
       // land. Flag it so the run still reads as unsettled-in-truth: a
@@ -26415,7 +27287,10 @@ function buildPanel() {
     if (rebootPruneFailureNoticeShown) return;
     rebootPruneFailureNoticeShown = true;
     appendSystem(
-      "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+      tr(
+        "panel.note_this_browser_wouldn_t_let_me",
+        "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+      ),
     );
   }
 
@@ -26476,10 +27351,13 @@ function buildPanel() {
 
   /** Human label for the conversation that armed the reboot, for the held notice. */
   function rebootArmingThreadLabel(marker) {
+    // The unnamed fallback is prose the user reads inside the notices below, so it is
+    // translated; a real thread title / workflow key is the user's own text and is not.
+    const unnamed = tr("panel.another_conversation", "another conversation");
     const tid = marker?.threadId;
-    if (!tid) return "another conversation";
+    if (!tid) return unnamed;
     const t = threads.find((candidate) => candidate.id === tid) || null;
-    return t?.title || t?.workflowKey || "another conversation";
+    return t?.title || t?.workflowKey || unnamed;
   }
 
   /** The arming conversation isn't on screen — hold, and tell the user where it went. */
@@ -26487,8 +27365,12 @@ function buildPanel() {
     if (!rebootSessionNoticeShown) {
       rebootSessionNoticeShown = true;
       appendSystem(
-        `A restart resume is waiting for ${rebootArmingThreadLabel(step.marker)} — switch back to it to pick that work up. ` +
-          `I won't send it here; it belongs to the conversation that asked for the restart.`,
+        tr(
+          "panel.a_restart_resume_is_waiting_for_switch",
+          "A restart resume is waiting for {thread} — switch back to it to pick that work up. " +
+            "I won't send it here; it belongs to the conversation that asked for the restart.",
+          { thread: rebootArmingThreadLabel(step.marker) },
+        ),
       );
     }
     armRebootWatch();
@@ -26501,8 +27383,12 @@ function buildPanel() {
     rebootSessionNoticeShown = false;
     ssSet(REBOOT_KEY, null);
     appendSystem(
-      `The restart resume for ${rebootArmingThreadLabel(step.marker)} expired without being delivered — ` +
-        `it was never re-opened. If that conversation was mid-build, tell it to continue.`,
+      tr(
+        "panel.the_restart_resume_for_expired_without_being",
+        "The restart resume for {thread} expired without being delivered — " +
+          "it was never re-opened. If that conversation was mid-build, tell it to continue.",
+        { thread: rebootArmingThreadLabel(step.marker) },
+      ),
     );
   }
 
@@ -26568,8 +27454,14 @@ function buildPanel() {
         ssSet(REBOOT_KEY, retained); // keep the marker itself, just without the count
         if (!rebootAttemptCountUnreliableNoticeShown) {
           rebootAttemptCountUnreliableNoticeShown = true;
+          // `_2` / `_3` suffixes: three distinct "Note: this browser wouldn't let me …"
+          // messages slug to the same first-seven-words key, so they are disambiguated the
+          // way scripts/i18n-extract.mjs disambiguates a collision.
           appendSystem(
-            "Note: this browser wouldn't let me record the restart-nudge attempt, so I can't tell whether one already went out. I'll warn the agent about a possible duplicate.",
+            tr(
+              "panel.note_this_browser_wouldn_t_let_me_2",
+              "Note: this browser wouldn't let me record the restart-nudge attempt, so I can't tell whether one already went out. I'll warn the agent about a possible duplicate.",
+            ),
           );
         }
       }
@@ -26628,12 +27520,24 @@ function buildPanel() {
     ssSet(MID_TASK_KEY, null);
     rebootWaitNoticeShown = false;
     rebootSessionNoticeShown = false;
+    // WHOLE sentences, one per reachable case, never a fragment spliced into a finished
+    // one. A `" (prompt {ids})"` fragment would carry a load-bearing LEADING SPACE into
+    // the catalog, where a translation memory that trims edge whitespace silently welds
+    // it to the preceding word — and a language that moves the parenthetical could not
+    // move it at all.
     appendSystem(
       unconfirmed
-        ? `Reconnected — couldn't confirm the render that was in flight before the restart${
-            owed.length ? ` (prompt ${owed.join(", ")})` : ""
-          }. Resuming, and telling the agent to check the queue before re-running.`
-        : "Reconnected — resuming where we left off.",
+        ? owed.length
+          ? tr(
+              "panel.reconnected_couldn_t_confirm_the_render_that",
+              "Reconnected — couldn't confirm the render that was in flight before the restart (prompt {ids}). Resuming, and telling the agent to check the queue before re-running.",
+              { ids: owed.join(", ") },
+            )
+          : tr(
+              "panel.reconnected_couldn_t_confirm_the_render_that_2",
+              "Reconnected — couldn't confirm the render that was in flight before the restart. Resuming, and telling the agent to check the queue before re-running.",
+            )
+        : tr("panel.reconnected_resuming_where_we_left_off", "Reconnected — resuming where we left off."),
     );
     showThinking();
     armRebootWatch(); // keep watching until the orchestrator acknowledges receipt
@@ -26663,7 +27567,10 @@ function buildPanel() {
     // write, so disclose it rather than pretend the state is clean.
     if (ssGet(REBOOT_KEY) != null) {
       appendSystem(
-        "Note: this browser wouldn't let me clear the restart marker. If you reload, I may repeat the restart nudge — ignore the second one.",
+        tr(
+          "panel.note_this_browser_wouldn_t_let_me_3",
+          "Note: this browser wouldn't let me clear the restart marker. If you reload, I may repeat the restart nudge — ignore the second one.",
+        ),
       );
     }
     return true;
@@ -26756,7 +27663,10 @@ function buildPanel() {
       if (!rebootResumeStalledNoticeShown) {
         rebootResumeStalledNoticeShown = true;
         appendSystem(
-          "Couldn't confirm the restart nudge reached the agent. Keeping it pending — it'll retry when the connection next comes back.",
+          tr(
+            "panel.couldn_t_confirm_the_restart_nudge_reached",
+            "Couldn't confirm the restart nudge reached the agent. Keeping it pending — it'll retry when the connection next comes back.",
+          ),
         );
       }
       return false;
@@ -26835,7 +27745,10 @@ function buildPanel() {
       if (!rebootWaitNoticeShown) {
         rebootWaitNoticeShown = true;
         appendSystem(
-          "Reconnected — holding the restart nudge until the render that was already in flight reports back.",
+          tr(
+            "panel.reconnected_holding_the_restart_nudge_until_the",
+            "Reconnected — holding the restart nudge until the render that was already in flight reports back.",
+          ),
         );
       }
       armRebootWatch(); // marker deliberately RETAINED; the watch reissues the resume
@@ -26993,7 +27906,7 @@ function buildPanel() {
     // Only flag a restart if our bridge actually went down — a benign ComfyUI WS
     // blip (asset view / image check) shouldn't print a false "restarting" alarm.
     if ((ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) && !client.isConnected()) {
-      appendSystem("ComfyUI is restarting…");
+      appendSystem(tr("panel.comfyui_is_restarting", "ComfyUI is restarting…"));
     }
   }
   function onComfyReconnected() {
@@ -27032,7 +27945,7 @@ function buildPanel() {
     ) {
       return;
     }
-    appendSystem("ComfyUI is back — reconnecting the agent…");
+    appendSystem(tr("panel.comfyui_is_back_reconnecting_the_agent", "ComfyUI is back — reconnecting the agent…"));
     connectAgent();
   }
   try {
@@ -27049,7 +27962,7 @@ function buildPanel() {
 
   saveBtn.addEventListener("click", () => {
     client.setUrl(urlInput.value.trim());
-    appendSystem(`Reconnecting to ${redactBridgeUrl(client.currentUrl())}…`);
+    appendSystem(tr("panel.reconnecting_to_url", "Reconnecting to {url}…", { url: redactBridgeUrl(client.currentUrl()) }));
   });
 
   // Connect: ask ComfyUI's server to start the background agent on demand, then
@@ -27111,9 +28024,13 @@ function buildPanel() {
     externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
     appendSystem(
-      "No agent is listening on the bridge (" + bridge + "). This ComfyUI won’t " +
-        "start one — run the agent on YOUR machine, then click Connect:\n" +
-        "    " + connectCommand(),
+      tr(
+        "panel.no_agent_is_listening_on_the_bridge",
+        "No agent is listening on the bridge ({bridge}). This ComfyUI won’t " +
+          "start one — run the agent on YOUR machine, then click Connect:\n" +
+          "    {command}",
+        { bridge, command: connectCommand() },
+      ),
     );
   }
   function resetAutoReclaim() {
@@ -27207,7 +28124,7 @@ function buildPanel() {
   // timer: it can't loop, so no competing-respawn storm.
   function escalateSoftReload() {
     if (!softReloadInFlight) return; // handshake already landed / guard cleared → nothing to do
-    appendSystem("The agent reload is taking too long to hand off — reconnecting cleanly…");
+    appendSystem(tr("panel.the_agent_reload_is_taking_too_long", "The agent reload is taking too long to hand off — reconnecting cleanly…"));
     client.stop(); // drop the stuck socket so connect() won't early-return on an OPEN sock
     connecting = false; // don't let a stale in-flight guard block the escalation connect
     void connectAgent();
@@ -27242,15 +28159,18 @@ function buildPanel() {
       if (!respawnGaveUpNoticed) {
         respawnGaveUpNoticed = true;
         appendSystem(
-          "⚠ The panel agent keeps failing to start. Check you're signed in " +
-            "(run `claude` once, `codex login` for Codex, `gemini` for Gemini, or `ollama serve` for local models), then click Connect.",
+          tr(
+            "panel.the_panel_agent_keeps_failing_to_start",
+            "⚠ The panel agent keeps failing to start. Check you're signed in " +
+              "(run `claude` once, `codex login` for Codex, `gemini` for Gemini, or `ollama serve` for local models), then click Connect.",
+          ),
         );
       }
       return false;
     }
     autoRespawnsLeft -= 1;
     autoRespawning = true;
-    appendSystem("The panel agent dropped — restarting it…");
+    appendSystem(tr("panel.the_panel_agent_dropped_restarting_it", "The panel agent dropped — restarting it…"));
     const myGen = connectGen;
     void (async () => {
       try {
@@ -27274,7 +28194,7 @@ function buildPanel() {
         }
       } catch (err) {
         if (myGen !== connectGen) return;
-        appendSystem(`Auto-restart failed: ${coerceMessageText(err?.message ?? err)}`);
+        appendSystem(tr("panel.auto_restart_failed", "Auto-restart failed: {error}", { error: coerceMessageText(err?.message ?? err) }));
         autoRespawnsLeft = 0; // can't reach the pack → don't loop
         client.start(); // resume the bare WS retry so the client isn't left idle
       } finally {
@@ -27295,7 +28215,7 @@ function buildPanel() {
     if (handshakeRedialsLeft <= 0) return false;
     if (timedOutUrl !== client.currentUrl()) return false;
     handshakeRedialsLeft -= 1;
-    appendSystem("The panel agent isn't answering yet — reconnecting…");
+    appendSystem(tr("panel.the_panel_agent_isn_t_answering_yet", "The panel agent isn't answering yet — reconnecting…"));
     client.setUrl(client.currentUrl()); // close + reopen on the same url → fresh hello
     return true;
   }
@@ -27309,8 +28229,10 @@ function buildPanel() {
     autoReclaimsLeft -= 1;
     autoReclaiming = true;
     appendSystem(
-      "No response from the panel agent on the bridge — the orchestrator looks wedged. " +
-        "Restarting it automatically…",
+      tr(
+        "panel.no_response_from_the_panel_agent_on",
+        "No response from the panel agent on the bridge — the orchestrator looks wedged. " + "Restarting it automatically…",
+      ),
     );
     const myGen = connectGen; // tie to the current connect generation
     void (async () => {
@@ -27341,7 +28263,7 @@ function buildPanel() {
         }
       } catch (err) {
         if (myGen !== connectGen) return;
-        appendSystem(`Auto-restart failed: ${coerceMessageText(err?.message ?? err)}`);
+        appendSystem(tr("panel.auto_restart_failed", "Auto-restart failed: {error}", { error: coerceMessageText(err?.message ?? err) }));
         autoReclaimsLeft = 0; // can't reach the pack → don't loop
       } finally {
         autoReclaiming = false;
@@ -27430,7 +28352,7 @@ function buildPanel() {
     lsSet(USER_DISCONNECTED_KEY, null);
     connecting = true;
     connectBtn.disabled = true;
-    connectBtn.textContent = "Starting…";
+    connectBtn.textContent = tr("panel.starting", "Starting…");
     // Honor whatever is typed in the Bridge URL field — Connect previously
     // ignored it (only Reconnect applied it), so editing the port (e.g. 9181)
     // then clicking Connect still hit the old URL. setUrl persists + reconnects.
@@ -27503,7 +28425,11 @@ function buildPanel() {
       if (myGen !== connectGen) return; // superseded → swallow the stale error too
       // No /connect route (older/headless host) — fall through and try the
       // bridge directly in case the user started the orchestrator themselves.
-      appendSystem(`Couldn't reach ComfyUI to start the agent: ${coerceMessageText(err?.message ?? err)}`);
+      appendSystem(
+        tr("panel.couldn_t_reach_comfyui_to_start_the", "Couldn't reach ComfyUI to start the agent: {error}", {
+          error: coerceMessageText(err?.message ?? err),
+        }),
+      );
     } finally {
       connecting = false;
     }
@@ -27587,7 +28513,7 @@ function buildPanel() {
     renderBackendChips(
       Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
         backend: el.dataset.backend,
-        running: el.title === "Running",
+        running: el.dataset.running === "1",
       })),
     );
     // Switching to a DIFFERENT backend than we're connected to: agent sessions are
@@ -27672,7 +28598,7 @@ function buildPanel() {
         }
       }
       ssSet(SIDEBAR_REOPEN_KEY, "1");
-      appendSystem("Reloading the panel UI (new frontend code)…");
+      appendSystem(tr("panel.reloading_the_panel_ui_new_frontend_code", "Reloading the panel UI (new frontend code)…"));
       // #584 — the cmcpReload page-URL param busts only the top document; the
       // panel's JS MODULES can still come straight out of heuristic cache,
       // which is exactly how a stale bundle survived this very reload. Prime
@@ -27711,7 +28637,7 @@ function buildPanel() {
     // that made soft reload fail intermittently). Cleared on handshake or by the
     // guard's safety timeout.
     setSoftReloadGuard();
-    appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
+    appendSystem(tr("panel.soft_reloading_the_agent_new_code_no", "Soft-reloading the agent (new code, no ComfyUI restart)…"));
     try {
       // Whole lifecycle (stop → bounded POST → decide interlock → ALWAYS start) lives
       // in performSoftReloadRecovery so the "reload never leaves the bridge dead"
@@ -27752,13 +28678,24 @@ function buildPanel() {
         note: (outcome) => {
           if (outcome?.error) {
             appendSystem(
-              `Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: ${coerceMessageText(outcome.error?.message ?? outcome.error)}`,
+              tr("panel.couldn_t_reach_comfyui_to_reload_the", "Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: {error}", {
+                error: coerceMessageText(outcome.error?.message ?? outcome.error),
+              }),
             );
           } else {
             const cmd = outcome?.startCommand || "";
+            // The manual-restart tail is its own key because it only appears when the
+            // orchestrator reported a start command. The separating newline stays in the
+            // CODE, not in the catalog: a leading "\n" inside a translated value is edge
+            // whitespace, and translation tooling trims it.
             appendSystem(
-              "Reconnecting the panel bridge…" +
-                (cmd ? `\n(To load new orchestrator code, restart it manually: ${cmd})` : ""),
+              tr("panel.reconnecting_the_panel_bridge", "Reconnecting the panel bridge…") +
+                (cmd
+                  ? "\n" +
+                    tr("panel.to_load_new_orchestrator_code_restart_it", "(To load new orchestrator code, restart it manually: {command})", {
+                      command: cmd,
+                    })
+                  : ""),
             );
           }
         },
@@ -27786,7 +28723,7 @@ function buildPanel() {
   async function hardRestart(origin = "user") {
     if (reloading) return;
     reloading = true;
-    appendSystem("Restarting the agent backend…");
+    appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -27795,13 +28732,19 @@ function buildPanel() {
       if (data?.ok) {
         ok = true;
       } else {
+        // `data.message` is the pack's own text and arrives already-worded; only our own
+        // fallback is ours to translate.
         appendSystem(
           data?.message ||
-            "Restart failed — try Disconnect then Connect, or fully restart ComfyUI.",
+            tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
         );
       }
     } catch (err) {
-      appendSystem(`Couldn't reach ComfyUI to restart the agent: ${coerceMessageText(err?.message ?? err)}`);
+      appendSystem(
+        tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
+          error: coerceMessageText(err?.message ?? err),
+        }),
+      );
     } finally {
       reloading = false;
     }
@@ -27810,12 +28753,19 @@ function buildPanel() {
       // resume (resuming would restore the wedged shell). Don't arm the resume
       // nudge. The reconnect spins up a brand-new agent.
       if (!await invalidateDurableAgentSession()) {
-        appendSystem("The old session could not be invalidated durably; reconnect is paused to avoid restoring it.");
+        appendSystem(
+          tr(
+            "panel.the_old_session_could_not_be_invalidated",
+            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+          ),
+        );
         return;
       }
       ssSet(SOFT_RELOAD_KEY, null);
       ssSet(MID_TASK_KEY, null);
-      appendSystem("Agent restarted with a fresh session — your message history is still here.");
+      appendSystem(
+        tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
+      );
     }
     // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
     // restore the bridge we dropped (the old backend may still be intact).
@@ -27849,7 +28799,7 @@ function buildPanel() {
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
     connectBtn.disabled = false;
-    connectBtn.textContent = "Connect";
+    connectBtn.textContent = tr("panel.connect", "Connect");
     statusText.textContent = "disconnected";
     dot.className = "cmcp-dot";
     settingsBox.hidden = false;
@@ -27858,7 +28808,7 @@ function buildPanel() {
     } catch {
       // best-effort; a user-run orchestrator is intentionally left running
     }
-    appendSystem("Disconnected. Click Connect to start again.");
+    appendSystem(tr("panel.disconnected_click_connect_to_start_again", "Disconnected. Click Connect to start again."));
   });
 
   // ---- slash commands (run locally, no agent round-trip) ----
@@ -27876,54 +28826,66 @@ function buildPanel() {
    *  keeps a rejection from escaping as an unhandled promise, and surfaces it in the
    *  transcript instead of only the console. */
   function runSlashCommand(entry) {
+    // `cmd` is the literal command the user typed ("/revert") — a placeholder, never
+    // translated prose.
+    const failed = (err) =>
+      appendSystem(
+        tr("panel.slash_command_failed", "{cmd} failed: {error}", { cmd: entry.cmd, error: coerceMessageText(err?.message ?? err) }),
+      );
     try {
-      Promise.resolve(entry.run()).catch((err) => {
-        appendSystem(`${entry.cmd} failed: ${coerceMessageText(err?.message ?? err)}`);
-      });
+      Promise.resolve(entry.run()).catch(failed);
     } catch (err) {
-      appendSystem(`${entry.cmd} failed: ${coerceMessageText(err?.message ?? err)}`);
+      failed(err);
     }
   }
 
   const SLASH_COMMANDS = [
-    { cmd: "/new", icon: "pi-plus", hint: "start a new chat", run: () => newChat() },
+    { cmd: "/new", icon: "pi-plus", get hint() { return tr("panel.start_a_new_chat", "start a new chat"); }, run: () => newChat() },
     {
       cmd: "/fit",
       icon: "pi-window-maximize",
-      hint: "fit the canvas to the graph",
+      get hint() { return tr("panel.fit_the_canvas_to_the_graph", "fit the canvas to the graph"); },
       run: () => runLocalCommand("graph_canvas", { action: "fit" }),
     },
-    { cmd: "/run", icon: "pi-play", hint: "queue the open workflow", run: () => runLocalCommand("graph_run", {}) },
+    { cmd: "/run", icon: "pi-play", get hint() { return tr("panel.queue_the_open_workflow", "queue the open workflow"); }, run: () => runLocalCommand("graph_run", {}) },
     {
       cmd: "/reload",
       icon: "pi-sync",
-      hint: "soft-reload the agent (new code, keeps ComfyUI + this chat)",
+      get hint() { return tr("panel.soft_reload_the_agent_new_code_keeps", "soft-reload the agent (new code, keeps ComfyUI + this chat)"); },
       run: () => softReload("user", "orchestrator"),
     },
     {
       cmd: "/reload-ui",
       icon: "pi-refresh",
-      hint: "reload just the panel UI (new frontend code, keeps the session)",
+      get hint() { return tr("panel.reload_just_the_panel_ui_new_frontend", "reload just the panel UI (new frontend code, keeps the session)"); },
       run: () => softReload("user", "frontend"),
     },
     {
       cmd: "/restart",
       icon: "pi-refresh",
-      hint: "restart the agent backend — recover an unresponsive agent",
+      get hint() { return tr("panel.restart_the_agent_backend_recover_an_unresponsive", "restart the agent backend — recover an unresponsive agent"); },
       run: () => hardRestart("user"),
     },
     {
       cmd: "/revert",
       icon: "pi-undo",
-      hint: "undo the last turn's graph edits — revert the canvas to before your last message",
+      get hint() { return tr("panel.undo_the_last_turn_s_graph_edits", "undo the last turn's graph edits — revert the canvas to before your last message"); },
       run: async () => {
         const outcome = await revertGraphToLastSnapshot();
         const label = outcome?.snapshot?.label;
         appendSystem(
           describeRevertOutcome(outcome, {
+            // `action` is spliced INTO describeRevertOutcome's own English refusal/failure
+            // sentences (lib/graph-revert.js), so translating it here would produce a
+            // half-translated line. It stays English until that lib is converted too.
             action: "revert",
-            restoredText: `↩ Reverted the canvas to before${label ? ` “${label}”` : " your last message"}.`,
-            noneText: "Nothing to revert — no graph snapshot captured in this session yet.",
+            // Two whole sentences rather than one with a conditional clause: the label is
+            // the user's own snapshot title, and a language that reorders the sentence
+            // needs the placeholder to move with it.
+            restoredText: label
+              ? tr("panel.reverted_the_canvas_to_before_label", "↩ Reverted the canvas to before “{label}”.", { label })
+              : tr("panel.reverted_the_canvas_to_before_your_last", "↩ Reverted the canvas to before your last message."),
+            noneText: tr("panel.nothing_to_revert_no_graph_snapshot_captured", "Nothing to revert — no graph snapshot captured in this session yet."),
           }),
         );
       },
@@ -27931,13 +28893,13 @@ function buildPanel() {
     {
       cmd: "/errors",
       icon: "pi-info-circle",
-      hint: "show the last execution errors",
+      get hint() { return tr("panel.show_the_last_execution_errors", "show the last execution errors"); },
       run: () => runLocalCommand("graph_get_errors", {}),
     },
     {
       cmd: "/docs",
       icon: "pi-book",
-      hint: "open the docs — guides for the panel, tools, local LLMs and troubleshooting",
+      get hint() { return tr("panel.open_the_docs_guides_for_the_panel", "open the docs — guides for the panel, tools, local LLMs and troubleshooting"); },
       // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
       // navigation hijacks the whole window with no way back.
       //
@@ -27954,14 +28916,14 @@ function buildPanel() {
       // throw, but a remedy that depends on its own failure path staying healthy is
       // not a remedy.
       run: () => {
-        appendSystem(`Docs: ${DOCS_URL} — if nothing opened, copy that address.`);
+        appendSystem(tr("panel.docs_if_nothing_opened_copy_that_address", "Docs: {url} — if nothing opened, copy that address.", { url: DOCS_URL }));
         openExternalUrl(DOCS_URL);
       },
     },
     {
       cmd: "/help",
       icon: "pi-question-circle",
-      hint: "list commands",
+      get hint() { return tr("panel.list_commands", "list commands"); },
       // These are PANEL SHORTCUTS, not a list of what the agent can do — so /help
       // says where the rest lives rather than leaving the reader to conclude this is
       // everything (#111). Joined with the same " · " as the rest of the line, NOT
@@ -27972,8 +28934,12 @@ function buildPanel() {
       run: () =>
         appendSystem(
           [
+            // `c.cmd` is the literal command and `c.hint` is already translated at its own
+            // call site, so only the closing pointer-to-the-docs is a string of ours.
             ...SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`),
-            `these are panel shortcuts; for what the agent itself can do, see the docs: ${DOCS_URL}`,
+            tr("panel.these_are_panel_shortcuts_for_what_the", "these are panel shortcuts; for what the agent itself can do, see the docs: {url}", {
+              url: DOCS_URL,
+            }),
           ].join(" · "),
         ),
     },
@@ -28210,7 +29176,10 @@ function buildPanel() {
     return att.token || "";
   }
   function attChipLabel(att) {
-    if (att.kind === "text") return `Pasted text #${att.id}`;
+    // DISPLAY only. The bracketed `[Pasted text #N]` token above is wire format — it is
+    // matched against the composer text on send — so it stays English; this label is the
+    // chip the user reads and is not compared against anything.
+    if (att.kind === "text") return tr("panel.pasted_text_chip", "Pasted text #{id}", { id: att.id });
     return att.name || attTokenFor(att) || `#${att.id}`;
   }
   // Remove the attachment + its inline token (and a single trailing space) from
@@ -28261,14 +29230,14 @@ function buildPanel() {
         chipPreview.appendChild(img);
       } else {
         const p = document.createElement("pre");
-        p.textContent = att.name || "image (no preview yet)";
+        p.textContent = att.name || tr("panel.image_no_preview_yet", "image (no preview yet)");
         chipPreview.appendChild(p);
       }
       return;
     }
     const pre = document.createElement("pre");
     const content = att.content != null ? String(att.content) : "";
-    pre.textContent = content || (att.ready ? "Loading…" : "(empty)");
+    pre.textContent = content || (att.ready ? tr("panel.loading", "Loading…") : tr("panel.empty", "(empty)"));
     chipPreview.appendChild(pre);
   }
   // Rebuild the chip strip from attachments[]. Safe to call any time.
@@ -28289,7 +29258,7 @@ function buildPanel() {
       chip.type = "button";
       chip.className = "cmcp-attach-chip";
       if (att.id === openPreviewId) chip.classList.add("open");
-      chip.title = "Click to preview";
+      chip.title = tr("panel.click_to_preview", "Click to preview");
       if (att.kind === "image" && att.dataUrl) {
         const img = document.createElement("img");
         img.className = "cmcp-attach-thumb";
@@ -28308,7 +29277,21 @@ function buildPanel() {
       if (att.kind === "text") {
         const meta = document.createElement("span");
         meta.className = "cmcp-attach-meta";
-        meta.textContent = `${(att.content || "").length.toLocaleString()} chars`;
+        // Counted, so the plural category comes from Intl rather than a trailing "s":
+        // Russian needs one/few/many and Korean needs none of them.
+        //
+        // TWO variables on purpose, and a translator must use `{n}`: `{n}` is the
+        // locale-GROUPED number ("12,345" / "12.345"), `count` is the raw number Intl
+        // reads to pick the category. Grouped with the PANEL's locale, not the browser's
+        // — pickLocale deliberately lets those diverge (an explicit language setting and
+        // ComfyUI's own outrank navigator.languages), and German grouping inside a
+        // Japanese sentence is the visible result of getting that wrong.
+        const chars = (att.content || "").length;
+        meta.textContent = tr(
+          "panel.chars_count",
+          { one: "{n} char", other: "{n} chars" },
+          { count: chars, n: chars.toLocaleString(currentLocale()) },
+        );
         chip.appendChild(meta);
       }
       chip.addEventListener("click", () => toggleAttachPreview(att.id));
@@ -28316,7 +29299,7 @@ function buildPanel() {
       const rm = document.createElement("span");
       rm.className = "cmcp-attach-rm";
       rm.setAttribute("role", "button");
-      rm.title = "Remove attachment";
+      rm.title = tr("panel.remove_attachment", "Remove attachment");
       const rmi = document.createElement("i");
       rmi.className = "pi pi-times";
       rm.appendChild(rmi);
@@ -28583,7 +29566,15 @@ function buildPanel() {
   form.style.position = form.style.position || "relative";
   const dropzone = document.createElement("div");
   dropzone.className = "cmcp-dropzone";
-  dropzone.innerHTML = '<span><i class="pi pi-paperclip"></i> Drop a file to attach</span>';
+  // Built as DOM rather than innerHTML now that the label is translated: a catalog string
+  // must never be parsed as markup, and the structure (span > icon + text) is unchanged.
+  {
+    const dropLabel = document.createElement("span");
+    const dropIcon = document.createElement("i");
+    dropIcon.className = "pi pi-paperclip";
+    dropLabel.append(dropIcon, ` ${tr("panel.drop_a_file_to_attach", "Drop a file to attach")}`);
+    dropzone.appendChild(dropLabel);
+  }
   form.appendChild(dropzone);
   let dragDepth = 0;
   const showDrop = (on) => dropzone.classList.toggle("cmcp-show", on);
@@ -28653,7 +29644,7 @@ function buildPanel() {
   let recognition = null;
   if (!SR) {
     micBtn.disabled = true;
-    micBtn.title = "Voice input is not supported in this browser";
+    micBtn.title = tr("panel.voice_input_is_not_supported_in_this", "Voice input is not supported in this browser");
   }
   micBtn.addEventListener("click", () => {
     if (!SR) return;
@@ -28674,7 +29665,9 @@ function buildPanel() {
       recognition = null;
     });
     recognition.addEventListener("error", (ev) => {
-      if (ev.error !== "aborted") appendSystem(`Voice input error: ${ev.error}`);
+      // `ev.error` is the Web Speech API's own code ("no-speech", "network") — an
+      // identifier, not prose, so it rides in as a placeholder.
+      if (ev.error !== "aborted") appendSystem(tr("panel.voice_input_error", "Voice input error: {error}", { error: ev.error }));
     });
     micBtn.classList.add("active");
     recognition.start();
@@ -28780,9 +29773,22 @@ function buildPanel() {
     const outcome = await revertGraphToLastSnapshot();
     const reverted = revertDidRestore(outcome); // an outcome object is ALWAYS truthy
     if (reverted || recalled) {
+      // Three WHOLE sentences, one per reachable combination, instead of one sentence with
+      // two clauses spliced in. The English is byte-for-byte what the concatenation
+      // produced; the difference is that a translator sees a complete sentence and can
+      // reorder the clauses, which the old form made impossible.
       appendSystem(
-        `↩ Rewound your last turn${reverted ? " — canvas reverted" : ""}` +
-          `${recalled ? "; your message is back in the composer to edit & resend" : ""}.`,
+        reverted && recalled
+          ? tr(
+              "panel.rewound_your_last_turn_canvas_reverted_your",
+              "↩ Rewound your last turn — canvas reverted; your message is back in the composer to edit & resend.",
+            )
+          : reverted
+            ? tr("panel.rewound_your_last_turn_canvas_reverted", "↩ Rewound your last turn — canvas reverted.")
+            : tr(
+                "panel.rewound_your_last_turn_your_message_is",
+                "↩ Rewound your last turn; your message is back in the composer to edit & resend.",
+              ),
       );
       input.focus();
     }
@@ -28796,13 +29802,18 @@ function buildPanel() {
     if (!reverted) {
       appendSystem(
         describeRevertOutcome(outcome, {
+          // English on purpose — see the /revert call site: `action` is interpolated into
+          // the lib's own untranslated refusal/failure sentences.
           action: "rewind the canvas",
           restoredText: "",
           noneText: recalled
-            ? "The canvas was NOT reverted — no graph snapshot for that turn (they are kept for the " +
-              "last 25 and then evicted). Your message is back in the composer, but the canvas still " +
-              "holds that turn's edits."
-            : "Nothing to rewind yet — no message or graph snapshot from this session.",
+            ? tr(
+                "panel.the_canvas_was_not_reverted_no_graph",
+                "The canvas was NOT reverted — no graph snapshot for that turn (they are kept for the " +
+                  "last 25 and then evicted). Your message is back in the composer, but the canvas still " +
+                  "holds that turn's edits.",
+              )
+            : tr("panel.nothing_to_rewind_yet_no_message_or", "Nothing to rewind yet — no message or graph snapshot from this session."),
         }),
       );
     }
@@ -28818,7 +29829,7 @@ function buildPanel() {
     modal.className = "cmcp-modal";
     const title = document.createElement("div");
     title.className = "cmcp-modal-title";
-    title.textContent = "Roll back & edit";
+    title.textContent = tr("panel.roll_back_edit", "Roll back & edit");
     const ta = document.createElement("textarea");
     ta.className = "cmcp-modal-text";
     ta.rows = 3;
@@ -28827,9 +29838,9 @@ function buildPanel() {
     scopeWrap.className = "cmcp-modal-scopes";
     let chosen = "both";
     const scopes = [
-      { v: "both", label: "Code + conversation", hint: "revert the canvas AND rewind the agent's memory" },
-      { v: "code", label: "Code only", hint: "revert the canvas; keep the conversation" },
-      { v: "conversation", label: "Conversation only", hint: "rewind the agent's memory; keep the canvas" },
+      { v: "both", label: tr("panel.code_conversation", "Code + conversation"), get hint() { return tr("panel.revert_the_canvas_and_rewind_the_agent", "revert the canvas AND rewind the agent's memory"); } },
+      { v: "code", label: tr("panel.code_only", "Code only"), get hint() { return tr("panel.revert_the_canvas_keep_the_conversation", "revert the canvas; keep the conversation"); } },
+      { v: "conversation", label: tr("panel.conversation_only", "Conversation only"), get hint() { return tr("panel.rewind_the_agent_s_memory_keep_the", "rewind the agent's memory; keep the canvas"); } },
     ];
     for (const s of scopes) {
       const lbl = document.createElement("label");
@@ -28854,11 +29865,11 @@ function buildPanel() {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "cmcp-btn";
-    cancel.textContent = "Cancel";
+    cancel.textContent = tr("panel.cancel", "Cancel");
     const go = document.createElement("button");
     go.type = "button";
     go.className = "cmcp-btn cmcp-btn-primary";
-    go.textContent = "Roll back & resend";
+    go.textContent = tr("panel.roll_back_resend", "Roll back & resend");
     // The canvas rollback is an ASYNC load, so this modal outlives a single tick and
     // needs explicit lifecycle state: `settled` makes the primary action single-shot
     // (a double-click would otherwise start two restores and BOTH continuations
@@ -28894,9 +29905,10 @@ function buildPanel() {
         const outcome = await revertGraphSnapshotByMid(mid);
         appendSystem(
           describeRevertOutcome(outcome, {
+            // English on purpose — see the /revert call site.
             action: "roll back the canvas",
-            restoredText: "↩ Canvas reverted to before this message.",
-            noneText: "No graph snapshot for this message — canvas left as-is.",
+            restoredText: tr("panel.canvas_reverted_to_before_this_message", "↩ Canvas reverted to before this message."),
+            noneText: tr("panel.no_graph_snapshot_for_this_message_canvas", "No graph snapshot for this message — canvas left as-is."),
           }),
         );
         // The user asked to roll the canvas back AND resend against it. Unless the
@@ -28914,8 +29926,11 @@ function buildPanel() {
           close();
           if (edited) setComposerValue(edited);
           appendSystem(
-            "Not resending — the canvas was not rolled back to the state you asked for. Your edited " +
-              "message is in the composer; send it once the canvas is what you want.",
+            tr(
+              "panel.not_resending_the_canvas_was_not_rolled",
+              "Not resending — the canvas was not rolled back to the state you asked for. Your edited " +
+                "message is in the composer; send it once the canvas is what you want.",
+            ),
           );
           return;
         }
@@ -28927,7 +29942,10 @@ function buildPanel() {
       if (cancelled) {
         if (edited) setComposerValue(edited);
         appendSystem(
-          "Cancelled — not rewinding the conversation or resending. Your edited message is in the composer.",
+          tr(
+            "panel.cancelled_not_rewinding_the_conversation_or_resending",
+            "Cancelled — not rewinding the conversation or resending. Your edited message is in the composer.",
+          ),
         );
         return;
       }
@@ -28935,8 +29953,8 @@ function buildPanel() {
         client.sendFrame?.({ type: "rewind", anchor });
         appendSystem(
           anchor
-            ? "↩ Rewound the conversation to before this message."
-            : "↩ Started a fresh conversation from this point.",
+            ? tr("panel.rewound_the_conversation_to_before_this_message", "↩ Rewound the conversation to before this message.")
+            : tr("panel.started_a_fresh_conversation_from_this_point", "↩ Started a fresh conversation from this point."),
         );
       }
       close();
@@ -29001,7 +30019,7 @@ function buildPanel() {
   // nothing is exposed beyond loopback until the user opens this modal).
   function openPairModal() {
     if (!client?.sendFrame) {
-      appendSystem("Connect to an agent first, then use Remote control to pair a phone.");
+      appendSystem(tr("panel.connect_to_an_agent_first_then_use", "Connect to an agent first, then use Remote control to pair a phone."));
       return;
     }
     const overlay = document.createElement("div");
@@ -29010,14 +30028,14 @@ function buildPanel() {
     modal.className = "cmcp-modal";
     const title = document.createElement("div");
     title.className = "cmcp-modal-title";
-    title.textContent = "Remote control — pair a phone";
+    title.textContent = tr("panel.remote_control_pair_a_phone", "Remote control — pair a phone");
 
     const scopeWrap = document.createElement("div");
     scopeWrap.className = "cmcp-modal-scopes";
     let mode = "lan";
     const modes = [
-      { v: "lan", label: "Local wifi", hint: "phone on the same network — stays inside your network" },
-      { v: "tunnel", label: "Internet", hint: "pair from anywhere via an encrypted tunnel" },
+      { v: "lan", label: tr("panel.local_wifi", "Local wifi"), get hint() { return tr("panel.phone_on_the_same_network_stays_inside", "phone on the same network — stays inside your network"); } },
+      { v: "tunnel", label: tr("panel.internet", "Internet"), get hint() { return tr("panel.pair_from_anywhere_via_an_encrypted_tunnel", "pair from anywhere via an encrypted tunnel"); } },
     ];
 
     const qrWrap = document.createElement("div");
@@ -29045,7 +30063,9 @@ function buildPanel() {
       durabilityLine.hidden = true;
       durabilityLine.textContent = "";
       statusMsg.textContent =
-        mode === "tunnel" ? "Opening a secure tunnel…" : "Preparing a local link…";
+        mode === "tunnel"
+          ? tr("panel.opening_a_secure_tunnel", "Opening a secure tunnel…")
+          : tr("panel.preparing_a_local_link", "Preparing a local link…");
       const myReq = ++reqId;
       pendingPair = (res) => {
         if (myReq !== reqId) return; // a newer request (mode switch) superseded this
@@ -29056,7 +30076,7 @@ function buildPanel() {
         try {
           drawQrToCanvas(canvas, pairingQrText(res.url));
           canvas.hidden = false;
-          statusMsg.textContent = "Scan with your phone camera or the app";
+          statusMsg.textContent = tr("panel.scan_with_your_phone_camera_or_the", "Scan with your phone camera or the app");
           urlLine.textContent = res.url;
           // Weighted by survivesRestart: a quiet confirmation when it holds, a
           // visible caution when it does not. The SENTENCE is the orchestrator's
@@ -29070,7 +30090,7 @@ function buildPanel() {
             durabilityLine.hidden = false;
           }
         } catch {
-          statusMsg.textContent = "⚠ Could not render the QR code.";
+          statusMsg.textContent = tr("panel.could_not_render_the_qr_code", "⚠ Could not render the QR code.");
         }
       };
       client.sendFrame({ type: "pair", mode });
@@ -29101,7 +30121,7 @@ function buildPanel() {
     const doneBtn = document.createElement("button");
     doneBtn.type = "button";
     doneBtn.className = "cmcp-btn cmcp-btn-primary";
-    doneBtn.textContent = "Done";
+    doneBtn.textContent = tr("panel.done", "Done");
     const close = () => {
       pendingPair = null;
       overlay.remove();
@@ -29136,7 +30156,7 @@ function buildPanel() {
       }
     }
     if (!client.isConnected()) {
-      appendSystem("Not connected — click Connect (in the Connection panel) and try again.");
+      appendSystem(tr("panel.not_connected_click_connect_in_the_connection", "Not connected — click Connect (in the Connection panel) and try again."));
       settingsBox.hidden = false;
       return;
     }
@@ -29395,7 +30415,7 @@ function buildPanel() {
     if (client.sendFrame({ type: "interrupt" })) {
       ev.preventDefault();
       endTurnLocally();
-      appendSystem("Interrupted.");
+      appendSystem(tr("panel.interrupted", "Interrupted."));
     }
   }
   document.addEventListener("keydown", onInterruptKeydown, true);
@@ -29662,7 +30682,7 @@ function buildPanel() {
   // panel; the most-recently-mounted panel owns the hooks.
   panelHooks.applyBackend = (id) => {
     if (!id || id === selectedBackend) return;
-    appendSystem(`Default backend → ${BACKEND_LABELS[id] || id}.`);
+    appendSystem(tr("panel.default_backend_switched", "Default backend → {backend}.", { backend: BACKEND_LABELS[id] || id }));
     // Route through connectBackend, which CENTRALLY seeds prefs from the new
     // backend's group before connecting (same path as the chips / model-popover
     // provider row) — exactly ONE connect, and the single post-handshake catalog
@@ -29691,10 +30711,10 @@ function buildPanel() {
     refreshContextRingForScope(); // #381: the scope mode changed — reflect the target scope's fill
     appendSystem(
       mode === "panel"
-        ? "Chat scope → panel-wide conversation."
+        ? tr("panel.chat_scope_panel_wide_conversation", "Chat scope → panel-wide conversation.")
         : mode === "workflow"
-          ? "Chat scope → separate histories for each workflow."
-          : "Chat scope → ask whenever the workflow changes.",
+          ? tr("panel.chat_scope_separate_histories_for_each_workflow", "Chat scope → separate histories for each workflow.")
+          : tr("panel.chat_scope_ask_whenever_the_workflow_changes", "Chat scope → ask whenever the workflow changes."),
     );
   };
   panelHooks.applyModel = (id) => {
@@ -29709,7 +30729,7 @@ function buildPanel() {
       savePrefs(prefs);
       refreshModelChip();
       client?.sendFrame?.({ type: "set_options", model: null, effort: prefs.effort ?? null });
-      appendSystem("Model → Auto (the agent picks).");
+      appendSystem(tr("panel.model_auto_the_agent_picks", "Model → Auto (the agent picks)."));
       return;
     }
     if (next === prefs.model && !prefs.modelAuto) return;
@@ -29719,7 +30739,7 @@ function buildPanel() {
     savePrefs(prefs);
     refreshModelChip();
     client?.sendFrame?.({ type: "set_options", model: next, effort: prefs.effort ?? null });
-    appendSystem(`Model → ${modelLabel(modelCatalog, next)}.`);
+    appendSystem(tr("panel.model_switched", "Model → {model}.", { model: modelLabel(modelCatalog, next) }));
   };
   panelHooks.applyEffort = (eff) => {
     const next = eff || undefined;
@@ -29729,7 +30749,11 @@ function buildPanel() {
     savePrefs(prefs);
     refreshModelChip();
     client?.sendFrame?.({ type: "set_options", effort: prefs.effort ?? null });
-    appendSystem(next ? `Effort → ${effortMeta(next).label}.` : "Effort → model default.");
+    appendSystem(
+      next
+        ? tr("panel.effort_switched", "Effort → {effort}.", { effort: effortMeta(next).label })
+        : tr("panel.effort_model_default", "Effort → model default."),
+    );
   };
   panelHooks.applyBridgeUrl = (url) => {
     const u = (url || "").trim();
@@ -29738,7 +30762,7 @@ function buildPanel() {
     saveBridgeUrl(u);
     if (client.isConnected()) {
       client.setUrl(u);
-      appendSystem(`Bridge URL → ${redactBridgeUrl(u)} (reconnecting).`);
+      appendSystem(tr("panel.bridge_url_reconnecting", "Bridge URL → {url} (reconnecting).", { url: redactBridgeUrl(u) }));
     }
   };
   panelHooks.applyAutoConnect = (on) => {
@@ -29768,7 +30792,7 @@ function buildPanel() {
     }
     paintSecret({
       label: `${friendly} API key`,
-      hint: "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context.",
+      get hint() { return tr("panel.sent_straight_to_the_orchestrator_s_0600", "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context."); },
     })
       .then((value) => {
         if (!value) return;
@@ -30147,6 +31171,11 @@ function registerExtensionWhenReady(tries = 0) {
     // never persist a raw value here. See panelSettingsList() above.
     settings: panelSettingsList(),
     async setup() {
+      // FIRST: resolve the language and pull the catalog, before anything paints. Every
+      // failure path inside resolves to an English panel rather than throwing, so this
+      // cannot block startup — but it must be AWAITED, because a catalog that arrives
+      // after the first render leaves the panel in English until something re-renders it.
+      await applyPanelLocale();
       // #458 SEED OBSERVED-BACKEND-HISTORY at startup with the FULL baseline /object_info.
       // This runs after ComfyUI's core has already fetched /object_info (extensions set
       // up post-init), so it records every pack PRESENT at page load — BEFORE any of them
@@ -30168,13 +31197,13 @@ function registerExtensionWhenReady(tries = 0) {
 
       const tabSpec = {
         id: tabId,
-        title: "Agent",
+        title: tr("panel.agent", "Agent"),
         // The chat bubble. The sidebar rail is a row of FUNCTION glyphs (assets,
         // nodes, models, workflows…), so a brand mark there reads as decoration
         // and doesn't say what the tab does — brand belongs in the panel header,
         // which is where the wordmark now lives.
         icon: "pi pi-comments",
-        tooltip: "ComfyUI Agent Panel — your agent session's window into this graph",
+        tooltip: tr("panel.comfyui_agent_panel_your_agent_session_s", "ComfyUI Agent Panel — your agent session's window into this graph"),
         type: "custom",
         // KEEP-ALIVE: the panel (bridge client, agent session, chat DOM) is built
         // ONCE and survives tab switches. render() re-attaches the same root into

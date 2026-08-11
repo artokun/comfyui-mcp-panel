@@ -42,6 +42,14 @@ const capped = (v, n) => str(v) && v.length <= n;
 /**
  * Validate + normalize a raw card spec. Returns { ok:true, spec } with defaults
  * applied, or { ok:false, errors:[...] }. Never throws.
+ *
+ * NOT TRANSLATED, deliberately. These read as user-facing because
+ * renderA2UIFailCard puts them on screen, but every one of them names a field of
+ * the A2UI wire schema (`components array is required`, `duplicate id "x"`) and
+ * the audience is whoever is writing the agent that emitted the bad card. They are
+ * also the text a user pastes into a bug report; translating them would mean the
+ * maintainer receives a Korean rendering of a schema violation and cannot grep for
+ * it. The card's own chrome around them (title, "tap to view raw") IS translated.
  */
 export function validateA2UISpec(raw) {
   const errors = [];
@@ -221,6 +229,7 @@ export function validateA2UISpec(raw) {
 // ---------------------------------------------------------------------------
 
 import { mountStandardComponent } from "./cmcp-a2ui-lit-adapter.js";
+import { tr } from "./lib/i18n.js";
 
 export const A2UI_CSS = `
 :root {
@@ -380,7 +389,7 @@ function buildGraphSVG(c) {
 function buildGraphFallbackList(c) {
   const div = document.createElement("div");
   div.className = "cmcp-a2ui-text";
-  div.textContent = "Graph: " + c.nodes.map((n) => n.label).join(" · ");
+  div.textContent = tr("a2ui.graph", "Graph: ") + c.nodes.map((n) => n.label).join(" · ");
   return div;
 }
 
@@ -594,7 +603,7 @@ export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = 
       const x = document.createElement("button");
       x.type = "button";
       x.className = "cmcp-a2ui-x";
-      x.title = "Dismiss";
+      x.title = tr("a2ui.dismiss", "Dismiss");
       x.textContent = "✕";
       x.addEventListener("click", () => {
         if (resolved) return;
@@ -656,11 +665,23 @@ export function renderA2UIFailCard(rawText, errors) {
   el.className = "cmcp-a2ui cmcp-a2ui-fail";
   const t = document.createElement("div");
   t.className = "cmcp-a2ui-title";
-  t.textContent = "Unsupported card";
+  t.textContent = tr("a2ui.unsupported_card", "Unsupported card");
   el.appendChild(t);
   const why = document.createElement("div");
   why.className = "cmcp-a2ui-text";
-  why.textContent = (errors && errors.length ? errors.slice(0, 3).join("; ") : "could not render") + " — tap to view raw";
+  // The validator's own `errors` stay in English on purpose — they name spec fields
+  // ("component.type must be a string"), which is the vocabulary of the JSON below, not
+  // prose. Only the two pieces of chrome around them are translated.
+  //
+  // The reason is a `{reason}` HOLE rather than a fragment concatenated onto a leading
+  // " — ", for two independent reasons. Edge whitespace inside a catalog value is the kind
+  // of thing a translator (or a JSON round-trip) drops silently, and `i18n-check` validates
+  // holes, not whitespace — so the separator lives in the sentence, where losing it is
+  // visible. And the panel ships ar/fa: an RTL sentence does not necessarily put the
+  // affordance AFTER the reason, so interpolating lets the translator order both halves
+  // while concatenating would pin them to English's order.
+  const reason = errors && errors.length ? errors.slice(0, 3).join("; ") : tr("a2ui.could_not_render", "could not render");
+  why.textContent = tr("a2ui.tap_to_view_raw", "{reason} — tap to view raw", { reason });
   why.style.cursor = "pointer";
   const pre = document.createElement("pre");
   pre.textContent = typeof rawText === "string" ? rawText : JSON.stringify(rawText, null, 2);

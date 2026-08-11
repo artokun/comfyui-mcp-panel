@@ -22,6 +22,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+// The SHIPPED translator, not a stub. No catalog is loaded in this process, which is
+// exactly the state `tr` is designed to survive: every call returns its English fallback
+// with `{holes}` filled. So the wording assertions below still read the English the panel
+// renders, and they still fail if that English changes.
+import { tr } from "../../web/js/lib/i18n.js";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 
@@ -60,7 +66,7 @@ function loadRetire() {
   const document = {
     createElement: () => ({ className: "", style: { cssText: "" }, textContent: "" }),
   };
-  return new Function("document", `${fn}; return retireInteractiveCard;`)(document);
+  return new Function("document", "tr", `${fn}; return retireInteractiveCard;`)(document, tr);
 }
 
 const retire = loadRetire();
@@ -148,7 +154,12 @@ test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () =
     /const unregisterSecret = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
     "registered at paint, and ONLY when a command painted it",
   );
-  assert.match(paint, /what: "secret request"/);
+  // Either the bare literal or the translated form — but if it is translated, the KEY is
+  // pinned too, not just the English. A wildcard key would let `tr("panel.question",
+  // "secret request")` pass while every non-English locale renders the secret card with the
+  // question card's noun: the assertion stays green in the one language the author reads,
+  // and the "secret-safe wording" this test exists for is gone everywhere else.
+  assert.match(paint, /what: (?:tr\("panel\.secret_request",\s*)?"secret request"/);
   assert.match(paint, /Nothing was sent and nothing was stored/, "no false 'saved' impression survives");
   assert.match(paint, /do not paste the value into the chat/, "never redirect a secret into the transcript");
   assert.match(paint, /promise\.then\(unregisterSecret, unregisterSecret\)/);
