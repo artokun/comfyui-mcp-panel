@@ -289,6 +289,66 @@ test("RTL is actually WIRED, not just implemented", () => {
   );
 });
 
+test("no DOM property written from tr() is read back as a comparison sentinel", () => {
+  // The bug this generalises: `chip.title = tr("panel.running", "Running")` was written in
+  // one place and read back as `el.title === "Running"` in two others to reconstruct state.
+  // Translating the tooltip made that comparison permanently false, silently losing the flag
+  // for every non-English user — and every test stayed green, because the whole suite runs in
+  // English. Visible text is for humans; state belongs in a data attribute.
+  //
+  // Scoped to DOM display properties on purpose. A bare `sort === "Newest"` compares a
+  // CivitAI API value that merely shares an English word with a label, and flagging it would
+  // be a false positive that pushes someone to "fix" correct code.
+  const DISPLAY_PROPS = ["textContent", "innerText", "title", "label", "placeholder", "ariaLabel"];
+  const en = new Map();
+  const flat = (o, p = "") => {
+    for (const [k, v] of Object.entries(o)) {
+      const key = p ? `${p}.${k}` : k;
+      if (v && typeof v === "object") flat(v, key);
+      else en.set(v, key);
+    }
+  };
+  flat(readJson("locales/en/main.json").comfyuiMcpPanel);
+
+  const files = [
+    "web/js/comfyui-mcp-panel.js", "web/js/cmcp-apps-ui.js", "web/js/cmcp-civitai-ui.js",
+    "web/js/cmcp-training-ui.js", "web/js/cmcp-runpod-ui.js", "web/js/cmcp-sidepanel-ui.js",
+    "web/js/cmcp-modal.js", "web/js/cmcp-a2ui.js", "web/js/cmcp-civitai.js",
+  ];
+  const offenders = [];
+  const rx = new RegExp(`\\.(${DISPLAY_PROPS.join("|")})\\s*(?:===|!==|==|!=)\\s*(["'])(.*?)\\2`, "g");
+  for (const f of files) {
+    let src;
+    try {
+      src = readFileSync(join(ROOT, f), "utf8");
+    } catch {
+      continue;
+    }
+    src.split("\n").forEach((line, i) => {
+      rx.lastIndex = 0;
+      let m;
+      while ((m = rx.exec(line)) !== null) {
+        if (en.has(m[3])) offenders.push(`${f}:${i + 1} compares .${m[1]} to ${JSON.stringify(m[3])} (key ${en.get(m[3])})`);
+      }
+    });
+  }
+  assert.deepEqual(offenders, [], "put the state in a data attribute and compare that instead");
+});
+
+test("a variable's VALUE is never re-scanned for placeholders", () => {
+  // Substituting one variable at a time expands `{name}` holes that appear inside a value
+  // already written by an earlier variable. ComfyUI widget values carry braces routinely
+  // (dynamic-prompt syntax), so a group genuinely titled "{id}" rendered as
+  // `Created group "7" (id 7)` — the user's own title silently replaced by other data.
+  __setCatalogForTest("en", {});
+  const out = tr("panel.x", 'Created group "{title}" (id {id})', { title: "{id}", id: 7 });
+  assert.equal(out, 'Created group "{id}" (id 7)');
+
+  // An unknown placeholder is left alone rather than blanked — a missing var should look
+  // obviously wrong in review, not silently erase part of the sentence.
+  assert.equal(tr("panel.y", "a {nope} b", { other: 1 }), "a {nope} b");
+});
+
 test("right-to-left languages are flagged", () => {
   assert.ok(isRTL("ar"));
   assert.ok(isRTL("fa"));

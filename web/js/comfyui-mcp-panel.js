@@ -19431,6 +19431,14 @@ function buildPanel() {
         chip.style.opacity = "0.55"; // dim a provider that isn't signed in yet
       } else if (b.running) {
         chip.title = tr("panel.running", "Running");
+        // State lives in a data attribute, NOT in the visible tooltip. Two readers below
+        // (renderBackendChips, ~:25343 and ~:27134) reconstruct each chip's `running` flag
+        // from the DOM; when they read `title === "Running"` that comparison became
+        // permanently false the moment the tooltip was translated, silently losing the flag
+        // for every non-English user. Tests never caught it because they all run in English.
+        chip.dataset.running = "1";
+      } else {
+        delete chip.dataset.running;
       }
       if (id === selectedBackend) {
         chip.style.cssText =
@@ -25340,7 +25348,7 @@ function buildPanel() {
         renderBackendChips(
           Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
             backend: el.dataset.backend,
-            running: el.title === "Running",
+            running: el.dataset.running === "1",
           })),
         );
       }
@@ -27131,7 +27139,7 @@ function buildPanel() {
     renderBackendChips(
       Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
         backend: el.dataset.backend,
-        running: el.title === "Running",
+        running: el.dataset.running === "1",
       })),
     );
     // Switching to a DIFFERENT backend than we're connected to: agent sessions are

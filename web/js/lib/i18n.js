@@ -213,12 +213,23 @@ export function tr(key, fallback, vars) {
   }
   out = out ?? "";
 
-  if (vars) {
-    for (const [k, v] of Object.entries(vars)) {
-      out = out.split(`{${k}}`).join(String(v));
-    }
-  }
-  return out;
+  return interpolate(out, vars);
+}
+
+/**
+ * Substitute `{name}` holes in ONE pass.
+ *
+ * Deliberately not a loop of `split(...).join(...)` per variable: that expands placeholders
+ * that appear INSIDE an already-substituted value, so a group literally titled `{id}` renders
+ * as `Created group "7" (id 7)` — the user's own title destroyed by the next variable's turn.
+ * ComfyUI widget values carry braces routinely (dynamic-prompt syntax), so this is ordinary
+ * data, not a crafted input. A single pass never revisits what it just wrote.
+ */
+function interpolate(str, vars) {
+  if (!vars || !str) return str;
+  return String(str).replace(/\{(\w+)\}/g, (whole, name) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : whole,
+  );
 }
 
 /** Intl.PluralRules is not free to construct; one per locale is plenty. */
