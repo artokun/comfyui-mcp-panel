@@ -129,3 +129,27 @@ test("#646 the bound is the CALLER's deadline minus a margin, not a number of ou
   // Reads the frame's field, so it activates the moment the orchestrator sends it.
   assert.match(SRC, /msg\.timeout_ms/);
 });
+
+test("#646 (codex) a deadline AT OR BELOW the margin is still bounded", async () => {
+  // The gap this closes: a 1000ms timeout is neither absent nor invalid, so falling through
+  // to unbounded would leave the caller with silence exactly where they give up soonest.
+  // Below the margin the budget is half the deadline, which still lands before it.
+  const awaitDuplicateReply = buildHelper(); // margin 5ms in the rebuilt copy
+  const never = new Promise(() => {});
+  for (const deadline of [4, 5, 2]) {
+    const reply = await Promise.race([
+      awaitDuplicateReply(never, "dup", deadline),
+      new Promise((r) => setTimeout(() => r("still waiting"), 60)),
+    ]);
+    assert.notEqual(reply, "still waiting", `deadline ${deadline}ms must still produce a reply`);
+    assert.equal(reply.ok, false);
+    assert.equal(reply.rid, "dup");
+  }
+});
+
+test("#646 (codex) the ask_user claim is scoped to whose contract it is", () => {
+  // The comment used to assert that ask_user/request_secret "carry long or absent deadlines".
+  // Nothing in this file establishes that — there is no command-specific guard here — so it
+  // now names the orchestrator as the party that holds that contract.
+  assert.match(SRC, /That is the\s*\r?\n?\s*\/\/ ORCHESTRATOR's contract, not something this file enforces or can verify/);
+});

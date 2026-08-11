@@ -16257,11 +16257,17 @@ function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
   // process's contract — and a guess that is too high changes nothing (25s cannot rescue a
   // 20s deadline), while one that is too low reports 'still running' for a merely slow
   // command. It also disposes of ask_user/request_secret without a special case: they carry
-  // long or absent deadlines, so a short bound never fires for them.
-  const budget =
-    Number.isFinite(callerTimeoutMs) && callerTimeoutMs > DUPLICATE_AWAIT_MARGIN_MS
+  // deadlines long enough that a bound derived from them does not fire early. That is the
+  // ORCHESTRATOR's contract, not something this file enforces or can verify (codex).
+  // EVERY usable deadline gets a bound, including one at or below the margin (codex): a
+  // 1000ms timeout is neither absent nor invalid, and falling through to unbounded there
+  // would be a silent gap exactly where the caller gives up soonest. Below the margin the
+  // budget is half the deadline, which still lands before it.
+  const budget = !Number.isFinite(callerTimeoutMs) || callerTimeoutMs <= 0
+    ? null
+    : callerTimeoutMs > DUPLICATE_AWAIT_MARGIN_MS
       ? callerTimeoutMs - DUPLICATE_AWAIT_MARGIN_MS
-      : null;
+      : Math.floor(callerTimeoutMs / 2);
   if (budget === null) return Promise.resolve(prior);
   return Promise.race([
     Promise.resolve(prior),
