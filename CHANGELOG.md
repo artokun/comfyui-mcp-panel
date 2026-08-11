@@ -6,6 +6,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-10
+
+> The other half of #952. A question card whose connection was replaced already stopped
+> looking answerable in 0.13.0; the command behind it, however, was left waiting forever.
+
+### Fixed
+- withdrawing an interactive card now ENDS the command behind it (#952). `panel_ask` and
+  the secret request are the only commands whose executor blocks on a person, and retiring
+  their card deliberately did not resolve its promise — so the executor stayed suspended,
+  its entry in the command ledger stayed in flight, and entries in flight are never
+  evicted, by design. Every withdrawn question kept a slot for the life of the tab and held
+  the ledger's bound out of reach; a duplicate delivery of that request id then waited on a
+  promise that could never resolve, and the panel answered nothing at all. Retirement now
+  settles the command explicitly, as a failure that fabricates no answer.
+- a payload-free failure for those two commands is no longer rewritten as "the panel
+  collected the response, but the connection dropped" when nothing was collected. Replies
+  that actually carry the person's own input are redacted exactly as before.
+
+### Changed
+- a correction to this project's own notes on #952, recorded because the plan rested on it:
+  the orchestrator mints its session epoch once per PROCESS, so a tab reconnecting to the
+  same process keeps its ledger scope. The earlier claim that a reconnect lands in a new
+  scope and fails open into a duplicate card was wrong; that only happens across an
+  orchestrator restart.
+
+
 ## [0.13.0] - 2026-08-10
 
 > A panel connected to a ComfyUI the orchestrator cannot reach — a tunnel, a proxy URL, a
