@@ -6,6 +6,33 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-10
+
+> #753: the panel's text was small and the obvious fix did nothing. Overriding
+> `.cmcp-root { font-size }` scaled almost nothing, because every inner size was `rem` —
+> resolved against the PAGE root, not the panel.
+
+### Added
+- **`--cmcp-fs`, one variable that scales the panel's text.** Set it on `:root` or
+  `.cmcp-root` in a user stylesheet (default `0.8125rem`) and every panel font size follows,
+  including the CivitAI explorer, the Apps tab and the modals. Measured: overriding it to
+  1.5x moves 2110 of 2476 rendered elements by exactly that.
+- It does NOT scale spacing, icons, or the handful of elements that carry a fixed pixel
+  size, and the setting's tooltip now says so rather than promising more.
+
+### Changed
+- 214 inner font sizes became `calc(var(--cmcp-fs, 0.8125rem) * k)`, each reproducing its
+  original pixel size at the default — verified element by element against a capture of the
+  panel taken before the change, with no drift beyond sub-pixel rounding.
+- The "Panel UI scale (%)" setting is unchanged and is still the way to scale the panel as a
+  whole. Its tooltip used to explain why a stylesheet override could not work; that trap is
+  gone, so it now names the knob that does.
+
+### Fixed
+- the status caret set its size through a JS assignment rather than a stylesheet rule, so it
+  had been missed by every sweep. It scales with the rest now.
+
+
 ## [0.13.2] - 2026-08-10
 
 > #945: the panel could not tell one workflow OBJECT from another without looking at the
