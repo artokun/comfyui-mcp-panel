@@ -2474,7 +2474,11 @@ function noteWorkflowInstanceMismatch() {
  *  The leading `workflow instance mismatch:` token is preserved deliberately: it
  *  is what readers and existing reports recognise this refusal by. Only the claim
  *  about causation changes. */
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null } = {}) {
+// #968 — `movedNote` is INJECTED, never read from the recorder here: this function is pure
+// and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
+// exist. One line on purpose (see above). Appended, never substituted — the refusal's own
+// reasoning survives; the note only says WHY the active workflow is not what was expected.
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -2486,7 +2490,7 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
   const compared = expected
     ? `this command was issued for workflow instance ${expected}, and ${canvasSays}`
     : `this command carries no workflow-instance stamp, and ${canvasSays}`;
-  return (
+  const base = (
     `workflow instance mismatch: ${compared}. Nothing was applied.\n\n` +
     `That is the comparison, not the cause — the panel observed only that the two ` +
     `identities differ. It can mean the workflow was switched or replaced after the ` +
@@ -2511,8 +2515,8 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
-  const note = typeof movedNote === "string" && movedNote.trim() ? movedNote.trim() : null;
-  return note ? `${base}\n\n${note}` : base;
+  const movedLine = typeof movedNote === "string" && movedNote.trim() ? movedNote.trim() : null;
+  return movedLine ? `${base}\n\n${movedLine}` : base;
 }
 
 function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
@@ -17019,11 +17023,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // #607 — re-advertise the panel's CURRENT identity (re-hello) so the
               // recovery this message advertises actually reaches the orchestrator's
               // cached stamp; see noteWorkflowInstanceMismatch.
+              // #968 — observe before reporting: a move that happened since the previous
+              // command is exactly what makes this binding stale, and an unclaimed one is
+              // the case this issue is hunting.
+              noteActiveWorkflowMove();
               noteWorkflowInstanceMismatch();
               throw new Error(
                 workflowInstanceMismatchMessage({
                   commandUuid: dispatchCommandUuid,
                   activeUuid: dispatchActiveUuid,
+                  // #968 — what last moved the active workflow, if anything did. This is the
+                  // refusal a caller actually sees when a binding has gone stale.
+                  movedNote: activeWorkflowMoves.describeLast(),
                 }),
               );
             }

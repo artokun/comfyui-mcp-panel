@@ -128,3 +128,99 @@ test("#968 SOURCE: this module decides nothing about whether a command may run",
   const body = src.slice(src.indexOf("export function createActiveWorkflowProvenance"));
   assert.ok(!/\breturn (?:true|false)\b/.test(body), "no boolean verdict is returned");
 });
+
+test("#968 WIRED: the observer runs before the refusal, and the note reaches it", () => {
+  // A recorder nothing calls is inert — the first attempt at this shipped exactly that, so
+  // these pin the wiring rather than the module.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+
+  // 1. Something drives the observer, and it does so BEFORE the mismatch is reported.
+  const obs = src.indexOf("noteActiveWorkflowMove();");
+  assert.ok(obs > 0, "the observer is called");
+  // Compared LOCALLY, not by whole-file index: `noteWorkflowInstanceMismatch` has an earlier
+  // occurrence of its own, and an index comparison against that one passes for the wrong
+  // reason. Assert the two sit together on the refusal path instead.
+  const near = src.slice(obs, obs + 400);
+  assert.match(near, /noteWorkflowInstanceMismatch\(\);/, "observed immediately before the refusal is composed");
+
+  // 2. NOT beside onCommandReceived: #508 pins that callback being alone in its own try, so
+  //    a host callback cannot suppress a reply. Sharing that try would weaken it.
+  const boundary = src.indexOf("onCommandReceived?.();");
+  assert.ok(Math.abs(boundary - obs) > 200, "the observer does not share the onCommandReceived try");
+
+  // 3. The refusal a caller actually sees is given the line.
+  assert.match(src, /movedNote: activeWorkflowMoves\.describeLast\(\),/);
+
+  // 4. The pure helper's own call site is UNCHANGED — #1019 pins its three-argument shape,
+  //    and it is rebuilt with `new Function`, where a module global does not exist.
+  assert.match(
+    src,
+    /workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved \}\)/,
+    "the fence helper still calls it with exactly three arguments",
+  );
+});
+
+test("#968 WIRED: the message stays PURE and single-line", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  // Single line, because namedFunctionSource extracts this function by name and a multi-line
+  // parameter list makes it stop at the PARAMETER brace instead of the body's — which is how
+  // an earlier attempt broke 13 tests without touching their subject.
+  assert.match(
+    src,
+    /function workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null \} = \{\}\) \{/,
+  );
+  // And it reads only its parameters: a module global here is unreachable under `new Function`.
+  const start = src.indexOf("function workflowInstanceMismatchMessage({ commandUuid");
+  const body = src.slice(start, src.indexOf("\r\n}", src.indexOf("const movedLine", start)));
+  assert.ok(!/activeWorkflowMoves/.test(body), "the message never reaches for the recorder");
+});
+
+/** Same extractor the other suites use — brace-balanced, so a destructured parameter list
+ *  cannot make it stop at the parameter brace (the trap that broke an earlier attempt). */
+function namedFunctionSource(src, name) {
+  const start = src.indexOf(`function ${name}(`);
+  if (start === -1) return null;
+  // `") {"`, not `"{"`. With a DESTRUCTURED parameter list the first `{` belongs to the
+  // parameters, so balancing from there ends at the parameter object's close and returns a
+  // truncated function that fails to parse. That is the third time this trap has bitten this
+  // file today; the copies in bridge-route/open-outcome still use the naive form and work
+  // only because their subjects take positional parameters.
+  const open = src.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    if (src[i] === "{") depth += 1;
+    if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  return null;
+}
+
+const buildMismatchMessage = () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const fn = namedFunctionSource(src, "workflowInstanceMismatchMessage");
+  assert.ok(fn, "workflowInstanceMismatchMessage not found");
+  return new Function(`${fn}; return workflowInstanceMismatchMessage;`)();
+};
+
+test("#968 the note is APPENDED to the refusal, never substituted for it", () => {
+  const msg = buildMismatchMessage();
+  const args = { commandUuid: "aaaa-1111", activeUuid: "bbbb-2222" };
+  const plain = msg(args);
+  const withNote = msg({ ...args, movedNote: "MOVED-BY-SOMETHING-ELSE" });
+
+  // Everything the refusal already said survives — the note explains, it does not replace.
+  assert.ok(withNote.startsWith(plain), "the original refusal is still the whole first part");
+  assert.match(withNote, /MOVED-BY-SOMETHING-ELSE$/);
+  assert.match(withNote, /\n\nMOVED-BY-SOMETHING-ELSE$/, "separated, so it reads as its own statement");
+  // Both identities are still reported.
+  assert.match(withNote, /aaaa-1111/);
+  assert.match(withNote, /bbbb-2222/);
+});
+
+test("#968 no note, or an empty one, changes the refusal not at all", () => {
+  const msg = buildMismatchMessage();
+  const args = { commandUuid: "aaaa-1111", activeUuid: "bbbb-2222" };
+  const plain = msg(args);
+  for (const empty of [null, undefined, "", "   ", 42, {}]) {
+    assert.equal(msg({ ...args, movedNote: empty }), plain, JSON.stringify(empty) ?? "undefined");
+  }
+});
