@@ -83,6 +83,37 @@ function makeKey(file, text) {
 }
 
 /**
+ * Index of the `}` that closes the object starting at `s[0] === '{'`, or -1.
+ *
+ * `s.indexOf('}')` cannot be used here, and the reason is not hypothetical: a plural fallback
+ * is written `{ one: "{count} node", other: "{count} nodes" }`, so the FIRST `}` in the text
+ * is the one inside `{count}` — the placeholder that makes it a plural in the first place.
+ * Truncating there left a body with no complete `key: "value"` pair, the form regex matched
+ * nothing, and the site vanished. Silently: an unreadable call site is missing from BOTH
+ * sides of the round-trip comparison, so the gate that exists to catch exactly this stayed
+ * green while every counted string in the panel became permanently untranslatable.
+ *
+ * Braces are therefore counted at depth, skipping string literals (where a `{` or `}` is
+ * text, not structure) and their escapes.
+ */
+function objectBodyEnd(s) {
+  let depth = 0;
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === '\\') i++;            // escaped char — never closes the string
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') quote = c;
+    else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
  * Read back an ALREADY-CONVERTED call site: `tr("key", "English")`, or the plural form
  * `tr("key", { one: "…", other: "…" })`.
  *
@@ -110,7 +141,7 @@ function readConverted(src, file) {
     }
     // Plural object: emit one candidate per category so English carries `key_one`/`key_other`.
     if (rest.startsWith('{')) {
-      const close = rest.indexOf('}');
+      const close = objectBodyEnd(rest);
       if (close === -1) continue;
       const body = rest.slice(1, close);
       const form = /(\w+)\s*:\s*(["'`])((?:\\.|(?!\2)[^\\])*)\2/g;

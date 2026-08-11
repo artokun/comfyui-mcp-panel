@@ -480,7 +480,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   const subTabsWrap = el("div", "cmcp-cv-tabs");
   for (const t of TABS) {
     const b = el("button", "cmcp-cv-tab");
-    b.innerHTML = `<i class="pi ${t.icon}"></i><span>${t.label}</span>`;
+    // The label goes in as TEXT rather than through innerHTML. `lib/i18n.js` documents
+    // that `tr()` "returns a string and never HTML, so it introduces no injection
+    // path" — true of the helper, but only true of a call site that writes text, and
+    // this was the one that wrote markup. `/i18n` merges EVERY installed pack's
+    // main.json, so a label is a string another pack can influence. Same DOM as the
+    // template it replaces: `el()` sets className and textContent.
+    b.append(el("i", `pi ${t.icon}`), el("span", null, t.label));
     b.addEventListener("click", () => { state.tab = t.key; syncTabs(); reload(); });
     b._key = t.key;
     subTabsWrap.appendChild(b);
@@ -1741,8 +1747,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           foot.appendChild(el("span", null, tr("civitai_ui.n_selected", {
             one: "{count} selected", other: "{count} selected",
           }, { count: f.baseModels.length })));
-          // Reuses the panel-wide "Clear" — same word, already in the catalog.
-          const clear = el("button", "cmcp-cv-ddclear", tr("panel.clear", "Clear"));
+          // Its OWN key, not the panel-wide `panel.clear`, even though the English is
+          // identical. That key labels the credentials card's "clear this API key"
+          // button; a translator seeing only that context can legitimately render it
+          // ja "キーを消去" ("clear the key"), which would then mislabel THIS button —
+          // which clears base-model filters. Sharing a key shares the context too.
+          const clear = el("button", "cmcp-cv-ddclear", tr("civitai_ui.clear", "Clear"));
           clear.type = "button";
           // Left button only — right-clicking "Clear" would otherwise wipe every
           // selected model before the context menu even appeared.
@@ -1842,6 +1852,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
             // Counted, but the number the user READS is abbreviated ("1.2M"), and a
             // plural category can't be derived from that string. So `count` carries the
             // real total for Intl and `{n}` carries the abbreviation for display.
+            //
+            // Known residual, bounded and deliberate: once abbreviated, the category
+            // follows the TRUE total, not the displayed numeral. `compactCount(1001)`
+            // is "1K" while ru's rule for 1001 is `one`, so that row reads "1K
+            // загрузка" where the displayed "1K" wants the genitive. Getting this
+            // exactly right needs locale-aware compact formatting
+            // (Intl.NumberFormat notation:"compact"), which would also change the
+            // digits every existing row shows — a bigger change than this row is
+            // worth. Every count below 1000 displays in full and is exactly right,
+            // which is most creators; English is immune either way.
             const sub = c.position != null
               ? [
                   c.downloads != null
@@ -2010,8 +2030,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           newBtn.disabled = false;
         }
       });
-      // Reuses the panel-wide "Sign out" — same two words, already in the catalog.
-      const out = el("button", "cmcp-btn", tr("panel.sign_out", "Sign out"));
+      // Its own key rather than `panel.sign_out` — see the note on civitai_ui.clear.
+      // That one signs out of an AI provider; this one signs out of CivitAI, and the
+      // two need not share a verb in every language.
+      const out = el("button", "cmcp-btn", tr("civitai_ui.sign_out", "Sign out"));
       out.addEventListener("click", async () => {
         await ctx.api.fetchApi("/comfyui_mcp_panel/civitai/oauth/logout", { method: "POST" });
         await refreshAuth(); sheet.close();

@@ -106,7 +106,24 @@ test("every shipped locale file matches the English key set exactly", () => {
     }
     return out;
   };
+  // Plural siblings are per-LANGUAGE and must not be compared as a flat set. English has
+  // `_one`/`_other`; Korean, Japanese and Chinese use `other` alone, and Russian needs
+  // `few`/`many` that English will never have. A naive set comparison demands zh carry
+  // `n_nodes_one` — the exact key `scripts/i18n-check.mjs` rejects as "has `_one`, which zh
+  // never uses — remove it". The two gates were mutually unsatisfiable the moment any plural
+  // key entered the catalog, which nothing noticed because the catalog had none: the panel's
+  // first counted strings arrive with the CivitAI unit. Verified both directions — adding the
+  // `_one` siblings turns this test green and i18n-check red with 18 problems; removing them
+  // does the reverse. So plural bases are checked against Intl here, exactly as the gate does,
+  // and only non-plural keys are compared literally.
+  const splitPlural = (k) => {
+    const m = k.match(/^(.*)_(zero|one|two|few|many|other)$/);
+    return m ? { base: m[1], cat: m[2] } : null;
+  };
   const expected = flat(en);
+  const plainExpected = [...expected].filter((k) => !splitPlural(k));
+  const basesExpected = new Set([...expected].map(splitPlural).filter(Boolean).map((p) => p.base));
+
   for (const { code } of LOCALES) {
     if (code === "en") continue;
     let target;
@@ -116,10 +133,27 @@ test("every shipped locale file matches the English key set exactly", () => {
       continue; // not started yet — falls back to English wholesale, which is fine
     }
     const got = flat(target);
-    const missing = [...expected].filter((k) => !got.has(k));
-    const extra = [...got].filter((k) => !expected.has(k));
-    assert.deepEqual(missing, [], `${code} is missing keys`);
-    assert.deepEqual(extra, [], `${code} has keys English does not`);
+    const plainGot = [...got].filter((k) => !splitPlural(k));
+    assert.deepEqual(plainExpected.filter((k) => !got.has(k)), [], `${code} is missing keys`);
+    assert.deepEqual(plainGot.filter((k) => !expected.has(k)), [], `${code} has keys English does not`);
+
+    // Every plural base English declares must be present in EXACTLY this language's categories.
+    const cats = new Intl.PluralRules(code).resolvedOptions().pluralCategories;
+    for (const base of basesExpected) {
+      const have = new Set(
+        [...got].map(splitPlural).filter((p) => p && p.base === base).map((p) => p.cat),
+      );
+      assert.deepEqual(
+        cats.filter((c) => !have.has(c)),
+        [],
+        `${code} plural "${base}" is missing categories it needs [${cats.join(", ")}]`,
+      );
+      assert.deepEqual(
+        [...have].filter((c) => !cats.includes(c)),
+        [],
+        `${code} plural "${base}" has categories ${code} never uses`,
+      );
+    }
   }
 });
 
@@ -271,6 +305,41 @@ test("regenerating English is a ROUND TRIP — it never loses a converted key", 
     [],
     "these catalog keys have no tr() call site — stale after a revert or rename",
   );
+});
+
+test("a plural call site is readable back — including the {count} in its own text", () => {
+  // The round-trip test above CANNOT catch this, and that is the point of a separate one.
+  // `readConverted` found the plural object's end with `indexOf("}")`, so the first `}` it hit
+  // was the one inside `{count}` — the placeholder that makes a fallback a plural at all. The
+  // body was truncated mid-string, the form regex matched nothing, and the site disappeared.
+  //
+  // Disappeared from BOTH sides: absent from the extractor output means absent from `converted`
+  // AND never expected in the catalog, so the round trip stayed green while every counted
+  // string in the panel was permanently untranslatable. Measured before the fix: 6 plural call
+  // sites in the tree, 0 plural keys in the catalog, 0 failures reported.
+  const out = execFileSync("node", ["scripts/i18n-extract.mjs", "--json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 1 << 26,
+  });
+  const candidates = JSON.parse(out);
+  const plural = candidates.filter((c) => c.converted && /_(zero|one|two|few|many|other)$/.test(c.key));
+
+  // Asserted against the SOURCE, not against a fixture: the guard has to fail when the code
+  // stops emitting these, not when a hand-written expectation drifts.
+  const sites = readFileSync(join(ROOT, "web/js/cmcp-civitai-ui.js"), "utf8")
+    .match(/\btr\(\s*"[\w.]+"\s*,\s*\{\s*(?:\/\/[^\n]*\n\s*)?one\s*:/g) || [];
+  assert.ok(sites.length > 0, "cmcp-civitai-ui.js should still hold plural call sites to check");
+  assert.equal(
+    plural.length,
+    sites.length * 2,
+    `each plural site must yield _one and _other; got ${plural.length} for ${sites.length} sites`,
+  );
+
+  // And the text must survive INTACT — a truncation at `{count}` would still emit a candidate
+  // if the regex happened to close, just with the placeholder chopped off.
+  const withHole = plural.filter((c) => /\{(count|n)\}/.test(c.text));
+  assert.equal(withHole.length, plural.length, "every plural form must keep its {count}/{n} placeholder");
 });
 
 test("RTL is actually WIRED, not just implemented", () => {
