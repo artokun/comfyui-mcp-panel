@@ -7,18 +7,23 @@
  * it is talking to. What it CAN do is describe the answer it just got, cheaply and
  * deterministically, so two answers can be compared.
  *
- * WHAT IT COVERS, and this is the whole claim: the set of TYPE NAMES. Two payloads with
- * the same fingerprint have the same types; they may still differ INSIDE a definition — a
+ * WHAT IT COVERS: the set of TYPE NAMES. A fingerprint is a HASH, not a proof (codex) —
+ * two different type sets of the same size can in principle produce the same value, so
+ * this is a cache key and is described as one. Two payloads that agree on it are
+ * overwhelmingly likely to have the same types; they may still differ INSIDE a definition — a
  * changed combo list, a renamed widget, a new input on an existing node. A caller that
  * needs those must re-read rather than trust the fingerprint, and the reply says so rather
  * than leaving it implied. Hashing the whole 5MB payload would answer that question too and
  * costs far more than the fetch it saves; the type set is what a conversion keys on.
  */
 
-/** FNV-1a over a string. Small, dependency-free, and stable across runs — this is a cache
- *  key, never a security primitive. */
-function fnv1a(text) {
-  let hash = 0x811c9dc5;
+/** FNV-1a over a string, with a caller-chosen offset basis. Small, dependency-free and
+ *  stable across runs — a cache key, never a security primitive. Two independent bases
+ *  are combined below: a single 32-bit value collides far too readily to describe a
+ *  4000-type schema, and the reply built on it would then say 'unchanged' about a
+ *  genuinely different set (codex). */
+function fnv1a(text, basis) {
+  let hash = basis >>> 0;
   for (let i = 0; i < text.length; i += 1) {
     hash ^= text.charCodeAt(i);
     // The classic 32-bit multiply, kept in range without BigInt.
@@ -46,7 +51,11 @@ export function objectInfoFingerprint(defs) {
     // occur inside a node type name, and two different type sets hashing alike is exactly
     // the collision a cache key must not have. (An earlier cut used a NUL separator, which
     // the repo's own control-character guard rejected from shipped source, correctly.)
-    return `t${names.length}-${fnv1a(JSON.stringify(names)).toString(36)}`;
+    const encoded = JSON.stringify(names);
+    // TWO bases, so a collision needs the same type COUNT and agreement under both.
+    const a = fnv1a(encoded, 0x811c9dc5).toString(36);
+    const b = fnv1a(encoded, 0x01000193).toString(36);
+    return `t${names.length}-${a}${b}`;
   } catch {
     return null;
   }

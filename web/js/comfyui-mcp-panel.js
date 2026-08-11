@@ -3371,6 +3371,17 @@ function comfyuiUrlForConnect() {
 // (window.location) — so the agent auto-targets whatever ComfyUI is open (local or
 // a RunPod proxy) with zero config. The orchestrator retargets to it and decides
 // local vs remote mode from the host, so a bare `--panel-orchestrator` just works.
+// #1006 — the origin the page's own `api` client talks to, which is the one that
+// answers a /object_info fetch made through it. Deliberately NOT the Remote-URL
+// override: that is what the orchestrator should target, not a claim about who served
+// a request the browser already made.
+function pageComfyOrigin() {
+  try {
+    return window.location.origin || null;
+  } catch {
+    return null;
+  }
+}
 function comfyuiUrlForAgent() {
   const override = remoteUrlSetting();
   if (override) return override;
@@ -8252,7 +8263,11 @@ const GRAPH_TOOL_EXECUTORS = {
       getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
       fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
     });
-    const served_by = comfyuiUrlForAgent() || null;
+    // THE ORIGIN THAT ACTUALLY ANSWERED (codex). `comfyuiUrlForAgent()` prefers a
+    // user-set Remote-URL override, but this fetch goes through the page's own `api`
+    // client — so on an install where those differ, reporting the override would
+    // attribute the schema to a host that served nothing.
+    const served_by = pageComfyOrigin();
     if (!defs) {
       // FAIL CLOSED and say what was tried. A conversion that proceeds on a missing
       // schema produces a wrong answer, so this never returns a partial map.
