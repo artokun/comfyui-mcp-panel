@@ -7055,7 +7055,7 @@ const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
 const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
 function widgetName(liveGraph, nodeId, i) {
   try {
-    const w = liveGraph?.getNodeById?.(Number(nodeId))?.widgets?.[i];
+    const w = liveGraph?.getNodeById?.(canonicalNodeId(nodeId))?.widgets?.[i];
     if (w && w.name) return w.name;
   } catch {}
   return `#${i}`;
@@ -11100,9 +11100,15 @@ const GRAPH_TOOL_EXECUTORS = {
     if (rail && fields.some((field) => field !== "pos" && own(field))) {
       throw new Error("a subgraph boundary rail only supports pos edits");
     }
-    const realNode = !rail && hasNodeId && Number.isFinite(Number(args.node_id)) && typeof graph.getNodeById === "function"
-      ? graph.getNodeById(Number(args.node_id))
-      : null;
+    const realNode =
+      !rail &&
+      hasNodeId &&
+      // #1425 — a subgraph-qualified id is id-shaped too. Number("263:78") is NaN,
+      // so the finite check alone called a real node unreal.
+      (isQualifiedNodeId(args.node_id) || Number.isFinite(Number(args.node_id))) &&
+      typeof graph.getNodeById === "function"
+        ? graph.getNodeById(canonicalNodeId(args.node_id))
+        : null;
     if (!rail && !realNode && hasNodeId && graph === rootGraph && railKindFor(args.node_id)) {
       throw new Error(`${args.node_id} is a subgraph boundary rail, which only exists inside a subgraph — enter the subgraph first (panel_enter_subgraph).`);
     }
@@ -14292,7 +14298,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const store = getSubgraphStore();
     let target = null;
     if (node_id != null) {
-      target = graph.getNodeById(Number(node_id));
+      target = graph.getNodeById(canonicalNodeId(node_id));
       if (!target) throw new Error(`No node with id ${node_id} in the current graph`);
       if (!target.subgraph) {
         throw new Error(`Node ${node_id} (${target.type}) is not a subgraph node`);

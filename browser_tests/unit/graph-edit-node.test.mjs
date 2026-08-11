@@ -4,6 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { canonicalNodeId, isQualifiedNodeId } from "../../web/js/lib/node-id.js";
 import { fileURLToPath } from "node:url";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -31,9 +32,22 @@ function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypa
     "unsafeBypassMappings",
     "resolveRailNode",
     "railKindFor",
+    // #1425 — the REAL helpers, not doubles: injecting a stub here would let the
+    // extracted method pass against a canonicalNodeId that always returned NaN.
+    "canonicalNodeId",
+    "isQualifiedNodeId",
     `const executors = { ${methodMatch[0]} }; return executors.graph_edit_node;`,
   );
-  return factory(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
+  return factory(
+    getGraphCtx,
+    resolveNode,
+    refreshNodeArea,
+    unsafeBypassMappings,
+    resolveRailNode,
+    railKindFor,
+    canonicalNodeId,
+    isQualifiedNodeId,
+  );
 }
 
 function realLegacyColor(getGraphCtx, resolveNode, normalizeLegacyNodeId) {
@@ -54,9 +68,11 @@ function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypas
     "resolveRailNode",
     "railKindFor",
     "normalizeLegacyNodeId",
+    "canonicalNodeId",
+    "isQualifiedNodeId",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyMoveMatch[0]} ${legacyResizeMatch[0]} };
      return { move: GRAPH_TOOL_EXECUTORS.graph_move_node, resize: GRAPH_TOOL_EXECUTORS.graph_resize_node };`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId);
 }
 
 function realLegacyTitle(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
@@ -68,8 +84,10 @@ function realLegacyTitle(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypass
     "resolveRailNode",
     "railKindFor",
     "normalizeLegacyNodeId",
+    "canonicalNodeId",
+    "isQualifiedNodeId",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyTitleMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_title;`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId);
 }
 
 function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
@@ -81,8 +99,10 @@ function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBy
     "resolveRailNode",
     "railKindFor",
     "normalizeLegacyNodeId",
+    "canonicalNodeId",
+    "isQualifiedNodeId",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyCollapsedMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_node_collapsed;`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId);
 }
 
 function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings, normalizeLegacyNodeId) {
