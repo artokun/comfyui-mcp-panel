@@ -93,6 +93,35 @@ function makeKey(file, text) {
  * 247-key catalog and failed the gate with ~246 unknown-key errors in every language.
  * Conversion has to be a round trip, not a one-way door.
  */
+/**
+ * Index of the `}` that closes the `{` at position 0 of `s`, ignoring braces inside string
+ * literals.
+ *
+ * A plain `indexOf('}')` is wrong here, and specifically wrong for the ONLY shape plurals
+ * take: every form carries a `{count}` placeholder, so in `{ one: "{count} run", other: … }`
+ * the first `}` is the one closing `{count}` INSIDE the literal. The body came back cut off
+ * mid-string, neither `one` nor `other` matched, and the site emitted zero candidates —
+ * silently. Zero candidates means the round-trip test has no key to demand, so every plural
+ * string in the panel would stay English in every language with the whole suite green.
+ */
+function matchingBrace(s) {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      for (i++; i < s.length; i++) {
+        if (s[i] === '\\') { i++; continue; }
+        if (s[i] === quote) break;
+      }
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
 function readConverted(src, file) {
   const out = [];
   // `tr(` + a quoted key + `,` + either a quoted string or a `{ one: …, other: … }` object.
@@ -110,7 +139,7 @@ function readConverted(src, file) {
     }
     // Plural object: emit one candidate per category so English carries `key_one`/`key_other`.
     if (rest.startsWith('{')) {
-      const close = rest.indexOf('}');
+      const close = matchingBrace(rest);
       if (close === -1) continue;
       const body = rest.slice(1, close);
       const form = /(\w+)\s*:\s*(["'`])((?:\\.|(?!\2)[^\\])*)\2/g;
