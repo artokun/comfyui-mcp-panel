@@ -22,8 +22,24 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+// The SHIPPED translator, not a stub. No catalog is loaded in this process, which is
+// exactly the state `tr` is designed to survive: every call returns its English fallback
+// with `{holes}` filled. So the wording assertions below still read the English the panel
+// renders, and they still fail if that English changes.
+import { tr } from "../../web/js/lib/i18n.js";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
+
+/**
+ * Strip the `tr("panel.key", ` prefix from a source excerpt, leaving the English literal.
+ *
+ * The SOURCE guards here are about which WORDS a card uses — "secret request" rather than
+ * the question card's default — not about how those words are looked up. Unwrapping keeps
+ * that question the one being asked: change the wording and the assertion still fails;
+ * delete the string and it still fails. Only the lookup mechanism is made invisible.
+ */
+const unwrapTr = (src) => src.replace(/\btr\(\s*"[\w.]+"\s*,\s*/g, "");
 
 function namedFunctionSource(src, name) {
   const start = src.indexOf(`function ${name}(`);
@@ -60,7 +76,7 @@ function loadRetire() {
   const document = {
     createElement: () => ({ className: "", style: { cssText: "" }, textContent: "" }),
   };
-  return new Function("document", `${fn}; return retireInteractiveCard;`)(document);
+  return new Function("document", "tr", `${fn}; return retireInteractiveCard;`)(document, tr);
 }
 
 const retire = loadRetire();
@@ -148,7 +164,7 @@ test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () =
     /const unregisterSecret = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
     "registered at paint, and ONLY when a command painted it",
   );
-  assert.match(paint, /what: "secret request"/);
+  assert.match(unwrapTr(paint), /what: "secret request"/);
   assert.match(paint, /Nothing was sent and nothing was stored/, "no false 'saved' impression survives");
   assert.match(paint, /do not paste the value into the chat/, "never redirect a secret into the transcript");
   assert.match(paint, /promise\.then\(unregisterSecret, unregisterSecret\)/);

@@ -661,7 +661,12 @@ export function renderA2UIFailCard(rawText, errors) {
   el.appendChild(t);
   const why = document.createElement("div");
   why.className = "cmcp-a2ui-text";
-  why.textContent = (errors && errors.length ? errors.slice(0, 3).join("; ") : "could not render") + " — tap to view raw";
+  // The validator's own `errors` stay in English on purpose — they name spec fields
+  // ("component.type must be a string"), which is the vocabulary of the JSON below, not
+  // prose. Only the two pieces of chrome around them are translated.
+  why.textContent =
+    (errors && errors.length ? errors.slice(0, 3).join("; ") : tr("a2ui.could_not_render", "could not render")) +
+    tr("a2ui.tap_to_view_raw", " — tap to view raw");
   why.style.cursor = "pointer";
   const pre = document.createElement("pre");
   pre.textContent = typeof rawText === "string" ? rawText : JSON.stringify(rawText, null, 2);
