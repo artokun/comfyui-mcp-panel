@@ -6,6 +6,60 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-10
+
+> #753: the panel's text was small and the obvious fix did nothing. Overriding
+> `.cmcp-root { font-size }` scaled almost nothing, because every inner size was `rem` —
+> resolved against the PAGE root, not the panel.
+
+### Added
+- **`--cmcp-fs`, one variable that scales the panel's text.** Set it on `:root` or
+  `.cmcp-root` in a user stylesheet (default `0.8125rem`) and every panel font size follows,
+  including the CivitAI explorer, the Apps tab and the modals. Measured: overriding it to
+  1.5x moves 2110 of 2476 rendered elements by exactly that.
+- It does NOT scale spacing, icons, or the handful of elements that carry a fixed pixel
+  size, and the setting's tooltip now says so rather than promising more.
+
+### Changed
+- 214 inner font sizes became `calc(var(--cmcp-fs, 0.8125rem) * k)`, each reproducing its
+  original pixel size at the default — verified element by element against a capture of the
+  panel taken before the change, with no drift beyond sub-pixel rounding.
+- The "Panel UI scale (%)" setting is unchanged and is still the way to scale the panel as a
+  whole. Its tooltip used to explain why a stylesheet override could not work; that trap is
+  gone, so it now names the knob that does.
+
+### Fixed
+- the status caret set its size through a JS assignment rather than a stylesheet rule, so it
+  had been missed by every sweep. It scales with the rest now.
+
+
+## [0.13.2] - 2026-08-10
+
+> #945: the panel could not tell one workflow OBJECT from another without looking at the
+> canvas — so two guards that decide whether an identity belongs to a copy were deciding
+> nothing at all.
+
+### Fixed
+- a workflow that is not the one on screen can now be asked for its own identity (#945).
+  The three fields that lookup used are absent on current ComfyUI, so it answered null
+  every time, and both fork guards behind it short-circuited on their first line. It now
+  falls back to the workflow's own captured state — but only for a workflow that is NOT
+  mounted, and the reason for that restriction is the whole of this fix: for the workflow
+  on screen, that field is a clone of the live canvas, so reading it there would answer
+  "whose identity is this?" with "whatever is on screen", which is precisely what the
+  caller asked it not to do.
+- the mounted check compares identity the way the rest of the panel does, rather than with
+  `===`. ComfyUI hands out reactive proxies in some places and raw objects in others, and
+  the path that matters most here unwraps deliberately — measured on this machine, the
+  active workflow IS a proxy whose raw target is a different object, so a strict comparison
+  would have let the canvas back in with no race required.
+
+### Changed
+- where identity is WRITTEN is untouched. Embedding into the workflow's captured state
+  moves where identity persists — it stops reaching the graph that a save serializes — and
+  was reverted once for exactly that. Reading a field is not writing it.
+
+
 ## [0.13.1] - 2026-08-10
 
 > The other half of #952. A question card whose connection was replaced already stopped

@@ -2,7 +2,7 @@
 //
 // THE REPORT. A user on Windows 11 found the sidebar text barely readable, and
 // the fix anyone would reach for does nothing: `.cmcp-root` sets
-// `font-size: 0.8125rem`, but the panel's inner rules are `rem`, which resolve
+// `font-size: 0.8125rem`. Historically the panel's inner rules were `rem`, resolving
 // against the PAGE root rather than against the panel. Overriding
 // `.cmcp-root { font-size }` in a user stylesheet therefore moves only the few
 // elements that inherit, and every rem-sized label stays exactly as it was.
