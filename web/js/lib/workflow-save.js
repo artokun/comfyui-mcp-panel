@@ -587,18 +587,9 @@ export async function saveActiveWorkflow(
 
     const cls = await classifySource(svc, wf, sourcePath, existsOnDisk);
 
-    // #226 CLASSIFICATION GUARD (hoisted so it applies regardless of which copy API
-    // is used) — a source ACTING temporary that isn't PROVABLY never-persisted must
-    // not be relocated: it might be a real on-disk file a relocate could move or
-    // destroy. This is about the SOURCE, not the write mechanism. A correctly-opened
-    // persisted workflow (isTemporary === false) hits the copy path below.
-    if (wf.isTemporary === true && cls !== "never-persisted") {
-      throw new Error(
-        `refusing to save: the active workflow is flagged unsaved but its source "${sourcePath}" ` +
-          `${cls === "persisted" ? "exists on disk" : "cannot be proven absent from disk"} — ` +
-          `saving now could MOVE (destroy) the original (issue #226). Re-open the workflow and try again.`,
-      );
-    }
+    // The #226 CLASSIFICATION GUARD lives just below, AFTER the write route is
+    // resolved, because the hazard it names belongs to the route and not to the
+    // source. See the comment at that check (#1066 defect 2).
 
     // #226/#309 P1-1 — a relocating Save-As can COLLIDE with an existing file, and a
     // non-atomic HEAD pre-check can NEVER make an OVERWRITING write safe (a target can
@@ -628,13 +619,57 @@ export async function saveActiveWorkflow(
     // evidence; a mid-trio switch to a foreign tab must thread/consume NOTHING).
     const producedRecord = {};
     const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign });
+
+    // #226 CLASSIFICATION GUARD, scoped to the hazard it actually names (#1066 defect 2).
+    //
+    // A source ACTING temporary that isn't PROVABLY never-persisted must not be MOVED:
+    // it might be a real on-disk file a relocate would destroy. That is the invariant,
+    // and it is unchanged. What changed is where it can be violated.
+    //
+    // The guard used to run BEFORE the route was chosen, on the reasoning that it is
+    // "about the SOURCE, not the write mechanism". That was true when a moving route
+    // existed: the frontend's `saveWorkflowAs` branches on `isTemporary` and MOVES a
+    // temporary via renameWorkflow. It is no longer reachable — `saveWorkflowAs` and
+    // `renameWorkflow` now appear in this module only in comments, and every non-atomic
+    // relocation throws (see the refusal below this block). The one surviving relocating
+    // route is the atomic trio, and it is move-free BY CONSTRUCTION, verified against the
+    // real frontend rather than inferred: `workflowStore.saveAs(existing, path)` builds a
+    // NEW ComfyWorkflow from a deep copy of `existing.activeState`, inserts it at
+    // `workflowLookup[path]`, and returns it — it never reads `existing.path`, never calls
+    // /userdata, and never deletes. `saveWorkflow(copy)` then POSTs the COPY with
+    // `overwrite: copy.isPersisted` → false (a fresh copy has `size === -1`), so the
+    // target is server-guarded too. The source file is untouchable from this path.
+    //
+    // So on the trio the refusal could only ever be a FALSE one — and #1066 is what that
+    // costs a user: a URL-derived temporary tab whose source can be classified by nothing
+    // (the in-memory oracle returns the tab itself; ComfyUI's /userdata answers a URL-shaped
+    // path with a 500, not a 404 — measured, see the issue) was unsaveable under ANY name,
+    // by the panel or by ComfyUI's own Save-As.
+    //
+    // FAILS CLOSED: the exemption is conditioned on the move-free route being the one that
+    // will actually run, so reintroducing any moving fallback re-arms the guard rather than
+    // silently inheriting the exemption. Without a move-free route we still refuse here,
+    // with the message naming the SOURCE — which is the more useful of the two refusals
+    // available, and the reason this is not simply deleted in favour of the generic
+    // "atomic Save-As is unavailable" throw below.
+    if (wf.isTemporary === true && cls !== "never-persisted" && !atomicCopy) {
+      throw new Error(
+        `refusing to save: the active workflow is flagged unsaved but its source "${sourcePath}" ` +
+          `${cls === "persisted" ? "exists on disk" : "cannot be proven absent from disk"} — ` +
+          `saving now could MOVE (destroy) the original (issue #226). Re-open the workflow and try again.`,
+      );
+    }
+
     if (atomicCopy) {
       assertExpect(); // #330: still the workflow we probed?
       // Authoritative outcome: a "never-persisted" source (a temp / new_workflow tab
       // with no backing file) is a FIRST SAVE (panel#363 — no original to preserve);
       // a "persisted" source is a Save-As COPY of a real file that stays put (#579).
-      // (cls is only ever "persisted" or "never-persisted" here — the #226 guard above
-      // has already thrown for a temporary source that isn't provably never-persisted.)
+      // An "unknown" source (#1066 defect 2) reports as a COPY too, and that is the
+      // honest label rather than a fallback: the trio copied, and we cannot claim the
+      // "no original to preserve" that "first-save" asserts. Under-claiming here also
+      // keeps the two decisions that DO turn on proof — predecessor consumption and the
+      // move backstop — reading "not never-persisted", which is what they must see.
       recordOutcome(details, cls === "never-persisted" ? "first-save" : "save-as-copy", {
         sourcePath,
         targetPath: finalTargetPath,
@@ -655,15 +690,42 @@ export async function saveActiveWorkflow(
       // (disk 200) was present and is now CONFIRMED absent (disk 404) — classifyOriginalOnDisk
       // "lost". Every indeterminate case (no oracle / unknown pre or post / in-memory-only
       // signal) is a NO-OP, never a false "moved" (#226).
-      if (cls === "persisted") {
+      //
+      // Runs for an UNKNOWN source as well as a persisted one (#1066 defect 2). An
+      // unknown source is exactly the case where we could not establish what is on disk,
+      // so it is the one that most needs the observed check afterwards — and the check
+      // costs nothing when the answer stays unknown, because "lost" demands a CONFIRMED
+      // 200 before and a CONFIRMED 404 after. For the URL-derived tab this issue is about,
+      // both probes are 500 ⇒ null ⇒ "unverified" ⇒ no-op. Only never-persisted skips it,
+      // and only because a proven-absent source has nothing to lose.
+      //
+      // It is also the mitigation for the one thing the route exemption above cannot
+      // check: that exemption is DUCK-TYPED (three method names), so a frontend whose
+      // `saveAs` is not the move-free one verified against 1.50.3 would take the copy
+      // path with nothing having proven it move-free. This probe observes the OUTCOME
+      // rather than trusting the shape, and an unknown source is precisely the case with
+      // no other evidence — so it is the one that most needs observing (codex).
+      //
+      // ACCEPTED RESIDUAL (codex): two probes establish DISAPPEARANCE, not CAUSATION. A
+      // source deleted by something ELSE during the awaited persist trips this too, and no
+      // client-side check can separate the two — /userdata exposes no per-file version or
+      // actor. That is why the message below reports what was OBSERVED and names both
+      // causes instead of asserting this save moved it. The residual is inherited rather
+      // than introduced: the identical race already applied to a "persisted" source before
+      // this condition was widened. Erring toward a loud, accurate report is deliberate —
+      // the alternative is silence about a file that really is gone.
+      if (cls !== "never-persisted") {
         const sourceOnDiskAfter = await probeSourceOnDisk(existsOnDisk, sourceNorm);
         if (
           classifyOriginalOnDisk({ preExisted: sourceOnDiskBefore, postExists: sourceOnDiskAfter }) ===
           "lost"
         ) {
           throw new Error(
-            `save moved the original workflow "${sourcePath}" instead of copying it — ` +
-              `the source no longer exists on disk (issue #226)`,
+            `the original workflow "${sourcePath}" was on disk when this save began and is GONE ` +
+              `now — the copy "${finalTargetPath}" was written, but the source disappeared across ` +
+              `the save. Most likely this save moved it instead of copying it (issue #226); it can ` +
+              `also mean something else deleted it mid-save, which these two probes cannot tell ` +
+              `apart. Check the source before relying on it.`,
           );
         }
       }
@@ -1256,7 +1318,13 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   // call that SUCCEEDS: `persisted` if it shows a persisted workflow here,
   // `confirmedAbsent` only if a successful lookup shows none. An oracle that
   // THROWS proves nothing (a thrown lookup is not proof of absence, #226) — we
-  // leave both false so the result stays "unknown" → refuse.
+  // leave both false so the result stays "unknown".
+  //
+  // What "unknown" COSTS is no longer a blanket refusal (#1066 defect 2, codex): it
+  // withholds the two rights that need proof — taking a MOVE path, and CONSUMING the
+  // source tab (#566) — while a provably move-free copy may still proceed. So this
+  // function's job is unchanged and its strictness matters just as much; only the
+  // consequence downstream is narrower than "refuse".
   let persisted = false;
   let confirmedAbsent = false;
 
@@ -1300,9 +1368,9 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   // real file (#226/#215). They are indistinguishable in memory; only the disk
   // can tell them apart. Consult the authoritative filesystem oracle: a proven
   // ABSENCE (404) means there is no backing file to destroy → never-persisted
-  // (safe to ground); a proven PRESENCE means a real file → persisted (refuse).
-  // Unknown/failure changes nothing (stays "unknown" → refuse), so this only
-  // ever ADDS safe grounds to save and never weakens the #226 refusal.
+  // (safe to ground); a proven PRESENCE means a real file → persisted (copy it,
+  // never move it). Unknown/failure changes nothing (stays "unknown"), so this
+  // only ever ADDS safe grounds and never weakens the #226 invariant.
   if (typeof existsOnDisk === "function" && wf?.isPersisted !== true) {
     let exists = null;
     try {
