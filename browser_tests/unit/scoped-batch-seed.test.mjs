@@ -262,6 +262,26 @@ test("#1339 — an ARMED node with a degenerate random range still repeats", () 
   assert.match(note, /randomMin=5, randomMax=5/);
   assert.match(note, /randomMin\/randomMax/);
 
+  // A range that LOOKS healthy but cannot vary, because of the widget's step. rgthree
+  // divides by step/10, so randomRange <= 1 makes every draw return randomMin — measured
+  // as ONE distinct value across 200 draws at min=0, max=5, step=100, while `min < max`
+  // says nothing is wrong. Found by working the probe rather than waiting to be told.
+  const bigStep = {
+    ...rgthreeSeed(650, -1),
+    properties: { randomMin: 0, randomMax: 5 },
+    widgets: [{ name: "seed", value: -1, options: { step: 100 } }],
+  };
+  assert.equal(findRgthreeSeedNodes([bigStep])[0].varies, false);
+  assert.match(rgthreeFixedSeedNote(findRgthreeSeedNodes([bigStep]), 3), /at step 100/);
+
+  // …and the same narrow range at the ORDINARY step still varies (50 distinct values).
+  const okStep = {
+    ...rgthreeSeed(651, -1),
+    properties: { randomMin: 0, randomMax: 5 },
+    widgets: [{ name: "seed", value: -1, options: { step: 1 } }],
+  };
+  assert.equal(findRgthreeSeedNodes([okStep])[0].varies, true);
+
   // A NORMAL range keeps its silence — the defaults, and an explicit wide range.
   for (const properties of [undefined, { randomMin: 0, randomMax: 1125899906842624 }]) {
     const ok = { ...rgthreeSeed(649, -1), ...(properties ? { properties } : {}) };

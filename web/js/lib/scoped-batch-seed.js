@@ -210,23 +210,39 @@ function isRgthreeSeedNode(node) {
  * `|| 1125899906842624` in `generateRandomSeed`), because that is what the node will
  * actually use, not as "unknown".
  */
-function rgthreeRandomRange(node) {
+function rgthreeRandomRange(node, seedWidget) {
   let min = 0;
   let max = 1125899906842624;
+  let step = 1;
   try {
     const props = node?.properties ?? {};
     min = Number(props.randomMin || 0);
     max = Number(props.randomMax || 1125899906842624);
+    step = Number(seedWidget?.options?.step) || 1;
   } catch {
     /* the defaults above are what rgthree would use anyway */
   }
-  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(step)) {
     return { varies: true, reason: null };
   }
-  if (min >= max) {
+  // THE STEP IS PART OF THE CONDITION, and `min >= max` alone missed it. rgthree draws:
+  //
+  //     const randomRange = (randomMax - randomMin) / (step / 10);
+  //     let seed = Math.floor(Math.random() * randomRange) * (step / 10) + randomMin;
+  //
+  // so when `randomRange <= 1`, `Math.floor(Math.random() * randomRange)` is always 0 and
+  // every draw returns `randomMin`. Measured: min=0, max=5, step=100 gives ONE distinct
+  // value across 200 draws while min < max looks perfectly healthy. A range check that
+  // ignores the step reports that node as varying, which is the silence this whole fix is
+  // about.
+  const range = (max - min) / (step / 10);
+  if (!(range > 1)) {
     return {
       varies: false,
-      reason: `its random range is randomMin=${min}, randomMax=${max}, which admits a single value`,
+      reason:
+        `its random range is randomMin=${min}, randomMax=${max}` +
+        (step !== 1 ? ` at step ${step}` : "") +
+        `, which admits a single value`,
     };
   }
   return { varies: true, reason: null };
@@ -289,7 +305,7 @@ export function findRgthreeSeedNodes(nodes) {
       // number, and a degenerate range landing on a sentinel is coerced to 0. So an armed
       // node with randomMin === randomMax submits the SAME seed every item while looking
       // armed. Silence there would recreate the exact surprise this warning exists for.
-      const range = rgthreeRandomRange(node);
+      const range = rgthreeRandomRange(node, seedWidget);
       const varies = mode !== null && range.varies;
       found.push({
         node_id: node?.id != null ? String(node.id) : null,
