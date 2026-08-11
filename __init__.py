@@ -456,27 +456,26 @@ def _start_hint(port, comfyui_url=None):
 # the module docstring.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# #584 — a reload that keeps running the OLD panel JS.
+# #584 — a BACKSTOP for hosts that do not already stop the browser reusing panel JS.
 #
-# Reproduced on a dev machine while shipping #753: after editing the panel source,
-# ``location.reload()`` brought the page back with the extension registered, the panel
-# rendered — and the OLD code running. Fetching the same URL returned the NEW bytes while
-# the live stylesheet still held the OLD rules. That is the shape reported here: an
-# installed 0.11.38 with a tab running 0.11.34, surviving a ComfyUI restart and a frontend
-# reload, cleared only by Ctrl+Shift+R.
+# Measured against the running server (ComfyUI 0.31.1) before claiming anything: every
+# /extensions/ path ALREADY answers `Cache-Control: no-store` — ours and other packs' alike
+# — so on this version the HTTP cache is not the mechanism, and this middleware is a no-op.
+# It only ever acts where the host sets no cache header at all, which is the shape ComfyUI's
+# own e0982a71 describes for older builds: an aiohttp ETag from mtime+size, a 304, stale
+# content served.
 #
-# A stale module is invisible from inside the page — it compares equal to itself and every
-# consistency check it can run passes. The only place it can be prevented is the response
-# headers.
+# A CORRECTION worth recording, because it was my own working theory. While shipping #753 I
+# saw the page come back running OLD code after `location.reload()` and read it as a cache.
+# It was not: the reload was being CANCELLED by ComfyUI's unsaved-changes prompt, and the
+# code only updated once I suppressed that and navigated. The header measurement above is
+# what ruled the cache out; without it this comment would still be blaming the wrong thing.
 #
-# ``no-cache``, deliberately NOT ``no-store``: the browser may keep the file, but must ask
-# before reusing it. ComfyUI already answers with an ETag derived from mtime+size, so an
-# unchanged file still gets a 304 with no body and costs one conditional request; a changed
-# one can no longer be served from cache without asking. The cost is bounded by our own
-# module count; the failure it removes is a tab that silently runs a build the user
-# replaced.
+# `no-cache`, deliberately NOT `no-store`: the browser may keep the file, but must ask before
+# reusing it. Where an ETag exists an unchanged file still answers 304 with no body, so the
+# cost is one conditional request per module rather than a re-download.
 #
-# Scoped to this pack's own assets. Nothing else ComfyUI serves is touched.
+# Scoped to this pack's own assets, and it never overwrites a header the host set.
 # ---------------------------------------------------------------------------
 _ASSET_PREFIX = "/extensions/comfyui-mcp-panel/"
 

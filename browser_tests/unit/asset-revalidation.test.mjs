@@ -1,19 +1,21 @@
 /**
- * #584 — a reload that keeps running the OLD panel JS.
+ * #584 — a BACKSTOP against a browser reusing panel JS, not a fix for today's ComfyUI.
  *
- * Reproduced on a dev machine while shipping #753, which is why this exists as a fix rather
- * than more instrumentation: after editing the panel source, `location.reload()` brought the
- * page back with the extension registered and the panel rendered — running the OLD code.
- * Fetching the same URL returned the NEW bytes while the live stylesheet still held the OLD
- * rules. Getting the new code needed `fetch(url, {cache:'reload'})` per file plus a
- * navigation with a changed query string.
+ * MEASURED FIRST, and it overturned my working theory. On the running server (ComfyUI
+ * 0.31.1) every `/extensions/` path already answers `Cache-Control: no-store` — ours and
+ * other packs' alike. So on this version the HTTP cache is NOT the mechanism, and this
+ * middleware does nothing. It acts only where the host sets no cache header at all, which
+ * is the shape ComfyUI's own e0982a71 describes for older builds: an aiohttp ETag from
+ * mtime+size, a 304, stale content served.
  *
- * The reported shape is the same: an installed 0.11.38 with a tab running 0.11.34, surviving
- * a ComfyUI restart and `panel_reload(scope:'frontend')`, cleared only by Ctrl+Shift+R.
+ * The correction: while shipping #753 I saw a page come back running OLD code after
+ * `location.reload()` and read it as a cache. It was not. The reload was being CANCELLED
+ * by ComfyUI's unsaved-changes prompt; the code updated only once I suppressed that and
+ * navigated. Without the header measurement this would have shipped blaming the cache.
  *
- * A stale module cannot be detected from inside the page — it compares equal to itself and
- * every consistency check it can run passes. The only place it can be PREVENTED is the
- * response headers, which is what these tests pin.
+ * A stale module still cannot be detected from inside the page — it compares equal to
+ * itself and every consistency check it can run passes — so where a host DOES leave the
+ * door open, headers are the only place to close it.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -85,12 +87,15 @@ test("#584 the installer is actually CALLED during registration", () => {
   assert.ok(call > 0 && log > call, "installed before the completion log");
 });
 
-test("#584 the comment records the measurement, not a guess", () => {
+test("#584 the comment records the MEASUREMENT, including the theory it killed", () => {
   const header = INIT.slice(INIT.indexOf("# #584 —"), INIT.indexOf("_ASSET_PREFIX ="));
-  assert.match(header, /Reproduced on a dev machine/, "this was observed, not theorised");
-  assert.match(header, /compares equal to itself/, "why the page cannot self-diagnose");
-  assert.match(header, /ETag/, "and why revalidation is cheap here");
-  // It must not promise the thing headers cannot deliver: a tab that is ALREADY stale still
-  // has to revalidate once before it can notice.
-  assert.ok(!/guarantees|can never be stale/i.test(header));
+  // The header measurement is the load-bearing fact: it is what rules the cache out on
+  // this version, and what makes this a backstop rather than a fix.
+  assert.match(header, /ALREADY answers `Cache-Control: no-store`/);
+  assert.match(header, /this middleware is a no-op/, "says plainly it does nothing here");
+  // And the retraction, because the wrong theory is the more useful thing to record.
+  assert.match(header, /A CORRECTION worth recording/);
+  assert.match(header, /CANCELLED by ComfyUI's unsaved-changes prompt/);
+  // It must not claim to fix the reported symptom on a host that already sets the header.
+  assert.ok(!/guarantees|can never be stale|fixes #584/i.test(header));
 });
