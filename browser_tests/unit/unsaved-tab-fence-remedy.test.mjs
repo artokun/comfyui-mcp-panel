@@ -20,9 +20,11 @@
  *     a consistent identity to compare against rather than the previous tab's.
  *
  * What remained, and is what this ships: the refusal's own remedy names
- * `panel_open_workflow`, which resolves a workflow BY PATH. For an unsaved tab — exactly
- * the canvas a `panel_new_workflow` just made — that half of the advice cannot be
- * followed, and the reporter had to say so themselves.
+ * `panel_open_workflow`, which resolves a workflow BY PATH — so it cannot re-select an
+ * unsaved ACTIVE tab, exactly the canvas a `panel_new_workflow` just made. The claim is
+ * kept that narrow (codex): a mismatch means the command's intended workflow is not the
+ * active one, and if that intended workflow is a SAVED one, open remains the right
+ * recovery. What is ruled out is re-selecting THIS tab, nothing more.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -65,29 +67,40 @@ const build = (() => {
 
 const ARGS = { commandUuid: "11111111-2222-4333-8444-555555555555", activeUuid: "99999999-8888-4777-8666-555555555555" };
 
-test("#1019 an UNSAVED active tab is told that open cannot reach it", () => {
+test("#1019 an UNSAVED active tab is told open cannot re-select THAT tab", () => {
   const msg = build({ ...ARGS, activeIsUnsaved: true });
-  assert.match(msg, /The active tab is UNSAVED, so panel_open_workflow cannot reach it/);
-  assert.match(msg, /resolves a workflow by path and this one has none/, "and why");
-  assert.match(msg, /Re-targeting is the route here/, "what to do instead");
+  assert.match(msg, /the ACTIVE tab is unsaved, so panel_open_workflow cannot re-select THAT one/);
+  assert.match(msg, /resolves a workflow by path and this tab has none/, "and why");
+  assert.match(msg, /If the canvas you want is this active tab, re-target instead/, "what to do instead");
   assert.match(msg, /panel_list_workflows is exempt from this fence/, "and the fence-exempt probe");
+});
+
+test("#1019 (codex) it does NOT tell a caller that open is useless", () => {
+  // A mismatch means the command's intended workflow is not the active one, and that
+  // intended workflow may be a SAVED one — for which panel_open_workflow is exactly the
+  // right recovery. The unsaved state rules out re-selecting THIS tab, nothing more.
+  const msg = build({ ...ARGS, activeIsUnsaved: true });
+  assert.match(msg, /opening a different, saved workflow still works normally/);
+  assert.doesNotMatch(msg, /Re-targeting is the route here/, "an overclaim that contradicts the remedy above it");
+  assert.match(msg, /re-select the intended workflow with panel_open_workflow/, "the original remedy still stands");
 });
 
 test("#1019 a SAVED active tab keeps the existing advice, unchanged", () => {
   const msg = build({ ...ARGS, activeIsUnsaved: false });
-  assert.doesNotMatch(msg, /UNSAVED/, "no clause about a tab that can be opened");
+  assert.doesNotMatch(msg, /ACTIVE tab is unsaved/, "no clause about a tab that can be opened");
   assert.match(msg, /re-select the intended workflow with panel_open_workflow, then retry\./);
 });
 
 test("#1019 an UNREADABLE tab says nothing about it — an unproven fact adds nothing to a refusal", () => {
   for (const unknown of [null, undefined]) {
     const msg = build({ ...ARGS, activeIsUnsaved: unknown });
-    assert.doesNotMatch(msg, /UNSAVED/, `activeIsUnsaved=${String(unknown)}`);
+    assert.doesNotMatch(msg, /ACTIVE tab is unsaved/, `activeIsUnsaved=${String(unknown)}`);
   }
   // The default is the same silence.
-  assert.doesNotMatch(build(ARGS), /UNSAVED/);
+  assert.doesNotMatch(build(ARGS), /ACTIVE tab is unsaved/);
   // And a non-boolean is not truthy evidence.
-  for (const junk of ["yes", 1, {}]) assert.doesNotMatch(build({ ...ARGS, activeIsUnsaved: junk }), /UNSAVED/);
+  for (const junk of ["yes", 1, {}])
+    assert.doesNotMatch(build({ ...ARGS, activeIsUnsaved: junk }), /ACTIVE tab is unsaved/);
 });
 
 test("#1019 everything the refusal already said is still said", () => {
@@ -103,7 +116,7 @@ test("#1019 everything the refusal already said is still said", () => {
 test("#1019 an UNSTAMPED command still reports that, whatever the tab", () => {
   const msg = build({ activeUuid: ARGS.activeUuid, activeIsUnsaved: true });
   assert.match(msg, /this command carries no workflow-instance stamp/);
-  assert.match(msg, /The active tab is UNSAVED/, "and the unsaved remedy is independent of that");
+  assert.match(msg, /the ACTIVE tab is unsaved/, "and the unsaved note is independent of that");
 });
 
 test("#1019 source guard: the fact is READ, not assumed, and an unreadable read stays null", () => {

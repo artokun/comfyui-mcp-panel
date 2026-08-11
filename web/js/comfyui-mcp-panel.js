@@ -2428,11 +2428,17 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
     `intended workflow with panel_open_workflow, then retry.` +
     // #1019 — only when the panel POSITIVELY read that the active tab has no path.
     // `null` means it could not tell, and an unproven fact adds nothing to a refusal.
+    // NARROW, and only about THIS tab (codex). A mismatch means the command's intended
+    // workflow is not the active one — and that intended workflow may well be a saved one,
+    // for which panel_open_workflow is exactly the right recovery. What the unsaved state
+    // rules out is re-selecting THE ACTIVE TAB by path, which is the case a caller lands in
+    // when the canvas they want is the one panel_new_workflow just made.
     (activeIsUnsaved === true
-      ? ` The active tab is UNSAVED, so panel_open_workflow cannot reach it — that tool ` +
-        `resolves a workflow by path and this one has none. Re-targeting is the route ` +
-        `here; panel_list_workflows is exempt from this fence and republishes the active ` +
-        `identity if you need it first (#1019).`
+      ? ` Note that the ACTIVE tab is unsaved, so panel_open_workflow cannot re-select ` +
+        `THAT one — it resolves a workflow by path and this tab has none. If the canvas you ` +
+        `want is this active tab, re-target instead; opening a different, saved workflow ` +
+        `still works normally. panel_list_workflows is exempt from this fence and ` +
+        `republishes the active identity if you need it first (#1019).`
       : "") +
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
