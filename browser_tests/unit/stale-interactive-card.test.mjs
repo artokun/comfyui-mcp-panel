@@ -31,16 +31,6 @@ import { tr } from "../../web/js/lib/i18n.js";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 
-/**
- * Strip the `tr("panel.key", ` prefix from a source excerpt, leaving the English literal.
- *
- * The SOURCE guards here are about which WORDS a card uses — "secret request" rather than
- * the question card's default — not about how those words are looked up. Unwrapping keeps
- * that question the one being asked: change the wording and the assertion still fails;
- * delete the string and it still fails. Only the lookup mechanism is made invisible.
- */
-const unwrapTr = (src) => src.replace(/\btr\(\s*"[\w.]+"\s*,\s*/g, "");
-
 function namedFunctionSource(src, name) {
   const start = src.indexOf(`function ${name}(`);
   if (start === -1) return null;
@@ -164,7 +154,12 @@ test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () =
     /const unregisterSecret = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
     "registered at paint, and ONLY when a command painted it",
   );
-  assert.match(unwrapTr(paint), /what: "secret request"/);
+  // Either the bare literal or the translated form — but if it is translated, the KEY is
+  // pinned too, not just the English. A wildcard key would let `tr("panel.question",
+  // "secret request")` pass while every non-English locale renders the secret card with the
+  // question card's noun: the assertion stays green in the one language the author reads,
+  // and the "secret-safe wording" this test exists for is gone everywhere else.
+  assert.match(paint, /what: (?:tr\("panel\.secret_request",\s*)?"secret request"/);
   assert.match(paint, /Nothing was sent and nothing was stored/, "no false 'saved' impression survives");
   assert.match(paint, /do not paste the value into the chat/, "never redirect a secret into the transcript");
   assert.match(paint, /promise\.then\(unregisterSecret, unregisterSecret\)/);

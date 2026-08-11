@@ -23020,12 +23020,19 @@ function buildPanel() {
       // `what` and `detail` arrive already translated from the call sites — the caller
       // knows which kind of card it is, and a `{what}` hole lets each language place the
       // noun where its grammar wants it rather than mid-sentence as English does.
-      note.textContent =
+      //
+      // The two sentences are JOINED here rather than the first one carrying a trailing
+      // space. Edge whitespace in a catalog value is silently droppable and `i18n-check`
+      // only validates holes, so a translator who trimmed it would glue two sentences
+      // together with no way to see why.
+      note.textContent = [
         tr(
           "panel.the_connection_that_asked_this_dropped_so",
-          "The connection that asked this {what} dropped, so an answer here can no longer reach the agent. ",
+          "The connection that asked this {what} dropped, so an answer here can no longer reach the agent.",
           { what: what ?? tr("panel.question", "question") },
-        ) + (detail ?? tr("panel.if_it_asked_again_answer_the_newer", "If it asked again, answer the newer card."));
+        ),
+        detail ?? tr("panel.if_it_asked_again_answer_the_newer", "If it asked again, answer the newer card."),
+      ].join(" ");
       card.appendChild(note);
     } catch {
       /* presentation only — never break a reconnect */
@@ -24338,6 +24345,12 @@ function buildPanel() {
         // title this thread is already STORED under (see the record() path above), so
         // translating it here would hand the user a different string than the row shows
         // and write a locale-specific title into IndexedDB on OK.
+        //
+        // Not the same case as a `record({ text })` card entry, which IS translated at the
+        // point it is written: a transcript row is a record of what was ON SCREEN at that
+        // moment, and freezing its language is correct. A thread TITLE is live metadata
+        // re-rendered on every repaint, so a frozen one goes stale the moment the user
+        // switches language.
         const next = window.prompt(tr("panel.chat_title", "Chat title"), t.title || firstUser?.text || "New chat");
         if (next == null) return;
         historyStore.reviseThread(t, { title: next.trim().slice(0, 160) || null });
