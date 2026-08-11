@@ -2406,7 +2406,7 @@ function noteWorkflowInstanceMismatch() {
  *  The leading `workflow instance mismatch:` token is preserved deliberately: it
  *  is what readers and existing reports recognise this refusal by. Only the claim
  *  about causation changes. */
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid } = {}) {
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -2425,9 +2425,17 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid } = {}) {
     `command was issued, that this session's fence was never established or could not ` +
     `be refreshed, or that the identity could not be read at all.\n\n` +
     `Re-target with panel_set_workflow_target({mode:"current"}), or re-select the ` +
-    `intended workflow with panel_open_workflow, then retry. If NO panel tab is ` +
-    `connected, neither will help and the connection is the thing to fix — ` +
-    `panel_graph_outline reports connectivity directly.`
+    `intended workflow with panel_open_workflow, then retry.` +
+    // #1019 — only when the panel POSITIVELY read that the active tab has no path.
+    // `null` means it could not tell, and an unproven fact adds nothing to a refusal.
+    (activeIsUnsaved === true
+      ? ` The active tab is UNSAVED, so panel_open_workflow cannot reach it — that tool ` +
+        `resolves a workflow by path and this one has none. Re-targeting is the route ` +
+        `here; panel_list_workflows is exempt from this fence and republishes the active ` +
+        `identity if you need it first (#1019).`
+      : "") +
+    ` If NO panel tab is connected, neither will help and the connection is the thing ` +
+    `to fix — panel_graph_outline reports connectivity directly.`
   );
 }
 
@@ -2443,7 +2451,21 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
     })
   ) {
     noteWorkflowInstanceMismatch();
-    throw new Error(workflowInstanceMismatchMessage({ commandUuid, activeUuid }));
+    // #1019 — WHETHER THE ACTIVE TAB CAN BE RE-OPENED AT ALL. The remedy names
+    // `panel_open_workflow`, which resolves a workflow BY PATH; an unsaved tab has none,
+    // so for the canvas this refusal is most likely to be about — one `panel_new_workflow`
+    // just created — half the advice cannot be followed. The reporter said exactly that:
+    // "Since the new workflow is unsaved, panel_open_workflow cannot recover it."
+    // Read defensively: an unreadable path is not evidence either way, and the message
+    // then keeps its existing wording rather than claiming something about the tab.
+    let activeIsUnsaved = null;
+    try {
+      const active = activeWorkflowRef();
+      if (active) activeIsUnsaved = !savedWorkflowPath(active);
+    } catch {
+      activeIsUnsaved = null;
+    }
+    throw new Error(workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved }));
   }
 }
 
