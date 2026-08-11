@@ -159,7 +159,12 @@ import {
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
 import { findStalePlaceholders, stalePlaceholderNote } from "./lib/stale-placeholders.js";
-import { findRepeatingControlWidgets, scopedBatchSeedNote } from "./lib/scoped-batch-seed.js";
+import {
+  findRepeatingControlWidgets,
+  scopedBatchSeedNote,
+  findRgthreeSeedNodes,
+  rgthreeFixedSeedNote,
+} from "./lib/scoped-batch-seed.js";
 import {
   materializePromotedValues,
   materializedValuesNote,
@@ -11835,6 +11840,21 @@ const GRAPH_TOOL_EXECUTORS = {
         repeatingControls = []; /* a warning must never take down the run */
       }
     }
+    // #1339 — rgthree seeds, on ANY batch > 1. NOT gated on `partialTargets`, unlike the
+    // scan above: #988 is about a scoped run skipping the queue-time widget hooks, while a
+    // FIXED rgthree seed is submitted verbatim for every item whether the run is scoped or
+    // not. Gating it the same way would have kept it invisible for exactly the unscoped
+    // batch a user reaches for when they want ten different images.
+    let rgthreeSeeds = [];
+    if (batch > 1) {
+      try {
+        rgthreeSeeds = findRgthreeSeedNodes(
+          collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
+        );
+      } catch {
+        rgthreeSeeds = []; /* a warning must never take down the run */
+      }
+    }
     if (!partialTargets) {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
@@ -11986,6 +12006,13 @@ const GRAPH_TOOL_EXECUTORS = {
     if (repeatingNote) {
       accept.repeating_controls = repeatingControls;
       accept.repeating_controls_note = repeatingNote;
+    }
+    // #1339 — the same class of surprise from a node the scan above cannot see, because
+    // rgthree deletes the `control_after_generate` widget it matches on.
+    const fixedSeedNote = rgthreeFixedSeedNote(rgthreeSeeds, batch);
+    if (fixedSeedNote) {
+      accept.fixed_seed_nodes = rgthreeSeeds.filter((s) => s && s.armed === false);
+      accept.fixed_seed_note = fixedSeedNote;
     }
     // #572 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
     // excluded queue-time hook inputs (beforeQueued carriers + their linked,

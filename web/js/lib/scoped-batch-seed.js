@@ -155,3 +155,117 @@ export function scopedBatchSeedNote(controls, batchCount) {
     `yourself between runs, or drop to_node_id so the run is unscoped and ComfyUI advances it.`
   );
 }
+
+/**
+ * #1339 — the same surprise, from a node this module could not see.
+ *
+ * A reporter ran `batch_count: 10` against a workflow whose seed comes from an rgthree
+ * Seed node set to "Randomize Each Time", got ten identical images, and was told
+ * `queued: true` with ten prompt ids and nothing else. The disclosure above could not
+ * fire, because rgthree DELETES the widget it looks for:
+ *
+ *     // Grab the already available widgets, and remove the built-in control_after_generate
+ *     } else if (w.name === "control_after_generate") { this.widgets.splice(i, 1); }
+ *
+ * A live `Seed (rgthree)` node carries `seed` plus three buttons and nothing else. So the
+ * most widely used custom seed node was invisible to the one warning about repeated seeds.
+ *
+ * WHAT IT DOES *NOT* SAY, and this is the point. It does not claim an rgthree seed repeats
+ * because the batch is scoped. MEASURED, driving rgthree's own handler three times on a
+ * node armed with the sentinel:
+ *
+ *     posted seeds  1028465986822020, 98533269447704, 557498712106716   (all differ)
+ *     widget after each call: -1 (still armed)
+ *
+ * …and a scoped batch of 3 was measured to call `api.queuePrompt` THREE times, so that
+ * handler fires per item. rgthree substitutes in its own `api.queuePrompt` patch rather
+ * than in the queue-time widget hooks a partial execution skips — so it is not subject to
+ * the #988 mechanism at all. Extending the warning above to cover it would have been a
+ * confident, checkable, WRONG sentence.
+ *
+ * What actually decides whether these ten renders differ is whether the node is ARMED:
+ * rgthree only substitutes when the seed widget holds one of its sentinels. A concrete
+ * number means every item of the batch uses that number — correct behaviour, and exactly
+ * what identical outputs look like from the outside.
+ */
+
+/** rgthree's sentinels: -1 random, -2 increment, -3 decrement (`src_web/comfyui/seed.ts`). */
+const RGTHREE_SPECIAL_SEEDS = new Map([
+  [-1, "randomize"],
+  [-2, "increment"],
+  [-3, "decrement"],
+]);
+
+/** A node is one of rgthree's seed nodes if it says so and carries the seed widget. */
+function isRgthreeSeedNode(node) {
+  const type = typeof node?.type === "string" ? node.type : "";
+  return /rgthree/i.test(type) && /seed/i.test(type);
+}
+
+/**
+ * rgthree seed nodes in this graph, and whether each will vary across a batch.
+ *
+ * Returns `[{ node_id, node_type, seed, armed, mode }]` — `armed` is the whole answer:
+ * true means rgthree swaps a fresh value into every submitted prompt, false means the
+ * concrete number in the widget is used for every item.
+ *
+ * Defensive for the same reason as the scan above: a warning must not be able to take
+ * down the run it is about.
+ */
+export function findRgthreeSeedNodes(nodes) {
+  const found = [];
+  if (!Array.isArray(nodes)) return found;
+  for (const node of nodes) {
+    try {
+      if (!isRgthreeSeedNode(node)) continue;
+      const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+      const seedWidget = widgets.find((w) => w?.name === "seed");
+      if (!seedWidget) continue;
+      const raw = Number(seedWidget.value);
+      if (!Number.isFinite(raw)) continue;
+      const mode = RGTHREE_SPECIAL_SEEDS.get(raw) ?? null;
+      found.push({
+        node_id: node?.id != null ? String(node.id) : null,
+        node_type: node?.type ?? null,
+        seed: raw,
+        armed: mode !== null,
+        ...(mode ? { mode } : {}),
+      });
+    } catch {
+      /* one unreadable node costs its own entry, never the whole diagnosis */
+    }
+  }
+  return found;
+}
+
+/**
+ * The disclosure for a batch whose rgthree seed is FIXED.
+ *
+ * Silent when the node is armed, because then it genuinely varies per item and there is
+ * nothing to warn about — saying something anyway would be the noise that trains people to
+ * ignore the useful case. Silent for a batch of one, where "every item uses this seed" is
+ * not a surprise.
+ *
+ * Unlike the scoped-batch note, this does NOT depend on the run being scoped: a fixed seed
+ * repeats in an unscoped batch too.
+ */
+export function rgthreeFixedSeedNote(seeds, batchCount) {
+  if (!Array.isArray(seeds) || !(Number(batchCount) > 1)) return "";
+  const fixed = seeds.filter((s) => s && s.armed === false);
+  if (!fixed.length) return "";
+  const which = fixed
+    .slice(0, 5)
+    .map((s) => `node ${s.node_id}${s.node_type ? ` (${s.node_type})` : ""} seed=${s.seed}`)
+    .join("; ");
+  const more = fixed.length > 5 ? `, and ${fixed.length - 5} more` : "";
+  return (
+    `ALL ${batchCount} ITEMS OF THIS BATCH WILL USE THE SAME SEED from ${which}${more}. ` +
+    `An rgthree Seed node only produces a new value per item while it is ARMED — its seed ` +
+    `widget holding -1 (randomize), -2 (increment) or -3 (decrement) — and these hold a ` +
+    `concrete number, so rgthree submits that number every time. That is the node behaving ` +
+    `as configured, not a fault: identical seeds mean identical prompts, which ComfyUI can ` +
+    `answer from cache, so the renders can come back pixel-identical (#1339). Press ` +
+    `"🎲 Randomize Each Time" on the node to arm it, or set a different seed between runs. ` +
+    `This is reported, not repaired — the panel does not rewrite your seeds.`
+  );
+}
