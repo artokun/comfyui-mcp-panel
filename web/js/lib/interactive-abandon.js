@@ -46,9 +46,19 @@
 // defensive: it answers a duplicate frame if one is ever delivered, instead of
 // waiting forever on a promise that cannot resolve.
 //
-// What settling actually buys is the LEDGER ITSELF: the entry becomes settled, so
-// it is evictable and the cap applies again, and no future delivery of that rid
-// can hang the handler. That is the whole claim.
+// What settling actually buys, stated exactly (codex r3 — the earlier "no future
+// delivery of that rid can hang the handler" was one step too broad, and the
+// tests below contain its own counterexample):
+//
+//   While the settled (epoch, rid, fingerprint) entry is RETAINED, a matching
+//   duplicate replays its recorded failure instead of awaiting the abandoned
+//   promise. Settling also makes the entry eligible for normal cap eviction.
+//
+// Not more than that. Eviction is deliberately fail-open, so a duplicate arriving
+// after the entry ages out calls `begin()` and executes a fresh interactive
+// command — which blocks on a human again, correctly. A same-rid frame with a
+// DIFFERENT fingerprint is treated as new work for the same reason. Both are the
+// ledger behaving as designed; neither is something this change removes.
 //
 // The reply is journaled by the existing lost-reply path like any other
 // undelivered outcome. Unlike an ANSWER, it is safe to replay across a reconnect —
@@ -91,8 +101,8 @@ export function abandonedInteractiveError(cmd) {
   const what = cmd === "request_secret" ? "secret request" : "question";
   return (
     `The ${what} was withdrawn: the connection it was asked on was replaced before anyone ` +
-    `answered. NOTHING WAS ANSWERED and nothing was applied — the card on screen has been ` +
-    `disabled, so a late answer to it cannot reach you either. Re-issue it on the current ` +
-    `connection if you still need it.`
+    `answered. NOTHING WAS ANSWERED and nothing was applied — and any card still on screen ` +
+    `for it has been disabled, so a late answer given there cannot reach you either. ` +
+    `Re-issue it on the current connection if you still need it.`
   );
 }

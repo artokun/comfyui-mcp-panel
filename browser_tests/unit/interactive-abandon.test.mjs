@@ -165,13 +165,30 @@ test("#952 (codex ×2) the claim is the LEDGER — not a caller-visible recovery
   assert.match(src, /the caller\s*(?:\/\/\s*)?never sees the text below/, "and stated concretely");
   assert.match(src, /keeps `msg\.ok` replies only/, "and names the specific orchestrator behaviour");
   assert.match(src, /Treat that branch as\s*(?:\/\/\s*)?defensive/, "the replay branch is not sold as recovery");
-  assert.match(src, /evictable and the cap applies again/, "the claim that IS established");
+  // The claim that IS established, and it is bounded by RETENTION — eviction is fail-open,
+  // so a duplicate arriving after the entry ages out executes fresh and blocks on a human
+  // again. The eviction test above is that counterexample, so the two must agree.
+  assert.match(src, /While the settled \(epoch, rid, fingerprint\) entry is RETAINED/);
+  assert.match(src, /eligible for normal cap eviction/);
+  assert.match(src, /Eviction is deliberately fail-open/);
   for (const overclaim of [
     /the caller (?:learns|is told|sees) (?:that )?the card was withdrawn/i,
     /the only path on which a caller reads it/i,
     /does still reach the handler/i,
+    /no future delivery of that rid\s*(?:\/\/\s*)?can hang the handler/i,
   ]) {
     assert.ok(!overclaim.test(src), `retracted claim is gone: ${overclaim}`);
+  }
+});
+
+test("#952 (codex r3) the note does not claim a card that may not be on screen", () => {
+  // Retirement returns early when the card is no longer in the DOM, and abandons the
+  // command anyway. "The card on screen has been disabled" was therefore false in exactly
+  // that case; scoping it to a card that IS still there is true in both.
+  for (const cmd of ["ask_user", "request_secret"]) {
+    const note = abandonedInteractiveError(cmd);
+    assert.match(note, /any card still on screen for it has been disabled/, cmd);
+    assert.ok(!/the card on screen has been disabled/.test(note), cmd);
   }
 });
 
