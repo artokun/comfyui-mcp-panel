@@ -202,7 +202,7 @@ test("#1339 — an rgthree seed node is invisible to the control_after_generate 
 test("#1339 — a FIXED rgthree seed is reported for a batch > 1", () => {
   const found = findRgthreeSeedNodes([rgthreeSeed(649, 12345)]);
   assert.deepEqual(found, [
-    { node_id: "649", node_type: "Seed (rgthree)", seed: 12345, armed: false },
+    { node_id: "649", node_type: "Seed (rgthree)", seed: 12345, armed: false, varies: false },
   ]);
   const note = rgthreeFixedSeedNote(found, 10);
   assert.match(note, /ALL 10 ITEMS/);
@@ -224,24 +224,50 @@ test("#1339 — an ARMED rgthree seed says NOTHING", () => {
   ]) {
     const found = findRgthreeSeedNodes([rgthreeSeed(649, sentinel)]);
     assert.deepEqual(found, [
-      { node_id: "649", node_type: "Seed (rgthree)", seed: sentinel, armed: true, mode },
+      { node_id: "649", node_type: "Seed (rgthree)", seed: sentinel, armed: true, varies: true, mode },
     ]);
     assert.equal(rgthreeFixedSeedNote(found, 10), "");
   }
 });
 
-test("#1339 — a seed CONVERTED TO AN INPUT is not reported as fixed", () => {
-  // The widget keeps a stale number when the seed is driven by a link, so calling it
-  // "fixed for all N items" would be a confident wrong claim about a node that may well be
-  // varying — the same error, pointed at a different node.
-  const driven = {
-    ...rgthreeSeed(649, 12345),
-    inputs: [{ name: "seed", link: 42 }],
+test("#1339 — a LINKED seed is still read from the widget, because rgthree overwrites it", () => {
+  // I added a guard here that declined when the seed was converted to an input, reasoning
+  // that the widget value would be stale. That is true of an ordinary node and FALSE of
+  // this one: rgthree's queue handler writes `outputInputs[seed] = getSeedToUse()` from
+  // its own widget regardless of any link. Declining suppressed the warning for a linked
+  // node holding a fixed number — a MISSED warning, which is the original bug rather than
+  // a new false claim (codex probe 2).
+  const driven = { ...rgthreeSeed(649, 12345), inputs: [{ name: "seed", link: 42 }] };
+  const found = findRgthreeSeedNodes([driven]);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].varies, false);
+  assert.match(rgthreeFixedSeedNote(found, 10), /node 649/);
+});
+
+test("#1339 — an ARMED node with a degenerate random range still repeats", () => {
+  // codex P2. rgthree's randomMin/randomMax are node PROPERTIES the user can edit, and
+  // `generateRandomSeed` draws inside them — so a range admitting one value returns that
+  // value every time while the node looks armed. Silence there would recreate the exact
+  // surprise this warning exists for, and it is the more confusing case: they DID press
+  // the button.
+  const degenerate = {
+    ...rgthreeSeed(649, -1),
+    properties: { randomMin: 5, randomMax: 5 },
   };
-  assert.deepEqual(findRgthreeSeedNodes([driven]), []);
-  // …and an UNLINKED input entry (the shape after disconnecting) still reads the widget.
-  const unlinked = { ...rgthreeSeed(649, 12345), inputs: [{ name: "seed", link: null }] };
-  assert.equal(findRgthreeSeedNodes([unlinked]).length, 1);
+  const found = findRgthreeSeedNodes([degenerate]);
+  assert.equal(found[0].armed, true);
+  assert.equal(found[0].varies, false);
+  const note = rgthreeFixedSeedNote(found, 10);
+  assert.match(note, /armed to randomize/);
+  assert.match(note, /randomMin=5, randomMax=5/);
+  assert.match(note, /randomMin\/randomMax/);
+
+  // A NORMAL range keeps its silence — the defaults, and an explicit wide range.
+  for (const properties of [undefined, { randomMin: 0, randomMax: 1125899906842624 }]) {
+    const ok = { ...rgthreeSeed(649, -1), ...(properties ? { properties } : {}) };
+    assert.equal(findRgthreeSeedNodes([ok])[0].varies, true);
+    assert.equal(rgthreeFixedSeedNote(findRgthreeSeedNodes([ok]), 10), "");
+  }
 });
 
 test("#1339 — silent for a batch of one, where a repeated seed is not a surprise", () => {

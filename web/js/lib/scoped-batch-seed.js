@@ -203,6 +203,36 @@ function isRgthreeSeedNode(node) {
 }
 
 /**
+ * Can this node's random draw produce more than one value?
+ *
+ * Only meaningful for an ARMED node — a fixed seed does not draw at all. Unreadable
+ * properties are treated as the DEFAULTS rgthree itself falls back to (`|| 0` and
+ * `|| 1125899906842624` in `generateRandomSeed`), because that is what the node will
+ * actually use, not as "unknown".
+ */
+function rgthreeRandomRange(node) {
+  let min = 0;
+  let max = 1125899906842624;
+  try {
+    const props = node?.properties ?? {};
+    min = Number(props.randomMin || 0);
+    max = Number(props.randomMax || 1125899906842624);
+  } catch {
+    /* the defaults above are what rgthree would use anyway */
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return { varies: true, reason: null };
+  }
+  if (min >= max) {
+    return {
+      varies: false,
+      reason: `its random range is randomMin=${min}, randomMax=${max}, which admits a single value`,
+    };
+  }
+  return { varies: true, reason: null };
+}
+
+/**
  * rgthree seed nodes in this graph, and whether each will vary across a batch.
  *
  * Returns `[{ node_id, node_type, seed, armed, mode }]` — `armed` is the whole answer:
@@ -221,25 +251,45 @@ export function findRgthreeSeedNodes(nodes) {
       const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
       const seedWidget = widgets.find((w) => w?.name === "seed");
       if (!seedWidget) continue;
-      // A SEED CONVERTED TO AN INPUT IS NOT THIS WIDGET'S VALUE. When the seed is driven
-      // by a link — a Primitive with its own control_after_generate, another extension's
-      // sampler-scheduler, anything — the widget keeps a stale number that says nothing
-      // about what will be submitted. Reporting that number as "fixed for all N items"
-      // would be a confident, checkable, WRONG claim about a node that is in fact varying,
-      // which is the error this whole issue is about. Nothing is established, so nothing
-      // is said.
-      const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
-      const driven = inputs.some((inp) => inp?.name === "seed" && inp?.link != null);
-      if (driven) continue;
+      // NO LINK GUARD HERE, and that is deliberate — I added one and it was wrong.
+      //
+      // For an ordinary node, a seed converted to an input makes the widget value stale.
+      // Not for this one: rgthree's queue handler OVERWRITES the outgoing seed from its own
+      // widget regardless of any link —
+      //
+      //     const seedToUse = this.getSeedToUse();               // reads seedWidget.value
+      //     outputInputs[this.seedWidget.name || "seed"] = seedToUse;
+      //
+      // (`src_web/comfyui/seed.ts`, the `comfy-api-queue-prompt-before` handler.) So the
+      // widget IS what gets submitted, and declining on a link suppressed the warning for a
+      // linked node whose widget holds a fixed number — a MISSED warning, which is the
+      // original bug rather than a new false claim (codex).
       const raw = Number(seedWidget.value);
       if (!Number.isFinite(raw)) continue;
       const mode = RGTHREE_SPECIAL_SEEDS.get(raw) ?? null;
+      // ARMED IS NOT THE SAME AS VARYING (codex P2). rgthree's random range is a pair of
+      // node PROPERTIES the user can edit:
+      //
+      //     const randomMin = Number(this.properties["randomMin"] || 0);
+      //     const randomMax = Number(this.properties["randomMax"] || 1125899906842624);
+      //     const randomRange = (randomMax - randomMin) / (step / 10);
+      //     let seed = Math.floor(Math.random() * randomRange) * (step / 10) + randomMin;
+      //     if (SPECIAL_SEEDS.includes(seed)) seed = 0;
+      //
+      // A range that admits one value — min >= max — makes every "random" draw the same
+      // number, and a degenerate range landing on a sentinel is coerced to 0. So an armed
+      // node with randomMin === randomMax submits the SAME seed every item while looking
+      // armed. Silence there would recreate the exact surprise this warning exists for.
+      const range = rgthreeRandomRange(node);
+      const varies = mode !== null && range.varies;
       found.push({
         node_id: node?.id != null ? String(node.id) : null,
         node_type: node?.type ?? null,
         seed: raw,
         armed: mode !== null,
+        varies,
         ...(mode ? { mode } : {}),
+        ...(mode !== null && !range.varies ? { degenerate_range: range.reason } : {}),
       });
     } catch {
       /* one unreadable node costs its own entry, never the whole diagnosis */
@@ -261,21 +311,41 @@ export function findRgthreeSeedNodes(nodes) {
  */
 export function rgthreeFixedSeedNote(seeds, batchCount) {
   if (!Array.isArray(seeds) || !(Number(batchCount) > 1)) return "";
-  const fixed = seeds.filter((s) => s && s.armed === false);
-  if (!fixed.length) return "";
-  const which = fixed
+  // `varies === false` covers BOTH ways an rgthree seed repeats: a concrete number in the
+  // widget, and an armed node whose random range admits one value. Keying on `armed`
+  // alone missed the second (codex P2) — and an armed-but-degenerate node is the more
+  // confusing of the two, because the user did press the button.
+  const repeating = seeds.filter((s) => s && s.varies === false);
+  if (!repeating.length) return "";
+  const which = repeating
     .slice(0, 5)
-    .map((s) => `node ${s.node_id}${s.node_type ? ` (${s.node_type})` : ""} seed=${s.seed}`)
+    .map((s) => {
+      const where = `node ${s.node_id}${s.node_type ? ` (${s.node_type})` : ""}`;
+      return s.armed
+        ? `${where} is armed to ${s.mode}, but ${s.degenerate_range}`
+        : `${where} seed=${s.seed}`;
+    })
     .join("; ");
-  const more = fixed.length > 5 ? `, and ${fixed.length - 5} more` : "";
+  const more = repeating.length > 5 ? `, and ${repeating.length - 5} more` : "";
+  const anyFixed = repeating.some((s) => !s.armed);
+  const anyDegenerate = repeating.some((s) => s.armed);
   return (
     `ALL ${batchCount} ITEMS OF THIS BATCH WILL USE THE SAME SEED from ${which}${more}. ` +
-    `An rgthree Seed node only produces a new value per item while it is ARMED — its seed ` +
-    `widget holding -1 (randomize), -2 (increment) or -3 (decrement) — and these hold a ` +
-    `concrete number, so rgthree submits that number every time. That is the node behaving ` +
-    `as configured, not a fault: identical seeds mean identical prompts, which ComfyUI can ` +
-    `answer from cache, so the renders can come back pixel-identical (#1339). Press ` +
-    `"🎲 Randomize Each Time" on the node to arm it, or set a different seed between runs. ` +
-    `This is reported, not repaired — the panel does not rewrite your seeds.`
+    (anyFixed
+      ? `An rgthree Seed node only produces a new value per item while it is ARMED — its ` +
+        `seed widget holding -1 (randomize), -2 (increment) or -3 (decrement) — and a ` +
+        `concrete number is submitted verbatim every time. `
+      : "") +
+    (anyDegenerate
+      ? `An armed node still repeats when its randomMin/randomMax properties admit a ` +
+        `single value, which is why pressing the button did not help. `
+      : "") +
+    `That is the node behaving as configured, not a fault: identical seeds mean identical ` +
+    `prompts, which ComfyUI can answer from cache, so the renders can come back ` +
+    `pixel-identical (#1339). ` +
+    (anyFixed ? `Press "🎲 Randomize Each Time" on the node to arm it` : "") +
+    (anyFixed && anyDegenerate ? `, and widen ` : anyDegenerate ? `Widen ` : "") +
+    (anyDegenerate ? `randomMin/randomMax in its node properties` : "") +
+    `. This is reported, not repaired — the panel does not rewrite your seeds.`
   );
 }
