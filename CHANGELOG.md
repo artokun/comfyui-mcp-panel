@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-08-11
+
+> #1066: open an output image in ComfyUI and it mints a temporary workflow tab whose path is
+> the URL the asset came from. Renaming that tab replaces only its filename — so the URL
+> stays on as the tab's folder, and the tab could not be saved under ANY name.
+
+### Fixed
+- saving such a tab no longer builds `workflows/http://127.0.0.1:8188/api/YourName.json` and
+  fails with a 500. A URL-shaped folder is recognised and the save is redirected to the
+  workflows root, the same as any other unwritable location.
+
+### Changed
+- a URL-derived tab is deliberately NOT treated as an "external file". That classification
+  drives a copy route whose whole premise is a real file on disk to copy — and a URL is not
+  one, so treating it that way kept the tab unsaveable by a different path. This is why the
+  reporter's own first successful save required treating the URL source as never persisted.
+- one known cost, taken deliberately: on Linux/macOS a folder can legally be named with
+  `://` in it, and a tab in such a folder now has its Save-As redirected to the workflows
+  root. A redirected save is visible and recoverable; the 500 it replaces was not. Windows
+  cannot hit this at all, since `:` is illegal in a filename there.
+
+
 ## [0.13.8] - 2026-08-11
 
 > #968: three reports of the panel saying a tab was bound to the workflow you asked for
