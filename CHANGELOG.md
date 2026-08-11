@@ -6,6 +6,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-08-11
+
+> #1369: `panel_add_node` applied a node definition's declared default over a widget's
+> value whenever the two differed. For a COMBO whose option list does not CONTAIN that
+> default, the "correction" wrote a value the node cannot accept — and reported success.
+
+### Fixed
+
+- a stale-schema "correction" no longer rewrites a valid COMBO widget to a value the node
+  cannot accept (#1369). The live KJNodes def is
+  `"sage_attention": [["disabled","auto",...], {"default": false}]` — the widget held a
+  valid `"disabled"` and was overwritten with `false`.
+- when a declared default is absent from that same definition's option list, the existing
+  value is KEPT and the refusal recorded, rather than written and called a correction.
+
+### Changed
+
+- verified against this machine's live ComfyUI (4183 node types): of 1105 combo inputs
+  carrying a default, 1083 corrections still apply and 22 are refused. The 22 are the
+  reported KJNodes case plus model-filename defaults naming files not installed here,
+  which ComfyUI's own `validate_inputs` would reject as well. No valid default was
+  refused — the direction that would have quietly disabled the correction entirely.
+
 ## [0.13.4] - 2026-08-10
 
 > #584: a ComfyUI tab that keeps running OLD panel JS after a reload, so the orchestrator
