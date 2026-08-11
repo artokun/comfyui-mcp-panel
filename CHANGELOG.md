@@ -6,6 +6,62 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-08-11
+
+> #1066, the other half: 0.13.9 stopped a URL-derived tab from building an unwritable
+> `workflows/http://…/YourName.json`, but the tab still could not be saved. A second guard
+> refused every name, because it could not prove what was on disk at the URL path — and
+> nothing can. This is the fix that lets the tab save.
+
+### Fixed
+- a temporary tab whose path came from a URL now saves. The refusal came from a safety guard
+  that protects against a save MOVING (destroying) the original file. That could happen when
+  ComfyUI's `saveWorkflowAs` was the copy route — it moves a temporary rather than copying
+  it. The panel stopped using it some time ago; the only relocating route left builds a new
+  workflow in memory and writes that, never touching the source's file. So the guard now runs
+  after the route is chosen and refuses only when no move-free route exists.
+
+### Changed
+- three separate attempts to prove such a source absent are recorded in #1066 as dead ends,
+  because the trap is easy to fall into: the path shape (`://`) proves nothing — on Linux a
+  real folder can legally be named `notes://draft`; the `isTemporary` flag proves nothing —
+  real saved files can carry it after a load race; and ComfyUI's `/userdata` answers a
+  URL-shaped path with a **500**, not a "not found", so the disk cannot answer either. The fix
+  does not add a fourth attempt. It stops needing the proof.
+- the "the original is gone" safety check now also runs for a source that could not be
+  classified, which is the case with the least evidence and so the one that most needs
+  checking afterwards. Its message now reports what was observed rather than blaming the save:
+  two checks can prove a file DISAPPEARED, not who removed it.
+
+### Notes
+- your workflows are protected by the same rule as before — a save may never remove a file
+  that exists. What changed is only where that rule can be broken, and the check that catches
+  it if it ever is.
+
+
+## [0.14.0] - 2026-08-11
+
+> The panel shipped English-only while ComfyUI ships 12 languages, so setting ComfyUI to
+> Korean gave you an English sidebar inside a Korean app.
+
+### Added
+- the panel, every sub-panel and its helper text are translated — roughly 1,000 strings.
+  Korean, Simplified Chinese and Japanese are filled in; the other eight fall back to English
+  per string until they are. The 52 rows in ComfyUI's own Settings dialog translate too.
+- a **Panel language** setting: follow ComfyUI's language automatically, or pick one of the
+  same 12 explicitly.
+- Arabic and Persian lay out right-to-left, scoped to the panel so ComfyUI's canvas is
+  untouched.
+
+### Changed
+- counts read correctly in every language. "1 model / 3 models" is an English rule; Korean has
+  one form, Russian four, Arabic six, and the panel now uses each language's actual rules.
+
+### Notes
+- this entry was written after the fact — 0.14.0 shipped without one, which meant the panel's
+  own changelog view had nothing to show for the release.
+
+
 ## [0.13.9] - 2026-08-11
 
 > #1066: open an output image in ComfyUI and it mints a temporary workflow tab whose path is
