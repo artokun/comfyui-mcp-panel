@@ -1944,15 +1944,73 @@ function workflowOwnedExtra(wf = activeWorkflowRef()) {
   return candidate && typeof candidate === "object" ? candidate : null;
 }
 
+/**
+ * #945 — the READ carrier for `allowGraph: false`, and deliberately NOT the write
+ * one.
+ *
+ * `workflowOwnedExtra` above answers null on every frontend observed here, so the
+ * two fork guards behind it arbitrate a value they never receive. The uuid is on
+ * the workflow object — one field away, in `activeState.extra`.
+ *
+ * NOT FOR THE ACTIVE WORKFLOW, and that restriction is the whole design (codex).
+ * `activeState` is a getter onto `changeTracker.activeState`, and for the workflow
+ * that is CURRENTLY MOUNTED the tracker fills it from `captureCanvasState()`, which
+ * clones `app.rootGraph.serialize()` — so on the active tab this field IS the live
+ * canvas's identity wearing a different name. Reading it there would satisfy
+ * `allowGraph: false` with exactly the mounted-root authority that flag exists to
+ * refuse, and nothing would look wrong.
+ *
+ * My own measurement did not catch that: with three workflows open on 0.31.1 /
+ * frontend 1.48.7, each NON-ACTIVE workflow's `activeState.extra` carried its OWN
+ * uuid (30dfba50…, 2d7fa288…) while the active one's matched `app.graph.extra`
+ * (e66e531b…) — which reads as "distinct from the canvas" only if you never look at
+ * the active row.
+ *
+ * So the rung applies to a workflow that is NOT mounted — and "not mounted" is
+ * decided with `sameWorkflowObject`, never `===` (codex r2). The workflow service
+ * hands out Vue PROXIES in its computed lists while raw objects flow through the
+ * uuid stores, and the active binding path unwraps deliberately: the graph fence
+ * calls `workflowOwnsRootUuidTag(activeWorkflowRef())`, which re-enters here with
+ * `rawWorkflowObject(w)`. A strict comparison against the proxy would be false for
+ * the mounted workflow's own raw target, and the exclusion would let exactly the
+ * canvas state back in through the back door. `sameWorkflowObject` also matches on
+ * the shared `changeTracker` object, which is what `activeState` reads from, so two
+ * references to the same tracker cannot disagree about whether it is mounted.
+ *
+ * With that comparison, a non-mounted workflow's tracker state is the capture from
+ * when it was last live: its own, with no mounted root consulted. The active
+ * workflow keeps answering null here, exactly as before, because for it there is no
+ * workflow-owned carrier distinguishable from the canvas.
+ *
+ * THE WRITE IS NOT REPOINTED. Embedding into `activeState.extra` moves where
+ * identity persists — it stops reaching `app.graph.extra`, which is what a save
+ * serializes — and was reverted once for exactly that. Reading a field is not
+ * writing it, so the revert's reason is preserved rather than re-argued: this
+ * function has no callers that mutate what it returns.
+ */
+function workflowOwnedExtraForRead(wf = activeWorkflowRef()) {
+  const owned = workflowOwnedExtra(wf);
+  if (owned) return owned;
+  // The mounted workflow's tracker state is a clone of the live root, so it is not a
+  // workflow-owned answer at all. Absent `wf` defaults to the active one, which lands
+  // here too — an unspecified workflow must never be answered from the canvas.
+  const active = activeWorkflowRef();
+  if (!wf || sameWorkflowObject(wf, active)) return null;
+  const state = wf?.activeState?.extra;
+  return state && typeof state === "object" ? state : null;
+}
+
 function embeddedWorkflowUuid(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
-  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtraForRead(wf);
   const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const id = ns?.[WORKFLOW_UUID_FIELD];
   return typeof id === "string" && id ? id : null;
 }
 
 function embeddedWorkflowPath(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
-  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  // Same carrier as the uuid — they are recorded together in one namespace, so
+  // reading them from different places could answer about two different workflows.
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtraForRead(wf);
   const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
   return typeof path === "string" && path ? path : null;
