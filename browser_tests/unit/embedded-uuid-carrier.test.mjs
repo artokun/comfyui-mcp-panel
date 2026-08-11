@@ -54,6 +54,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  sameWorkflowObject,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
 } from "../../web/js/lib/workflow-chat-identity.js";
@@ -72,7 +73,7 @@ const workflowOwnedExtra = (wf) => {
 const workflowOwnedExtraForRead = (wf, active = null) => {
   const owned = workflowOwnedExtra(wf);
   if (owned) return owned;
-  if (!wf || (active && wf === active)) return null;
+  if (!wf || sameWorkflowObject(wf, active)) return null;
   const state = wf?.activeState?.extra;
   return state && typeof state === "object" ? state : null;
 };
@@ -190,6 +191,41 @@ test("#945 (codex P0) the MOUNTED workflow is refused — its activeState IS the
   // An UNSPECIFIED workflow defaults to the active one in production, so it lands here too.
   assert.equal(embeddedUuidRead(null, active), null);
   assert.equal(embeddedUuidRead(undefined, active), null);
+});
+
+test("#945 (codex r2) a Vue PROXY of the mounted workflow is still refused", () => {
+  // The exclusion cannot use `===`. The workflow service hands out reactive PROXIES in
+  // its computed lists while raw objects flow through the uuid stores, and the active
+  // binding path unwraps deliberately: the graph fence calls
+  // `workflowOwnsRootUuidTag(activeWorkflowRef())`, which re-enters this reader with
+  // `rawWorkflowObject(w)`. A strict comparison against the proxy is FALSE for the
+  // mounted workflow's own raw target — so the canvas state walks back in through the
+  // door the exclusion was supposed to close, on the one path that matters most.
+  const raw = realComfyWorkflow("e66e531b-a4ca-4bee-8a11-12df34b830e2");
+  const proxy = new Proxy(raw, {
+    get: (t, k) => (k === "__v_raw" ? t : Reflect.get(t, k, t)),
+  });
+  assert.notEqual(proxy, raw, "the shapes really are different objects");
+  assert.equal(
+    embeddedUuidRead(raw, proxy),
+    null,
+    "raw target vs proxy active — the exact shape the fence produces",
+  );
+  assert.equal(embeddedUuidRead(proxy, raw), null, "and the reverse");
+  // A DIFFERENT workflow that merely looks similar is still answered — the refusal is
+  // identity, not a blanket refusal of anything proxy-shaped.
+  const other = realComfyWorkflow("30dfba50-4c01-4c40-a4c2-72a47e12269c");
+  assert.equal(embeddedUuidRead(other, proxy), "30dfba50-4c01-4c40-a4c2-72a47e12269c");
+});
+
+test("#945 (codex r2) two references sharing a changeTracker are the same workflow", () => {
+  // `activeState` reads THROUGH `changeTracker`, so two references to the same tracker
+  // cannot meaningfully disagree about whether it is mounted. sameWorkflowObject already
+  // treats that as identity; relying on it is what makes this exclusion total.
+  const raw = realComfyWorkflow("e66e531b-a4ca-4bee-8a11-12df34b830e2");
+  const twin = { path: raw.path, changeTracker: raw.changeTracker, get activeState() { return this.changeTracker?.activeState ?? null; } };
+  assert.equal(sameWorkflowObject(twin, raw), true, "shared tracker is shared identity");
+  assert.equal(embeddedUuidRead(twin, raw), null, "so the mounted canvas is refused here too");
 });
 
 test("#945 a NON-mounted workflow is answered from its own capture", () => {
@@ -342,7 +378,7 @@ test("SOURCE: the modelled chain is the one production actually reads", async ()
   // would otherwise start deciding on a different field without anything failing.
   assert.match(
     src,
-    /const owned = workflowOwnedExtra\(wf\);\r?\n\s*if \(owned\) return owned;[\s\S]{0,400}?if \(!wf \|\| \(active && wf === active\)\) return null;\r?\n\s*const state = wf\?\.activeState\?\.extra;/,
+    /const owned = workflowOwnedExtra\(wf\);\r?\n\s*if \(owned\) return owned;[\s\S]{0,400}?if \(!wf \|\| sameWorkflowObject\(wf, active\)\) return null;\r?\n\s*const state = wf\?\.activeState\?\.extra;/,
     "the read carrier's order changed — re-check which field decides identity",
   );
   // Both guards still read the value under the name the tests use, so a rename

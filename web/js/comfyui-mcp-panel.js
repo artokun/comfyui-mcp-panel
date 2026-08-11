@@ -1966,11 +1966,21 @@ function workflowOwnedExtra(wf = activeWorkflowRef()) {
  * (e66e531b…) — which reads as "distinct from the canvas" only if you never look at
  * the active row.
  *
- * So the rung applies to a workflow that is NOT mounted. Its tracker state is the
- * capture from when that workflow was last live, which is genuinely its own: no
- * mounted root is being consulted, and the active workflow keeps answering null
- * here, exactly as before, because for it there is no workflow-owned carrier that
- * is distinguishable from the canvas.
+ * So the rung applies to a workflow that is NOT mounted — and "not mounted" is
+ * decided with `sameWorkflowObject`, never `===` (codex r2). The workflow service
+ * hands out Vue PROXIES in its computed lists while raw objects flow through the
+ * uuid stores, and the active binding path unwraps deliberately: the graph fence
+ * calls `workflowOwnsRootUuidTag(activeWorkflowRef())`, which re-enters here with
+ * `rawWorkflowObject(w)`. A strict comparison against the proxy would be false for
+ * the mounted workflow's own raw target, and the exclusion would let exactly the
+ * canvas state back in through the back door. `sameWorkflowObject` also matches on
+ * the shared `changeTracker` object, which is what `activeState` reads from, so two
+ * references to the same tracker cannot disagree about whether it is mounted.
+ *
+ * With that comparison, a non-mounted workflow's tracker state is the capture from
+ * when it was last live: its own, with no mounted root consulted. The active
+ * workflow keeps answering null here, exactly as before, because for it there is no
+ * workflow-owned carrier distinguishable from the canvas.
  *
  * THE WRITE IS NOT REPOINTED. Embedding into `activeState.extra` moves where
  * identity persists — it stops reaching `app.graph.extra`, which is what a save
@@ -1985,7 +1995,7 @@ function workflowOwnedExtraForRead(wf = activeWorkflowRef()) {
   // workflow-owned answer at all. Absent `wf` defaults to the active one, which lands
   // here too — an unspecified workflow must never be answered from the canvas.
   const active = activeWorkflowRef();
-  if (!wf || (active && wf === active)) return null;
+  if (!wf || sameWorkflowObject(wf, active)) return null;
   const state = wf?.activeState?.extra;
   return state && typeof state === "object" ? state : null;
 }
