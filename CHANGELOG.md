@@ -6,6 +6,39 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-08-10
+
+> When a command is refused because it targets a different workflow than the canvas, the
+> panel offers two recoveries: re-target, or re-open the workflow you meant. For a tab that
+> has never been saved — the one a fresh `panel_new_workflow` just made — the second is not
+> available, because opening resolves a workflow by its path and that tab has none. A
+> reporter had to work that out for themselves.
+
+### Fixed
+- the refusal now says so, when the panel can actually see it: the active tab is unsaved, so
+  re-opening cannot re-select THAT tab, and re-targeting is the route if the canvas you want
+  is the active one (#1019).
+- the note is kept narrow on purpose. Opening a different, saved workflow still works — the
+  refusal means the command targeted something other than the active canvas, and that
+  something may well be a saved workflow the existing remedy reaches perfectly well.
+- a saved tab reads exactly as before, and a tab the panel could not read says nothing at
+  all: an unproven fact has no place in a refusal.
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.12.0] - 2026-08-10
 
 > Searching for a custom node pack and getting "no matches" reads as "that pack does not
