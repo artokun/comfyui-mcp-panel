@@ -128,7 +128,11 @@ test("#952 (codex) source guard: a DIFFERENT SOCKET retires cards, and nothing r
 test("#952 source guard: a question card registers itself and unregisters when answered", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const paint = namedFunctionSource(src, "paintQuestion");
-  assert.match(paint, /const unregister = registerInteractiveCard\(\{/, "registered at paint");
+  assert.match(
+    paint,
+    /const unregister = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
+    "registered at paint, and ONLY when a command painted it",
+  );
   assert.match(paint, /alreadyAnswered: \(\) => done,/, "so an answered card is skipped");
   assert.match(paint, /promise\.then\(unregister, unregister\)/, "and dropped once it settles, either way");
 });
@@ -139,7 +143,11 @@ test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () =
   // when nothing received it.
   const src = readFileSync(PANEL_JS, "utf8");
   const paint = namedFunctionSource(src, "paintSecret");
-  assert.match(paint, /const unregisterSecret = registerInteractiveCard\(\{/, "registered at paint");
+  assert.match(
+    paint,
+    /const unregisterSecret = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
+    "registered at paint, and ONLY when a command painted it",
+  );
   assert.match(paint, /what: "secret request"/);
   assert.match(paint, /Nothing was sent and nothing was stored/, "no false 'saved' impression survives");
   assert.match(paint, /do not paste the value into the chat/, "never redirect a secret into the transcript");
@@ -189,13 +197,13 @@ test("#952 (codex r2) a card painted BEFORE its socket handshakes is not retired
   // Socket A connects; a card is painted and answered normally.
   s.onStatus("connected", 1);
   const retiredA = [];
-  s.registerInteractiveCard({ retire: () => retiredA.push("A") });
+  s.registerInteractiveCard({ paintedOnSocket: 1, retire: () => retiredA.push("A") });
 
   // A drops, B opens ("connecting" carries B's id) and receives ask_user BEFORE its models
   // frame — the window this test exists for.
   s.onStatus("connecting", 2);
   const retiredB = [];
-  s.registerInteractiveCard({ retire: () => retiredB.push("B") });
+  s.registerInteractiveCard({ paintedOnSocket: 2, retire: () => retiredB.push("B") });
 
   // B handshakes.
   s.onStatus("connected", 2);
@@ -219,7 +227,7 @@ test("#952 (codex r2) a RE-HANDSHAKE on the same socket retires nothing", () => 
   )();
   make.onStatus("connected", 7);
   const retired = [];
-  make.registerInteractiveCard({ retire: () => retired.push("x") });
+  make.registerInteractiveCard({ paintedOnSocket: 7, retire: () => retired.push("x") });
   // Every models frame re-emits "connected" on the SAME socket; a workflow change re-hellos it.
   make.onStatus("connected", 7);
   make.onStatus("connected", 7);
@@ -257,9 +265,9 @@ test("#952 (codex r2) the card records the socket that ASKED, not the UI's belie
   // BOTH painters, COUNTED. Matching once passed while one of the two had lost it — a
   // guard that cannot tell "both do this" from "at least one does" is not guarding much.
   assert.equal(
-    (src.match(/\.\.\.\(paintedOnSocket != null \? \{ paintedOnSocket \} : \{\}\),/g) ?? []).length,
+    (src.match(/paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/g) ?? []).length,
     2,
-    "the question card AND the secret card each record the socket they were painted on",
+    "the question card AND the secret card each register only when a command painted them",
   );
 });
 
@@ -283,7 +291,7 @@ test("#952 (codex r2) a card painted on a socket the UI never adopted is still t
   )();
   make.onStatus("connected", 1); // socket A is live
   const retiredA = [];
-  make.registerInteractiveCard({ retire: () => retiredA.push("A") });
+  make.registerInteractiveCard({ paintedOnSocket: 1, retire: () => retiredA.push("A") });
   // Socket B opens with NO status reaching the UI, and an ask_user arrives on it: the
   // painter names B explicitly.
   const retiredB = [];
@@ -291,4 +299,32 @@ test("#952 (codex r2) a card painted on a socket the UI never adopted is still t
   make.onStatus("connected", 2); // B finally handshakes
   assert.deepEqual(retiredA, ["A"], "the card from A is retired");
   assert.deepEqual(retiredB, [], "the card that named B survives B handshaking");
+});
+
+test("#952 (codex r3) a SETTINGS token card is never registered — it is agent-free", () => {
+  // `paintSecret` also serves the Settings "Set … token" buttons, which have no command
+  // behind them. That card can still send its set_secret on whatever socket is current
+  // after a reconnect, so retiring it would disable a working control and tell the user to
+  // wait for a request that is never coming.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const settingsCall = src.slice(src.indexOf("    paintSecret({"), src.indexOf("    paintSecret({") + 400);
+  assert.ok(settingsCall.length > 0, "the Settings call site exists");
+  assert.ok(!/socketId/.test(settingsCall), "it passes no socket id");
+  // …and with none passed, the painter does not register it at all.
+  const make = new Function(
+    `let liveSocketId = 9;
+     const liveInteractiveCards = new Set();
+     ${namedFunctionSource(src, "registerInteractiveCard")}
+     return { registerInteractiveCard, size: () => liveInteractiveCards.size };`,
+  )();
+  // The painter's own gate is what skips registration; this asserts the registry keeps no
+  // belief-based fallback that would put a socket on an entry that never named one.
+  const off = make.registerInteractiveCard({ retire: () => {} });
+  assert.equal(make.size(), 1);
+  off();
+  assert.match(
+    namedFunctionSource(src, "registerInteractiveCard"),
+    /const record = \{ paintedOnSocket: null, \.\.\.entry \};/,
+    "no liveSocketId fallback — an entry names its own socket or none",
+  );
 });

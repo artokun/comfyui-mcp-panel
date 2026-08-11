@@ -22851,8 +22851,11 @@ function buildPanel() {
     // as clickable as a newer card asking the same thing. The orchestrator's own message
     // has to warn "the user may see two … tell them which one to answer"; the panel is
     // the side that can just say it.
-    const unregister = registerInteractiveCard({
-      ...(paintedOnSocket != null ? { paintedOnSocket } : {}),
+    // #952 — tracked ONLY when a command painted it. A card with no command behind it
+    // has no socket to be orphaned by, and retiring it would disable something that
+    // still works (codex r3).
+    const unregister = paintedOnSocket == null ? () => {} : registerInteractiveCard({
+      paintedOnSocket,
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
@@ -22883,9 +22886,9 @@ function buildPanel() {
   const liveInteractiveCards = new Set();
 
   function registerInteractiveCard(entry) {
-    // The socket the CARD was painted on, taken from the command frame when the caller
-    // knows it. `liveSocketId` is only a fallback for a painter with no frame in hand.
-    const record = { paintedOnSocket: liveSocketId, ...entry };
+    // Every entry names the socket its COMMAND arrived on; a card with no command
+    // behind it is never registered, so there is no belief-based fallback here.
+    const record = { paintedOnSocket: null, ...entry };
     liveInteractiveCards.add(record);
     return () => liveInteractiveCards.delete(record);
   }
@@ -23061,8 +23064,13 @@ function buildPanel() {
     // stored when nothing received it. Same retirement, different words: never suggest
     // typing the value somewhere else, because the whole point of this card is that the
     // value reaches the orchestrator through an input the agent never sees.
-    const unregisterSecret = registerInteractiveCard({
-      ...(paintedOnSocket != null ? { paintedOnSocket } : {}),
+    // #952 — command-originated cards only. The Settings "Set … token" buttons paint
+    // this same card with no command behind them, and that card is agent-free: after a
+    // reconnect it can still send its set_secret on the current socket, so retiring it
+    // would disable a working control and tell the user to wait for a request that is
+    // never coming (codex r3).
+    const unregisterSecret = paintedOnSocket == null ? () => {} : registerInteractiveCard({
+      paintedOnSocket,
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
