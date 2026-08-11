@@ -1952,13 +1952,25 @@ function workflowOwnedExtra(wf = activeWorkflowRef()) {
  * two fork guards behind it arbitrate a value they never receive. The uuid is on
  * the workflow object — one field away, in `activeState.extra`.
  *
- * MEASURED before adding it, because the whole point of `allowGraph: false` is to
- * refuse the live canvas's identity for a workflow object, and a carrier that is
- * secretly the canvas would defeat that silently. On 0.31.1 / frontend 1.48.7 with
- * three workflows open, each NON-ACTIVE workflow's `activeState.extra` carried its
- * OWN uuid (30dfba50…, 2d7fa288…), distinct from the canvas's (e66e531b…, which is
- * what `app.graph.extra` held). It tracks the workflow, not the screen — so it
- * satisfies the contract this parameter exists to enforce.
+ * NOT FOR THE ACTIVE WORKFLOW, and that restriction is the whole design (codex).
+ * `activeState` is a getter onto `changeTracker.activeState`, and for the workflow
+ * that is CURRENTLY MOUNTED the tracker fills it from `captureCanvasState()`, which
+ * clones `app.rootGraph.serialize()` — so on the active tab this field IS the live
+ * canvas's identity wearing a different name. Reading it there would satisfy
+ * `allowGraph: false` with exactly the mounted-root authority that flag exists to
+ * refuse, and nothing would look wrong.
+ *
+ * My own measurement did not catch that: with three workflows open on 0.31.1 /
+ * frontend 1.48.7, each NON-ACTIVE workflow's `activeState.extra` carried its OWN
+ * uuid (30dfba50…, 2d7fa288…) while the active one's matched `app.graph.extra`
+ * (e66e531b…) — which reads as "distinct from the canvas" only if you never look at
+ * the active row.
+ *
+ * So the rung applies to a workflow that is NOT mounted. Its tracker state is the
+ * capture from when that workflow was last live, which is genuinely its own: no
+ * mounted root is being consulted, and the active workflow keeps answering null
+ * here, exactly as before, because for it there is no workflow-owned carrier that
+ * is distinguishable from the canvas.
  *
  * THE WRITE IS NOT REPOINTED. Embedding into `activeState.extra` moves where
  * identity persists — it stops reaching `app.graph.extra`, which is what a save
@@ -1969,8 +1981,11 @@ function workflowOwnedExtra(wf = activeWorkflowRef()) {
 function workflowOwnedExtraForRead(wf = activeWorkflowRef()) {
   const owned = workflowOwnedExtra(wf);
   if (owned) return owned;
-  // Last, not first: an older build that really does carry one of the three fields
-  // above keeps answering from it, so this only fills the gap where they are absent.
+  // The mounted workflow's tracker state is a clone of the live root, so it is not a
+  // workflow-owned answer at all. Absent `wf` defaults to the active one, which lands
+  // here too — an unspecified workflow must never be answered from the canvas.
+  const active = activeWorkflowRef();
+  if (!wf || (active && wf === active)) return null;
   const state = wf?.activeState?.extra;
   return state && typeof state === "object" ? state : null;
 }

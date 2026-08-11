@@ -65,11 +65,14 @@ const workflowOwnedExtra = (wf) => {
   return candidate && typeof candidate === "object" ? candidate : null;
 };
 /** The READ carrier, exactly as `workflowOwnedExtraForRead` implements it: the same
- *  chain, with `activeState.extra` behind it. Ordered so an older build that really
- *  does carry one of the three original fields keeps answering from it. */
-const workflowOwnedExtraForRead = (wf) => {
+ *  chain, with `activeState.extra` behind it — and ONLY for a workflow that is not the
+ *  mounted one. Ordered so an older build that really does carry one of the three
+ *  original fields keeps answering from it. `active` stands in for the module's
+ *  `activeWorkflowRef()`. */
+const workflowOwnedExtraForRead = (wf, active = null) => {
   const owned = workflowOwnedExtra(wf);
   if (owned) return owned;
+  if (!wf || (active && wf === active)) return null;
   const state = wf?.activeState?.extra;
   return state && typeof state === "object" ? state : null;
 };
@@ -79,7 +82,7 @@ const uuidFrom = (extra) => {
 };
 const embeddedUuid = (wf) => uuidFrom(workflowOwnedExtra(wf));
 /** What `embeddedWorkflowUuid(wf, {allowGraph:false})` now resolves. */
-const embeddedUuidRead = (wf) => uuidFrom(workflowOwnedExtraForRead(wf));
+const embeddedUuidRead = (wf, active = null) => uuidFrom(workflowOwnedExtraForRead(wf, active));
 
 /** The real shape, from ComfyUI 0.31.1 / frontend 1.44.19. `activeState` is a
  *  getter onto the change tracker, which is where the uuid actually lives. */
@@ -133,19 +136,22 @@ test("OBSERVATION (#945): the original three-rung chain yields nothing", () => {
 
 test("#945 FIXED: the READ carrier reaches it, so `allowGraph:false` is no longer null", () => {
   const wf = realComfyWorkflow();
-  assert.equal(embeddedUuidRead(wf), "ff7890d8-1111-4111-8111-111111111111");
+  // Not the mounted one — see the codex P0 test below for why that distinction is the
+  // whole design.
+  const mounted = realComfyWorkflow("e66e531b-a4ca-4bee-8a11-12df34b830e2");
+  assert.equal(embeddedUuidRead(wf, mounted), "ff7890d8-1111-4111-8111-111111111111");
   // Through the real getter, not a planted own-property: `activeState` delegates to
   // `changeTracker.activeState`, so a build that stops populating the tracker goes back
   // to null rather than to a stale value.
   wf.changeTracker.activeState = null;
-  assert.equal(embeddedUuidRead(wf), null, "no tracker state → no identity, not a guess");
+  assert.equal(embeddedUuidRead(wf, mounted), null, "no tracker state → no identity, not a guess");
 
   // Same SHAPE check as the original chain, so the two rungs cannot disagree about what
   // counts as a carrier. A non-object here reads as no carrier rather than being handed
   // on: today a string would fall out as null one line later anyway, but that is the
   // reader's accident, not this function's contract.
   for (const bad of ["not-an-object", 42, true]) {
-    assert.equal(workflowOwnedExtraForRead({ activeState: { extra: bad } }), null, String(bad));
+    assert.equal(workflowOwnedExtraForRead({ activeState: { extra: bad } }, mounted), null, String(bad));
   }
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(src, /const state = wf\?\.activeState\?\.extra;\r?\n\s*return state && typeof state === "object" \? state : null;/, "production applies the same check");
@@ -157,21 +163,44 @@ test("#945 the original rungs still WIN — the new one only fills the gap", () 
   // frontend where both exist, and they can disagree.
   const wf = realComfyWorkflow("from-active-state-1111-4111-8111-111111111111");
   wf.extra = { comfyui_mcp: { workflow_uuid: "from-wf-extra" } };
-  assert.equal(embeddedUuidRead(wf), "from-wf-extra");
+  // Mounted OR not: the original rungs are consulted first either way, so this holds
+  // even for the workflow on screen.
+  assert.equal(embeddedUuidRead(wf, wf), "from-wf-extra");
+  assert.equal(embeddedUuidRead(wf, null), "from-wf-extra");
   delete wf.extra;
-  assert.equal(embeddedUuidRead(wf), "from-active-state-1111-4111-8111-111111111111");
+  assert.equal(embeddedUuidRead(wf, null), "from-active-state-1111-4111-8111-111111111111");
 });
 
-test("#945 the READ carrier is not the live canvas — it tracks the WORKFLOW", () => {
-  // The point of `allowGraph:false` is to refuse the canvas's identity for a workflow
-  // object, so a carrier that were secretly the canvas would defeat it silently.
-  // Measured on 0.31.1 / frontend 1.48.7 with three workflows open: each NON-ACTIVE
-  // workflow's `activeState.extra` held its OWN uuid (30dfba50…, 2d7fa288…), distinct
-  // from `app.graph.extra` (e66e531b…, the active one).
-  const background = realComfyWorkflow("30dfba50-4c01-4c40-a4c2-72a47e12269c");
+test("#945 (codex P0) the MOUNTED workflow is refused — its activeState IS the canvas", () => {
+  // The finding that reshaped this fix. `activeState` is a getter onto
+  // `changeTracker.activeState`, and for the workflow currently mounted the tracker
+  // fills it from `captureCanvasState()`, which clones `app.rootGraph.serialize()`.
+  // Reading it there would answer `allowGraph:false` with the mounted root's identity —
+  // the exact authority that flag exists to refuse — and nothing would look wrong.
+  //
+  // My measurement missed it: with three workflows open, the two NON-ACTIVE rows carried
+  // their own uuids (30dfba50…, 2d7fa288…) and the ACTIVE row matched `app.graph.extra`
+  // (e66e531b…). That reads as 'distinct from the canvas' only if you skip the active row.
   const active = realComfyWorkflow("e66e531b-a4ca-4bee-8a11-12df34b830e2");
-  assert.notEqual(embeddedUuidRead(background), embeddedUuidRead(active));
-  assert.equal(embeddedUuidRead(background), "30dfba50-4c01-4c40-a4c2-72a47e12269c");
+  assert.equal(
+    embeddedUuidRead(active, active),
+    null,
+    "the mounted workflow gets no answer from this carrier, exactly as before the fix",
+  );
+  // An UNSPECIFIED workflow defaults to the active one in production, so it lands here too.
+  assert.equal(embeddedUuidRead(null, active), null);
+  assert.equal(embeddedUuidRead(undefined, active), null);
+});
+
+test("#945 a NON-mounted workflow is answered from its own capture", () => {
+  // Its tracker state is the capture from when it was last live, which no mounted root
+  // is consulted for. That is a workflow-owned answer, and it is what revives the guards.
+  const active = realComfyWorkflow("e66e531b-a4ca-4bee-8a11-12df34b830e2");
+  const background = realComfyWorkflow("30dfba50-4c01-4c40-a4c2-72a47e12269c");
+  assert.equal(embeddedUuidRead(background, active), "30dfba50-4c01-4c40-a4c2-72a47e12269c");
+  assert.notEqual(embeddedUuidRead(background, active), embeddedUuidRead(active, active));
+  // And with no active workflow at all, a workflow still answers for itself.
+  assert.equal(embeddedUuidRead(background, null), "30dfba50-4c01-4c40-a4c2-72a47e12269c");
 });
 
 test("#945 the WRITE was deliberately not repointed", () => {
@@ -313,7 +342,7 @@ test("SOURCE: the modelled chain is the one production actually reads", async ()
   // would otherwise start deciding on a different field without anything failing.
   assert.match(
     src,
-    /const owned = workflowOwnedExtra\(wf\);\r?\n\s*if \(owned\) return owned;[\s\S]{0,300}?const state = wf\?\.activeState\?\.extra;/,
+    /const owned = workflowOwnedExtra\(wf\);\r?\n\s*if \(owned\) return owned;[\s\S]{0,400}?if \(!wf \|\| \(active && wf === active\)\) return null;\r?\n\s*const state = wf\?\.activeState\?\.extra;/,
     "the read carrier's order changed — re-check which field decides identity",
   );
   // Both guards still read the value under the name the tests use, so a rename
