@@ -9798,7 +9798,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // value that is not the current definition's). Reconcile against currentDef BEFORE
     // the node reaches the graph, and DISCLOSE every correction — a silent fix is still
     // a value the caller did not ask for.
-    const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);
+    const correctionOut = {};
+    const valueCorrections = applyCurrentDefWidgetValues(node, currentDef, correctionOut);
     // No await follows this validation. Re-read the graph/workflow now so a
     // tab or subgraph switch during the async preflight cannot commit to the
     // graph captured at command start.
@@ -9813,6 +9814,7 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     const added = summarizeNode(node);
+    const rejectedCorrections = correctionOut.rejected ?? [];
     if (valueCorrections.length) {
       added.schema_value_corrections = valueCorrections;
       added.warning =
@@ -9820,8 +9822,29 @@ const GRAPH_TOOL_EXECUTORS = {
         `this tab loaded). ${valueCorrections.length} widget value${valueCorrections.length === 1 ? " was" : "s were"} ` +
         `taken from the backend's CURRENT definition instead of the stale one: ` +
         `${valueCorrections.map((c) => `"${c.name}" ${JSON.stringify(c.from)} → ${JSON.stringify(c.to)}`).join(", ")}. ` +
-        `The node is valid to queue, but reload the ComfyUI tab to pick up the updated definition ` +
-        `before editing it further.`;
+        // #1369 — this used to end "The node is valid to queue". It was not: a COMBO had
+        // been rewritten to a value outside its own option list and ComfyUI refused the
+        // run. Correcting values does not amount to validating the node, and certifying
+        // it SUPPRESSES the check the caller would otherwise do — which is what made a
+        // recoverable bad value into a wasted render. Say what was actually done.
+        `Each corrected value was checked against the current definition (a COMBO value ` +
+        `outside its own option list is refused, not applied), but that is not a full ` +
+        `validation of the node — queue it and read the result. Reload the ComfyUI tab to ` +
+        `pick up the updated definition before editing it further.`;
+    }
+    if (rejectedCorrections.length) {
+      // Surfaced even when nothing else was corrected: the node is usable, and the
+      // caller should still know its schema contradicts itself, because the next
+      // confusing thing that node does will look unrelated.
+      added.schema_rejected_corrections = rejectedCorrections;
+      added.warning =
+        `${added.warning ? `${added.warning} ` : ""}` +
+        `NOTE: "${class_type}" declares ${rejectedCorrections.length} default(s) its own option ` +
+        `list does not contain — ` +
+        `${rejectedCorrections.map((r) => `"${r.name}" default ${JSON.stringify(r.proposed)} not in its options; kept ${JSON.stringify(r.kept)}`).join(", ")}. ` +
+        `That is a defect in the node pack, not in your graph. The kept value is a real ` +
+        `member of the list; applying the declared default would have made the node ` +
+        `unqueueable.`;
     }
     return { added };
   },
