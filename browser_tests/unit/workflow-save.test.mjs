@@ -437,10 +437,18 @@ function makeFaithfulService({ files = [], active } = {}) {
   return svc
 }
 
-test('refuses save-as when an on-disk source is mis-flagged temporary — never moves it (#226)', async () => {
+test('an on-disk source mis-flagged temporary COPIES via the move-free trio — never moved (#226/#1066)', async () => {
   // The reproduced drift: panel_open_workflow left a PERSISTED workflow flagged
   // temporary (isTemporary === true), but its file is on disk. Delegating to the
-  // frontend saveWorkflowAs here would MOVE (destroy) the original.
+  // frontend saveWorkflowAs here would MOVE (destroy) the original — so the panel
+  // does not delegate to it, and has not for some time.
+  //
+  // #1066 defect 2: this used to REFUSE outright. The refusal named a move, and this
+  // frontend exposes the move-free trio, so the move it protected against could not
+  // happen. What #226 actually demands is asserted below and holds: the original file
+  // is still on disk, renameWorkflow was never called, and saveWorkflowAs — which is
+  // present on this double precisely so a wrong delegation would be visible — was not
+  // invoked. The user gets the copy they asked for.
   const active = {
     path: 'workflows/zz226b-orig.json',
     filename: 'zz226b-orig.json',
@@ -450,13 +458,48 @@ test('refuses save-as when an on-disk source is mis-flagged temporary — never 
   }
   const svc = makeFaithfulService({ files: [active.path], active })
 
-  await assert.rejects(
-    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
-    /could MOVE \(destroy\) the original/
+  const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
+
+  assert.equal(saved, 'zz226b-copy')
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'ORIGINAL PRESERVED — the #226 invariant')
+  assert.ok(svc.disk.has('workflows/zz226b-copy.json'), 'copy created')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the move-free store saveAs')
+})
+
+test('#1066 defect 2: a URL-derived temporary tab saves — unprovable source, move-free route', async () => {
+  // The reported dead end. ComfyUI mints a TEMPORARY workflow whose path is the URL an
+  // asset was opened from, so the tab's source can be classified by NOTHING: the
+  // in-memory lookup returns the tab itself (not proof of absence), and ComfyUI's
+  // /userdata answers a URL-shaped path with a 500, not a 404 (measured against a live
+  // 0.24.0 on Windows — os.makedirs on the illegal parent throws before the existence
+  // check runs), so the disk oracle is null. cls is therefore "unknown" forever, and the
+  // tab was unsaveable under ANY name, from the panel or from ComfyUI's own Save-As.
+  //
+  // Nothing here proves the source absent — that is the point. The save is authorised by
+  // the ROUTE being move-free, not by a claim about the path.
+  const urlPath =
+    'workflows/http://127.0.0.1:8188/api/view?filename=x.png&type=output&subfolder=a'
+  const active = {
+    path: urlPath,
+    filename: 'view?filename=x.png',
+    directory: 'workflows/http://127.0.0.1:8188/api',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const svc = makeFaithfulService({ files: [], active })
+  const existsOnDisk = async () => null // /userdata 500 ⇒ indeterminate
+
+  const saved = await saveActiveWorkflow(svc, 'AnimaPltMg001', { existsOnDisk })
+
+  assert.equal(saved, 'AnimaPltMg001')
+  // Defect (1)'s redirect puts it in the workflows ROOT, never under the URL directory.
+  assert.ok(svc.disk.has('workflows/AnimaPltMg001.json'), 'saved into the workflows root')
+  assert.ok(
+    ![...svc.disk].some((p) => p.includes('http://')),
+    'nothing written under a URL directory'
   )
-  // Original stands, nothing was moved, saveWorkflowAs was never even invoked.
-  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'original preserved')
-  assert.ok(!svc.disk.has('workflows/zz226b-copy.json'), 'no rogue copy')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
   assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
 })
@@ -481,10 +524,16 @@ test('a correctly-flagged persisted workflow still COPIES via the faithful front
   assert.equal(saved, 'zz226b-copy')
 })
 
-test('item 1: an oracle that THROWS is NOT proof of absence ⇒ unknown ⇒ REFUSE (#226)', async () => {
+test('item 1: an oracle that THROWS is still NOT proof of absence — it copies, never moves (#226)', async () => {
   // A drifted-temporary doc with a real path, whose getWorkflowByPath lookup
-  // throws. A thrown lookup proves nothing about the disk — it must NOT be read
-  // as "no file here" and must refuse rather than move.
+  // throws. A thrown lookup proves nothing about the disk, so the classification
+  // stays "unknown" — that part is unchanged and must never become "absent".
+  //
+  // #1066 defect 2: "unknown" no longer means REFUSE, it means "do not take a move
+  // path and do not consume the source". The trio does neither, so the save runs
+  // and the source is untouched. Note the copy adapter itself fails closed on a
+  // throwing lookup for the TARGET (a separate check), which is why the target
+  // collision re-check is restored below before the save.
   const active = {
     path: 'workflows/zz226b-orig.json',
     filename: 'zz226b-orig.json',
@@ -493,16 +542,21 @@ test('item 1: an oracle that THROWS is NOT proof of absence ⇒ unknown ⇒ REFU
     isTemporary: true // drifted
   }
   const svc = makeFaithfulService({ files: [active.path], active })
-  svc.getWorkflowByPath = () => {
-    throw new Error('store not ready')
+  const realLookup = svc.getWorkflowByPath.bind(svc)
+  let thrown = 0
+  svc.getWorkflowByPath = (path) => {
+    // Throw for the SOURCE classification only; the adapter's target re-check is a
+    // different guard with its own fail-closed behaviour and is not what this asserts.
+    if (path === active.path && thrown++ === 0) throw new Error('store not ready')
+    return realLookup(path)
   }
 
-  await assert.rejects(
-    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
-    /cannot be proven absent from disk/
-  )
+  const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
+
+  assert.equal(saved, 'zz226b-copy')
   assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'source preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
 })
 
 test('item 2: a genuine NEW workflow with NO path grounds/saves (never refused) (#226)', async () => {
@@ -629,7 +683,7 @@ test('round-6: a THROWING post-save probe does NOT false-alarm — a valid copy 
   assert.equal(saved, 'zz226b-copy', 'reported success, not a false "moved" error')
 })
 
-test('P0 round-4: oracle returns the DRIFTED non-persisted wf for an on-disk path ⇒ unknown ⇒ REFUSE (#226)', async () => {
+test('P0 round-4: oracle returns the DRIFTED non-persisted wf for an on-disk path ⇒ unknown ⇒ COPY, never move (#226)', async () => {
   // Source IS on disk, but its in-memory object is mis-flagged temporary. The
   // store's getWorkflowByPath returns that same non-persisted object. A RETURNED
   // object is NOT proof of absence — classifying it never-persisted would move
@@ -646,10 +700,13 @@ test('P0 round-4: oracle returns the DRIFTED non-persisted wf for an on-disk pat
   assert.equal(svc.getWorkflowByPath('workflows/zz226b-orig.json'), active)
   assert.equal(active.isPersisted, false)
 
-  await assert.rejects(
-    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
-    /cannot be proven absent from disk/
-  )
+  const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
+
+  // #1066 defect 2: a RETURNED object is still not proof of absence, so this is still
+  // "unknown" — and "unknown" still forbids a move and forbids consuming the source.
+  // On the move-free trio neither can happen, so the copy proceeds and the real file
+  // is exactly where it was.
+  assert.equal(saved, 'zz226b-copy')
   assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'real source preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
   assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
@@ -690,7 +747,7 @@ test('P0 round-4: a LIST-miss is not proof of absence ⇒ unknown ⇒ REFUSE (#2
   assert.equal(calls.length, 0, 'nothing was called — no move')
 })
 
-test('P0-a: no existence oracle + mis-flagged temporary + real name ⇒ REFUSE, never move (#226)', async () => {
+test('P0-a: no existence oracle + mis-flagged temporary + real name ⇒ COPY, never move (#226)', async () => {
   // The most dangerous drift: the doc has a REAL filename and is flagged
   // temporary, but there is NO existence API/list to prove whether a file backs
   // it. Existence is UNKNOWN, which must FAIL SAFE (refuse) — the old code
@@ -706,22 +763,28 @@ test('P0-a: no existence oracle + mis-flagged temporary + real name ⇒ REFUSE, 
   // ⇒ no existence oracle ⇒ classification is UNKNOWN.
   const svc = makeService({ files: [active.path], active })
 
-  await assert.rejects(
-    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
-    /cannot be proven absent from disk/
-  )
-  // Source untouched; saveWorkflowAs never delegated a move.
+  const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
+
+  // #1066 defect 2: existence is still UNKNOWN — nothing here proves the file absent,
+  // and nothing pretends to. The save is authorised by the route, which cannot move.
+  assert.equal(saved, 'zz226b-copy')
   assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'original preserved')
-  assert.equal(svc.calls.length, 0, 'nothing was called')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
 })
 
 for (const realName of ['Untitled 2026-07-24', 'Unsaved Workflow 3']) {
-  test(`P0 name-vs-proof: a REAL on-disk "${realName}" drifted temporary + NO oracle ⇒ REFUSE, never moved (#226)`, async () => {
+  test(`P0 name-vs-proof: a REAL on-disk "${realName}" drifted temporary + NO oracle is COPIED, never moved (#226)`, async () => {
     // The exact collision: a user really can have "workflows/Untitled ….json"
     // (or "Unsaved Workflow 3.json") ON DISK. If its flags drift temporary and
     // there is no existence oracle, the placeholder NAME must NOT be treated as
-    // proof of absence — that would classify a real file as never-persisted and
-    // then MOVE (destroy) it. With no oracle to confirm absence ⇒ unknown ⇒ refuse.
+    // proof of absence — that would classify a real file as never-persisted, and
+    // never-persisted is what licenses CONSUMING the source tab (#566).
+    //
+    // #1066 defect 2: the classification is unchanged — still "unknown", still not
+    // never-persisted, so the source is neither moved nor consumed. What changed is
+    // that "unknown" no longer blocks the copy, because the route cannot move. The
+    // file the placeholder name was protecting is asserted still present below.
     const active = {
       path: `workflows/${realName}.json`,
       filename: `${realName}.json`,
@@ -729,14 +792,13 @@ for (const realName of ['Untitled 2026-07-24', 'Unsaved Workflow 3']) {
       isPersisted: false, // drifted
       isTemporary: true // drifted
     }
-    // makeService ⇒ NO getWorkflowByPath, NO lists ⇒ no existence oracle.
     const svc = makeService({ files: [active.path], active })
 
-    await assert.rejects(
-      () => saveActiveWorkflow(svc, 'a-copy', {}),
-      /cannot be proven absent from disk/
-    )
+    const saved = await saveActiveWorkflow(svc, 'a-copy', {})
+
+    assert.equal(saved, 'a-copy')
     assert.ok(svc.disk.has(`workflows/${realName}.json`), 'real source preserved')
+    assert.ok(svc.disk.has('workflows/a-copy.json'), 'copy created')
     assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
     assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
   })
@@ -967,11 +1029,15 @@ test('1.47: a persisted workflow Save-As COPIES via saveAs+saveWorkflow, source 
   assert.equal(saved, 'Bar')
 })
 
-test('1.47: a drifted-temporary REAL file (on disk) is NEVER moved — refuse via disk oracle (#226/#215)', async () => {
+test('1.47: a drifted-temporary REAL file (on disk) is COPIED, never moved — disk oracle (#226/#215)', async () => {
   // The exact #226 hole the #268 fix must not reopen: a PERSISTED file left
   // flagged temporary. getWorkflowByPath returns that same non-persisted object
   // (can't prove absence); only the /userdata oracle can — and it says the file
-  // EXISTS, so the classifier must say "persisted" → refuse, never copy/move.
+  // EXISTS, so the classifier says "persisted".
+  //
+  // #1066 defect 2: "persisted" means COPY, which is what a Save-As of a real file
+  // is supposed to do — it does not mean refuse. The hole stays shut where it
+  // actually was: no renameWorkflow, and the source file is still on disk after.
   const active = {
     path: 'workflows/Real.json',
     filename: 'Real.json',
@@ -983,20 +1049,20 @@ test('1.47: a drifted-temporary REAL file (on disk) is NEVER moved — refuse vi
   // Sanity: the in-memory oracle returns the SAME non-persisted object.
   assert.equal(svc.getWorkflowByPath('workflows/Real.json'), active)
 
-  await assert.rejects(
-    () => saveActiveWorkflow(svc, 'Copy', { existsOnDisk }),
-    /exists on disk/
-  )
+  const saved = await saveActiveWorkflow(svc, 'Copy', { existsOnDisk })
+
+  assert.equal(saved, 'Copy')
   assert.ok(svc.disk.has('workflows/Real.json'), 'real source preserved')
-  assert.ok(!svc.disk.has('workflows/Copy.json'), 'no rogue copy')
+  assert.ok(svc.disk.has('workflows/Copy.json'), 'copy created')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
-  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted a move')
 })
 
-test('1.47: a drifted-temporary path with an UNKNOWN disk oracle still refuses (fail safe, #226)', async () => {
-  // If /userdata is unreachable (oracle returns null), a flagged-temporary doc
-  // whose in-memory lookup is inconclusive stays "unknown" → refuse. Grounding
-  // only ever happens on a PROVEN 404.
+test('1.47: a drifted-temporary path with an UNKNOWN disk oracle copies without claiming absence (#226)', async () => {
+  // If /userdata is unreachable (oracle returns null), a flagged-temporary doc whose
+  // in-memory lookup is inconclusive stays "unknown". That is still not "absent", and
+  // the two decisions that need proof still read it correctly: the source is not
+  // consumed and no move is taken. Grounding — which DOES require proof — still only
+  // ever happens on a PROVEN 404 (see the grounding tests).
   const active = {
     path: 'workflows/Real.json',
     filename: 'Real.json',
@@ -1007,13 +1073,11 @@ test('1.47: a drifted-temporary path with an UNKNOWN disk oracle still refuses (
   const { svc } = makeStore147Service({ files: [active.path], active })
   const existsOnDisk = async () => null // oracle unreachable ⇒ unknown
 
-  await assert.rejects(
-    () => saveActiveWorkflow(svc, 'Copy', { existsOnDisk }),
-    /cannot be proven absent from disk/
-  )
+  const saved = await saveActiveWorkflow(svc, 'Copy', { existsOnDisk })
+
+  assert.equal(saved, 'Copy')
   assert.ok(svc.disk.has('workflows/Real.json'), 'source preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
-  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted a move')
 })
 
 test('1.47: saveAs+saveWorkflow but NO openWorkflow ⇒ refuse, never persist null content (#226)', async () => {
