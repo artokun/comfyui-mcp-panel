@@ -106,7 +106,14 @@ test("every shipped locale file matches the English key set exactly", () => {
     }
     return out;
   };
-  const expected = flat(en);
+  // Plural siblings are excluded from EXACT parity and checked by category instead — the two
+  // rules were mutually unsatisfiable otherwise. This test demanded zh carry `x_one` because
+  // English has it; `scripts/i18n-check.mjs` rejects `x_one` because Chinese has no `one`
+  // category. No zh file could satisfy both, so the only way to green was to make Chinese
+  // grammatically wrong. Parity is the right rule for ordinary keys and the wrong one for
+  // plurals, where the correct key SET differs per language by design.
+  const PLURAL = /_(?:zero|one|two|few|many|other)$/;
+  const expected = new Set([...flat(en)].filter((k) => !PLURAL.test(k)));
   for (const { code } of LOCALES) {
     if (code === "en") continue;
     let target;
@@ -115,12 +122,62 @@ test("every shipped locale file matches the English key set exactly", () => {
     } catch {
       continue; // not started yet — falls back to English wholesale, which is fine
     }
-    const got = flat(target);
+    const got = new Set([...flat(target)].filter((k) => !PLURAL.test(k)));
     const missing = [...expected].filter((k) => !got.has(k));
     const extra = [...got].filter((k) => !expected.has(k));
     assert.deepEqual(missing, [], `${code} is missing keys`);
     assert.deepEqual(extra, [], `${code} has keys English does not`);
   }
+});
+
+test("no fallback is concatenated with a variable instead of using a {placeholder}", () => {
+  // `tr("k", "Hello " + name)` puts only "Hello " in the catalog. English looks perfect — it
+  // evaluates the whole expression at runtime — while every translated language loses the
+  // value entirely, and no RTL language can move it to where its grammar needs it. Adjacent
+  // string literals are now joined automatically; a VARIABLE has to become a {placeholder},
+  // which only a human can name.
+  const out = execFileSync("node", ["scripts/i18n-extract.mjs", "--json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 1 << 26,
+  });
+  const bad = JSON.parse(out).filter((c) => c.varConcat);
+  assert.deepEqual(
+    bad.map((c) => `${c.file}:${c.line} tr("${c.key}", "…" + <var>)`),
+    [],
+    'use tr("key", "… {name} …", { name }) so translators can move the value',
+  );
+});
+
+test("no tr() call site is invisible to the extractor", () => {
+  // The blind spot unit 6 found: a plural fallback's first `}` is the one inside `{count}`,
+  // so the object body was truncated and every plural site silently vanished. The round-trip
+  // guard could not see it — a site the parser chokes on is absent from BOTH sides of that
+  // comparison, so it stayed green while reporting on nothing. Only counting what was SKIPPED
+  // notices. Any future parser gap fails here rather than quietly shrinking the catalog.
+  const out = execFileSync("node", ["scripts/i18n-extract.mjs", "--json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 1 << 26,
+  });
+  const parsed = JSON.parse(out).filter((c) => c.converted);
+  const byFile = new Map();
+  for (const c of parsed) {
+    if (!byFile.has(c.file)) byFile.set(c.file, []);
+    byFile.get(c.file).push(c);
+  }
+  const unparsed = [];
+  for (const [file, items] of byFile) {
+    const src = readFileSync(join(ROOT, file), "utf8");
+    const lines = new Set(items.map((c) => c.line));
+    const call = /\btr\(\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*,/g;
+    let m;
+    while ((m = call.exec(src)) !== null) {
+      const line = src.slice(0, m.index).split("\n").length;
+      if (!lines.has(line)) unparsed.push(`${file}:${line} tr("${m[2]}", …)`);
+    }
+  }
+  assert.deepEqual(unparsed, [], "the extractor could not read these call sites — their keys would vanish from English");
 });
 
 test("our language table matches the codes ComfyUI itself ships", () => {

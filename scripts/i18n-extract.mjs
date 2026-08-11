@@ -93,6 +93,51 @@ function makeKey(file, text) {
  * 247-key catalog and failed the gate with ~246 unknown-key errors in every language.
  * Conversion has to be a round trip, not a one-way door.
  */
+/**
+ * Index of the `}` closing the object that starts at `s[0]`, skipping braces inside strings.
+ *
+ * A naive `indexOf('}')` finds the brace inside `{count}` — the FIRST thing every plural
+ * fallback contains — so it truncated the object body and every plural site was dropped.
+ * Worse, the round-trip guard could not see it: a site the extractor cannot parse is absent
+ * from BOTH sides of the comparison, so the gate written to catch exactly this stayed green.
+ * Hence `unparsedCallSites()` below, which counts what was skipped rather than what was read.
+ */
+function matchingBrace(s) {
+  let depth = 0;
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === '\\') i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') quote = c;
+    else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Every `tr(` in the source that `readConverted` did NOT turn into a candidate.
+ *
+ * This is the blind-spot check. Comparing catalog-to-candidates can only ever police sites
+ * the parser already understood; a site it chokes on is invisible to both sides. Counting the
+ * difference is the only thing that notices.
+ */
+export function unparsedCallSites(src, file, parsed) {
+  const seen = new Set(parsed.map((c) => c.line));
+  const out = [];
+  const call = /\btr\(\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*,/g;
+  let m;
+  while ((m = call.exec(src)) !== null) {
+    const line = src.slice(0, m.index).split('\n').length;
+    if (!seen.has(line)) out.push({ file, line, key: m[2] });
+  }
+  return out;
+}
+
 function readConverted(src, file) {
   const out = [];
   // `tr(` + a quoted key + `,` + either a quoted string or a `{ one: …, other: … }` object.
@@ -105,12 +150,27 @@ function readConverted(src, file) {
 
     const str = rest.match(/^(["'`])((?:\\.|(?!\1)[^\\])*)\1/);
     if (str) {
-      out.push({ key, text: str[2], file, line, converted: true });
+      // Fallbacks are often written as `"first half " + "second half"` to stay inside the
+      // line limit. Reading only the first literal put HALF a sentence in the catalog: English
+      // still rendered correctly (it evaluates the whole expression at runtime), so every
+      // translated language silently lost the rest and nothing in English could reveal it.
+      let text = str[2];
+      let tail = rest.slice(str[0].length);
+      let more;
+      while ((more = tail.match(/^\s*\+\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/))) {
+        text += more[2];
+        tail = tail.slice(more[0].length);
+      }
+      // `"Hello " + name` is a different animal: the variable never reaches the catalog at
+      // all, so no translator can move it and RTL languages cannot reorder it. That needs a
+      // {placeholder}, and it is reported rather than silently half-captured.
+      const varConcat = /^\s*\+\s*[A-Za-z_$]/.test(tail);
+      out.push({ key, text, file, line, converted: true, ...(varConcat ? { varConcat: true } : {}) });
       continue;
     }
     // Plural object: emit one candidate per category so English carries `key_one`/`key_other`.
     if (rest.startsWith('{')) {
-      const close = rest.indexOf('}');
+      const close = matchingBrace(rest);
       if (close === -1) continue;
       const body = rest.slice(1, close);
       const form = /(\w+)\s*:\s*(["'`])((?:\\.|(?!\2)[^\\])*)\2/g;
