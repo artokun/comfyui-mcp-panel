@@ -3970,10 +3970,11 @@ function panelSettingsList() {
       tooltip:
         "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard " +
         "to read on a high-DPI or large display. 100% is the default; 100-250. Applies immediately, to " +
-        "every open panel. For text only, the panel also exposes a CSS variable: setting `--cmcp-fs` " +
-        "(default 0.8125rem) on `:root` or `.cmcp-root` in a user stylesheet scales every panel font " +
-        "size, including the CivitAI, Apps and modal surfaces. It does not scale spacing or icons — " +
-        "this setting is still the supported way to scale the panel as a whole.",
+        "every open panel. For text, the panel also exposes a CSS variable: setting `--cmcp-fs` " +
+        "(default 0.8125rem) on `:root` or `.cmcp-root` in a user stylesheet scales the panel's font " +
+        "sizes, including the CivitAI, Apps and modal surfaces. It does not scale spacing, icons, or " +
+        "the handful of elements that carry a fixed pixel size. This setting is still the supported " +
+        "way to scale the panel as a whole.",
       type: "slider",
       attrs: { min: PANEL_UI_SCALE_MIN, max: PANEL_UI_SCALE_MAX, step: 5 },
       defaultValue: 100,
@@ -19421,7 +19422,9 @@ function buildPanel() {
   statusText.textContent = "disconnected";
   const caret = document.createElement("i");
   caret.className = "pi pi-angle-down";
-  caret.style.fontSize = "0.625rem";
+  // #753 — assigned through style.fontSize rather than a `font-size:` declaration, so the
+  // conversion sweep could not see it (codex). 0.625/0.8125, same as every other value.
+  caret.style.fontSize = "calc(var(--cmcp-fs, 0.8125rem) * 0.7692)";
   status.append(dot, statusText, caret);
 
   function iconBtn(icon, titleText) {

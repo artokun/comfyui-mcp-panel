@@ -166,5 +166,9 @@ test("the tooltip names the knob that now DOES work, and what it does not cover"
   );
   // It scales TEXT. Spacing is still rem on purpose, and saying otherwise would have
   // users expect a denser panel that never arrives.
-  assert.match(entry, /does not scale spacing or icons/);
+  assert.match(entry, /does not scale spacing, icons, or/);
+  // ...and the fixed-pixel elements. A tooltip promising "every panel font size" would be
+  // wrong: a training caption and a few rules carry literal px (codex).
+  assert.match(entry, /fixed pixel size/);
+  assert.ok(!/scales every panel font/.test(entry), "no absolute claim");
 });
