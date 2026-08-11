@@ -12,8 +12,9 @@
 //
 //   "Call the node's own removal path so its bookkeeping runs."  rgthree's 🗑️ Remove is
 //   `removeArrayItem(this.widgets, widget)` — a plain splice, no hook, no bookkeeping.
-//   There is nothing to call. We use the frontend's own `node.removeWidget()` when it
-//   exists (LGraphNode provides it; rgthree's `configure()` calls it) and splice otherwise.
+//   There is nothing to call. We use the frontend's own `node.removeWidget()`, passing the
+//   WIDGET OBJECT: LGraphNode's takes one and throws on a miss, and rgthree's override
+//   accepts either a widget or an index. The object is the only argument both accept.
 //
 //   "Renumber the remaining rows (lora_2 -> lora_1)."  The names are not positional.
 //   rgthree's `loraWidgetsCounter` is monotonic, `configure()` re-mints `lora_1..N` from
@@ -30,6 +31,10 @@
 // failed lookup became a confident negative.
 
 import { isControlAfterGenerateWidget } from "./control-after-generate.js";
+// The panel already decides "is this a subgraph container?" in one place, by SHAPE rather
+// than by type string. Reusing it keeps one answer to the question instead of two that
+// can drift — a subgraph node's `type` is a UUID, so a name test would never work anyway.
+import { isVirtualSubgraphContainer } from "./node-resolve.js";
 
 /** Widget names whose VALUE we never echo back, even in a "here is what I removed" reply. */
 const SECRETISH_NAME = /(api[_-]?key|secret|token|password|passwd|credential)/i;
@@ -75,6 +80,8 @@ export function declaredInputNames(def) {
  *                        success.
  *   "linked"           — the widget is carried by an input slot that currently has a LINK.
  *                        Removing it would orphan the wire silently.
+ *   "subgraph"         — a SUBGRAPH container, whose widgets are promoted from the graph
+ *                        inside it. Not a missing def; a different kind of thing.
  *   "dynamic"          — a row the node added itself. Removable.
  */
 export function classifyWidgetRemoval(node, widgetName, { declaredNames } = {}) {
@@ -96,6 +103,18 @@ export function classifyWidgetRemoval(node, widgetName, { declaredNames } = {}) 
   );
   if (linkedInput) return { kind: "linked", index, widget, input_name: linkedInput.name ?? widgetName };
 
+  // A SUBGRAPH NODE HAS NO BACKEND DEF, AND THAT IS NOT A FAILED LOOKUP.
+  //
+  // SubgraphNode sets `this.type = subgraph.id` — a UUID — so `defs[node.type]` misses for
+  // a reason that has nothing to do with whether /object_info could be read. It would have
+  // been refused with "I could not read the node definitions", a sentence that is simply
+  // false there: the defs read fine, this node just is not a backend type. Reporting a
+  // lookup failure that did not happen is the same defect class as the refusal itself.
+  //
+  // Its widgets are PROMOTED from the interior graph, and its own removeWidget dispatches
+  // `widget-demoted` without splicing `node.widgets`, so this is not a row to splice in any
+  // case — demotion is the operation, and it is not one this tool performs.
+  if (isVirtualSubgraphContainer(node)) return { kind: "subgraph", index, widget };
   if (!declaredNames) return { kind: "unknown", index, widget };
   if (declaredNames.has(widgetName)) return { kind: "backend-declared", index, widget };
   return { kind: "dynamic", index, widget };
@@ -134,6 +153,14 @@ export function removalRefusal(node, widgetName, classification, { objectInfoNot
         `(it governs how the value next to it is rewritten after each run). The frontend ` +
         `re-creates it, so removing it would look like it worked and change nothing. Set it to ` +
         `"fixed" with panel_set_widget if you want the value to stop moving.`
+      );
+    case "subgraph":
+      return (
+        `"${widgetName}" on node ${id} belongs to a SUBGRAPH node, whose widgets are ` +
+        `promoted from the graph inside it rather than declared by a backend node type. ` +
+        `Removing one is a DEMOTION performed on the interior node that owns it, not a row ` +
+        `this tool can splice off the container — use panel_promote_widget with demote:true ` +
+        `against the interior node.`
       );
     case "linked":
       return (
@@ -179,10 +206,13 @@ export function runRemoveWidget(node, widgetName, opts = {}) {
     // on the current frontend that line throws too. A call that happens to exist is not
     // a contract — the method's own source is.
     //
-    // There is no fallback path. removeWidget lives on LGraphNode.prototype, so
-    // `typeof === "function"` is unconditionally true and a `splice` branch behind that
-    // test is unreachable code that reads like a safety net. If the method is ever
-    // genuinely absent, the verification below reports it honestly instead.
+    // THE SPLICE FALLBACK IS NOT DEAD CODE, though I wrote a comment saying it was.
+    // I reasoned that removeWidget lives on LGraphNode.prototype so `typeof === "function"`
+    // is unconditionally true — correct for a real canvas node, and false for the thing
+    // that actually exercises this line: a plain object standing in for a node. Deleting
+    // the branch on the strength of that comment fails a test, which is a fair summary of
+    // why the comment was wrong. It stays, and it is a genuine fallback for any node-like
+    // object that does not carry the method.
     if (typeof node.removeWidget === "function") node.removeWidget(widget);
     else node.widgets.splice(index, 1);
   } finally {

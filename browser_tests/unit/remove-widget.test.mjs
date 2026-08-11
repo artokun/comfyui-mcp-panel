@@ -18,26 +18,36 @@ import {
 } from "../../web/js/lib/remove-widget.js";
 
 /**
- * LGraphNode.removeWidget, transcribed from the running frontend (1.48.7):
+ * TWO REAL removeWidget IMPLEMENTATIONS, because the ecosystem has two.
  *
- *   removeWidget(e){
- *     if(!this.widgets) throw Error("removeWidget called on node without widgets");
- *     let t=this.widgets.indexOf(e);
- *     if(t===-1) throw Error("Widget not found on this node");
- *     …
- *     this.widgets.splice(t,1)
+ * LGraphNode.removeWidget (frontend 1.50.3, recovered from the shipped source map at
+ * src/lib/litegraph/src/LGraphNode.ts) takes the WIDGET OBJECT and throws on a miss:
+ *
+ *   removeWidget(widget) {
+ *     if (!this.widgets) throw new Error('removeWidget called on node without widgets')
+ *     const i = this.widgets.indexOf(widget)
+ *     if (i === -1) throw new Error('Widget not found on this node')
+ *     ...clears input._widget/.widget/.pos, sets _widgetSlotsDirty, widget.onRemove?.()
+ *     this.widgets.splice(i, 1)
  *   }
  *
- * IT TAKES THE WIDGET OBJECT. My first version of this file hand-built an INDEX-based
- * double — `node.removeWidget = (i) => node.widgets.splice(i, 1)` — and asserted the index
- * it received. Fifteen tests passed against a production code path that threw
- * "Widget not found on this node" on every single invocation and removed nothing.
+ * rgthree OVERRIDES it (rgthree-comfy/web/comfyui/base_node.js:97) and accepts EITHER:
  *
- * That is the failure mode a double invites: it pins what I believed the frontend does.
- * Transcribing the real signature (including both throws) is what makes the suite able to
- * catch this class at all, so every test below installs THIS one.
+ *   removeWidget(widget) { if (typeof widget === "number") widget = this.widgets[widget]; ... }
+ *
+ * MY FIRST VERSION OF THIS FILE GOT BOTH WRONG, IN OPPOSITE DIRECTIONS. It hand-built an
+ * index-based double — `node.removeWidget = (i) => node.widgets.splice(i, 1)` — and 15
+ * tests passed while production threw "Widget not found on this node" on every call. Then
+ * the fix commit over-corrected: it asserted rgthree's own `removeWidget(0)` "throws on the
+ * current frontend", which rgthree's shipped source directly contradicts, and installed
+ * LGraphNode's method on a factory named "a Power Lora Loader as it actually appears" —
+ * unfaithful for the exact node it models.
+ *
+ * The production fix (pass the widget) is right either way, and that is the point: it is
+ * the only argument BOTH implementations accept. What was wrong was the story and the
+ * double. Both are modelled below so neither belief can be re-encoded.
  */
-function installRealRemoveWidget(node) {
+function installLGraphNodeRemoveWidget(node) {
   node.removeWidget = function (w) {
     if (!this.widgets) throw new Error("removeWidget called on node without widgets");
     const t = this.widgets.indexOf(w);
@@ -47,9 +57,22 @@ function installRealRemoveWidget(node) {
   return node;
 }
 
+/** rgthree's override: coerces a number, ignores a miss, calls onRemove. */
+function installRgthreeRemoveWidget(node) {
+  node.removeWidget = function (w) {
+    if (typeof w === "number") w = this.widgets[w];
+    if (!w) return;
+    const i = this.widgets.indexOf(w);
+    if (i > -1) this.widgets.splice(i, 1);
+    w.onRemove?.();
+  };
+  return node;
+}
+
 /** A Power Lora Loader as it actually appears: rows the def does not declare. */
 function powerLoraNode() {
-  return installRealRemoveWidget({
+  // A Power Lora Loader really does carry rgthree's override.
+  return installRgthreeRemoveWidget({
     id: 35,
     type: "Power Lora Loader (rgthree)",
     inputs: [],
@@ -149,13 +172,38 @@ test("the node's own removeWidget is called with the WIDGET, not its index", () 
   assert.deepEqual(node.widgets.map((w) => w.name), ["lora_1", "lora_2"]);
 });
 
-test("an index-passing implementation would THROW against the real signature", () => {
-  // Pins the frontend contract itself, so this file cannot drift back to believing
-  // removeWidget is index-based. rgthree's configure() calls removeWidget(0) — legacy
-  // code against an older litegraph, and the evidence I originally misread.
-  const node = powerLoraNode();
-  assert.throws(() => node.removeWidget(0), /Widget not found on this node/);
-  assert.equal(node.widgets.length, 3, "nothing may be removed by a failed call");
+test("passing the WIDGET is the only argument both real implementations accept", () => {
+  // rgthree coerces a number, so an index happens to work THERE — which is why my
+  // "rgthree's removeWidget(0) throws too" claim was false. On a plain LGraphNode it
+  // throws, and Impact/Inspire list nodes have no override. The widget object is accepted
+  // by both; that is the whole justification for the fix, and it is not "rgthree is broken".
+  const rg = installRgthreeRemoveWidget({ id: 1, type: "T", inputs: [], widgets: [{ name: "a" }, { name: "b" }] });
+  rg.removeWidget(0);
+  assert.deepEqual(rg.widgets.map((w) => w.name), ["b"], "rgthree tolerates an index");
+
+  const plain = installLGraphNodeRemoveWidget({ id: 2, type: "T", inputs: [], widgets: [{ name: "a" }, { name: "b" }] });
+  assert.throws(() => plain.removeWidget(0), /Widget not found on this node/, "LGraphNode does not");
+  assert.equal(plain.widgets.length, 2, "and removes nothing when it throws");
+
+  // The widget object works on both.
+  rg.removeWidget(rg.widgets[0]);
+  plain.removeWidget(plain.widgets[0]);
+  assert.equal(rg.widgets.length, 0);
+  assert.deepEqual(plain.widgets.map((w) => w.name), ["b"]);
+});
+
+test("the fix works against a PLAIN LGraphNode too — the case the P0 actually broke", () => {
+  // Impact/Inspire list nodes have no rgthree override, so they get LGraphNode's method
+  // verbatim. This is where passing an index genuinely threw and removed nothing.
+  const node = installLGraphNodeRemoveWidget({
+    id: 7,
+    type: "ImpactSomethingList",
+    inputs: [],
+    widgets: [{ name: "row_1", value: 1 }, { name: "row_2", value: 2 }],
+  });
+  const out = runRemoveWidget(node, "row_1", { declaredNames: new Set(["mode"]) });
+  assert.equal(out.removed.widget, "row_1");
+  assert.deepEqual(node.widgets.map((w) => w.name), ["row_2"]);
 });
 
 test("a removeWidget that silently NO-OPS is reported as a failure, not a success", () => {
@@ -239,6 +287,35 @@ test("REFUSES a widget whose input slot is currently LINKED", () => {
   };
   runRemoveWidget(unlinked, "value", { declaredNames: new Set() });
   assert.equal(unlinked.widgets.length, 0);
+});
+
+test("REFUSES a SUBGRAPH node with the true reason, not a fabricated lookup failure", () => {
+  // A SubgraphNode's `type` is the subgraph's UUID, so `defs[node.type]` misses — and it
+  // would have been refused with "I could not read the node definitions", which is false:
+  // the defs read fine, this node just is not a backend type. Claiming a lookup failure
+  // that never happened is the same defect class as the refusal this tool exists to avoid.
+  const node = {
+    id: 12,
+    type: "0f6a1e1e-1111-4111-8111-111111111111",
+    inputs: [],
+    widgets: [{ name: "promoted_steps", value: 20 }],
+    subgraph: { _nodes: [] },
+  };
+  assert.throws(
+    () => runRemoveWidget(node, "promoted_steps", { declaredNames: null }),
+    /SUBGRAPH node/,
+  );
+  assert.throws(
+    () => runRemoveWidget(node, "promoted_steps", { declaredNames: null }),
+    /panel_promote_widget with demote:true/,
+  );
+  // …and it must NOT claim the definitions were unreadable.
+  try {
+    runRemoveWidget(node, "promoted_steps", { declaredNames: null });
+  } catch (err) {
+    assert.doesNotMatch(err.message, /could not read the node definitions/);
+  }
+  assert.equal(node.widgets.length, 1);
 });
 
 test("a missing widget is refused by NAME, listing what the node actually has", () => {
