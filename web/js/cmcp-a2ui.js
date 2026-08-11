@@ -42,6 +42,14 @@ const capped = (v, n) => str(v) && v.length <= n;
 /**
  * Validate + normalize a raw card spec. Returns { ok:true, spec } with defaults
  * applied, or { ok:false, errors:[...] }. Never throws.
+ *
+ * NOT TRANSLATED, deliberately. These read as user-facing because
+ * renderA2UIFailCard puts them on screen, but every one of them names a field of
+ * the A2UI wire schema (`components array is required`, `duplicate id "x"`) and
+ * the audience is whoever is writing the agent that emitted the bad card. They are
+ * also the text a user pastes into a bug report; translating them would mean the
+ * maintainer receives a Korean rendering of a schema violation and cannot grep for
+ * it. The card's own chrome around them (title, "tap to view raw") IS translated.
  */
 export function validateA2UISpec(raw) {
   const errors = [];
@@ -665,10 +673,13 @@ export function renderA2UIFailCard(rawText, errors) {
   // ("component.type must be a string"), which is the vocabulary of the JSON below, not
   // prose. Only the two pieces of chrome around them are translated.
   //
-  // The reason is a `{reason}` HOLE rather than a separate string concatenated onto a
-  // leading " — ". Edge whitespace inside a catalog value is the kind of thing a translator
-  // (or a JSON round-trip) drops silently, and `i18n-check` only validates holes — so the
-  // separator lives in the sentence, where losing it is visible.
+  // The reason is a `{reason}` HOLE rather than a fragment concatenated onto a leading
+  // " — ", for two independent reasons. Edge whitespace inside a catalog value is the kind
+  // of thing a translator (or a JSON round-trip) drops silently, and `i18n-check` validates
+  // holes, not whitespace — so the separator lives in the sentence, where losing it is
+  // visible. And the panel ships ar/fa: an RTL sentence does not necessarily put the
+  // affordance AFTER the reason, so interpolating lets the translator order both halves
+  // while concatenating would pin them to English's order.
   const reason = errors && errors.length ? errors.slice(0, 3).join("; ") : tr("a2ui.could_not_render", "could not render");
   why.textContent = tr("a2ui.tap_to_view_raw", "{reason} — tap to view raw", { reason });
   why.style.cursor = "pointer";

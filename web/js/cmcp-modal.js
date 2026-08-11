@@ -14,6 +14,23 @@
 //   formModal   ({title,fields[],submitLabel,cancelLabel})        -> Promise<values|null>
 //
 // All user text goes through textContent (el() below) — no HTML injection.
+//
+// TRANSLATION: every word this module supplies itself ("Confirm"/"Cancel"/
+// "Save"/"OK") lives in a DEFAULT PARAMETER, which is why the string extractor
+// never proposed them — it matches `label:`-style assignment contexts, and a
+// default sits in a destructuring pattern instead. Defaults are evaluated per
+// CALL, not at module load, so tr() here resolves against whatever catalog is
+// loaded by the time a sheet actually opens; there is no ordering hazard with
+// loadCatalog().
+//
+// Only `cancelLabel` is currently reached: no caller anywhere passes one, while
+// every live call site overrides title/confirmLabel/submitLabel with its own
+// wording (cmcp-apps-ui.js). Those literals are that file's to translate. The
+// rest are the contract this module publishes for a caller that omits them, and
+// a dead default that renders English the day someone stops passing one is the
+// bug this is here to prevent.
+
+import { tr } from "./lib/i18n.js";
 
 const el = (tag, cls, txt) => {
   const n = document.createElement(tag);
@@ -90,10 +107,10 @@ function injectModalCss() {
 /** Yes/No confirmation. Resolves true only when the confirm button is clicked;
  *  ✕ / backdrop / cancel all resolve false. */
 export function confirmModal({
-  title = "Confirm",
+  title = tr("modal.confirm", "Confirm"),
   message = "",
-  confirmLabel = "Confirm",
-  cancelLabel = "Cancel",
+  confirmLabel = tr("modal.confirm", "Confirm"),
+  cancelLabel = tr("panel.cancel", "Cancel"),
   danger = false,
 } = {}) {
   injectModalCss();
@@ -121,7 +138,12 @@ export function confirmModal({
 
 /** Multi-field form modal. `fields` = [{key,label,value,placeholder,type,multiline,rows}].
  *  Resolves a { key: value } object on submit, or null when dismissed. */
-export function formModal({ title = "", fields = [], submitLabel = "Save", cancelLabel = "Cancel" } = {}) {
+export function formModal({
+  title = "",
+  fields = [],
+  submitLabel = tr("panel.save", "Save"),
+  cancelLabel = tr("panel.cancel", "Cancel"),
+} = {}) {
   injectModalCss();
   return new Promise((resolve) => {
     let settled = false;
@@ -180,8 +202,8 @@ export function promptModal({
   value = "",
   placeholder = "",
   multiline = false,
-  submitLabel = "OK",
-  cancelLabel = "Cancel",
+  submitLabel = tr("modal.ok", "OK"),
+  cancelLabel = tr("panel.cancel", "Cancel"),
 } = {}) {
   return formModal({
     title,

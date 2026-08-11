@@ -497,8 +497,22 @@ const _ADVICE = {
  *  Returns `{ message, detail, retryable }`: `message` is the whole sentence for
  *  the error card, `detail` is the bounded upstream text ALONE (so the UI and the
  *  agent-facing error state can use it without re-parsing prose), and `retryable`
- *  is true / false / null. Pure, and exported for unit tests. */
-export function describeUpstreamFailure({ status, statusText, bodyText, label = "CivitAI API" }) {
+ *  is true / false / null. Exported for unit tests. Pure with respect to its
+ *  ARGUMENTS; since `label` defaults through tr() it also reads the loaded
+ *  translation catalog, so the same inputs render in the user's language. */
+// `label` is a DEFAULT PARAMETER, which is why the string extractor missed it: it
+// matches assignment contexts, not destructuring defaults. It heads the sentence
+// on the error card ("CivitAI API 503: …") — "CivitAI" is the brand and stays,
+// "API" is the translatable noun. Evaluated per call, so the catalog is loaded
+// long before any request can fail.
+//
+// `message` has a SECOND audience: civitaiErrorState carries it into
+// panel_civitai_results as `error`, so under a non-English locale the agent reads
+// a partly-translated status line. That is accepted, not overlooked — the same is
+// already true of the tr()'d download label below, the status code and the quoted
+// upstream detail are untouched, and the user seeing their own language on the
+// card is what #705 was about. Do not, however, ever compare this string.
+export function describeUpstreamFailure({ status, statusText, bodyText, label = tr("civitai.civitai_api", "CivitAI API") }) {
   const { text, shape, fromProxy, proxyRetryable } = extractUpstreamDetail(bodyText);
   // A proxy-authored reply carries OUR status, so upstreamFailureClass would be
   // reading a number that says nothing about CivitAI. Honour what the proxy

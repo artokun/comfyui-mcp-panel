@@ -47,22 +47,41 @@ export function panelFailureReport(err, info = {}) {
       ? `${err.name}: ${err.message}`
       : typeof err === "string" && err
         ? err
-        : "(the failure produced no message)";
+        : tr("panel_failure_shell.the_failure_produced_no_message", "(the failure produced no message)");
   const stack = err instanceof Error && typeof err.stack === "string" ? err.stack : "";
+  // `body` and `where` are the two sentences that actually do the work of #779 —
+  // ruling out the reinstall, and saying where to send it — so they are the last
+  // text that should stay English for a Korean user staring at a dead tab. The
+  // extractor could not see them: it reads ONE quoted literal at a time and these
+  // are multi-line `+` concatenations, so no single literal is the string. Each
+  // keeps its whole sentence as the fallback, concatenation and all; only `title:`
+  // (a single literal) had been converted before.
   return {
     title: tr("panel_failure_shell.the_agent_panel_could_not_start", "The agent panel could not start."),
-    body:
+    body: tr(
+      "panel_failure_shell.building_the_panel_threw_so_nothing_was",
       "Building the panel threw, so nothing was rendered. This is a fault in the panel " +
-      "itself — it is NOT a connection problem, and reinstalling ComfyUI or the pack will " +
-      "not change it. The details below are what was actually observed; nothing here is a " +
-      "diagnosis of the cause.",
+        "itself — it is NOT a connection problem, and reinstalling ComfyUI or the pack will " +
+        "not change it. The details below are what was actually observed; nothing here is a " +
+        "diagnosis of the cause.",
+    ),
     message,
     stack,
     panelVersion: info.panelVersion || "unknown",
     frontendVersion: info.frontendVersion || "unknown",
-    where:
-      "Please report this at https://github.com/artokun/comfyui-mcp-panel/issues with the " +
-      "text above, your ComfyUI frontend version, and your browser.",
+    // `{url}` rather than baking the address into the sentence, because the gate
+    // can police a hole and cannot police a literal: i18n-check.mjs extracts
+    // `{name}` runs from English and from each target and hard-fails on a
+    // mismatch, so a translation that loses or mistypes the placeholder is caught
+    // in CI. A pasted URL is checked by nobody — and this is the one sentence in
+    // #779 whose whole job is telling the user where to send the report, so
+    // losing it re-creates the defect for every language but English.
+    where: tr(
+      "panel_failure_shell.please_report_this_at_with_the_text",
+      "Please report this at {url} with the text above, your ComfyUI frontend " +
+        "version, and your browser.",
+      { url: "https://github.com/artokun/comfyui-mcp-panel/issues" },
+    ),
   };
 }
 
