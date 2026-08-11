@@ -151,21 +151,28 @@ test("#952 a reply that CARRIES the answer is still redacted — both commands",
   assert.equal(redactSensitiveReply(graph, "graph_add_node"), graph);
 });
 
-test("#952 (codex) the module says where this reply is read — it is NOT the disconnected caller", () => {
-  // The first draft implied the caller would read "the question was withdrawn". Measured
-  // against the orchestrator, they do not: the old socket's close already rejected the
-  // call with the bridge's own outcome-unknown error, the journal replay finds no pending
-  // rid, and the bridge's late-answer buffer for `ask_user` keeps `msg.ok` replies only —
-  // so a payload-free failure is dropped there, and `request_secret` has no late route at
-  // all. The settle is worth doing for the LEDGER; the prose is read on a redelivery.
+test("#952 (codex ×2) the claim is the LEDGER — not a caller-visible recovery", () => {
+  // Two drafts were too generous and both were caught here. The first implied the
+  // disconnected caller would read "the question was withdrawn"; they do not — the bridge
+  // already failed that call, the journal replay finds no pending rid, and the late-ask
+  // buffer keeps `msg.ok` only. The second retreated to "a REDELIVERY reads it", which is
+  // also not a production path for these two commands: every dispatch mints a fresh rid,
+  // `retry_of` is injected only for RETRY_TOKEN_CMDS (which excludes both), and re-asking
+  // mints a new `ask_id` that is part of the fingerprint. What survives is narrow and
+  // true: the entry settles, so it is evictable and no later delivery can hang.
   const src = readFileSync(new URL("../../web/js/lib/interactive-abandon.js", import.meta.url), "utf8");
-  assert.match(src, /does NOT reach the\s*(?:\/\/\s*)?caller/, "the limit is stated, not implied");
+  assert.match(src, /It does NOT rescue the interrupted call/, "the limit is stated, not implied");
+  assert.match(src, /the caller\s*(?:\/\/\s*)?never sees the text below/, "and stated concretely");
   assert.match(src, /keeps `msg\.ok` replies only/, "and names the specific orchestrator behaviour");
-  assert.match(src, /REDELIVERY of that rid/, "and the one path that does read it");
-  assert.ok(
-    !/the caller (?:learns|is told|sees) (?:that )?the card was withdrawn/i.test(src),
-    "no claim that the disconnected caller receives this",
-  );
+  assert.match(src, /Treat that branch as\s*(?:\/\/\s*)?defensive/, "the replay branch is not sold as recovery");
+  assert.match(src, /evictable and the cap applies again/, "the claim that IS established");
+  for (const overclaim of [
+    /the caller (?:learns|is told|sees) (?:that )?the card was withdrawn/i,
+    /the only path on which a caller reads it/i,
+    /does still reach the handler/i,
+  ]) {
+    assert.ok(!overclaim.test(src), `retracted claim is gone: ${overclaim}`);
+  }
 });
 
 test("#952 source: retirement disables the card AND ends its command, in that order", () => {

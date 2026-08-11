@@ -23,9 +23,11 @@
 // explicitly, which settles the ledger through the ordinary error path. Nothing
 // is fabricated — the reply says the question was withdrawn unanswered.
 //
-// WHERE THE TEXT BELOW IS ACTUALLY READ, measured against the orchestrator rather
-// than assumed (codex). In the ordinary disconnect this reply does NOT reach the
-// caller, and this module does not pretend otherwise:
+// WHAT SETTLING BUYS — and what it does not. Measured against the orchestrator
+// twice, because the first two answers here were both too generous (codex).
+//
+// It does NOT rescue the interrupted call. In the ordinary disconnect the caller
+// never sees the text below:
 //
 //   * the old socket's close already removed the pending rid and rejected the call
 //     with the bridge's own OUTCOME-UNKNOWN error, before anything from the panel
@@ -36,11 +38,17 @@
 //     payload-free FAILURE is dropped there; `request_secret` has no late route at
 //     all.
 //
-// So the value of settling is the LEDGER, not this prose: the entry becomes
-// evictable, and a REDELIVERY of that rid — which does still reach the handler and
-// is answered from the ledger — gets this text instead of silence. That is the
-// only path on which a caller reads it, and it is worth having: the alternative is
-// a second outcome-unknown with no timeout of the panel's own to end it.
+// Nor is the ledger's replay branch a recovery path for these two commands. It
+// needs the SAME rid (every dispatch mints a fresh UUID and overwrites a supplied
+// one) or a `retry_of` naming it (injected only for RETRY_TOKEN_CMDS, which
+// excludes both) — and re-asking mints a new `ask_id`, which is part of the
+// fingerprint, so even a hand-written token would miss. Treat that branch as
+// defensive: it answers a duplicate frame if one is ever delivered, instead of
+// waiting forever on a promise that cannot resolve.
+//
+// What settling actually buys is the LEDGER ITSELF: the entry becomes settled, so
+// it is evictable and the cap applies again, and no future delivery of that rid
+// can hang the handler. That is the whole claim.
 //
 // The reply is journaled by the existing lost-reply path like any other
 // undelivered outcome. Unlike an ANSWER, it is safe to replay across a reconnect —
@@ -75,7 +83,9 @@ export function isAbandonedInteractive(value) {
  * remedy names the current connection because the ANSWER to a withdrawn card is
  * never replayed across a reconnect, so re-asking is the only way to get one.
  *
- * See the header for the one path a caller actually reads this on.
+ * Rarely read, and the header says why: the interrupted call has already been
+ * failed by the bridge. This is the outcome the panel RECORDS, and what a
+ * duplicate frame would be answered with — not a rescue for the original caller.
  */
 export function abandonedInteractiveError(cmd) {
   const what = cmd === "request_secret" ? "secret request" : "question";
