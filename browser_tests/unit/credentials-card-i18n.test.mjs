@@ -44,6 +44,20 @@ function credentialsFrameBody() {
  * A template literal assigned at `anchor`, returned with its backticks so it can be
  * re-evaluated. Tracks `${...}` nesting so an interpolation containing a backtick-quoted
  * fragment (the card's `data-help` row is one) does not terminate the scan early.
+ *
+ * Counting `${` but NOT a bare `{` is a latent trap, and the trigger is narrower than it
+ * first looks — measured, not reasoned about. An object literal alone is survivable: the
+ * under-counted `}` drops depth to 0 early, but the scan then walks to the true terminator
+ * anyway. It breaks only when a nested backtick template FOLLOWS the object literal inside
+ * the SAME interpolation, because the scan is at depth 0 by then and takes that opening
+ * backtick as the end:
+ *
+ *     `${cond ? f({ a: 1 }) : `<b>y</b>`}`   ->   truncated to  `${cond ? f({ a: 1 }) : `
+ *
+ * The card's `data-help` row is already `${s.help ? `<div…>` : ""}`, so it is one object
+ * literal away from that shape. A truncated template surfaces as `new Function` throwing on
+ * the product's own markup, which reads exactly like the panel being broken. Every `{`
+ * therefore increments once an interpolation is open.
  */
 function templateAt(body, anchor) {
   const at = body.indexOf(anchor);
@@ -56,6 +70,7 @@ function templateAt(body, anchor) {
     const c = body[i];
     if (c === "\\") { i++; continue; }
     if (c === "$" && body[i + 1] === "{") { depth++; i++; continue; }
+    if (c === "{" && depth > 0) { depth++; continue; }
     if (c === "}" && depth > 0) { depth--; continue; }
     if (c === "`" && depth === 0) break;
   }
@@ -190,6 +205,34 @@ test("the English rendering is byte-identical to the pre-translation markup", ()
 });
 
 /**
+ * Reaching `tr()` is only half of shipping a translation — the key also has to EXIST in the
+ * source catalog, or every language renders the English fallback and this file stays green
+ * while the dialog it guards is permanently English. That is the "green check is a stale
+ * check" shape, and it is worth stating out loud rather than leaving as an absence.
+ *
+ * Marked `todo` because it currently FAILS and the fix is not available from here:
+ *
+ *   - `locales/en/main.json` is GENERATED, never hand-edited (scripts/i18n-build-en.mjs), so
+ *     adding the keys by hand would be overwritten by the next build.
+ *   - That build is itself broken for converted call sites: it reads
+ *     scripts/i18n-extract.mjs, whose UI_CONTEXT patterns anchor on the code PRECEDING a
+ *     literal (`/\.textContent\s*=\s*$/` and friends), which no longer matches once the site
+ *     reads `… = tr("k", "English")`. Measured: `node scripts/i18n-extract.mjs` reports 1
+ *     candidate against the 247 keys already in the catalog. Its line 100 also skips any
+ *     literal containing `${`, so the four interpolated keys here could never be emitted.
+ *
+ * A `todo` test reports on every run without failing the build, so the gap is visible
+ * instead of silent. When the extractor learns to read `tr("key", "English")` and the
+ * catalog is regenerated, this should start passing — drop the `todo` marker then.
+ */
+test("every key the card uses exists in the English catalog", { todo: "blocked on the i18n-extract regeneration gap — see comment above" }, () => {
+  const en = JSON.parse(readFileSync(join(HERE, "../../locales/en/main.json"), "utf8")).comfyuiMcpPanel;
+  const has = (key) => key.split(".").reduce((o, k) => (o == null ? undefined : o[k]), en) !== undefined;
+  const missing = TRANSLATED.map(([key]) => key).filter((key) => !has(key));
+  assert.deepEqual(missing, [], `${missing.length} key(s) render English in every language`);
+});
+
+/**
  * Which keys each `innerHTML` template must resolve through, per branch. The counting check
  * above is BLIND here and was measured to be: reverting `${esc2(tr("panel.save", "Save"))}`
  * to a bare `Save` inside the template left every assertion green, because a word sitting in
@@ -229,10 +272,15 @@ test("the card's markup resolves through the catalog — no English is baked int
 });
 
 test("a hostile translation cannot break out of the card's markup", () => {
-  // The break-out attempt: a leading `"` closes an attribute, `<b>` opens an element, and
-  // `onload=` is what would then be parsed as a handler. If any of these survive RAW, the
-  // catalog has become an injection path into a card that shows credential state.
-  const HOSTILE = 'x" onload="alert(1)" <b>&';
+  // The break-out attempt: a leading `"` closes an attribute, `<script>` opens an element,
+  // and `onload=` is what would then be parsed as a handler. If any of these survive RAW,
+  // the catalog has become an injection path into a card that shows credential state.
+  //
+  // `<script>` rather than `<b>` on purpose: the card's own header legitimately contains
+  // `<b style="…">`, so a `<b>` probe would only ever pass because of that style attribute,
+  // and moving the bold to a CSS class — a routine cleanup — would fail this test on
+  // completely correct output. No tag below appears in either template.
+  const HOSTILE = 'x" onload="alert(1)" <script>&';
   const trHostile = (key, _fallback, vars) => {
     let out = `${HOSTILE}|${key}`;
     if (vars) for (const [k, v] of Object.entries(vars)) out = out.split(`{${k}}`).join(String(v));
@@ -249,7 +297,7 @@ test("a hostile translation cannot break out of the card's markup", () => {
     // passes on nothing and fails on the correct output.
     assert.doesNotMatch(html, /onload="/, `${what}: translation broke out of an attribute`);
     assert.ok(!html.includes(HOSTILE), `${what}: translation reached the DOM unescaped`);
-    assert.ok(!html.includes("<b>"), `${what}: translation injected an element`);
+    assert.ok(!html.includes("<script>"), `${what}: translation injected an element`);
   }
 });
 
@@ -271,15 +319,23 @@ test("the card's error paths translate their OWN text and pass the server's thro
   // `d.error` / `ack.message` is the orchestrator's reason, in English, and is not ours to
   // translate — but the fallback beside it is. Both halves must stay in that shape: a
   // `tr()` wrapped around the whole expression would translate nothing and lose the reason.
-  for (const [expr, key] of [
-    ['d.error || tr("panel.save_failed"', "panel.save_failed"],
-    ['d.error || tr("panel.clear_failed"', "panel.clear_failed"],
-    ['d.error || tr("panel.could_not_load"', "panel.could_not_load"],
-    ['ack.message || tr("panel.couldn_t_load_sign_in_status"', "panel.couldn_t_load_sign_in_status"],
-    ['ack.message || tr("panel.sign_in_failed"', "panel.sign_in_failed"],
-    ['ack.message || tr("panel.sign_out_failed"', "panel.sign_out_failed"],
+  //
+  // Matched as a SHAPE, not as an exact source substring. `d.error || tr("panel.save_failed"`
+  // as a literal breaks the moment a formatter wraps the line or someone writes `d?.error`,
+  // neither of which changes whether the server's reason still wins — a test that fails on
+  // reformatting teaches people to delete it.
+  for (const [source, key] of [
+    ["d.error", "panel.save_failed"],
+    ["d.error", "panel.clear_failed"],
+    ["d.error", "panel.could_not_load"],
+    ["ack.message", "panel.couldn_t_load_sign_in_status"],
+    ["ack.message", "panel.sign_in_failed"],
+    ["ack.message", "panel.sign_out_failed"],
   ]) {
-    assert.ok(BODY.includes(expr), `${key} must keep the server's own reason ahead of the translated fallback`);
+    const shape = new RegExp(
+      `${source.replace(".", "\\??\\.")}\\s*\\|\\|\\s*tr\\(\\s*"${key.replace(/\./g, "\\.")}"`,
+    );
+    assert.match(CODE, shape, `${key} must keep ${source} ahead of the translated fallback`);
   }
 });
 

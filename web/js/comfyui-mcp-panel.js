@@ -1042,7 +1042,7 @@ function cmcpOpenCredentialsFrame(client) {
     r.style.cssText = "margin-bottom:12px";
     r.innerHTML = `
       <label style="display:block;margin-bottom:4px">${esc2(s.label)}
-        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${s.set ? esc2(tr("panel.set", "set · ")) + esc2(s.masked || "") : esc2(tr("panel.not_set", "not set"))}</span></label>
+        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${esc2(s.set ? tr("panel.set", "set · ") + (s.masked || "") : tr("panel.not_set", "not set"))}</span></label>
       <div style="display:flex;gap:6px">
         <input type="password" autocomplete="off" data-input
                placeholder="${esc2(s.set ? tr("panel.set_type_to_replace", "•••• set — type to replace") : tr("panel.paste_key", "paste key"))}"
