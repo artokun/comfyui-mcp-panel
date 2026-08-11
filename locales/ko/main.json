@@ -65,8 +65,7 @@
       "workflows": "워크플로우"
     },
     "civitai": {
-      "civitai_download": "CivitAI 다운로드",
-      "pg_13": "PG-13"
+      "civitai_download": "CivitAI 다운로드"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager에 연결할 수 없습니다 (내장 Manager가 켜져 있나요?)"

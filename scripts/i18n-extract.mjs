@@ -82,11 +82,66 @@ function makeKey(file, text) {
   return `${fileSlug}.${textSlug || 'text'}`;
 }
 
+/**
+ * Read back an ALREADY-CONVERTED call site: `tr("key", "English")`, or the plural form
+ * `tr("key", { one: "…", other: "…" })`.
+ *
+ * This is the authoritative source once conversion has happened, and its absence was a real
+ * defect: the context patterns below anchor on the code PRECEDING a literal, so the moment a
+ * site becomes `.textContent = tr("panel.save", "Save")` nothing matches it any more. The
+ * extractor went from 264 candidates to 1, and regenerating English would have emptied a
+ * 247-key catalog and failed the gate with ~246 unknown-key errors in every language.
+ * Conversion has to be a round trip, not a one-way door.
+ */
+function readConverted(src, file) {
+  const out = [];
+  // `tr(` + a quoted key + `,` + either a quoted string or a `{ one: …, other: … }` object.
+  const call = /\btr\(\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*,\s*/g;
+  let m;
+  while ((m = call.exec(src)) !== null) {
+    const key = m[2];
+    const rest = src.slice(m.index + m[0].length);
+    const line = src.slice(0, m.index).split('\n').length;
+
+    const str = rest.match(/^(["'`])((?:\\.|(?!\1)[^\\])*)\1/);
+    if (str) {
+      out.push({ key, text: str[2], file, line, converted: true });
+      continue;
+    }
+    // Plural object: emit one candidate per category so English carries `key_one`/`key_other`.
+    if (rest.startsWith('{')) {
+      const close = rest.indexOf('}');
+      if (close === -1) continue;
+      const body = rest.slice(1, close);
+      const form = /(\w+)\s*:\s*(["'`])((?:\\.|(?!\2)[^\\])*)\2/g;
+      let f;
+      while ((f = form.exec(body)) !== null) {
+        if (!['zero', 'one', 'two', 'few', 'many', 'other'].includes(f[1])) continue;
+        out.push({ key: `${key}_${f[1]}`, text: f[3], file, line, converted: true });
+      }
+    }
+  }
+  return out;
+}
+
 const candidates = [];
 const seenKeys = new Map();
 
 for (const file of sources()) {
   const src = fs.readFileSync(file, 'utf8');
+  const rel = path.relative(ROOT, file).replace(/\\/g, '/');
+
+  // Converted sites first — they own their key, so a later proposal cannot rename them.
+  for (const c of readConverted(src, rel)) {
+    const prior = seenKeys.get(c.key);
+    if (prior !== undefined && prior !== c.text) {
+      console.error(`key "${c.key}" has two different English texts:\n  a: ${prior}\n  b: ${c.text}\n  (${c.file}:${c.line})`);
+      process.exitCode = 1;
+    }
+    seenKeys.set(c.key, c.text);
+    candidates.push(c);
+  }
+
   const lines = src.split('\n');
   lines.forEach((line, i) => {
     // Every quoted literal on the line, with the code that precedes it.
@@ -97,7 +152,13 @@ for (const file of sources()) {
       const before = line.slice(0, m.index);
       if (isProbablyNotProse(text)) continue;
       if (!UI_CONTEXT.some((rx) => rx.test(before))) continue;
-      if (/\$\{/.test(text)) continue; // template holes: convert by hand, they need vars
+      // A literal INSIDE a tr(...) call was already captured by readConverted above; catching
+      // it again here would propose a second, derived key for text that already has one.
+      if (/\btr\(\s*["'][^"']*["']\s*,\s*$/.test(before)) continue;
+      // `${…}` holes still need a human to choose the {var} names, so they are reported as
+      // candidates rather than skipped outright — silently dropping them is how a whole class
+      // of user-facing strings stayed English through the first pass.
+      const interpolated = /\$\{/.test(text);
       let key = makeKey(file, text);
       // Same text in the same file is one key; different text colliding gets a suffix.
       const prior = seenKeys.get(key);
@@ -107,7 +168,7 @@ for (const file of sources()) {
         key = `${key}_${n}`;
       }
       seenKeys.set(key, text);
-      candidates.push({ key, text, file: path.relative(ROOT, file).replace(/\\/g, '/'), line: i + 1 });
+      candidates.push({ key, text, file: rel, line: i + 1, interpolated });
     }
   });
 }

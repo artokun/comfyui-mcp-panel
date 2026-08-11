@@ -430,7 +430,7 @@ import {
   savedWorkflowRoute,
 } from "./lib/bridge-route.js";
 import {
-import { tr, LOCALES, loadCatalog, pickLocale } from "./lib/i18n.js";
+import { tr, LOCALES, loadCatalog, pickLocale, applyDirection } from "./lib/i18n.js";
   adoptRebootRuns,
   decodeRebootMarker,
   isRealBridgeDrop,
@@ -19152,6 +19152,11 @@ function buildPanel() {
   // workflow switch that re-mounts the sidebar), not only to one that is open
   // when the slider moves. Read it here, at the one place a root is created.
   applyPanelUiScale(getSetting(SETTING_UI_SCALE), root);
+  // Same reasoning as the scale above, for text direction: Arabic and Persian ship in the
+  // language dropdown, so a root that mounts in one of them has to lay out right-to-left.
+  // Scoped to OUR root on purpose — setting `dir` on documentElement would re-lay-out
+  // ComfyUI's canvas and every other extension's UI, which is not ours to do.
+  applyDirection(root);
   // A2UI seam (forward-compat, see spec): the chat surface width is a SINGLE piece
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.

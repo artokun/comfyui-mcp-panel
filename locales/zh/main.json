@@ -65,8 +65,7 @@
       "workflows": "工作流"
     },
     "civitai": {
-      "civitai_download": "CivitAI 下载",
-      "pg_13": "PG-13"
+      "civitai_download": "CivitAI 下载"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "无法连接 ComfyUI-Manager（内置管理器是否已启用？）"

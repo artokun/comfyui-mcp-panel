@@ -65,8 +65,7 @@
       "workflows": "Workflows"
     },
     "civitai": {
-      "civitai_download": "CivitAI download",
-      "pg_13": "PG-13"
+      "civitai_download": "CivitAI download"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager not reachable (is the built-in Manager enabled?)"
