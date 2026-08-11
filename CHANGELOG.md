@@ -6,6 +6,37 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.99] - 2026-08-10
+
+> After a Save-As, graph tools could keep refusing even for an agent that did exactly what
+> the reply told it to do. The reply said to re-target to the new workflow, and that clears
+> one guard — but ComfyUI activates the saved copy without repainting the canvas, so the
+> canvas is still showing the workflow you saved FROM. The second guard then refuses,
+> correctly, and nothing said why.
+
+### Fixed
+- a Save-As reply now says that no canvas repaint was requested, and that re-targeting may
+  therefore not be enough for graph tools: if a graph command is then refused for a
+  root-workflow-uuid mismatch, that is the reason, and opening the saved workflow is what
+  brings it onto the canvas (#978).
+- the warning is stated conditionally rather than asserted, because a tab switch or a
+  reconnect can repaint during the save — the panel knows the save did not ask for a
+  repaint, not what the canvas holds by the time the reply is read.
+- a FIRST save of an unsaved workflow no longer gets any of that: it keeps the same
+  identity, nothing is about to be refused, and telling that caller to re-target and
+  re-open would have sent them fixing a problem they do not have.
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
 ## [0.11.98] - 2026-08-10
 
 > A widget write could be refused for "object_info is unavailable — the backend is
