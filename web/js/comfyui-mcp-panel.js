@@ -5911,6 +5911,47 @@ function assertGraphBoundToActiveWorkflow(
  * with a single-use marker carried in the SAME payload `extra` as the uuid
  * instead, which makes any repair unnecessary — see binding-recovery.test.mjs.
  */
+/**
+ * #978 — after a SAVE-AS, put the produced workflow's identity on the live root.
+ *
+ * The save publishes the new identity in its reply (#747/#941), so a caller can re-stamp
+ * its command fence. But the ROOT GRAPH keeps whatever tag it had before the save, and
+ * `assertGraphBoundToActiveWorkflow` compares the root's tag against the ACTIVE
+ * workflow's uuid — so every graph tool is refused for a root-workflow-uuid mismatch
+ * until something heals it. That is the reporter's second symptom: `panel_graph_outline`
+ * and `panel_get_errors` rejected right after a successful Save-As.
+ *
+ * The existing heal is the fence's own content proof, and a Save-As is exactly the case
+ * it cannot serve: the ORIGINAL workflow is still open holding byte-identical content, so
+ * the proof is not EXCLUSIVE and correctly declines. Waiting for the user to close the
+ * source tab is not a remedy.
+ *
+ * WHAT LICENSES THE STAMP HERE IS CAUSATION, NOT COMPARISON. This runs inside the save
+ * that produced the record, and the root it stamps is the graph that save just serialized
+ * — the same reasoning `workflow_new` uses for a canvas it just created, and stronger
+ * than the content equality the fence has to fall back on. It is still gated on the
+ * produced record being the workflow that is active NOW: the save awaits, and a tab
+ * switch during them would make this a different canvas, which must never be stamped
+ * with the saved workflow's identity.
+ */
+function stampRootForProducedSave(producedRecord, identity) {
+  try {
+    const uuid = identity?.uuid;
+    if (!uuid || !producedRecord || typeof producedRecord !== "object") return false;
+    const active = activeWorkflowRef();
+    // Proxy-safe, like every other workflow-object comparison here (#558 r2).
+    if (!active || !sameWorkflowObject(active, producedRecord)) return false;
+    const rootGraph = app?.graph;
+    if (!rootGraph) return false;
+    stampGraphRootWorkflowUuid(rootGraph, uuid, producedRecord);
+    return true;
+  } catch {
+    // Identity bookkeeping must never turn a save that already wrote the file into a
+    // failure. An unstamped root keeps the pre-existing refusal and its remedies.
+    return false;
+  }
+}
+
 function stampGraphRootWorkflowUuid(rootGraph, uuid, ownerWorkflow) {
   const extra =
     rootGraph.extra && typeof rootGraph.extra === "object" ? rootGraph.extra : (rootGraph.extra = {});
@@ -11994,6 +12035,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // workflow; saves in place otherwise.
     const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
     const replyIdentity = saveProducedIdentity(producedRecord, !!outcome.saved_as);
+    // #978 — a Save-As leaves the PRE-SAVE tag on the live root, and the graph fence
+    // compares that tag against the now-active workflow, so every graph tool is refused
+    // until something heals it. Heal it here, where the save's own causation licenses the
+    // stamp. An in-place save does not change which workflow is active, so it needs none.
+    if (outcome.saved_as) stampRootForProducedSave(producedRecord, replyIdentity);
     // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
     // first_save) so a rename-vs-copy is never silent (mcp#579).
     //
@@ -12018,6 +12064,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
     const replyIdentity = saveProducedIdentity(producedRecord, true);
+    // #978 — this path ALWAYS changes which workflow is active, so the root always needs
+    // the produced identity put on it.
+    stampRootForProducedSave(producedRecord, replyIdentity);
     return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: true }) };
   },
 
