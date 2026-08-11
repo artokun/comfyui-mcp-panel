@@ -708,6 +708,41 @@ test("#695: a union registered under its own key in the widget registry is a wid
   assert.deepEqual(unavailableRequiredWidgetReport(def, { "IMAGE,MASK": () => {} }, new Set(), def), []);
 });
 
+test("#695/#1062: a socket-shaped union hiding an unproven CUSTOM member stays blocked", () => {
+  // Recast (codex) to state the invariant this protects, rather than an incidental reading
+  // of a file-format union — which is what made #1062 look like an oversight when it is an
+  // intentional false negative.
+  //
+  // THE INVARIANT: a proven socket member must not LAUNDER an unregistered,
+  // output-unproven custom member into an accepted node. An EMPTY config makes it concrete,
+  // because `{}` counts as socket-shaped — so `socketDeclared` contains the union and the
+  // input-level bar cannot catch it. Only requiring EVERY member to be proven does.
+  //
+  // This is why #1062's one-word `every` -> `some` is unsafe: `MESH` alone would admit the
+  // node below and silently skip a widget that never registered (#580's false accept).
+  const custom = { input: { required: { thing: ["MESH,ZIPN_STYLE_GALLERY", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["MESH"]), custom),
+    ["MESH,ZIPN_STYLE_GALLERY"],
+    "a proven MESH does not vouch for an unregistered custom member",
+  );
+  // Either proof clears it: a constructor registered under the exact union key...
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(
+      custom,
+      { "MESH,ZIPN_STYLE_GALLERY": () => {} },
+      new Set(["MESH"]),
+      custom,
+    ),
+    [],
+  );
+  // ...or output proof for EVERY member.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["MESH", "ZIPN_STYLE_GALLERY"]), custom),
+    [],
+  );
+});
+
 test("#695: a union with ONE unproven member still fails closed", () => {
   // SaveGaussianSplat.model_3d = FILE_3D_SPLAT_ANY,FILE_3D_PLY,… — proving some members
   // is not proving the type, so the guard is not weakened into "any member counts".
