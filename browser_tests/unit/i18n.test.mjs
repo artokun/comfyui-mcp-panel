@@ -258,8 +258,30 @@ test("module-scope config reads translations LAZILY, not at import time", () => 
       [],
       `${name} in ${f} evaluates tr() at import time. Use \`get <field>() { return tr(...) }\``,
     );
-    // And it must actually be using the getter form — otherwise a block that simply stopped
-    // translating would pass the check above by having no tr() at all.
+    // And every display field must be a getter — not merely SOME of them.
+    //
+    // Asserting a single `get x() { return tr(` match was blind: reverting 5 of 6 entries to
+    // bare English still left one getter, so the guard passed. The round-trip guard caught
+    // that revert only because orphaned catalog keys remained — and in the merge flow English
+    // is regenerated in the same step, which removes the orphans and leaves nothing to notice.
+    // So this checks the shape that cannot be partially satisfied: NO bare display literal.
+    // Per-FIELD consistency, not blanket coverage. A field nobody has converted yet (`desc:`
+    // before its unit lands) is untranslated work, not a defect. A field converted in SOME
+    // entries and bare in others is the partial-revert bug — and that is the shape a
+    // single-match assertion cannot see.
+    const FIELDS = ["label", "title", "note", "hint", "desc", "text", "summary"];
+    for (const field of FIELDS) {
+      const lazy = new RegExp(`get ${field}\\(\\) \\{ return tr\\(`, "g");
+      const bare = new RegExp(`\\b${field}\\s*:\\s*["'\`]`, "g");
+      const lazyCount = (block.match(lazy) || []).length;
+      const bareCount = (block.match(bare) || []).length;
+      if (lazyCount > 0 && bareCount > 0) {
+        assert.fail(
+          `${name} in ${f}: \`${field}\` is a getter in ${lazyCount} entr${lazyCount === 1 ? "y" : "ies"} but a bare ` +
+            `literal in ${bareCount} — those ${bareCount} are frozen to English at import. Convert all or none.`,
+        );
+      }
+    }
     assert.match(block, /get \w+\(\) \{ return tr\(/, `${name} in ${f} should read translations via getters`);
   }
 });
