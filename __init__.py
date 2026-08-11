@@ -32,6 +32,7 @@ Env knobs:
 - ``COMFYUI_URL`` — the ComfyUI the agent targets (auto-detected otherwise).
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -496,13 +497,15 @@ def _install_no_cache_middleware(web):
     @web.middleware
     async def _revalidate_panel_assets(request, handler):
         response = await handler(request)
-        try:
+        # contextlib.suppress rather than try/except/pass: identical behaviour, and the
+        # Comfy Registry's Bandit parity scan flags the bare form (B110). A header must
+        # never break a response — an already-prepared streaming response, for instance,
+        # can refuse a late header — so the failure mode here is 'no header', never 'no page'.
+        with contextlib.suppress(Exception):
             if request.path.startswith(_ASSET_PREFIX):
                 # Never overwrite a header the host set deliberately.
                 if not response.headers.get("Cache-Control"):
                     response.headers["Cache-Control"] = "no-store"
-        except Exception:  # pragma: no cover - a header must never break a response
-            pass
         return response
 
     try:
