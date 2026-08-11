@@ -22828,7 +22828,79 @@ function buildPanel() {
 
     log.appendChild(card);
     scrollLog();
+    // #952 — REGISTER THE CARD AGAINST THE CONNECTION THAT PAINTED IT. A reply of this
+    // kind is deliberately not replayed across a reconnect, so once this connection is
+    // replaced the card cannot deliver an answer to anyone — while still looking exactly
+    // as clickable as a newer card asking the same thing. The orchestrator's own message
+    // has to warn "the user may see two … tell them which one to answer"; the panel is
+    // the side that can just say it.
+    const unregister = registerInteractiveCard({
+      retire: () =>
+        retireInteractiveCard(card, {
+          alreadyAnswered: () => done,
+          what: "question",
+        }),
+    });
+    promise.then(unregister, unregister);
     return promise;
+  }
+
+  /**
+   * #952 — cards painted on a connection that has since been replaced.
+   *
+   * `bridgeConnectSeq` counts CONNECTS, not status changes: a card records the value at
+   * paint time, and a later connect retires everything painted before it. That is a
+   * positive fact — a new connection exists — rather than an inference from a transient
+   * "connecting" blip, and it needs no bridge epoch plumbed into the UI.
+   *
+   * Deliberately NOT resolving the card's promise. The command that painted it already
+   * failed with an unknown outcome on the socket that dropped; resolving here would send
+   * an answer nowhere, and the panel's own rule is that a reply of this kind does not
+   * cross a reconnect. The card stops LOOKING answerable, and says why.
+   */
+  let bridgeConnectSeq = 0;
+  const liveInteractiveCards = new Set();
+
+  function registerInteractiveCard(entry) {
+    const record = { paintedOnConnect: bridgeConnectSeq, ...entry };
+    liveInteractiveCards.add(record);
+    return () => liveInteractiveCards.delete(record);
+  }
+
+  function retireInteractiveCardsFromPreviousConnections() {
+    for (const record of [...liveInteractiveCards]) {
+      if (record.paintedOnConnect >= bridgeConnectSeq) continue;
+      liveInteractiveCards.delete(record);
+      try {
+        record.retire?.();
+      } catch {
+        // A card that cannot be retired is left exactly as it was — never a thrown
+        // error out of a connection callback.
+      }
+    }
+  }
+
+  /** Turn a live interactive card into a dead one: no controls, and a reason. */
+  function retireInteractiveCard(card, { alreadyAnswered, what } = {}) {
+    try {
+      if (typeof alreadyAnswered === "function" && alreadyAnswered()) return;
+      if (!card || !card.isConnected) return;
+      for (const el of card.querySelectorAll("button, input, textarea, select")) {
+        el.disabled = true;
+        el.style.opacity = "0.5";
+        el.style.cursor = "not-allowed";
+      }
+      card.style.opacity = "0.6";
+      const note = document.createElement("div");
+      note.className = "cmcp-card-stale";
+      note.style.cssText = "font-size:0.68rem;opacity:0.8;margin-top:0.4rem;";
+      note.textContent =
+        `The connection that asked this ${what ?? "question"} dropped, so an answer here can no ` +
+        `longer reach the agent. If it asked again, answer the newer card.`;
+      card.appendChild(note);
+    } catch {
+      /* presentation only — never break a reconnect */
+    }
   }
 
   /**
@@ -24569,6 +24641,14 @@ function buildPanel() {
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
+      // #952 — a CONNECT retires interactive cards painted on an earlier connection.
+      // Counting connects rather than reacting to "connecting"/"disconnected" keeps this
+      // on a positive fact: a new connection exists, so anything asked on the previous one
+      // can no longer deliver an answer.
+      if (state === "connected") {
+        bridgeConnectSeq += 1;
+        retireInteractiveCardsFromPreviousConnections();
+      }
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       // Connection status does NOT drive this box's visibility. It's a
       // dropdown: the user opens it and the user closes it (trigger, click
