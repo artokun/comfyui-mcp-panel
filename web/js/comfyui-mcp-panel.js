@@ -176,6 +176,7 @@ import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -3370,6 +3371,17 @@ function comfyuiUrlForConnect() {
 // (window.location) — so the agent auto-targets whatever ComfyUI is open (local or
 // a RunPod proxy) with zero config. The orchestrator retargets to it and decides
 // local vs remote mode from the host, so a bare `--panel-orchestrator` just works.
+// #1006 — the origin the page's own `api` client talks to, which is the one that
+// answers a /object_info fetch made through it. Deliberately NOT the Remote-URL
+// override: that is what the orchestrator should target, not a claim about who served
+// a request the browser already made.
+function pageComfyOrigin() {
+  try {
+    return window.location.origin || null;
+  } catch {
+    return null;
+  }
+}
 function comfyuiUrlForAgent() {
   const override = remoteUrlSetting();
   if (override) return override;
@@ -8227,6 +8239,70 @@ const GRAPH_TOOL_EXECUTORS = {
     const { rootGraph } = getGraphCtx();
     const workflow = rootGraph.serialize();
     return { workflow, node_count: workflow?.nodes?.length ?? 0 };
+  },
+
+  // #1006 — THIS TAB'S OWN ComfyUI node definitions.
+  //
+  // Anything that pairs a panel-captured graph with node definitions reads the graph
+  // from the connected panel and the definitions from the orchestrator's global client,
+  // which resolves COMFYUI_URL. Same machine locally; TWO machines for a remote panel —
+  // so a remote panel cannot convert its own live canvas at all.
+  //
+  // Fetching the tab's observed origin from the orchestrator instead was considered and
+  // rejected on the issue: in a tunnel or loopback-only topology the BROWSER is the only
+  // thing that can reach that ComfyUI, so it trades one silent failure for a narrower
+  // one — and it adds an outbound fetch to an origin the connected tab chose. The
+  // browser is by definition able to reach this host: it is already talking to it.
+  //
+  // `if_none_match` is how this stays affordable. The payload is large (4183 types on
+  // the install this was written against), so a caller passes back the fingerprint it
+  // holds and gets `unchanged: true` with no payload when the TYPE SET still matches.
+  // What that does and does not establish is stated in the reply, not implied.
+  async graph_get_object_info({ if_none_match } = {}) {
+    const { defs, failures } = await fetchWholeObjectInfo({
+      getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+      fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+    });
+    // THE ORIGIN THAT ACTUALLY ANSWERED (codex). `comfyuiUrlForAgent()` prefers a
+    // user-set Remote-URL override, but this fetch goes through the page's own `api`
+    // client — so on an install where those differ, reporting the override would
+    // attribute the schema to a host that served nothing.
+    const served_by = pageComfyOrigin();
+    if (!defs) {
+      // FAIL CLOSED and say what was tried. A conversion that proceeds on a missing
+      // schema produces a wrong answer, so this never returns a partial map.
+      return {
+        ok: false,
+        served_by,
+        reason: "object_info_unavailable",
+        detail:
+          "This panel could not obtain a usable /object_info from the ComfyUI it is " +
+          "connected to." + objectInfoOracleFailureNote(failures),
+      };
+    }
+    const fingerprint = objectInfoFingerprint(defs);
+    if (objectInfoUnchanged(if_none_match, fingerprint)) {
+      return {
+        ok: true,
+        served_by,
+        unchanged: true,
+        fingerprint,
+        node_type_count: Object.keys(defs).length,
+        note:
+          "The TYPE SET is unchanged since the fingerprint you passed, so the payload is " +
+          "omitted. That does not establish that individual definitions are identical — a " +
+          "combo list, a widget name or a new input on an existing node can change without " +
+          "changing which types exist. Re-read without if_none_match if you need those " +
+          "(#1006).",
+      };
+    }
+    return {
+      ok: true,
+      served_by,
+      fingerprint,
+      node_type_count: Object.keys(defs).length,
+      object_info: defs,
+    };
   },
 
   graph_get_state() {
