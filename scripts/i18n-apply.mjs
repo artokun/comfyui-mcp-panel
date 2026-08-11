@@ -81,9 +81,16 @@ for (const [file, items] of [...byFile.entries()].sort()) {
     // Add the import if this file does not already have one.
     if (!lines.some((l) => /from ["'].*lib\/i18n\.js["']/.test(l))) {
       const spec = importPathFor(file);
-      const lastImport = lines.reduce((acc, l, i) => (/^import\s/.test(l) ? i : acc), -1);
       const stmt = `import { tr } from "${spec}";`;
-      if (lastImport >= 0) lines.splice(lastImport + 1, 0, stmt);
+      // Insert BEFORE the first import, never after "the last line starting with import".
+      // That heuristic shipped a P0: a multi-line `import {\n  a,\n  b,\n} from "x"` has its
+      // opening line match `/^import\s/`, so the new statement landed INSIDE the specifier
+      // list and the whole panel became a SyntaxError — no chat, no tools, no settings, in
+      // every language. `node --check foo.js` parses as CommonJS and reported OK throughout;
+      // only checking it as a MODULE reveals it. Inserting before the first import is
+      // position-independent and cannot land inside anything.
+      const firstImport = lines.findIndex((l) => /^import\s/.test(l));
+      if (firstImport >= 0) lines.splice(firstImport, 0, stmt);
       else {
         // No imports yet: place it after the leading block comment so the file's
         // explanatory header stays at the top where readers expect it.

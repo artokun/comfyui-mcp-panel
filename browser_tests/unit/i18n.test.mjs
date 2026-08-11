@@ -8,7 +8,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -147,6 +148,39 @@ test("no fallback is concatenated with a variable instead of using a {placeholde
     [],
     'use tr("key", "… {name} …", { name }) so translators can move the value',
   );
+});
+
+test("every panel source parses AS AN ES MODULE, not just as a script", () => {
+  // This is the check that was missing, and its absence shipped a P0: the i18n import was
+  // spliced INSIDE a multi-line import's specifier list, making the whole panel a
+  // SyntaxError — nothing constructed, in every language including English.
+  //
+  // `node --check foo.js` reports OK on that file, because a bare .js is parsed as CommonJS
+  // where `import` is merely an identifier. The panel is served as type="module". So the
+  // check has to run against a .mjs copy, or it is not checking what the browser does.
+  const files = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (e.name !== "vendor") walk(`${dir}/${e.name}`);
+      } else if (e.name.endsWith(".js")) files.push(`${dir}/${e.name}`);
+    }
+  };
+  walk("web/js");
+  assert.ok(files.length > 5, "expected to find the panel sources");
+
+  const tmp = join(tmpdir(), `cmcp-modcheck-${process.pid}.mjs`);
+  const broken = [];
+  for (const f of files) {
+    writeFileSync(tmp, readFileSync(join(ROOT, f), "utf8"));
+    try {
+      execFileSync("node", ["--check", tmp], { stdio: "pipe" });
+    } catch (e) {
+      broken.push(`${f}: ${String(e.stderr || e).split("\n").find((l) => l.includes("Error")) || "parse failed"}`);
+    }
+  }
+  rmSync(tmp, { force: true });
+  assert.deepEqual(broken, [], "these do not parse as ES modules — the browser will not load them");
 });
 
 test("no tr() call site is invisible to the extractor", () => {

@@ -429,8 +429,8 @@ import {
   savedWorkflowHandle,
   savedWorkflowRoute,
 } from "./lib/bridge-route.js";
-import {
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection } from "./lib/i18n.js";
+import {
   adoptRebootRuns,
   decodeRebootMarker,
   isRealBridgeDrop,
