@@ -13200,32 +13200,31 @@ const GRAPH_TOOL_EXECUTORS = {
           //               is the already-current case #874 was written for, and it captures
           //               exactly as it always did.
           //   "foreign" — the root positively belongs to another workflow. Skip.
-          //   "unknown" — no usable tag. Fall back to node IDENTITY, the same comparison
-          //               the divergence disclosure uses: a canvas sharing ids with this
-          //               target's own state is this target's canvas. Incremental editing
-          //               keeps most ids, so overlap is strong evidence of ownership.
+          //   "unknown" — cannot tell. CAPTURES, exactly as it does today.
           //
-          // `comparable:false` (either side empty) is NOT ownership, so it skips: an empty
-          // target with a populated canvas is precisely the reproduction — the empty tab
-          // came back holding the other workflow's seven nodes.
+          // "unknown" deliberately changes NOTHING, which is the same discipline #708
+          // already applies with this oracle: only a POSITIVE, durable identity conflict
+          // refuses, so older frontends and a first observation behave as they always have.
+          // This fix therefore closes the provable case and introduces no regression
+          // anywhere else — it can only ever REMOVE a capture proven to be reading another
+          // workflow's canvas.
           //
-          // KNOWN RESIDUAL, stated rather than hidden: an untagged root whose ids have
-          // ALL turned over — clearing a tab and rebuilding it from scratch before saving —
-          // reads as unowned, so its capture is skipped and the repaint restores the older
-          // state. That needs no tag AND a total id turnover AND an unsaved rebuild, and it
-          // is the same shape the divergence helper documents as indistinguishable. The
-          // alternative is keeping a capture that writes a foreign graph into the tab.
+          // I tried to do better and the attempt was unsound, so it is recorded here rather
+          // than repeated: falling back to node-id OVERLAP against the target's own state
+          // (via canvasFileDivergence) looks like ownership evidence and is not. ComfyUI
+          // assigns node ids as small integers from 1, so any two non-trivial graphs share
+          // ids 1..n — overlap would have answered "yours" for almost every foreign canvas,
+          // making the fallback worse than useless. That helper is built for the opposite
+          // reading (DISJOINT is suspicious) and its own header warns that a refusal built
+          // on it would be a wrong-graph refusal of its own (codex).
+          //
+          // KNOWN RESIDUAL, stated rather than hidden: an UNTAGGED root graph is still
+          // captured, so the contamination remains reachable on a canvas the panel has
+          // never stamped. Closing that needs ownership evidence that does not exist yet —
+          // not a guess dressed as one — and the reported cases are saved, panel-driven
+          // workflows whose roots carry the tag, which is the case this does close.
           const captureBinding = describeLiveCanvasBinding(target);
-          let canvasIsTargets = captureBinding === "bound";
-          if (captureBinding === "unknown") {
-            const targetState = target.changeTracker?.activeState ?? target.activeState;
-            const overlap = canvasFileDivergence({
-              diskNodes: targetState?.nodes,
-              canvasNodes: app?.graph?._nodes ?? app?.graph?.nodes,
-            });
-            canvasIsTargets = overlap.comparable && !overlap.disjoint;
-          }
-          if (canvasIsTargets) {
+          if (captureBinding !== "foreign") {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
               // otherwise have `activeState` read before the capture landed — the silent
