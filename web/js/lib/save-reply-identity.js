@@ -57,10 +57,25 @@ export function saveReplyIdentity(identity, { savedAs = false } = {}) {
     ...(savedAs
       ? {
           workflow_instance_changed: true,
+          // #978 — RE-FENCING IS NOT ENOUGH, and saying only that stranded a reporter who
+          // did it correctly and was still refused. ComfyUI's own store moves the active
+          // pointer without repainting: `workflowStore.openWorkflow` does not call
+          // `loadGraphData` (only `workflowService.openWorkflow` does), so after a Save-As
+          // the CANVAS still holds the SOURCE workflow's graph while the COPY is active.
+          // The graph fence compares the live root's identity against the active
+          // workflow's and refuses — correctly, because the canvas really is the other
+          // workflow's. The remedy is to bring the copy onto the canvas, which is what
+          // `panel_open_workflow` does.
+          canvas_not_repainted: true,
           workflow_instance_note:
-            "Save-As made a DIFFERENT workflow active. A session still fenced to the " +
+            "Save-As made a DIFFERENT workflow active, so a session still fenced to the " +
             "previous instance will have every following command refused with \"workflow " +
-            "instance mismatch\" — re-fence it to the workflow_uuid reported here.",
+            "instance mismatch\" — re-fence it to the workflow_uuid reported here. That " +
+            "alone is not enough for GRAPH tools: the copy is active but the CANVAS was " +
+            "not repainted, so it still holds the source workflow's graph, and a graph " +
+            "command is refused for a root-workflow-uuid mismatch. Open the saved " +
+            "workflow (panel_open_workflow) to put it on the canvas before reading or " +
+            "editing the graph (#978).",
         }
       : {}),
   };
