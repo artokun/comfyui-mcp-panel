@@ -213,6 +213,17 @@ export async function groundingIsSafe(wf, existsOnDisk) {
   if (typeof existsOnDisk !== "function") return false; // no oracle ⇒ cannot prove ⇒ refuse
   const raw = wf.path;
   if (!raw) return false; // pathless ⇒ cannot probe ⇒ refuse (do not blanket-approve)
+  // #1066 — a URL-DERIVED path is a proven absence BY CONSTRUCTION, so it does not need the
+  // oracle (which cannot answer for it anyway: the probe is not a valid store path, so the
+  // result is `unknown` and the save is refused — every name, forever, which is what the
+  // reporter hit).
+  //
+  // The proof: /userdata stores RELATIVE `workflows/…` paths. A path carrying `://` cannot
+  // be one, so no backing file can exist at it — and therefore there is no original for
+  // grounding to overwrite or move, which is the entire #226 hazard this refusal exists to
+  // prevent. This is placed AFTER the `isPersisted === true` check, so a workflow the
+  // frontend considers genuinely saved is still never auto-grounded on this route.
+  if (isUrlDerivedWorkflowPath(raw)) return true;
   let exists = null;
   try {
     exists = await existsOnDisk(raw);
