@@ -429,7 +429,7 @@ import {
   savedWorkflowHandle,
   savedWorkflowRoute,
 } from "./lib/bridge-route.js";
-import { tr, LOCALES, loadCatalog, pickLocale, applyDirection } from "./lib/i18n.js";
+import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -3088,6 +3088,25 @@ const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ant
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
+// The BUTTON label for each token row, one translation key PER ROW.
+//
+// Not one interpolated `"Set {friendly} {noun}…"`: `friendly` and `noun` are English
+// constants from the call sites ("Custom endpoint", "API key"), so an interpolated label
+// would splice English fragments into a translated sentence and could never agree with the
+// fully translated row NAME that ComfyUI paints directly above it out of
+// locales/<lang>/settings.json. Written out so each key is greppable from the catalog too.
+//
+// Keyed by setting id, via COMPUTED keys off the SETTING_* constants rather than repeated
+// id literals — a typo'd literal would not throw, it would just never match and quietly
+// render English forever. The caller falls back to the English default, so adding a token
+// row without a label here degrades to English rather than rendering a blank button.
+const TOKEN_BUTTON_LABEL = {
+  [SETTING_TOKEN_OPENROUTER]: () => tr("panel.set_openrouter_api_key", "Set OpenRouter API key…"),
+  [SETTING_TOKEN_CUSTOM]: () => tr("panel.set_custom_endpoint_api_key", "Set Custom endpoint API key…"),
+  [SETTING_TOKEN_CIVITAI]: () => tr("panel.set_civitai_token", "Set CivitAI token…"),
+  [SETTING_TOKEN_HF]: () => tr("panel.set_huggingface_token", "Set HuggingFace token…"),
+};
+
 // Hooks the OPEN panel registers so the Settings dialog can drive the running
 // panel live. Null when no panel is mounted (settings still persist via ComfyUI;
 // buildPanel re-seeds from them on the next open). Every applier is idempotent
@@ -3426,6 +3445,25 @@ function localComfyuiPathForAgent() {
 
 // Build the settings list registered on the extension. Defined as a function so
 // it can close over the module-level hooks/helpers above.
+//
+// TRANSLATION — DO NOT WRAP `name:` / `tooltip:` IN tr().
+//
+// These rows are painted by ComfyUI's OWN Settings dialog, and SettingItem.vue looks each
+// row up as `settings.<id>.name` / `settings.<id>.tooltip` in the merged /i18n catalog —
+// where <id> is the setting id with DOTS replaced by underscores and hyphens PRESERVED
+// (`normalizeI18nKey`, verified against ComfyUI's own shipped `Comfy-Desktop_AutoUpdate`).
+// So `comfyui-mcp.defaultModel.claude` is translated by adding
+// `comfyui-mcp_defaultModel_claude` to locales/<lang>/settings.json — zero JavaScript.
+//
+// tr() here would be actively WRONG, not merely redundant: panelSettingsList() is
+// evaluated as an argument to app.registerExtension, which runs BEFORE setup() awaits the
+// catalog, so every tr() in this list resolves against an EMPTY catalog and freezes the
+// English fallback for the session. Text built inside a `type: () => …` render fn is the
+// opposite case — the fn runs when the dialog opens, the catalog is loaded by then, and
+// ComfyUI never looks at that text — so those DO use tr().
+//
+// The interpolated tooltips below (per-provider model/effort/token) therefore need one
+// fully-written literal per id in settings.json; ComfyUI's lookup has no placeholders.
 function panelSettingsList() {
   const cat = (sub, name) => ["Comfy MCP Agent", sub, name];
   // A BUTTON-type setting: ComfyUI supports a custom `type` render function that
@@ -3436,8 +3474,13 @@ function panelSettingsList() {
     name: `${friendly} ${noun}`,
     category: cat(section, friendly),
     sortOrder,
+    // `noun` is "token" for the two rows whose credential is called a token, and "API key"
+    // for the two whose credential is called a key — so the key rows already carry "API"
+    // and a hardcoded one in front produced "your OpenRouter API API key". Prefixed only
+    // when it is missing, which keeps "your CivitAI API token" reading right.
     tooltip:
-      `Securely store your ${friendly} API ${noun}. Opens a masked input; the value goes straight to the ` +
+      `Securely store your ${friendly} ${noun.startsWith("API") ? noun : `API ${noun}`}. ` +
+      `Opens a masked input; the value goes straight to the ` +
       `orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, ` +
       `or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready).`,
     type: () => {
@@ -3446,7 +3489,12 @@ function panelSettingsList() {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "p-button p-component";
-      btn.textContent = `Set ${friendly} ${noun}…`;
+      // tr(), unlike the `name:`/`tooltip:` above — text built INSIDE a render fn never
+      // passes through ComfyUI's settings lookup, so settings.json cannot reach it. Safe
+      // to translate here because the fn runs when the dialog opens, long after setup()
+      // awaited the catalog; the sibling `tooltip:` is evaluated at REGISTRATION, which is
+      // why that one must stay a plain literal.
+      btn.textContent = TOKEN_BUTTON_LABEL[id]?.() ?? `Set ${friendly} ${noun}…`;
       btn.style.cssText =
         "padding:0.3rem 0.7rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
         "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:0.8rem;white-space:nowrap;";
@@ -3456,9 +3504,16 @@ function panelSettingsList() {
         const at = lsGet(SECRET_SET_AT_PREFIX + envKey);
         if (at) {
           const d = new Date(Number(at));
+          // BOTH arms translated: the date-less arm is the same sentence with the one
+          // fact missing, so leaving it English would show a language seam exactly when
+          // the stored timestamp is unreadable.
+          //
+          // And the date is formatted in the PANEL's locale, not the browser's. Translating
+          // the sentence around it is what creates the need: a Korean panel in an en-US
+          // browser would otherwise read "🔒 8/10/2026 설정됨", half in each locale.
           status.textContent = Number.isFinite(d.getTime())
-            ? `🔒 set ${d.toLocaleDateString()}`
-            : "🔒 set";
+            ? tr("panel.locked_set_on", "🔒 set {date}", { date: d.toLocaleDateString(currentLocale()) })
+            : tr("panel.locked_set", "🔒 set");
           status.style.color = "var(--p-green-400,#4ade80)";
         } else {
           status.textContent = tr("panel.not_set", "not set");
@@ -3616,7 +3671,9 @@ function panelSettingsList() {
       type: () => {
         const b = document.createElement("button");
         b.type = "button";
-        b.textContent = `📋 Show what's new in ${PANEL_VERSION}`;
+        b.textContent = tr("panel.show_whats_new_in_version", "📋 Show what's new in {version}", {
+          version: PANEL_VERSION,
+        });
         b.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3674,7 +3731,20 @@ function panelSettingsList() {
       name: "Community",
       category: cat("About", "Community"),
       sortOrder: 199,
-      tooltip: tr("panel.join_the_comfyui_mcp_discord_announcements_tips", "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab."),
+      // A PLAIN literal, deliberately — every other `name:`/`tooltip:` in this list is
+      // translated by ComfyUI itself out of locales/<lang>/settings.json (it looks up
+      // `settings.comfyui-mcp_joinDiscord.tooltip`), with no JS involved. Wrapping this
+      // one in tr() routed it through OUR catalog instead, so the same row's name and
+      // tooltip came from two different files — and the tr() value would be resolved once
+      // at registration, before the catalog has loaded, which is why the mechanism has to
+      // stay uniform rather than merely consistent-looking.
+      //
+      // KEEP THE STRING ON ITS OWN LINE. scripts/i18n-extract.mjs proposes any literal
+      // preceded by `tooltip:` on the SAME line, so `tooltip: "…"` would be re-proposed
+      // and `i18n-apply --write` would silently re-wrap it in tr() — exactly the mis-route
+      // being removed here. Every other tooltip in this list escapes for the same reason.
+      tooltip:
+        "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab.",
       type: () => {
         const a = document.createElement("a");
         a.href = DISCORD_INVITE_URL;
@@ -3904,9 +3974,11 @@ function panelSettingsList() {
         const wrap = document.createElement("div");
         wrap.style.cssText = "display:flex;flex-direction:column;gap:0.4rem;max-width:26rem;";
         const note = document.createElement("div");
-        note.textContent =
+        note.textContent = tr(
+          "panel.beta_the_app_changes_rapidly_and_builds",
           "⚠️ Beta — the app changes rapidly and builds may break between updates. " +
-          "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.";
+            "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
+        );
         note.style.cssText = "font-size:0.75rem;opacity:0.75;line-height:1.35;";
         const row = document.createElement("div");
         row.style.cssText = "display:flex;gap:0.5rem;flex-wrap:wrap;";
@@ -3922,7 +3994,10 @@ function panelSettingsList() {
             a.target = "_blank";
             a.rel = "noopener noreferrer";
           } else {
-            a.textContent += " — coming soon";
+            // Appended, not interpolated, so the label above stays one translatable unit
+            // per platform; a language that needs the marker elsewhere in the phrase can
+            // fold it into its own label text.
+            a.textContent += tr("panel.coming_soon", " — coming soon");
             a.style.opacity = "0.45";
             a.style.pointerEvents = "none";
             a.setAttribute("aria-disabled", "true");
@@ -3930,8 +4005,8 @@ function panelSettingsList() {
           return a;
         };
         row.append(
-          linkBtn("🍎 iOS — TestFlight", MOBILE_IOS_TESTFLIGHT_URL),
-          linkBtn("🤖 Android — Firebase beta", MOBILE_ANDROID_FIREBASE_URL),
+          linkBtn(tr("panel.ios_testflight", "🍎 iOS — TestFlight"), MOBILE_IOS_TESTFLIGHT_URL),
+          linkBtn(tr("panel.android_firebase_beta", "🤖 Android — Firebase beta"), MOBILE_ANDROID_FIREBASE_URL),
         );
         wrap.append(note, row);
         return wrap;
