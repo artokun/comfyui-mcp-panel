@@ -25,11 +25,17 @@ import { createLocalContent } from "./cmcp-runpod-ui.js";
 import { tr } from "./lib/i18n.js";
 
 // key → content factory + tab presentation. Order = tab-bar order.
+//
+// `label` is a GETTER, not a value. This array is built at MODULE SCOPE, which runs at import
+// time — before setup() has awaited loadCatalog() — so a plain `label: tr(...)` would capture
+// the English fallback permanently and no translation could ever appear, however complete the
+// catalog was. A getter defers the lookup to the moment the label is read (line ~313), by
+// which point the catalog is loaded. Every consumer still just reads `.label`.
 const TABS = [
-  { key: "civitai", label: tr("sidepanel_ui.civitai", "CivitAI"), icon: "pi-images", factory: createCivitaiContent },
-  { key: "apps", label: tr("sidepanel_ui.apps", "Apps"), icon: "pi-th-large", factory: createAppsContent },
-  { key: "training", label: tr("sidepanel_ui.training", "Training"), icon: "pi-bolt", factory: createTrainingContent },
-  { key: "local", label: tr("sidepanel_ui.runpod", "RunPod"), icon: "pi-server", factory: createLocalContent },
+  { key: "civitai", get label() { return tr("sidepanel_ui.civitai", "CivitAI"); }, icon: "pi-images", factory: createCivitaiContent },
+  { key: "apps", get label() { return tr("sidepanel_ui.apps", "Apps"); }, icon: "pi-th-large", factory: createAppsContent },
+  { key: "training", get label() { return tr("sidepanel_ui.training", "Training"); }, icon: "pi-bolt", factory: createTrainingContent },
+  { key: "local", get label() { return tr("sidepanel_ui.runpod", "RunPod"); }, icon: "pi-server", factory: createLocalContent },
 ];
 // Legacy per-surface alias classes applied to the modal while that tab is active.
 const ALIAS = { civitai: "cmcp-civitai-modal", training: "cmcp-tr-modal", apps: "cmcp-apps-modal" };

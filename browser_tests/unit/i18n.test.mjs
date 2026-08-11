@@ -53,6 +53,10 @@ test("region tags degrade to the base language, except where we ship the region"
   // Regional variants we DO ship must not be flattened.
   assert.equal(resolveLocale("zh-TW"), "zh-TW");
   assert.equal(resolveLocale("zh-CN"), "zh");
+  // Script beats region: Hong Kong and Macau write Traditional, so they get zh-TW even
+  // though plain `zh` is shipped and would win a naive base match.
+  assert.equal(resolveLocale("zh-HK"), "zh-TW");
+  assert.equal(resolveLocale("zh-MO"), "zh-TW");
   assert.equal(resolveLocale("KO"), "ko");
   assert.equal(resolveLocale(""), null);
   assert.equal(resolveLocale(null), null);
@@ -157,6 +161,78 @@ test("the language setting offers Detect plus every shipped language", () => {
   // Built FROM the table rather than a hand-copied list, so adding a language cannot
   // silently miss the dropdown.
   assert.match(row, /LOCALES\.map/, "options must derive from LOCALES, not a duplicate list");
+});
+
+test("module-scope config reads translations LAZILY, not at import time", () => {
+  // The defect this guards: `const TABS = [{ label: tr("x", "Tabs") }]` at module scope runs
+  // at IMPORT time — before setup() awaits loadCatalog() — so it captures the English
+  // fallback permanently. The key can be perfectly translated in every catalog and the tab
+  // will still read "Tabs" forever. Nothing else in the suite notices: the English rendering
+  // is exactly what an English-reading reviewer expects to see.
+  // Checked against an ENUMERATED list of the module-scope config declarations, not a
+  // keyword pattern. A pattern like /\{.*label: tr\(/ also matches objects built INSIDE
+  // functions — `buildPanel()`, `makeShellCommandBlock()` — where a plain `tr()` is entirely
+  // correct because the function runs long after the catalog loads. Blocking those would be
+  // wrong in the direction nobody checks: the guard looks green either way, and the fix it
+  // demands makes correct code worse.
+  const MODULE_SCOPE_CONFIGS = [
+    ["web/js/cmcp-sidepanel-ui.js", "TABS"],
+    ["web/js/cmcp-civitai-ui.js", "TABS"],
+    ["web/js/cmcp-training-ui.js", "FLOWS"],
+    ["web/js/cmcp-training-ui.js", "PRESETS"],
+    ["web/js/comfyui-mcp-panel.js", "CMCP_OAUTH_PROVIDERS"],
+    ["web/js/comfyui-mcp-panel.js", "EFFORT_META"],
+  ];
+  for (const [f, name] of MODULE_SCOPE_CONFIGS) {
+    const src = readFileSync(join(ROOT, f), "utf8");
+    const start = src.indexOf(`\nconst ${name} = `);
+    assert.notEqual(start, -1, `${f} must still declare ${name} at module scope`);
+    // Bound the block at the next column-0 statement.
+    const rest = src.slice(start + 1);
+    const endRel = rest.search(/\n(?:const|let|var|function|export|\/\*\*|\/\/ ─)/);
+    const block = endRel === -1 ? rest : rest.slice(0, endRel);
+    const bare = block.split("\n").filter((l) => /\b(?:label|title|note|hint)\s*:\s*tr\(/.test(l));
+    assert.deepEqual(
+      bare,
+      [],
+      `${name} in ${f} evaluates tr() at import time. Use \`get <field>() { return tr(...) }\``,
+    );
+    // And it must actually be using the getter form — otherwise a block that simply stopped
+    // translating would pass the check above by having no tr() at all.
+    assert.match(block, /get \w+\(\) \{ return tr\(/, `${name} in ${f} should read translations via getters`);
+  }
+});
+
+test("a getter-backed label re-reads the catalog after it loads", () => {
+  // The behavioural half: proves the pattern the test above enforces actually fixes it.
+  const cfg = { get label() { return tr("panel.cancel", "Cancel"); } };
+  __setCatalogForTest("ko", {});
+  assert.equal(cfg.label, "Cancel", "before the catalog loads, English");
+  __setCatalogForTest("ko", { panel: { cancel: "취소" } });
+  assert.equal(cfg.label, "취소", "after it loads, the same object yields Korean");
+});
+
+test("plurals pick the category the language actually uses", () => {
+  // English: two forms.
+  __setCatalogForTest("en", {});
+  const enForms = { one: "{count} node", other: "{count} nodes" };
+  assert.equal(tr("panel.n", enForms, { count: 1 }), "1 node");
+  assert.equal(tr("panel.n", enForms, { count: 5 }), "5 nodes");
+
+  // Korean: ONE form for every number. An English-shaped one/other would be wrong.
+  __setCatalogForTest("ko", { panel: { n_other: "노드 {count}개" } });
+  assert.equal(tr("panel.n", enForms, { count: 1 }), "노드 1개");
+  assert.equal(tr("panel.n", enForms, { count: 5 }), "노드 5개");
+
+  // Russian: 1 / 2 / 5 take three DIFFERENT forms — the case hand-rolled n===1 always breaks.
+  __setCatalogForTest("ru", { panel: { n_one: "{count} узел", n_few: "{count} узла", n_many: "{count} узлов" } });
+  assert.equal(tr("panel.n", enForms, { count: 1 }), "1 узел");
+  assert.equal(tr("panel.n", enForms, { count: 3 }), "3 узла");
+  assert.equal(tr("panel.n", enForms, { count: 5 }), "5 узлов");
+
+  // A catalog with only `_other` still resolves for a language that wants `_one`.
+  __setCatalogForTest("en", { panel: { n_other: "{count} nodes" } });
+  assert.equal(tr("panel.n", enForms, { count: 1 }), "1 nodes");
 });
 
 test("right-to-left languages are flagged", () => {

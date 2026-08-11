@@ -978,9 +978,9 @@ let cmcpConsoleToken = null;
 // `copilot` is experimental (device-code, GitHub ToS risk) and only ever
 // sent with `allow_experimental: true`.
 const CMCP_OAUTH_PROVIDERS = [
-  { id: "codex", label: tr("panel.chatgpt_codex", "ChatGPT (Codex)") },
-  { id: "grok", label: tr("panel.grok", "Grok") },
-  { id: "copilot", label: tr("panel.github_copilot", "GitHub Copilot"), experimental: true },
+  { id: "codex", get label() { return tr("panel.chatgpt_codex", "ChatGPT (Codex)"); } },
+  { id: "grok", get label() { return tr("panel.grok", "Grok"); } },
+  { id: "copilot", get label() { return tr("panel.github_copilot", "GitHub Copilot"); }, experimental: true },
 ];
 
 // Hooks the OAuth section of the credentials card (built on demand — see
@@ -4167,14 +4167,14 @@ const FALLBACK_MODELS = [
 ];
 // Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
 const EFFORT_META = {
-  none: { label: tr("panel.none", "None"), small: "no reasoning" },
-  minimal: { label: tr("panel.minimal", "Minimal"), small: "fastest" },
-  low: { label: tr("panel.low", "Low"), small: "quick" },
-  medium: { label: tr("panel.medium", "Medium"), small: "default" },
-  high: { label: tr("panel.high", "High"), small: "thorough" },
-  xhigh: { label: tr("panel.extra_high", "Extra high"), small: "deep" },
-  max: { label: tr("panel.max", "Max"), small: "exhaustive" },
-  ultra: { label: tr("panel.ultra", "Ultra"), small: "4 parallel agents" },
+  none: { get label() { return tr("panel.none", "None"); }, small: "no reasoning" },
+  minimal: { get label() { return tr("panel.minimal", "Minimal"); }, small: "fastest" },
+  low: { get label() { return tr("panel.low", "Low"); }, small: "quick" },
+  medium: { get label() { return tr("panel.medium", "Medium"); }, small: "default" },
+  high: { get label() { return tr("panel.high", "High"); }, small: "thorough" },
+  xhigh: { get label() { return tr("panel.extra_high", "Extra high"); }, small: "deep" },
+  max: { get label() { return tr("panel.max", "Max"); }, small: "exhaustive" },
+  ultra: { get label() { return tr("panel.ultra", "Ultra"); }, small: "4 parallel agents" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
@@ -8344,7 +8344,7 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(others.length ? { other_selected_items: others } : {}),
       ...(picked.length
         ? {}
-        : { hint: tr("panel.nothing_is_selected_on_the_canvas_ask", "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it.") }),
+        : { get hint() { return tr("panel.nothing_is_selected_on_the_canvas_ask", "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it."); } }),
     };
   },
 
@@ -27425,36 +27425,36 @@ function buildPanel() {
   }
 
   const SLASH_COMMANDS = [
-    { cmd: "/new", icon: "pi-plus", hint: tr("panel.start_a_new_chat", "start a new chat"), run: () => newChat() },
+    { cmd: "/new", icon: "pi-plus", get hint() { return tr("panel.start_a_new_chat", "start a new chat"); }, run: () => newChat() },
     {
       cmd: "/fit",
       icon: "pi-window-maximize",
-      hint: tr("panel.fit_the_canvas_to_the_graph", "fit the canvas to the graph"),
+      get hint() { return tr("panel.fit_the_canvas_to_the_graph", "fit the canvas to the graph"); },
       run: () => runLocalCommand("graph_canvas", { action: "fit" }),
     },
-    { cmd: "/run", icon: "pi-play", hint: tr("panel.queue_the_open_workflow", "queue the open workflow"), run: () => runLocalCommand("graph_run", {}) },
+    { cmd: "/run", icon: "pi-play", get hint() { return tr("panel.queue_the_open_workflow", "queue the open workflow"); }, run: () => runLocalCommand("graph_run", {}) },
     {
       cmd: "/reload",
       icon: "pi-sync",
-      hint: tr("panel.soft_reload_the_agent_new_code_keeps", "soft-reload the agent (new code, keeps ComfyUI + this chat)"),
+      get hint() { return tr("panel.soft_reload_the_agent_new_code_keeps", "soft-reload the agent (new code, keeps ComfyUI + this chat)"); },
       run: () => softReload("user", "orchestrator"),
     },
     {
       cmd: "/reload-ui",
       icon: "pi-refresh",
-      hint: tr("panel.reload_just_the_panel_ui_new_frontend", "reload just the panel UI (new frontend code, keeps the session)"),
+      get hint() { return tr("panel.reload_just_the_panel_ui_new_frontend", "reload just the panel UI (new frontend code, keeps the session)"); },
       run: () => softReload("user", "frontend"),
     },
     {
       cmd: "/restart",
       icon: "pi-refresh",
-      hint: tr("panel.restart_the_agent_backend_recover_an_unresponsive", "restart the agent backend — recover an unresponsive agent"),
+      get hint() { return tr("panel.restart_the_agent_backend_recover_an_unresponsive", "restart the agent backend — recover an unresponsive agent"); },
       run: () => hardRestart("user"),
     },
     {
       cmd: "/revert",
       icon: "pi-undo",
-      hint: tr("panel.undo_the_last_turn_s_graph_edits", "undo the last turn's graph edits — revert the canvas to before your last message"),
+      get hint() { return tr("panel.undo_the_last_turn_s_graph_edits", "undo the last turn's graph edits — revert the canvas to before your last message"); },
       run: async () => {
         const outcome = await revertGraphToLastSnapshot();
         const label = outcome?.snapshot?.label;
@@ -27470,13 +27470,13 @@ function buildPanel() {
     {
       cmd: "/errors",
       icon: "pi-info-circle",
-      hint: tr("panel.show_the_last_execution_errors", "show the last execution errors"),
+      get hint() { return tr("panel.show_the_last_execution_errors", "show the last execution errors"); },
       run: () => runLocalCommand("graph_get_errors", {}),
     },
     {
       cmd: "/docs",
       icon: "pi-book",
-      hint: tr("panel.open_the_docs_guides_for_the_panel", "open the docs — guides for the panel, tools, local LLMs and troubleshooting"),
+      get hint() { return tr("panel.open_the_docs_guides_for_the_panel", "open the docs — guides for the panel, tools, local LLMs and troubleshooting"); },
       // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
       // navigation hijacks the whole window with no way back.
       //
@@ -27500,7 +27500,7 @@ function buildPanel() {
     {
       cmd: "/help",
       icon: "pi-question-circle",
-      hint: tr("panel.list_commands", "list commands"),
+      get hint() { return tr("panel.list_commands", "list commands"); },
       // These are PANEL SHORTCUTS, not a list of what the agent can do — so /help
       // says where the rest lives rather than leaving the reader to conclude this is
       // everything (#111). Joined with the same " · " as the rest of the line, NOT
@@ -28366,9 +28366,9 @@ function buildPanel() {
     scopeWrap.className = "cmcp-modal-scopes";
     let chosen = "both";
     const scopes = [
-      { v: "both", label: tr("panel.code_conversation", "Code + conversation"), hint: tr("panel.revert_the_canvas_and_rewind_the_agent", "revert the canvas AND rewind the agent's memory") },
-      { v: "code", label: tr("panel.code_only", "Code only"), hint: tr("panel.revert_the_canvas_keep_the_conversation", "revert the canvas; keep the conversation") },
-      { v: "conversation", label: tr("panel.conversation_only", "Conversation only"), hint: tr("panel.rewind_the_agent_s_memory_keep_the", "rewind the agent's memory; keep the canvas") },
+      { v: "both", label: tr("panel.code_conversation", "Code + conversation"), get hint() { return tr("panel.revert_the_canvas_and_rewind_the_agent", "revert the canvas AND rewind the agent's memory"); } },
+      { v: "code", label: tr("panel.code_only", "Code only"), get hint() { return tr("panel.revert_the_canvas_keep_the_conversation", "revert the canvas; keep the conversation"); } },
+      { v: "conversation", label: tr("panel.conversation_only", "Conversation only"), get hint() { return tr("panel.rewind_the_agent_s_memory_keep_the", "rewind the agent's memory; keep the canvas"); } },
     ];
     for (const s of scopes) {
       const lbl = document.createElement("label");
@@ -28555,8 +28555,8 @@ function buildPanel() {
     scopeWrap.className = "cmcp-modal-scopes";
     let mode = "lan";
     const modes = [
-      { v: "lan", label: tr("panel.local_wifi", "Local wifi"), hint: tr("panel.phone_on_the_same_network_stays_inside", "phone on the same network — stays inside your network") },
-      { v: "tunnel", label: tr("panel.internet", "Internet"), hint: tr("panel.pair_from_anywhere_via_an_encrypted_tunnel", "pair from anywhere via an encrypted tunnel") },
+      { v: "lan", label: tr("panel.local_wifi", "Local wifi"), get hint() { return tr("panel.phone_on_the_same_network_stays_inside", "phone on the same network — stays inside your network"); } },
+      { v: "tunnel", label: tr("panel.internet", "Internet"), get hint() { return tr("panel.pair_from_anywhere_via_an_encrypted_tunnel", "pair from anywhere via an encrypted tunnel"); } },
     ];
 
     const qrWrap = document.createElement("div");
@@ -29302,7 +29302,7 @@ function buildPanel() {
     }
     paintSecret({
       label: `${friendly} API key`,
-      hint: tr("panel.sent_straight_to_the_orchestrator_s_0600", "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context."),
+      get hint() { return tr("panel.sent_straight_to_the_orchestrator_s_0600", "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context."); },
     })
       .then((value) => {
         if (!value) return;

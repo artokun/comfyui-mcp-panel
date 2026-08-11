@@ -23,13 +23,17 @@ import { coerceMessageText } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
 import { tr } from "./lib/i18n.js";
 
+// `label` is a GETTER: this array is built at module scope, which runs at IMPORT time —
+// before setup() awaits loadCatalog() — so a plain value would freeze the English fallback
+// forever and no translation could ever render. Deferring the lookup to read-time fixes it
+// without touching a single consumer.
 const TABS = [
-  { key: "images", label: tr("civitai_ui.images", "Images"), icon: "pi-image", media: "image" },
-  { key: "videos", label: tr("civitai_ui.videos", "Videos"), icon: "pi-video", media: "video" },
-  { key: "checkpoints", label: tr("civitai_ui.checkpoints", "Checkpoints"), icon: "pi-box", model: "Checkpoint" },
-  { key: "loras", label: tr("civitai_ui.loras", "LoRAs"), icon: "pi-sliders-h", model: "LORA" },
-  { key: "workflows", label: tr("civitai_ui.workflows", "Workflows"), icon: "pi-share-alt", model: "Workflows" },
-  { key: "favorites", label: tr("civitai_ui.favorites", "Favorites"), icon: "pi-heart", media: "image", fav: true },
+  { key: "images", get label() { return tr("civitai_ui.images", "Images"); }, icon: "pi-image", media: "image" },
+  { key: "videos", get label() { return tr("civitai_ui.videos", "Videos"); }, icon: "pi-video", media: "video" },
+  { key: "checkpoints", get label() { return tr("civitai_ui.checkpoints", "Checkpoints"); }, icon: "pi-box", model: "Checkpoint" },
+  { key: "loras", get label() { return tr("civitai_ui.loras", "LoRAs"); }, icon: "pi-sliders-h", model: "LORA" },
+  { key: "workflows", get label() { return tr("civitai_ui.workflows", "Workflows"); }, icon: "pi-share-alt", model: "Workflows" },
+  { key: "favorites", get label() { return tr("civitai_ui.favorites", "Favorites"); }, icon: "pi-heart", media: "image", fav: true },
 ];
 
 const SUBFOLDER = {

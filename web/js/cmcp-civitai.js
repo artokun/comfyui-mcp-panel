@@ -20,7 +20,7 @@ export const CIVITAI_REQUEST_TIMEOUT_MS = 15000;
 // ── constants (mirror civitai_models.dart) ─────────────────────────────────
 export const LEVELS = [
   { label: "PG", level: 1 },
-  { label: tr("civitai.pg_13", "PG-13"), level: 2 },
+  { label: "PG-13", level: 2 },
   { label: "R", level: 4 },
   { label: "X", level: 8 },
   { label: "XXX", level: 16 },

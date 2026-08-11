@@ -81,6 +81,14 @@ export function resolveLocale(input) {
   const raw = String(input).trim();
   if (!raw) return null;
   if (SUPPORTED.has(raw)) return raw;
+
+  // Script beats region for Chinese. We ship `zh` (Simplified) and `zh-TW` (Traditional);
+  // Hong Kong and Macau write Traditional, so base-matching them to `zh` hands those users
+  // the wrong script. Kept identical to the orchestrator's resolver in src/i18n/index.ts —
+  // if these two ever disagree, a `say` bubble arrives in a different script than the panel
+  // around it.
+  if (/^zh[-_](HK|MO|Hant)/i.test(raw)) return "zh-TW";
+
   const base = raw.split(/[-_]/)[0];
   if (SUPPORTED.has(base)) return base;
   // Case-insensitive pass ("KO", "pt-br").
@@ -188,13 +196,57 @@ export async function loadCatalog(locale, api) {
  * DOM write — this returns a string and never HTML, so it introduces no injection path.
  */
 export function tr(key, fallback, vars) {
-  let out = (loaded && catalog[key]) || fallback || "";
+  const plural = vars && typeof vars.count === "number";
+  let out;
+
+  if (plural) {
+    // Ask Intl for the CATEGORY this number takes in this language — "one"/"other" for
+    // English, "other" alone for ja/ko/zh, and one/few/many/other for ru, which no amount of
+    // hand-rolled `n === 1` logic gets right. Fall back to `_other`, the one category every
+    // language has, then to the unsuffixed key so an un-pluralised catalog still resolves.
+    const cat = pluralCategory(activeLocale, vars.count);
+    if (loaded) out = catalog[`${key}_${cat}`] ?? catalog[`${key}_other`] ?? catalog[key];
+    if (out === undefined) out = pickFallbackForm(fallback, "en", vars.count);
+  } else {
+    if (loaded) out = catalog[key];
+    if (out === undefined) out = typeof fallback === "string" ? fallback : pickFallbackForm(fallback, "en", 0);
+  }
+  out = out ?? "";
+
   if (vars) {
     for (const [k, v] of Object.entries(vars)) {
       out = out.split(`{${k}}`).join(String(v));
     }
   }
   return out;
+}
+
+/** Intl.PluralRules is not free to construct; one per locale is plenty. */
+const pluralRules = new Map();
+function pluralCategory(locale, n) {
+  try {
+    let r = pluralRules.get(locale);
+    if (!r) {
+      r = new Intl.PluralRules(locale);
+      pluralRules.set(locale, r);
+    }
+    return r.select(n);
+  } catch {
+    // An exotic tag Intl refuses still has to render something.
+    return n === 1 ? "one" : "other";
+  }
+}
+
+/**
+ * English fallbacks for counted strings are written at the call site as
+ * `{ one: "{count} node", other: "{count} nodes" }` — an object, not a string, so the English
+ * plural stays visible in the code instead of being reconstructed from a suffix convention.
+ */
+function pickFallbackForm(fallback, sourceLocale, n) {
+  if (typeof fallback === "string") return fallback;
+  if (!fallback || typeof fallback !== "object") return "";
+  const cat = pluralCategory(sourceLocale, n);
+  return fallback[cat] ?? fallback.other ?? Object.values(fallback)[0] ?? "";
 }
 
 /** The active locale code. */

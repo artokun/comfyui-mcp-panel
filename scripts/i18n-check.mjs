@@ -47,6 +47,50 @@ function schemaFor(node, trail = '') {
 /** `{name}` placeholders must survive translation or the value silently never appears. */
 const holes = (s) => (String(s).match(/\{[a-zA-Z0-9_]+\}/g) || []).sort().join(',');
 
+const PLURAL_SUFFIXES = ['zero', 'one', 'two', 'few', 'many', 'other'];
+const pluralSplit = (key) => {
+  const m = key.match(/^(.*)_(zero|one|two|few|many|other)$/);
+  return m ? { base: m[1], cat: m[2] } : null;
+};
+
+/**
+ * A counted string must carry EXACTLY the plural categories its language uses — no more, no
+ * fewer. Intl knows the CLDR answer per language, so this is checked rather than trusted:
+ * Korean takes only `other`, Russian needs one/few/many/other, and a translator working from
+ * the English one/other pair will get both of those wrong in a way nothing else detects.
+ * The rendered result of a missing category is a silent fall back to `_other`, which reads as
+ * correct to anyone who does not speak the language.
+ */
+function pluralIssues(locale, sourceFlat, targetFlat) {
+  let cats;
+  try {
+    cats = new Intl.PluralRules(locale).resolvedOptions().pluralCategories;
+  } catch {
+    return [];
+  }
+  const required = new Set(cats);
+  // Plural bases the SOURCE declares — English only ever has one/other, so the base set comes
+  // from English and the required categories come from the target language.
+  const bases = new Set();
+  for (const key of sourceFlat.keys()) {
+    const p = pluralSplit(key);
+    if (p) bases.add(p.base);
+  }
+  const out = [];
+  for (const base of bases) {
+    const have = new Set(
+      [...targetFlat.keys()].map(pluralSplit).filter((p) => p && p.base === base).map((p) => p.cat),
+    );
+    for (const cat of required) {
+      if (!have.has(cat)) out.push(`${base}: missing "_${cat}" — ${locale} requires [${cats.join(', ')}]`);
+    }
+    for (const cat of have) {
+      if (!required.has(cat)) out.push(`${base}: has "_${cat}", which ${locale} never uses — remove it`);
+    }
+  }
+  return out;
+}
+
 function flat(node, prefix = '', out = new Map()) {
   for (const [k, v] of Object.entries(node ?? {})) {
     const key = prefix ? `${prefix}.${k}` : k;
@@ -72,10 +116,30 @@ if (!locales.includes(SOURCE)) {
   process.exit(1);
 }
 
+/**
+ * Plural siblings are legitimately per-language — Russian has `_few`/`_many` that English
+ * never will, Korean drops `_one` that English needs. Strict key-parity is therefore checked
+ * on the NON-plural keys only, and the plural bases are checked separately against Intl.
+ * Without this split, a correct Russian file would fail as "unknown key" and the only way to
+ * pass would be to make Russian grammatically wrong.
+ */
+function withoutPlurals(node) {
+  if (!node || typeof node !== 'object') return node;
+  const out = Array.isArray(node) ? [] : {};
+  for (const [k, v] of Object.entries(node)) {
+    if (v && typeof v === 'object') {
+      out[k] = withoutPlurals(v);
+    } else if (!pluralSplit(k)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 for (const file of FILES) {
   const source = read(SOURCE, file);
   if (!source) continue;
-  const schema = schemaFor(source);
+  const schema = schemaFor(withoutPlurals(source));
   const sourceFlat = flat(source);
 
   for (const locale of locales.filter((l) => l !== SOURCE).sort()) {
@@ -87,7 +151,7 @@ for (const file of FILES) {
       continue;
     }
 
-    const parsed = schema.safeParse(target);
+    const parsed = schema.safeParse(withoutPlurals(target));
     if (!parsed.success) {
       for (const issue of parsed.error.issues.slice(0, 12)) {
         const at = issue.path.join('.') || '(root)';
@@ -113,9 +177,17 @@ for (const file of FILES) {
 
     // Shape is right; now check the things a shape check cannot see.
     const targetFlat = flat(target);
+
+    for (const problem of pluralIssues(locale, sourceFlat, targetFlat)) {
+      note(`${locale}/${file} @ ${problem}`);
+    }
+
     let placeholderBad = 0;
     let untranslated = 0;
     for (const [key, en] of sourceFlat) {
+      // Plural variants are compared by base above; a per-key comparison here would flag
+      // every legitimately-absent English category as a mismatch.
+      if (pluralSplit(key)) continue;
       const tr = targetFlat.get(key);
       if (holes(en) !== holes(tr)) {
         note(`${locale}/${file} @ ${key}: placeholders differ — English has [${holes(en) || 'none'}], ${locale} has [${holes(tr) || 'none'}]`);

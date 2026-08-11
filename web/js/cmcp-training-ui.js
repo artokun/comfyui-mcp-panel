@@ -100,19 +100,21 @@ function injectCss() {
   document.head.appendChild(style);
 }
 
+// Getters, not values — see the note in cmcp-sidepanel-ui.js. Module scope runs before the
+// catalog loads, so a plain `tr(...)` here captures English permanently.
 const FLOWS = [
-  { title: tr("training_ui.image_character", "Image Character"), icon: "pi-user", models: ["FLUX.1-dev"], desc: "Train a person or character into an image model.", live: true },
-  { title: tr("training_ui.image_edit", "Image Edit"), icon: "pi-pencil", models: ["Qwen Edit 2509"], desc: "Teach an edit model your custom transformation." },
-  { title: tr("training_ui.image_style", "Image Style"), icon: "pi-palette", models: ["Krea2", "Flux2", "ZImg"], desc: "Capture an art style you can apply to any prompt." },
-  { title: tr("training_ui.image_slider", "Image Slider"), icon: "pi-sliders-h", models: ["Krea2", "Flux2", "ZImg"], desc: "A concept slider with adjustable strength." },
-  { title: tr("training_ui.video_character", "Video Character"), icon: "pi-video", models: ["LTX 2.3", "Wan 2.2"], desc: "Bring a character into video generation." },
-  { title: tr("training_ui.video_action", "Video Action"), icon: "pi-forward", models: ["LTX 2.3", "Wan 2.2"], desc: "Teach a motion or action to a video model." },
+  { get title() { return tr("training_ui.image_character", "Image Character"); }, icon: "pi-user", models: ["FLUX.1-dev"], desc: "Train a person or character into an image model.", live: true },
+  { get title() { return tr("training_ui.image_edit", "Image Edit"); }, icon: "pi-pencil", models: ["Qwen Edit 2509"], desc: "Teach an edit model your custom transformation." },
+  { get title() { return tr("training_ui.image_style", "Image Style"); }, icon: "pi-palette", models: ["Krea2", "Flux2", "ZImg"], desc: "Capture an art style you can apply to any prompt." },
+  { get title() { return tr("training_ui.image_slider", "Image Slider"); }, icon: "pi-sliders-h", models: ["Krea2", "Flux2", "ZImg"], desc: "A concept slider with adjustable strength." },
+  { get title() { return tr("training_ui.video_character", "Video Character"); }, icon: "pi-video", models: ["LTX 2.3", "Wan 2.2"], desc: "Bring a character into video generation." },
+  { get title() { return tr("training_ui.video_action", "Video Action"); }, icon: "pi-forward", models: ["LTX 2.3", "Wan 2.2"], desc: "Teach a motion or action to a video model." },
 ];
 
 const PRESETS = {
-  smoke: { label: tr("training_ui.smoke_test", "Smoke test"), params: { steps: 200, saveEvery: 100, sampleEvery: 100, resolution: [512] }, note: tr("training_ui.10_min_on_a_4090_proves_the", "~10 min on a 4090 — proves the pipeline, not a usable LoRA.") },
-  standard: { label: tr("training_ui.standard", "Standard"), params: { steps: 2000, lr: 1e-4, rank: 16, resolution: [512, 768, 1024], saveEvery: 250, sampleEvery: 250, quantize: true }, note: tr("training_ui.1_2_h_on_a_4090_the", "~1–2 h on a 4090. The real thing.") },
-  custom: { label: tr("training_ui.custom", "Custom"), params: null, note: tr("training_ui.edit_every_parameter_yourself", "Edit every parameter yourself.") },
+  smoke: { get label() { return tr("training_ui.smoke_test", "Smoke test"); }, params: { steps: 200, saveEvery: 100, sampleEvery: 100, resolution: [512] }, get note() { return tr("training_ui.10_min_on_a_4090_proves_the", "~10 min on a 4090 — proves the pipeline, not a usable LoRA."); } },
+  standard: { get label() { return tr("training_ui.standard", "Standard"); }, params: { steps: 2000, lr: 1e-4, rank: 16, resolution: [512, 768, 1024], saveEvery: 250, sampleEvery: 250, quantize: true }, get note() { return tr("training_ui.1_2_h_on_a_4090_the", "~1–2 h on a 4090. The real thing."); } },
+  custom: { get label() { return tr("training_ui.custom", "Custom"); }, params: null, get note() { return tr("training_ui.edit_every_parameter_yourself", "Edit every parameter yourself."); } },
 };
 
 /** The rig's GPU ("RTX 4090 24GB") from ComfyUI's /system_stats — the panel
