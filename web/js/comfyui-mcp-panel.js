@@ -12404,6 +12404,10 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
     try {
+      // #968 r2 — NOT claimed here. #606/#708 reconstruct workflow_new from source and
+      // rebuild it in isolation, so an inserted call breaks 12 guards that exist for
+      // independent reasons. Recorded on the PR: this cause stays unwired until the
+      // claim can be staked somewhere those guards do not reach.
       await mgr.command.execute("Comfy.NewBlankWorkflow");
     } catch (err) {
       // The creation command itself threw. It may have got partway, and workflow_new is
@@ -12728,6 +12732,9 @@ const GRAPH_TOOL_EXECUTORS = {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
         // through failOpen below (outside the freeze) so the negative is journaled.
         openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+        // #968 r2 — the claim was staked before the switch; the switch did not happen, so
+        // release it rather than let a later move inherit this command's name.
+        claimActiveWorkflowMove(null, null);
       } finally {
         endWorkflowReloadStep(reloadGuardToken);
       }
@@ -16212,18 +16219,27 @@ const activeWorkflowMoves = createActiveWorkflowProvenance();
 // observer so it does not double-report them as external.
 let _claimedNextMove = null;
 function claimActiveWorkflowMove(cause, detail) {
-  _claimedNextMove = { cause, detail: typeof detail === "string" ? detail : null };
+  // A null cause RELEASES a claim (an open that failed before switching).
+  _claimedNextMove = cause ? { cause, detail: typeof detail === "string" ? detail : null } : null;
 }
 let _lastSeenActiveKey = null;
 function noteActiveWorkflowMove() {
   try {
-    const key = workflowTabId(activeWorkflowRef()) || null;
+    // #968 r2 (codex P1) — CONSUME the claim on every observation, not only when the key
+    // changed. A claim left pending by an open that failed, no-opped or was superseded
+    // would otherwise be applied to the NEXT different key, labelling an external move as
+    // panel-made — mislabelling exactly the case this exists to find.
+    const claim = _claimedNextMove;
+    _claimedNextMove = null;
+    // #968 r2 (codex P2) — a null active workflow is NO DESTINATION. `workflowTabId(null)`
+    // falls back to getTabId(), a browser-session id, so reading it here would report a
+    // move to a browser tab as though it were a workflow.
+    const active = activeWorkflowRef();
+    const key = active ? workflowTabId(active) || null : null;
     if (key === _lastSeenActiveKey) return;
     const from = _lastSeenActiveKey;
     _lastSeenActiveKey = key;
     if (!key) return; // nothing active — a destination-less move records nothing
-    const claim = _claimedNextMove;
-    _claimedNextMove = null;
     activeWorkflowMoves.record({
       // An UNCLAIMED move is the case #968 is hunting: a tab click, a reconnect restore, a
       // file reopened at a new path. Defaulting to `external` is what makes it visible.

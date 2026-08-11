@@ -98,7 +98,11 @@ export function createActiveWorkflowProvenance({ cap = DEFAULT_CAP } = {}) {
     describeLast() {
       const e = entries.length ? entries[entries.length - 1] : null;
       if (!e) return null;
-      const where = e.from ? `from ${e.from} to ${e.to}` : `to ${e.to}`;
+      // #968 r2 (codex P2) — `from` is the LAST OBSERVED workflow, not necessarily the
+      // previous one: observations are taken at specific points, so several real switches
+      // between them collapse into one transition. Say 'last seen as' rather than 'from',
+      // which would assert an adjacency that was never established.
+      const where = e.from ? `to ${e.to} (last seen as ${e.from})` : `to ${e.to}`;
       if (e.cause === MOVE_CAUSES.EXTERNAL) {
         return (
           `The active workflow last moved ${where}, and the panel did not make that move — ` +

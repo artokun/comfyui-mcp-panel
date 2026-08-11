@@ -30,7 +30,9 @@ test("#968 a move the panel did NOT make is the one worth naming", () => {
 
   const note = p.describeLast();
   assert.match(note, /the panel did not make that move/);
-  assert.match(note, /from wf:b\.json to wf:c\.json/);
+  // "last seen as", not "from": observations are point-in-time, so adjacency was never
+  // established (codex P2).
+  assert.match(note, /to wf:c\.json \(last seen as wf:b\.json\)/);
   // It must name the routes that can do it — both reporters' triggers are in this list.
   assert.match(note, /reconnect restore/);
   assert.match(note, /reopened at a new path/);
