@@ -17,9 +17,16 @@ import { execSync } from 'child_process';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const WRITE = process.argv.includes('--write');
 
+// PROPOSALS ONLY. The extractor also reports sites that are ALREADY `tr("key", "English")`,
+// and feeding those back in is destructive: this script emits English as the SECOND argument,
+// while its "already converted" guard only recognised a literal in FIRST position — so it
+// never recognised its own output. A second `--write` would have wrapped 312 call sites into
+// `tr("k", tr("k", "text"))`. The two behaviours were added separately and only interact
+// wrongly when combined, which is exactly the kind of coupling a comment claiming
+// "idempotent re-runs are safe" hides rather than prevents.
 const candidates = JSON.parse(
   execSync('node scripts/i18n-extract.mjs --json', { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 })
-);
+).filter((c) => !c.converted);
 
 /** Group by file so each file is read and written exactly once. */
 const byFile = new Map();
@@ -68,8 +75,11 @@ for (const [file, items] of [...byFile.entries()].sort()) {
     if (!found) {
       skipped++; skips.push(`${file}:${c.line} literal moved or changed: ${JSON.stringify(c.text.slice(0, 45))}`); continue;
     }
-    // Already converted (idempotent re-runs are safe).
-    if (/\btr\(\s*$/.test(line.slice(0, found.at))) continue;
+    // Belt and braces alongside the `!c.converted` filter above: skip a literal sitting in
+    // EITHER argument position of an existing tr(...) call. The first alternative catches a
+    // key, the second an English fallback — the position this script actually writes to.
+    const before = line.slice(0, found.at);
+    if (/\btr\(\s*$/.test(before) || /\btr\(\s*(["'])(?:\\.|(?!\1)[^\\])*\1\s*,\s*$/.test(before)) continue;
 
     const call = `tr("${c.key}", ${literal(c.text, '"')})`;
     lines[idx] = line.slice(0, found.at) + call + line.slice(found.at + found.lit.length);
