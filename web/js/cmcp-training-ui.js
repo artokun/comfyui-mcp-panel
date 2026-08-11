@@ -11,6 +11,7 @@
 //    training-sample images from the rig's training root.
 
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
+import { tr } from "./lib/i18n.js";
 
 let cssInjected = false;
 function injectCss() {
@@ -100,18 +101,18 @@ function injectCss() {
 }
 
 const FLOWS = [
-  { title: "Image Character", icon: "pi-user", models: ["FLUX.1-dev"], desc: "Train a person or character into an image model.", live: true },
-  { title: "Image Edit", icon: "pi-pencil", models: ["Qwen Edit 2509"], desc: "Teach an edit model your custom transformation." },
-  { title: "Image Style", icon: "pi-palette", models: ["Krea2", "Flux2", "ZImg"], desc: "Capture an art style you can apply to any prompt." },
-  { title: "Image Slider", icon: "pi-sliders-h", models: ["Krea2", "Flux2", "ZImg"], desc: "A concept slider with adjustable strength." },
-  { title: "Video Character", icon: "pi-video", models: ["LTX 2.3", "Wan 2.2"], desc: "Bring a character into video generation." },
-  { title: "Video Action", icon: "pi-forward", models: ["LTX 2.3", "Wan 2.2"], desc: "Teach a motion or action to a video model." },
+  { title: tr("training_ui.image_character", "Image Character"), icon: "pi-user", models: ["FLUX.1-dev"], desc: "Train a person or character into an image model.", live: true },
+  { title: tr("training_ui.image_edit", "Image Edit"), icon: "pi-pencil", models: ["Qwen Edit 2509"], desc: "Teach an edit model your custom transformation." },
+  { title: tr("training_ui.image_style", "Image Style"), icon: "pi-palette", models: ["Krea2", "Flux2", "ZImg"], desc: "Capture an art style you can apply to any prompt." },
+  { title: tr("training_ui.image_slider", "Image Slider"), icon: "pi-sliders-h", models: ["Krea2", "Flux2", "ZImg"], desc: "A concept slider with adjustable strength." },
+  { title: tr("training_ui.video_character", "Video Character"), icon: "pi-video", models: ["LTX 2.3", "Wan 2.2"], desc: "Bring a character into video generation." },
+  { title: tr("training_ui.video_action", "Video Action"), icon: "pi-forward", models: ["LTX 2.3", "Wan 2.2"], desc: "Teach a motion or action to a video model." },
 ];
 
 const PRESETS = {
-  smoke: { label: "Smoke test", params: { steps: 200, saveEvery: 100, sampleEvery: 100, resolution: [512] }, note: "~10 min on a 4090 — proves the pipeline, not a usable LoRA." },
-  standard: { label: "Standard", params: { steps: 2000, lr: 1e-4, rank: 16, resolution: [512, 768, 1024], saveEvery: 250, sampleEvery: 250, quantize: true }, note: "~1–2 h on a 4090. The real thing." },
-  custom: { label: "Custom", params: null, note: "Edit every parameter yourself." },
+  smoke: { label: tr("training_ui.smoke_test", "Smoke test"), params: { steps: 200, saveEvery: 100, sampleEvery: 100, resolution: [512] }, note: tr("training_ui.10_min_on_a_4090_proves_the", "~10 min on a 4090 — proves the pipeline, not a usable LoRA.") },
+  standard: { label: tr("training_ui.standard", "Standard"), params: { steps: 2000, lr: 1e-4, rank: 16, resolution: [512, 768, 1024], saveEvery: 250, sampleEvery: 250, quantize: true }, note: tr("training_ui.1_2_h_on_a_4090_the", "~1–2 h on a 4090. The real thing.") },
+  custom: { label: tr("training_ui.custom", "Custom"), params: null, note: tr("training_ui.edit_every_parameter_yourself", "Edit every parameter yourself.") },
 };
 
 /** The rig's GPU ("RTX 4090 24GB") from ComfyUI's /system_stats — the panel
@@ -481,7 +482,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     const nameInput = el("input", null);
     nameInput.type = "text";
     nameInput.dataset.ref = "field:dataset_name";
-    nameInput.placeholder = "e.g. aria_character";
+    nameInput.placeholder = tr("training_ui.e_g_aria_character", "e.g. aria_character");
     nameInput.value = wiz.datasetName;
     nameInput.oninput = () => { wiz.datasetName = nameInput.value; syncNext(); };
     nameRow.appendChild(nameInput);
@@ -491,7 +492,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     const trigInput = el("input", null);
     trigInput.type = "text";
     trigInput.dataset.ref = "field:trigger";
-    trigInput.placeholder = "e.g. ohwx — a rare token, not a real word";
+    trigInput.placeholder = tr("training_ui.e_g_ohwx_a_rare_token_not", "e.g. ohwx — a rare token, not a real word");
     trigInput.value = wiz.trigger;
     trigInput.oninput = () => { wiz.trigger = trigInput.value.trim(); };
     trigRow.appendChild(trigInput);
@@ -529,7 +530,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
         const chip = el("div", "cmcp-tr-chip");
         chip.style.backgroundImage = `url("${img.thumb}")`;
         const x = el("button", null, "×");
-        x.title = "Remove";
+        x.title = tr("training_ui.remove", "Remove");
         x.onclick = () => { wiz.images.splice(idx, 1); syncTray(); syncNext(); if (refreshGridSel) refreshGridSel(); };
         chip.appendChild(x);
         tray.appendChild(chip);
@@ -643,7 +644,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
         }
       }
       async function addFiles(files) {
-        if (!ctx.uploadBlobToInput) { status.textContent = "Upload unavailable (no bridge helper)."; return; }
+        if (!ctx.uploadBlobToInput) { status.textContent = tr("training_ui.upload_unavailable_no_bridge_helper", "Upload unavailable (no bridge helper)."); return; }
         // Track the batch: Next stays disabled until every upload settles, so a
         // user can't advance mid-batch and silently lose/re-caption the files
         // still in flight (codex finding).
@@ -923,7 +924,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
         localBtn.dataset.ref = "target:local";
         const podBtn = el("button", wiz.target === "pod" ? "active" : null, `Pod (${pod.name || pod.id}${pod.gpu ? ` · ${pod.gpu}` : ""})`);
         podBtn.dataset.ref = "target:pod";
-        if (!pod.ssh) podBtn.title = "pod has no working SSH endpoint";
+        if (!pod.ssh) podBtn.title = tr("training_ui.pod_has_no_working_ssh_endpoint", "pod has no working SSH endpoint");
         localBtn.onclick = () => { wiz.target = "local"; localBtn.classList.add("active"); podBtn.classList.remove("active"); syncLaunchEnabled(); syncSummary(); };
         podBtn.onclick = () => {
           if (!pod.ssh) return;
@@ -1004,7 +1005,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
         || !datasetReady
         || (wiz.target === "pod" ? !podReady : preflightState !== "local" && preflightState !== "failed")
         || !syncCustomValidity();
-      if (wiz.launching) launch.textContent = "Launching…";
+      if (wiz.launching) launch.textContent = tr("training_ui.launching", "Launching…");
       else launch.textContent = wiz.target === "pod" ? "Launch on pod" : "Launch training";
       // Freeze the target choice while launching — the submitted job runs on the
       // target that was selected at click time (codex finding).
@@ -1015,7 +1016,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     launch.onclick = async () => {
       err.textContent = "";
       if (!syncCustomValidity()) {
-        err.textContent = "Fix the custom parameters first — every field needs a positive value.";
+        err.textContent = tr("training_ui.fix_the_custom_parameters_first_every_field", "Fix the custom parameters first — every field needs a positive value.");
         return;
       }
       // Modal-scoped lock: navigating Back/Jobs and returning must NOT allow a
@@ -1200,7 +1201,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
           dsLink.title = `${cfg.datasetPath} — see the labeled set this job trained on`;
           dsLink.onclick = () => { wiz.datasetDetail = dsName; show("dataset-detail"); };
           const againBtn = el("button", "cmcp-tr-btn", "Train again");
-          againBtn.title = "Run another job from this dataset + settings";
+          againBtn.title = tr("training_ui.run_another_job_from_this_dataset_settings", "Run another job from this dataset + settings");
           againBtn.onclick = async () => {
             if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
             await checkBackendCapable(); // a Jobs-first entry may never have probed (codex)
@@ -1259,7 +1260,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
         }
         const s = p.samples || [];
         if (s.length) {
-          samplesLabel.textContent = "Latest samples:";
+          samplesLabel.textContent = tr("training_ui.latest_samples", "Latest samples:");
           samples.textContent = "";
           for (const sp of s) {
             const img = document.createElement("img");
@@ -1574,7 +1575,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
 
   // ── content provider (the shell owns the chrome; this owns the body) ──────
   return {
-    key: "training", label: "Training", icon: "pi-bolt", driveKind: "training",
+    key: "training", label: tr("training_ui.training", "Training"), icon: "pi-bolt", driveKind: "training",
     // Search filters the outputs grid on the Dataset step only (decision B).
     hasSearch: () => currentView === "wizard-1" && outputsTabActive,
     searchPlaceholder: "Filter outputs by filename…",

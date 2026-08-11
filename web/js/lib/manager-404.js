@@ -31,6 +31,7 @@
  * Pure and body-only: the caller owns the fetch, so this stays unit-testable and
  * cannot itself consume a stream twice.
  */
+import { tr } from "./i18n.js";
 
 /** Manager's security refusal, matched on the stable part of its phrasing.
  *  Deliberately loose on surrounding text (the message has carried different
@@ -74,6 +75,6 @@ export function classifyManager404(bodyText) {
   }
   return {
     routeMissing: true,
-    message: "ComfyUI-Manager not reachable (is the built-in Manager enabled?)",
+    message: tr("manager_404.comfyui_manager_not_reachable_is_the_built", "ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
   };
 }

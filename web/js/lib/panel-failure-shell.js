@@ -21,6 +21,7 @@
  * versions — and says where to send it. A wrong explanation would be worse than
  * the blank tab, because it would be acted on.
  */
+import { tr } from "./i18n.js";
 
 /** Kept inline: the panel stylesheet is loaded by the panel we just failed to build. */
 const STYLE = {
@@ -49,7 +50,7 @@ export function panelFailureReport(err, info = {}) {
         : "(the failure produced no message)";
   const stack = err instanceof Error && typeof err.stack === "string" ? err.stack : "";
   return {
-    title: "The agent panel could not start.",
+    title: tr("panel_failure_shell.the_agent_panel_could_not_start", "The agent panel could not start."),
     body:
       "Building the panel threw, so nothing was rendered. This is a fault in the panel " +
       "itself — it is NOT a connection problem, and reinstalling ComfyUI or the pack will " +

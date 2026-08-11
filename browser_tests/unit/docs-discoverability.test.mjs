@@ -60,7 +60,14 @@ test("#111 Settings → About has a docs row that opens the docs site", () => {
   // textContent line left every other assertion in this file green while shipping an
   // unlabeled link, which is functionally the same absence this whole change set out
   // to remove: a signpost nobody can read is not a signpost.
-  const label = row.match(/a\.textContent = "([^"]*)"/);
+  // Accepts either the bare literal or the translated form `tr("key", "English")`. The
+  // asserted string is the ENGLISH FALLBACK in both cases, which is exactly right: it is
+  // what English users see, and what EVERY locale renders when a key is missing from its
+  // catalog. So this still fails if the label is deleted, blanked, or reduced to an icon —
+  // the three regressions it was written to catch — in any language.
+  const label =
+    row.match(/a\.textContent = tr\(\s*"[^"]*"\s*,\s*"([^"]*)"/) ??
+    row.match(/a\.textContent = "([^"]*)"/);
   assert.ok(label, "the docs link must set a visible label");
   const text = label[1].trim();
   assert.notEqual(text, "", "an empty label renders a blank control");

@@ -26,6 +26,7 @@
 // worth checking out; this backend is our own (runs the user's real canvas).
 
 import { isImeComposing } from "./lib/ime.js";
+import { tr } from "./lib/i18n.js";
 
 const GPU_CLI_URL = "https://gpu-cli.sh";
 
@@ -113,7 +114,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   body.style.margin = "1rem auto";
   const title = document.createElement("div");
   title.className = "cmcp-rp-title";
-  title.textContent = "RunPod — cloud GPU for this session";
+  title.textContent = tr("runpod_ui.runpod_cloud_gpu_for_this_session", "RunPod — cloud GPU for this session");
 
   // Host indicator (honest: where renders run right now).
   const host = document.createElement("div");
@@ -135,7 +136,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   podSelect.className = "cmcp-rp-podselect";
   podSelect.append(new Option("Loading pods…", ""));
   const refreshBtn = mkBtn("↻");
-  refreshBtn.title = "Refresh pod list";
+  refreshBtn.title = tr("runpod_ui.refresh_pod_list", "Refresh pod list");
   refreshBtn.classList.add("cmcp-rp-refresh");
   const connectBtn = mkBtn("Connect", "primary");
   connectRow.append(podSelect, refreshBtn, connectBtn);
@@ -146,7 +147,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   manualRow.style.display = "none";
   const podInput = document.createElement("input");
   podInput.type = "text";
-  podInput.placeholder = "paste pod id (from console.runpod.io)";
+  podInput.placeholder = tr("runpod_ui.paste_pod_id_from_console_runpod_io", "paste pod id (from console.runpod.io)");
   podInput.spellcheck = false;
   manualRow.append(podInput);
   // Enter in the manual-ID field connects, matching the primary button.
@@ -175,7 +176,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   linkRow.className = "cmcp-rp-muted";
   const linkBtn = document.createElement("a");
   linkBtn.href = "#";
-  linkBtn.textContent = "New RunPod user? Open the deploy link (supports the project via referral) ↗";
+  linkBtn.textContent = tr("runpod_ui.new_runpod_user_open_the_deploy_link", "New RunPod user? Open the deploy link (supports the project via referral) ↗");
   linkBtn.style.color = "inherit";
   linkRow.append(linkBtn);
 
@@ -263,11 +264,11 @@ export function createLocalContent(ctx, shell, opts = {}) {
       const bits = [s.name || s.pod_id || "RunPod pod"];
       if (s.gpu) bits.push(s.gpu);
       if (s.cost_per_hr != null) bits.push(`$${Number(s.cost_per_hr).toFixed(3)}/hr`);
-      hostText.textContent = "Rendering on RunPod · " + bits.join(" · ");
+      hostText.textContent = tr("runpod_ui.rendering_on_runpod", "Rendering on RunPod · ") + bits.join(" · ");
     } else if (onPod) {
-      hostText.textContent = "Rendering on a remote pod";
+      hostText.textContent = tr("runpod_ui.rendering_on_a_remote_pod", "Rendering on a remote pod");
     } else {
-      hostText.textContent = "Rendering locally · this machine";
+      hostText.textContent = tr("runpod_ui.rendering_locally_this_machine", "Rendering locally · this machine");
     }
 
     // Status card.
@@ -392,14 +393,14 @@ export function createLocalContent(ctx, shell, opts = {}) {
       deployBtn.dataset.armed = "1";
       deployArmedAt = Date.now();
       const gen = ++deployArmGen;
-      deployBtn.textContent = "Deploy — this bills. Click to confirm";
+      deployBtn.textContent = tr("runpod_ui.deploy_this_bills_click_to_confirm", "Deploy — this bills. Click to confirm");
       setLog("A new pod bills per running GPU-second (~$0.30–0.70/hr). It idle-auto-stops; Stop ends GPU billing (disk storage still bills until you terminate the pod in the console).", "");
       setTimeout(() => {
         // Only disarm the arming that scheduled this timer — a newer arm (e.g.
         // after a deploy completes and re-arms) must not be cleared by an old one.
         if (deployBtn.dataset.armed === "1" && deployArmGen === gen) {
           deployBtn.dataset.armed = "0";
-          deployBtn.textContent = "Deploy new pod";
+          deployBtn.textContent = tr("runpod_ui.deploy_new_pod", "Deploy new pod");
         }
       }, 5000);
       return;
@@ -409,7 +410,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
     if (Date.now() - deployArmedAt < DEPLOY_ARM_COOLDOWN_MS) return;
     deployArmGen++; // invalidate the pending disarm timer for this arming
     deployBtn.dataset.armed = "0";
-    deployBtn.textContent = "Deploy new pod";
+    deployBtn.textContent = tr("runpod_ui.deploy_new_pod", "Deploy new pod");
     run("Deploying a new pod", () => callTool("runpod", { action: "create" }, { timeout: 120000 })).then((ok) => {
       if (ok) loadPods(); // show the new pod in the dropdown
     });
@@ -438,7 +439,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   }
 
   return {
-    key: "local", label: "RunPod", icon: "pi-server", driveKind: null,
+    key: "local", label: tr("runpod_ui.runpod", "RunPod"), icon: "pi-server", driveKind: null,
     hasSearch: false, drive: null,
     subnavExtras: () => [],
     mount(bodyEl) { bodyEl.appendChild(body); render(); },

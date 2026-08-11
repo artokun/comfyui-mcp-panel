@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tr } from "../../web/js/lib/i18n.js";
 
 import {
   pickRevertSnapshot,
@@ -349,6 +350,11 @@ function buildRollbackModal({ revert }) {
     "describeRevertOutcome",
     "revertDidRestore",
     "setTimeout",
+    // The panel's own translator, passed in like every other collaborator. Deliberately the
+    // REAL `tr` rather than a stub: with no catalog loaded it returns the English fallback,
+    // so the button-text assertions below still read as English and still exercise the
+    // production lookup path instead of a test-only shim that could diverge from it.
+    "tr",
     `${source}\nreturn openRollbackModal;`,
   )(
     fakeDom(),
@@ -365,6 +371,7 @@ function buildRollbackModal({ revert }) {
     describeRevertOutcome,
     revertDidRestore,
     () => {},
+    tr,
   );
 
   openRollbackModal({ mid: "m1", text: "do the thing", anchor: "a1" });

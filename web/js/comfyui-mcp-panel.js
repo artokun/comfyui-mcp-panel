@@ -430,6 +430,7 @@ import {
   savedWorkflowRoute,
 } from "./lib/bridge-route.js";
 import {
+import { tr, LOCALES, loadCatalog, pickLocale } from "./lib/i18n.js";
   adoptRebootRuns,
   decodeRebootMarker,
   isRealBridgeDrop,
@@ -977,9 +978,9 @@ let cmcpConsoleToken = null;
 // `copilot` is experimental (device-code, GitHub ToS risk) and only ever
 // sent with `allow_experimental: true`.
 const CMCP_OAUTH_PROVIDERS = [
-  { id: "codex", label: "ChatGPT (Codex)" },
-  { id: "grok", label: "Grok" },
-  { id: "copilot", label: "GitHub Copilot", experimental: true },
+  { id: "codex", label: tr("panel.chatgpt_codex", "ChatGPT (Codex)") },
+  { id: "grok", label: tr("panel.grok", "Grok") },
+  { id: "copilot", label: tr("panel.github_copilot", "GitHub Copilot"), experimental: true },
 ];
 
 // Hooks the OAuth section of the credentials card (built on demand — see
@@ -1055,7 +1056,7 @@ function cmcpOpenCredentialsFrame(client) {
       const value = input.value.trim();
       if (!value) return;
       showErr("");
-      btn.disabled = true; btn.textContent = "Saving…";
+      btn.disabled = true; btn.textContent = tr("panel.saving", "Saving…");
       try {
         const resp = await fetch(cmcpApiBase(), {
           method: "POST", headers: { "content-type": "application/json" },
@@ -1064,13 +1065,13 @@ function cmcpOpenCredentialsFrame(client) {
         const d = await resp.json();
         if (!resp.ok || !d.ok) throw new Error(d.error || "save failed");
         input.value = "";
-        badge.textContent = "set · " + (d.masked || "");
+        badge.textContent = tr("panel.set", "set · ") + (d.masked || "");
         clearBtn.style.display = "";
-        btn.textContent = "Saved ✓";
-        setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 1400);
+        btn.textContent = tr("panel.saved", "Saved ✓");
+        setTimeout(() => { btn.textContent = tr("panel.save", "Save"); btn.disabled = false; }, 1400);
       } catch (e) {
         showErr(String((e && e.message) || e));
-        btn.textContent = "Save"; btn.disabled = false;
+        btn.textContent = tr("panel.save", "Save"); btn.disabled = false;
       }
     };
     // Revoke path (comfyui-mcp issue #203): POST {slot, clear:true} removes every
@@ -1078,7 +1079,7 @@ function cmcpOpenCredentialsFrame(client) {
     // overwritten, never removed, short of hand-editing panel-secrets.json.
     clearBtn.onclick = async () => {
       showErr("");
-      clearBtn.disabled = true; clearBtn.textContent = "Clearing…";
+      clearBtn.disabled = true; clearBtn.textContent = tr("panel.clearing", "Clearing…");
       try {
         const resp = await fetch(cmcpApiBase(), {
           method: "POST", headers: { "content-type": "application/json" },
@@ -1086,13 +1087,13 @@ function cmcpOpenCredentialsFrame(client) {
         });
         const d = await resp.json();
         if (!resp.ok || !d.ok) throw new Error(d.error || "clear failed");
-        badge.textContent = "not set";
-        input.placeholder = "paste key";
+        badge.textContent = tr("panel.not_set", "not set");
+        input.placeholder = tr("panel.paste_key", "paste key");
         clearBtn.style.display = "none";
-        clearBtn.textContent = "Clear"; clearBtn.disabled = false;
+        clearBtn.textContent = tr("panel.clear", "Clear"); clearBtn.disabled = false;
       } catch (e) {
         showErr(String((e && e.message) || e));
-        clearBtn.textContent = "Clear"; clearBtn.disabled = false;
+        clearBtn.textContent = tr("panel.clear", "Clear"); clearBtn.disabled = false;
       }
     };
     return r;
@@ -1105,7 +1106,7 @@ function cmcpOpenCredentialsFrame(client) {
       if (!resp.ok || !d.ok) throw new Error(d.error || "could not load");
       list.innerHTML = "";
       for (const s of (d.slots || [])) list.appendChild(row(s));
-      if (!list.children.length) list.textContent = "No credential slots.";
+      if (!list.children.length) list.textContent = tr("panel.no_credential_slots", "No credential slots.");
     } catch (e) {
       list.textContent = "";
       showErr("Couldn't load credentials — reconnect the panel. (" + String((e && e.message) || e) + ")");
@@ -1120,7 +1121,7 @@ function cmcpOpenCredentialsFrame(client) {
   const oauthSection = card.querySelector("[data-oauth]");
   const oauthHeader = document.createElement("div");
   oauthHeader.style.cssText = "font-weight:600;margin-bottom:8px;font-size:13px";
-  oauthHeader.textContent = "Sign in";
+  oauthHeader.textContent = tr("panel.sign_in", "Sign in");
   oauthSection.appendChild(oauthHeader);
   // Section-level error line (e.g. a failed oauth_status probe — Fix 2). Hidden
   // until there's something to say; textContent only, per XSS discipline.
@@ -1207,7 +1208,7 @@ function cmcpOpenCredentialsFrame(client) {
       const signOutBtn = document.createElement("button");
       signOutBtn.type = "button";
       signOutBtn.className = "cmcp-btn";
-      signOutBtn.textContent = "Sign out";
+      signOutBtn.textContent = tr("panel.sign_out", "Sign out");
       signOutBtn.disabled = !!state.busy;
       signOutBtn.onclick = () => beginOauthSignout(p);
       info.append(who, signOutBtn);
@@ -1240,10 +1241,10 @@ function cmcpOpenCredentialsFrame(client) {
         copyBtn.type = "button";
         copyBtn.className = "cmcp-btn";
         copyBtn.style.cssText = "padding:2px 8px;font-size:11px";
-        copyBtn.textContent = "Copy URL";
+        copyBtn.textContent = tr("panel.copy_url", "Copy URL");
         copyBtn.onclick = () => {
           navigator.clipboard?.writeText(url).then(
-            () => { copyBtn.textContent = "Copied ✓"; setTimeout(() => { copyBtn.textContent = "Copy URL"; }, 1200); },
+            () => { copyBtn.textContent = tr("panel.copied", "Copied ✓"); setTimeout(() => { copyBtn.textContent = tr("panel.copy_url", "Copy URL"); }, 1200); },
             () => {},
           );
         };
@@ -1252,12 +1253,12 @@ function cmcpOpenCredentialsFrame(client) {
       rowEl.appendChild(urlRow);
       const waiting = document.createElement("div");
       waiting.style.cssText = "opacity:.65;font-size:11px";
-      waiting.textContent = "Waiting for approval…";
+      waiting.textContent = tr("panel.waiting_for_approval", "Waiting for approval…");
       rowEl.appendChild(waiting);
     } else if (state.status === "pending_loopback") {
       const waiting = document.createElement("div");
       waiting.style.cssText = "opacity:.75;font-size:12px";
-      waiting.textContent = "A browser window opened — finish sign-in there…";
+      waiting.textContent = tr("panel.a_browser_window_opened_finish_sign_in", "A browser window opened — finish sign-in there…");
       rowEl.appendChild(waiting);
     } else {
       const signInBtn = document.createElement("button");
@@ -1391,11 +1392,11 @@ function cmcpOpenCredentialsFrame(client) {
   if (experimentalProviders.length) {
     const expHeader = document.createElement("div");
     expHeader.style.cssText = "font-weight:600;margin:10px 0 2px;font-size:12px;opacity:.85";
-    expHeader.textContent = "Experimental";
+    expHeader.textContent = tr("panel.experimental", "Experimental");
     oauthSection.appendChild(expHeader);
     const expNote = document.createElement("div");
     expNote.style.cssText = "opacity:.6;font-size:11px;margin-bottom:8px";
-    expNote.textContent = "Signs in as VS Code — against GitHub's Copilot API terms; use at your own risk.";
+    expNote.textContent = tr("panel.signs_in_as_vs_code_against_github", "Signs in as VS Code — against GitHub's Copilot API terms; use at your own risk.");
     oauthSection.appendChild(expNote);
     for (const p of experimentalProviders) {
       paintOauthRow(p);
@@ -3015,6 +3016,10 @@ const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 // leak in and make the panel dial a dead port.
 const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
+// Panel language. "" means Detect, which defers to ComfyUI's own `Comfy.Locale` and only
+// then to the browser — so the default behaviour is to follow the language the user already
+// chose for ComfyUI rather than to compete with it. An explicit value overrides that.
+const SETTING_LANGUAGE = "comfyui-mcp.language";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
 // #753 — the sidebar had no way to make its text bigger, and the obvious user
@@ -3172,7 +3177,7 @@ function populateModelSelect(sel, backend) {
   sel.replaceChildren();
   const auto = document.createElement("option");
   auto.value = "";
-  auto.textContent = "Auto (let the agent pick)";
+  auto.textContent = tr("panel.auto_let_the_agent_pick", "Auto (let the agent pick)");
   sel.appendChild(auto);
   const seen = new Set([""]);
   if (rows) {
@@ -3257,6 +3262,28 @@ function getSetting(id) {
     return app?.ui?.settings?.getSettingValue?.(id);
   } catch {
     return undefined;
+  }
+}
+/**
+ * Resolve the panel's language and load its catalog.
+ *
+ * Awaited before the sidebar tab is registered so the FIRST paint is already translated —
+ * loading afterwards would render English and then either flicker or, worse, sit there in
+ * English until something happened to re-render.
+ *
+ * Resolves rather than rejects on every failure: a panel that renders in English is fine,
+ * a panel whose startup threw is not.
+ */
+async function applyPanelLocale(explicit) {
+  try {
+    const locale = pickLocale({
+      ourSetting: explicit !== undefined ? explicit : getSetting(SETTING_LANGUAGE),
+      comfyLocale: getSetting("Comfy.Locale"),
+      navigatorLangs: globalThis.navigator?.languages || [globalThis.navigator?.language],
+    });
+    return await loadCatalog(locale, api);
+  } catch {
+    return null;
   }
 }
 /** Conversation ownership. The legacy boolean remains a read-only migration
@@ -3434,7 +3461,7 @@ function panelSettingsList() {
             : "🔒 set";
           status.style.color = "var(--p-green-400,#4ade80)";
         } else {
-          status.textContent = "not set";
+          status.textContent = tr("panel.not_set", "not set");
           status.style.color = "var(--p-text-muted-color,#a1a1aa)";
         }
       };
@@ -3565,7 +3592,7 @@ function panelSettingsList() {
         a.href = "https://github.com/artokun/comfyui-mcp-panel";
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = "⭐ Star comfyui-mcp-panel on GitHub";
+        a.textContent = tr("panel.star_comfyui_mcp_panel_on_github", "⭐ Star comfyui-mcp-panel on GitHub");
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3633,7 +3660,7 @@ function panelSettingsList() {
         a.href = DOCS_URL;
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = "📖 Read the docs";
+        a.textContent = tr("panel.read_the_docs", "📖 Read the docs");
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3647,13 +3674,13 @@ function panelSettingsList() {
       name: "Community",
       category: cat("About", "Community"),
       sortOrder: 199,
-      tooltip: "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab.",
+      tooltip: tr("panel.join_the_comfyui_mcp_discord_announcements_tips", "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab."),
       type: () => {
         const a = document.createElement("a");
         a.href = DISCORD_INVITE_URL;
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = "💬 Join the Discord";
+        a.textContent = tr("panel.join_the_discord", "💬 Join the Discord");
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -3675,7 +3702,7 @@ function panelSettingsList() {
       type: () => {
         const btn = document.createElement("button");
         btn.type = "button";
-        btn.textContent = "🆘 Need help? Contact me on Discord";
+        btn.textContent = tr("panel.need_help_contact_me_on_discord", "🆘 Need help? Contact me on Discord");
         btn.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-primary-color,#8b5cf6);background:var(--p-primary-color,#8b5cf6);" +
@@ -3696,8 +3723,8 @@ function panelSettingsList() {
           ].join("\n");
           try {
             await navigator.clipboard.writeText(diag);
-            btn.textContent = "✅ Diagnostics copied — paste them in Discord";
-            setTimeout(() => { btn.textContent = "🆘 Need help? Contact me on Discord"; }, 4000);
+            btn.textContent = tr("panel.diagnostics_copied_paste_them_in_discord", "✅ Diagnostics copied — paste them in Discord");
+            setTimeout(() => { btn.textContent = tr("panel.need_help_contact_me_on_discord", "🆘 Need help? Contact me on Discord"); }, 4000);
           } catch {
             // clipboard blocked (permissions/insecure context) — still open Discord;
             // the user can describe the issue manually.
@@ -3776,6 +3803,29 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    {
+      id: SETTING_LANGUAGE,
+      name: "Panel language",
+      category: cat("General", "Panel language"),
+      sortOrder: 146,
+      tooltip:
+        "Language for the panel's own text. Detect follows ComfyUI's language setting, so changing ComfyUI's " +
+        "language changes the panel too. Anything not yet translated falls back to English. " +
+        "Takes effect when the panel is reopened or reloaded.",
+      type: "combo",
+      // Same codes and the same self-named labels ComfyUI uses, so the two dropdowns can
+      // never disagree about what "ko" means or read as two different products.
+      options: [{ value: "", text: "Detect (follow ComfyUI)" }, ...LOCALES.map((l) => ({ value: l.code, text: l.text }))],
+      defaultValue: "",
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        // Re-fetch under the new language now so the next render is already translated.
+        // Deliberately NOT a live re-render: the panel builds plain DOM, so retranslating
+        // in place would mean rebuilding a tree that may hold an in-flight run, an open
+        // modal, or half-typed composer text. The tooltip says so rather than pretending.
+        void applyPanelLocale(v);
       },
     },
     {
@@ -4117,14 +4167,14 @@ const FALLBACK_MODELS = [
 ];
 // Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
 const EFFORT_META = {
-  none: { label: "None", small: "no reasoning" },
-  minimal: { label: "Minimal", small: "fastest" },
-  low: { label: "Low", small: "quick" },
-  medium: { label: "Medium", small: "default" },
-  high: { label: "High", small: "thorough" },
-  xhigh: { label: "Extra high", small: "deep" },
-  max: { label: "Max", small: "exhaustive" },
-  ultra: { label: "Ultra", small: "4 parallel agents" },
+  none: { label: tr("panel.none", "None"), small: "no reasoning" },
+  minimal: { label: tr("panel.minimal", "Minimal"), small: "fastest" },
+  low: { label: tr("panel.low", "Low"), small: "quick" },
+  medium: { label: tr("panel.medium", "Medium"), small: "default" },
+  high: { label: tr("panel.high", "High"), small: "thorough" },
+  xhigh: { label: tr("panel.extra_high", "Extra high"), small: "deep" },
+  max: { label: tr("panel.max", "Max"), small: "exhaustive" },
+  ultra: { label: tr("panel.ultra", "Ultra"), small: "4 parallel agents" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
@@ -6810,9 +6860,9 @@ function connectCommand() {
 function makeShellCommandBlock(baseCmd) {
   const forms = { powershell: `cmd /c "${baseCmd}"`, cmd: baseCmd, unix: baseCmd };
   const shells = [
-    { key: "powershell", label: "PowerShell" },
-    { key: "cmd", label: "Command Prompt" },
-    { key: "unix", label: "macOS / Linux" },
+    { key: "powershell", label: tr("panel.powershell", "PowerShell") },
+    { key: "cmd", label: tr("panel.command_prompt", "Command Prompt") },
+    { key: "unix", label: tr("panel.macos_linux", "macOS / Linux") },
   ];
   const isWin = /win/i.test(navigator.platform || navigator.userAgent || "");
   let selected = isWin ? "powershell" : "unix";
@@ -6823,12 +6873,12 @@ function makeShellCommandBlock(baseCmd) {
   pills.style.cssText = "display:flex;gap:0.25rem;flex-wrap:wrap;";
   const code = document.createElement("code");
   code.className = "cmcp-cmd";
-  code.title = "Click to copy";
+  code.title = tr("panel.click_to_copy", "Click to copy");
 
   let flashTimer = null;
   const copy = (text) =>
     navigator.clipboard?.writeText(text).then(() => {
-      code.textContent = "Copied ✓";
+      code.textContent = tr("panel.copied", "Copied ✓");
       if (flashTimer) clearTimeout(flashTimer);
       flashTimer = setTimeout(() => { code.textContent = forms[selected]; }, 900);
     }, () => {});
@@ -8294,7 +8344,7 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(others.length ? { other_selected_items: others } : {}),
       ...(picked.length
         ? {}
-        : { hint: "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it." }),
+        : { hint: tr("panel.nothing_is_selected_on_the_canvas_ask", "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it.") }),
     };
   },
 
@@ -11918,7 +11968,7 @@ const GRAPH_TOOL_EXECUTORS = {
         reasons: reasons.get(String(n.id)) ?? [],
         ...(reasons.get(String(n.id))?.length
           ? {}
-          : { note: "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values." }),
+          : { note: tr("panel.flagged_by_litegraph_but_no_source_explained", "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values.") }),
       }));
 
     // "clean" must reflect EVERY surface, not just per-node/exec errors — a workflow
@@ -11966,7 +12016,7 @@ const GRAPH_TOOL_EXECUTORS = {
               ...summarizeNode(n),
               red_outline: true,
               reasons: [],
-              note: "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error.",
+              note: tr("panel.litegraph_still_shows_this_red_outline_but", "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error."),
             })),
             ...(staleRedFlags.length > MAX_STATE_NODES
               ? {
@@ -12013,7 +12063,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
       last_execution_error: boundExecFailurePayload(lastExecFailure),
       node_errors: nodeErrors,
-      ...(clean ? { note: "no errors recorded since the last execution start" } : {}),
+      ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
     };
   },
 
@@ -14007,7 +14057,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph, LG } = getGraphCtx();
     const GroupCls = LG.LGraphGroup;
     if (typeof GroupCls !== "function") throw new Error("LGraphGroup unavailable on this frontend");
-    const group = new GroupCls(typeof title === "string" && title ? title : "Group");
+    const group = new GroupCls(typeof title === "string" && title ? title : tr("panel.group", "Group"));
     // Resync every node's cached boundingRect to its live pos/size BEFORE we build
     // the box and compute membership. The box is derived from pos/size but
     // membership is tested boundingRect-first (nodeFocusBounds), so any stale
@@ -14900,7 +14950,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // only exists inside the skipped parent and navigated nowhere useful (#412).
   async graph_exit_subgraph() {
     const { app: comfyApp, graph, canvas, rootGraph } = getGraphCtx();
-    if (graph === rootGraph) return { viewing: { scope: "root" }, note: "already at root" };
+    if (graph === rootGraph) return { viewing: { scope: "root" }, note: tr("panel.already_at_root", "already at root") };
     if (typeof canvas.setGraph !== "function") {
       throw new Error("subgraph navigation unavailable on this frontend");
     }
@@ -15700,7 +15750,7 @@ const GRAPH_TOOL_EXECUTORS = {
           endpoint: route,
           method,
           ...rebootTargetFields(),
-          note: "connection dropped (server going down) — reboot initiated",
+          note: tr("panel.connection_dropped_server_going_down_reboot_initiated", "connection dropped (server going down) — reboot initiated"),
         };
       }
     }
@@ -19188,7 +19238,7 @@ function buildPanel() {
   const status = document.createElement("button");
   status.type = "button";
   status.className = "cmcp-status cmcp-status-btn";
-  status.title = "Connection";
+  status.title = tr("panel.connection", "Connection");
   const dot = document.createElement("span");
   dot.className = "cmcp-dot";
   const statusText = document.createElement("span");
@@ -19273,7 +19323,7 @@ function buildPanel() {
   }
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
-  backendLabel.textContent = "Agent backend";
+  backendLabel.textContent = tr("panel.agent_backend", "Agent backend");
   const backendChips = document.createElement("div");
   backendChips.className = "cmcp-backend-chips";
   backendChips.style.cssText =
@@ -19375,7 +19425,7 @@ function buildPanel() {
         chip.title = hint;
         chip.style.opacity = "0.55"; // dim a provider that isn't signed in yet
       } else if (b.running) {
-        chip.title = "Running";
+        chip.title = tr("panel.running", "Running");
       }
       if (id === selectedBackend) {
         chip.style.cssText =
@@ -19388,7 +19438,7 @@ function buildPanel() {
         // picking a ToS-risk provider is always a deliberate, informed act.
         chip.style.borderColor = "var(--p-orange-500,#f59e0b)";
         if (id !== selectedBackend) chip.style.color = "var(--p-orange-500,#f59e0b)";
-        if (!hint) chip.title = "Experimental — signs in as VS Code, against GitHub's Copilot API terms";
+        if (!hint) chip.title = tr("panel.experimental_signs_in_as_vs_code_against", "Experimental — signs in as VS Code, against GitHub's Copilot API terms");
       }
       chip.addEventListener("click", () => connectBackend(id));
       backendChips.appendChild(chip);
@@ -19412,7 +19462,7 @@ function buildPanel() {
 
   const urlLabel = document.createElement("label");
   urlLabel.className = "cmcp-label";
-  urlLabel.textContent = "Bridge URL";
+  urlLabel.textContent = tr("panel.bridge_url", "Bridge URL");
   const urlInput = document.createElement("input");
   urlInput.className = "cmcp-input";
   urlInput.type = "text";
@@ -19424,21 +19474,21 @@ function buildPanel() {
   const connectBtn = document.createElement("button");
   connectBtn.className = "cmcp-btn";
   connectBtn.type = "button";
-  connectBtn.textContent = "Connect";
+  connectBtn.textContent = tr("panel.connect", "Connect");
   connectBtn.style.cssText =
     "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
 
   const disconnectBtn = document.createElement("button");
   disconnectBtn.className = "cmcp-btn";
   disconnectBtn.type = "button";
-  disconnectBtn.textContent = "Disconnect";
+  disconnectBtn.textContent = tr("panel.disconnect", "Disconnect");
   disconnectBtn.hidden = true;
 
   const saveBtn = document.createElement("button");
   saveBtn.className = "cmcp-btn";
   saveBtn.type = "button";
-  saveBtn.textContent = "Reconnect";
-  saveBtn.title = "Re-open the bridge connection at the URL above";
+  saveBtn.textContent = tr("panel.reconnect", "Reconnect");
+  saveBtn.title = tr("panel.re_open_the_bridge_connection_at_the", "Re-open the bridge connection at the URL above");
   saveBtn.style.opacity = "0.8";
 
   // Opens the orchestrator's credentials console (API keys) in an in-panel
@@ -19447,8 +19497,8 @@ function buildPanel() {
   const apiKeysBtn = document.createElement("button");
   apiKeysBtn.className = "cmcp-btn";
   apiKeysBtn.type = "button";
-  apiKeysBtn.textContent = "API Keys";
-  apiKeysBtn.title = "Open the credentials console";
+  apiKeysBtn.textContent = tr("panel.api_keys", "API Keys");
+  apiKeysBtn.title = tr("panel.open_the_credentials_console", "Open the credentials console");
   apiKeysBtn.style.opacity = "0.8";
   apiKeysBtn.addEventListener("click", () => {
     settingsBox.hidden = true;
@@ -19461,8 +19511,8 @@ function buildPanel() {
   const promptsBtn = document.createElement("button");
   promptsBtn.className = "cmcp-btn";
   promptsBtn.type = "button";
-  promptsBtn.textContent = "Prompts";
-  promptsBtn.title = "Edit the agent's system prompts (persona, per-backend, Ask-AI)";
+  promptsBtn.textContent = tr("panel.prompts", "Prompts");
+  promptsBtn.title = tr("panel.edit_the_agent_s_system_prompts_persona", "Edit the agent's system prompts (persona, per-backend, Ask-AI)");
   promptsBtn.style.opacity = "0.8";
   promptsBtn.addEventListener("click", () => {
     if (!cmcpConsoleUrl || !cmcpConsoleToken) {
@@ -19527,7 +19577,7 @@ function buildPanel() {
     savePrefs(prefs);
   });
   const sbText = document.createElement("span");
-  sbText.textContent = "Show the agent a storyboard of generated videos";
+  sbText.textContent = tr("panel.show_the_agent_a_storyboard_of_generated", "Show the agent a storyboard of generated videos");
   sbWrap.append(sbToggle, sbText);
 
   advWrap.append(urlLabel, urlInput, sbWrap);
@@ -19535,7 +19585,7 @@ function buildPanel() {
   const advToggle = document.createElement("button");
   advToggle.type = "button";
   advToggle.className = "cmcp-link";
-  advToggle.textContent = "Advanced ▸";
+  advToggle.textContent = tr("panel.advanced", "Advanced ▸");
   advToggle.style.cssText =
     "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
   advToggle.addEventListener("click", () => {
@@ -19568,7 +19618,7 @@ function buildPanel() {
   emptyIcon.className = "pi pi-comments";
   const emptyTitle = document.createElement("div");
   emptyTitle.className = "cmcp-empty-title";
-  emptyTitle.textContent = "Your agent is at your canvas";
+  emptyTitle.textContent = tr("panel.your_agent_is_at_your_canvas", "Your agent is at your canvas");
   const emptyBody = document.createElement("div");
   emptyBody.textContent =
     "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.";
@@ -19611,37 +19661,37 @@ function buildPanel() {
   // NEITHER provider is ready (CLI on PATH + a login on disk). The moment one is
   // ready it hides and the panel auto-picks that provider (see applyReadiness).
   const PROVIDER_SETUP = {
-    claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
-    codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
-    gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
+    claude: { label: tr("panel.claude", "Claude"), install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
+    codex: { label: tr("panel.chatgpt", "ChatGPT"), install: "npm i -g @openai/codex", login: "codex login" },
+    gemini: { label: tr("panel.gemini", "Gemini"), install: "npm i -g @google/gemini-cli", login: "gemini" },
     // Google's Antigravity CLI (agy) — the individual-tier Google-subscription
     // path; auth lives in the OS keyring (no in-panel OAuth, no API-key slot).
-    antigravity: { label: "Antigravity (Google subscription)", install: "install the Antigravity CLI (agy)", login: "agy" },
+    antigravity: { label: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)"), install: "install the Antigravity CLI (agy)", login: "agy" },
     // pi.dev — a multi-provider coding CLI. "install" is the official installer;
     // "login" is configuring any provider (env key or `/login`). NOTE: pi has no
     // MCP, so a pi agent has no ComfyUI panel tools (see the ready banner).
-    pi: { label: "Pi (pi.dev, multi-provider CLI)", install: "curl -fsSL https://pi.dev/install.sh | sh", login: "set a provider API key, or run `pi` then /login" },
-    grok: { label: "Grok", install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
-    kimi: { label: "Kimi", install: "install the Kimi CLI (Moonshot)", login: "kimi" },
+    pi: { label: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)"), install: "curl -fsSL https://pi.dev/install.sh | sh", login: "set a provider API key, or run `pi` then /login" },
+    grok: { label: tr("panel.grok", "Grok"), install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
+    kimi: { label: tr("panel.kimi", "Kimi"), install: "install the Kimi CLI (Moonshot)", login: "kimi" },
     // No CLI — "setup" is pasting a Moonshot platform API key (Kimi K3).
-    moonshot: { label: "Kimi K3 (Moonshot, hosted)", install: "", login: "Set MOONSHOT_API_KEY via API Keys (▾ menu by “connected”)" },
+    moonshot: { label: tr("panel.kimi_k3_moonshot_hosted", "Kimi K3 (Moonshot, hosted)"), install: "", login: "Set MOONSHOT_API_KEY via API Keys (▾ menu by “connected”)" },
     // No CLI — "setup" is pasting a z.ai coding-plan API key (GLM).
-    glm: { label: "GLM (z.ai coding plan, hosted)", install: "", login: "Set ZAI_API_KEY via API Keys (▾ menu by “connected”)" },
-    minimax: { label: "MiniMax (hosted)", install: "", login: "Set MINIMAX_API_KEY via API Keys (▾ menu by “connected”)" },
+    glm: { label: tr("panel.glm_z_ai_coding_plan_hosted", "GLM (z.ai coding plan, hosted)"), install: "", login: "Set ZAI_API_KEY via API Keys (▾ menu by “connected”)" },
+    minimax: { label: tr("panel.minimax_hosted", "MiniMax (hosted)"), install: "", login: "Set MINIMAX_API_KEY via API Keys (▾ menu by “connected”)" },
     // No sign-in — "login" is pulling OUR FINE-TUNE: gemma4 QLoRA-trained on
     // 1,055 server-verified comfyui-mcp trajectories (hf.co/artokun/
     // gemma4-comfyui-mcp) — it knows this tool suite natively. :e2b fits
     // ~2 GB VRAM, :12b ~8 GB.
-    ollama: { label: "Ollama (local, free — our ComfyUI fine-tune)", install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
+    ollama: { label: tr("panel.ollama_local_free_our_comfyui_fine_tune", "Ollama (local, free — our ComfyUI fine-tune)"), install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
     // No CLI — "setup" is pasting an OpenRouter API key (Settings › OpenRouter).
-    openrouter: { label: "OpenRouter (hosted, 1M · SOTA)", install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
+    openrouter: { label: tr("panel.openrouter_hosted_1m_sota", "OpenRouter (hosted, 1M · SOTA)"), install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
     // No sign-in — "login" is starting the local server with a tool-calling model.
-    lmstudio: { label: "LM Studio (local, free)", install: "winget install ElementLabs.LMStudio", login: "LM Studio → Developer → Start Server (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)" },
+    lmstudio: { label: tr("panel.lm_studio_local_free", "LM Studio (local, free)"), install: "winget install ElementLabs.LMStudio", login: "LM Studio → Developer → Start Server (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)" },
     // No sign-in — "login" is launching llama-server; --jinja is REQUIRED for tool calling.
-    llamacpp: { label: "llama.cpp (local, free)", install: "winget install ggml.llamacpp", login: "llama-server -m model.gguf --jinja -c 16384" },
+    llamacpp: { label: tr("panel.llama_cpp_local_free", "llama.cpp (local, free)"), install: "winget install ggml.llamacpp", login: "llama-server -m model.gguf --jinja -c 16384" },
     // No CLI — "setup" is pointing the panel at any OpenAI-compatible /v1
     // (vLLM, DeepSeek, Together, Azure, a llama-server on another box…).
-    custom: { label: "Custom endpoint (any OpenAI-compatible)", install: "", login: "Set the base URL (and API key if needed) in Settings › Custom endpoint" },
+    custom: { label: tr("panel.custom_endpoint_any_openai_compatible", "Custom endpoint (any OpenAI-compatible)"), install: "", login: "Set the base URL (and API key if needed) in Settings › Custom endpoint" },
   };
   let anyReady = false;
   // (autoPickDone is module-scoped now — once per PAGE, not per mount, so workflow
@@ -19654,7 +19704,7 @@ function buildPanel() {
     const code = document.createElement("code");
     code.className = "cmcp-cmd";
     code.textContent = cmd;
-    code.title = "Click to copy";
+    code.title = tr("panel.click_to_copy", "Click to copy");
     code.addEventListener("click", () => {
       navigator.clipboard?.writeText(cmd).then(() => appendSystem("Command copied."), () => {});
     });
@@ -19665,7 +19715,7 @@ function buildPanel() {
     onboard.replaceChildren();
     const title = document.createElement("div");
     title.className = "cmcp-onboard-title";
-    title.textContent = "Sign in to an AI provider to use the agent";
+    title.textContent = tr("panel.sign_in_to_an_ai_provider_to", "Sign in to an AI provider to use the agent");
     const sub = document.createElement("div");
     sub.className = "cmcp-onboard-sub";
     sub.textContent =
@@ -19685,7 +19735,7 @@ function buildPanel() {
       if (!st.cli) {
         const s1 = document.createElement("div");
         s1.className = "cmcp-onboard-step";
-        s1.textContent = "1. Install the CLI";
+        s1.textContent = tr("panel.1_install_the_cli", "1. Install the CLI");
         col.append(s1, onboardCmd(meta.install));
       }
       const s2 = document.createElement("div");
@@ -19701,7 +19751,7 @@ function buildPanel() {
     runCol.className = "cmcp-onboard-col";
     const runProv = document.createElement("div");
     runProv.className = "cmcp-onboard-prov";
-    runProv.textContent = "Then start the agent (on this machine)";
+    runProv.textContent = tr("panel.then_start_the_agent_on_this_machine", "Then start the agent (on this machine)");
     runCol.appendChild(runProv);
     // No URL needed: the panel sends the ComfyUI host (window.location) in its
     // hello, so a bare `connect` auto-targets whatever ComfyUI is open. Offer the
@@ -19710,7 +19760,7 @@ function buildPanel() {
     runCol.append(makeShellCommandBlock(connectCommand()));
     const clickNote = document.createElement("div");
     clickNote.className = "cmcp-onboard-step";
-    clickNote.textContent = "…then click Connect above.";
+    clickNote.textContent = tr("panel.then_click_connect_above", "…then click Connect above.");
     runCol.appendChild(clickNote);
     onboard.appendChild(runCol);
   }
@@ -19941,7 +19991,7 @@ function buildPanel() {
         const handle = document.createElement("span");
         handle.className = "cmcp-pending-handle";
         handle.draggable = true;
-        handle.title = "Drag to reorder";
+        handle.title = tr("panel.drag_to_reorder", "Drag to reorder");
         handle.innerHTML = '<i class="pi pi-bars"></i>';
         handle.addEventListener("dragstart", (e) => {
           e.dataTransfer.setData("text/plain", mid);
@@ -19986,7 +20036,7 @@ function buildPanel() {
       dl.className = "cmcp-dl";
       const head = document.createElement("div");
       head.className = "cmcp-tray-head";
-      head.textContent = "Downloads";
+      head.textContent = tr("panel.downloads", "Downloads");
       dl.appendChild(head);
       for (const d of downloadItems) {
         const total = d && Number(d.total) > 0 ? Number(d.total) : 0;
@@ -20137,12 +20187,12 @@ function buildPanel() {
     ring.appendChild(c);
   }
   const ringTitle = document.createElementNS(SVG_NS, "title");
-  ringTitle.textContent = "Context window — fills as the agent reports usage";
+  ringTitle.textContent = tr("panel.context_window_fills_as_the_agent_reports", "Context window — fills as the agent reports usage");
   ring.appendChild(ringTitle);
   // Compact context-usage readout shown right after the ring.
   const ctxLabel = document.createElement("span");
   ctxLabel.className = "cmcp-ctx";
-  ctxLabel.title = "Context window used";
+  ctxLabel.title = tr("panel.context_window_used", "Context window used");
   const CTX_KEY = "comfyui-mcp.panel.ctxPct";
   ctxLabel.textContent = "—"; // until the first usage report
 
@@ -20261,7 +20311,7 @@ function buildPanel() {
   modelChip.className = "cmcp-chip";
   // Initial title only — refreshModelChip() replaces it with the live model and
   // effort, since the name can be ellipsised at narrow widths.
-  modelChip.title = "Model & reasoning effort for the background agent";
+  modelChip.title = tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
   const modelChipLabel = document.createElement("span");
   modelChipLabel.className = "name";
   const modelChipEffort = document.createElement("span");
@@ -20456,8 +20506,8 @@ function buildPanel() {
   const modelSearchInput = document.createElement("input");
   modelSearchInput.type = "text";
   modelSearchInput.className = "cmcp-modelsearch-input";
-  modelSearchInput.placeholder = "Search models across connected providers…";
-  modelSearchInput.setAttribute("aria-label", "Search models across connected providers");
+  modelSearchInput.placeholder = tr("panel.search_models_across_connected_providers", "Search models across connected providers…");
+  modelSearchInput.setAttribute("aria-label", tr("panel.search_models_across_connected_providers_2", "Search models across connected providers"));
   const modelSearchCap = document.createElement("div");
   modelSearchCap.className = "cmcp-modelsearch-cap";
   // Recently-used section (non-virtualized; bounded to RECENTS_CAP). Shown only in
@@ -20692,8 +20742,8 @@ function buildPanel() {
     const x = document.createElement("button");
     x.type = "button";
     x.className = "cmcp-modelrecent-x";
-    x.title = "Remove from recently used";
-    x.setAttribute("aria-label", "Remove from recently used");
+    x.title = tr("panel.remove_from_recently_used", "Remove from recently used");
+    x.setAttribute("aria-label", tr("panel.remove_from_recently_used", "Remove from recently used"));
     const xi = document.createElement("i");
     xi.className = "pi pi-times";
     x.appendChild(xi);
@@ -20723,7 +20773,7 @@ function buildPanel() {
     modelRecents.hidden = false;
     const h = document.createElement("div");
     h.className = "cmcp-pop-section";
-    h.textContent = "Recently used";
+    h.textContent = tr("panel.recently_used", "Recently used");
     modelRecents.appendChild(h);
     // Prefer the live aggregated row (fresh label/effort) when the provider is
     // connected; otherwise fall back to the stored display fields.
@@ -20778,7 +20828,7 @@ function buildPanel() {
       } else {
         // Empty query with nothing left to recommend (e.g. all models are recents).
         modelEmpty.hidden = recentCount > 0;
-        if (!recentCount) modelEmpty.textContent = "No models yet — connect a provider to search.";
+        if (!recentCount) modelEmpty.textContent = tr("panel.no_models_yet_connect_a_provider_to", "No models yet — connect a provider to search.");
         modelSearchCap.textContent = "";
       }
       return;
@@ -21311,7 +21361,7 @@ function buildPanel() {
   const openRunpod = () => openSidePanelTab("local");
   const civitaiBtn = toolbarBtn("pi-circle", "CivitAI");
   civitaiBtn.querySelector(".pi").remove();
-  civitaiBtn.title = "CivitAI explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
+  civitaiBtn.title = tr("panel.civitai_explorer_browse_and_pull_models_loras", "CivitAI explorer — browse and pull models, LoRAs, and workflows without leaving the panel.");
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
   // Clicking the already-open CivitAI tab toggles it closed.
   civitaiBtn.addEventListener("click", () => toggleSidePanelTab("civitai", () => openCivitai({ dock: true })));
@@ -21342,7 +21392,7 @@ function buildPanel() {
   // squares (mini-app launcher mark), currentColor like the neighbors.
   const appsBtn = toolbarBtn("pi-circle", "Apps");
   appsBtn.querySelector(".pi").remove();
-  appsBtn.title = "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.";
+  appsBtn.title = tr("panel.apps_one_click_micro_apps_built_from", "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.");
   appsBtn.addEventListener("click", () => toggleSidePanelTab("apps", () => openApps()));
   {
     const svgNs = "http://www.w3.org/2000/svg";
@@ -21365,7 +21415,7 @@ function buildPanel() {
   // Same side-panel treatment as the CivitAI browser; dumbbell mark via currentColor.
   const trainingBtn = toolbarBtn("pi-circle", "Training");
   trainingBtn.querySelector(".pi").remove();
-  trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
+  trainingBtn.title = tr("panel.lora_training_train_a_character_lora_locally", "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).");
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
   trainingBtn.addEventListener("click", () => toggleSidePanelTab("training", () => openTraining({ dock: true })));
   {
@@ -21393,7 +21443,7 @@ function buildPanel() {
   let _comfyuiTarget = null; // last comfyui_target frame
   const runpodBtn = toolbarBtn("pi-circle", "Local");
   runpodBtn.querySelector(".pi").remove();
-  runpodBtn.title = "RunPod — run this session on a cloud GPU (deploy / start / stop / connect), or switch back to local.";
+  runpodBtn.title = tr("panel.runpod_run_this_session_on_a_cloud", "RunPod — run this session on a cloud GPU (deploy / start / stop / connect), or switch back to local.");
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -21433,9 +21483,9 @@ function buildPanel() {
     if (onPod && s && s.watching) {
       label.textContent = s.name || s.pod_id || "RunPod";
     } else if (onPod) {
-      label.textContent = "RunPod";
+      label.textContent = tr("panel.runpod", "RunPod");
     } else {
-      label.textContent = "Local";
+      label.textContent = tr("panel.local", "Local");
     }
     runpodBtn.classList.toggle("cmcp-runpod-onpod", onPod);
     const alertCount = _runpodAlerts.size;
@@ -21981,7 +22031,7 @@ function buildPanel() {
       const edit = document.createElement("button");
       edit.type = "button";
       edit.className = "cmcp-edit-btn";
-      edit.title = "Edit & roll back from this message";
+      edit.title = tr("panel.edit_roll_back_from_this_message", "Edit & roll back from this message");
       edit.innerHTML = '<i class="pi pi-pencil"></i>';
       const rewindAnchor = opts.rewindAnchor ?? null;
       edit.addEventListener("click", () => openRollbackModal({ mid: opts.mid, text, anchor: rewindAnchor }));
@@ -22100,7 +22150,7 @@ function buildPanel() {
     caption.className = "cmcp-lightbox-caption";
     const openBtn = document.createElement("button");
     openBtn.type = "button"; openBtn.className = "cmcp-lightbox-open";
-    openBtn.textContent = "Open original"; openBtn.title = "Open in a new browser tab";
+    openBtn.textContent = tr("panel.open_original", "Open original"); openBtn.title = tr("panel.open_in_a_new_browser_tab", "Open in a new browser tab");
 
     // Release any decoded <video> before it leaves the DOM (memory + stop audio).
     const releaseVideo = () => {
@@ -22252,7 +22302,7 @@ function buildPanel() {
     label.className = "cmcp-media-stub-name";
     label.textContent = name || (kind === "video" ? "Video" : "Image");
     const hint = document.createElement("span");
-    hint.textContent = "· hidden, click to show";
+    hint.textContent = tr("panel.hidden_click_to_show", "· hidden, click to show");
     stub.append(icon, label, hint);
     card.appendChild(stub);
 
@@ -22473,8 +22523,8 @@ function buildPanel() {
     const expandBtn = document.createElement("button");
     expandBtn.type = "button";
     expandBtn.className = "cmcp-media-expand";
-    expandBtn.title = "View full size";
-    expandBtn.setAttribute("aria-label", "View full size");
+    expandBtn.title = tr("panel.view_full_size", "View full size");
+    expandBtn.setAttribute("aria-label", tr("panel.view_full_size", "View full size"));
     expandBtn.innerHTML = "⛶";
     expandBtn.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
     tools.appendChild(expandBtn);
@@ -22563,7 +22613,7 @@ function buildPanel() {
     card.appendChild(a);
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
-    hint.textContent = "The panel can't preview this file type — open or download it.";
+    hint.textContent = tr("panel.the_panel_can_t_preview_this_file", "The panel can't preview this file type — open or download it.");
     card.appendChild(hint);
     log.appendChild(card);
     scrollLog();
@@ -22819,7 +22869,7 @@ function buildPanel() {
     otherRow.style.cssText = "display:flex;gap:0.3rem;margin-top:0.4rem;";
     const other = document.createElement("input");
     other.type = "text";
-    other.placeholder = "Other… (type your own answer)";
+    other.placeholder = tr("panel.other_type_your_own_answer", "Other… (type your own answer)");
     other.style.cssText =
       "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
@@ -22989,7 +23039,7 @@ function buildPanel() {
     input.type = "password";
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = "Paste token…";
+    input.placeholder = tr("panel.paste_token", "Paste token…");
     input.style.cssText =
       "flex:1 1 10rem;min-width:0;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
@@ -23040,7 +23090,7 @@ function buildPanel() {
     submit.style.cssText =
       "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
-    submit.textContent = "Save";
+    submit.textContent = tr("panel.save", "Save");
     submit.addEventListener("click", () => finish(input.value.trim()));
     btns.appendChild(submit);
 
@@ -23049,7 +23099,7 @@ function buildPanel() {
     skip.style.cssText =
       "flex:none;padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:transparent;color:inherit;cursor:pointer;font-size:0.8rem;";
-    skip.textContent = "Skip";
+    skip.textContent = tr("panel.skip", "Skip");
     skip.addEventListener("click", () => finish(""));
     btns.appendChild(skip);
     row.appendChild(btns);
@@ -23423,7 +23473,7 @@ function buildPanel() {
     det.className = "cmcp-think";
     det.open = true;
     const sum = document.createElement("summary");
-    sum.textContent = "Thinking…";
+    sum.textContent = tr("panel.thinking", "Thinking…");
     const body = document.createElement("div");
     body.className = "cmcp-think-body";
     det.append(sum, body);
@@ -24016,8 +24066,8 @@ function buildPanel() {
     const search = document.createElement("input");
     search.type = "search";
     search.className = "cmcp-hist-search";
-    search.placeholder = "Search chats…";
-    search.setAttribute("aria-label", "Search chat history");
+    search.placeholder = tr("panel.search_chats", "Search chats…");
+    search.setAttribute("aria-label", tr("panel.search_chat_history", "Search chat history"));
     search.dataset.testid = "history-search";
     const exportBtn = iconBtn("pi-download", "Export all chat history");
     exportBtn.dataset.testid = "history-export";
@@ -24174,7 +24224,7 @@ function buildPanel() {
         row.classList.add("foreign-workflow");
       } else if (legacyReadonly) {
         item.disabled = true;
-        item.title = "A pre-upgrade copy kept for reference — it can't be resumed";
+        item.title = tr("panel.a_pre_upgrade_copy_kept_for_reference", "A pre-upgrade copy kept for reference — it can't be resumed");
         row.classList.add("foreign-workflow");
       }
       item.addEventListener("click", () => {
@@ -24278,16 +24328,16 @@ function buildPanel() {
     footer.className = "cmcp-hist-footer";
     const note = document.createElement("p");
     note.className = "cmcp-hist-note";
-    note.textContent = "Transcripts are stored in this browser using IndexedDB.";
+    note.textContent = tr("panel.transcripts_are_stored_in_this_browser_using", "Transcripts are stored in this browser using IndexedDB.");
     const clear = document.createElement("button");
     clear.type = "button";
     clear.className = "cmcp-hist-clear";
     clear.disabled = !threads.length;
-    clear.title = "Permanently clear chat history for every workflow in this browser";
+    clear.title = tr("panel.permanently_clear_chat_history_for_every_workflow", "Permanently clear chat history for every workflow in this browser");
     const clearIcon = document.createElement("i");
     clearIcon.className = "pi pi-trash";
     const clearLabel = document.createElement("span");
-    clearLabel.textContent = "Clear all history";
+    clearLabel.textContent = tr("panel.clear_all_history", "Clear all history");
     clear.append(clearIcon, clearLabel);
     clear.addEventListener("click", async () => {
       if (!threads.length) return;
@@ -24298,11 +24348,11 @@ function buildPanel() {
       );
       if (!confirmed) return;
       clear.disabled = true;
-      clearLabel.textContent = "Clearing…";
+      clearLabel.textContent = tr("panel.clearing", "Clearing…");
       const result = await historyStore.clearAll(threads, historyMeta);
       if (!result?.ok || !result.snapshot) {
         clear.disabled = false;
-        clearLabel.textContent = "Clear all history";
+        clearLabel.textContent = tr("panel.clear_all_history", "Clear all history");
         appendSystem(
           result?.code === "history-clear-canonical-unavailable"
             ? "Chat history could not be cleared because IndexedDB is unavailable or blocked. " +
@@ -26919,7 +26969,7 @@ function buildPanel() {
     lsSet(USER_DISCONNECTED_KEY, null);
     connecting = true;
     connectBtn.disabled = true;
-    connectBtn.textContent = "Starting…";
+    connectBtn.textContent = tr("panel.starting", "Starting…");
     // Honor whatever is typed in the Bridge URL field — Connect previously
     // ignored it (only Reconnect applied it), so editing the port (e.g. 9181)
     // then clicking Connect still hit the old URL. setUrl persists + reconnects.
@@ -27338,7 +27388,7 @@ function buildPanel() {
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
     connectBtn.disabled = false;
-    connectBtn.textContent = "Connect";
+    connectBtn.textContent = tr("panel.connect", "Connect");
     statusText.textContent = "disconnected";
     dot.className = "cmcp-dot";
     settingsBox.hidden = false;
@@ -27375,36 +27425,36 @@ function buildPanel() {
   }
 
   const SLASH_COMMANDS = [
-    { cmd: "/new", icon: "pi-plus", hint: "start a new chat", run: () => newChat() },
+    { cmd: "/new", icon: "pi-plus", hint: tr("panel.start_a_new_chat", "start a new chat"), run: () => newChat() },
     {
       cmd: "/fit",
       icon: "pi-window-maximize",
-      hint: "fit the canvas to the graph",
+      hint: tr("panel.fit_the_canvas_to_the_graph", "fit the canvas to the graph"),
       run: () => runLocalCommand("graph_canvas", { action: "fit" }),
     },
-    { cmd: "/run", icon: "pi-play", hint: "queue the open workflow", run: () => runLocalCommand("graph_run", {}) },
+    { cmd: "/run", icon: "pi-play", hint: tr("panel.queue_the_open_workflow", "queue the open workflow"), run: () => runLocalCommand("graph_run", {}) },
     {
       cmd: "/reload",
       icon: "pi-sync",
-      hint: "soft-reload the agent (new code, keeps ComfyUI + this chat)",
+      hint: tr("panel.soft_reload_the_agent_new_code_keeps", "soft-reload the agent (new code, keeps ComfyUI + this chat)"),
       run: () => softReload("user", "orchestrator"),
     },
     {
       cmd: "/reload-ui",
       icon: "pi-refresh",
-      hint: "reload just the panel UI (new frontend code, keeps the session)",
+      hint: tr("panel.reload_just_the_panel_ui_new_frontend", "reload just the panel UI (new frontend code, keeps the session)"),
       run: () => softReload("user", "frontend"),
     },
     {
       cmd: "/restart",
       icon: "pi-refresh",
-      hint: "restart the agent backend — recover an unresponsive agent",
+      hint: tr("panel.restart_the_agent_backend_recover_an_unresponsive", "restart the agent backend — recover an unresponsive agent"),
       run: () => hardRestart("user"),
     },
     {
       cmd: "/revert",
       icon: "pi-undo",
-      hint: "undo the last turn's graph edits — revert the canvas to before your last message",
+      hint: tr("panel.undo_the_last_turn_s_graph_edits", "undo the last turn's graph edits — revert the canvas to before your last message"),
       run: async () => {
         const outcome = await revertGraphToLastSnapshot();
         const label = outcome?.snapshot?.label;
@@ -27420,13 +27470,13 @@ function buildPanel() {
     {
       cmd: "/errors",
       icon: "pi-info-circle",
-      hint: "show the last execution errors",
+      hint: tr("panel.show_the_last_execution_errors", "show the last execution errors"),
       run: () => runLocalCommand("graph_get_errors", {}),
     },
     {
       cmd: "/docs",
       icon: "pi-book",
-      hint: "open the docs — guides for the panel, tools, local LLMs and troubleshooting",
+      hint: tr("panel.open_the_docs_guides_for_the_panel", "open the docs — guides for the panel, tools, local LLMs and troubleshooting"),
       // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
       // navigation hijacks the whole window with no way back.
       //
@@ -27450,7 +27500,7 @@ function buildPanel() {
     {
       cmd: "/help",
       icon: "pi-question-circle",
-      hint: "list commands",
+      hint: tr("panel.list_commands", "list commands"),
       // These are PANEL SHORTCUTS, not a list of what the agent can do — so /help
       // says where the rest lives rather than leaving the reader to conclude this is
       // everything (#111). Joined with the same " · " as the rest of the line, NOT
@@ -27778,7 +27828,7 @@ function buildPanel() {
       chip.type = "button";
       chip.className = "cmcp-attach-chip";
       if (att.id === openPreviewId) chip.classList.add("open");
-      chip.title = "Click to preview";
+      chip.title = tr("panel.click_to_preview", "Click to preview");
       if (att.kind === "image" && att.dataUrl) {
         const img = document.createElement("img");
         img.className = "cmcp-attach-thumb";
@@ -27805,7 +27855,7 @@ function buildPanel() {
       const rm = document.createElement("span");
       rm.className = "cmcp-attach-rm";
       rm.setAttribute("role", "button");
-      rm.title = "Remove attachment";
+      rm.title = tr("panel.remove_attachment", "Remove attachment");
       const rmi = document.createElement("i");
       rmi.className = "pi pi-times";
       rm.appendChild(rmi);
@@ -28142,7 +28192,7 @@ function buildPanel() {
   let recognition = null;
   if (!SR) {
     micBtn.disabled = true;
-    micBtn.title = "Voice input is not supported in this browser";
+    micBtn.title = tr("panel.voice_input_is_not_supported_in_this", "Voice input is not supported in this browser");
   }
   micBtn.addEventListener("click", () => {
     if (!SR) return;
@@ -28307,7 +28357,7 @@ function buildPanel() {
     modal.className = "cmcp-modal";
     const title = document.createElement("div");
     title.className = "cmcp-modal-title";
-    title.textContent = "Roll back & edit";
+    title.textContent = tr("panel.roll_back_edit", "Roll back & edit");
     const ta = document.createElement("textarea");
     ta.className = "cmcp-modal-text";
     ta.rows = 3;
@@ -28316,9 +28366,9 @@ function buildPanel() {
     scopeWrap.className = "cmcp-modal-scopes";
     let chosen = "both";
     const scopes = [
-      { v: "both", label: "Code + conversation", hint: "revert the canvas AND rewind the agent's memory" },
-      { v: "code", label: "Code only", hint: "revert the canvas; keep the conversation" },
-      { v: "conversation", label: "Conversation only", hint: "rewind the agent's memory; keep the canvas" },
+      { v: "both", label: tr("panel.code_conversation", "Code + conversation"), hint: tr("panel.revert_the_canvas_and_rewind_the_agent", "revert the canvas AND rewind the agent's memory") },
+      { v: "code", label: tr("panel.code_only", "Code only"), hint: tr("panel.revert_the_canvas_keep_the_conversation", "revert the canvas; keep the conversation") },
+      { v: "conversation", label: tr("panel.conversation_only", "Conversation only"), hint: tr("panel.rewind_the_agent_s_memory_keep_the", "rewind the agent's memory; keep the canvas") },
     ];
     for (const s of scopes) {
       const lbl = document.createElement("label");
@@ -28343,11 +28393,11 @@ function buildPanel() {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "cmcp-btn";
-    cancel.textContent = "Cancel";
+    cancel.textContent = tr("panel.cancel", "Cancel");
     const go = document.createElement("button");
     go.type = "button";
     go.className = "cmcp-btn cmcp-btn-primary";
-    go.textContent = "Roll back & resend";
+    go.textContent = tr("panel.roll_back_resend", "Roll back & resend");
     // The canvas rollback is an ASYNC load, so this modal outlives a single tick and
     // needs explicit lifecycle state: `settled` makes the primary action single-shot
     // (a double-click would otherwise start two restores and BOTH continuations
@@ -28499,14 +28549,14 @@ function buildPanel() {
     modal.className = "cmcp-modal";
     const title = document.createElement("div");
     title.className = "cmcp-modal-title";
-    title.textContent = "Remote control — pair a phone";
+    title.textContent = tr("panel.remote_control_pair_a_phone", "Remote control — pair a phone");
 
     const scopeWrap = document.createElement("div");
     scopeWrap.className = "cmcp-modal-scopes";
     let mode = "lan";
     const modes = [
-      { v: "lan", label: "Local wifi", hint: "phone on the same network — stays inside your network" },
-      { v: "tunnel", label: "Internet", hint: "pair from anywhere via an encrypted tunnel" },
+      { v: "lan", label: tr("panel.local_wifi", "Local wifi"), hint: tr("panel.phone_on_the_same_network_stays_inside", "phone on the same network — stays inside your network") },
+      { v: "tunnel", label: tr("panel.internet", "Internet"), hint: tr("panel.pair_from_anywhere_via_an_encrypted_tunnel", "pair from anywhere via an encrypted tunnel") },
     ];
 
     const qrWrap = document.createElement("div");
@@ -28545,7 +28595,7 @@ function buildPanel() {
         try {
           drawQrToCanvas(canvas, pairingQrText(res.url));
           canvas.hidden = false;
-          statusMsg.textContent = "Scan with your phone camera or the app";
+          statusMsg.textContent = tr("panel.scan_with_your_phone_camera_or_the", "Scan with your phone camera or the app");
           urlLine.textContent = res.url;
           // Weighted by survivesRestart: a quiet confirmation when it holds, a
           // visible caution when it does not. The SENTENCE is the orchestrator's
@@ -28559,7 +28609,7 @@ function buildPanel() {
             durabilityLine.hidden = false;
           }
         } catch {
-          statusMsg.textContent = "⚠ Could not render the QR code.";
+          statusMsg.textContent = tr("panel.could_not_render_the_qr_code", "⚠ Could not render the QR code.");
         }
       };
       client.sendFrame({ type: "pair", mode });
@@ -28590,7 +28640,7 @@ function buildPanel() {
     const doneBtn = document.createElement("button");
     doneBtn.type = "button";
     doneBtn.className = "cmcp-btn cmcp-btn-primary";
-    doneBtn.textContent = "Done";
+    doneBtn.textContent = tr("panel.done", "Done");
     const close = () => {
       pendingPair = null;
       overlay.remove();
@@ -29252,7 +29302,7 @@ function buildPanel() {
     }
     paintSecret({
       label: `${friendly} API key`,
-      hint: "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context.",
+      hint: tr("panel.sent_straight_to_the_orchestrator_s_0600", "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context."),
     })
       .then((value) => {
         if (!value) return;
@@ -29631,6 +29681,11 @@ function registerExtensionWhenReady(tries = 0) {
     // never persist a raw value here. See panelSettingsList() above.
     settings: panelSettingsList(),
     async setup() {
+      // FIRST: resolve the language and pull the catalog, before anything paints. Every
+      // failure path inside resolves to an English panel rather than throwing, so this
+      // cannot block startup — but it must be AWAITED, because a catalog that arrives
+      // after the first render leaves the panel in English until something re-renders it.
+      await applyPanelLocale();
       // #458 SEED OBSERVED-BACKEND-HISTORY at startup with the FULL baseline /object_info.
       // This runs after ComfyUI's core has already fetched /object_info (extensions set
       // up post-init), so it records every pack PRESENT at page load — BEFORE any of them
@@ -29652,13 +29707,13 @@ function registerExtensionWhenReady(tries = 0) {
 
       const tabSpec = {
         id: tabId,
-        title: "Agent",
+        title: tr("panel.agent", "Agent"),
         // The chat bubble. The sidebar rail is a row of FUNCTION glyphs (assets,
         // nodes, models, workflows…), so a brand mark there reads as decoration
         // and doesn't say what the tab does — brand belongs in the panel header,
         // which is where the wordmark now lives.
         icon: "pi pi-comments",
-        tooltip: "ComfyUI Agent Panel — your agent session's window into this graph",
+        tooltip: tr("panel.comfyui_agent_panel_your_agent_session_s", "ComfyUI Agent Panel — your agent session's window into this graph"),
         type: "custom",
         // KEEP-ALIVE: the panel (bridge client, agent session, chat DOM) is built
         // ONCE and survives tab switches. render() re-attaches the same root into

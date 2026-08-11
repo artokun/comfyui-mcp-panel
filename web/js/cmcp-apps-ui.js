@@ -18,6 +18,7 @@
 import { AppBuilder, AppsClient, RegistryClient } from "./cmcp-apps.js";
 import { confirmModal, promptModal, formModal, toast, openSubModal as openSubModalBase } from "./cmcp-modal.js";
 import { chipRow, makeFilterButton, openFilterPanel } from "./cmcp-filter.js";
+import { tr } from "./lib/i18n.js";
 
 let styleInjected = false;
 function injectStyle() {
@@ -517,12 +518,12 @@ export function createAppsContent(ctx, shell, opts = {}) {
   // tag/category rows drop straight in as the catalogue grows. Shown on Explore
   // (My Apps has nothing to sort). Sort keys match RegistryClient.list.
   const APPS_SORTS = [
-    { value: "trending", label: "Trending" },
-    { value: "new", label: "Newest" },
-    { value: "stars", label: "Most Stars" },
+    { value: "trending", label: tr("apps_ui.trending", "Trending") },
+    { value: "new", label: tr("apps_ui.newest", "Newest") },
+    { value: "stars", label: tr("apps_ui.most_stars", "Most Stars") },
   ];
   const { btn: filterBtn, setActive: setFilterActive } =
-    makeFilterButton({ onOpen: () => openAppsFilters(), title: "Filter apps" });
+    makeFilterButton({ onOpen: () => openAppsFilters(), title: tr("apps_ui.filter_apps", "Filter apps") });
   function syncFilterBtn() {
     filterBtn.style.display = _tab === "explore" ? "" : "none";
     setFilterActive(exploreSort !== "trending"); // "dirty" dot once sort != default
@@ -531,7 +532,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     openFilterPanel({
       // Thread the tracker so Escape peels the sheet before it can close the panel.
       openModal: (title, onClose) => openSubModalBase(title, onClose, _subModals),
-      title: "Filter apps",
+      title: tr("apps_ui.filter_apps", "Filter apps"),
       render: (wrap, rerender) => {
         chipRow(
           wrap, "Sort", APPS_SORTS,
@@ -572,7 +573,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       const bar = el("div", "cmcp-apps-toolbar");
       const convertBtn = makeBtn("＋ Convert current workflow", {
         primary: true,
-        title: "Package the workflow on the canvas as a one-click app.",
+        title: tr("apps_ui.package_the_workflow_on_the_canvas_as", "Package the workflow on the canvas as a one-click app."),
       });
       convertBtn.addEventListener("click", () => showConvert().catch(showError));
       bar.append(convertBtn);
@@ -820,7 +821,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
             else show(el("span", "cmcp-deps-muted", "downloading… (see tray)"));
           } catch (e) {
             if (!alive()) return;
-            show(el("span", "cmcp-deps-err", e && e.message ? e.message : "download failed"));
+            show(el("span", "cmcp-deps-err", e && e.message ? e.message : tr("apps_ui.download_failed", "download failed")));
             btn.disabled = false;
           }
         });
@@ -854,7 +855,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
           if (!alive()) return;
           loading.remove();
           if (!resolved.length) {
-            h.textContent = "Custom nodes (0)";
+            h.textContent = tr("apps_ui.custom_nodes_0", "Custom nodes (0)");
             sec.append(el("div", "cmcp-deps-note", "No custom-node packs required."));
             return;
           }
@@ -887,7 +888,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         btn.addEventListener("click", async () => {
           // Installing a custom node runs that pack's third-party code — gate it.
           const ok = await confirmModal({
-            title: "Install custom-node pack",
+            title: tr("apps_ui.install_custom_node_pack", "Install custom-node pack"),
             message:
               `Install custom node pack “${r.pack}”?\n\n` +
               "This downloads and runs third-party code. ComfyUI may need to restart to load the new nodes.",
@@ -906,7 +907,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
             toast("Installed — restart ComfyUI to load new nodes.");
           } catch (e) {
             if (!alive()) return;
-            show(el("span", "cmcp-deps-err", e && e.message ? e.message : "install failed"));
+            show(el("span", "cmcp-deps-err", e && e.message ? e.message : tr("apps_ui.install_failed", "install failed")));
             btn.disabled = false;
           }
         });
@@ -1104,13 +1105,13 @@ export function createAppsContent(ctx, shell, opts = {}) {
     const nameInput = document.createElement("input");
     nameInput.type = "text";
     nameInput.maxLength = 120;
-    nameInput.placeholder = "e.g. Studio Portrait";
+    nameInput.placeholder = tr("apps_ui.e_g_studio_portrait", "e.g. Studio Portrait");
     nameField.append(nameInput);
 
     const descField = el("div", "cmcp-apps-field");
     descField.append(el("label", "", "Description"));
     const descInput = document.createElement("textarea");
-    descInput.placeholder = "What does this app do? What do its inputs mean?";
+    descInput.placeholder = tr("apps_ui.what_does_this_app_do_what_do", "What does this app do? What do its inputs mean?");
     descField.append(descInput);
 
     const thumbField = el("div", "cmcp-apps-field");
@@ -1153,7 +1154,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       status.classList.remove("err");
       const name = nameInput.value.trim();
       if (!name) {
-        status.textContent = "Name the app first.";
+        status.textContent = tr("apps_ui.name_the_app_first", "Name the app first.");
         status.classList.add("err");
         return;
       }
@@ -1161,7 +1162,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         (c) => pick.querySelector(`input[data-key="${CSS.escape(`${c.nodeId}.${c.widget}`)}"]`)?.checked,
       );
       if (!inputs.length) {
-        status.textContent = "Expose at least one input — an app with no endpoints is just a workflow.";
+        status.textContent = tr("apps_ui.expose_at_least_one_input_an_app", "Expose at least one input — an app with no endpoints is just a workflow.");
         status.classList.add("err");
         return;
       }
@@ -1169,7 +1170,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         .filter((c) => pick.querySelector(`input[data-out="${c.nodeId}"]`)?.checked)
         .map(({ nodeId, kind }) => ({ nodeId, kind }));
       saveBtn.disabled = true;
-      status.textContent = "Saving…";
+      status.textContent = tr("apps_ui.saving", "Saving…");
       try {
         let thumbnail_b64;
         const file = thumbInput.files && thumbInput.files[0];
@@ -1245,7 +1246,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     if (regCtx) {
       const starBtn = el("button", "cmcp-apps-starbtn", "☆");
       starBtn.type = "button";
-      starBtn.title = "Star this app";
+      starBtn.title = tr("apps_ui.star_this_app", "Star this app");
       const starCount = el("span", "cmcp-apps-starcount", String(regCtx.stars || 0));
       let starred = false;
       let count = Number(regCtx.stars || 0);
@@ -1330,7 +1331,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const inp = document.createElement("input");
         inp.type = "text";
         inp.autocomplete = "off";
-        inp.placeholder = "Pick or type a model…";
+        inp.placeholder = tr("apps_ui.pick_or_type_a_model", "Pick or type a model…");
         inp.className = "cmcp-apps-modelpick";
         const dl = document.createElement("datalist");
         dl.id = `cmcp-models-${key.replace(/[^\w-]/g, "_")}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1462,9 +1463,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
     }
 
     const runRow = el("div", "cmcp-apps-runbar");
-    const runBtn = makeBtn("▶ Run", { primary: true, title: "Queue this app on the local ComfyUI." });
+    const runBtn = makeBtn("▶ Run", { primary: true, title: tr("apps_ui.queue_this_app_on_the_local_comfyui", "Queue this app on the local ComfyUI.") });
     const runpodBtn = makeBtn("☁ Run on RunPod", {
-      title: "Queue this app on your connected RunPod pod (see the RunPod panel to connect one).",
+      title: tr("apps_ui.queue_this_app_on_your_connected_runpod", "Queue this app on your connected RunPod pod (see the RunPod panel to connect one)."),
     });
     const status = el("span", "cmcp-apps-status");
     runRow.append(runBtn, runpodBtn, status);
@@ -1493,7 +1494,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     const mgmt = el("div", "cmcp-apps-toolbar");
     const editBtn = makeBtn("✎ Edit info");
     const publishBtn = makeBtn(app.published ? "⇪ Update published" : "⇪ Publish", {
-      title: "Share this app to the public registry (Explore tab). Hidden apps upload the run snapshot only — never the graph.",
+      title: tr("apps_ui.share_this_app_to_the_public_registry", "Share this app to the public registry (Explore tab). Hidden apps upload the run snapshot only — never the graph."),
     });
     const hideBtn = makeBtn(app.hideWorkflow ? "🔒 Workflow hidden" : "🔓 Hide workflow", {
       title:
@@ -1511,7 +1512,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       }
       if (app.hideWorkflow) {
         const ok = await confirmModal({
-          title: "Publish a hidden app?",
+          title: tr("apps_ui.publish_a_hidden_app", "Publish a hidden app?"),
           message:
             "Publish “" + (app.name || "this app") + "” as a HIDDEN app?\n\n" +
             "Only the run snapshot is uploaded — never the node graph. This is best-effort " +
@@ -1526,8 +1527,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
         try { creatorName = localStorage.getItem("comfyui-mcp.panel.creatorName"); } catch {}
         if (!creatorName) {
           creatorName = await promptModal({
-            title: "Publish to the registry",
-            label: "Creator name",
+            title: tr("apps_ui.publish_to_the_registry", "Publish to the registry"),
+            label: tr("apps_ui.creator_name", "Creator name"),
             value: "anonymous",
             placeholder: "anonymous",
             submitLabel: "Continue",
@@ -1565,11 +1566,11 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     editBtn.addEventListener("click", async () => {
       const vals = await formModal({
-        title: "Edit app info",
+        title: tr("apps_ui.edit_app_info", "Edit app info"),
         submitLabel: "Save",
         fields: [
-          { key: "name", label: "App name", value: app.name || "", maxLength: 120 },
-          { key: "description", label: "Description", value: app.description || "", multiline: true, rows: 4 },
+          { key: "name", label: tr("apps_ui.app_name", "App name"), value: app.name || "", maxLength: 120 },
+          { key: "description", label: tr("apps_ui.description", "Description"), value: app.description || "", multiline: true, rows: 4 },
         ],
       });
       if (!vals) return;
@@ -1580,7 +1581,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     hideBtn.disabled = !!app.hideWorkflow;
     hideBtn.addEventListener("click", async () => {
       const ok = await confirmModal({
-        title: "Hide the workflow?",
+        title: tr("apps_ui.hide_the_workflow", "Hide the workflow?"),
         message:
           "Hide the workflow for “" + (app.name || "this app") + "”?\n\n" +
           "This DELETES the stored node graph — the app keeps only its run snapshot and can't be " +
@@ -1596,7 +1597,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     delBtn.addEventListener("click", async () => {
       const ok = await confirmModal({
-        title: "Delete app",
+        title: tr("apps_ui.delete_app", "Delete app"),
         message: `Delete “${app.name || "this app"}”? This can't be undone.`,
         confirmLabel: "Delete",
         danger: true,
@@ -1624,7 +1625,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     /** Local image transfer: same-origin /upload/image. */
     async function uploadImageLocal(f) {
-      status.textContent = "Uploading image…";
+      status.textContent = tr("apps_ui.uploading_image", "Uploading image…");
       const ref = await uploadBlobToInput(f, f.name);
       if (!ref) throw new Error("image upload failed");
       return ref.subfolder ? `${ref.subfolder}/${ref.filename}` : ref.filename;
@@ -1651,14 +1652,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
       runBtn.disabled = true;
       runpodBtn.disabled = true;
       status.classList.remove("err");
-      status.textContent = "Queueing…";
+      status.textContent = tr("apps_ui.queueing", "Queueing…");
       outputs.textContent = "";
       try {
         const values = await collectValues(uploadImageLocal);
         const res = await client.run(app.id, values);
         const promptId = res.prompt_id;
         if (!promptId) throw new Error("queue returned no prompt_id");
-        status.textContent = "Running…";
+        status.textContent = tr("apps_ui.running", "Running…");
         await pollRun(promptId);
       } catch (e) {
         status.textContent = e.message;
@@ -1691,7 +1692,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
             return done();
           }
           if (Date.now() > deadline) {
-            status.textContent = "Timed out waiting for the run — it may still finish; check ComfyUI's queue.";
+            status.textContent = tr("apps_ui.timed_out_waiting_for_the_run_it", "Timed out waiting for the run — it may still finish; check ComfyUI's queue.");
             status.classList.add("err");
             return done();
           }
@@ -1768,7 +1769,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       runpodBtn.disabled = true;
       runBtn.disabled = true;
       try {
-        status.textContent = "Preparing…";
+        status.textContent = tr("apps_ui.preparing", "Preparing…");
         const values = await collectValues(uploadImageToPod);
         const dry = await client.run(app.id, values, { dry: true });
         const patched = dry.prompt;
@@ -1790,7 +1791,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
           if (res && res.ok === false) throw new Error(`model push failed (${m.name}): ${text}`);
         }
 
-        status.textContent = "Queueing on pod…";
+        status.textContent = tr("apps_ui.queueing_on_pod", "Queueing on pod…");
         const res = await callTool("enqueue_workflow", {
           action: "enqueue",
           workflow: patched,
@@ -1843,7 +1844,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
   }
 
   return {
-    key: "apps", label: "Apps", icon: "pi-th-large", driveKind: null,
+    key: "apps", label: tr("apps_ui.apps", "Apps"), icon: "pi-th-large", driveKind: null,
     hasSearch: () => _tab === "explore",
     searchPlaceholder: "Search apps…",
     subnavExtras: () => [mineChip, exploreChip, filterBtn],

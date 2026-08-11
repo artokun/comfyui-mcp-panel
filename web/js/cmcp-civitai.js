@@ -9,6 +9,7 @@
 // is no sign-in clamp. OAuth only enables the Favorites tab.
 
 import { coerceMessageText } from "./lib/chat-serialize.js";
+import { tr } from "./lib/i18n.js";
 
 /** #417 — client-side abort budget for a single proxied CivitAI request. The
  *  Python proxy already bounds each upstream ATTEMPT at 30s but retries 3× on
@@ -19,7 +20,7 @@ export const CIVITAI_REQUEST_TIMEOUT_MS = 15000;
 // ── constants (mirror civitai_models.dart) ─────────────────────────────────
 export const LEVELS = [
   { label: "PG", level: 1 },
-  { label: "PG-13", level: 2 },
+  { label: tr("civitai.pg_13", "PG-13"), level: 2 },
   { label: "R", level: 4 },
   { label: "X", level: 8 },
   { label: "XXX", level: 16 },
@@ -1211,7 +1212,7 @@ export class CivitaiClient {
         status: res.status,
         statusText: res.statusText,
         bodyText: await _readErrorBody(res),
-        label: "CivitAI download",
+        label: tr("civitai.civitai_download", "CivitAI download"),
       });
       throw Object.assign(new Error(upstream.message), {
         status: res.status,

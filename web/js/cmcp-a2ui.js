@@ -221,6 +221,7 @@ export function validateA2UISpec(raw) {
 // ---------------------------------------------------------------------------
 
 import { mountStandardComponent } from "./cmcp-a2ui-lit-adapter.js";
+import { tr } from "./lib/i18n.js";
 
 export const A2UI_CSS = `
 :root {
@@ -380,7 +381,7 @@ function buildGraphSVG(c) {
 function buildGraphFallbackList(c) {
   const div = document.createElement("div");
   div.className = "cmcp-a2ui-text";
-  div.textContent = "Graph: " + c.nodes.map((n) => n.label).join(" · ");
+  div.textContent = tr("a2ui.graph", "Graph: ") + c.nodes.map((n) => n.label).join(" · ");
   return div;
 }
 
@@ -594,7 +595,7 @@ export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = 
       const x = document.createElement("button");
       x.type = "button";
       x.className = "cmcp-a2ui-x";
-      x.title = "Dismiss";
+      x.title = tr("a2ui.dismiss", "Dismiss");
       x.textContent = "✕";
       x.addEventListener("click", () => {
         if (resolved) return;
@@ -656,7 +657,7 @@ export function renderA2UIFailCard(rawText, errors) {
   el.className = "cmcp-a2ui cmcp-a2ui-fail";
   const t = document.createElement("div");
   t.className = "cmcp-a2ui-title";
-  t.textContent = "Unsupported card";
+  t.textContent = tr("a2ui.unsupported_card", "Unsupported card");
   el.appendChild(t);
   const why = document.createElement("div");
   why.className = "cmcp-a2ui-text";

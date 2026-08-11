@@ -21,14 +21,15 @@ import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
 import { coerceMessageText } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
+import { tr } from "./lib/i18n.js";
 
 const TABS = [
-  { key: "images", label: "Images", icon: "pi-image", media: "image" },
-  { key: "videos", label: "Videos", icon: "pi-video", media: "video" },
-  { key: "checkpoints", label: "Checkpoints", icon: "pi-box", model: "Checkpoint" },
-  { key: "loras", label: "LoRAs", icon: "pi-sliders-h", model: "LORA" },
-  { key: "workflows", label: "Workflows", icon: "pi-share-alt", model: "Workflows" },
-  { key: "favorites", label: "Favorites", icon: "pi-heart", media: "image", fav: true },
+  { key: "images", label: tr("civitai_ui.images", "Images"), icon: "pi-image", media: "image" },
+  { key: "videos", label: tr("civitai_ui.videos", "Videos"), icon: "pi-video", media: "video" },
+  { key: "checkpoints", label: tr("civitai_ui.checkpoints", "Checkpoints"), icon: "pi-box", model: "Checkpoint" },
+  { key: "loras", label: tr("civitai_ui.loras", "LoRAs"), icon: "pi-sliders-h", model: "LORA" },
+  { key: "workflows", label: tr("civitai_ui.workflows", "Workflows"), icon: "pi-share-alt", model: "Workflows" },
+  { key: "favorites", label: tr("civitai_ui.favorites", "Favorites"), icon: "pi-heart", media: "image", fav: true },
 ];
 
 const SUBFOLDER = {
@@ -454,7 +455,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     makeFilterButton({ onOpen: () => toggleFilters(), title: null });
   const acctBtn = el("button", "cmcp-cv-iconbtn");
   acctBtn.innerHTML = '<i class="pi pi-user"></i>';
-  acctBtn.title = "CivitAI account";
+  acctBtn.title = tr("civitai_ui.civitai_account", "CivitAI account");
   acctBtn.addEventListener("click", () => accountFlow());
 
   // Civitai sub-tabs (images / videos / checkpoints / …) — mounted in the shell
@@ -549,7 +550,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     if (state.loading || state.done) return;
     const req = ++state.reqId;
     setLoading(true);
-    sentinel.textContent = "Loading…";
+    sentinel.textContent = tr("civitai_ui.loading", "Loading…");
     // keyword × creator on model tabs matches client-side (API quirk — see
     // fetchModels): even after its bounded page-chase a load can come back
     // empty with more pages left. That must not dead-end the list — the
@@ -561,7 +562,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const t = tabDef();
       if (t.fav) {
         if (!state.signedIn) {
-          sentinel.textContent = "Sign in to see your favorites.";
+          sentinel.textContent = tr("civitai_ui.sign_in_to_see_your_favorites", "Sign in to see your favorites.");
           // Distinct agent-facing status so an empty favorites feed isn't read as
           // "you have no favourites" when the real cause is a signed-out session (#375).
           state.favoritesStatus = "signed_out";
@@ -699,7 +700,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         more.addEventListener("click", () => loadMore());
         sentinel.appendChild(more);
       } else if (state.done && !grid.children.length) {
-        sentinel.textContent = "No results.";
+        sentinel.textContent = tr("civitai_ui.no_results", "No results.");
       } else {
         sentinel.textContent = "";
         // Under-filled top-up (every tab): a page that doesn't overflow the
@@ -714,7 +715,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       }
     } catch (e) {
       if (req === state.reqId) {
-        sentinel.textContent = "CivitAI error: " + (e.message || e);
+        sentinel.textContent = tr("civitai_ui.civitai_error", "CivitAI error: ") + (e.message || e);
         // Record the failure so the agent-facing panel_civitai_results can report
         // a distinct error state instead of an indistinguishable total:0 (#190);
         // kind:"transport" marks a failure where no HTTP response was received
@@ -990,13 +991,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         if (wf) {
           if (wf.format === "ui") {
             const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
-            loadBtn.title = "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).";
+            loadBtn.title = tr("civitai_ui.replace_the_current_canvas_with_this_post", "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).");
             loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph, closeLb); });
             actions.appendChild(loadBtn);
             // Same loadable-workflow condition as "Load onto canvas": load the graph,
             // then jump to the Apps tab's convert view seeded from the live canvas.
             const appBtn = el("button", "cmcp-btn", "Create App from workflow");
-            appBtn.title = "Load this workflow onto the canvas and package it as a one-click app.";
+            appBtn.title = tr("civitai_ui.load_this_workflow_onto_the_canvas_and", "Load this workflow onto the canvas and package it as a one-click app.");
             appBtn.addEventListener("click", () => {
               void createAppFromWorkflow(() => loadOntoCanvas(wf.graph, closeLb, { keepPanelOpen: true }));
             });
@@ -1084,7 +1085,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     if (wf) {
       if (wf.format === "ui") {
         const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
-        loadBtn.title = "Replace the current canvas with this example's embedded ComfyUI workflow (Ctrl+Z undoes it).";
+        loadBtn.title = tr("civitai_ui.replace_the_current_canvas_with_this_example", "Replace the current canvas with this example's embedded ComfyUI workflow (Ctrl+Z undoes it).");
         loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph); });
         actions.appendChild(loadBtn);
       }
@@ -1101,7 +1102,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     }
     if (gen.meta?.prompt) {
       const p = el("div"); p.style.cssText = "font-size:.78rem;margin-top:.5rem;white-space:pre-wrap";
-      p.textContent = "Prompt: " + coerceMessageText(gen.meta.prompt); sheet.body.appendChild(p);
+      p.textContent = tr("civitai_ui.prompt", "Prompt: ") + coerceMessageText(gen.meta.prompt); sheet.body.appendChild(p);
     }
   }
 
@@ -1351,7 +1352,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         // then hop to the Apps convert view seeded from the now-loaded canvas.
         const appB = el("button", "cmcp-btn",
           wfFiles.length > 1 ? `Create App — ${f.name}` : "Create App from workflow");
-        appB.title = "Download this workflow, load it onto the canvas, and package it as a one-click app.";
+        appB.title = tr("civitai_ui.download_this_workflow_load_it_onto_the", "Download this workflow, load it onto the canvas, and package it as a one-click app.");
         appB.addEventListener("click", () => {
           void createAppFromWorkflow(
             () => loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow(), keepPanelOpen: true }),
@@ -1522,7 +1523,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const dd = el("div", "cmcp-cv-dd");
       const ddId = `cmcp-cv-bm-${Math.random().toString(36).slice(2, 8)}`;
       const bmSearch = el("input", "cmcp-cv-search");
-      bmSearch.placeholder = "Search base models…";
+      bmSearch.placeholder = tr("civitai_ui.search_base_models", "Search base models…");
       bmSearch.setAttribute("role", "combobox");
       bmSearch.setAttribute("aria-expanded", "false");
       bmSearch.setAttribute("aria-controls", ddId);
@@ -1578,7 +1579,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         listbox.id = ddId;
         listbox.setAttribute("role", "listbox");
         listbox.setAttribute("aria-multiselectable", "true");
-        listbox.setAttribute("aria-label", "Base model");
+        listbox.setAttribute("aria-label", tr("civitai_ui.base_model", "Base model"));
         bmPanel.appendChild(listbox);
         const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, query));
         const groups = [
@@ -1699,7 +1700,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         box.style.opacity = ".6";
         if (f.username) {
           const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
-          pill.title = "Remove creator filter";
+          pill.title = tr("civitai_ui.remove_creator_filter", "Remove creator filter");
           pill.addEventListener("click", () => { setCreator(null); renderSheet(); update(); });
           box.appendChild(pill);
         }
@@ -1710,7 +1711,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         const crPills = el("div", "cmcp-cv-frow");
         if (f.username) {
           const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
-          pill.title = "Remove creator filter";
+          pill.title = tr("civitai_ui.remove_creator_filter", "Remove creator filter");
           pill.addEventListener("click", () => { setCreator(null); renderSheet(); update(); });
           crPills.appendChild(pill);
         }
@@ -1748,7 +1749,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           clearTimeout(crTimer); crTimer = null;
           const req = ++crReq;
           const cq = crSearch.value.trim();
-          crNote.style.display = ""; crNote.textContent = "Looking up creators…";
+          crNote.style.display = ""; crNote.textContent = tr("civitai_ui.looking_up_creators", "Looking up creators…");
           (cq ? client.searchCreators(cq) : topCreators())
             .then((matches) => {
               if (req !== crReq) return; // a newer lookup owns the list
@@ -2128,7 +2129,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   // ── content provider (the shell owns the chrome; this owns the body) ──────
   let _started = false;
   return {
-    key: "civitai", label: "Civitai", icon: "pi-images", driveKind: "civitai",
+    key: "civitai", label: tr("civitai_ui.civitai", "Civitai"), icon: "pi-images", driveKind: "civitai",
     hasSearch: true, searchPlaceholder: "Search CivitAI…",
     subnavExtras: () => [subTabsWrap, favChips, filterBtn, acctBtn],
     mount(bodyEl) {
