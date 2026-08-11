@@ -406,8 +406,21 @@ const CORE_3D_FILE_TYPES = new Set([
   "FILE_3D_USDZ",
 ]);
 
+/**
+ * EXACT match, no normalisation (codex). Trimming and upper-casing looked like tidiness and
+ * was a hole in the closed-list claim above: every other registry here keys on the declared
+ * spelling verbatim — the widget-constructor lookup and `knownSocketTypes` both do — so a
+ * required input declared `file_3d_gltf`, or a single-member `" FILE_3D_GLTF "`, is a
+ * DIFFERENT identifier from the core type everywhere else in this module. Normalising here
+ * would have let those be waived as proven core sockets, which is precisely the laundering
+ * the explicit set exists to prevent, and would additionally have made the refusal text
+ * claim the backend declares that exact spelling as a link datatype when it does not.
+ *
+ * Union members arrive already trimmed from `declaredTypeMembers`; a single type does not,
+ * and that asymmetry is the store's, not ours to paper over.
+ */
 export function isCore3dFileType(type) {
-  return typeof type === "string" && CORE_3D_FILE_TYPES.has(type.trim().toUpperCase());
+  return typeof type === "string" && CORE_3D_FILE_TYPES.has(type);
 }
 
 /**
@@ -458,6 +471,21 @@ const WIDGET_VALUE_CONFIG_KEYS = [
   "video_upload",
   "audio_upload",
   "placeholder",
+  // #1062 (codex) — `widgetType` is the strongest widget declaration of all, and it was
+  // missing. It is not a value like the keys above; it is the input naming the widget it
+  // renders as, which the stock frontend resolves with `widgetType ?? type` (verified in
+  // the shipped bundle, and already documented by the #788 case
+  // `("FLOAT,INT", {widgetType: "FLOAT", …})`).
+  //
+  // Its absence was latent rather than harmless: an input declaring ONLY `widgetType` — no
+  // `default`, no range — counted as socket-shaped, so `socketDeclared` held it and the
+  // input-level bar waved it through. Nothing reached that state before, because such a
+  // type still had to clear `linkProven` and an unproduced datatype never did. Adding the
+  // core-3D proof removed that accidental second lock, which is what surfaced this:
+  // `("FILE_3D_GLTF", {widgetType: "STRING"})` would have been added as a socket while
+  // genuinely being a STRING widget — a node with neither a widget value nor a link, which
+  // is exactly #580's false accept.
+  "widgetType",
 ];
 
 /**

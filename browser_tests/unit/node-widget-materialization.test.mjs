@@ -824,6 +824,56 @@ test("#1062 #580 INTACT: the 3D waiver is a CLOSED list, not a FILE_3D_* prefix"
   );
 });
 
+test("#1062 #580 (codex): a bare `widgetType` is a WIDGET declaration, not a socket", () => {
+  // The false accept codex found. `widgetType` was missing from WIDGET_VALUE_CONFIG_KEYS,
+  // so an input declaring ONLY it — no default, no range — counted as socket-shaped. That
+  // was inert while an unproduced datatype could never clear `linkProven`; adding the
+  // core-3D proof removed that accidental second lock. Without this, the node below is
+  // added as a socket while genuinely being a STRING widget: neither value nor link.
+  const hint = { input: { required: { mesh: ["FILE_3D_GLTF", { widgetType: "STRING" }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(hint, {}, new Set(), hint),
+    ["FILE_3D_GLTF"],
+    "an input naming the widget it renders as is not a socket",
+  );
+  // Its own constructor still clears it, like any other widget.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(hint, { FILE_3D_GLTF: () => {} }, new Set(), hint),
+    [],
+  );
+  // And the same hint on a UNION is a widget too — the #788 ruling, now enforced by the
+  // key list rather than by that union happening to also carry `default`.
+  const union = {
+    input: { required: { mesh: ["MESH,FILE_3D_GLB", { widgetType: "STRING" }] } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(union, {}, new Set(["MESH"]), union), [
+    "MESH,FILE_3D_GLB",
+  ]);
+});
+
+test("#1062 #580 (codex): the core-3D set matches the DECLARED SPELLING, not a normalised one", () => {
+  // The other bypass. Every registry in this module keys on the spelling as declared — the
+  // widget-constructor lookup and knownSocketTypes both do — so a lower-case or
+  // space-padded name is a DIFFERENT identifier, and a custom type is free to use one.
+  // Normalising inside the core-3D check would have laundered exactly those.
+  const lower = { input: { required: { mesh: ["file_3d_gltf", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(lower, {}, new Set(), lower),
+    ["file_3d_gltf"],
+    "a lower-case custom type is not the core datatype",
+  );
+  const padded = { input: { required: { mesh: [" FILE_3D_GLTF ", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(padded, {}, new Set(), padded),
+    [" FILE_3D_GLTF "],
+    "a single (non-union) type is not trimmed by declaredTypeMembers, so it stays distinct",
+  );
+  // Sanity: the exact core spelling IS matched, so this is a spelling rule and not a
+  // regression that disabled the waiver.
+  const exact = { input: { required: { mesh: ["FILE_3D_GLTF", {}] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(exact, {}, new Set(), exact), []);
+});
+
 test("#1062: a core 3D file input declaring a WIDGET value still waits for its constructor", () => {
   // The type-level waiver never overrides the input-level bar. A declaration carrying
   // widget-value keys is a widget that ACCEPTS those links, not a socket — the same ruling
