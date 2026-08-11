@@ -6,6 +6,33 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-08-11
+
+> artokun/comfyui-mcp#938: an agent could WRITE a dynamic widget row and could delete the
+> whole NODE, but had no way to delete one row — the add/remove affordance is a canvas-drawn
+> button it cannot click.
+
+### Added
+
+- `graph_remove_widget` removes ONE dynamic widget row (rgthree Power Lora Loader `lora_N`,
+  Impact/Inspire list rows). Undoable with Ctrl+Z.
+
+### Fixed
+
+- the remaining rows are NOT renumbered. `lora_N` is a monotonic id, not a position:
+  `configure()` re-mints the names from serialized ORDER on every load, and the backend
+  reads `**kwargs` filtered by name prefix, so gaps never reach it. The reply lists the
+  remaining names, because an agent that assumed renumbering would address the wrong row.
+
+### Changed
+
+- removal is refused, with the specific reason, for an input the BACKEND declares (it would
+  change what is sent at queue time), a frontend-generated control widget, a widget whose
+  input slot currently has a link, and a subgraph container's promoted widgets. Node
+  definitions that could not be READ are reported as unknown rather than treated as
+  "declares nothing" — the difference between those two is the only thing separating a row
+  from a KSampler's `steps`.
+
 ## [0.13.6] - 2026-08-11
 
 > #968: three reports of the panel saying "bound to the requested workflow" while graph
