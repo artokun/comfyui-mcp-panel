@@ -698,6 +698,22 @@ export async function saveActiveWorkflow(
       // 200 before and a CONFIRMED 404 after. For the URL-derived tab this issue is about,
       // both probes are 500 ⇒ null ⇒ "unverified" ⇒ no-op. Only never-persisted skips it,
       // and only because a proven-absent source has nothing to lose.
+      //
+      // It is also the mitigation for the one thing the route exemption above cannot
+      // check: that exemption is DUCK-TYPED (three method names), so a frontend whose
+      // `saveAs` is not the move-free one verified against 1.50.3 would take the copy
+      // path with nothing having proven it move-free. This probe observes the OUTCOME
+      // rather than trusting the shape, and an unknown source is precisely the case with
+      // no other evidence — so it is the one that most needs observing (codex).
+      //
+      // ACCEPTED RESIDUAL (codex): two probes establish DISAPPEARANCE, not CAUSATION. A
+      // source deleted by something ELSE during the awaited persist trips this too, and no
+      // client-side check can separate the two — /userdata exposes no per-file version or
+      // actor. That is why the message below reports what was OBSERVED and names both
+      // causes instead of asserting this save moved it. The residual is inherited rather
+      // than introduced: the identical race already applied to a "persisted" source before
+      // this condition was widened. Erring toward a loud, accurate report is deliberate —
+      // the alternative is silence about a file that really is gone.
       if (cls !== "never-persisted") {
         const sourceOnDiskAfter = await probeSourceOnDisk(existsOnDisk, sourceNorm);
         if (
@@ -705,8 +721,11 @@ export async function saveActiveWorkflow(
           "lost"
         ) {
           throw new Error(
-            `save moved the original workflow "${sourcePath}" instead of copying it — ` +
-              `the source no longer exists on disk (issue #226)`,
+            `the original workflow "${sourcePath}" was on disk when this save began and is GONE ` +
+              `now — the copy "${finalTargetPath}" was written, but the source disappeared across ` +
+              `the save. Most likely this save moved it instead of copying it (issue #226); it can ` +
+              `also mean something else deleted it mid-save, which these two probes cannot tell ` +
+              `apart. Check the source before relying on it.`,
           );
         }
       }
@@ -1299,7 +1318,13 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   // call that SUCCEEDS: `persisted` if it shows a persisted workflow here,
   // `confirmedAbsent` only if a successful lookup shows none. An oracle that
   // THROWS proves nothing (a thrown lookup is not proof of absence, #226) — we
-  // leave both false so the result stays "unknown" → refuse.
+  // leave both false so the result stays "unknown".
+  //
+  // What "unknown" COSTS is no longer a blanket refusal (#1066 defect 2, codex): it
+  // withholds the two rights that need proof — taking a MOVE path, and CONSUMING the
+  // source tab (#566) — while a provably move-free copy may still proceed. So this
+  // function's job is unchanged and its strictness matters just as much; only the
+  // consequence downstream is narrower than "refuse".
   let persisted = false;
   let confirmedAbsent = false;
 
@@ -1343,9 +1368,9 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   // real file (#226/#215). They are indistinguishable in memory; only the disk
   // can tell them apart. Consult the authoritative filesystem oracle: a proven
   // ABSENCE (404) means there is no backing file to destroy → never-persisted
-  // (safe to ground); a proven PRESENCE means a real file → persisted (refuse).
-  // Unknown/failure changes nothing (stays "unknown" → refuse), so this only
-  // ever ADDS safe grounds to save and never weakens the #226 refusal.
+  // (safe to ground); a proven PRESENCE means a real file → persisted (copy it,
+  // never move it). Unknown/failure changes nothing (stays "unknown"), so this
+  // only ever ADDS safe grounds and never weakens the #226 invariant.
   if (typeof existsOnDisk === "function" && wf?.isPersisted !== true) {
     let exists = null;
     try {

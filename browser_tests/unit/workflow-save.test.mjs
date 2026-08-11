@@ -605,8 +605,81 @@ test('disk-existence backstop catches a low-level copy that moves a persisted so
 
   await assert.rejects(
     () => saveActiveWorkflow(svc, 'zz226b-copy', { existsOnDisk }),
-    /moved the original workflow .* instead of copying it/
+    /was on disk when this save began and is GONE now/
   )
+})
+
+test('#1066/codex: the backstop catches a ROGUE moving saveAs even when the source was UNKNOWN', async () => {
+  // The route exemption that lets an unprovable source be copied is DUCK-TYPED — it
+  // checks for three method NAMES, not that saveAs is the move-free one verified
+  // against the real frontend. This is the case that exemption cannot check for
+  // itself: a frontend whose saveAs moves, on a source no oracle could classify.
+  //
+  // The backstop is what covers it, which is why it now runs for "unknown" and not
+  // only "persisted". Without that widening this save would report SUCCESS while the
+  // source was destroyed.
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted ⇒ in-memory lookup cannot prove absence
+    isTemporary: true
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  // Disk oracle answers honestly about existence but the in-memory oracle returns the
+  // drifted object, so classifySource lands on... let's force UNKNOWN outright by
+  // making the CLASSIFICATION probe indeterminate while the BACKSTOP probes truthfully.
+  let classified = false
+  const existsOnDisk = async (p) => {
+    if (!classified) {
+      classified = true
+      return null // classification probe: indeterminate ⇒ cls === "unknown"
+    }
+    return svc.disk.has(p) // pre/post-copy probes: truthful 200 → 404
+  }
+  const origSaveAs = svc.saveAs
+  svc.saveAs = (wf, path) => {
+    svc.disk.delete(wf.path) // ROGUE: consumes (moves) the source
+    return origSaveAs(wf, path)
+  }
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'zz226b-copy', { existsOnDisk }),
+    /was on disk when this save began and is GONE now/
+  )
+})
+
+test('#1066/codex: the backstop reports DISAPPEARANCE, not causation — it names both causes', async () => {
+  // Two probes cannot separate "this save moved it" from "something else deleted it
+  // mid-save"; /userdata exposes no per-file version or actor. The message must
+  // therefore not assert causation. This pins that wording, because the alternative
+  // (the old text) blamed the save for a deletion it may not have performed — the
+  // false-attribution codex flagged when the backstop was widened to "unknown".
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  const existsOnDisk = async (p) => svc.disk.has(p)
+  const origSaveWorkflow = svc.saveWorkflow.bind(svc)
+  svc.saveWorkflow = async (wf) => {
+    // A THIRD PARTY deletes the source during the awaited persist — this save is
+    // move-free and did not touch it.
+    svc.disk.delete('workflows/zz226b-orig.json')
+    return origSaveWorkflow(wf)
+  }
+
+  const err = await saveActiveWorkflow(svc, 'zz226b-copy', { existsOnDisk }).then(
+    () => null,
+    (e) => e
+  )
+  assert.ok(err, 'a vanished source is surfaced, never silently swallowed')
+  assert.match(err.message, /disappeared across the save/, 'states what was observed')
+  assert.match(err.message, /can\s+also mean something else deleted it/, 'names the other cause')
+  assert.ok(svc.disk.has('workflows/zz226b-copy.json'), 'the copy WAS written — reported as such')
 })
 
 test('P0 round-5: no-name save of a persisted workflow with an EMPTY filename refuses — never moves Orig.json → .json (#226)', async () => {
@@ -1055,6 +1128,10 @@ test('1.47: a drifted-temporary REAL file (on disk) is COPIED, never moved — d
   assert.ok(svc.disk.has('workflows/Real.json'), 'real source preserved')
   assert.ok(svc.disk.has('workflows/Copy.json'), 'copy created')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(
+    svc.openWorkflows.some((w) => w.path === 'workflows/Real.json'),
+    'persisted source tab NOT consumed — a Save-As copy leaves the original tab open'
+  )
 })
 
 test('1.47: a drifted-temporary path with an UNKNOWN disk oracle copies without claiming absence (#226)', async () => {
@@ -1078,6 +1155,19 @@ test('1.47: a drifted-temporary path with an UNKNOWN disk oracle copies without 
   assert.equal(saved, 'Copy')
   assert.ok(svc.disk.has('workflows/Real.json'), 'source preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  // The OTHER right that "unknown" must withhold (codex): #566 predecessor
+  // consumption purges the source's in-memory record, and only a PROVEN
+  // never-persisted source licenses it. Guarding a widened consumption condition,
+  // which disk assertions alone would not catch.
+  assert.ok(
+    svc.openWorkflows.some((w) => w.path === 'workflows/Real.json'),
+    'unknown source tab NOT consumed — still in the open tab strip'
+  )
+  assert.equal(
+    svc.getWorkflowByPath('workflows/Real.json'),
+    active,
+    'unknown source record NOT purged from the store lookup'
+  )
 })
 
 test('1.47: saveAs+saveWorkflow but NO openWorkflow ⇒ refuse, never persist null content (#226)', async () => {
