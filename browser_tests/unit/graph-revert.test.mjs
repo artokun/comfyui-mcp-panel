@@ -572,6 +572,10 @@ function buildRewindLastTurn({ outcome, recalled }) {
   assert.ok(end > start, "could not bound rewindLastTurn");
 
   const systems = [];
+  // The REAL `tr`, not a stub. No catalog is loaded here, so every lookup returns its
+  // English fallback — which is exactly what the assertions below read, and what every
+  // locale renders when its catalog is missing the key. A stub returning the key would
+  // have made these tests pass over a blanked message.
   const rewindLastTurn = new Function(
     "recallPrev",
     "input",
@@ -579,6 +583,7 @@ function buildRewindLastTurn({ outcome, recalled }) {
     "revertDidRestore",
     "describeRevertOutcome",
     "appendSystem",
+    "tr",
     `${src.slice(start, end)}\nreturn rewindLastTurn;`,
   )(
     () => recalled,
@@ -587,6 +592,7 @@ function buildRewindLastTurn({ outcome, recalled }) {
     revertDidRestore,
     describeRevertOutcome,
     (msg) => systems.push(msg),
+    tr,
   );
   return { rewindLastTurn, systems };
 }

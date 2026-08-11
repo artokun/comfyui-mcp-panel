@@ -434,7 +434,7 @@ import {
 // to construct. `node --check panel.js` does NOT catch it (Node parses a bare .js as
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
-import { tr, LOCALES, loadCatalog, pickLocale, applyDirection } from "./lib/i18n.js";
+import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -25239,7 +25239,12 @@ function buildPanel() {
           sessionId: ssGet(SESSION_KEY),
         });
         ssSet(REBOOT_KEY, armedMarker);
-        appendSystem("Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.");
+        appendSystem(
+          tr(
+            "panel.restarting_comfyui_to_load_new_nodes_i",
+            "Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.",
+          ),
+        );
         // ssSet is best-effort (a full/blocked sessionStorage throws and is
         // swallowed). Verify the EXACT value landed, not merely that some marker is
         // present — a refused overwrite would leave a PREVIOUS reboot's marker,
@@ -25249,7 +25254,10 @@ function buildPanel() {
         if (ssGet(REBOOT_KEY) !== armedMarker) {
           ssSet(REBOOT_KEY, null); // better no marker than a stale one deciding this restart
           appendSystem(
-            "Heads up: this browser wouldn't let me save the restart marker, so I can't auto-resume after the restart — reconnect manually if the agent goes quiet.",
+            tr(
+              "panel.heads_up_this_browser_wouldn_t_let",
+              "Heads up: this browser wouldn't let me save the restart marker, so I can't auto-resume after the restart — reconnect manually if the agent goes quiet.",
+            ),
           );
         }
       }
@@ -25339,7 +25347,11 @@ function buildPanel() {
         const switched = connectedBackend !== null && connectedBackend !== backend;
         if (switched) {
           appendSystem(
-            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
+            tr(
+              "panel.switched_to_sessions_aren_t_shared_across",
+              "Switched to {backend} — sessions aren't shared across providers, so this starts a fresh chat.",
+              { backend: BACKEND_LABELS[backend] },
+            ),
           );
         }
         selectedBackend = backend;
@@ -25413,7 +25425,18 @@ function buildPanel() {
       // killing the in-flight reply). Let the user know so the picker selection
       // not taking effect *this* turn isn't a mystery.
       if (ack?.kind === "options" && ack.deferred) {
-        appendSystem(`Effort → ${ack.effort ?? "default"} — applies after the current turn finishes.`);
+        // "default" is a WORD the user reads, so it gets its own whole sentence rather
+        // than riding in as a placeholder — an English word interpolated into a
+        // translated frame ("努力 → default — …") is the defect this file works around
+        // for `action:` in the revert family, and here it is avoidable. `== null` keeps
+        // the old `??` semantics exactly: an empty-string effort still renders as one.
+        appendSystem(
+          ack.effort == null
+            ? tr("panel.effort_default_applies_after_the_current_turn", "Effort → default — applies after the current turn finishes.")
+            : tr("panel.effort_applies_after_the_current_turn_finishes", "Effort → {effort} — applies after the current turn finishes.", {
+                effort: ack.effort,
+              }),
+        );
         return;
       }
       // A "ready" ack PROVES this backend actually runs on the agent machine —
@@ -25445,7 +25468,7 @@ function buildPanel() {
         const origin = ssGet(SOFT_RELOAD_KEY);
         ssSet(SOFT_RELOAD_KEY, null);
         ssSet(MID_TASK_KEY, null); // deliberate reload — don't also fire the drop nudge
-        appendSystem("Agent reloaded — session resumed.");
+        appendSystem(tr("panel.agent_reloaded_session_resumed", "Agent reloaded — session resumed."));
         if (origin === "agent") {
           showThinking();
           client.sendUserMessage(
@@ -25465,7 +25488,7 @@ function buildPanel() {
         // would inject a spurious turn into a live session. A real ComfyUI restart
         // takes many seconds to come back, so a long gap since the drop = real.
         if (Date.now() - lastBridgeDownAt < 6000) return;
-        appendSystem("Reconnected — picking up where we left off.");
+        appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         client.sendUserMessage(
           "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
@@ -25666,7 +25689,9 @@ function buildPanel() {
         kind: "run_error",
         error: `A queued render failed while the connection was down (prompt ${promptId}).`,
       });
-      if (sent) appendSystem("A queued render failed while the connection was down.");
+      // The `error:` frame above is AGENT-facing and stays English; only this
+      // transcript line is read by the user.
+      if (sent) appendSystem(tr("panel.a_queued_render_failed_while_the_connection", "A queued render failed while the connection was down."));
       // A muted agent intentionally suppresses this (sendFrame also returns false);
       // reconcileKey already marked it delivered, so leave it. Only a genuine
       // transport failure re-pends so the next reconnect/retry re-delivers it.
@@ -25683,7 +25708,12 @@ function buildPanel() {
         `The workflow run you queued was cancelled while the connection was down (prompt ${promptId}). ` +
         `It did not crash; no action is required unless the cancellation was unintended.`;
       const sent = client.sendFrame({ type: "agent_event", kind: "executed", note });
-      if (sent) appendSystem(`Queued render was cancelled while disconnected (prompt ${promptId}).`);
+      if (sent)
+        appendSystem(
+          tr("panel.queued_render_was_cancelled_while_disconnected_prompt", "Queued render was cancelled while disconnected (prompt {promptId}).", {
+            promptId,
+          }),
+        );
       // Match terminal-error recovery: only a transport drop re-pends the
       // cancellation notice; an intentionally muted agent stays silent.
       else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
@@ -25701,7 +25731,9 @@ function buildPanel() {
           `Render status for prompt ${promptId} could not be confirmed after reconnecting ` +
           `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
       });
-      appendSystem(`Render status unknown for prompt ${promptId} — safe to requeue.`);
+      appendSystem(
+        tr("panel.render_status_unknown_for_prompt_safe_to", "Render status unknown for prompt {promptId} — safe to requeue.", { promptId }),
+      );
       // #585: give-up EVICTS the run from the recovery ledger, so unlike the
       // error/interrupted paths there is nothing to re-pend if this notice didn't
       // land. Flag it so the run still reads as unsettled-in-truth: a
@@ -25972,7 +26004,10 @@ function buildPanel() {
     if (rebootPruneFailureNoticeShown) return;
     rebootPruneFailureNoticeShown = true;
     appendSystem(
-      "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+      tr(
+        "panel.note_this_browser_wouldn_t_let_me",
+        "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+      ),
     );
   }
 
@@ -26033,10 +26068,13 @@ function buildPanel() {
 
   /** Human label for the conversation that armed the reboot, for the held notice. */
   function rebootArmingThreadLabel(marker) {
+    // The unnamed fallback is prose the user reads inside the notices below, so it is
+    // translated; a real thread title / workflow key is the user's own text and is not.
+    const unnamed = tr("panel.another_conversation", "another conversation");
     const tid = marker?.threadId;
-    if (!tid) return "another conversation";
+    if (!tid) return unnamed;
     const t = threads.find((candidate) => candidate.id === tid) || null;
-    return t?.title || t?.workflowKey || "another conversation";
+    return t?.title || t?.workflowKey || unnamed;
   }
 
   /** The arming conversation isn't on screen — hold, and tell the user where it went. */
@@ -26044,8 +26082,12 @@ function buildPanel() {
     if (!rebootSessionNoticeShown) {
       rebootSessionNoticeShown = true;
       appendSystem(
-        `A restart resume is waiting for ${rebootArmingThreadLabel(step.marker)} — switch back to it to pick that work up. ` +
-          `I won't send it here; it belongs to the conversation that asked for the restart.`,
+        tr(
+          "panel.a_restart_resume_is_waiting_for_switch",
+          "A restart resume is waiting for {thread} — switch back to it to pick that work up. " +
+            "I won't send it here; it belongs to the conversation that asked for the restart.",
+          { thread: rebootArmingThreadLabel(step.marker) },
+        ),
       );
     }
     armRebootWatch();
@@ -26058,8 +26100,12 @@ function buildPanel() {
     rebootSessionNoticeShown = false;
     ssSet(REBOOT_KEY, null);
     appendSystem(
-      `The restart resume for ${rebootArmingThreadLabel(step.marker)} expired without being delivered — ` +
-        `it was never re-opened. If that conversation was mid-build, tell it to continue.`,
+      tr(
+        "panel.the_restart_resume_for_expired_without_being",
+        "The restart resume for {thread} expired without being delivered — " +
+          "it was never re-opened. If that conversation was mid-build, tell it to continue.",
+        { thread: rebootArmingThreadLabel(step.marker) },
+      ),
     );
   }
 
@@ -26125,8 +26171,14 @@ function buildPanel() {
         ssSet(REBOOT_KEY, retained); // keep the marker itself, just without the count
         if (!rebootAttemptCountUnreliableNoticeShown) {
           rebootAttemptCountUnreliableNoticeShown = true;
+          // `_2` / `_3` suffixes: three distinct "Note: this browser wouldn't let me …"
+          // messages slug to the same first-seven-words key, so they are disambiguated the
+          // way scripts/i18n-extract.mjs disambiguates a collision.
           appendSystem(
-            "Note: this browser wouldn't let me record the restart-nudge attempt, so I can't tell whether one already went out. I'll warn the agent about a possible duplicate.",
+            tr(
+              "panel.note_this_browser_wouldn_t_let_me_2",
+              "Note: this browser wouldn't let me record the restart-nudge attempt, so I can't tell whether one already went out. I'll warn the agent about a possible duplicate.",
+            ),
           );
         }
       }
@@ -26185,12 +26237,24 @@ function buildPanel() {
     ssSet(MID_TASK_KEY, null);
     rebootWaitNoticeShown = false;
     rebootSessionNoticeShown = false;
+    // WHOLE sentences, one per reachable case, never a fragment spliced into a finished
+    // one. A `" (prompt {ids})"` fragment would carry a load-bearing LEADING SPACE into
+    // the catalog, where a translation memory that trims edge whitespace silently welds
+    // it to the preceding word — and a language that moves the parenthetical could not
+    // move it at all.
     appendSystem(
       unconfirmed
-        ? `Reconnected — couldn't confirm the render that was in flight before the restart${
-            owed.length ? ` (prompt ${owed.join(", ")})` : ""
-          }. Resuming, and telling the agent to check the queue before re-running.`
-        : "Reconnected — resuming where we left off.",
+        ? owed.length
+          ? tr(
+              "panel.reconnected_couldn_t_confirm_the_render_that",
+              "Reconnected — couldn't confirm the render that was in flight before the restart (prompt {ids}). Resuming, and telling the agent to check the queue before re-running.",
+              { ids: owed.join(", ") },
+            )
+          : tr(
+              "panel.reconnected_couldn_t_confirm_the_render_that_2",
+              "Reconnected — couldn't confirm the render that was in flight before the restart. Resuming, and telling the agent to check the queue before re-running.",
+            )
+        : tr("panel.reconnected_resuming_where_we_left_off", "Reconnected — resuming where we left off."),
     );
     showThinking();
     armRebootWatch(); // keep watching until the orchestrator acknowledges receipt
@@ -26220,7 +26284,10 @@ function buildPanel() {
     // write, so disclose it rather than pretend the state is clean.
     if (ssGet(REBOOT_KEY) != null) {
       appendSystem(
-        "Note: this browser wouldn't let me clear the restart marker. If you reload, I may repeat the restart nudge — ignore the second one.",
+        tr(
+          "panel.note_this_browser_wouldn_t_let_me_3",
+          "Note: this browser wouldn't let me clear the restart marker. If you reload, I may repeat the restart nudge — ignore the second one.",
+        ),
       );
     }
     return true;
@@ -26313,7 +26380,10 @@ function buildPanel() {
       if (!rebootResumeStalledNoticeShown) {
         rebootResumeStalledNoticeShown = true;
         appendSystem(
-          "Couldn't confirm the restart nudge reached the agent. Keeping it pending — it'll retry when the connection next comes back.",
+          tr(
+            "panel.couldn_t_confirm_the_restart_nudge_reached",
+            "Couldn't confirm the restart nudge reached the agent. Keeping it pending — it'll retry when the connection next comes back.",
+          ),
         );
       }
       return false;
@@ -26392,7 +26462,10 @@ function buildPanel() {
       if (!rebootWaitNoticeShown) {
         rebootWaitNoticeShown = true;
         appendSystem(
-          "Reconnected — holding the restart nudge until the render that was already in flight reports back.",
+          tr(
+            "panel.reconnected_holding_the_restart_nudge_until_the",
+            "Reconnected — holding the restart nudge until the render that was already in flight reports back.",
+          ),
         );
       }
       armRebootWatch(); // marker deliberately RETAINED; the watch reissues the resume
@@ -26550,7 +26623,7 @@ function buildPanel() {
     // Only flag a restart if our bridge actually went down — a benign ComfyUI WS
     // blip (asset view / image check) shouldn't print a false "restarting" alarm.
     if ((ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) && !client.isConnected()) {
-      appendSystem("ComfyUI is restarting…");
+      appendSystem(tr("panel.comfyui_is_restarting", "ComfyUI is restarting…"));
     }
   }
   function onComfyReconnected() {
@@ -26589,7 +26662,7 @@ function buildPanel() {
     ) {
       return;
     }
-    appendSystem("ComfyUI is back — reconnecting the agent…");
+    appendSystem(tr("panel.comfyui_is_back_reconnecting_the_agent", "ComfyUI is back — reconnecting the agent…"));
     connectAgent();
   }
   try {
@@ -26606,7 +26679,7 @@ function buildPanel() {
 
   saveBtn.addEventListener("click", () => {
     client.setUrl(urlInput.value.trim());
-    appendSystem(`Reconnecting to ${redactBridgeUrl(client.currentUrl())}…`);
+    appendSystem(tr("panel.reconnecting_to_url", "Reconnecting to {url}…", { url: redactBridgeUrl(client.currentUrl()) }));
   });
 
   // Connect: ask ComfyUI's server to start the background agent on demand, then
@@ -26668,9 +26741,13 @@ function buildPanel() {
     externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
     appendSystem(
-      "No agent is listening on the bridge (" + bridge + "). This ComfyUI won’t " +
-        "start one — run the agent on YOUR machine, then click Connect:\n" +
-        "    " + connectCommand(),
+      tr(
+        "panel.no_agent_is_listening_on_the_bridge",
+        "No agent is listening on the bridge ({bridge}). This ComfyUI won’t " +
+          "start one — run the agent on YOUR machine, then click Connect:\n" +
+          "    {command}",
+        { bridge, command: connectCommand() },
+      ),
     );
   }
   function resetAutoReclaim() {
@@ -26764,7 +26841,7 @@ function buildPanel() {
   // timer: it can't loop, so no competing-respawn storm.
   function escalateSoftReload() {
     if (!softReloadInFlight) return; // handshake already landed / guard cleared → nothing to do
-    appendSystem("The agent reload is taking too long to hand off — reconnecting cleanly…");
+    appendSystem(tr("panel.the_agent_reload_is_taking_too_long", "The agent reload is taking too long to hand off — reconnecting cleanly…"));
     client.stop(); // drop the stuck socket so connect() won't early-return on an OPEN sock
     connecting = false; // don't let a stale in-flight guard block the escalation connect
     void connectAgent();
@@ -26799,15 +26876,18 @@ function buildPanel() {
       if (!respawnGaveUpNoticed) {
         respawnGaveUpNoticed = true;
         appendSystem(
-          "⚠ The panel agent keeps failing to start. Check you're signed in " +
-            "(run `claude` once, `codex login` for Codex, `gemini` for Gemini, or `ollama serve` for local models), then click Connect.",
+          tr(
+            "panel.the_panel_agent_keeps_failing_to_start",
+            "⚠ The panel agent keeps failing to start. Check you're signed in " +
+              "(run `claude` once, `codex login` for Codex, `gemini` for Gemini, or `ollama serve` for local models), then click Connect.",
+          ),
         );
       }
       return false;
     }
     autoRespawnsLeft -= 1;
     autoRespawning = true;
-    appendSystem("The panel agent dropped — restarting it…");
+    appendSystem(tr("panel.the_panel_agent_dropped_restarting_it", "The panel agent dropped — restarting it…"));
     const myGen = connectGen;
     void (async () => {
       try {
@@ -26831,7 +26911,7 @@ function buildPanel() {
         }
       } catch (err) {
         if (myGen !== connectGen) return;
-        appendSystem(`Auto-restart failed: ${coerceMessageText(err?.message ?? err)}`);
+        appendSystem(tr("panel.auto_restart_failed", "Auto-restart failed: {error}", { error: coerceMessageText(err?.message ?? err) }));
         autoRespawnsLeft = 0; // can't reach the pack → don't loop
         client.start(); // resume the bare WS retry so the client isn't left idle
       } finally {
@@ -26852,7 +26932,7 @@ function buildPanel() {
     if (handshakeRedialsLeft <= 0) return false;
     if (timedOutUrl !== client.currentUrl()) return false;
     handshakeRedialsLeft -= 1;
-    appendSystem("The panel agent isn't answering yet — reconnecting…");
+    appendSystem(tr("panel.the_panel_agent_isn_t_answering_yet", "The panel agent isn't answering yet — reconnecting…"));
     client.setUrl(client.currentUrl()); // close + reopen on the same url → fresh hello
     return true;
   }
@@ -26866,8 +26946,10 @@ function buildPanel() {
     autoReclaimsLeft -= 1;
     autoReclaiming = true;
     appendSystem(
-      "No response from the panel agent on the bridge — the orchestrator looks wedged. " +
-        "Restarting it automatically…",
+      tr(
+        "panel.no_response_from_the_panel_agent_on",
+        "No response from the panel agent on the bridge — the orchestrator looks wedged. " + "Restarting it automatically…",
+      ),
     );
     const myGen = connectGen; // tie to the current connect generation
     void (async () => {
@@ -26898,7 +26980,7 @@ function buildPanel() {
         }
       } catch (err) {
         if (myGen !== connectGen) return;
-        appendSystem(`Auto-restart failed: ${coerceMessageText(err?.message ?? err)}`);
+        appendSystem(tr("panel.auto_restart_failed", "Auto-restart failed: {error}", { error: coerceMessageText(err?.message ?? err) }));
         autoReclaimsLeft = 0; // can't reach the pack → don't loop
       } finally {
         autoReclaiming = false;
@@ -27060,7 +27142,11 @@ function buildPanel() {
       if (myGen !== connectGen) return; // superseded → swallow the stale error too
       // No /connect route (older/headless host) — fall through and try the
       // bridge directly in case the user started the orchestrator themselves.
-      appendSystem(`Couldn't reach ComfyUI to start the agent: ${coerceMessageText(err?.message ?? err)}`);
+      appendSystem(
+        tr("panel.couldn_t_reach_comfyui_to_start_the", "Couldn't reach ComfyUI to start the agent: {error}", {
+          error: coerceMessageText(err?.message ?? err),
+        }),
+      );
     } finally {
       connecting = false;
     }
@@ -27229,7 +27315,7 @@ function buildPanel() {
         }
       }
       ssSet(SIDEBAR_REOPEN_KEY, "1");
-      appendSystem("Reloading the panel UI (new frontend code)…");
+      appendSystem(tr("panel.reloading_the_panel_ui_new_frontend_code", "Reloading the panel UI (new frontend code)…"));
       // #584 — the cmcpReload page-URL param busts only the top document; the
       // panel's JS MODULES can still come straight out of heuristic cache,
       // which is exactly how a stale bundle survived this very reload. Prime
@@ -27268,7 +27354,7 @@ function buildPanel() {
     // that made soft reload fail intermittently). Cleared on handshake or by the
     // guard's safety timeout.
     setSoftReloadGuard();
-    appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
+    appendSystem(tr("panel.soft_reloading_the_agent_new_code_no", "Soft-reloading the agent (new code, no ComfyUI restart)…"));
     try {
       // Whole lifecycle (stop → bounded POST → decide interlock → ALWAYS start) lives
       // in performSoftReloadRecovery so the "reload never leaves the bridge dead"
@@ -27309,13 +27395,24 @@ function buildPanel() {
         note: (outcome) => {
           if (outcome?.error) {
             appendSystem(
-              `Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: ${coerceMessageText(outcome.error?.message ?? outcome.error)}`,
+              tr("panel.couldn_t_reach_comfyui_to_reload_the", "Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: {error}", {
+                error: coerceMessageText(outcome.error?.message ?? outcome.error),
+              }),
             );
           } else {
             const cmd = outcome?.startCommand || "";
+            // The manual-restart tail is its own key because it only appears when the
+            // orchestrator reported a start command. The separating newline stays in the
+            // CODE, not in the catalog: a leading "\n" inside a translated value is edge
+            // whitespace, and translation tooling trims it.
             appendSystem(
-              "Reconnecting the panel bridge…" +
-                (cmd ? `\n(To load new orchestrator code, restart it manually: ${cmd})` : ""),
+              tr("panel.reconnecting_the_panel_bridge", "Reconnecting the panel bridge…") +
+                (cmd
+                  ? "\n" +
+                    tr("panel.to_load_new_orchestrator_code_restart_it", "(To load new orchestrator code, restart it manually: {command})", {
+                      command: cmd,
+                    })
+                  : ""),
             );
           }
         },
@@ -27343,7 +27440,7 @@ function buildPanel() {
   async function hardRestart(origin = "user") {
     if (reloading) return;
     reloading = true;
-    appendSystem("Restarting the agent backend…");
+    appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -27352,13 +27449,19 @@ function buildPanel() {
       if (data?.ok) {
         ok = true;
       } else {
+        // `data.message` is the pack's own text and arrives already-worded; only our own
+        // fallback is ours to translate.
         appendSystem(
           data?.message ||
-            "Restart failed — try Disconnect then Connect, or fully restart ComfyUI.",
+            tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
         );
       }
     } catch (err) {
-      appendSystem(`Couldn't reach ComfyUI to restart the agent: ${coerceMessageText(err?.message ?? err)}`);
+      appendSystem(
+        tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
+          error: coerceMessageText(err?.message ?? err),
+        }),
+      );
     } finally {
       reloading = false;
     }
@@ -27367,12 +27470,19 @@ function buildPanel() {
       // resume (resuming would restore the wedged shell). Don't arm the resume
       // nudge. The reconnect spins up a brand-new agent.
       if (!await invalidateDurableAgentSession()) {
-        appendSystem("The old session could not be invalidated durably; reconnect is paused to avoid restoring it.");
+        appendSystem(
+          tr(
+            "panel.the_old_session_could_not_be_invalidated",
+            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+          ),
+        );
         return;
       }
       ssSet(SOFT_RELOAD_KEY, null);
       ssSet(MID_TASK_KEY, null);
-      appendSystem("Agent restarted with a fresh session — your message history is still here.");
+      appendSystem(
+        tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
+      );
     }
     // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
     // restore the bridge we dropped (the old backend may still be intact).
@@ -27415,7 +27525,7 @@ function buildPanel() {
     } catch {
       // best-effort; a user-run orchestrator is intentionally left running
     }
-    appendSystem("Disconnected. Click Connect to start again.");
+    appendSystem(tr("panel.disconnected_click_connect_to_start_again", "Disconnected. Click Connect to start again."));
   });
 
   // ---- slash commands (run locally, no agent round-trip) ----
@@ -27433,12 +27543,16 @@ function buildPanel() {
    *  keeps a rejection from escaping as an unhandled promise, and surfaces it in the
    *  transcript instead of only the console. */
   function runSlashCommand(entry) {
+    // `cmd` is the literal command the user typed ("/revert") — a placeholder, never
+    // translated prose.
+    const failed = (err) =>
+      appendSystem(
+        tr("panel.slash_command_failed", "{cmd} failed: {error}", { cmd: entry.cmd, error: coerceMessageText(err?.message ?? err) }),
+      );
     try {
-      Promise.resolve(entry.run()).catch((err) => {
-        appendSystem(`${entry.cmd} failed: ${coerceMessageText(err?.message ?? err)}`);
-      });
+      Promise.resolve(entry.run()).catch(failed);
     } catch (err) {
-      appendSystem(`${entry.cmd} failed: ${coerceMessageText(err?.message ?? err)}`);
+      failed(err);
     }
   }
 
@@ -27478,9 +27592,17 @@ function buildPanel() {
         const label = outcome?.snapshot?.label;
         appendSystem(
           describeRevertOutcome(outcome, {
+            // `action` is spliced INTO describeRevertOutcome's own English refusal/failure
+            // sentences (lib/graph-revert.js), so translating it here would produce a
+            // half-translated line. It stays English until that lib is converted too.
             action: "revert",
-            restoredText: `↩ Reverted the canvas to before${label ? ` “${label}”` : " your last message"}.`,
-            noneText: "Nothing to revert — no graph snapshot captured in this session yet.",
+            // Two whole sentences rather than one with a conditional clause: the label is
+            // the user's own snapshot title, and a language that reorders the sentence
+            // needs the placeholder to move with it.
+            restoredText: label
+              ? tr("panel.reverted_the_canvas_to_before_label", "↩ Reverted the canvas to before “{label}”.", { label })
+              : tr("panel.reverted_the_canvas_to_before_your_last", "↩ Reverted the canvas to before your last message."),
+            noneText: tr("panel.nothing_to_revert_no_graph_snapshot_captured", "Nothing to revert — no graph snapshot captured in this session yet."),
           }),
         );
       },
@@ -27511,7 +27633,7 @@ function buildPanel() {
       // throw, but a remedy that depends on its own failure path staying healthy is
       // not a remedy.
       run: () => {
-        appendSystem(`Docs: ${DOCS_URL} — if nothing opened, copy that address.`);
+        appendSystem(tr("panel.docs_if_nothing_opened_copy_that_address", "Docs: {url} — if nothing opened, copy that address.", { url: DOCS_URL }));
         openExternalUrl(DOCS_URL);
       },
     },
@@ -27529,8 +27651,12 @@ function buildPanel() {
       run: () =>
         appendSystem(
           [
+            // `c.cmd` is the literal command and `c.hint` is already translated at its own
+            // call site, so only the closing pointer-to-the-docs is a string of ours.
             ...SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`),
-            `these are panel shortcuts; for what the agent itself can do, see the docs: ${DOCS_URL}`,
+            tr("panel.these_are_panel_shortcuts_for_what_the", "these are panel shortcuts; for what the agent itself can do, see the docs: {url}", {
+              url: DOCS_URL,
+            }),
           ].join(" · "),
         ),
     },
@@ -27767,7 +27893,10 @@ function buildPanel() {
     return att.token || "";
   }
   function attChipLabel(att) {
-    if (att.kind === "text") return `Pasted text #${att.id}`;
+    // DISPLAY only. The bracketed `[Pasted text #N]` token above is wire format — it is
+    // matched against the composer text on send — so it stays English; this label is the
+    // chip the user reads and is not compared against anything.
+    if (att.kind === "text") return tr("panel.pasted_text_chip", "Pasted text #{id}", { id: att.id });
     return att.name || attTokenFor(att) || `#${att.id}`;
   }
   // Remove the attachment + its inline token (and a single trailing space) from
@@ -27818,14 +27947,14 @@ function buildPanel() {
         chipPreview.appendChild(img);
       } else {
         const p = document.createElement("pre");
-        p.textContent = att.name || "image (no preview yet)";
+        p.textContent = att.name || tr("panel.image_no_preview_yet", "image (no preview yet)");
         chipPreview.appendChild(p);
       }
       return;
     }
     const pre = document.createElement("pre");
     const content = att.content != null ? String(att.content) : "";
-    pre.textContent = content || (att.ready ? "Loading…" : "(empty)");
+    pre.textContent = content || (att.ready ? tr("panel.loading", "Loading…") : tr("panel.empty", "(empty)"));
     chipPreview.appendChild(pre);
   }
   // Rebuild the chip strip from attachments[]. Safe to call any time.
@@ -27865,7 +27994,21 @@ function buildPanel() {
       if (att.kind === "text") {
         const meta = document.createElement("span");
         meta.className = "cmcp-attach-meta";
-        meta.textContent = `${(att.content || "").length.toLocaleString()} chars`;
+        // Counted, so the plural category comes from Intl rather than a trailing "s":
+        // Russian needs one/few/many and Korean needs none of them.
+        //
+        // TWO variables on purpose, and a translator must use `{n}`: `{n}` is the
+        // locale-GROUPED number ("12,345" / "12.345"), `count` is the raw number Intl
+        // reads to pick the category. Grouped with the PANEL's locale, not the browser's
+        // — pickLocale deliberately lets those diverge (an explicit language setting and
+        // ComfyUI's own outrank navigator.languages), and German grouping inside a
+        // Japanese sentence is the visible result of getting that wrong.
+        const chars = (att.content || "").length;
+        meta.textContent = tr(
+          "panel.chars_count",
+          { one: "{n} char", other: "{n} chars" },
+          { count: chars, n: chars.toLocaleString(currentLocale()) },
+        );
         chip.appendChild(meta);
       }
       chip.addEventListener("click", () => toggleAttachPreview(att.id));
@@ -28140,7 +28283,15 @@ function buildPanel() {
   form.style.position = form.style.position || "relative";
   const dropzone = document.createElement("div");
   dropzone.className = "cmcp-dropzone";
-  dropzone.innerHTML = '<span><i class="pi pi-paperclip"></i> Drop a file to attach</span>';
+  // Built as DOM rather than innerHTML now that the label is translated: a catalog string
+  // must never be parsed as markup, and the structure (span > icon + text) is unchanged.
+  {
+    const dropLabel = document.createElement("span");
+    const dropIcon = document.createElement("i");
+    dropIcon.className = "pi pi-paperclip";
+    dropLabel.append(dropIcon, ` ${tr("panel.drop_a_file_to_attach", "Drop a file to attach")}`);
+    dropzone.appendChild(dropLabel);
+  }
   form.appendChild(dropzone);
   let dragDepth = 0;
   const showDrop = (on) => dropzone.classList.toggle("cmcp-show", on);
@@ -28231,7 +28382,9 @@ function buildPanel() {
       recognition = null;
     });
     recognition.addEventListener("error", (ev) => {
-      if (ev.error !== "aborted") appendSystem(`Voice input error: ${ev.error}`);
+      // `ev.error` is the Web Speech API's own code ("no-speech", "network") — an
+      // identifier, not prose, so it rides in as a placeholder.
+      if (ev.error !== "aborted") appendSystem(tr("panel.voice_input_error", "Voice input error: {error}", { error: ev.error }));
     });
     micBtn.classList.add("active");
     recognition.start();
@@ -28337,9 +28490,22 @@ function buildPanel() {
     const outcome = await revertGraphToLastSnapshot();
     const reverted = revertDidRestore(outcome); // an outcome object is ALWAYS truthy
     if (reverted || recalled) {
+      // Three WHOLE sentences, one per reachable combination, instead of one sentence with
+      // two clauses spliced in. The English is byte-for-byte what the concatenation
+      // produced; the difference is that a translator sees a complete sentence and can
+      // reorder the clauses, which the old form made impossible.
       appendSystem(
-        `↩ Rewound your last turn${reverted ? " — canvas reverted" : ""}` +
-          `${recalled ? "; your message is back in the composer to edit & resend" : ""}.`,
+        reverted && recalled
+          ? tr(
+              "panel.rewound_your_last_turn_canvas_reverted_your",
+              "↩ Rewound your last turn — canvas reverted; your message is back in the composer to edit & resend.",
+            )
+          : reverted
+            ? tr("panel.rewound_your_last_turn_canvas_reverted", "↩ Rewound your last turn — canvas reverted.")
+            : tr(
+                "panel.rewound_your_last_turn_your_message_is",
+                "↩ Rewound your last turn; your message is back in the composer to edit & resend.",
+              ),
       );
       input.focus();
     }
@@ -28353,13 +28519,18 @@ function buildPanel() {
     if (!reverted) {
       appendSystem(
         describeRevertOutcome(outcome, {
+          // English on purpose — see the /revert call site: `action` is interpolated into
+          // the lib's own untranslated refusal/failure sentences.
           action: "rewind the canvas",
           restoredText: "",
           noneText: recalled
-            ? "The canvas was NOT reverted — no graph snapshot for that turn (they are kept for the " +
-              "last 25 and then evicted). Your message is back in the composer, but the canvas still " +
-              "holds that turn's edits."
-            : "Nothing to rewind yet — no message or graph snapshot from this session.",
+            ? tr(
+                "panel.the_canvas_was_not_reverted_no_graph",
+                "The canvas was NOT reverted — no graph snapshot for that turn (they are kept for the " +
+                  "last 25 and then evicted). Your message is back in the composer, but the canvas still " +
+                  "holds that turn's edits.",
+              )
+            : tr("panel.nothing_to_rewind_yet_no_message_or", "Nothing to rewind yet — no message or graph snapshot from this session."),
         }),
       );
     }
@@ -28451,9 +28622,10 @@ function buildPanel() {
         const outcome = await revertGraphSnapshotByMid(mid);
         appendSystem(
           describeRevertOutcome(outcome, {
+            // English on purpose — see the /revert call site.
             action: "roll back the canvas",
-            restoredText: "↩ Canvas reverted to before this message.",
-            noneText: "No graph snapshot for this message — canvas left as-is.",
+            restoredText: tr("panel.canvas_reverted_to_before_this_message", "↩ Canvas reverted to before this message."),
+            noneText: tr("panel.no_graph_snapshot_for_this_message_canvas", "No graph snapshot for this message — canvas left as-is."),
           }),
         );
         // The user asked to roll the canvas back AND resend against it. Unless the
@@ -28471,8 +28643,11 @@ function buildPanel() {
           close();
           if (edited) setComposerValue(edited);
           appendSystem(
-            "Not resending — the canvas was not rolled back to the state you asked for. Your edited " +
-              "message is in the composer; send it once the canvas is what you want.",
+            tr(
+              "panel.not_resending_the_canvas_was_not_rolled",
+              "Not resending — the canvas was not rolled back to the state you asked for. Your edited " +
+                "message is in the composer; send it once the canvas is what you want.",
+            ),
           );
           return;
         }
@@ -28484,7 +28659,10 @@ function buildPanel() {
       if (cancelled) {
         if (edited) setComposerValue(edited);
         appendSystem(
-          "Cancelled — not rewinding the conversation or resending. Your edited message is in the composer.",
+          tr(
+            "panel.cancelled_not_rewinding_the_conversation_or_resending",
+            "Cancelled — not rewinding the conversation or resending. Your edited message is in the composer.",
+          ),
         );
         return;
       }
@@ -28492,8 +28670,8 @@ function buildPanel() {
         client.sendFrame?.({ type: "rewind", anchor });
         appendSystem(
           anchor
-            ? "↩ Rewound the conversation to before this message."
-            : "↩ Started a fresh conversation from this point.",
+            ? tr("panel.rewound_the_conversation_to_before_this_message", "↩ Rewound the conversation to before this message.")
+            : tr("panel.started_a_fresh_conversation_from_this_point", "↩ Started a fresh conversation from this point."),
         );
       }
       close();
@@ -28558,7 +28736,7 @@ function buildPanel() {
   // nothing is exposed beyond loopback until the user opens this modal).
   function openPairModal() {
     if (!client?.sendFrame) {
-      appendSystem("Connect to an agent first, then use Remote control to pair a phone.");
+      appendSystem(tr("panel.connect_to_an_agent_first_then_use", "Connect to an agent first, then use Remote control to pair a phone."));
       return;
     }
     const overlay = document.createElement("div");
@@ -28602,7 +28780,9 @@ function buildPanel() {
       durabilityLine.hidden = true;
       durabilityLine.textContent = "";
       statusMsg.textContent =
-        mode === "tunnel" ? "Opening a secure tunnel…" : "Preparing a local link…";
+        mode === "tunnel"
+          ? tr("panel.opening_a_secure_tunnel", "Opening a secure tunnel…")
+          : tr("panel.preparing_a_local_link", "Preparing a local link…");
       const myReq = ++reqId;
       pendingPair = (res) => {
         if (myReq !== reqId) return; // a newer request (mode switch) superseded this
@@ -28693,7 +28873,7 @@ function buildPanel() {
       }
     }
     if (!client.isConnected()) {
-      appendSystem("Not connected — click Connect (in the Connection panel) and try again.");
+      appendSystem(tr("panel.not_connected_click_connect_in_the_connection", "Not connected — click Connect (in the Connection panel) and try again."));
       settingsBox.hidden = false;
       return;
     }
@@ -28947,7 +29127,7 @@ function buildPanel() {
     if (client.sendFrame({ type: "interrupt" })) {
       ev.preventDefault();
       endTurnLocally();
-      appendSystem("Interrupted.");
+      appendSystem(tr("panel.interrupted", "Interrupted."));
     }
   }
   document.addEventListener("keydown", onInterruptKeydown, true);
@@ -29214,7 +29394,7 @@ function buildPanel() {
   // panel; the most-recently-mounted panel owns the hooks.
   panelHooks.applyBackend = (id) => {
     if (!id || id === selectedBackend) return;
-    appendSystem(`Default backend → ${BACKEND_LABELS[id] || id}.`);
+    appendSystem(tr("panel.default_backend_switched", "Default backend → {backend}.", { backend: BACKEND_LABELS[id] || id }));
     // Route through connectBackend, which CENTRALLY seeds prefs from the new
     // backend's group before connecting (same path as the chips / model-popover
     // provider row) — exactly ONE connect, and the single post-handshake catalog
@@ -29243,10 +29423,10 @@ function buildPanel() {
     refreshContextRingForScope(); // #381: the scope mode changed — reflect the target scope's fill
     appendSystem(
       mode === "panel"
-        ? "Chat scope → panel-wide conversation."
+        ? tr("panel.chat_scope_panel_wide_conversation", "Chat scope → panel-wide conversation.")
         : mode === "workflow"
-          ? "Chat scope → separate histories for each workflow."
-          : "Chat scope → ask whenever the workflow changes.",
+          ? tr("panel.chat_scope_separate_histories_for_each_workflow", "Chat scope → separate histories for each workflow.")
+          : tr("panel.chat_scope_ask_whenever_the_workflow_changes", "Chat scope → ask whenever the workflow changes."),
     );
   };
   panelHooks.applyModel = (id) => {
@@ -29261,7 +29441,7 @@ function buildPanel() {
       savePrefs(prefs);
       refreshModelChip();
       client?.sendFrame?.({ type: "set_options", model: null, effort: prefs.effort ?? null });
-      appendSystem("Model → Auto (the agent picks).");
+      appendSystem(tr("panel.model_auto_the_agent_picks", "Model → Auto (the agent picks)."));
       return;
     }
     if (next === prefs.model && !prefs.modelAuto) return;
@@ -29271,7 +29451,7 @@ function buildPanel() {
     savePrefs(prefs);
     refreshModelChip();
     client?.sendFrame?.({ type: "set_options", model: next, effort: prefs.effort ?? null });
-    appendSystem(`Model → ${modelLabel(modelCatalog, next)}.`);
+    appendSystem(tr("panel.model_switched", "Model → {model}.", { model: modelLabel(modelCatalog, next) }));
   };
   panelHooks.applyEffort = (eff) => {
     const next = eff || undefined;
@@ -29281,7 +29461,11 @@ function buildPanel() {
     savePrefs(prefs);
     refreshModelChip();
     client?.sendFrame?.({ type: "set_options", effort: prefs.effort ?? null });
-    appendSystem(next ? `Effort → ${effortMeta(next).label}.` : "Effort → model default.");
+    appendSystem(
+      next
+        ? tr("panel.effort_switched", "Effort → {effort}.", { effort: effortMeta(next).label })
+        : tr("panel.effort_model_default", "Effort → model default."),
+    );
   };
   panelHooks.applyBridgeUrl = (url) => {
     const u = (url || "").trim();
@@ -29290,7 +29474,7 @@ function buildPanel() {
     saveBridgeUrl(u);
     if (client.isConnected()) {
       client.setUrl(u);
-      appendSystem(`Bridge URL → ${redactBridgeUrl(u)} (reconnecting).`);
+      appendSystem(tr("panel.bridge_url_reconnecting", "Bridge URL → {url} (reconnecting).", { url: redactBridgeUrl(u) }));
     }
   };
   panelHooks.applyAutoConnect = (on) => {
