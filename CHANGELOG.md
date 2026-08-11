@@ -6,6 +6,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-08-10
+
+> #584: a ComfyUI tab that keeps running OLD panel JS after a reload, so the orchestrator
+> sees a stale version and refuses graph writes. This is a backstop for hosts that leave the
+> door open — not a cure, and the notes below say exactly which.
+
+### Fixed
+- the pack now gives its own `/extensions/comfyui-mcp-panel/` assets a cache policy on hosts
+  that set none, matching the value current ComfyUI already applies to every extension.
+  Older ComfyUI builds serve extension files with an ETag from mtime+size and no policy,
+  which is the shape that lets a replaced file keep being served from cache.
+
+### Changed
+- **Measured before claiming**: ComfyUI 0.31.1 already sends `Cache-Control: no-store` for
+  every `/extensions/` path, so on current builds this changes nothing. The staleness
+  reproduced while developing 0.13.3 turned out not to be a cache at all — it was a reload
+  cancelled by ComfyUI's unsaved-changes prompt.
+- A first attempt used a weaker header and was described as a no-op. It was not: this pack's
+  middleware runs INSIDE ComfyUI's own, so the host's `setdefault` preserved the weaker
+  value and the panel's assets ended up with a LOOSER policy than every other pack's. The
+  shipped version matches the host's value, so that inversion cannot happen.
+
+
 ## [0.13.3] - 2026-08-10
 
 > #753: the panel's text was small and the obvious fix did nothing. Overriding
