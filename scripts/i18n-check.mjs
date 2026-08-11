@@ -81,6 +81,13 @@ function pluralIssues(locale, sourceFlat, targetFlat) {
     const have = new Set(
       [...targetFlat.keys()].map(pluralSplit).filter((p) => p && p.base === base).map((p) => p.cat),
     );
+    // A base this language has not started renders English through tr()'s fallback, exactly
+    // like any other missing key. Only a PARTIALLY-formed plural is a defect — that is the
+    // one that silently resolves to `_other` and reads as correct to anyone who does not
+    // speak the language. Without this, adding a counted string to English would instantly
+    // break every language that has not caught up, which is the same mistake this file
+    // already corrected for flat keys.
+    if (have.size === 0) continue;
     for (const cat of required) {
       if (!have.has(cat)) out.push(`${base}: missing "_${cat}" — ${locale} requires [${cats.join(', ')}]`);
     }

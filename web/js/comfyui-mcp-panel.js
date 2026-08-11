@@ -23488,7 +23488,7 @@ function buildPanel() {
     const q = document.createElement("div");
     q.style.cssText = "font-weight:600;margin:0.15rem 0 0.5rem;";
     // The agent's own question is never translated — only our stand-in when it sent none.
-    renderRichText(q, coerceMessageText(msg.question) || tr("panel.pick_one", "Pick one:"));
+    renderRichText(q, coerceMessageText(msg.question) || tr("panel.pick_one_prompt", "Pick one:"));
     card.appendChild(q);
 
     const selected = new Set();
