@@ -472,7 +472,18 @@ function inputDeclaresNativeWidgetType(spec) {
   if (!Array.isArray(spec)) return false;
   const config = spec[1];
   if (!config || typeof config !== "object" || Array.isArray(config)) return false;
-  return isPrimitiveWidgetType(config.widgetType);
+  // EXACT match against the primitive set, deliberately NOT via isPrimitiveWidgetType
+  // (codex). That helper trims and upper-cases, which is right where it is used — the #788
+  // waiver feeds it union MEMBERS, and whitespace around a comma is the store's syntax
+  // rather than part of the identifier. Here the value is an identifier the frontend looks
+  // up verbatim, so normalising would waive `"string"` and `" STRING "` as native widgets
+  // when ComfyUI would resolve neither, granting the waiver to a name that is not the
+  // primitive. Same exact-spelling discipline as isCore3dFileType, and for the same reason.
+  //
+  // Left isPrimitiveWidgetType untouched rather than tightening it globally: it predates
+  // this and #788 depends on its current behaviour, so narrowing it here is the change that
+  // is actually justified by the evidence.
+  return typeof config.widgetType === "string" && PRIMITIVE_WIDGET_TYPES.has(config.widgetType);
 }
 
 export function inputDeclaredAsSocket(spec) {

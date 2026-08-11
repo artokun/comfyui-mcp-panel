@@ -885,6 +885,41 @@ test("#1062 (codex re-review): a PRIMITIVE `widgetType` hint resolves natively �
   ]);
 });
 
+test("#1062 (codex): the native-widget waiver takes the EXACT primitive spelling only", () => {
+  // The waiver is a claim that ComfyUI will resolve `widgetType` to a native widget, and
+  // ComfyUI looks that name up verbatim. `"string"` is not `"STRING"`, so waiving it would
+  // grant the waiver to a name that resolves to nothing — the same laundering the core-3D
+  // set is exact to avoid. Every one of these must stay refused.
+  const refused = [
+    { widgetType: "string" },
+    { widgetType: " STRING " },
+    { widgetType: "Int" },
+    { widgetType: "ACME_GALLERY" },
+    { widgetType: null },
+    { widgetType: 42 },
+    { widgetType: ["STRING"] },
+    { widgetType: { type: "STRING" } },
+    {},
+  ];
+  for (const config of refused) {
+    const def = { input: { required: { thing: ["ZIPN_STYLE_GALLERY", config] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+      ["ZIPN_STYLE_GALLERY"],
+      `widgetType ${JSON.stringify(config.widgetType)} must not be waived as native`,
+    );
+  }
+  // Only the exact spellings resolve.
+  for (const widgetType of ["STRING", "INT", "FLOAT", "BOOLEAN"]) {
+    const def = { input: { required: { thing: ["ZIPN_STYLE_GALLERY", { widgetType }] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+      [],
+      `widgetType "${widgetType}" resolves natively`,
+    );
+  }
+});
+
 test("#1062 #580 (codex): the core-3D set matches the DECLARED SPELLING, not a normalised one", () => {
   // The other bypass. Every registry in this module keys on the spelling as declared — the
   // widget-constructor lookup and knownSocketTypes both do — so a lower-case or
