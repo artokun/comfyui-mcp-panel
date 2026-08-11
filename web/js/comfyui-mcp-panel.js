@@ -22078,13 +22078,22 @@ function buildPanel() {
       historyPersistenceWarningCode = failure?.code || "history-persistence-unavailable";
       appendSystem(
         failure?.code === "history-canonical-unavailable-shadow-truncated"
-          ? "IndexedDB is unavailable. Only the newest 20 chats / 200 entries fit in the " +
-            "localStorage fallback; older history is still in this open tab but is not durably saved. " +
-            "Keep this tab open, restore browser storage, then send or edit once to retry."
+          ? tr(
+              "panel.indexeddb_is_unavailable_only_the_newest_20",
+              "IndexedDB is unavailable. Only the newest 20 chats / 200 entries fit in the " +
+                "localStorage fallback; older history is still in this open tab but is not durably saved. " +
+                "Keep this tab open, restore browser storage, then send or edit once to retry.",
+            )
           : failure?.code === "history-legacy-shadow-unavailable"
-            ? "Some legacy chat history has no IndexedDB copy and could not be saved to localStorage. " +
-              "Keep this tab open, free browser storage, then send or edit once to retry."
-            : "Chat history could not be saved. Keep this tab open, free browser storage, then send or edit once to retry.",
+            ? tr(
+                "panel.some_legacy_chat_history_has_no_indexeddb",
+                "Some legacy chat history has no IndexedDB copy and could not be saved to localStorage. " +
+                  "Keep this tab open, free browser storage, then send or edit once to retry.",
+              )
+            : tr(
+                "panel.chat_history_could_not_be_saved_keep",
+                "Chat history could not be saved. Keep this tab open, free browser storage, then send or edit once to retry.",
+              ),
       );
     },
   });
@@ -22505,6 +22514,19 @@ function buildPanel() {
     }
   }
 
+  /**
+   * "12 nodes" — the workflow-snapshot chip, shown on a user bubble and again on its
+   * history row. Counted, so it goes through the plural path: Russian needs four forms
+   * and Korean one, and `n === 1 ? "node" : "nodes"` is right in neither.
+   *
+   * A `function` declaration, not a `const` arrow: both callers are hoisted painters that
+   * the hydration path can reach before this line runs, and a TDZ error there would blank
+   * a bubble over a chip.
+   */
+  function nodeCountLabel(count) {
+    return tr("panel.nodes", { one: "{count} node", other: "{count} nodes" }, { count: Number(count) || 0 });
+  }
+
   function paintUser(text, opts = {}) {
     clearEmpty();
     const b = document.createElement("div");
@@ -22514,13 +22536,13 @@ function buildPanel() {
       const version = thread?.workflowVersions?.[opts.workflowVersion];
       const badge = document.createElement("span");
       badge.className = "cmcp-workflow-version";
-      badge.title = version?.path || version?.title || "Workflow snapshot";
+      badge.title = version?.path || version?.title || tr("panel.workflow_snapshot", "Workflow snapshot");
       badge.innerHTML = '<i class="pi pi-sitemap"></i>';
       badge.appendChild(
         document.createTextNode(
           version
-            ? `${version.nodeCount} nodes · ${version.hash}`
-            : `workflow · ${opts.workflowVersion}`,
+            ? `${nodeCountLabel(version.nodeCount)} · ${version.hash}`
+            : tr("panel.workflow", "workflow · {version}", { version: opts.workflowVersion }),
         ),
       );
       b.appendChild(badge);
@@ -22644,9 +22666,10 @@ function buildPanel() {
       b.type = "button"; b.className = cls; b.innerHTML = html; if (title) b.title = title;
       return b;
     };
-    const prevBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-prev", "‹", "Previous");
-    const nextBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-next", "›", "Next");
-    const closeBtn = mkBtn("cmcp-lightbox-close", "✕", "Close (Esc)");
+    // The glyphs are punctuation, not words — only the tooltips are translated.
+    const prevBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-prev", "‹", tr("panel.previous", "Previous"));
+    const nextBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-next", "›", tr("panel.next", "Next"));
+    const closeBtn = mkBtn("cmcp-lightbox-close", "✕", tr("panel.close_esc", "Close (Esc)"));
     const caption = document.createElement("div");
     caption.className = "cmcp-lightbox-caption";
     const openBtn = document.createElement("button");
@@ -22783,6 +22806,19 @@ function buildPanel() {
    * these same painters.
    */
   function attachMediaCollapse(card, { url, kind, name, tools, onCollapse }) {
+    // FOUR whole sentences rather than `${verb} this ${kind}`. Gluing a verb to a noun
+    // is an English-only sentence shape: German wants "Dieses Bild ausblenden", Korean
+    // "이 이미지 숨기기", and a translator handed the two halves separately cannot reorder
+    // them. Each combination gets its own key so each language writes its own sentence.
+    const showHideTitle = (collapsed) =>
+      collapsed
+        ? kind === "video"
+          ? tr("panel.show_this_video", "Show this video")
+          : tr("panel.show_this_image", "Show this image")
+        : kind === "video"
+          ? tr("panel.hide_this_video", "Hide this video")
+          : tr("panel.hide_this_image", "Hide this image");
+
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "cmcp-media-collapse";
@@ -22795,13 +22831,15 @@ function buildPanel() {
     stub.className = "cmcp-media-stub";
     stub.setAttribute("role", "button");
     stub.tabIndex = 0;
-    stub.title = `Show this ${kind}`;
+    stub.title = showHideTitle(true);
     const icon = document.createElement("span");
     icon.setAttribute("aria-hidden", "true");
     icon.textContent = kind === "video" ? "🎬" : "🖼";
     const label = document.createElement("span");
     label.className = "cmcp-media-stub-name";
-    label.textContent = name || (kind === "video" ? "Video" : "Image");
+    // `name` is the agent's own caption/filename and stays exactly as it arrived; only
+    // the generic stand-in when there is no caption is ours to translate.
+    label.textContent = name || (kind === "video" ? tr("panel.video", "Video") : tr("panel.image", "Image"));
     const hint = document.createElement("span");
     hint.textContent = tr("panel.hidden_click_to_show", "· hidden, click to show");
     stub.append(icon, label, hint);
@@ -22810,9 +22848,9 @@ function buildPanel() {
     const apply = (collapsed) => {
       card.classList.toggle("cmcp-media-collapsed", collapsed);
       btn.textContent = collapsed ? "▸" : "▾";
-      const verb = collapsed ? "Show" : "Hide";
-      btn.title = `${verb} this ${kind}`;
-      btn.setAttribute("aria-label", `${verb} this ${kind}`);
+      const title = showHideTitle(collapsed);
+      btn.title = title;
+      btn.setAttribute("aria-label", title);
       btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
       if (collapsed) {
         try {
@@ -22870,7 +22908,7 @@ function buildPanel() {
     const tools = mediaToolsFor(card);
     const img = document.createElement("img");
     img.src = url;
-    img.alt = name || "output";
+    img.alt = name || tr("panel.output", "output"); // read aloud by screen readers
     img.loading = "lazy";
     // NO inline `display` — it would outrank the collapsed rule in the stylesheet
     // and the card would never actually hide (#818). `.cmcp-imgcard > img` sets it.
@@ -22962,8 +23000,11 @@ function buildPanel() {
       // the only one, and the other codes get a narrower sentence that claims no cause.
       const unsupported = v.error?.code === 4;
       holder.textContent = unsupported
-        ? "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM."
-        : "This video could not be loaded.";
+        ? tr(
+            "panel.this_browser_can_t_play_this_video",
+            "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM.",
+          )
+        : tr("panel.this_video_could_not_be_loaded", "This video could not be loaded.");
       holder._preFailCss = holder.style.cssText;
       holder.style.cssText +=
         ";display:grid;place-items:center;padding:1rem;box-sizing:border-box;text-align:center;" +
@@ -23110,7 +23151,7 @@ function buildPanel() {
     a.target = "_blank";
     a.rel = "noopener noreferrer";
     if (name) a.download = name;
-    a.textContent = name || "Open file";
+    a.textContent = name || tr("panel.open_file", "Open file");
     card.appendChild(a);
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
@@ -23178,7 +23219,7 @@ function buildPanel() {
     const reply = coerceMessageText(text);
     appendUser(reply, {});
     const ok = client?.sendUserMessage?.(reply);
-    if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
+    if (!ok) appendSystem(tr("panel.card_reply_couldn_t_be_sent_agent", "Card reply couldn't be sent — agent disconnected."));
   }
 
   /**
@@ -23260,7 +23301,7 @@ function buildPanel() {
       }
       log.appendChild(renderA2UIInert(m.spec, m.choice));
     } catch {
-      log.appendChild(renderA2UIFailCard(m?.spec, ["stored card failed to render"]));
+      log.appendChild(renderA2UIFailCard(m?.spec, [tr("panel.stored_card_failed_to_render", "stored card failed to render")]));
     }
   }
 
@@ -23296,7 +23337,8 @@ function buildPanel() {
     }
     const q = document.createElement("div");
     q.style.cssText = "font-weight:600;margin:0.15rem 0 0.5rem;";
-    renderRichText(q, coerceMessageText(msg.question) || "Pick one:");
+    // The agent's own question is never translated — only our stand-in when it sent none.
+    renderRichText(q, coerceMessageText(msg.question) || tr("panel.pick_one", "Pick one:"));
     card.appendChild(q);
 
     const selected = new Set();
@@ -23327,7 +23369,7 @@ function buildPanel() {
       a.textContent = `✓ ${answerText}`;
       card.appendChild(a);
       // Record as a plain card so a reload restores it as static text, not a widget.
-      record({ role: "card", icon: "pi-check", text: questionText || "Choice", detail: answerText });
+      record({ role: "card", icon: "pi-check", text: questionText || tr("panel.choice", "Choice"), detail: answerText });
       scrollLog();
       resolveFn(answer);
     };
@@ -23385,7 +23427,7 @@ function buildPanel() {
     submit.style.cssText =
       "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
-    submit.textContent = multi ? "Submit" : "Send";
+    submit.textContent = multi ? tr("panel.submit", "Submit") : tr("panel.send", "Send");
     submit.addEventListener("click", () => {
       if (done) return;
       if (other.value.trim()) finish(other.value.trim());
@@ -23471,10 +23513,22 @@ function buildPanel() {
       const note = document.createElement("div");
       note.className = "cmcp-card-stale";
       note.style.cssText = "font-size:0.68rem;opacity:0.8;margin-top:0.4rem;";
-      note.textContent =
-        `The connection that asked this ${what ?? "question"} dropped, so an answer here can no ` +
-        `longer reach the agent. ` +
-        (detail ?? "If it asked again, answer the newer card.");
+      // `what` and `detail` arrive already translated from the call sites — the caller
+      // knows which kind of card it is, and a `{what}` hole lets each language place the
+      // noun where its grammar wants it rather than mid-sentence as English does.
+      //
+      // The two sentences are JOINED here rather than the first one carrying a trailing
+      // space. Edge whitespace in a catalog value is silently droppable and `i18n-check`
+      // only validates holes, so a translator who trimmed it would glue two sentences
+      // together with no way to see why.
+      note.textContent = [
+        tr(
+          "panel.the_connection_that_asked_this_dropped_so",
+          "The connection that asked this {what} dropped, so an answer here can no longer reach the agent.",
+          { what: what ?? tr("panel.question", "question") },
+        ),
+        detail ?? tr("panel.if_it_asked_again_answer_the_newer", "If it asked again, answer the newer card."),
+      ].join(" ");
       card.appendChild(note);
     } catch {
       /* presentation only — never break a reconnect */
@@ -23502,14 +23556,20 @@ function buildPanel() {
     lock.className = "pi pi-lock";
     const t = document.createElement("span");
     t.style.fontWeight = "600";
-    t.textContent = msg.label || "Paste your token";
+    // `msg.label` / `msg.hint` are the agent's own words and pass through untouched; only
+    // the panel's stand-in for a card that supplied neither is translated.
+    t.textContent = msg.label || tr("panel.paste_your_token", "Paste your token");
     head.append(lock, t);
     card.appendChild(head);
 
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:0.68rem;opacity:0.7;margin:0.2rem 0 0.4rem;";
     hint.textContent =
-      msg.hint || "Sent straight to your config — never shown to the agent and never saved to chat history.";
+      msg.hint ||
+      tr(
+        "panel.sent_straight_to_your_config_never_shown",
+        "Sent straight to your config — never shown to the agent and never saved to chat history.",
+      );
     card.appendChild(hint);
 
     let done = false;
@@ -23558,10 +23618,13 @@ function buildPanel() {
       const ok = document.createElement("div");
       ok.style.cssText = "font-size:0.75rem;color:var(--p-green-400,#4ade80);";
       const m = mask(value);
-      ok.textContent = value ? `🔒 Token saved: ${m}` : "Skipped — no token entered.";
+      ok.textContent = value
+        ? tr("panel.token_saved", "🔒 Token saved: {masked}", { masked: m })
+        : tr("panel.skipped_no_token_entered", "Skipped — no token entered.");
       card.appendChild(ok);
-      // Record ONLY the masked preview — never the full value.
-      record({ role: "card", icon: "pi-lock", text: msg.label || "Token", detail: value ? `saved ${m}` : "skipped" });
+      // Record ONLY the masked preview — never the full value. `detail` stays English:
+      // it is a machine-shaped audit note ("saved ab…yz"), not a sentence.
+      record({ role: "card", icon: "pi-lock", text: msg.label || tr("panel.token", "Token"), detail: value ? `saved ${m}` : "skipped" });
       scrollLog();
       resolveFn(value || "");
     };
@@ -23625,10 +23688,12 @@ function buildPanel() {
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
-          what: "secret request",
-          detail:
+          what: tr("panel.secret_request", "secret request"),
+          detail: tr(
+            "panel.nothing_was_sent_and_nothing_was_stored",
             "Nothing was sent and nothing was stored. Wait for the agent to ask again on " +
-            "the new connection — do not paste the value into the chat.",
+              "the new connection — do not paste the value into the chat.",
+          ),
         }),
     });
     promise.then(unregisterSecret, unregisterSecret);
@@ -23715,8 +23780,8 @@ function buildPanel() {
     if (!statusEl) return;
     statusEl.className = "cmcp-msg-status " + state;
     statusEl.replaceChildren(
-      iconAction("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
-      iconAction("pi-times", "Cancel this message", () => deleteMsg(mid)),
+      iconAction("pi-pencil", tr("panel.edit_pull_back_to_the_composer", "Edit — pull back to the composer"), () => editMsg(mid)),
+      iconAction("pi-times", tr("panel.cancel_this_message", "Cancel this message"), () => deleteMsg(mid)),
     );
   }
 
@@ -23881,7 +23946,7 @@ function buildPanel() {
       if (v.ok) appendA2UICard(v.spec);
       else {
         log.appendChild(renderA2UIFailCard(s.raw, v.errors));
-        record({ role: "card", icon: "pi-exclamation-triangle", text: "Unsupported card", detail: v.errors[0] || "invalid a2ui spec" });
+        record({ role: "card", icon: "pi-exclamation-triangle", text: tr("a2ui.unsupported_card", "Unsupported card"), detail: v.errors[0] || "invalid a2ui spec" });
         scrollLog();
       }
     }
@@ -24003,7 +24068,7 @@ function buildPanel() {
       kickStreams(s);
     } else if (phase === "text") {
       const s = ensureStreamBubble(id);
-      collapseThinking(s, "See thinking"); // reply began → tuck the reasoning away
+      collapseThinking(s, tr("panel.see_thinking", "See thinking")); // reply began → tuck the reasoning away
       s.replyTarget += delta;
       s.replyEl.classList.add("streaming-cursor");
       kickStreams(s);
@@ -24016,7 +24081,7 @@ function buildPanel() {
     animating.delete(s);
     streamBubbles.delete(s.id);
     s.replyEl.classList.remove("streaming-cursor");
-    collapseThinking(s, "See thinking");
+    collapseThinking(s, tr("panel.see_thinking", "See thinking"));
     renderRichText(s.replyEl, s.commitText); // streamed plain text → final markdown
     s.el.classList.remove("streaming");
     record({ role: "agent", text: s.commitText }); // thinking is ephemeral
@@ -24110,9 +24175,17 @@ function buildPanel() {
       box.dataset.testid = 'panel-whats-new';
       const head = document.createElement('div');
       head.className = 'cmcp-whatsnew-head';
+      // Only the heading is ours. The entries below come from changelog.json, which is
+      // written in English at release time and has no translated counterpart to fetch.
       head.textContent = lastSeen
-        ? `Updated to ${PANEL_VERSION} (you were on ${lastSeen}) — what changed:`
-        : `ComfyUI Agent Panel ${PANEL_VERSION} — recent changes:`;
+        ? tr(
+            "panel.updated_to_you_were_on_what_changed",
+            "Updated to {version} (you were on {lastSeen}) — what changed:",
+            { version: PANEL_VERSION, lastSeen },
+          )
+        : tr("panel.comfyui_agent_panel_recent_changes", "ComfyUI Agent Panel {version} — recent changes:", {
+            version: PANEL_VERSION,
+          });
       box.appendChild(head);
       const list = document.createElement('ul');
       list.className = 'cmcp-whatsnew-list';
@@ -24282,7 +24355,11 @@ function buildPanel() {
     if (!followsPanel && !isThreadInScope(t, scopeKey)) {
       detachInvalidCurrentThread({ scopeKey, rebind: true });
       appendSystem(
-        `Blocked a chat from another workflow. Open "${t?.workflowTitle || "its owning workflow"}" before resuming it.`,
+        tr(
+          "panel.blocked_a_chat_from_another_workflow_open",
+          'Blocked a chat from another workflow. Open "{workflow}" before resuming it.',
+          { workflow: t?.workflowTitle || tr("panel.its_owning_workflow", "its owning workflow") },
+        ),
       );
       return false;
     }
@@ -24345,9 +24422,18 @@ function buildPanel() {
     const initial = currentWorkflowId == null;
     if (!initial && chatScopeMode() === "ask") {
       const name = wf?.filename || wfkey || wfid;
+      // Two keys, not one: the OK/Cancel body is the same in both branches of every
+      // future scope prompt, and splitting it keeps the question (which interpolates a
+      // filename) apart from the fixed explanation of the two buttons.
       askModeFollowsPanel = window.confirm(
-        `Continue the current Agent Panel conversation on "${name}"?\n\n` +
-          "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
+        tr("panel.continue_the_current_agent_panel_conversation_on", 'Continue the current Agent Panel conversation on "{name}"?', {
+          name,
+        }) +
+          "\n\n" +
+          tr(
+            "panel.ok_carry_this_chat_to_the_new",
+            "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
+          ),
       );
     }
     const followsPanel = historyScopeFollowsPanel();
@@ -24472,7 +24558,9 @@ function buildPanel() {
             `Your panel_* graph tools operate on THIS graph now; re-read it (panel_graph_outline) before ` +
             `assuming or editing anything, since earlier turns may refer to a different workflow.`,
         );
-        appendSystem(`Canvas → ${name} (same conversation).`);
+        // The armContext line just above is AGENT-facing and stays English; this one is
+        // the transcript note the human reads, so only this one is translated.
+        appendSystem(tr("panel.canvas_same_conversation", "Canvas → {name} (same conversation).", { name }));
       }
       return;
     }
@@ -24570,9 +24658,9 @@ function buildPanel() {
     search.placeholder = tr("panel.search_chats", "Search chats…");
     search.setAttribute("aria-label", tr("panel.search_chat_history", "Search chat history"));
     search.dataset.testid = "history-search";
-    const exportBtn = iconBtn("pi-download", "Export all chat history");
+    const exportBtn = iconBtn("pi-download", tr("panel.export_all_chat_history", "Export all chat history"));
     exportBtn.dataset.testid = "history-export";
-    const importBtn = iconBtn("pi-upload", "Import chat history (merge)");
+    const importBtn = iconBtn("pi-upload", tr("panel.import_chat_history_merge", "Import chat history (merge)"));
     importBtn.dataset.testid = "history-import";
     const currentOnlyLabel = document.createElement("label");
     currentOnlyLabel.className = "cmcp-hist-filter";
@@ -24580,7 +24668,7 @@ function buildPanel() {
     currentOnly.type = "checkbox";
     currentOnly.checked = !historyScopeFollowsPanel();
     currentOnly.dataset.testid = "history-current-workflow";
-    currentOnlyLabel.append(currentOnly, document.createTextNode("Current workflow only"));
+    currentOnlyLabel.append(currentOnly, document.createTextNode(tr("panel.current_workflow_only", "Current workflow only")));
     tools.append(search, exportBtn, importBtn, currentOnlyLabel);
 
     const listEl = document.createElement("div");
@@ -24588,8 +24676,8 @@ function buildPanel() {
     histPop.append(tools, listEl);
 
     function friendlyWorkflowName(t) {
-      if (t.workflowKey === "panel:global") return "Panel-wide conversations";
-      return t.workflowTitle || t.workflowKey?.replace(/^workflow:|^wf:/, "") || "Unknown workflow";
+      if (t.workflowKey === "panel:global") return tr("panel.panel_wide_conversations", "Panel-wide conversations");
+      return t.workflowTitle || t.workflowKey?.replace(/^workflow:|^wf:/, "") || tr("panel.unknown_workflow", "Unknown workflow");
     }
 
     function rowAction(icon, titleText, onClick, extraClass = "") {
@@ -24655,7 +24743,9 @@ function buildPanel() {
         const none = document.createElement("div");
         none.className = "cmcp-sys";
         none.style.padding = "0.75rem";
-        none.textContent = q ? "No chats match this search." : "No past chats in this scope yet.";
+        none.textContent = q
+          ? tr("panel.no_chats_match_this_search", "No chats match this search.")
+          : tr("panel.no_past_chats_in_this_scope_yet", "No past chats in this scope yet.");
         listEl.appendChild(none);
         return;
       }
@@ -24697,13 +24787,13 @@ function buildPanel() {
       const lbl = document.createElement("span");
       lbl.className = "lbl";
       const firstUser = t.msgs.find((m) => m.role === "user");
-      lbl.textContent = (t.title || firstUser?.text || "(no messages)").slice(0, 80);
+      lbl.textContent = (t.title || firstUser?.text || tr("panel.no_messages", "(no messages)")).slice(0, 80);
       const sub = document.createElement("span");
       sub.className = "cmcp-hist-sub";
       const latestVersion = Object.values(t.workflowVersions || {}).sort(
         (a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0),
       )[0];
-      sub.textContent = [t.provider, t.model, latestVersion ? `${latestVersion.nodeCount} nodes · ${latestVersion.hash}` : null]
+      sub.textContent = [t.provider, t.model, latestVersion ? `${nodeCountLabel(latestVersion.nodeCount)} · ${latestVersion.hash}` : null]
         .filter(Boolean)
         .join(" · ");
       meta.append(lbl, sub);
@@ -24720,8 +24810,15 @@ function buildPanel() {
       const legacyReadonly = t.legacyShadow === true;
       if (foreignWorkflow) {
         item.disabled = true;
-        item.title = `Open ${friendlyWorkflowName(t)} before resuming this chat`;
-        item.setAttribute("aria-label", `${lbl.textContent} — open that workflow before resuming`);
+        item.title = tr("panel.open_before_resuming_this_chat", "Open {workflow} before resuming this chat", {
+          workflow: friendlyWorkflowName(t),
+        });
+        item.setAttribute(
+          "aria-label",
+          tr("panel.open_that_workflow_before_resuming", "{title} — open that workflow before resuming", {
+            title: lbl.textContent,
+          }),
+        );
         row.classList.add("foreign-workflow");
       } else if (legacyReadonly) {
         item.disabled = true;
@@ -24734,20 +24831,31 @@ function buildPanel() {
         loadThread(t);
       });
 
-      const pin = rowAction(t.pinned ? "pi-bookmark-fill" : "pi-bookmark", t.pinned ? "Unpin chat" : "Pin chat", () => {
+      const pin = rowAction(t.pinned ? "pi-bookmark-fill" : "pi-bookmark", t.pinned ? tr("panel.unpin_chat", "Unpin chat") : tr("panel.pin_chat", "Pin chat"), () => {
         historyStore.reviseThread(t, { pinned: !t.pinned });
         persistThreads();
         paintList();
       }, t.pinned ? "on" : "");
-      const rename = rowAction("pi-pencil", "Rename chat", () => {
-        const next = window.prompt("Chat title", t.title || firstUser?.text || "New chat");
+      const rename = rowAction("pi-pencil", tr("panel.rename_chat", "Rename chat"), () => {
+        // The PROMPT is translated; the pre-filled default is not. "New chat" is the
+        // title this thread is already STORED under (see the record() path above), so
+        // translating it here would hand the user a different string than the row shows
+        // and write a locale-specific title into IndexedDB on OK.
+        //
+        // Not the same case as a `record({ text })` card entry, which IS translated at the
+        // point it is written: a transcript row is a record of what was ON SCREEN at that
+        // moment, and freezing its language is correct. A thread TITLE is live metadata
+        // re-rendered on every repaint, so a frozen one goes stale the moment the user
+        // switches language.
+        const next = window.prompt(tr("panel.chat_title", "Chat title"), t.title || firstUser?.text || "New chat");
         if (next == null) return;
         historyStore.reviseThread(t, { title: next.trim().slice(0, 160) || null });
         persistThreads();
         paintList();
       });
-      const del = rowAction("pi-trash", "Delete this chat", () => {
-        if (!window.confirm(`Delete chat "${t.title || firstUser?.text || "New chat"}"?`)) return;
+      const del = rowAction("pi-trash", tr("panel.delete_this_chat", "Delete this chat"), () => {
+        const title = t.title || firstUser?.text || "New chat";
+        if (!window.confirm(tr("panel.delete_chat", 'Delete chat "{title}"?', { title }))) return;
         const now = nextHistoryRevision();
         historyMeta.deletedThreads = historyMeta.deletedThreads || {};
         historyMeta.deletedThreads[t.id] = {
@@ -24794,7 +24902,9 @@ function buildPanel() {
         if (!file) return;
         try {
           if (file.size > CHAT_HISTORY_MAX_IMPORT_BYTES) {
-            throw new Error("Chat history import exceeds the 25 MB limit");
+            // Caught two lines below and shown to the user, so this message is UI text
+            // rather than a developer log — hence the translation.
+            throw new Error(tr("panel.chat_history_import_exceeds_the_25_mb", "Chat history import exceeds the 25 MB limit"));
           }
           const currentThreadId = thread?.id;
           const imported = historyStore.importPayload(await file.text(), threads, historyMeta);
@@ -24808,14 +24918,36 @@ function buildPanel() {
           }
           persistThreads();
           paintList();
+          // "chat(s)" / "alias(es)" was English hedging around a count. Both go through
+          // the plural path now, so a language with more (or fewer) forms than English
+          // gets a real sentence instead of a parenthesised suffix it cannot use.
           appendSystem(
-            `Merged ${imported.importedCount || 0} imported chat(s); existing history was preserved.` +
-            (imported.skippedAliasCount
-              ? ` ${imported.skippedAliasCount} extra workflow alias(es) were skipped at the storage limit.`
-              : ""),
+            tr(
+              "panel.merged_imported_chats_existing_history_was_preserved",
+              {
+                one: "Merged {count} imported chat; existing history was preserved.",
+                other: "Merged {count} imported chats; existing history was preserved.",
+              },
+              { count: imported.importedCount || 0 },
+            ) +
+              (imported.skippedAliasCount
+                ? " " +
+                  tr(
+                    "panel.extra_workflow_aliases_were_skipped_at_the",
+                    {
+                      one: "{count} extra workflow alias was skipped at the storage limit.",
+                      other: "{count} extra workflow aliases were skipped at the storage limit.",
+                    },
+                    { count: imported.skippedAliasCount },
+                  )
+                : ""),
           );
         } catch (error) {
-          appendSystem(`History import failed: ${coerceMessageText(error?.message || error)}`);
+          appendSystem(
+            tr("panel.history_import_failed", "History import failed: {error}", {
+              error: coerceMessageText(error?.message || error),
+            }),
+          );
         }
       }, { once: true });
       picker.click();
@@ -24843,9 +24975,13 @@ function buildPanel() {
     clear.addEventListener("click", async () => {
       if (!threads.length) return;
       const confirmed = globalThis.confirm?.(
-        "Clear all Agent Panel chat history from this browser?\n\n" +
-        "This affects every workflow and open ComfyUI tab. It cannot be undone. " +
-        "Your workflows and their stable identities will not be deleted.",
+        tr("panel.clear_all_agent_panel_chat_history_from", "Clear all Agent Panel chat history from this browser?") +
+          "\n\n" +
+          tr(
+            "panel.this_affects_every_workflow_and_open_comfyui",
+            "This affects every workflow and open ComfyUI tab. It cannot be undone. " +
+              "Your workflows and their stable identities will not be deleted.",
+          ),
       );
       if (!confirmed) return;
       clear.disabled = true;
@@ -24856,9 +24992,12 @@ function buildPanel() {
         clearLabel.textContent = tr("panel.clear_all_history", "Clear all history");
         appendSystem(
           result?.code === "history-clear-canonical-unavailable"
-            ? "Chat history could not be cleared because IndexedDB is unavailable or blocked. " +
-              "Close other ComfyUI tabs and retry; in permanent private-storage mode, clear this site's browser data."
-            : "Chat history could not be cleared. Keep this tab open and try again.",
+            ? tr(
+                "panel.chat_history_could_not_be_cleared_because",
+                "Chat history could not be cleared because IndexedDB is unavailable or blocked. " +
+                  "Close other ComfyUI tabs and retry; in permanent private-storage mode, clear this site's browser data.",
+              )
+            : tr("panel.chat_history_could_not_be_cleared_keep", "Chat history could not be cleared. Keep this tab open and try again."),
         );
         return;
       }
@@ -24882,7 +25021,7 @@ function buildPanel() {
       ctxLabel.textContent = "—";
       client?.sendFrame?.({ type: "new_session" });
       histPop.hidden = true;
-      appendSystem("Chat history was cleared from this browser.");
+      appendSystem(tr("panel.chat_history_was_cleared_from_this_browser", "Chat history was cleared from this browser."));
     });
     footer.append(note, clear);
     histPop.appendChild(footer);
@@ -24903,6 +25042,10 @@ function buildPanel() {
   // including silent tool work where nothing posts to the chat — so it never
   // looks idle right before a big reply lands. Whimsical status words cycle so
   // it's clearly alive.
+  // DELIBERATELY NOT TRANSLATED. These are nonsense-word jokes ("Flibbertigibbeting",
+  // "Reticulating splines" — a SimCity gag), and a per-word key would ask a translator to
+  // render a pun they have no source for. A language that wants its own set of jokes needs
+  // its own LIST, not twelve translations of one; that is a bigger change than this pass.
   const WORK_WORDS = [
     "Flibbertigibbeting",
     "Reticulating splines",
@@ -25010,11 +25153,14 @@ function buildPanel() {
     // words. A running tool clears the token meter (setThinkingAction), so the
     // action label wins during silent tool phases rather than a stale count.
     let base;
-    if (thinkingReconnecting) base = "Reconnecting… (turn still running)";
-    else if (thinkingTokens > 0) base = `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`;
+    if (thinkingReconnecting) base = tr("panel.reconnecting_turn_still_running", "Reconnecting… (turn still running)");
+    else if (thinkingTokens > 0)
+      // NOT the plural path: `tokens` here is always a formatted string ("1.4k"), not a
+      // number, so there is no count for Intl to categorise.
+      base = tr("panel.thinking_tokens", "Thinking… ({tokens} tokens)", { tokens: fmtThinkTokens(thinkingTokens) });
     else if (thinkingAction) base = thinkingAction;
     else base = `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
-    thinkingLabel.textContent = `${base} (Esc or Ctrl+C to stop)`;
+    thinkingLabel.textContent = tr("panel.esc_or_ctrl_c_to_stop", "{status} (Esc or Ctrl+C to stop)", { status: base });
     workWordIdx += 1;
   }
   // Live extended-thinking token meter (from the orchestrator's thinking frame).
@@ -25033,7 +25179,9 @@ function buildPanel() {
     let s = String(name || "").trim();
     s = s.split(".").pop() || s; // drop a "panel." (etc.) namespace prefix
     s = s.replace(/^panel_/, "").replace(/_/g, " ").trim();
-    return s ? `Using ${s}…` : "Working…";
+    // `{tool}` stays English — it is a tool NAME off the wire ("query graph"), and there
+    // is no catalog of tool names to translate it against. The frame around it is ours.
+    return s ? tr("panel.using", "Using {tool}…", { tool: s }) : tr("panel.working", "Working…");
   }
   function setThinkingAction(name) {
     thinkingAction = humanizeAction(name);
@@ -25473,7 +25621,7 @@ function buildPanel() {
         log.appendChild(renderA2UIFailCard(msg.spec, v.errors));
         scrollLog();
         // Record a plain card so the fail chip survives reload (matches the fence path).
-        record({ role: "card", icon: "pi-exclamation-triangle", text: "Unsupported card", detail: v.errors[0] || "invalid a2ui spec" });
+        record({ role: "card", icon: "pi-exclamation-triangle", text: tr("a2ui.unsupported_card", "Unsupported card"), detail: v.errors[0] || "invalid a2ui spec" });
         throw new Error(`invalid a2ui spec: ${v.errors.slice(0, 5).join("; ")}`);
       }
       const card_id = appendA2UICard(v.spec);

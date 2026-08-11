@@ -661,7 +661,16 @@ export function renderA2UIFailCard(rawText, errors) {
   el.appendChild(t);
   const why = document.createElement("div");
   why.className = "cmcp-a2ui-text";
-  why.textContent = (errors && errors.length ? errors.slice(0, 3).join("; ") : "could not render") + " — tap to view raw";
+  // The validator's own `errors` stay in English on purpose — they name spec fields
+  // ("component.type must be a string"), which is the vocabulary of the JSON below, not
+  // prose. Only the two pieces of chrome around them are translated.
+  //
+  // The reason is a `{reason}` HOLE rather than a separate string concatenated onto a
+  // leading " — ". Edge whitespace inside a catalog value is the kind of thing a translator
+  // (or a JSON round-trip) drops silently, and `i18n-check` only validates holes — so the
+  // separator lives in the sentence, where losing it is visible.
+  const reason = errors && errors.length ? errors.slice(0, 3).join("; ") : tr("a2ui.could_not_render", "could not render");
+  why.textContent = tr("a2ui.tap_to_view_raw", "{reason} — tap to view raw", { reason });
   why.style.cursor = "pointer";
   const pre = document.createElement("pre");
   pre.textContent = typeof rawText === "string" ? rawText : JSON.stringify(rawText, null, 2);
