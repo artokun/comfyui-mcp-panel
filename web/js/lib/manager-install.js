@@ -664,6 +664,45 @@ export function managerUnavailableResult(query, err) {
  * needing a signal Manager does not expose today; inventing a staleness claim here would
  * repeat the very fault #808 reports.
  */
+/**
+ * #890 — what a NO-MATCH over a populated catalogue may honestly say.
+ *
+ * Only two things are claimed, and the panel knows both for certain: how many packs the
+ * catalogue it searched contained, and that it asked Manager for the CACHED copy. It does
+ * NOT claim the cache is stale, or old, or that the registry is blocked — none of that is
+ * observable from the response, and asserting it is the fault the parent issue was filed
+ * about.
+ *
+ * `mode=cache` is read off the route actually requested rather than hardcoded, so if the
+ * route changes and this text does not, the note stops claiming a mode that was not asked
+ * for.
+ */
+export function cachedCatalogueNoMatch(query, catalogueSize, route) {
+  const q = query == null ? "" : String(query);
+  const mode = /[?&]mode=([^&]+)/.exec(String(route ?? ""))?.[1] ?? null;
+  // STRICTLY a number. `Number.isFinite(Number(v))` accepts `null` — Number(null) is 0 —
+  // and would print "(0 packs)" for an absent size, which reads as an EMPTY catalogue:
+  // the one thing this branch is not about, and the case #808 answers far more strongly.
+  const size = typeof catalogueSize === "number" && Number.isFinite(catalogueSize) ? catalogueSize : null;
+  if (mode !== "cache") return {};
+  return {
+    // REQUESTED, not served (codex). Naming this `catalogue_mode` asserted where the
+    // bytes came from, which is the one thing this code cannot see: the parameter is what
+    // the panel ASKED for, and nothing in the answer says whether Manager honoured it.
+    requested_mode: "cache",
+    no_match_note:
+      `No pack in the catalogue matched${q ? ` "${q}"` : ""}${
+        size == null ? "" : `, out of ${size} packs searched`
+      }. This request asked ComfyUI-Manager for mode=cache. What the response came FROM is ` +
+      "not something the panel can tell: Manager does not report whether it honoured that " +
+      "parameter, when the data was fetched, or whether it served the network, its on-disk " +
+      "cache or the copy bundled with the Manager package (#890). So this result cannot " +
+      "distinguish \"no such pack\" from \"a pack too recent for whatever list was " +
+      "searched\". If the pack is recent, refresh Manager's cache from its UI and search " +
+      "again before concluding it does not exist.",
+  };
+}
+
 export function emptyCatalogueResult(query) {
   const q = query == null ? "" : String(query);
   return {
@@ -733,7 +772,19 @@ export async function searchNodesVia(
   // `count` (packs that matched), because a healthy catalogue legitimately returns
   // count 0 all the time and must keep reading as the ordinary no-match it is.
   if (parsed.catalogue_size === 0) return emptyCatalogueResult(query);
-  return parsed;
+  // #890 — a NO-MATCH over a populated catalogue is the case #808 left open, and it is
+  // the likelier one in the field because Manager works hard never to return empty. A
+  // blocked registry yields a FULL list that may be months old, presented identically to
+  // a current one, so "no matches" and "that pack does not exist" arrive as the same
+  // answer. Nothing in the payload carries provenance — no fetch time, no indication of
+  // network vs cache vs bundle — and the issue's own follow-up measured that a
+  // "is this the bundled map" discriminator would never fire (5583 served vs 4884
+  // bundled, sharing ~1800 keys), so it would ship as a check that always passes.
+  //
+  // What IS observable without inventing anything: this search asked for `mode=cache`.
+  // That is the panel's own request, not an inference about the payload, and it is
+  // exactly the fact a reader needs before concluding a pack does not exist.
+  return parsed.count === 0 ? { ...parsed, ...cachedCatalogueNoMatch(query, parsed.catalogue_size, route) } : parsed;
 }
 
 /** #425 — ordered reboot {route, method} candidates for the detected dialect.
