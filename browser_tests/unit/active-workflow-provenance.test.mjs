@@ -23,13 +23,20 @@ import {
   createActiveWorkflowProvenance,
 } from "../../web/js/lib/active-workflow-provenance.js";
 
-test("#968 a move the panel did NOT make is the one worth naming", () => {
+test("#968 an UNCLAIMED move asserts ignorance, not that the panel is innocent", () => {
   const p = createActiveWorkflowProvenance();
   p.record({ cause: MOVE_CAUSES.OPEN_EXECUTOR, from: "wf:a.json", to: "wf:b.json", at: 1, detail: "open_seq 2" });
-  p.record({ cause: MOVE_CAUSES.EXTERNAL, from: "wf:b.json", to: "wf:c.json", at: 2 });
+  p.record({ cause: MOVE_CAUSES.UNKNOWN, from: "wf:b.json", to: "wf:c.json", at: 2 });
 
   const note = p.describeLast();
-  assert.match(note, /the panel did not make that move/);
+  // NOT "the panel did not make that move". Not every executor can claim — `workflow_new` is
+  // reconstructed in isolation by #606/#708 — and one of #968's three reports entered the
+  // desync through exactly that command. A false EXCLUSION on a reported entry path would
+  // send the next investigator away from the panel at the moment it was responsible (codex).
+  assert.match(note, /NO PANEL COMMAND CLAIMED IT/);
+  assert.match(note, /does not prove the panel did not do it/);
+  assert.match(note, /covers a panel_new_workflow/);
+  assert.ok(!/the panel did not make that move/.test(note), "the false exclusion is gone");
   // "last seen as", not "from": observations are point-in-time, so adjacency was never
   // established (codex P2).
   assert.match(note, /to wf:c\.json \(last seen as wf:b\.json\)/);
@@ -62,13 +69,13 @@ test("#968 NOTHING recorded reads as 'not known', never as 'the panel moved it'"
   assert.deepEqual(p.history(), []);
 });
 
-test("#968 an unrecognized cause is recorded as EXTERNAL, not dropped and not trusted", () => {
+test("#968 an unrecognized cause is recorded as UNKNOWN, not dropped and not trusted", () => {
   // Dropping it would hide a move; trusting it would let a future call site invent an
   // authority it does not have. The hunted case is precisely "a move nobody attributed".
   const p = createActiveWorkflowProvenance();
   for (const cause of ["something_new", "", null, undefined, 42, {}]) {
     p.record({ cause, to: "wf:x.json", at: 1 });
-    assert.equal(p.last().cause, MOVE_CAUSES.EXTERNAL, String(cause));
+    assert.equal(p.last().cause, MOVE_CAUSES.UNKNOWN, String(cause));
   }
 });
 
@@ -76,7 +83,7 @@ test("#968 a move with no destination records NOTHING", () => {
   // A half-entry is worse than no entry: `describeLast` would then report a move whose
   // target is unknown, which reads as information and is not.
   const p = createActiveWorkflowProvenance();
-  for (const bad of [null, undefined, {}, { cause: MOVE_CAUSES.EXTERNAL }, { to: "" }, { to: 5 }, "x"]) {
+  for (const bad of [null, undefined, {}, { cause: MOVE_CAUSES.UNKNOWN }, { to: "" }, { to: 5 }, "x"]) {
     assert.equal(p.record(bad), null, JSON.stringify(bad) ?? "undefined");
   }
   assert.equal(p.last(), null);
@@ -84,7 +91,7 @@ test("#968 a move with no destination records NOTHING", () => {
 
 test("#968 the log is bounded — a long session must not grow it forever", () => {
   const p = createActiveWorkflowProvenance({ cap: 3 });
-  for (let i = 0; i < 10; i += 1) p.record({ cause: MOVE_CAUSES.EXTERNAL, to: `wf:${i}.json`, at: i });
+  for (let i = 0; i < 10; i += 1) p.record({ cause: MOVE_CAUSES.UNKNOWN, to: `wf:${i}.json`, at: i });
   const h = p.history();
   assert.equal(h.length, 3);
   // Oldest-first eviction: the RECENT moves are the ones a stale binding is explained by.
@@ -94,12 +101,12 @@ test("#968 the log is bounded — a long session must not grow it forever", () =
 
 test("#968 history() hands out a COPY — a diagnostic a caller can edit can lie", () => {
   const p = createActiveWorkflowProvenance();
-  p.record({ cause: MOVE_CAUSES.EXTERNAL, to: "wf:a.json", at: 1 });
+  p.record({ cause: MOVE_CAUSES.UNKNOWN, to: "wf:a.json", at: 1 });
   const h = p.history();
   h[0].to = "wf:tampered.json";
   h[0].cause = MOVE_CAUSES.OPEN_EXECUTOR;
   assert.equal(p.last().to, "wf:a.json");
-  assert.equal(p.last().cause, MOVE_CAUSES.EXTERNAL);
+  assert.equal(p.last().cause, MOVE_CAUSES.UNKNOWN);
 });
 
 test("#968 free-text detail is bounded and never structured", () => {
@@ -172,8 +179,11 @@ test("#968 WIRED: the message stays PURE and single-line", () => {
     /function workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null \} = \{\}\) \{/,
   );
   // And it reads only its parameters: a module global here is unreachable under `new Function`.
-  const start = src.indexOf("function workflowInstanceMismatchMessage({ commandUuid");
-  const body = src.slice(start, src.indexOf("\r\n}", src.indexOf("const movedLine", start)));
+  // Extracted with the brace-balanced reader below rather than a hand-rolled slice — the
+  // slice this replaces depended on a literal "\r\n}" and on a local's name, and broke when
+  // neither had changed, which is a test failing for a reason unrelated to its subject.
+  const body = namedFunctionSource(src, "workflowInstanceMismatchMessage");
+  assert.ok(body, "the message function is extractable");
   assert.ok(!/activeWorkflowMoves/.test(body), "the message never reaches for the recorder");
 });
 

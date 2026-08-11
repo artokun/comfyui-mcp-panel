@@ -16243,7 +16243,7 @@ function noteActiveWorkflowMove() {
     activeWorkflowMoves.record({
       // An UNCLAIMED move is the case #968 is hunting: a tab click, a reconnect restore, a
       // file reopened at a new path. Defaulting to `external` is what makes it visible.
-      cause: claim ? claim.cause : MOVE_CAUSES.EXTERNAL,
+      cause: claim ? claim.cause : MOVE_CAUSES.UNKNOWN,
       detail: claim ? claim.detail : null,
       from,
       to: key,

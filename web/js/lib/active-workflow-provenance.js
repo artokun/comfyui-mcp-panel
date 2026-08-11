@@ -25,15 +25,25 @@
 //
 // Dependency-free (no DOM, no LiteGraph). Unit-testable with plain fixtures.
 
-/** Causes the panel can attribute a move to. Anything else is `external`. */
+/** Causes the panel can attribute a move to. Anything else is `unknown`. */
 export const MOVE_CAUSES = Object.freeze({
   /** The panel's own workflow_open executor, after its repaint and content proof. */
   OPEN_EXECUTOR: "open_executor",
-  /** The panel created a workflow and switched to it. */
+  /** The panel created a workflow and switched to it. Declared but NOT yet claimed
+   *  anywhere: `workflow_new` is reconstructed from source and rebuilt in isolation by
+   *  #606/#708, so a claim cannot be inserted there without breaking twelve guards. */
   NEW_EXECUTOR: "new_executor",
-  /** Observed moving with no panel action behind it — a frontend tab click, a reconnect
-   *  restore, a file reopened at a new path. The interesting one for #968. */
-  EXTERNAL: "external",
+  /** NO CLAIM was recorded for this move.
+   *
+   *  Deliberately NOT "external" (codex). "External" asserts the panel did not do it, and
+   *  the panel cannot establish that: not every executor can claim, and one of #968's three
+   *  reports entered the desync through `panel_new_workflow` specifically. A false
+   *  EXCLUSION on a reported entry path is worse than no attribution — it would send the
+   *  next investigator away from the panel at exactly the moment the panel was responsible.
+   *
+   *  `unknown` asserts nothing about who moved it, and still establishes the half that is
+   *  always true and always useful: a binding taken before this move is stale. */
+  UNKNOWN: "unknown",
 });
 
 const KNOWN = new Set(Object.values(MOVE_CAUSES));
@@ -64,10 +74,11 @@ export function createActiveWorkflowProvenance({ cap = DEFAULT_CAP } = {}) {
       if (!entry || typeof entry !== "object") return null;
       const to = typeof entry.to === "string" && entry.to ? entry.to : null;
       if (!to) return null;
-      // An unrecognized cause is stored AS external rather than dropped or trusted: the
-      // point of the log is that a move happened, and mislabelling it "panel did this"
-      // would hide the very case being hunted.
-      const cause = KNOWN.has(entry.cause) ? entry.cause : MOVE_CAUSES.EXTERNAL;
+      // An unrecognized cause is stored as UNKNOWN rather than dropped or trusted. The point
+      // of the log is that a move HAPPENED; mislabelling it in either direction is worse than
+      // recording it plainly — "panel did this" hides the case being hunted, and "panel did
+      // not" falsely excludes it.
+      const cause = KNOWN.has(entry.cause) ? entry.cause : MOVE_CAUSES.UNKNOWN;
       const stored = {
         cause,
         to,
@@ -103,11 +114,13 @@ export function createActiveWorkflowProvenance({ cap = DEFAULT_CAP } = {}) {
       // between them collapse into one transition. Say 'last seen as' rather than 'from',
       // which would assert an adjacency that was never established.
       const where = e.from ? `to ${e.to} (last seen as ${e.from})` : `to ${e.to}`;
-      if (e.cause === MOVE_CAUSES.EXTERNAL) {
+      if (e.cause === MOVE_CAUSES.UNKNOWN) {
         return (
-          `The active workflow last moved ${where}, and the panel did not make that move — ` +
-          `a tab click, a reconnect restore or a file reopened at a new path can all do it. ` +
-          `A binding taken before it is stale.`
+          `The active workflow last moved ${where}, and NO PANEL COMMAND CLAIMED IT. That does ` +
+          `not prove the panel did not do it — not every executor can register a claim, so this ` +
+          `covers a panel_new_workflow as well as a tab click, a reconnect restore, or a file ` +
+          `reopened at a new path. What it does establish is that a binding taken before this ` +
+          `move is stale.`
         );
       }
       const which = e.cause === MOVE_CAUSES.OPEN_EXECUTOR ? "panel_open_workflow" : "panel_new_workflow";
