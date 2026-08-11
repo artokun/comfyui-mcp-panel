@@ -240,6 +240,7 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
+import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
@@ -7054,7 +7055,7 @@ const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
 const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
 function widgetName(liveGraph, nodeId, i) {
   try {
-    const w = liveGraph?.getNodeById?.(Number(nodeId))?.widgets?.[i];
+    const w = liveGraph?.getNodeById?.(canonicalNodeId(nodeId))?.widgets?.[i];
     if (w && w.name) return w.name;
   } catch {}
   return `#${i}`;
@@ -7953,8 +7954,24 @@ function nodeDescription(node) {
   return String(node?.constructor?.nodeData?.description ?? node?.description ?? "");
 }
 
+/**
+ * artokun/comfyui-mcp#1425 — a SUBGRAPH-QUALIFIED node id (`120:104`, `263:78`).
+ *
+ * Unpacking a subgraph leaves genuine ROOT-level nodes carrying these ids, and the
+ * read tools hand them out. `Number("263:78")` is NaN, so every write that went
+ * through `getNodeById(Number(id))` reported the node as missing — readable graph,
+ * uneditable nodes.
+ *
+ * Passing the qualified form THROUGH is what resolves it: LiteGraph's getNodeById
+ * is a `_nodes_by_id[id]` object lookup, and object keys are strings, so the id the
+ * reader printed is the key the node is stored under. (Measured against a live
+ * ComfyUI: node ids there are already strings, and lookup by string resolves.)
+ *
+ * Numbers still go through `Number()` unchanged — a plain id must keep behaving
+ * exactly as before, including the numeric-string compatibility surface.
+ */
 function resolveNode(graph, nodeId) {
-  const node = graph.getNodeById(Number(nodeId));
+  const node = graph.getNodeById(canonicalNodeId(nodeId));
   // #697 — a node the READS just listed can be unresolvable here: reads span every
   // scope, while a write applies to the graph being VIEWED. Say WHERE it actually is
   // instead of only that it is not here. Diagnostic-only: runs on the failure path,
@@ -8000,7 +8017,10 @@ function normalizeLegacyNodeId(nodeId) {
     const normalized = Number(nodeId);
     if (Number.isSafeInteger(normalized)) return normalized;
   }
-  throw new Error("node_id must be an integer");
+  // #1425 — a subgraph-qualified id stays a STRING. Coercing it is the bug: it
+  // would resolve to NaN here, and to the wrong node upstream if parsed instead.
+  if (isQualifiedNodeId(nodeId)) return nodeId;
+  throw new Error("node_id must be an integer or a subgraph-qualified id (e.g. 120:104)");
 }
 
 // ---- Node-type resolution guard (#458) ------------------------------------
@@ -11080,9 +11100,15 @@ const GRAPH_TOOL_EXECUTORS = {
     if (rail && fields.some((field) => field !== "pos" && own(field))) {
       throw new Error("a subgraph boundary rail only supports pos edits");
     }
-    const realNode = !rail && hasNodeId && Number.isFinite(Number(args.node_id)) && typeof graph.getNodeById === "function"
-      ? graph.getNodeById(Number(args.node_id))
-      : null;
+    const realNode =
+      !rail &&
+      hasNodeId &&
+      // #1425 — a subgraph-qualified id is id-shaped too. Number("263:78") is NaN,
+      // so the finite check alone called a real node unreal.
+      (isQualifiedNodeId(args.node_id) || Number.isFinite(Number(args.node_id))) &&
+      typeof graph.getNodeById === "function"
+        ? graph.getNodeById(canonicalNodeId(args.node_id))
+        : null;
     if (!rail && !realNode && hasNodeId && graph === rootGraph && railKindFor(args.node_id)) {
       throw new Error(`${args.node_id} is a subgraph boundary rail, which only exists inside a subgraph — enter the subgraph first (panel_enter_subgraph).`);
     }
@@ -14272,7 +14298,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const store = getSubgraphStore();
     let target = null;
     if (node_id != null) {
-      target = graph.getNodeById(Number(node_id));
+      target = graph.getNodeById(canonicalNodeId(node_id));
       if (!target) throw new Error(`No node with id ${node_id} in the current graph`);
       if (!target.subgraph) {
         throw new Error(`Node ${node_id} (${target.type}) is not a subgraph node`);

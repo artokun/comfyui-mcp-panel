@@ -138,7 +138,7 @@ test("WIRING: resolveNode builds its error through describeMissingNode", async (
   assert.ok(body.includes("describeMissingNode(nodeId, rootGraph, viewingRoot)"),
     "the failure path must go through the locator");
   // The lookup itself must be unchanged — this is diagnostics only, never a wider search.
-  assert.ok(body.includes("graph.getNodeById(Number(nodeId))"),
+  assert.ok(body.includes("graph.getNodeById(canonicalNodeId(nodeId))"),
     "resolution must still be scoped to the current graph");
   // And the diagnostic must not be able to break the call.
   assert.ok(body.includes("} catch {"), "reading the root must be guarded");
