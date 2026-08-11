@@ -53,9 +53,15 @@ export function objectInfoFingerprint(defs) {
     // the repo's own control-character guard rejected from shipped source, correctly.)
     const encoded = JSON.stringify(names);
     // TWO bases, so a collision needs the same type COUNT and agreement under both.
+    //
+    // SEPARATED, and this is the same lesson one level down (codex): base-36 strings are
+    // variable length, so `${a}${b}` is not injective — "1"+"23" and "12"+"3" both read as
+    // "123". Concatenating two hashes without a boundary throws away exactly the agreement
+    // the second one was added to establish. The base-36 alphabet cannot contain "-", so a
+    // hyphen is an unambiguous boundary.
     const a = fnv1a(encoded, 0x811c9dc5).toString(36);
     const b = fnv1a(encoded, 0x01000193).toString(36);
-    return `t${names.length}-${a}${b}`;
+    return `t${names.length}-${a}-${b}`;
   } catch {
     return null;
   }
