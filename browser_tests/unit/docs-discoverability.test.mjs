@@ -100,7 +100,21 @@ test("#111 /docs is a LOCAL command — it opens externally, never in-frame", ()
   // a popup — so an assertion that the docs "opened", or that they opened "in a new
   // tab", is a state never observed (and the tab wording is simply wrong on
   // desktop). What survives is the URL plus a conditional remedy.
-  assert.match(code, /Docs: \$\{DOCS_URL\} — if nothing opened, copy that address\./);
+  // Read the note itself, whether it is still a bare template literal or has been
+  // wrapped as `tr("key", "English", { url: DOCS_URL })`. In the translated form the
+  // asserted string is the ENGLISH FALLBACK — what English users see, and what EVERY
+  // locale renders when the key is missing from its catalog — so a dropped remedy or a
+  // fabricated outcome claim is still caught in any language.
+  const translated = code.match(/appendSystem\(\s*tr\(\s*"[^"]*"\s*,\s*"([^"]*)"/);
+  const noteText = translated ? translated[1] : code.match(/appendSystem\(`([^`]*)`/)?.[1];
+  assert.ok(noteText, "the /docs command must put a note in the transcript");
+  if (translated) {
+    // The hole must still be filled from the constant, never a re-typed literal.
+    assert.match(code, /\{\s*url:\s*DOCS_URL\s*\}/, "the note interpolates DOCS_URL");
+    assert.match(noteText, /^Docs: \{url\} — if nothing opened, copy that address\.$/);
+  } else {
+    assert.match(noteText, /^Docs: \$\{DOCS_URL\} — if nothing opened, copy that address\.$/);
+  }
   // ORDER MATTERS. The note is the remedy for the open having failed, so emitting it
   // after the attempt made it conditional on that attempt not throwing — backwards.
   // openExternalUrl is guarded and should not throw, but a remedy that relies on its
@@ -109,8 +123,18 @@ test("#111 /docs is a LOCAL command — it opens externally, never in-frame", ()
     code.indexOf("appendSystem(") < code.indexOf("openExternalUrl("),
     "the URL must reach the transcript BEFORE the open is attempted",
   );
-  assert.doesNotMatch(code, /appendSystem\(`Opening\b/, "must not report an outcome it cannot see");
-  assert.doesNotMatch(code, /appendSystem\([^)]*new tab/, "must not name a mechanism it does not control");
+  // Asserted BOTH ways. Against the note TEXT, because once the string moved inside
+  // `tr(...)` an `appendSystem(\`Opening…` pattern stopped matching the very wording it
+  // exists to forbid. And still ENTRY-WIDE, because `noteText` is the first note only —
+  // narrowing to it would let a SECOND appendSystem added later slip the claim past.
+  assert.doesNotMatch(noteText, /^Opening\b/, "must not report an outcome it cannot see");
+  assert.doesNotMatch(noteText, /new tab/, "must not name a mechanism it does not control");
+  assert.doesNotMatch(
+    code,
+    /appendSystem\(\s*(?:tr\(\s*"[^"]*"\s*,\s*)?[`"']Opening\b/,
+    "no note anywhere in /docs may report an outcome it cannot see",
+  );
+  assert.doesNotMatch(code, /appendSystem\([^;]*new tab/, "no note anywhere in /docs may name a mechanism it does not control");
 });
 
 test("#111 /help says its list is only panel shortcuts, and names where the rest is", () => {
