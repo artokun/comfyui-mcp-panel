@@ -17,7 +17,13 @@ import path from 'path';
 import { z } from 'zod';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const LOCALES_DIR = path.join(ROOT, 'locales');
+// `--locales <dir>` exists so the gate can be run against a FIXTURE. Without it the only way
+// to test that a rule fires is to break the shipped catalogs, which is why the plural rules
+// below went unverified long enough for one of them to be missing entirely.
+const dirArg = process.argv.indexOf('--locales');
+const LOCALES_DIR = dirArg > -1 && process.argv[dirArg + 1]
+  ? path.resolve(process.argv[dirArg + 1])
+  : path.join(ROOT, 'locales');
 const SOURCE = 'en';
 
 const read = (locale, file) => {
@@ -230,6 +236,40 @@ for (const file of FILES) {
         if (placeholderBad > 8) break;
       } else if (tr === en && /[a-z]{4}/.test(en)) {
         untranslated++;
+      }
+    }
+
+    // Plural forms are skipped above for a good reason — a per-key comparison would flag
+    // every English category the language legitimately does not have. But skipping them left
+    // the 108 counted strings with NO placeholder check at all, and those are precisely the
+    // ones carrying the number: a translation could drop {count}/{n} from all of them and
+    // this gate would still print a clean bill. The rendered result is "Deleted nodes" with
+    // no number, in the highest-traffic strings the panel has.
+    //
+    // The reference form is the SAME category when English declares it, else `_other`, else
+    // `_one` — so Russian's `_few`, which English will never have, is still checked. All 54
+    // English bases carry identical holes across their forms, so that reference is
+    // unambiguous rather than a guess. Emptiness is checked here too: `withoutPlurals` strips
+    // these keys before the Zod schema runs, so `.min(1)` never sees them either.
+    for (const [key, value] of targetFlat) {
+      if (placeholderBad > 8) break;
+      const p = pluralSplit(key);
+      if (!p) continue;
+      if (typeof value !== 'string' || value.length === 0) {
+        note(`${locale}/${file} @ ${key}: must not be empty`);
+        placeholderBad++;
+        continue;
+      }
+      const en =
+        sourceFlat.get(key) ?? sourceFlat.get(`${p.base}_other`) ?? sourceFlat.get(`${p.base}_one`);
+      // A plural base English does not declare at all is an unknown key; pluralIssues and the
+      // schema own that verdict, and reporting it twice would just be noise.
+      if (en === undefined) continue;
+      if (holes(en) !== holes(value)) {
+        note(
+          `${locale}/${file} @ ${key}: placeholders differ — English has [${holes(en) || 'none'}], ${locale} has [${holes(value) || 'none'}]`,
+        );
+        placeholderBad++;
       }
     }
     if (!placeholderBad) {

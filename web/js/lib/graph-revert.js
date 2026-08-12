@@ -22,6 +22,10 @@
 // pre-stringified snapshot.data is re-parsed so it canonicalizes the same way.
 // Unit-testable with plain object fixtures.
 
+// Still dependency-free in the sense that matters: i18n.js touches no DOM and no LiteGraph
+// at import time, so the plain-object fixture tests keep importing this module directly.
+import { tr } from "./i18n.js";
+
 /** Recursively key-sorted JSON so equality is independent of key insertion order. */
 function stableStringify(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -100,9 +104,12 @@ export const REVERT_STATUS = Object.freeze({
  *  fired. That is exactly how the rewind path went on reporting "Rewound your last
  *  turn" over an evicted ring, without ever saying the canvas still held that
  *  turn's edits — which is an unknown canvas read as permission to resend. */
-const DEFAULT_NONE_TEXT =
-  "The canvas was NOT restored — there is no graph snapshot available for this, so it still " +
-  "holds the edits you were trying to undo.";
+const DEFAULT_NONE_TEXT = () =>
+  tr(
+    "graph_revert.canvas_not_restored_no_snapshot",
+    "The canvas was NOT restored — there is no graph snapshot available for this, so it still " +
+      "holds the edits you were trying to undo.",
+  );
 
 /** Does this string SAY anything? At least one letter or digit that a renderer
  *  is actually obliged to draw.
@@ -154,21 +161,28 @@ function hasReadableText(value) {
  * GRAPH, so retrying is safe and that is what the message promises; a blanket
  * "nothing changed" would be claiming more than the path delivers.
  */
-export function describeRevertOutcome(outcome, { restoredText, noneText, action = "revert" } = {}) {
+export function describeRevertOutcome(outcome, { restoredText, noneText, action } = {}) {
   const status = outcome?.status;
-  const statedNone = hasReadableText(noneText) ? noneText : DEFAULT_NONE_TEXT;
+  const statedNone = hasReadableText(noneText) ? noneText : DEFAULT_NONE_TEXT();
   if (status === REVERT_STATUS.RESTORED) return restoredText;
   if (status === REVERT_STATUS.NONE) return statedNone;
+  // Default resolved HERE, not in the parameter list: a default evaluated at call time is
+  // still fine, but keeping every tr() on one line makes it obvious that no string in this
+  // function is captured before the catalog loads.
+  const verb = action ?? tr("graph_revert.action_revert", "revert");
   const reason = typeof outcome?.reason === "string" ? outcome.reason.trim() : "";
+  const statedReason = reason || tr("graph_revert.no_reason_was_reported", "No reason was reported.");
   if (status === REVERT_STATUS.REFUSED) {
     // Says nothing about a snapshot EXISTING. A refusal can happen before one is
     // ever selected — the no-active-workflow branches refuse without consulting the
     // ring at all — so "the snapshot is still here" would fabricate its existence
     // for exactly the caller least able to check. What is true of every refusal is
     // that nothing was loaded; the specifics ride in `reason`.
-    return (
-      `⚠️ Could not ${action} — nothing was loaded, so no graph edits were applied and retrying ` +
-      `is safe. ${reason || "No reason was reported."}`
+    return tr(
+      "graph_revert.could_not_action_nothing_was_loaded",
+      "⚠️ Could not {action} — nothing was loaded, so no graph edits were applied and retrying " +
+        "is safe. {reason}",
+      { action: verb, reason: statedReason },
     );
   }
   if (status === REVERT_STATUS.FAILED) {
@@ -180,14 +194,18 @@ export function describeRevertOutcome(outcome, { restoredText, noneText, action 
     // inside a disclosure, which is the thing this vocabulary exists to remove.
     // What holds for all three: it ran, the result is unconfirmed, the canvas may
     // have changed.
-    return (
-      `⚠️ The ${action} RAN but the panel could not confirm the result, so the canvas may have ` +
-      `changed — check it before doing anything else. ${reason || "No reason was reported."}`
+    return tr(
+      "graph_revert.the_action_ran_but_unconfirmed",
+      "⚠️ The {action} RAN but the panel could not confirm the result, so the canvas may have " +
+        "changed — check it before doing anything else. {reason}",
+      { action: verb, reason: statedReason },
     );
   }
-  return (
-    `⚠️ Could not tell whether the ${action} happened — the panel got back an outcome it does ` +
-    `not recognize, so check the canvas before doing anything else.`
+  return tr(
+    "graph_revert.could_not_tell_whether_the_action_happened",
+    "⚠️ Could not tell whether the {action} happened — the panel got back an outcome it does " +
+      "not recognize, so check the canvas before doing anything else.",
+    { action: verb },
   );
 }
 

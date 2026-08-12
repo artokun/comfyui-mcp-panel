@@ -13,6 +13,10 @@ playwright-report/
 test-results/
 .playwright/
 .claude/
+# Translation scratch: i18n-skeleton.mjs writes area-sized part files here and
+# i18n-merge-parts.mjs reassembles them into locales/. Deliberately OUTSIDE locales/ so a
+# half-finished area can never be committed, and can never be served to the panel.
+.i18n-work/
 vendor-spike/node_modules/
 vendor-spike/entry.js
 vendor-spike/package-lock.json
