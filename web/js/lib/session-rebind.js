@@ -148,8 +148,30 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
     noteTurnStarted() {
       outageMs = 0;
     },
-    /** The outage the current turn has seen, in ms (0 = none). */
-    outageMs: () => outageMs,
+    /** The outage the current turn has seen, in ms (0 = none).
+     *
+     *  While the bridge is still marked DOWN this measures LIVE from the outage start
+     *  instead of reporting the last closed one. That is not a nicety — the reader is
+     *  the `ready` ack, and `ready` does not wait for the handshake that closes an
+     *  outage. The orchestrator pushes its models frame from an async continuation
+     *  (`void ensureModels(backend).then(…)`) while the ready ack goes out
+     *  synchronously once hello is processed, so for any backend whose model discovery
+     *  costs a probe, `ready` arrives FIRST. Reporting the closed value there would
+     *  answer 0 for an outage still in progress and swallow the nudge on exactly the
+     *  real restart this exists to catch — a fresh way to lose it, in the change that
+     *  fixed the old one. Measuring live is also what the pre-#1145 code did: a stamp
+     *  can be subtracted from at any moment, and that property has to survive.
+     *
+     *  This does NOT reintroduce the backoff-step defect: `startedAt` is still written
+     *  once, by the first close, so a live reading measures from the outage's start and
+     *  not from the most recent refused retry. */
+    outageMs() {
+      if (!startedAt) return outageMs;
+      const t = readClock();
+      // Clamped for the same reason noteHandshake clamps: a clock that ran backwards
+      // reports no outage rather than a negative one.
+      return t === null ? outageMs : Math.max(0, t - startedAt);
+    },
     /** True while the bridge is down — the outage has begun but not yet ended. */
     isDown: () => startedAt > 0,
   };

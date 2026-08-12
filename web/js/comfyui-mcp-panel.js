@@ -2888,7 +2888,16 @@ const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
 // nothing, and scopes what it measured to the turn now running — so an outage that
 // ended before this turn began is not re-read as this turn's (the #1138 defect with a
 // stale timestamp in place of the 0 sentinel).
-const bridgeOutage = createBridgeOutageTracker();
+//
+// On the MONOTONIC clock, not the wall clock. This measures an elapsed window, and
+// `web/js/lib/reconnect-staleness.js` already fixed the rule for that class after a
+// prior review ("monotonic timestamp (performance.now) … codex P1"); `monotonicNow()`
+// exists for it. With `Date.now()` an NTP or DST correction landing inside a reconnect
+// decides the answer: a forward jump turns a two-second blip into a long outage and
+// nudges an agent whose turn never stopped, a backward jump erases a real restart and
+// leaves it idle. Both are the failure this issue is about, arriving through the clock
+// instead of through the backoff.
+const bridgeOutage = createBridgeOutageTracker({ now: monotonicNow });
 // One-shot flag set right before a frontend (page) reload WE trigger, so that
 // after the reload we re-activate our own sidebar tab. ComfyUI restores the
 // last active tab BEFORE our extension re-registers it, so it can't reopen ours

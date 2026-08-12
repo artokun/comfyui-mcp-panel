@@ -615,6 +615,16 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
   // The reverted sessionStorage twin must not return without its own review: every
   // confirmed leak on this branch came from persisting that timestamp.
   assert.doesNotMatch(src, /BRIDGE_DOWN_AT_KEY/, "the persisted drop timestamp stays reverted");
+  // #1145 — and the tracker measures on the MONOTONIC clock. This is the one part a
+  // behavioural test over the module cannot see: the tracker's own default is
+  // `Date.now()` (it must stay usable standalone), so which clock the PANEL measures
+  // with is decided at the construction site and nowhere else. reconnect-staleness.js
+  // already fixed this rule for elapsed-window state after a prior review; a wall clock
+  // here lets an NTP/DST correction inside a reconnect invent or erase an outage.
+  assert.ok(
+    src.includes("createBridgeOutageTracker({ now: monotonicNow })"),
+    "the panel's outage tracker must measure on the monotonic clock",
+  );
 });
 
 // ── #1145: the interval must be the OUTAGE, not one backoff step ─────────────
@@ -764,6 +774,59 @@ test("#1145: a backwards clock cannot manufacture or corrupt an outage", () => {
   broken.noteHandshake();
   assert.equal(broken.outageMs(), 0);
   assert.equal(broken.isDown(), false, "an untimed outage must still be closed out");
+});
+
+test("#1145: a `ready` ack that beats the models handshake still measures the outage", () => {
+  // THE ORDERING THIS NEARLY GOT WRONG. The reader is the ready ack, and ready does not
+  // wait for the handshake that closes an outage: the orchestrator pushes its models
+  // frame from an async continuation (`void ensureModels(backend).then(…)`) while the
+  // ready ack goes out synchronously once hello is processed. For any backend whose
+  // model discovery costs a probe, ready arrives FIRST — so at read time the outage is
+  // still open. Reporting the last CLOSED outage there would answer 0 and swallow the
+  // nudge on exactly the real restart this issue exists to restore.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed(); // ComfyUI restarts
+  clock.t += 30_000; // socket is back and hello processed; models still discovering
+  assert.equal(tracker.isDown(), true, "the handshake has not closed the outage yet");
+  assert.equal(
+    tracker.outageMs(),
+    30_000,
+    "an outage still in progress must read live, not as the last closed one",
+  );
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+
+  // …and the models frame landing moments later agrees, rather than revising it.
+  clock.t += 40;
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 30_040);
+});
+
+test("#1145: a LIVE reading still measures the outage, not the last backoff step", () => {
+  // The live path must not be a back door to the original defect: refused retries during
+  // the outage must leave its start alone here too.
+  const { clock, tracker } = trackerAt();
+  const t0 = clock.t;
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed();
+  for (const t of [1000, 3000]) {
+    clock.t = t0 + t;
+    tracker.noteBridgeClosed(); // refused attempts
+  }
+  clock.t = t0 + 7000; // the ready ack arrives before models
+  assert.equal(tracker.outageMs(), 7000, "live reading measures the outage, not 7000-3000");
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1145: a never-dropped bridge reads 0 live, not the age of the session", () => {
+  // The #1138 case against the live path: with no outage open, the live branch must not
+  // engage at all. If it measured from a 0 start it would report the whole session as an
+  // outage — the ~56-year sentinel bug, reintroduced through the new reading.
+  const { clock, tracker } = trackerAt();
+  clock.t += 3_600_000; // an hour of uptime, never a drop
+  assert.equal(tracker.isDown(), false);
+  assert.equal(tracker.outageMs(), 0);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
 });
 
 test("#1145: a second outage measures itself, not the gap since the first", () => {
