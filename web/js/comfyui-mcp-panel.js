@@ -240,6 +240,13 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
+import {
+  describeQueuePromptChain,
+  describeQueuePromptChainForReport,
+  queuePromptChainDeps,
+} from "./lib/queue-prompt-chain.js";
+
+
 import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
@@ -12144,8 +12151,15 @@ const GRAPH_TOOL_EXECUTORS = {
         `behaves differently — so this fallback is not expected on that build, and ` +
         `trying ComfyUI_frontend 1.48.7 may be the quickest workaround. Which OTHER ` +
         `builds take which shape is not something the panel can determine from inside ` +
-        `one of them, so please report this build (#996), including your ` +
-        `ComfyUI_frontend version.`;
+        `one of them.` +
+        // #996 — ASK FOR WHAT DISCRIMINATES. Two reports arrived with the build and
+        // the frontend version, and neither identified the cause: the version is
+        // not what differs. Measured on 1.48.7, BOTH links in the chain are
+        // routinely patched by extensions (a custom node wraps app.queuePrompt,
+        // rgthree wraps api.queuePrompt), and a wrapper that forwards its
+        // arguments is harmless while one that does not drops the scope silently.
+        // That is invisible in a version number, so the note carries it directly.
+        describeQueuePromptChainForReport(describeQueuePromptChain(queuePromptChainDeps()));
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
