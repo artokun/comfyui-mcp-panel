@@ -637,18 +637,40 @@ function inputValueConfig(spec) {
  * Pure apart from the node it is handed; returns [] when there is nothing current to
  * compare against, so a frontend-only type is untouched.
  */
-/** True when every own property is an enumerable STRING key — no symbols, no
- *  non-enumerables. Object.keys sees only those, so anything else would be invisible to a
- *  key-by-key comparison and a real difference could hide there (#1085 codex). */
-function hasOnlyEnumerableStringKeys(obj) {
-  return Reflect.ownKeys(obj).length === Object.keys(obj).length;
+/** Own ENUMERABLE DATA keys, or null when the object carries anything a key-by-key
+ *  comparison cannot faithfully see (#1085 codex): a SYMBOL key, a NON-ENUMERABLE own
+ *  property, or an ACCESSOR. Accessors matter twice over — a getter would be INVOKED by the
+ *  comparison, so two different shapes can read equal, and a THROWING getter would crash a
+ *  path that used to be a bare `!==`. `allowLength` skips an array's own non-enumerable
+ *  `length`, which every array has.
+ *
+ *  Returning null means "cannot compare structurally", and the caller then falls back to
+ *  identity — the answer `!==` gave before any of this existed. */
+function plainDataKeys(obj, allowLength) {
+  const out = [];
+  for (const key of Reflect.ownKeys(obj)) {
+    if (typeof key === "symbol") return null;
+    if (allowLength && key === "length") continue;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (!desc || !desc.enumerable || !("value" in desc)) return null;
+    out.push(key);
+  }
+  return out;
 }
 
-/** True when an array's own properties are exactly its present indices plus `length`.
- *  `arr.extra = 1`, a symbol, or a non-enumerable would be skipped by an index walk. */
-function hasOnlyIndexProperties(arr) {
-  if (Reflect.ownKeys(arr).length !== Object.keys(arr).length + 1) return false; // +1 = length
-  return Object.keys(arr).every((k) => String(Number(k)) === k && Number(k) >= 0);
+/** A canonical ARRAY INDEX key. `String(Number(k)) === k` is NOT this test: it accepts
+ *  "Infinity", "1.5" and "1e+21" (codex).
+ *
+ *  REDUNDANT TODAY, and said plainly rather than implied otherwise — mutation-verified:
+ *  loosening this predicate breaks no test. What actually closed that hole was switching
+ *  the array branch from a 0..length WALK to a comparison of the PRESENT KEY SET, which
+ *  visits every own key including the ones that are not indices. This kept as an explicit
+ *  refusal because a key that is not an index has no business in a value being compared as
+ *  an array, and because it is what would still hold if the loop ever went back to walking
+ *  indices. */
+function isArrayIndexKey(key) {
+  const n = Number(key);
+  return Number.isInteger(n) && n >= 0 && n < 2 ** 32 - 1 && String(n) === key;
 }
 
 /** #1085 — whether two widget values are the SAME VALUE, not the same reference.
@@ -694,17 +716,18 @@ function sameWidgetValue(a, b, depth = 0) {
       return false;
     }
     if (a.length !== b.length) return false;
-    // An array can carry own properties that are not indices — `arr.extra = 1`, a symbol,
-    // or a non-enumerable — and the index walk below would never see them (codex). Refuse
-    // to compare structurally when either side has any, which falls back to identity.
-    if (!hasOnlyIndexProperties(a) || !hasOnlyIndexProperties(b)) return false;
-    for (let i = 0; i < a.length; i++) {
-      // HOLES are compared, not skipped (codex). `every`/`map` jump over a sparse array's
-      // gaps, so `[,1]` and `[0,1]` came out equal — a real change reported as none, which
-      // is the one direction that must never happen here.
-      const aHas = Object.prototype.hasOwnProperty.call(a, i);
-      if (aHas !== Object.prototype.hasOwnProperty.call(b, i)) return false;
-      if (aHas && !sameWidgetValue(a[i], b[i], depth + 1)) return false;
+    // Compare the PRESENT INDEX KEYS rather than walking 0..length (codex). A single valid
+    // sparse index of 4294967294 sets length to 4294967295, and a length walk would spin
+    // through billions of absent slots and freeze the tab. This also compares hole-ness for
+    // free: a hole simply has no own key, so `[,1]` and `[0,1]` differ by key set.
+    const aIdx = plainDataKeys(a, true);
+    const bIdx = plainDataKeys(b, true);
+    if (!aIdx || !bIdx) return false;
+    if (aIdx.length !== bIdx.length) return false;
+    if (!aIdx.every(isArrayIndexKey) || !bIdx.every(isArrayIndexKey)) return false;
+    for (const key of aIdx) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+      if (!sameWidgetValue(a[key], b[key], depth + 1)) return false;
     }
     return true;
   }
@@ -724,10 +747,10 @@ function sameWidgetValue(a, b, depth = 0) {
   // prototype restriction disposed of them — it does not, and a test asserted that false
   // negative under a title saying it could not happen. Refuse to compare structurally when
   // either side has any such property; identity then answers, as it did before this existed.
-  if (!hasOnlyEnumerableStringKeys(a) || !hasOnlyEnumerableStringKeys(b)) return false;
-
-  const aKeys = Object.keys(a);
-  if (aKeys.length !== Object.keys(b).length) return false;
+  const aKeys = plainDataKeys(a, false);
+  const bKeys = plainDataKeys(b, false);
+  if (!aKeys || !bKeys) return false;
+  if (aKeys.length !== bKeys.length) return false;
   return aKeys.every(
     (k) => Object.prototype.hasOwnProperty.call(b, k) && sameWidgetValue(a[k], b[k], depth + 1),
   );

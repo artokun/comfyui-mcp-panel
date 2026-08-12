@@ -93,20 +93,76 @@ test("#1085: null and undefined are not confused with an empty object", () => {
   assert.equal(applyCurrentDefWidgetValues(fromNull, defWith("cfg", { default: {} })).length, 1);
   const bothNull = nodeWith("cfg", null);
   assert.deepEqual(applyCurrentDefWidgetValues(bothNull, defWith("cfg", { default: null })), []);
+  // undefined, which the title promised and the first version never exercised (codex).
+  const fromUndef = nodeWith("cfg", undefined);
+  assert.equal(applyCurrentDefWidgetValues(fromUndef, defWith("cfg", { default: {} })).length, 1);
+  assert.equal(applyCurrentDefWidgetValues(nodeWith("cfg", undefined), defWith("cfg", { default: null })).length, 1);
 });
 
 test("#1085: a CYCLIC live value fails toward today's behaviour, never a crash", () => {
-  // An /object_info default cannot be cyclic, but a live widget value could be. The depth
-  // cap answers "different" there — which is exactly what `!==` said before this existed —
-  // so the cost is a spurious correction, never a hang or a missed one.
+  // An /object_info default cannot be cyclic, but a live widget value could be. The first
+  // version of this test never reached the cycle — it bailed on a key-count mismatch one
+  // level in, so it would have passed with no depth cap at all (codex). Both sides now
+  // MATCH structurally all the way down, so the traversal really does recurse and only the
+  // depth cap ends it.
   const cyclic = { x: 0 };
   cyclic.self = cyclic;
+  const otherCyclic = { x: 0 };
+  otherCyclic.self = otherCyclic;
   const node = nodeWith("cfg", cyclic);
   let corrections;
   assert.doesNotThrow(() => {
-    corrections = applyCurrentDefWidgetValues(node, defWith("cfg", { default: { x: 0, self: {} } }));
+    corrections = applyCurrentDefWidgetValues(node, defWith("cfg", { default: otherCyclic }));
   });
-  assert.equal(corrections.length, 1);
+  assert.equal(corrections.length, 1, "the cap answers 'different' — a spurious correction, never a hang");
+});
+
+test("#1085 (codex r3): non-index own keys and huge sparse arrays are handled", () => {
+  // "Infinity" / "1.5" / "1e+21" all satisfy String(Number(k)) === k, so they passed the
+  // old index predicate. MUTATION NOTE: loosening that predicate does NOT break this test —
+  // what makes these visible is the array branch comparing the PRESENT KEY SET instead of
+  // walking 0..length, so every own key is visited whether or not it is an index. The
+  // predicate is an additional refusal, not the mechanism.
+  for (const key of ["Infinity", "1.5", "1e+21"]) {
+    const x = [1];
+    x[key] = 1;
+    const y = [1];
+    y[key] = 2;
+    assert.equal(
+      applyCurrentDefWidgetValues(nodeWith("cfg", { size: x }), defWith("cfg", { default: { size: y } })).length,
+      1,
+      `a differing "${key}" property must not hide`,
+    );
+  }
+  // A single high sparse index sets length near 2^32; comparing PRESENT KEYS rather than
+  // walking 0..length is what keeps this from spinning through billions of absent slots.
+  const big = [];
+  big[4294967294] = 1;
+  const big2 = [];
+  big2[4294967294] = 2;
+  const started = Date.now();
+  assert.equal(
+    applyCurrentDefWidgetValues(nodeWith("cfg", { size: big }), defWith("cfg", { default: { size: big2 } })).length,
+    1,
+  );
+  assert.ok(Date.now() - started < 1000, "must not walk the length");
+});
+
+test("#1085 (codex r3): an enumerable ACCESSOR is never invoked by the comparison", () => {
+  // A getter would be CALLED by a structural compare — two different shapes could read
+  // equal, and a throwing getter would crash a path that used to be a bare !==.
+  const withGetter = { x: 1 };
+  Object.defineProperty(withGetter, "boom", {
+    enumerable: true,
+    get() {
+      throw new Error("a getter must never run here");
+    },
+  });
+  let corrections;
+  assert.doesNotThrow(() => {
+    corrections = applyCurrentDefWidgetValues(nodeWith("cfg", withGetter), defWith("cfg", { default: { x: 1, boom: 1 } }));
+  });
+  assert.equal(corrections.length, 1, "refused structurally, so identity answers");
 });
 
 test("#1085: the #1369 self-contradictory COMBO ruling is unaffected", () => {
