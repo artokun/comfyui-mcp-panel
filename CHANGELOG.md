@@ -6,6 +6,24 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.13] - 2026-08-11
+
+### Fixed
+
+- **A numeric `from_output` no longer mints a junk rail slot named "4" (#1114).**
+  Inside a subgraph, `panel_connect({ from_output: 4, ... })` replied `exposed`
+  rather than `connected` and left a permanent rail input literally named `"4"`,
+  visible on the parent subgraph node too. The rail lookup gated its index branch
+  on `typeof ref === "number"`, but MCP argument coercion delivers `4` as the
+  string `"4"` — so the lookup missed, and the caller read the miss as "no such
+  slot" and created one. A lookup that failed closed would have been a refusal;
+  this one edited the graph.
+  The index parse is deliberately strict (`"04"` and `"007"` are names, not
+  index 4 and 7), so a mistyped name cannot land silently on an unrelated slot.
+  And when a ref matches BOTH a slot name and a different index — a rail whose
+  slots are digit-named out of order — it now refuses and names both candidates
+  instead of guessing, because nothing at that point can tell which was meant.
+
 ## [0.14.12] - 2026-08-11
 
 ### Fixed
