@@ -1207,54 +1207,79 @@ export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
  * into durable loss, because the stamp makes a later save write the foreign graph
  * to the target's file.
  *
- * The evidence rule is `describeLiveCanvasBinding`'s (#708/#349), applied to the
- * source state instead of the live canvas, plus TWO additional requirements:
+ * WHAT THE ANSWER IS FOR. Not a refusal — `workflow_open` must not refuse on this,
+ * and the first attempt at this fix did (codex NO-SHIP, round 1). The repaint's root
+ * re-stamp is the one documented heal for a conflicting root tag, so refusing before
+ * the load removes it and strands the pointer on the target with another workflow's
+ * uuid on `app.graph`. Every `graph_*` command is then refused by
+ * `assertGraphBoundToActiveWorkflow` — including the `panel_load_workflow` the
+ * refusal recommended, whose own error says to re-open the tab, which re-enters the
+ * refusal. A hard loop, on true positives as much as false ones.
  *
- *   bound   — the state carries the target's own identity. Repaint, unchanged.
- *   foreign — the state carries a tag the target does not claim, that tag is owned
- *             by a DIFFERENT currently-open workflow, AND the target tab is CLEAN.
- *             Refuse.
- *   unknown — anything else. Repaint, unchanged.
+ * `foreign` therefore authorizes a DISCLOSURE and nothing else. The load proceeds
+ * exactly as before, the root gets re-stamped by it, and the caller is told to verify
+ * the graph before editing. That is the whole remedy, and the reason it is the whole
+ * remedy is worth reading before anyone tries to strengthen it again.
+ *
+ * The evidence rule is `describeLiveCanvasBinding`'s (#708/#349), applied to the
+ * source state instead of the live canvas, plus ONE additional requirement:
+ *
+ *   bound   — the state carries the target's own identity.
+ *   foreign — the state carries a tag the target does not claim, AND that tag is
+ *             owned by a DIFFERENT currently-open workflow.
+ *   unknown — anything else.
  *
  * WHY THE LIVE OWNER. `workflowOwnsRootUuidTag`'s header records that a lagging
  * `activeState` can carry a REPLACED PREDECESSOR's uuid residue, "indistinguishable
  * from the genuine lineage stamp". A predecessor is not an open tab, so requiring a
  * live owner separates residue from another tab's graph.
  *
- * WHY THE CLEAN TAB, which is the part that makes this refusal SOUND rather than
- * merely careful (codex NO-SHIP, round 1). The tag alone cannot prove the GRAPH is
- * foreign, and #817 is the counter-example: a tab switch leaves the previous
- * workflow's tag on the reused `app.graph`, and the guard's rebind then re-stamps
- * that root on CONTENT proof — `rootContentProvesActiveWorkflow`, not a claimed tag.
+ * WHAT THIS DOES NOT ESTABLISH, and cannot. The tag does not prove the GRAPH is
+ * foreign. #817 is the counter-example: a tab switch leaves the previous workflow's
+ * tag on the reused `app.graph`, and the guard's rebind re-stamps that root on
+ * CONTENT proof — `rootContentProvesActiveWorkflow`, not a claimed tag.
  * `stampGraphRootWorkflowUuid` writes `rootGraph.extra` and nothing else, so a
- * capture taken before the heal leaves the tab's OWN content sitting under the other
- * tab's meta block, indefinitely. The whole `comfyui_mcp` block travels together as
- * residue, so no field in it — uuid or path — can tell that apart from a genuinely
- * foreign graph.
+ * capture taken before the heal leaves the tab's OWN content under the other tab's
+ * meta block, indefinitely. The whole `comfyui_mcp` block travels together as
+ * residue, so no field in it separates the two. The disclosure says "may be" for
+ * that reason and hands the comparison to the caller, who knows what the workflow
+ * should contain.
  *
- * So the refusal is not justified by proving the state foreign. It is justified by
- * its COST BEING ZERO when it is wrong: on a clean tab the recovery it names
- * (`panel_load_workflow`, which reads the file) is exactly what the tab already
- * holds, so a false refusal costs one extra call and loses nothing. On a DIRTY tab
- * that same advice discards unsaved work, and there the false refusal would be
- * destructive — which is why a dirty tab is `unknown` and repaints exactly as it
- * does today.
+ * TWO STRONGER REMEDIES WERE BUILT AND REMOVED. Both are recorded because both look
+ * obviously right and are not.
  *
- * STATED RESIDUAL: that leaves a dirty tab with a foreign source state repainting
- * as before. It is the harder half — its state cannot be recovered from disk by
- * definition — and closing it needs evidence that separates residue from a foreign
- * graph, which this does not have. Deciding it on the tag would refuse good opens
- * and take unsaved work with them.
+ *   REFUSING the open (codex NO-SHIP). The repaint's root re-stamp is the one
+ *   documented heal for a conflicting root tag, so refusing strands the pointer on
+ *   the target with another workflow's uuid on `app.graph`. Every `graph_*` command
+ *   is then refused — including the `panel_load_workflow` the refusal recommended,
+ *   whose own error says to re-open the tab, which re-enters the refusal. A hard
+ *   loop, on true positives as much as false ones.
+ *
+ *   AUTO-CORRECTING from disk. Gated on the tab being clean, which cannot bear it:
+ *   #874 records that ChangeTracker captures on USER INPUT events only, so a value a
+ *   NODE wrote (a populated wildcard, a rolled seed) is on the canvas, never marks
+ *   the tab modified, and was never saved — the re-read would silently replace
+ *   exactly what an agent just generated. The same flag fails in the other direction
+ *   too: a first-time open never runs `clearSpuriousOpenModified`, so a cold-opened
+ *   tab reads modified forever, and gating on it would have disarmed this guard for
+ *   that entire population. #442's re-read survives the argument only because it
+ *   fires on the FILE provably having changed, which is independent evidence about
+ *   the disk copy. A foreign source tag is no evidence about the file at all.
+ *
+ * STATED RESIDUAL: this warns, it does not prevent. An agent that ignores the
+ * disclosure can still edit the wrong graph. Closing that needs evidence separating
+ * residue from a foreign graph, which does not exist here — and every remedy tried
+ * on the weaker evidence traded a silent wrong-graph edit for a wedge or a silent
+ * data loss.
  *
  * Pure, so the ownership questions arrive as injected predicates. A predicate that
- * throws is inconclusive, never a refusal.
+ * throws is inconclusive, never a positive answer.
  */
 export function describeRepaintSourceBinding({
   state,
   targetUuid,
   targetClaimsTag,
   tagOwnedByOtherOpenWorkflow,
-  targetTabIsClean,
 } = {}) {
   try {
     const tag = state?.extra?.[PANEL_GRAPH_META_KEY]?.workflow_uuid;
@@ -1268,9 +1293,6 @@ export function describeRepaintSourceBinding({
     } catch {
       return "unknown";
     }
-    // Compared against `true` explicitly: an unreadable dirty flag is not a clean
-    // tab, and only a clean tab bounds the cost of being wrong.
-    if (targetTabIsClean !== true) return "unknown";
     try {
       return tagOwnedByOtherOpenWorkflow?.(tag) === true ? "foreign" : "unknown";
     } catch {
