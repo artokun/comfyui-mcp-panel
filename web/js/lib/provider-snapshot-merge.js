@@ -49,8 +49,18 @@
 // Pure and dependency-free (no DOM), so the ordering bug this fixes is unit-testable.
 
 /** The fields the ComfyUI host must never supply for a provider the orchestrator described.
- *  See the note above: the host cannot see the agent machine. */
-const READINESS_KEYS = ["ready", "cli", "auth"];
+ *
+ *  `ready`/`cli`/`auth` — readiness, per the note above: the host cannot see the agent
+ *  machine, so its view would false-flag a connected provider as "CLI not installed".
+ *
+ *  `experimental` — a SAFETY DISCLOSURE, not metadata (codex). It is what puts "(experimental)"
+ *  in `backendDisplayLabel` and the amber outline plus the "signs in as VS Code, against
+ *  GitHub's Copilot API terms" tooltip on the chip, so picking a ToS-risk provider is a
+ *  deliberate, informed act. The host's entries are sparse `{backend, running}`, so a
+ *  catch-all overlay would silently DELETE the flag on the next probe and quietly remove
+ *  that warning — and, in the other direction, would let the host invent it. Neither is the
+ *  host's call to make. */
+const AUTHORITATIVE_ONLY_KEYS = ["ready", "cli", "auth", "experimental"];
 
 /** A usable provider entry: an object naming a non-empty `backend` id. */
 function isProviderEntry(entry) {
@@ -89,11 +99,11 @@ export function mergeProviderSnapshots({ authoritative, probe } = {}) {
       continue;
     }
     // Shared id: keep the authoritative entry's membership and position, overlay the
-    // probe's live fields, and hold back readiness. Spread first, then restore the three
-    // readiness keys from the authoritative entry when it actually carried them — so a
-    // probe that omits them cannot blank them either.
+    // probe's live fields, and hold back the authoritative-only keys. Spread first, then
+    // restore those keys from the authoritative entry when it actually carried them — and
+    // DELETE them when it did not, so a probe can neither blank one nor invent one.
     const refreshed = { ...known, ...entry };
-    for (const key of READINESS_KEYS) {
+    for (const key of AUTHORITATIVE_ONLY_KEYS) {
       if (key in known) refreshed[key] = known[key];
       else delete refreshed[key];
     }

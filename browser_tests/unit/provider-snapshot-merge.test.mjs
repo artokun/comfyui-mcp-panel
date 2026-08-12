@@ -68,6 +68,47 @@ test("#1083 (codex): a SHARED provider's running state still follows the probe",
   assert.deepEqual(ids(idle), ids(ORCHESTRATOR));
 });
 
+test("#1083 (codex): the probe cannot erase or invent the EXPERIMENTAL safety disclosure", () => {
+  // `experimental` is what puts "(experimental)" in the chip label and the amber
+  // "signs in as VS Code, against GitHub's Copilot API terms" warning on it. The host's
+  // entries are sparse {backend, running}, so a catch-all overlay would delete the flag on
+  // the very next probe and quietly remove that warning.
+  const withCopilot = [{ backend: "copilot", running: false, ready: true, experimental: true }];
+  const sparse = mergeProviderSnapshots({
+    authoritative: withCopilot,
+    probe: [{ backend: "copilot", running: true }],
+  });
+  assert.equal(sparse[0].experimental, true, "the ToS warning survives a sparse probe");
+  assert.equal(sparse[0].running, true, "while liveness still refreshes");
+
+  // A probe explicitly contradicting it is refused in BOTH directions.
+  const contradicted = mergeProviderSnapshots({
+    authoritative: withCopilot,
+    probe: [{ backend: "copilot", running: false, experimental: false }],
+  });
+  assert.equal(contradicted[0].experimental, true, "the host cannot clear the disclosure");
+
+  const invented = mergeProviderSnapshots({
+    authoritative: [{ backend: "claude", running: false, ready: true }],
+    probe: [{ backend: "claude", running: false, experimental: true }],
+  });
+  assert.equal(invented[0].experimental, undefined, "nor invent it for a provider that is not");
+});
+
+test("#1083 (codex): a provider only the HOST reports is selectable even against a stale baseline", () => {
+  // Codex read this as unreachable during a reconnect window. It is not: a probe-only id is
+  // appended, so a provider the NEW orchestrator has and the retained baseline does not is
+  // still offered as soon as the host sees it. The residual really is the opposite —
+  // a stale EXTRA entry — which is why the baseline is not connection-scoped.
+  const staleBaseline = [{ backend: "gone-provider", running: false, ready: true }];
+  const merged = mergeProviderSnapshots({
+    authoritative: staleBaseline,
+    probe: [{ backend: "brand-new", running: true }],
+  });
+  assert.ok(ids(merged).includes("brand-new"), "the newly reported provider is selectable");
+  assert.deepEqual(ids(merged), ["gone-provider", "brand-new"]);
+});
+
 test("#1083 (codex): an explicitly EMPTY authoritative snapshot is honoured", () => {
   // `backends: []` is a provider report whose content is "none", not a frame that said
   // nothing. Requiring non-empty left a dropped-to-zero orchestrator with its old list
