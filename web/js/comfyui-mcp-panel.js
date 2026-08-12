@@ -21338,13 +21338,13 @@ function buildPanel() {
   function refreshModelChip() {
     const name = prefs.modelAuto ? tr("panel.auto", "Auto") : modelLabel(modelCatalog, prefs.model);
     modelChipLabel.textContent = name;
-    modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
+    modelChipEffort.textContent = prefs.effort ? ` · ${effortMeta(prefs.effort).label}` : "";
     // The name ellipsises in a narrow panel, so the hover has to carry the full
     // value — otherwise a truncated model id is unrecoverable without widening
     // the panel, which is the thing we're avoiding.
     modelChip.title =
       (prefs.effort
-        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: prefs.effort })
+        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: effortMeta(prefs.effort).label })
         : tr("panel.model_name", "Model: {name}", { name })) +
       "\n" +
       tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
