@@ -12,9 +12,12 @@
  * during an LTX render — so the one tool that could have shown them what they were
  * looking at is the one that failed, with a message that reads like a panel bug.
  *
- * It is not a panel bug, and it is not a graph or backend problem: in that same
- * moment `panel_get_errors` and `panel_graph_outline` both answered correctly. The
- * fault is in the frontend's own draw path, and the panel is only the caller.
+ * It is not a panel bug — the panel is the caller, and the throw came out of the
+ * frontend's draw path. It is NOT safe to go further and call it "not a graph
+ * problem", which the first version of this did: a node or widget the renderer
+ * cannot draw throws exactly here while `panel_graph_outline` reads that same node
+ * perfectly well, which is what the reporter observed. Where it threw is known;
+ * what caused it is not.
  *
  * So the panel says what it saw. It cannot repair LiteGraph's render loop, and it
  * must not pretend to know more than where the throw came from — see the function
@@ -51,8 +54,8 @@ export function describeCanvasDrawFailure(err, opts = {}) {
     `WHAT TO TRY: a hard refresh of the ComfyUI browser tab (F5) is what cleared it for the one ` +
     `report of this, and the panel cannot repair the frontend's render state from here, so ` +
     `re-taking the screenshot is unlikely to succeed before then. If a refresh does NOT clear it, ` +
-    `the cause is in the graph rather than in the render state and will still be there ` +
-    `afterwards. Either way a refresh discards unsaved canvas work, so offer the user a save ` +
+    `then it is not (only) stale render state: look at the graph, and at any extension ` +
+    `that draws on the canvas, because whatever it is survives a reload. Either way a refresh discards unsaved canvas work, so offer the user a save ` +
     `FIRST.`
   );
 }

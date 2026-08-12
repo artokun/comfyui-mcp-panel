@@ -15426,6 +15426,19 @@ const GRAPH_TOOL_EXECUTORS = {
       try {
         canvas.draw(true, true); // synchronous redraw at the fitted transform
       } catch (err) {
+        // Put the user's view back BEFORE failing (codex review). The fit above moved
+        // it, the restore that normally undoes that is further down, and a throw
+        // jumps over it — so a failed screenshot silently left them zoomed into the
+        // framing it had chosen. Values only: re-drawing here would very likely throw
+        // again, and the frontend repaints on its own once it can.
+        try {
+          ds.scale = saved.scale;
+          ds.offset[0] = saved.ox;
+          ds.offset[1] = saved.oy;
+          canvas.setDirty?.(true, true);
+        } catch {
+          /* best-effort: never replace the draw failure with a restore failure */
+        }
         // `cause` keeps the original type and stack: the draw-site frames are the
         // only thing that says WHICH draw failed (codex review).
         throw new Error(describeCanvasDrawFailure(err), { cause: err });

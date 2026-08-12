@@ -73,6 +73,12 @@ test("#1108 it names the remedy and admits the panel cannot apply it", () => {
   assert.doesNotMatch(text, /will clear it|this will fix|guaranteed/i, "no promise is made");
   assert.match(text, /unlikely to succeed before then/, "retrying is discouraged, not forbidden");
   assert.match(text, /If a refresh does NOT clear it/, "and the informative case is named");
+  // codex round 2, P1: "then the cause is in the graph" was a false dichotomy — a
+  // persistent frontend issue, an extension, or other browser state survives a
+  // reload without the graph being at fault.
+  assert.match(text, /not \(only\) stale render state/);
+  assert.match(text, /any extension that draws on the canvas/);
+  assert.doesNotMatch(text, /the cause is in the graph rather than/);
   // And a refresh discards unsaved work, which must be said BEFORE they do it.
   assert.match(text, /a refresh discards unsaved canvas work, so offer the user a save FIRST/);
 });
@@ -107,5 +113,15 @@ test("#1108 WIRING: the synchronous redraw is actually wrapped", () => {
     body,
     /throw new Error\(describeCanvasDrawFailure\(err\), \{ cause: err \}\)/,
     "its throw is translated, and the original is kept as `cause`",
+  );
+  // codex round 2, P1: the fit above moved the user's view, and the restore that
+  // undoes it sits further down — so a throw jumped over it and a FAILED screenshot
+  // left them zoomed into the framing it had chosen.
+  const catchStart = body.indexOf("} catch (err) {");
+  assert.ok(catchStart > 0, "the catch must exist");
+  const catchBlock = body.slice(catchStart, catchStart + 900);
+  assert.ok(
+    catchBlock.includes("ds.scale = saved.scale"),
+    "the user's view is restored before the failure is reported",
   );
 });
