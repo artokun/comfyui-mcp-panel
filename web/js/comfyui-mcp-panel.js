@@ -3226,7 +3226,7 @@ const BACKEND_SECTION = {
 // row exists for either, its description reads "the undefined background agent". No row does
 // today (they are instantiated one by one, not from this map), which is exactly why the gap
 // was invisible: the entries are added here so the next row added cannot ship that string.
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
+const BACKEND_TEXT = /* null-prototype: see BACKEND_LABELS (#1084 codex) */ Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -20381,7 +20381,13 @@ function buildPanel() {
   // "ChatGPT" next to "chatgpt" — which reads as an accident and gives no basis for choosing.
   // Both are named now; the orchestrator's own ready banner says "direct OAuth", so the panel
   // matches that wording rather than inventing a second vocabulary for the same thing.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
+  // NULL-PROTOTYPE, and it is load-bearing rather than tidiness (#1084 codex). Every read is
+  // `BACKEND_LABELS[id] || id`, and on a normal object literal that lookup walks the
+  // prototype chain: `BACKEND_LABELS["constructor"]` returns Object's constructor FUNCTION
+  // and `["__proto__"]` returns an object, so the `|| id` fallback never fires and a
+  // function would be interpolated into a sentence. Harmless while the gate below only let
+  // known ids through; reachable the moment it accepts an id this map has never seen.
+  const BACKEND_LABELS = Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
   // Appends a visible "(experimental)" marker to a backend's display label when
   // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
   // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
@@ -26826,7 +26832,16 @@ function buildPanel() {
       // because the orchestrator can add a backend before the panel ships a name for it and
       // that is a normal ordering, not an error. Every label read below falls back to the
       // raw id, so an unnamed backend degrades to showing "chatgpt" rather than "undefined".
-      const known = typeof backend === "string" && !!backend;
+      //
+      // SHAPE-CHECKED rather than merely non-empty (codex). This block persists the value to
+      // localStorage and keys a per-backend catalog cache on it, so accepting anything at all
+      // would let a malformed handshake — `" "`, or a stray sentence — become the saved
+      // provider preference and outlive the session that produced it. The pattern is
+      // deliberately permissive about WHICH id (that is the whole point of not using the
+      // label map) and strict only about it being id-SHAPED: a leading alphanumeric, then
+      // alphanumerics, hyphens or underscores. Every backend this panel has ever shipped
+      // matches, and so does one it has never heard of.
+      const known = typeof backend === "string" && /^[a-z0-9][a-z0-9_-]*$/i.test(backend);
       if (known) {
         // A real provider switch = the connected backend changed AND we were
         // already connected to something (not the first connect, not a re-pick).
