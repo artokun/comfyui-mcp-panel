@@ -199,3 +199,32 @@ test("#996 reading the globals cannot throw either — the caller's access is gu
 
   assert.deepEqual(queuePromptChainDeps(undefined), { app: undefined, api: undefined });
 });
+
+test("#996 an UNREADABLE or absent method is unknown — never 'comes from the prototype'", () => {
+  // codex round 3: a failed own-property probe was collapsed to `false` and then
+  // reported as a confident negative — the same defect this diagnostic exists to
+  // stop making, in its own guard.
+  const proxy = new Proxy(function () {}, {
+    getOwnPropertyDescriptor() {
+      throw new Error("nope");
+    },
+    get(_t, k) {
+      if (k === "queuePrompt") return function () {};
+      throw new Error("nope");
+    },
+  });
+  const unreadable = describeQueuePromptChain({ app: proxy, api: proxy });
+  assert.equal(unreadable.appShadowed, undefined);
+  assert.match(unreadable.summary, /could not be read, or is not there/);
+  assert.doesNotMatch(unreadable.summary, /comes from the prototype/);
+
+  // An object with NO queuePrompt is not "from the prototype" either.
+  const absent = describeQueuePromptChain({ app: {}, api: {} });
+  assert.equal(absent.appShadowed, undefined);
+  assert.match(absent.summary, /could not be read, or is not there/);
+
+  // …and the report must not take the "nothing shadows" branch for it.
+  const report = describeQueuePromptChainForReport(absent);
+  assert.match(report, /could not be read, so where it comes from is unknown/);
+  assert.doesNotMatch(report, /rules out one placement only/);
+});

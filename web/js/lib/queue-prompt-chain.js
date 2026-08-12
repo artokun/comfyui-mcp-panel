@@ -40,14 +40,25 @@ function readProp(obj, name) {
   }
 }
 
-/** Does `obj` carry its OWN `name`, shadowing the prototype's? A FACT — it does
- *  not say who put it there, and a frontend binding its own method in a
- *  constructor produces the same observation. */
+/**
+ * Does `obj` carry its OWN `name`, shadowing the prototype's?
+ *
+ * THREE states, not two (codex round 3). A probe that FAILS — a callable Proxy
+ * whose `getOwnPropertyDescriptor` throws is exactly the case the hostile-input
+ * test installs — must not be reported as "no". Neither must an object that has no
+ * such method at all: "comes from the prototype" would describe a method that is
+ * not there. Collapsing either into a confident negative is the same defect this
+ * whole diagnostic exists to stop making.
+ *
+ * @returns {true|false|undefined} undefined = could not be determined, or absent.
+ */
 function shadowsPrototype(obj, name) {
   try {
-    return Boolean(obj && Object.prototype.hasOwnProperty.call(obj, name));
+    if (!obj) return undefined;
+    if (typeof readProp(obj, name) !== "function") return undefined;
+    return Boolean(Object.prototype.hasOwnProperty.call(obj, name));
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -89,9 +100,15 @@ export function describeQueuePromptChain(deps) {
   const apiShadowed = shadowsPrototype(api, "queuePrompt");
   const protoMentionsOption = prototypeMentionsOption(api);
 
+  const where = (state, what) =>
+    state === undefined
+      ? `${what} could not be read, or is not there`
+      : state
+        ? `${what} is shadowed by an own property`
+        : `${what} comes from the prototype`;
   const parts = [
-    `app.queuePrompt ${appShadowed ? "is shadowed by an own property" : "comes from the prototype"}`,
-    `api.queuePrompt ${apiShadowed ? "is shadowed by an own property" : "comes from the prototype"}`,
+    where(appShadowed, "app.queuePrompt"),
+    where(apiShadowed, "api.queuePrompt"),
     protoMentionsOption === undefined
       ? "the prototype's api.queuePrompt source could not be read"
       : protoMentionsOption
@@ -115,14 +132,19 @@ export function describeQueuePromptChain(deps) {
  */
 export function describeQueuePromptChainForReport(chain) {
   if (!chain) return "";
-  const shadowed = chain.appShadowed || chain.apiShadowed;
+  const shadowed = chain.appShadowed === true || chain.apiShadowed === true;
+  const anyUnknown = chain.appShadowed === undefined || chain.apiShadowed === undefined;
   const next = shadowed
     ? // NOT "something replaced it": an own property is shadowing, and a frontend
       // that binds its own method in a constructor looks identical (codex round 2).
       ` An own property shadowing the prototype is ordinary — a frontend may bind its own, and ` +
       `many extensions wrap these — so this is where to look, not who to blame. What would ` +
       `settle it is whether whatever is installed passes its THIRD argument through.`
-    : // NOT "so it reached the frontend's own code": a wrapper installed ON THE
+    : anyUnknown
+      ? // Unknown is unknown: it must not fall into the "nothing shadows" branch,
+        // which would assert something about a method we could not even read.
+        ` One of those methods could not be read, so where it comes from is unknown here.`
+      : // NOT "so it reached the frontend's own code": a wrapper installed ON THE
       // PROTOTYPE leaves no own property, so absence of shadowing rules out one
       // placement, not interception (codex round 2).
       ` Nothing shadows either method at the instance level. That rules out one placement only — ` +
