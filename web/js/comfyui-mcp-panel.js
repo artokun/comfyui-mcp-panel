@@ -240,6 +240,7 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
+import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -8192,15 +8193,6 @@ function isEmptyRailSlotRef(ref) {
 
 /** Find an EXISTING rail slot (SubgraphInput/SubgraphOutput) by name or index,
  *  or null if none matches. */
-function findExistingRailSlot(slots, ref) {
-  if (ref == null) return null;
-  if (typeof ref === "number" && Number.isInteger(ref)) {
-    return ref >= 0 && ref < (slots?.length ?? 0) ? slots[ref] : null;
-  }
-  const name = String(ref).toLowerCase();
-  return (slots ?? []).find((s) => s?.name?.toLowerCase() === name) ?? null;
-}
-
 // ---- Group boxes (LiteGraph LGraphGroup) helpers --------------------------
 
 /** Resolve a group box by id (with an index fallback for graphs whose groups
