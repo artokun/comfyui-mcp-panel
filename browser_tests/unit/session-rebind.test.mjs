@@ -625,6 +625,19 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
     src.includes("createBridgeOutageTracker({ now: monotonicNow })"),
     "the panel's outage tracker must measure on the monotonic clock",
   );
+  // #1145 — and the two WRITE sites, not just the read. The tracker's behaviour is
+  // covered above, but a tracker nothing feeds answers 0 forever and every one of these
+  // tests still passes: deleting `noteBridgeClosed()` from the close handler silently
+  // restores "no drop was ever recorded", which is the bug #1138 fixed. Each site is
+  // pinned by exact substring for #1096's reason — loose token scans over this file
+  // assert nothing.
+  for (const [site, snippet] of [
+    ["the socket close handler must open the outage", "bridgeOutage.noteBridgeClosed();"],
+    ["the models handshake must close it", "bridgeOutage.noteHandshake();"],
+    ["a turn start must scope the evidence to that turn", "bridgeOutage.noteTurnStarted();"],
+  ]) {
+    assert.ok(src.includes(snippet), site);
+  }
 });
 
 // ── #1145: the interval must be the OUTAGE, not one backoff step ─────────────

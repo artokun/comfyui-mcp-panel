@@ -18257,6 +18257,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // that never opened is still the active one), and re-stamping on those reset the
       // clock to the last backoff step. The tracker ignores all but the first; the
       // outage stands until markConnected() ends it.
+      //
+      // A panel-DRIVEN teardown never reaches here, and that is deliberate rather than
+      // a gap: stop() nulls `sock` synchronously, so the late close fails the isActive()
+      // guard above and no outage opens. Every such path — Disconnect, provider switch,
+      // soft reload — routes through endTurnLocally() or its own ready-ack branch and
+      // clears MID_TASK_KEY, so there is no mid-task nudge left to decide. Opening an
+      // outage for them would only invent evidence about a drop the user asked for. The
+      // pre-#1145 stamp sat behind this same guard, so this is unchanged behaviour.
       bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks

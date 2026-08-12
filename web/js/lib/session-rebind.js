@@ -118,8 +118,16 @@ export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6
 //     drop from being re-read later as this turn's — the #1138 defect with a stale
 //     timestamp in place of the 0 sentinel.
 export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
-  // When the current outage began; 0 whenever the bridge is up.
-  let startedAt = 0;
+  // When the current outage began; NULL whenever the bridge is up.
+  //
+  // Null rather than 0, and tested with `=== null` rather than for truthiness, because
+  // 0 is a LEGITIMATE reading here: the panel measures on `monotonicNow()`
+  // (performance.now), whose origin is page load, so an early enough close genuinely
+  // stamps a near-zero value. A falsy-0 sentinel would read that as "no outage open" —
+  // the outage would never close, every later close would re-stamp it, and the backoff
+  // step would be back. That is #1138's mistake exactly: a sentinel sharing a value
+  // with real data.
+  let startedAt = null;
   // The outage the current turn has seen, in ms; 0 means "no drop during this turn".
   let outageMs = 0;
   const readClock = () => {
@@ -128,22 +136,22 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
   };
   return {
     noteBridgeClosed() {
-      if (startedAt) return; // already inside an outage — this close is not a new one
+      if (startedAt !== null) return; // inside an outage already — not a new one
       const t = readClock();
-      // An unreadable clock cannot start an outage. Leaving startedAt at 0 means the
+      // An unreadable clock cannot start an outage. Leaving startedAt null means the
       // handshake records no duration, so the nudge is withheld — the safe direction:
       // a missed nudge leaves an idle agent, an invented one derails a working agent.
       if (t !== null) startedAt = t;
     },
     noteHandshake() {
-      if (!startedAt) return; // ended no outage — records nothing
+      if (startedAt === null) return; // ended no outage — records nothing
       const t = readClock();
-      // Clamped at 0: a backwards wall-clock adjustment mid-outage must not hand the
+      // Clamped at 0: a backwards clock adjustment mid-outage must not hand the
       // predicate a negative duration to reason about.
       if (t !== null) outageMs = Math.max(0, t - startedAt);
       // Closed either way — an outage whose end could not be timed is still over, and
       // leaving it open would let the NEXT drop measure from this one's start.
-      startedAt = 0;
+      startedAt = null;
     },
     noteTurnStarted() {
       outageMs = 0;
@@ -166,14 +174,16 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
      *  once, by the first close, so a live reading measures from the outage's start and
      *  not from the most recent refused retry. */
     outageMs() {
-      if (!startedAt) return outageMs;
+      if (startedAt === null) return outageMs;
       const t = readClock();
       // Clamped for the same reason noteHandshake clamps: a clock that ran backwards
       // reports no outage rather than a negative one.
       return t === null ? outageMs : Math.max(0, t - startedAt);
     },
-    /** True while the bridge is down — the outage has begun but not yet ended. */
-    isDown: () => startedAt > 0,
+    /** True while the bridge is down — the outage has begun but not yet ended.
+     *  Read by the tests that pin the open/closed transitions; the panel decides on
+     *  outageMs() alone, so this stays a state ACCESSOR and never a second predicate. */
+    isDown: () => startedAt !== null,
   };
 }
 

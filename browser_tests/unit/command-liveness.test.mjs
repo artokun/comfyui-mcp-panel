@@ -508,7 +508,12 @@ test("#508 wiring: an undelivered reply is journaled, replayed after hello, and 
   // unrelated to what it checks.
   const mcStart = src.indexOf("function markConnected() {");
   assert.notEqual(mcStart, -1, "could not locate markConnected in the panel source");
-  const markConnected = src.slice(mcStart, src.indexOf("\n  }", mcStart));
+  // Both ends are asserted: a -1 from either indexOf would slice a window that is not
+  // the function — an unfound END silently degrades `slice` into a near-whole-file scan,
+  // which would pass no matter where replayLostReplies actually sits.
+  const mcEnd = src.indexOf("\n  }", mcStart);
+  assert.notEqual(mcEnd, -1, "could not locate the end of markConnected");
+  const markConnected = src.slice(mcStart, mcEnd);
   assert.match(markConnected, /replayLostReplies\(sock\);/, "replay rides the handshake");
 });
 
