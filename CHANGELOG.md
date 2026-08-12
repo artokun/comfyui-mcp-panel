@@ -6,6 +6,35 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.10] - 2026-08-11
+
+### Fixed
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
 ## [0.14.9] - 2026-08-11
 
 > #1085: adding an ImageCropV2 warned that this tab's node definitions were out of date and
