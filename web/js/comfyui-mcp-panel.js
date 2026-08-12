@@ -18900,6 +18900,11 @@ const PANEL_CSS = `
 }
 .cmcp-settings > summary::before { content: "▸"; transition: transform 0.15s; }
 .cmcp-settings[open] > summary::before { transform: rotate(90deg); }
+/* A collapsed disclosure caret points AT the text it would reveal, which is leftwards in
+   Arabic and Persian; CSS content cannot go through tr(), so mirror it here. The open state
+   points down in both directions, so it keeps the plain rotation. */
+[dir="rtl"] .cmcp-settings > summary::before { transform: scaleX(-1); }
+[dir="rtl"] .cmcp-settings[open] > summary::before { transform: rotate(90deg); }
 .cmcp-settings-body { padding: 0 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
 .cmcp-label { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-input {
@@ -20756,33 +20761,40 @@ function buildPanel() {
     // refreshes immediately. Windows env vars do NOT reach an already-running
     // orchestrator (processes snapshot their env at spawn), which is exactly
     // the trap a #help user fell into — so the hints lead with the card.
+    // These 22 strings are the panel's entire answer to "why can't I use this provider", and
+    // every one of them shipped in English to every locale. No detector could see them: the
+    // literal sits at a `return`, not next to a display sink, so the unwired scan has nothing
+    // to anchor on and coverage cannot miss a key that was never created.
+    //
+    // Command text stays verbatim inside the translated sentence — `ollama serve`, `codex
+    // login`, `MOONSHOT_API_KEY` are things the user types or an env var name, not prose.
     if (r.cli === false) {
       // For openrouter, "cli" is really "API key present" — no CLI to install.
-      if (b.backend === "openrouter") return "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately";
+      if (b.backend === "openrouter") return tr("panel.not_ready_openrouter_no_key", "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately");
       // For custom, "cli" is "a base URL is configured" — nothing to install.
-      if (b.backend === "custom") return "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)";
-      if (b.backend === "ollama") return "Ollama not installed — get it at ollama.com/download";
-      if (b.backend === "lmstudio") return "LM Studio not installed — get it at lmstudio.ai";
-      if (b.backend === "llamacpp") return "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)";
-      if (b.backend === "antigravity") return "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.";
-      if (b.backend === "pi") return "Install the pi CLI (pi.dev) and configure a provider (set a provider API key, or run `pi` once and `/login`).";
-      return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
+      if (b.backend === "custom") return tr("panel.not_ready_custom_no_endpoint", "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)");
+      if (b.backend === "ollama") return tr("panel.not_ready_ollama_not_installed", "Ollama not installed — get it at ollama.com/download");
+      if (b.backend === "lmstudio") return tr("panel.not_ready_lmstudio_not_installed", "LM Studio not installed — get it at lmstudio.ai");
+      if (b.backend === "llamacpp") return tr("panel.not_ready_llamacpp_not_on_path", "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)");
+      if (b.backend === "antigravity") return tr("panel.not_ready_antigravity_install_cli", "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.");
+      if (b.backend === "pi") return tr("panel.not_ready_pi_install_cli", "Install the pi CLI (pi.dev) and configure a provider (set a provider API key, or run `pi` once and `/login`).");
+      return tr("panel.not_ready_cli_not_installed", "{label} CLI not installed", { label: BACKEND_LABELS[b.backend] || b.backend });
     }
-    if (b.backend === "codex") return "Not signed in — Sign in via API Keys (▾ menu) or run: codex login";
-    if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
-    if (b.backend === "antigravity") return "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.";
-    if (b.backend === "pi") return "No provider configured — set a provider API key (e.g. ANTHROPIC_API_KEY) or run `pi` once and `/login`.";
-    if (b.backend === "grok") return "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok";
-    if (b.backend === "kimi") return "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi";
-    if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
-    if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
-    if (b.backend === "llamacpp") return "llama-server not running — llama-server -m model.gguf --jinja -c 16384";
-    if (b.backend === "openrouter") return "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "moonshot") return "No Moonshot API key — add MOONSHOT_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "glm") return "No z.ai API key — add ZAI_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "minimax") return "No MiniMax API key — add MINIMAX_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "custom") return "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)";
-    return "Not signed in — run: claude auth login";
+    if (b.backend === "codex") return tr("panel.not_ready_codex_signed_out", "Not signed in — Sign in via API Keys (▾ menu) or run: codex login");
+    if (b.backend === "gemini") return tr("panel.not_ready_gemini_signed_out", "Not signed in — run: gemini (then sign in with Google)");
+    if (b.backend === "antigravity") return tr("panel.not_ready_antigravity_install_cli", "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.");
+    if (b.backend === "pi") return tr("panel.not_ready_pi_no_provider", "No provider configured — set a provider API key (e.g. ANTHROPIC_API_KEY) or run `pi` once and `/login`.");
+    if (b.backend === "grok") return tr("panel.not_ready_grok_signed_out", "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok");
+    if (b.backend === "kimi") return tr("panel.not_ready_kimi_signed_out", "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi");
+    if (b.backend === "ollama") return tr("panel.not_ready_ollama_not_running", "Ollama not running — run: ollama serve");
+    if (b.backend === "lmstudio") return tr("panel.not_ready_lmstudio_not_running", "LM Studio server not running — LM Studio → Developer → Start Server");
+    if (b.backend === "llamacpp") return tr("panel.not_ready_llamacpp_not_running", "llama-server not running — llama-server -m model.gguf --jinja -c 16384");
+    if (b.backend === "openrouter") return tr("panel.not_ready_openrouter_no_key", "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "moonshot") return tr("panel.not_ready_moonshot_no_key", "No Moonshot API key — add MOONSHOT_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "glm") return tr("panel.not_ready_glm_no_key", "No z.ai API key — add ZAI_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "minimax") return tr("panel.not_ready_minimax_no_key", "No MiniMax API key — add MINIMAX_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "custom") return tr("panel.not_ready_custom_no_endpoint", "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)");
+    return tr("panel.not_ready_claude_signed_out", "Not signed in — run: claude auth login");
   }
 
   function renderBackendChips(backends) {
@@ -23948,7 +23960,11 @@ function buildPanel() {
 
     const apply = (collapsed) => {
       card.classList.toggle("cmcp-media-collapsed", collapsed);
-      btn.textContent = collapsed ? "▸" : "▾";
+      // The catalog mirrors the collapsed caret for RTL (Arabic ships ◂ for panel.advanced),
+      // so a hard-coded ▸ here renders pointing the wrong way next to translated ones.
+      btn.textContent = collapsed
+        ? tr("panel.caret_collapsed", "▸")
+        : tr("panel.caret_expanded", "▾");
       const title = showHideTitle(collapsed);
       btn.title = title;
       btn.setAttribute("aria-label", title);
@@ -24569,7 +24585,12 @@ function buildPanel() {
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
-          what: "question",
+          // Spliced into a TRANSLATED sentence downstream, so an English literal here reads
+          // as "…الذي أرسل question، لذا…". The consumer's own nullish fallback for this hole
+          // never rescues it, because this path always supplies a value.
+          // Described rather than quoted: writing that fallback's call shape here would read
+          // as an unparseable call site to the extractor's round-trip guard.
+          what: tr("panel.question", "question"),
         }),
       abandon,
     });

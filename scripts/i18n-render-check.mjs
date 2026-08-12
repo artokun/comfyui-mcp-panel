@@ -127,6 +127,18 @@ for (const locale of targets) {
   // depends on the test's own substitution values rather than on the file that ships.
   for (const [key, value] of targetFlat) checkSource(locale, key, value);
 
+  // settings.json gets the same source-text rules. It was skipped entirely, and the gap was
+  // hit for real: a zh-TW tooltip ending `…例如 OPENROUTER_API_KEY）` glues a fullwidth
+  // parenthesis onto an identifier, which check-tool-vocabulary rejects — and this script
+  // still printed "rendering OK". Only the CI-only vocabulary gate caught it. That rule bites
+  // hardest in Chinese, where （）：、， all fall inside its character class and extend the
+  // match across the surrounding Han text.
+  //
+  // Settings do not go through tr() — ComfyUI renders them from its own /i18n payload — so
+  // there is nothing to render here, only text to inspect.
+  const settings = readJson(path.join(LOCALES, locale, 'settings.json'));
+  if (settings) for (const [key, value] of flat(settings)) checkSource(locale, `settings.${key}`, value);
+
   let rendered = 0;
   let fellBack = 0;
 
