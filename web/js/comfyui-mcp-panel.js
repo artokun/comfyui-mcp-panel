@@ -26835,12 +26835,17 @@ function buildPanel() {
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
       applyReadiness(data, { fromOrchestrator: true });
-      // #1083 — THIS is the only thing that establishes an authoritative provider list:
-      // a real bridge frame carrying a non-empty array. Recorded before the repaint so a
-      // host probe racing this frame merges against it rather than against the rendered
-      // list. An empty/absent array leaves the previous baseline alone — it is a frame that
-      // told us nothing about providers, not one that told us there are none.
-      if (Array.isArray(data?.backends) && data.backends.length) orchestratorBackends = data.backends;
+      // #1083 — THIS is the only thing that establishes an authoritative provider list: a
+      // real bridge frame carrying an ARRAY. Recorded before the repaint so a host probe
+      // racing this frame merges against it rather than against the rendered list.
+      //
+      // A PRESENT array counts even when EMPTY (codex). An earlier draft required
+      // non-empty, reasoning that `[]` "told us nothing" — but the array's presence is what
+      // makes the frame a provider report, and its length is the report's content. Ignoring
+      // `[]` meant an orchestrator that had genuinely dropped to zero providers left the
+      // previous list authoritative forever, so later host probes kept re-asserting
+      // providers that no longer exist. The line directly below already reads it that way.
+      if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).

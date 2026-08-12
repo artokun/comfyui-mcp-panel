@@ -34,14 +34,45 @@ test("#1083: a host probe cannot delete providers from an authoritative snapshot
   }
 });
 
-test("#1083: the probe cannot DOWNGRADE a provider the orchestrator reported", () => {
-  // The same ruling applyReadiness already makes: the host cannot see the agent machine,
-  // so its view of a provider it half-knows is not an improvement. `claude` is running per
-  // the orchestrator and idle per the host; the orchestrator wins.
-  const merged = mergeProviderSnapshots({ authoritative: ORCHESTRATOR, probe: HOST });
+test("#1083: the probe cannot downgrade a provider's READINESS", () => {
+  // The same ruling applyReadiness already makes: the host cannot see the agent machine, so
+  // its readiness for a provider it half-knows would false-flag a connected provider as
+  // "CLI not installed".
+  const merged = mergeProviderSnapshots({
+    authoritative: ORCHESTRATOR,
+    probe: [{ backend: "claude", running: false, ready: false, cli: false }],
+  });
   const claude = merged.find((b) => b.backend === "claude");
-  assert.equal(claude.running, true, "orchestrator liveness is not overwritten by the host");
-  assert.equal(claude.ready, true, "orchestrator readiness is not overwritten by the host");
+  assert.equal(claude.ready, true, "orchestrator readiness survives");
+  assert.equal(claude.cli, undefined, "and a host-invented cli flag is not adopted");
+});
+
+test("#1083 (codex): a SHARED provider's running state still follows the probe", () => {
+  // The second freeze codex found, one id-set over from the first. Refusing the probe's
+  // fields wholesale meant `claude` — present in BOTH snapshots — kept whatever liveness it
+  // had when the orchestrator frame landed, permanently. The chip and the model popup both
+  // read `b.running`, and the host probe is what re-reads it on a timer.
+  const idle = mergeProviderSnapshots({
+    authoritative: ORCHESTRATOR, // claude: running true
+    probe: [{ backend: "claude", running: false }],
+  });
+  assert.equal(idle.find((b) => b.backend === "claude").running, false, "stop is seen");
+
+  const busy = mergeProviderSnapshots({
+    authoritative: ORCHESTRATOR.map((b) => (b.backend === "claude" ? { ...b, running: false } : b)),
+    probe: [{ backend: "claude", running: true }],
+  });
+  assert.equal(busy.find((b) => b.backend === "claude").running, true, "start is seen too");
+
+  // Membership and position are still the authoritative snapshot's.
+  assert.deepEqual(ids(idle), ids(ORCHESTRATOR));
+});
+
+test("#1083 (codex): an explicitly EMPTY authoritative snapshot is honoured", () => {
+  // `backends: []` is a provider report whose content is "none", not a frame that said
+  // nothing. Requiring non-empty left a dropped-to-zero orchestrator with its old list
+  // authoritative forever, so host probes kept re-asserting providers that no longer exist.
+  assert.deepEqual(ids(mergeProviderSnapshots({ authoritative: [], probe: HOST })), ids(HOST));
 });
 
 test("#1083: a provider only the HOST knows about is ADDED, never dropped", () => {
@@ -71,16 +102,20 @@ test("#1083: malformed input never throws and never invents a provider", () => {
   );
 });
 
-test("#1083: a duplicated id yields ONE chip, first writer wins", () => {
+test("#1083: a duplicated id yields ONE chip", () => {
+  // A malformed authoritative snapshot must not paint the same provider twice; within it,
+  // the first entry wins. The probe then refreshes that single entry's live fields as it
+  // does for any shared id, so `running` follows the probe — see the shared-liveness test.
   const merged = mergeProviderSnapshots({
     authoritative: [
-      { backend: "custom", running: true },
-      { backend: "custom", running: false },
+      { backend: "custom", running: true, ready: true },
+      { backend: "custom", running: false, ready: false },
     ],
     probe: [{ backend: "custom", running: false }],
   });
-  assert.equal(merged.length, 1);
-  assert.equal(merged[0].running, true);
+  assert.equal(merged.length, 1, "one chip, not two");
+  assert.equal(merged[0].ready, true, "the FIRST authoritative entry won, not the second");
+  assert.equal(merged[0].running, false, "and the probe still refreshed its liveness");
 });
 
 test("#1083: merging is stable — repeated host refreshes converge, never grow or shrink", () => {

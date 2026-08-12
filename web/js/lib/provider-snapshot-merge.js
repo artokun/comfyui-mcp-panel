@@ -26,15 +26,31 @@
 // WHAT THE PROBE MAY AND MAY NOT DO, once an authoritative snapshot exists:
 //   * it may ADD a provider the authoritative snapshot did not mention — additive, and it
 //     cannot make the list shorter;
-//   * it may NOT remove one, and it may NOT overwrite the fields of one. That second
-//     restriction is the same ruling `applyReadiness` already makes: the probe cannot see
-//     the agent machine, so its `ready`/`running` for a provider it half-knows is not an
-//     improvement on what the orchestrator said.
+//   * it may NOT remove one;
+//   * it MAY refresh the live fields of one, but NOT its readiness.
+//
+// That last split is the correction to this helper's first draft, which refused the probe's
+// fields wholesale (codex). Refusing everything froze `running` for every provider the two
+// sources share — the chip and the model popup both read `b.running`, and the host probe is
+// what re-reads it on a timer — so a shared provider such as `claude` would have shown
+// whatever liveness it had at the moment the orchestrator frame landed, permanently. That
+// is the same freeze the first draft had for host-only providers, one id-set over.
+//
+// Readiness (`ready`/`cli`/`auth`) is the part that must NOT come from the probe, and only
+// that part: the host cannot see the agent machine, so its view would false-flag a
+// connected provider as "CLI not installed". This is the same ruling `applyReadiness`
+// already makes, and the panel does not actually depend on the entry for it — `notReadyHint`
+// reads the durable `backendReady` map FIRST and only falls back to the entry — so holding
+// these three keys back is belt-and-braces rather than the load-bearing guard.
 //
 // With NO authoritative snapshot yet, the probe is all there is and is used as-is —
 // unchanged behaviour for a panel that has not connected.
 //
 // Pure and dependency-free (no DOM), so the ordering bug this fixes is unit-testable.
+
+/** The fields the ComfyUI host must never supply for a provider the orchestrator described.
+ *  See the note above: the host cannot see the agent machine. */
+const READINESS_KEYS = ["ready", "cli", "auth"];
 
 /** A usable provider entry: an object naming a non-empty `backend` id. */
 function isProviderEntry(entry) {
@@ -54,19 +70,34 @@ export function mergeProviderSnapshots({ authoritative, probe } = {}) {
   // Nothing authoritative to protect — the probe is the only source of truth there is.
   if (!auth.length) return host;
 
-  const authIds = new Set();
-  const merged = [];
+  const order = [];
+  const byId = new Map();
   for (const entry of auth) {
     // First writer wins on a duplicated id, so a malformed authoritative snapshot cannot
     // produce two chips for one provider.
-    if (authIds.has(entry.backend)) continue;
-    authIds.add(entry.backend);
-    merged.push(entry);
+    if (byId.has(entry.backend)) continue;
+    byId.set(entry.backend, entry);
+    order.push(entry.backend);
   }
   for (const entry of host) {
-    if (authIds.has(entry.backend)) continue; // never overwrite, never remove
-    authIds.add(entry.backend);
-    merged.push(entry);
+    const known = byId.get(entry.backend);
+    if (!known) {
+      // Additive — a provider only the host knows about. It keeps its own entry, so its
+      // liveness follows every later probe.
+      byId.set(entry.backend, entry);
+      order.push(entry.backend);
+      continue;
+    }
+    // Shared id: keep the authoritative entry's membership and position, overlay the
+    // probe's live fields, and hold back readiness. Spread first, then restore the three
+    // readiness keys from the authoritative entry when it actually carried them — so a
+    // probe that omits them cannot blank them either.
+    const refreshed = { ...known, ...entry };
+    for (const key of READINESS_KEYS) {
+      if (key in known) refreshed[key] = known[key];
+      else delete refreshed[key];
+    }
+    byId.set(entry.backend, refreshed);
   }
-  return merged;
+  return order.map((id) => byId.get(id));
 }
