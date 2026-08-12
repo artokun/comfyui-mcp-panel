@@ -6,6 +6,40 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The mid-task resume nudge now measures the outage instead of one backoff step, so a
+  ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
+  resumed agent its connection dropped mid-task and to continue what it was doing, and it
+  fires only for a REAL restart — judged by how long the bridge was gone. But the panel
+  assigns its socket before the connection resolves, so a REFUSED reconnect attempt is
+  still the active socket and ran the close handler in full, re-stamping the drop time.
+  With backoff doubling, the retries land near one, three, seven and fifteen seconds, so
+  the attempt that finally connected was separated from the previous failed close by only
+  that attempt's delay. The guard weighed its own retry cadence, not the outage: a genuine
+  restart returning inside about seven seconds measured roughly four and lost its nudge,
+  leaving the agent idle with a resumed session and no pending turn — after exactly the
+  event the nudge exists for. The outage is now stamped once, by the first close that
+  begins it, and its duration measured at the handshake that ends it.
+  A second reading of the same guard is closed with it: a drop stamp answers "how long
+  since the last drop, whenever that was", and kept answering after the outage it
+  described had ended — so a `ready` repeating on a live socket (the panel re-advertises
+  after every successful `free_vram`, #310) could be told about a drop from ten minutes
+  and two reconnects earlier. That is #1138's defect with a real timestamp in place of the
+  zero sentinel. What the guard reads is now a measured duration, scoped to the turn now
+  running, and a handshake that ended no outage records nothing rather than inheriting the
+  previous one.
+  The accounting moved into a tracker with unit tests that drive it through the real
+  sequence — drop, refused retry, refused retry, handshake — because no single call can
+  distinguish a drop from the third refused attempt, and a source scan over the panel
+  could not have caught this (a review previously proved by mutation that such scans stay
+  green through an inversion). Each guard was mutation-checked against those tests.
+  The two sibling `ready`-ack branches were audited for the same class and are clean: the
+  reboot-resume branch already decides on an observed drop rather than elapsed time
+  ("elapsed time is not evidence of a new connection; an observed drop is"), and the
+  soft-reload branch reads a marker it sets and clears itself. The mid-task branch was the
+  only one deriving a restart from a clock.
+
 ## [0.14.21] - 2026-08-12
 
 ### Added

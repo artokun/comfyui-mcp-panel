@@ -50,8 +50,8 @@ export function shouldRehelloAfterCommand(cmd, reply) {
 // reconnect (a sidebar remount, a brief WS blip) means it was not. That rule is right.
 //
 // What it missed is that "no drop at all" is not the same as "a very old drop", and the
-// subtraction cannot tell them apart: the panel's `lastBridgeDownAt` is 0 until the bridge
-// socket closes, and `Date.now() - 0` is ~56 years — the LONGEST possible gap, which the
+// subtraction cannot tell them apart: the panel's drop stamp was 0 until the bridge
+// socket closed, and `Date.now() - 0` is ~56 years — the LONGEST possible gap, which the
 // heuristic reads as the strongest possible evidence of a real restart. So the guard was
 // exactly inverted where it mattered most: the better established it was that nothing had
 // dropped, the more confidently it nudged.
@@ -60,23 +60,99 @@ export function shouldRehelloAfterCommand(cmd, reply) {
 // a fresh handshake, and #310 re-advertises after every successful free_vram by design. So
 // freeing VRAM mid-task could tell a user their connection had dropped when nothing had.
 //
-// `bridgeDroppedAt` is therefore required to be a positive timestamp: absent, zero or
-// unreadable means no drop was recorded, and no drop means no nudge.
-export function shouldNudgeAfterMidTaskReconnect({
-  bridgeDroppedAt = 0,
-  now = 0,
-  minGapMs = 6000,
-} = {}) {
-  if (typeof bridgeDroppedAt !== "number" || !Number.isFinite(bridgeDroppedAt)) return false;
-  // Not `> 0` by accident: a drop is stamped with Date.now(), so any real value is far
-  // above zero, and a non-positive one is the never-dropped sentinel or a corrupt clock.
-  if (bridgeDroppedAt <= 0) return false;
-  if (typeof now !== "number" || !Number.isFinite(now)) return false;
-  // A gap that reads NEGATIVE (a clock adjustment, or a drop stamped after this read)
-  // is not evidence of a long outage either — treat it as fast, i.e. no nudge.
-  const gap = now - bridgeDroppedAt;
-  if (gap < 0) return false;
-  return gap >= minGapMs;
+// #1145 — and the interval must be the OUTAGE, which is why this takes a measured
+// duration rather than a timestamp to subtract from `now`.
+//
+// The caller used to pass the last drop stamp and let this compute `now - stamp`. That
+// made the predicate's answer only as good as the stamp's meaning, and the stamp meant
+// the wrong thing twice. It was rewritten by every close, and a close is not once per
+// outage: the panel assigns its socket before the connection resolves, so each REFUSED
+// retry during a restart re-stamped it, and with backoff doubling the successful attempt
+// was separated from the previous failed close by one backoff step. A genuine restart
+// that returned inside ~7s therefore measured ~4s and lost its nudge — the guard reading
+// its own retry cadence instead of the outage.
+//
+// A duration also removes the second reading a bare timestamp allows. `now - stamp` is
+// "time since the last drop, whenever that was", which keeps answering after the outage
+// it described has long ended — so a `ready` repeating on a live socket could be told
+// about a drop from ten minutes and two reconnects ago. What this needs to know is how
+// long THIS connection was gone, and a duration cannot be silently reinterpreted as
+// anything else. The caller measures it once, at the handshake that ended the outage,
+// and reports 0 when a handshake ended no outage.
+//
+// `outageMs` is therefore required to be a positive, finite number of milliseconds:
+// absent, zero, negative or unreadable all mean no outage was measured, and no outage
+// means no nudge.
+export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6000 } = {}) {
+  if (typeof outageMs !== "number" || !Number.isFinite(outageMs)) return false;
+  // Not `> 0` by accident: a measured outage is a real elapsed duration, so a
+  // non-positive one is the never-dropped sentinel, an ended-and-consumed outage, or a
+  // clock that ran backwards — none of which is evidence that the orchestrator died.
+  if (outageMs <= 0) return false;
+  if (typeof minOutageMs !== "number" || !Number.isFinite(minOutageMs)) return false;
+  return outageMs >= minOutageMs;
+}
+
+// #1145 — the accounting that produces the `outageMs` above.
+//
+// It lives here, as a tracker over injected time, because the defect it fixes is a
+// SEQUENCE and only a sequence can demonstrate it: one close is indistinguishable from
+// another, and what went wrong was that four of them in a row each reset the clock.
+// Nothing about that is visible in a single call, and a source scan over the panel is
+// not an option — #1096's review proved by mutation that token-presence scans over that
+// file stay green when the logic under them is inverted. A tracker can be driven through
+// the real order of events (drop, refused retry, refused retry, handshake) and asked
+// what it measured, which is the one question the bug got wrong.
+//
+// The three events it distinguishes:
+//   noteBridgeClosed()  — a socket closed. The FIRST one opens an outage; every one
+//     after it belongs to the same outage and must not move its start. The panel assigns
+//     its socket at construction, before the connection resolves, so a refused reconnect
+//     attempt arrives here exactly like a genuine drop does.
+//   noteHandshake()     — a real orchestrator handshake landed, which is where an open
+//     outage ENDS and its duration is finally known. A handshake with no outage open is
+//     a re-advertise on a live socket (#310 does one after every free_vram) and records
+//     nothing rather than inheriting the previous outage as if it were its own.
+//   noteTurnStarted()   — a new agent turn began, so outages that ended before it are no
+//     longer evidence about the turn now running. This is what stops a real but settled
+//     drop from being re-read later as this turn's — the #1138 defect with a stale
+//     timestamp in place of the 0 sentinel.
+export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
+  // When the current outage began; 0 whenever the bridge is up.
+  let startedAt = 0;
+  // The outage the current turn has seen, in ms; 0 means "no drop during this turn".
+  let outageMs = 0;
+  const readClock = () => {
+    const t = now();
+    return typeof t === "number" && Number.isFinite(t) ? t : null;
+  };
+  return {
+    noteBridgeClosed() {
+      if (startedAt) return; // already inside an outage — this close is not a new one
+      const t = readClock();
+      // An unreadable clock cannot start an outage. Leaving startedAt at 0 means the
+      // handshake records no duration, so the nudge is withheld — the safe direction:
+      // a missed nudge leaves an idle agent, an invented one derails a working agent.
+      if (t !== null) startedAt = t;
+    },
+    noteHandshake() {
+      if (!startedAt) return; // ended no outage — records nothing
+      const t = readClock();
+      // Clamped at 0: a backwards wall-clock adjustment mid-outage must not hand the
+      // predicate a negative duration to reason about.
+      if (t !== null) outageMs = Math.max(0, t - startedAt);
+      // Closed either way — an outage whose end could not be timed is still over, and
+      // leaving it open would let the NEXT drop measure from this one's start.
+      startedAt = 0;
+    },
+    noteTurnStarted() {
+      outageMs = 0;
+    },
+    /** The outage the current turn has seen, in ms (0 = none). */
+    outageMs: () => outageMs,
+    /** True while the bridge is down — the outage has begun but not yet ended. */
+    isDown: () => startedAt > 0,
+  };
 }
 
 // #332 — During the post-restart reconnect window a Manager-backed fetch (e.g.

@@ -463,6 +463,7 @@ import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
   shouldNudgeAfterMidTaskReconnect,
+  createBridgeOutageTracker,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -2865,11 +2866,29 @@ const RELOAD_POST_TIMEOUT_MS = 10000;
 // resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
 // (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
 const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
-// Wall-clock (ms) of the last bridge drop — module-scoped so it survives panel
-// remounts. A FAST reconnect (panel swap / WS blip; orchestrator alive) vs a
-// SLOW one (real ComfyUI restart; orchestrator died + respawned) is how we tell
-// a spurious bounce from a real one — only the slow case fires the resume nudge.
-let lastBridgeDownAt = 0;
+// The OUTAGE the mid-task nudge weighs. A FAST reconnect (panel swap / WS blip;
+// orchestrator alive) vs a SLOW one (real ComfyUI restart; orchestrator died +
+// respawned) is how we tell a spurious bounce from a real one — only the slow case
+// fires the resume nudge. Module-scoped so it survives panel remounts.
+//
+// #1145 — this used to be a single "last drop" stamp rewritten by every close, and a
+// close is NOT once per outage. `connect()` assigns `sock` before the socket opens, so
+// a REFUSED retry during a restart is still the active socket and runs the close
+// handler in full. With backoff doubling from RECONNECT_BASE_MS the retries land near
+// t=1s/3s/7s/15s, so the successful attempt was separated from the previous failed
+// close by only THAT attempt's delay: the guard weighed one backoff step instead of the
+// outage, and a genuine restart returning inside ~7s lost its nudge.
+//
+// The accounting lives in session-rebind.js because the defect is a SEQUENCE — four
+// closes in a row, each resetting the clock — and only a sequence can demonstrate it.
+// A tracker there is driven through the real order of events by unit tests; a source
+// scan over THIS file could not have caught it (#1096 proved such scans stay green
+// through an inversion). It distinguishes the first close of an outage from the refused
+// retries that follow, the handshake that ends one from a re-advertise that ends
+// nothing, and scopes what it measured to the turn now running — so an outage that
+// ended before this turn began is not re-read as this turn's (the #1138 defect with a
+// stale timestamp in place of the 0 sentinel).
+const bridgeOutage = createBridgeOutageTracker();
 // One-shot flag set right before a frontend (page) reload WE trigger, so that
 // after the reload we re-activate our own sidebar tab. ComfyUI restores the
 // last active tab BEFORE our extension re-registers it, so it can't reopen ours
@@ -17180,6 +17199,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     handshakeDone = true;
     handshakenSock = sock;
     clearHandshake();
+    // #1145 — a real handshake is where an outage ENDS and its duration is finally
+    // known. Here and not at bare socket-open for the same reason the replay below is:
+    // an open socket only proves something holds the port, a `models` frame proves an
+    // orchestrator is behind it. A handshake that ended no outage records nothing (see
+    // the tracker in session-rebind.js).
+    bridgeOutage.noteHandshake();
     // Remember the user wants the agent connected, so we auto-reconnect after a
     // ComfyUI reboot / panel reopen (until they explicitly Disconnect). Mirror it
     // into the "Auto-connect on load" setting so the toggle reflects reality.
@@ -18217,7 +18242,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }
       pendingCalls.clear();
       clearHandshake();
-      lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
+      // #1145 — the OUTAGE begins at the FIRST close of a sequence and every close
+      // after it belongs to the same outage. A refused reconnect attempt reaches here
+      // exactly like a real drop does (`sock` is assigned at construction, so a socket
+      // that never opened is still the active one), and re-stamping on those reset the
+      // clock to the last backoff step. The tracker ignores all but the first; the
+      // outage stands until markConnected() ends it.
+      bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
         // connecting-vs-terminal based on the patience window). Do NOT flip to
@@ -26958,6 +26989,14 @@ function buildPanel() {
         showThinking();
         noteActivity(); // turn start = real activity → seed the silence clock
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
+        // #1145 — and arm it against THIS turn's outages only. The nudge tells the agent
+        // its connection dropped mid-task; an outage that ended before the turn began is
+        // not evidence about the turn now running, and leaving it standing is how a
+        // `ready` that merely repeats on a live socket (a #310 free_vram re-advertise,
+        // say) would read a long-settled drop as this turn's and nudge a working agent.
+        // Same defect #1138 fixed for the never-dropped sentinel, one step along: there
+        // the stale value was 0, here it is a real duration from an earlier outage.
+        bridgeOutage.noteTurnStarted();
       } else if (state === "done") {
         agentWorking = false;
         // Turn over: drop the owner so a later reconnect re-push (which has no
@@ -27381,12 +27420,12 @@ function buildPanel() {
         // would inject a spurious turn into a live session. A real ComfyUI restart
         // takes many seconds to come back, so a long gap since the drop = real.
         //
-        // #1138 — AND the bridge must actually have dropped. `lastBridgeDownAt` is 0
-        // until the bridge socket closes, and 0 does not mean "no drop" to the
-        // subtraction below: `Date.now() - 0` is ~56 years, the LONGEST possible gap,
+        // #1138 — AND the bridge must actually have dropped. The drop stamp this used to
+        // read was 0 until the bridge socket closed, and 0 did not mean "no drop" to the
+        // subtraction it fed: `Date.now() - 0` is ~56 years, the LONGEST possible gap,
         // which this heuristic reads as the most certain evidence of a real restart.
         // So the guard was exactly inverted in the case it exists to catch — the
-        // better established it is that nothing dropped, the more confidently it
+        // better established it was that nothing dropped, the more confidently it
         // nudged. The intent above was right from the start; only the sentinel's
         // arithmetic betrayed it.
         //
@@ -27396,12 +27435,16 @@ function buildPanel() {
         // mid-task could be told their connection had dropped — and the agent told to
         // resume work it was still doing — with no drop anywhere in the session.
         //
+        // #1145 — and the interval weighed is the OUTAGE this turn saw, measured once at
+        // the handshake that ended it, not `Date.now()` minus a stamp every failed retry
+        // rewrote. A stamp read at this moment answers "how long since the last drop,
+        // whenever that was"; the question here is "how long was THIS connection gone".
+        //
         // The decision moved into session-rebind.js so it is unit-tested by BEHAVIOUR.
         // A source-scan over this file could only assert the guard's tokens are present,
         // and #1096's review demonstrated by mutation that such a test stays green when
         // the guard is inverted — which is the one regression that matters here.
-        if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: lastBridgeDownAt, now: Date.now() }))
-          return;
+        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         client.sendUserMessage(
