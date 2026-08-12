@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-08-11
+
+> #1087: setting a widget inside a subgraph reported success and changed nothing about the
+> render — a run asked for 10 steps and sampled at 14, with nothing to indicate the value
+> had been ignored.
+
+### Fixed
+- setting a widget that is fed by a connection now tells you it will not affect the render.
+  When a subgraph promotes a widget to its outer node, the inner copy is driven by that
+  connection and the outer value is what actually runs — so writing the inner one stored a
+  number nothing reads. The write still happens (that inner value is the subgraph's stored
+  default, and setting it is a reasonable thing to want), but the reply now says plainly that
+  it will not change the output, and points at the outer node to set instead.
+
+### Changed
+- the check reuses exactly what the graph outline already shows for these widgets, so it
+  reports the same connection the outline names rather than a second opinion.
+- writing the widget on the OUTER subgraph node is unchanged and still the way to make it
+  take effect — that path already updates both copies, and it does not warn.
+
 ## [0.14.7] - 2026-08-11
 
 > #1084: the provider picker showed "ChatGPT" next to a lowercase "chatgpt", which looked
