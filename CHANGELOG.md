@@ -6,6 +6,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-08-11
+
+> #1084: the provider picker showed "ChatGPT" next to a lowercase "chatgpt", which looked
+> like an accidental duplicate and gave you nothing to choose between.
+
+### Fixed
+- both ways of reaching ChatGPT are now named. They are genuinely different routes to the
+  same subscription — **ChatGPT (Codex)** runs it through the Codex app-server, **ChatGPT
+  (direct OAuth)** talks to it directly with no extra process — and only the first had a
+  name, so the second showed its raw id.
+- the panel now knows which provider it is connected to when you use the direct-OAuth route.
+  This was the larger half: the panel decided whether a provider was "known" by whether it
+  had a display name for it, so the unnamed one skipped the step that records the connection
+  — leaving the remembered provider, the "Ask …" prompt and the highlighted chip all showing
+  the previous one.
+
+### Changed
+- a provider your agent machine reports but this panel version has never heard of is now
+  accepted rather than ignored, and shown under its own id until a release names it. New
+  providers can land before the panel ships a label for them, and that ordering is normal.
+- ComfyUI's Settings dropdown lists both routes too, so the default provider can be set to
+  either.
+
 ## [0.14.6] - 2026-08-11
 
 > #1083: connect to ChatGPT, reopen the model picker, and LM Studio, llama.cpp, Custom
