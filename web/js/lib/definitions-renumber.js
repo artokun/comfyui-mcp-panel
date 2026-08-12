@@ -50,7 +50,11 @@ const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
  */
 function deepEqual(a, b, seen = new Set(), depth = 0) {
   if (a === b) return true;
-  if (depth > 64) return false; // deeper than any real definition; fail closed
+  // Cycles are caught by `seen` below; this bound only stops pathological nesting from
+  // blowing the stack. 64 was too tight — review noted a legitimately deep but acyclic
+  // definition (nested widgets_values) would compare false and cause a FALSE REFUSAL on
+  // a valid large workflow. Raised well past anything a real graph produces.
+  if (depth > 512) return false;
   if (typeof a !== typeof b) return false;
   if (a === null || b === null) return false;
   if (typeof a !== "object") return Number.isNaN(a) && Number.isNaN(b);
@@ -96,10 +100,26 @@ function differsOnlyIn(a, b, allowed) {
  * null, which fails the comparison closed.
  */
 function linkEndpoints(link) {
+  // JSON of a TUPLE, not a delimiter-joined string. Review found the delimiter form
+  // collides: origin ("a:0>b", "c") and origin ("a", "0>b:c") both render as
+  // `a:0>b:c`, so two distinct wirings compared equal — on the guard that decides
+  // whether writes land. A tuple cannot be reassociated.
+  //
+  // Wrapped because it must never THROW on a hostile shape: an id like
+  // { toString: null, valueOf: null } makes String() throw, and an exception here
+  // would escape the guard instead of failing closed. null means "cannot read",
+  // which the caller treats as not-proven.
+  const encode = (parts) => {
+    try {
+      return JSON.stringify(parts);
+    } catch {
+      return null;
+    }
+  };
   if (Array.isArray(link)) {
     if (link.length < 5) return null;
     const [, oId, oSlot, tId, tSlot, type] = link;
-    return `${String(oId)}:${String(oSlot)}>${String(tId)}:${String(tSlot)}|${String(type ?? "")}`;
+    return encode([oId, oSlot, tId, tSlot, type ?? null]);
   }
   if (isObj(link)) {
     const o = link.origin_id ?? link.originId;
@@ -107,7 +127,7 @@ function linkEndpoints(link) {
     const t = link.target_id ?? link.targetId;
     const ts = link.target_slot ?? link.targetSlot;
     if (o === undefined || t === undefined) return null;
-    return `${String(o)}:${String(os)}>${String(t)}:${String(ts)}|${String(link.type ?? "")}`;
+    return encode([o, os ?? null, t, ts ?? null, link.type ?? null]);
   }
   return null;
 }
@@ -175,6 +195,14 @@ function nodesDifferOnlyInLinkRefs(a, b) {
   const ia = indexNodes(a);
   const ib = indexNodes(b);
   if (!ia || !ib || ia.size !== ib.size) return false;
+  // ORDER matters, and review was right to insist: LiteGraph node order can carry
+  // execution and draw ordering, so a reordered array is not the same subgraph. Set
+  // equality alone would have accepted it. Renumbering does not reorder nodes — the
+  // measured case preserves order exactly — so requiring it costs nothing real and
+  // closes a way for a different graph to pass.
+  const ka = [...ia.keys()];
+  const kb = [...ib.keys()];
+  if (ka.some((k, i) => k !== kb[i])) return false;
   for (const [k, na] of ia) {
     const nb = ib.get(k);
     if (!nb) return false;

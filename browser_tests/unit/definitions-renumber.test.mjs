@@ -294,3 +294,74 @@ test("#886 a differing subgraph COUNT refuses", () => {
   two.subgraphs.push(sgP0().subgraphs[0]);
   assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), two), false);
 });
+
+// ── Round 2 of review: four more ways a different graph could have passed ──
+
+test("#886 P0: REORDERED nodes are not renumbering", () => {
+  // LiteGraph node order can carry execution and draw ordering, so a reordered array
+  // is not the same subgraph. Indexing by identity alone accepted it.
+  const base = sgP0();
+  const reordered = sgP0({ nodes: [...sgP0().subgraphs[0].nodes].reverse() });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(base, reordered), false);
+});
+
+test("#886 P0: endpoint signatures cannot collide across delimiters", () => {
+  // ("a:0>b", "c") and ("a", "0>b:c") both rendered as `a:0>b:c` in the delimiter
+  // form, so two distinct wirings compared equal.
+  const mk = (o, os) =>
+    sgP0({
+      links: [[11, o, os, 4, 0, "IMAGE"]],
+      nodes: [
+        { id: 3, type: "LoadImage", outputs: [{ links: [11] }] },
+        { id: 4, type: "VAEEncode", inputs: [{ link: 11 }] },
+      ],
+    });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(mk("a:0>b", "c"), mk("a", "0>b:c")), false);
+});
+
+test("#886 P0: a changed link TYPE is not renumbering", () => {
+  const other = sgP0({
+    links: [
+      [11, 3, 0, 4, 0, "LATENT"],
+      [12, 4, 0, 5, 1, "MASK"],
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), other), false);
+});
+
+test("#886 P1: a hostile endpoint value fails closed instead of throwing", () => {
+  // String() throws on { toString: null, valueOf: null }; an exception here would
+  // escape the guard rather than answering "not proven".
+  // Must be something JSON.stringify itself rejects. A plain object with null
+  // toString/valueOf does NOT throw — stringify never calls them — so that fixture
+  // left the guard untested and a mutation removing it survived. A throwing toJSON
+  // (or a BigInt, or a cycle) is what actually reaches the catch.
+  const hostile = { toJSON() { throw new Error("corrupt link id"); } };
+  // Same link COUNT as the baseline, or the length check short-circuits before
+  // linkEndpoints is ever called — which is why a mutation removing the try/catch
+  // survived twice: the guarded line was unreachable from the fixture.
+  const bad = sgP0({
+    links: [
+      [11, hostile, 0, 4, 0, "IMAGE"],
+      [12, 4, 0, 5, 1, "MASK"],
+    ],
+  });
+  assert.doesNotThrow(() => definitionsDifferOnlyByLinkRenumber(sgP0(), bad));
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), bad), false);
+});
+
+test("#886 P1: a legitimately DEEP acyclic definition still compares", () => {
+  // A 64-level bound made a valid large workflow refuse. Build ~80 levels of nested
+  // widget data on both sides and confirm pure renumbering is still proven.
+  const deep = (n) => {
+    let v = { leaf: 1 };
+    for (let i = 0; i < n; i += 1) v = { nest: v };
+    return v;
+  };
+  const withDeep = (over) => {
+    const g = over ? renumberedP0() : sgP0();
+    g.subgraphs[0].nodes[0].widgets_values = [deep(80)];
+    return g;
+  };
+  assert.equal(definitionsDifferOnlyByLinkRenumber(withDeep(false), withDeep(true)), true);
+});
