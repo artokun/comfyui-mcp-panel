@@ -6,6 +6,59 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.17] - 2026-08-12
+
+### Added
+- freeze the English catalog and give translators a rendering instrument (#1135)
+
+### Fixed
+- the status chip must report the socket the session actually uses (#1137)
+- disclose the foreign source state on a FAILING open too (#1131)
+- a successful open must not report a canvas it did not verify (#1110)
+- say whether the workflow list was actually re-read, and stop blaming the folder (#1123)
+- advertise the vendored tool vocabulary in the hello (#1119)
+- a numeric from_output reuses the rail slot instead of minting one named "4" (#1117)
+- panel_screenshot stops throwing when a node has no type (#1115)
+- render the effort LABEL, not the raw token
+- the connect-screen blurb, and a broader audit than sinks can give
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- wire the strings no coverage metric could see
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- Korean is complete — every panel string now has a translation
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- fill Korean from 37% to 50% — the visible chrome was untranslated
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.16 (#1132)
+- 0.14.15 (#1128)
+- 0.14.14 (#1121)
+- re-vendor the tool vocabulary — the handshake found real drift (#1120)
+- 0.14.13 (#1118)
+- 0.14.12 (#1116)
+- 0.14.11 (#1113)
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
 ## [0.14.16] - 2026-08-12
 
 ### Fixed
