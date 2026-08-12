@@ -241,6 +241,7 @@ import {
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { findExistingRailSlot } from "./lib/rail-slot.js";
+import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -18063,6 +18064,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // Our build version, so the orchestrator can auto-stamp it into the
             // agent's ENV block (bug reports get version-pinned without digging).
             panelVersion: PANEL_VERSION,
+            // #236 — lets the orchestrator detect a tool-surface skew at CONNECT.
+            vocabularyHash: VENDORED_VOCABULARY_HASH,
             backend,
             // Blind content mode (issue #90): the orchestrator spawns this tab's
             // comfyui tool server with pixel-withholding env when true.

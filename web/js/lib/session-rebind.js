@@ -291,6 +291,7 @@ export function buildHelloPayload({
   tabId,
   title,
   panelVersion,
+  vocabularyHash,
   backend,
   blind = false,
   comfyuiUrl,
@@ -305,6 +306,22 @@ export function buildHelloPayload({
     tab_id: tabId,
     title,
     panel_version: panelVersion,
+    // #236 — the tool vocabulary THIS build vendored, so the orchestrator can compare
+    // it against its own AT CONNECT rather than letting the skew surface one failed
+    // tool call at a time as "unknown tool".
+    //
+    // A version string cannot do this job: two builds of one version can carry
+    // different vocabularies, and two versions can carry identical ones. A hash of the
+    // vocabulary changes exactly when the thing it identifies changes.
+    //
+    // Safe in both directions of skew. An orchestrator predating the check ignores an
+    // unknown hello field; one that has it treats an ABSENT hash as UNVERIFIED, never
+    // as disagreeing — so neither an old panel nor an old server is ever reported as
+    // wrong on the strength of a field it does not send.
+    //
+    // Passed IN rather than imported, like panelVersion: this module stays free of the
+    // panel bundle so its unit tests can build a hello without one.
+    vocabulary_hash: vocabularyHash,
     backend: backend || "claude",
     blind: Boolean(blind),
     // #570 P0c — advertise that THIS panel build enforces the per-command workflow-instance
