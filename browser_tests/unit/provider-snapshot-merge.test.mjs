@@ -101,12 +101,18 @@ test("#1083 (codex): the experimental guarantee is scoped to DESCRIBED providers
   // is no authoritative claim to prefer — and so does every entry when no authoritative
   // snapshot exists. Deliberate: of the two ways to be wrong, showing a warning that may
   // not apply is the safe one; hiding one that does is not.
+  //
+  // PRE-EXISTING WART this makes visible rather than introduces (codex): the chip's
+  // experimental tooltip is worded for Copilot specifically, so any provider carrying the
+  // flag shows GitHub-flavoured text. That is the renderer's, not the merge's, and changing
+  // it is out of scope here — noted so the next reader does not take this test as an
+  // endorsement of the wording.
   const probeOnly = mergeProviderSnapshots({
     authoritative: [{ backend: "claude", running: false, ready: true }],
-    probe: [{ backend: "claude", running: false }, { backend: "odd-one", experimental: true }],
+    probe: [{ backend: "claude", running: false }, { backend: "copilot", experimental: true }],
   });
   assert.equal(
-    probeOnly.find((b) => b.backend === "odd-one").experimental,
+    probeOnly.find((b) => b.backend === "copilot").experimental,
     true,
     "a probe-only provider carries its own flag — the warning is shown, not suppressed",
   );
@@ -128,11 +134,19 @@ test("#1083 (codex): a provider only the HOST reports is selectable even against
   assert.deepEqual(ids(merged), ["gone-provider", "brand-new"]);
 });
 
-test("#1083 (codex): an explicitly EMPTY authoritative snapshot is honoured", () => {
-  // `backends: []` is a provider report whose content is "none", not a frame that said
-  // nothing. Requiring non-empty left a dropped-to-zero orchestrator with its old list
-  // authoritative forever, so host probes kept re-asserting providers that no longer exist.
-  assert.deepEqual(ids(mergeProviderSnapshots({ authoritative: [], probe: HOST })), ids(HOST));
+test("#1083 (codex): an explicitly EMPTY authoritative snapshot CLEARS the baseline", () => {
+  // What `[]` buys, stated as the code actually behaves rather than as an earlier comment
+  // wished it did. It does NOT mean "render nothing" — it means there is no longer a
+  // baseline, so the merge falls through to pass-through and the host probe is the only
+  // source again. The value is in what STOPS happening: a dropped-to-zero orchestrator no
+  // longer leaves its previous list authoritative, re-asserted on every later probe.
+  const STALE = [{ backend: "gone-provider", running: false, ready: true }];
+  const beforeClear = mergeProviderSnapshots({ authoritative: STALE, probe: HOST });
+  assert.ok(ids(beforeClear).includes("gone-provider"), "stale entry survives while it is the baseline");
+
+  const afterClear = mergeProviderSnapshots({ authoritative: [], probe: HOST });
+  assert.deepEqual(ids(afterClear), ids(HOST), "and is gone once the orchestrator reports none");
+  assert.ok(!ids(afterClear).includes("gone-provider"));
 });
 
 test("#1083: a provider only the HOST knows about is ADDED, never dropped", () => {

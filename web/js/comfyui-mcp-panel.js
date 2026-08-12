@@ -26841,10 +26841,19 @@ function buildPanel() {
       //
       // A PRESENT array counts even when EMPTY (codex). An earlier draft required
       // non-empty, reasoning that `[]` "told us nothing" — but the array's presence is what
-      // makes the frame a provider report, and its length is the report's content. Ignoring
-      // `[]` meant an orchestrator that had genuinely dropped to zero providers left the
-      // previous list authoritative forever, so later host probes kept re-asserting
-      // providers that no longer exist. The line directly below already reads it that way.
+      // makes the frame a provider report. Ignoring `[]` left an orchestrator that had
+      // genuinely dropped to zero with its PREVIOUS list still authoritative, so later host
+      // probes kept re-asserting providers that no longer exist.
+      //
+      // WHAT `[]` DOES, precisely — a second correction, because the first version of this
+      // comment claimed more than the code delivers (codex): it CLEARS the baseline. It does
+      // not assert "show nothing". With no baseline left, the merge falls through to its
+      // pass-through case and the host probe becomes the only source again, exactly as
+      // before any frame arrived. That is the whole intended effect: the stale
+      // orchestrator-only entries stop being re-asserted. Making `[]` mean "render nothing"
+      // would need a coherent answer for whether the host's own providers may still be
+      // appended, and there is no evidence-backed answer to that — an orchestrator reporting
+      // zero providers is not a shape observed in practice.
       if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an
