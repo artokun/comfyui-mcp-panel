@@ -32,13 +32,46 @@ test("#1472 it says WHY there is no status or body, instead of omitting them", (
   assert.match(msg, /no HTTP status\s+or response body to report/);
 });
 
-test("#1472 it distinguishes 'never saw it' from 'rejected it'", () => {
-  // The distinction the reporter asked for, and the one that decides a retry: a
-  // request the server never received is safe to re-send; a rejection is not.
+test("#1472 it does NOT claim the server never received the request", () => {
+  // The first cut said exactly that, and review killed it. "Failed to fetch" proves
+  // only that JAVASCRIPT got no usable response: a CORS-blocked reply, a connection
+  // dropped after delivery, and a proxy that failed after forwarding are
+  // indistinguishable from here, and in each the mutation may already have applied.
   const msg = managerFetchFailureMessage("manager/queue/task", new TypeError("Failed to fetch"));
-  assert.match(msg, /never saw this request/);
-  assert.match(msg, /nothing was considered and nothing was applied/i);
-  assert.match(msg, /safe to re-send/);
+  assert.doesNotMatch(msg, /never saw this request/);
+  assert.doesNotMatch(msg, /nothing was considered and nothing was applied/i);
+  assert.doesNotMatch(msg, /safe to re-send/);
+});
+
+test("#1472 it names the uncertainty and what settles it", () => {
+  const msg = managerFetchFailureMessage("manager/queue/task", new TypeError("Failed to fetch"));
+  assert.match(msg, /does NOT establish that the server\s+never received the request/);
+  assert.match(msg, /may already have been applied/);
+  // The one action that can actually resolve it.
+  assert.match(msg, /check the current state first/);
+  assert.match(msg, /can apply it twice/);
+});
+
+test("#1472 a read-only call is still marked repeatable", () => {
+  // Refusing to distinguish at all would make every failure look dangerous, which is
+  // its own wrong answer.
+  const msg = managerFetchFailureMessage("manager/queue/task", new TypeError("Failed to fetch"));
+  assert.match(msg, /read-only call is safe to repeat/);
+});
+
+test("#1472 a Manager REJECTION mentioning a transport word is not reclassified", () => {
+  // The dangerous direction review found: an unanchored substring test would attach
+  // "no response arrived" advice to a request the server considered and refused.
+  for (const m of [
+    "Package validation failed: NetworkError in dependency metadata",
+    "fetch failed for upstream registry",
+    "Install aborted: connection refused by the pack's own installer",
+  ]) {
+    assert.equal(isTransportFailure(new Error(m)), false, m);
+    const msg = managerFetchFailureMessage("manager/queue/task", new Error(m));
+    assert.doesNotMatch(msg, /TRANSPORT failure/);
+    assert.match(msg, /failed: /);
+  }
 });
 
 test("#1472 it names plausible causes without asserting one", () => {
@@ -60,7 +93,16 @@ test("#1472 an UNRECOGNISED error is not relabelled as transport", () => {
 });
 
 test("#1472 transport detection covers the real browser strings", () => {
-  for (const s of ["Failed to fetch", "NetworkError when attempting to fetch resource", "Load failed", "fetch failed", "connection refused"]) {
+  // The real strings each engine produces, as the WHOLE message.
+  for (const s of [
+    "Failed to fetch",
+    "NetworkError when attempting to fetch resource",
+    "Load failed",
+    "fetch failed",
+    "net::ERR_CONNECTION_REFUSED",
+    "connection refused",
+    "  Failed to fetch  ", // whitespace from a wrapper must not defeat it
+  ]) {
     assert.equal(isTransportFailure(new Error(s)), true, s);
   }
   for (const s of ["boom", "A security error has occurred", "500 Internal Server Error"]) {

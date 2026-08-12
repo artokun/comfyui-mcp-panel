@@ -16,20 +16,52 @@
  * different problems with different next steps: a rejection means Manager considered
  * the request and said no; a transport failure means Manager never saw it.
  *
- * ## Why that distinction is load-bearing
+ * ## Why that distinction is load-bearing, and how far it actually goes
  *
- * A mutation that never reached the server may be safely re-sent. One that was
- * rejected must not be blindly retried. Collapsing both into "Failed to fetch" leaves
- * the caller unable to choose — which is precisely what the reporter asked for.
+ * A rejection means Manager considered the request and said no; a transport failure
+ * means the browser never got a usable response. Those need different next steps, and
+ * collapsing both into "Failed to fetch" leaves the caller unable to choose.
+ *
+ * But it does NOT license "safe to re-send", which is what the first cut of this file
+ * said. Review was right to kill it: "Failed to fetch" proves only that JAVASCRIPT
+ * received no usable response. A CORS-blocked reply, a connection dropped after the
+ * request was delivered, or a proxy that failed after forwarding all look identical
+ * from here — and in every one of those the server may already have installed,
+ * deleted, or queued the thing. Telling the caller to retry would duplicate the
+ * mutation.
+ *
+ * So this says what is known (no response arrived, so there is no status or body) and
+ * what is NOT known (whether the server acted), and points at the one thing that can
+ * settle it: looking at the state before retrying. Naming the uncertainty is the whole
+ * value; a confident wrong remedy here costs a duplicated install or a second delete.
  */
 
 /** Is this the browser's transport-level failure (no response ever arrived)? */
 export function isTransportFailure(err) {
-  const msg = err instanceof Error ? err.message : String(err ?? "");
-  return /failed to fetch|networkerror|load failed|fetch failed|err_network|connection refused/i.test(
-    msg,
-  );
+  const msg = (err instanceof Error ? err.message : String(err ?? "")).trim();
+  // ANCHORED, and deliberately so. Review found the original substring test would
+  // reclassify a Manager-ORIGINATED rejection that merely mentions one of these
+  // phrases — "Package validation failed: NetworkError in dependency metadata", or
+  // "fetch failed for upstream registry" — as "no response arrived". That is the
+  // dangerous direction: it would attach transport advice to a request the server
+  // considered and refused.
+  //
+  // The browser's own transport errors ARE these strings, not sentences containing
+  // them, so anchoring costs nothing real. An unrecognised shape falls through to the
+  // caller's own message, which is the honest outcome for an error we cannot classify.
+  return TRANSPORT_MESSAGES.some((re) => re.test(msg));
 }
+
+/** The exact messages browsers produce when no response arrived. Anchored at both
+ *  ends; the optional trailing detail covers engines that append a reason. */
+const TRANSPORT_MESSAGES = [
+  /^failed to fetch\.?$/i, // Chrome
+  /^networkerror when attempting to fetch resource\.?$/i, // Firefox
+  /^load failed\.?$/i, // Safari
+  /^fetch failed\.?$/i, // undici / Node
+  /^net::err_[a-z_]+$/i, // Chromium net stack
+  /^(?:econnrefused|connection refused)\.?$/i,
+];
 
 /**
  * What to say when a Manager call threw before any response arrived.
@@ -46,12 +78,14 @@ export function managerFetchFailureMessage(route, err) {
   }
   return (
     `ComfyUI-Manager request to ${path} did not complete: ${raw || "no message"}. This is a ` +
-    `TRANSPORT failure — the browser could not reach the server — so there is no HTTP status ` +
-    `or response body to report, and ComfyUI-Manager never saw this request ` +
-    `(comfyui-mcp#1472). That is different from Manager rejecting it: nothing was ` +
-    `considered and nothing was applied. Likely causes are ComfyUI having stopped or ` +
-    `restarted, the browser tab having lost its connection, or the Manager routes being ` +
-    `blocked by a proxy. Check ComfyUI is running and the tab is connected, then retry — ` +
-    `a request the server never received is safe to re-send.`
+    `TRANSPORT failure — no usable response reached the browser — so there is no HTTP ` +
+    `status or response body to report (comfyui-mcp#1472). Likely causes are ComfyUI ` +
+    `having stopped or restarted, the tab having lost its connection, or the Manager ` +
+    `routes being blocked by a proxy. IMPORTANT: this does NOT establish that the server ` +
+    `never received the request. A reply blocked by CORS, a connection dropped after ` +
+    `delivery, and a proxy that failed after forwarding all look exactly like this, and ` +
+    `in each of them the operation may already have been applied. Before retrying a ` +
+    `MUTATING call (install, update, delete, queue), check the current state first — a ` +
+    `blind retry can apply it twice. A read-only call is safe to repeat.`
   );
 }
