@@ -507,7 +507,7 @@
       "exhaustive": "exhaustif",
       "expanded_node": "Nœud {node_id} déplié",
       "experimental": "Expérimental",
-      "experimental_signs_in_as_vs_code_against": "Expérimental — se connecte en tant que VS Code, contrairement aux conditions de l'API Copilot de GitHub",
+      "experimental_signs_in_as_vs_code_against": "Expérimental — se connecte en tant que VS Code, en violation des conditions de l'API Copilot de GitHub",
       "export_all_chat_history": "Exporter tout l'historique",
       "extra_high": "Très élevé",
       "extra_workflow_aliases_were_skipped_at_the_many": "{count} alias de workflow supplémentaires ont été ignorés à la limite de stockage.",
@@ -829,7 +829,7 @@
       "sign_out_failed": "Échec de la déconnexion.",
       "signed_in": "Connecté",
       "signed_in_as": "Connecté en tant que {label}",
-      "signs_in_as_vs_code_against_github": "Se connecte en tant que VS Code — contrairement aux conditions de l'API Copilot de GitHub ; à utiliser à vos risques et périls.",
+      "signs_in_as_vs_code_against_github": "Se connecte en tant que VS Code — en violation des conditions de l'API Copilot de GitHub ; à utiliser à vos risques et périls.",
       "skip": "Passer",
       "skipped_no_token_entered": "Passé — aucun jeton saisi.",
       "slash_command_failed": "{cmd} a échoué : {error}",
@@ -968,7 +968,7 @@
       "training": "Entraînement"
     },
     "training_ui": {
-      "1_2_h_on_a_4090_the": "~1–2 h sur une 4090. La vraie chose.",
+      "1_2_h_on_a_4090_the": "~1–2 h sur une 4090. Du sérieux.",
       "1_dataset": "1 · Dataset",
       "10_30_varied_images_of_the_subject": "10 à 30 images variées du sujet donnent le meilleur résultat (angles, éclairages, arrière-plans). Le mot déclencheur figure dans chaque légende.",
       "10_min_on_a_4090_proves_the": "~10 min sur une 4090 — valide la chaîne, ne donne pas un LoRA utilisable.",
