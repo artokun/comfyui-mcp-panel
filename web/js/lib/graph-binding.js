@@ -1,3 +1,4 @@
+import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
 /**
  * Detect a graph READ that is out of sync with the ACTIVE workflow (panel#389).
  *
@@ -880,7 +881,26 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
     // unexplained by anything the node comparison establishes.
-    if (surfaces.length !== 1 || surfaces[0] !== "nodes") return NOT_PROVEN;
+    // #886 — a `definitions` surface may accompany `nodes`, but ONLY when the whole
+    // of it is link renumbering. Measured: the frontend regenerates link identity
+    // inside subgraph definitions on load (state.lastLinkId advanced 2092 -> 2106 on
+    // a real 4-subgraph workflow) while node ids, types and topology stay identical.
+    // Before this, a faithful open of ANY workflow containing subgraphs reported
+    // CONTENT_UNVERIFIED — binding proven, nodes perfect, refused on a surface nobody
+    // had characterised.
+    //
+    // Everything else still refuses. `definitionsDifferOnlyByLinkRenumber` returns
+    // false for anything it cannot fully account for, and the caller reads that as
+    // "not proven" — never as "changed".
+    const extra = surfaces.filter((s) => s !== "nodes");
+    if (extra.length === 1 && extra[0] === "definitions") {
+      if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
+        return NOT_PROVEN;
+      }
+    } else if (extra.length > 0) {
+      return NOT_PROVEN;
+    }
+    if (!surfaces.includes("nodes")) return NOT_PROVEN;
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
     // mutation: `classifyNodeDifference` only computes `fields` once the sets match, so
