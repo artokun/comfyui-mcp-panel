@@ -5053,9 +5053,14 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
   } catch (err) {
     // comfyui-mcp#1472 — a THROW here reached the caller as bare "Failed to fetch",
     // with no route, no status and no body, so an install could not be diagnosed at
-    // all. There is no status or body to report (the request never completed), but
-    // the ROUTE exists and so does the fact that this is a transport failure rather
-    // than a Manager rejection — which is what decides whether a re-send is safe.
+    // all. There is no status or body to report (no usable response arrived), but the
+    // ROUTE exists and was being discarded.
+    //
+    // It does NOT decide whether a re-send is safe, which is what an earlier version of
+    // this comment claimed. A fetch rejection establishes neither delivery nor
+    // non-delivery — a CORS block, or a connection dropped after the request was
+    // delivered, look identical from here — so the message tells the caller to check
+    // current state before retrying a MUTATING call.
     // An abort is the caller's own doing and must pass through untouched.
     if (err?.name === "AbortError") throw err;
     throw new Error(managerFetchFailureMessage(route, err), { cause: err });

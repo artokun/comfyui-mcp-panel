@@ -132,3 +132,37 @@ test("#1472 WIRING: managerV2 translates a throw and passes an abort through", (
   // The original error survives as `cause`, so the stack is not lost.
   assert.match(body, /\{ cause: err \}/);
 });
+
+test("#1472 a transport error carrying detail is still classified", () => {
+  // Round 2 of review: patterns anchored at BOTH ends dropped every real-world variant
+  // that appends a URL or an error code, losing the explanation this file exists to
+  // give. Start-anchoring keeps them.
+  for (const s of [
+    "Failed to fetch: http://127.0.0.1:8188/api/v2/manager/queue/task",
+    "NetworkError when attempting to fetch resource.",
+    "Load failed (kCFErrorDomainCFNetwork:-1005)",
+    "net::ERR_CONNECTION_REFUSED at /api",
+    "connection refused by peer",
+  ]) {
+    assert.equal(isTransportFailure(new Error(s)), true, s);
+  }
+});
+
+test("#1472 'fetch failed' stays EXACT because a prefix match collides", () => {
+  // undici's message is short enough that a real Manager rejection begins with it.
+  // Where a prefix is ambiguous, exactness wins; where it is not, tolerance wins.
+  assert.equal(isTransportFailure(new Error("fetch failed")), true);
+  assert.equal(isTransportFailure(new Error("fetch failed for upstream registry")), false);
+});
+
+test("#1472 WIRING: the source comment no longer claims a re-send verdict", () => {
+  // The comment beside the call still said this "decides whether a re-send is safe"
+  // after the message stopped saying so — contradictory guidance that would reintroduce
+  // the unsafe advice on the next edit. Review caught it.
+  const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
+  assert.equal((src.match(/decides whether a re-send is safe/g) ?? []).length, 0);
+  const at = src.indexOf("comfyui-mcp#1472 — a THROW here reached the caller");
+  assert.ok(at > 0);
+  const block = src.slice(at, at + 900);
+  assert.match(block, /establishes neither delivery nor\s+non-delivery/);
+});

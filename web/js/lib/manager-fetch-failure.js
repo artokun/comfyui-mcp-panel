@@ -52,15 +52,31 @@ export function isTransportFailure(err) {
   return TRANSPORT_MESSAGES.some((re) => re.test(msg));
 }
 
-/** The exact messages browsers produce when no response arrived. Anchored at both
- *  ends; the optional trailing detail covers engines that append a reason. */
+/**
+ * The messages browsers produce when no usable response arrived.
+ *
+ * Anchored at the START, not at both ends — an earlier version claimed in a comment to
+ * tolerate appended detail while every pattern demanded an exact match, so a real
+ * transport error carrying a URL or a reason fell through and lost the explanation this
+ * file exists to give. (Review caught the comment contradicting the code.)
+ *
+ * Start-anchoring is what makes the safety hold: the dangerous case is a
+ * Manager-ORIGINATED rejection that MENTIONS one of these phrases mid-sentence
+ * ("Package validation failed: NetworkError in dependency metadata", "Install aborted:
+ * connection refused by the pack's own installer"). Those do not BEGIN with it.
+ *
+ * `fetch failed` stays exact, and only it: undici's message is short enough that
+ * "fetch failed for upstream registry" — a real Manager rejection shape — would
+ * otherwise match. Where a prefix is ambiguous, exactness wins; where it is not,
+ * tolerance wins.
+ */
 const TRANSPORT_MESSAGES = [
-  /^failed to fetch\.?$/i, // Chrome
-  /^networkerror when attempting to fetch resource\.?$/i, // Firefox
-  /^load failed\.?$/i, // Safari
-  /^fetch failed\.?$/i, // undici / Node
-  /^net::err_[a-z_]+$/i, // Chromium net stack
-  /^(?:econnrefused|connection refused)\.?$/i,
+  /^failed to fetch\b/i, // Chrome
+  /^networkerror when attempting to fetch resource\b/i, // Firefox
+  /^load failed\b/i, // Safari
+  /^fetch failed\.?$/i, // undici / Node — EXACT: a prefix match collides (see above)
+  /^net::err_[a-z_]+\b/i, // Chromium net-stack text, seen via some wrappers
+  /^(?:econnrefused|connection refused)\b/i,
 ];
 
 /**
