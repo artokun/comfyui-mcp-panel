@@ -22501,6 +22501,14 @@ function buildPanel() {
       if (small) {
         const s = document.createElement("small");
         s.textContent = small;
+        // The row deliberately truncates this line rather than the provider NAME (see the
+        // cmcp-provider call site), and the CSS is nowrap + ellipsis. For a not-ready
+        // provider this line carries the recovery instruction — and the actionable part is
+        // TERMINAL in every one of them ("… — run: ollama serve", "… or run `pi` once and
+        // /login"), so the ellipsis eats precisely what the user needs. With no title there
+        // was no way to recover it at all. Already true of the 109-character English string;
+        // translations run up to 40% longer. The chip path next door has always done this.
+        s.title = small;
         el.appendChild(s);
       }
       // Always render the check (visibility toggled) so the column is reserved
