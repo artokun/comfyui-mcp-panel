@@ -83,6 +83,11 @@ test("#1108 it names the remedy and admits the panel cannot apply it", () => {
   assert.match(text, /proves less than it looks/);
   assert.match(text, /try it with the queue idle/);
   assert.match(text, /any extension that draws on the canvas/);
+  // codex round 4, P2: naming those two as "what is left" was still an exhaustive
+  // diagnosis — a stock ComfyUI or browser rendering defect produces this without
+  // either being at fault.
+  assert.match(text, /none of that is a shortlist, only a place to start/);
+  assert.doesNotMatch(text, /are what is left to look at/);
   assert.doesNotMatch(text, /the cause is in the graph rather than/);
   // And a refresh discards unsaved work, which must be said BEFORE they do it.
   assert.match(text, /a refresh discards unsaved canvas work, so offer the user a save FIRST/);

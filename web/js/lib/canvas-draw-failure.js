@@ -59,7 +59,8 @@ export function describeCanvasDrawFailure(err, opts = {}) {
     `that is worth knowing but proves less than it looks: a render that is still running can ` +
     `recreate the same state immediately, so try it with the queue idle before concluding ` +
     `anything. If it still returns with nothing running, the graph and any extension that draws ` +
-    `on the canvas are what is left to look at. Either way a refresh discards unsaved canvas ` +
+    `on the canvas are worth checking — though a stock ComfyUI or browser rendering defect ` +
+    `produces this too, so none of that is a shortlist, only a place to start. Either way a refresh discards unsaved canvas ` +
     `work, so offer the user a save FIRST.`
   );
 }
