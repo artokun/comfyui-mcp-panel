@@ -21,7 +21,8 @@
 /**
  * A slot INDEX from a number or a canonical numeric string, else null.
  *
- * Deliberately strict: "4" yes, " 4 " no, "4.0" no, "0x4" no, "-1" no. A loose
+ * Deliberately strict: "4" yes; " 4 ", "4.0", "0x4", "-1" and leading-zero forms
+ * like "04"/"007" no — those are names, not indices. A loose
  * parse would turn a mistyped NAME into a silent index hit on an unrelated slot —
  * connecting to the wrong input, which is worse than the visible junk slot this
  * fixes.
@@ -32,7 +33,11 @@ export function railSlotIndex(ref) {
     // anything meaningfully, and it slipped through until a test asked.
     return Number.isSafeInteger(ref) && ref >= 0 ? ref : null;
   }
-  if (typeof ref !== "string" || !/^\d+$/.test(ref)) return null;
+  // CANONICAL, not merely digits (codex review): /^\d+$/ accepts "04" and "007",
+  // so a caller passing a name-shaped "007" with no slot of that name would have
+  // been silently connected to index 7 — the same class of silent wrong-target
+  // this fix exists to remove, in a narrower window.
+  if (typeof ref !== "string" || !/^(?:0|[1-9]\d*)$/.test(ref)) return null;
   const n = Number(ref);
   return Number.isSafeInteger(n) ? n : null;
 }

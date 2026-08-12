@@ -55,6 +55,14 @@ test("#1114 a slot genuinely NAMED '4' wins over the index", () => {
   assert.equal(findExistingRailSlot(named, 4)?.slot, 1);
 });
 
+test("#1114 a leading-zero name resolves by NAME when the slot exists", () => {
+  // "007" is a legal slot name. It must match that slot — and must NOT fall through
+  // to index 7 when no such slot exists.
+  const named = [{ name: "a", slot: 0 }, { name: "007", slot: 1 }];
+  assert.equal(findExistingRailSlot(named, "007")?.slot, 1);
+  assert.equal(findExistingRailSlot(RAIL, "007"), null); // no slot named "007" here
+});
+
 test("#1114 name matching stays case-insensitive", () => {
   assert.equal(findExistingRailSlot([{ name: "Prompt" }], "prompt")?.name, "Prompt");
   assert.equal(findExistingRailSlot([{ name: "prompt" }], "PROMPT")?.name, "prompt");
@@ -63,7 +71,10 @@ test("#1114 name matching stays case-insensitive", () => {
 test("#1114 the index parse is STRICT — a mistyped name must not hit an index", () => {
   // A loose parse would turn a typo into a silent connection to an unrelated slot,
   // which is a worse failure than the visible junk slot: nothing would look wrong.
-  for (const bad of [" 4 ", "4.0", "0x4", "+4", "4px", "-1", "", "  ", "1e1"]) {
+  // codex review, P1: "04"/"007" were accepted by /^\d+$/ — so a name-shaped "007"
+  // with no matching slot connected silently to index 7. My own list had exotic
+  // cases and missed the obvious one.
+  for (const bad of [" 4 ", "4.0", "0x4", "+4", "4px", "-1", "", "  ", "1e1", "04", "007", "00"]) {
     assert.equal(railSlotIndex(bad), null, JSON.stringify(bad));
     assert.equal(findExistingRailSlot(RAIL, bad), null, JSON.stringify(bad));
   }
