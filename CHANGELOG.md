@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.18] - 2026-08-12
+
+### Fixed
+
+- **A live-socket re-advertise no longer reads as a fresh connect, so a benign reconnect
+  cannot tell you your connection dropped mid-task (#1138).** The panel injects a user
+  message — "Your connection dropped mid-task … continue exactly what you were doing" —
+  plus a transcript line whenever a `ready` ack arrives with a mid-task marker set. The
+  guard meant to suppress that on a live session read `Date.now() - lastBridgeDownAt <
+  6000`, and that timestamp is `0` until the bridge socket actually closes. So a bridge
+  that never dropped presented as a ~56-year gap — the longest possible — which a
+  long-gap-means-real-restart heuristic read as the strongest possible evidence of a
+  restart. The guard was exactly inverted in the case it existed to catch: the better
+  established that nothing had dropped, the more confidently it fired.
+  Reachable in normal use, because `ready` repeats on a live socket and the panel
+  re-advertises after every successful `free_vram` by design (#310). Freeing VRAM
+  mid-task could therefore tell you your connection had dropped when nothing had, and
+  tell a still-working agent to resume — making it restart or duplicate the render it was
+  already running.
+  A real restart still nudges, including exactly at the six-second boundary. The decision
+  moved into a pure predicate so it is covered by behaviour rather than by a source scan:
+  a review demonstrated by mutation that token-presence tests over this file stay green
+  when such a guard is inverted, which is the one regression that matters here.
+  Two related problems were found and deliberately left for their own issue rather than
+  patched here: every FAILED reconnect attempt re-stamps that timestamp, so the gap can
+  measure a backoff step instead of the outage; and the other `ready`-ack branches have
+  not been audited for the same sentinel exposure.
+
 ## [0.14.17] - 2026-08-12
 
 ### Added
