@@ -214,6 +214,38 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
   };
 }
 
+// #1096 — the SAME dropped-tab-mapping problem #310 fixed, on the path #310 did not
+// cover: a ComfyUI `reconnected` where the BRIDGE SURVIVED.
+//
+// #310 established the mechanism empirically — a ComfyUI bounce drops the orchestrator's
+// tab mapping, and the next graph tool answers "Connected: none" until this tab
+// re-advertises. It wired that conclusion to `free_vram` only, because free_vram was the
+// bounce in hand.
+//
+// On `reconnected` the panel asks `shouldResumeAfterComfyReconnect` whether to respawn.
+// When the bridge is DOWN it reconnects, and the fresh connect sends a hello, so the
+// mapping is re-established as a side effect. When the bridge is UP that guard returns
+// false — correctly, because bouncing a live session was #278's spurious "you
+// reconnected" — and the panel then returns having done NOTHING. The mapping stays
+// dropped, and every graph tool answers "Connected: none" with a resumed session on
+// screen saying otherwise. That is #1096: the reporter's `panel_graph_outline` calls
+// after a reconnect/resume event, against a tab id the orchestrator no longer held.
+//
+// A rehello is not a bounce and does not reopen #278: it re-advertises this tab on the
+// EXISTING socket, and the orchestrator carries the routing state across it explicitly
+// ("same-socket re-hello … the shared session continues", #884). So the uncovered case
+// is exactly the bridge-survived one, and the remedy is the cheapest frame there is.
+//
+// NOT free: the orchestrator runs its panel sync on every hello. Measured on a live
+// install that is ~1s, and it is the step that blocks on the panel operation lock — a
+// stale lock made it time out at 60s per hello. So this must not fire per WS blip; the
+// caller debounces, and this predicate answers only "is this the uncovered case".
+export function shouldRehelloAfterComfyReconnect({ bridgeConnected = false } = {}) {
+  // Compared against `true` explicitly: an unreadable connection state is not a live
+  // bridge, and the reconnect path will hello anyway when it turns out to be down.
+  return bridgeConnected === true;
+}
+
 // #332 — During the post-restart reconnect window a Manager-backed fetch (e.g.
 // panel_list_nodes) throws a bare transport error ("Failed to fetch") before any
 // HTTP status exists, so the usual 404/"unreachable" handling never fires. Match

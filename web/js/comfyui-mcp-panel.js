@@ -504,6 +504,7 @@ import {
   shouldRehelloAfterCommand,
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
+  shouldRehelloAfterComfyReconnect,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -944,6 +945,14 @@ function monotonicNow() {
     ? performance.now()
     : Date.now();
 }
+// #1096 — debounce for the re-advertise on a bridge-survived ComfyUI reconnect. A hello
+// is not free: the orchestrator runs its panel sync on each one (~1s measured, and the
+// step that blocks on the panel operation lock), and `reconnected` can fire repeatedly
+// while ComfyUI's socket flaps. One re-advertise per window is enough to repair a dropped
+// tab mapping; MONOTONIC so a wall-clock adjustment cannot make the gap look negative and
+// re-arm it early. Read/written only from the reconnect handler.
+const RECONNECT_REHELLO_MIN_GAP_MS = 5000;
+let lastReconnectRehelloAt = -Infinity;
 // The actual (idempotent) node-def registration; the coalescer owns the in-flight
 // slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
 // payload when present (graph_add_node passes the fresh defs it just validated
@@ -30153,6 +30162,31 @@ function buildPanel() {
         hasResumableSession,
       })
     ) {
+      // #1096 — NOT nothing. Returning here is right about the SESSION (bouncing a live
+      // one is #278's spurious "you reconnected") and was wrong about the TAB MAPPING:
+      // ComfyUI just bounced, which drops the orchestrator's mapping for this tab (the
+      // mechanism #310 measured), and nothing on this path re-advertised it. The resumed
+      // session stayed on screen while every graph tool answered "Connected: none".
+      //
+      // A rehello re-targets the EXISTING socket and the orchestrator carries the routing
+      // state across it (#884), so this repairs the mapping without touching the session.
+      //
+      // DEBOUNCED, because a hello is not free: the orchestrator runs its panel sync on
+      // each one (~1s measured, and the step that blocks on the panel operation lock — a
+      // stale lock made it 60s per hello). `reconnected` can fire repeatedly during a
+      // flapping window, and re-advertising per blip would queue that work behind itself.
+      if (shouldRehelloAfterComfyReconnect({ bridgeConnected: client.isConnected() })) {
+        const now = monotonicNow();
+        if (now - lastReconnectRehelloAt >= RECONNECT_REHELLO_MIN_GAP_MS) {
+          lastReconnectRehelloAt = now;
+          try {
+            client?.rehello?.();
+          } catch {
+            /* the reconnect path retries the hello; a failed re-advertise is not fatal
+               here because the mapping is already dropped — this can only improve it */
+          }
+        }
+      }
       return;
     }
     appendSystem(tr("panel.comfyui_is_back_reconnecting_the_agent", "ComfyUI is back — reconnecting the agent…"));

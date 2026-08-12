@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  shouldRehelloAfterComfyReconnect,
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
   planSoftReloadRecovery,
@@ -937,4 +938,117 @@ test("#1145: a second outage measures itself, not the gap since the first", () =
   tracker.noteHandshake();
   assert.equal(tracker.outageMs(), 1500, "the second outage is 1.5s, not 10 minutes");
   assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
+});
+
+test("#1096: re-advertise only when the bridge SURVIVED and a session exists", () => {
+  // Both parts are load-bearing, for different reasons.
+  assert.equal(
+    shouldRehelloAfterComfyReconnect({ bridgeConnected: true, hasResumableSession: true }),
+    true,
+  );
+  // bridge DOWN: shouldResumeAfterComfyReconnect takes it and connectAgent() hellos on
+  // its own. Re-advertising too would queue a second orchestrator panel sync for nothing.
+  assert.equal(
+    shouldRehelloAfterComfyReconnect({ bridgeConnected: false, hasResumableSession: true }),
+    false,
+  );
+  // NO SESSION: sendHello's own header records that a hello with the session key cleared
+  // "spawns a clean agent outright". Re-advertising here would turn a ComfyUI blip into a
+  // spurious agent start — the class #278 removed — and would buy nothing, because with
+  // no session there is no agent for a graph tool to route to.
+  assert.equal(
+    shouldRehelloAfterComfyReconnect({ bridgeConnected: true, hasResumableSession: false }),
+    false,
+  );
+  assert.equal(shouldRehelloAfterComfyReconnect({}), false);
+  assert.equal(shouldRehelloAfterComfyReconnect(), false, "no arguments must not act");
+});
+
+test("#1096: neither input may be satisfied by a truthy non-boolean", () => {
+  // Compared against `true` explicitly on both axes: an unreadable connection state is
+  // not a live bridge, and an unreadable session state is not a session worth spawning
+  // or rebinding an agent for.
+  for (const stray of [1, "true", {}, [], "yes"]) {
+    assert.equal(
+      shouldRehelloAfterComfyReconnect({ bridgeConnected: stray, hasResumableSession: true }),
+      false,
+      `non-true bridge state must not act: ${JSON.stringify(stray)}`,
+    );
+    assert.equal(
+      shouldRehelloAfterComfyReconnect({ bridgeConnected: true, hasResumableSession: stray }),
+      false,
+      `non-true session state must not act: ${JSON.stringify(stray)}`,
+    );
+  }
+});
+
+test("#1096: the two reconnect paths never both act, and never both decline with a session", () => {
+  // The gap this fix closes was precisely "both declined". With a resumable session,
+  // exactly one path must act on either side of the bridge axis.
+  for (const bridgeConnected of [true, false]) {
+    const resumes = shouldResumeAfterComfyReconnect({
+      bridgeConnected,
+      rebootPending: false,
+      autoConnect: false,
+      hasResumableSession: true,
+    });
+    const rehellos = shouldRehelloAfterComfyReconnect({ bridgeConnected, hasResumableSession: true });
+    assert.notEqual(
+      resumes,
+      rehellos,
+      `exactly one path must act (bridgeConnected=${bridgeConnected})`,
+    );
+  }
+  // And with NO session both correctly decline — nothing to preserve, nothing to route.
+  assert.equal(
+    shouldResumeAfterComfyReconnect({
+      bridgeConnected: true,
+      rebootPending: false,
+      autoConnect: false,
+      hasResumableSession: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldRehelloAfterComfyReconnect({ bridgeConnected: true, hasResumableSession: false }),
+    false,
+  );
+});
+
+test("#1096 wiring: the re-advertise is debounced and does not disturb the session", () => {
+  const src = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  );
+  // Anchored on the call, not on a one-line argument shape — the arguments are formatted
+  // across lines and a future one would break a stricter locator for no reason.
+  const at = src.indexOf("shouldRehelloAfterComfyReconnect({");
+  assert.notEqual(at, -1, "the reconnect handler must consult the predicate");
+  assert.match(
+    src.slice(at, src.indexOf("})", at)),
+    /bridgeConnected: client\.isConnected\(\)/,
+    "the live bridge state must come from the client, not a cached flag",
+  );
+  // It sits in the branch that used to `return` having done nothing.
+  const guardAt = src.indexOf("!shouldResumeAfterComfyReconnect({");
+  assert.ok(guardAt !== -1 && guardAt < at, "it must be inside the declined-resume branch");
+  // Bounded by the branch's OWN `return`, not by connectAgent(): the resume path that
+  // follows legitimately announces itself, and slicing that far would assert about it.
+  const block = src.slice(at, src.indexOf("return;", at));
+  // A hello runs the orchestrator's panel sync, so it must not fire per WS blip.
+  assert.match(block, /RECONNECT_REHELLO_MIN_GAP_MS/, "the re-advertise must be debounced");
+  assert.match(block, /lastReconnectRehelloAt = now/, "…and the window must be armed when it fires");
+  // A hello with no session spawns a clean agent, so the session input must be WIRED,
+  // not left to its default.
+  const callAt = src.indexOf("shouldRehelloAfterComfyReconnect({", 0);
+  const callBlock = src.slice(callAt, src.indexOf("})", callAt));
+  assert.match(callBlock, /hasResumableSession/, "the session input must be passed at the call site");
+  // MONOTONIC: a wall-clock adjustment must not be able to make the gap look negative.
+  assert.match(block, /monotonicNow\(\)/);
+  // It re-advertises and nothing more — no connect, no session frame. Bouncing a live
+  // session here is exactly what #278 removed.
+  assert.match(block, /client\?\.rehello\?\.\(\)/);
+  assert.doesNotMatch(block, /connectAgent\(/, "it must not reconnect");
+  assert.doesNotMatch(block, /resume_session/, "it must not re-resume the session");
+  assert.doesNotMatch(block, /appendSystem\(/, "a silent repair needs no chat line");
 });
