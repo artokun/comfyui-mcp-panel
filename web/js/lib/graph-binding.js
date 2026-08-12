@@ -1,4 +1,9 @@
 import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
+import {
+  isEmptyBaselineMismatch,
+  emptyBaselineNote,
+  emptyBaselineRemedy,
+} from "./empty-baseline-deadend.js";
 /**
  * Detect a graph READ that is out of sync with the ACTIVE workflow (panel#389).
  *
@@ -2279,7 +2284,16 @@ export function graphBindingRefusalMessage(verdict) {
       `session, it does not rebind the canvas.`
     );
   }
-  const expectation = sizesDisagree
+  // #803 — an EMPTY baseline against a populated canvas is not evidence of a different
+  // graph. The panel captures a workflow's state on user input, so a reconnect or a
+  // ComfyUI restart can leave it empty for a canvas that is perfectly correct. Asserting
+  // "bound to a different graph" here is the #796 shape: cannot-determine rendered as
+  // is-not-the-case. What gets REFUSED is unchanged (#565 rejected a zero-node skip);
+  // only the claim is.
+  const emptyBaseline = sizesDisagree && isEmptyBaselineMismatch({ expected, live });
+  const expectation = emptyBaseline
+    ? emptyBaselineNote(live)
+    : sizesDisagree
     ? `the workflow reports ${expected} node(s) but the live canvas holds ${live} — it is bound to a ` +
       `different graph`
     : measured && expected > 0
@@ -2295,13 +2309,24 @@ export function graphBindingRefusalMessage(verdict) {
   // disagreement at equal size does not even establish that much: it is exactly
   // the ambiguity above, and resolving it in the text is how this message misled
   // three readers.
-  const cause = sizesDisagree
+  const cause = emptyBaseline
+    ? ""
+    : sizesDisagree
     ? `The canvas therefore holds a graph other than the one the workflow describes, so this ` +
       `command was NOT applied. A load, tab switch or reconnect leaving the command on the wrong ` +
       `canvas is the usual explanation — the panel observed the mismatch, not the event.`
     : `The panel cannot tell whether this is a DIFFERENT workflow's canvas or this workflow's own ` +
       `canvas drifted from the state it last captured, so it was NOT applied.`;
-  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation}. ${cause} ${remedy}`;
+  // #803 — the remedy is REPLACED for the empty-baseline case, not appended to. The
+  // standing advice ("re-open the active workflow tab") is what turned this into a
+  // dead end: the captured state is refreshed only after a command SUCCEEDS, so while
+  // this refusal stands the repair that would refresh it is itself blocked, and the
+  // retry fails identically. A reload is the step known to break the loop.
+  const finalRemedy = emptyBaseline ? emptyBaselineRemedy() : remedy;
+  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation} ${cause} ${finalRemedy}`.replace(
+    /\s+/g,
+    " ",
+  );
 }
 
 /**
