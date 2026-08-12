@@ -244,7 +244,8 @@ import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import {
-  findUnregisteredTypes,
+  unrunnableNodeIds,
+  describeUnrunnable,
   missingNodeRunRefusal,
 } from "./lib/missing-node-preflight.js";
 import {
@@ -11772,23 +11773,22 @@ const GRAPH_TOOL_EXECUTORS = {
     // could not be reached is `unknown`, never `missing`, because refusing on a
     // failed metadata probe would trade one false failure for another.
     try {
-      const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
-      const nodesByType = {};
-      for (const n of liveNodes) {
-        const ty = typeof n?.type === "string" ? n.type : null;
-        if (!ty) continue;
-        (nodesByType[ty] ??= []).push(n.id);
-      }
-      const { missing, unknown } = await findUnregisteredTypes(
-        Object.keys(nodesByType),
-        async (cls) => {
-          const res = await api.fetchApi(`/object_info/${encodeURIComponent(cls)}`);
-          if (!res || res.ok === false) return null; // unreachable => unknown, not missing
-          return await res.json();
-        },
-      );
-      if (missing.length) {
-        throw new Error(missingNodeRunRefusal({ missing, nodesByType, unknown }));
+      // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already
+      // dropped or rewritten every virtual and frontend-only node (Note, Reroute,
+      // PrimitiveNode, an extension's own display node), so what survives with no
+      // class_type is exactly what the server cannot execute — and nothing else.
+      //
+      // The earlier version probed /object_info per canvas type, which refused runs
+      // that would have SUCCEEDED because those virtual nodes have no object_info
+      // entry (review). It also cost one sequential round trip per type, capped at
+      // 200, against a snapshot that could drift from what the run actually sent.
+      // None of that applies here: no network, no cap, and the bytes inspected are
+      // the bytes that would have been POSTed.
+      const built = await app.graphToPrompt();
+      const badIds = unrunnableNodeIds(built);
+      if (badIds.length) {
+        const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
+        throw new Error(missingNodeRunRefusal(describeUnrunnable(badIds, liveNodes)));
       }
     } catch (err) {
       // Only OUR refusal propagates. Anything else (a broken fetch, a frontend

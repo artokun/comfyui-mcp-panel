@@ -1,101 +1,102 @@
 /**
- * comfyui-mcp#1460 — a run queued nodes the server cannot dispatch, one rejection at
- * a time.
+ * comfyui-mcp#1460 — `panel_load_workflow` put pack nodes on the canvas, several were
+ * UNREGISTERED, and `graph_run` queued anyway and failed obscurely server-side.
  *
- * ## Measured, not inferred
+ * ## What is actually wrong, measured on the rig
  *
- * A node whose type is not registered stays on the canvas and is included in the
- * prompt by ComfyUI's OWN serializer:
+ * `graphToPrompt` INCLUDES a node whose type the frontend cannot resolve, emitting it
+ * with `class_type: undefined`. The prompt therefore leaves the browser carrying an
+ * entry the server cannot possibly execute, and the failure surfaces as a validation
+ * error about a node the caller never knowingly added.
  *
- *     canvas:  { id: "45", type: "TotallyNotInstalledNode", comfyClass: undefined }
- *     graphToPrompt() ids: ["1", "45"]     <- included
- *     prompt["45"].class_type: undefined   <- with nothing to dispatch on
+ * ## Why this checks the SERIALIZED prompt, not the canvas
  *
- * which is the reporter's error verbatim: "Node 'ID #45' has no class_type." It is
- * why their nodes were VISIBLE — an unregistered type renders as a placeholder — and
- * why this is not a serializer defect on our side: `graph_run` calls
- * `app.queuePrompt`, so ComfyUI builds that payload itself.
+ * The first version walked `graph._nodes` and probed `/object_info/<type>` for each
+ * distinct type. Review found that refuses runs that would have SUCCEEDED, which is
+ * strictly worse than the bug: virtual and frontend-only nodes (Note, Reroute,
+ * PrimitiveNode, MarkdownNote, and any extension's own display node) have no
+ * `/object_info` entry at all, yet `graphToPrompt` correctly drops or rewrites them.
+ * A canvas full of legitimate reroutes would have been declared unrunnable.
  *
- * The reporter discovered the four missing types sequentially, removing and rewiring
- * nodes after each rejection. Every one of them was knowable before the first queue.
+ * Reading the serialized prompt instead removes that entire class of error, because it
+ * asks the only question that matters: is there an entry in the payload we are about
+ * to POST that the server cannot execute? Everything the frontend resolves, virtualises
+ * or omits has already been resolved, virtualised or omitted by the time we look.
  *
- * ## Why refusing is safe here
+ * It also removes three problems the probing version had and could not fix:
+ *   - one sequential HTTP round trip per distinct type on every run (uncached)
+ *   - a 200-type cap that silently skipped the tail of a large graph
+ *   - a stale snapshot: the probe read the canvas while the run serialized separately
  *
- * A run containing an unregistered type CANNOT succeed — the server rejects it. So
- * this prevents no working run; it replaces a rejection loop with one complete
- * answer. That is the only reason a pre-flight is allowed to block at all.
- *
- * ## Two properties that must not be lost
- *
- * FAIL SOFT. An `/object_info` lookup that cannot be reached is UNKNOWN, not missing.
- * Refusing a run because a metadata probe failed would swap one false failure for
- * another, which is the defect class this repo keeps paying for.
- *
- * BOUNDED. One request per distinct TYPE, cached — a canvas with thirty KSamplers
- * must not become thirty requests, and a pathological canvas must not spend the run's
- * deadline on lookups (#589).
+ * There is now no network, no cap, and no second source of truth — the bytes inspected
+ * are the bytes that would have been sent.
  */
 
-/**
- * Which of `types` the server does not define.
- *
- * Returns `{ missing, unknown }`. A type whose lookup FAILED lands in `unknown` and
- * never in `missing`, so the caller can disclose it without refusing on it.
- */
-export async function findUnregisteredTypes(types, fetchClassInfo, { maxTypes = 200 } = {}) {
-  const missing = [];
-  const unknown = [];
-  if (!Array.isArray(types) || typeof fetchClassInfo !== "function") {
-    return { missing, unknown };
-  }
-  const distinct = [...new Set(types.filter((t) => typeof t === "string" && t))];
-  for (const t of distinct.slice(0, maxTypes)) {
-    let info;
-    try {
-      info = await fetchClassInfo(t);
-    } catch {
-      // Unreachable/failed lookup: not evidence of absence.
-      unknown.push(t);
-      continue;
-    }
-    if (info === null || info === undefined) {
-      unknown.push(t);
-      continue;
-    }
-    // A definition is an object keyed by the class name (or the class itself). An
-    // EMPTY object is the server saying it has no such class.
-    const defined =
-      typeof info === "object" && !Array.isArray(info) ? Object.keys(info).length > 0 : !!info;
-    if (!defined) missing.push(t);
-  }
-  return { missing, unknown };
+/** A serialized entry the server cannot execute: no usable `class_type`. */
+function unrunnable(entry) {
+  const ct = entry?.class_type;
+  return typeof ct !== "string" || ct.trim() === "";
 }
 
 /**
- * The refusal for a run whose canvas carries types the server does not define.
+ * Node ids in `prompt` that carry no usable `class_type`.
  *
- * Names every missing type AND the node ids each accounts for, because the reporter's
- * cost was not knowing which node came next.
+ * `prompt` is the object `graphToPrompt()` produces (its `output` map, or the whole
+ * result — both shapes are accepted, because callers differ across frontend versions).
+ * Returns `[]` for anything unrecognisable: this gates a RUN, so an input it cannot
+ * read must never become a refusal.
  */
-export function missingNodeRunRefusal({ missing, nodesByType, unknown = [] } = {}) {
-  const list = (missing ?? []).map((t) => {
-    const ids = (nodesByType?.[t] ?? []).map(String);
-    return ids.length ? `"${t}" (node ${ids.join(", ")})` : `"${t}"`;
+export function unrunnableNodeIds(prompt) {
+  const map = prompt?.output && typeof prompt.output === "object" ? prompt.output : prompt;
+  if (!map || typeof map !== "object" || Array.isArray(map)) return [];
+  const ids = [];
+  for (const [id, entry] of Object.entries(map)) {
+    if (entry && typeof entry === "object" && unrunnable(entry)) ids.push(String(id));
+  }
+  return ids;
+}
+
+/**
+ * Name the offending nodes using the live graph, which still knows their types.
+ *
+ * The serialized entry has lost the type — that is precisely why it is unrunnable — so
+ * the canvas is consulted for LABELS ONLY, never to decide whether to refuse. A node
+ * the graph cannot name still counts; it is reported by id.
+ */
+export function describeUnrunnable(ids, liveNodes) {
+  const byId = new Map();
+  for (const n of Array.isArray(liveNodes) ? liveNodes : []) {
+    if (n && n.id != null) byId.set(String(n.id), n);
+  }
+  return ids.map((id) => {
+    const n = byId.get(id);
+    const type = typeof n?.type === "string" && n.type ? n.type : null;
+    return { id, type };
   });
-  const unknownClause = unknown.length
-    ? ` ${unknown.length} further type(s) could NOT be checked (${unknown
-        .slice(0, 5)
-        .map((t) => `"${t}"`)
-        .join(", ")}) because the lookup failed — that is not evidence they are missing, ` +
-      `and they are NOT why this refused.`
-    : "";
+}
+
+/**
+ * The refusal for a run whose prompt carries nodes the server cannot execute.
+ *
+ * Prefixed `NOT queued:` so the caller can tell a refusal from an incidental error in
+ * the same block, and so it is unmistakable that nothing was sent.
+ */
+export function missingNodeRunRefusal(offenders) {
+  const list = (Array.isArray(offenders) ? offenders : []).map((o) =>
+    o?.type ? `${o.type} (node ${o.id})` : `node ${o.id}`,
+  );
+  const shown = list.slice(0, 12);
+  const more = list.length > shown.length ? `, and ${list.length - shown.length} more` : "";
+  const plural = list.length === 1 ? "" : "s";
   return (
-    `NOT queued: this canvas uses ${list.length} node type(s) the connected ComfyUI does not ` +
-    `define — ${list.join("; ")}. ComfyUI would have accepted the run and then rejected it with ` +
-    `"has no class_type" for one node at a time, because an unregistered type still draws on the ` +
-    `canvas and is still sent (comfyui-mcp#1460). Every one is named here so you do not have to ` +
-    `find them one rejection at a time.${unknownClause} Install the pack that provides them ` +
-    `(install_custom_node, or ComfyUI-Manager on the host) and RESTART ComfyUI, then retry. ` +
-    `Nothing was queued, so nothing needs undoing.`
+    `NOT queued: ${list.length} node${plural} in this workflow cannot be executed by the ` +
+    `server — ${shown.join(", ")}${more}. Their node types are not registered on this ` +
+    `ComfyUI, so the prompt was built with no class_type for them and would have failed ` +
+    `validation after being queued (comfyui-mcp#1460). Nothing was sent and the queue is ` +
+    `untouched. This usually means a custom-node pack is missing or failed to load: ` +
+    `install the pack that provides these types (list_packs / install_custom_node), ` +
+    `restart ComfyUI so the frontend registers them, then run again. If you expected ` +
+    `these nodes to be optional, delete or bypass them first — a bypassed node is ` +
+    `dropped during serialization and will not trip this check.`
   );
 }
