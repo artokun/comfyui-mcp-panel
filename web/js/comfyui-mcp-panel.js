@@ -243,6 +243,10 @@ import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-lo
 import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import {
+  findUnregisteredTypes,
+  missingNodeRunRefusal,
+} from "./lib/missing-node-preflight.js";
+import {
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
@@ -11735,6 +11739,41 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
+    }
+    // comfyui-mcp#1460 — PRE-FLIGHT the node types. An unregistered type still draws
+    // on the canvas and is still included by ComfyUI's own graphToPrompt, with
+    // `class_type: undefined` — so the server answers "has no class_type" for ONE
+    // node, and the caller removes it, retries, and meets the next. Measured on a
+    // live rig; every missing type is knowable before the first queue.
+    //
+    // Refusing is safe here and nowhere else: a run carrying an unregistered type
+    // cannot succeed, so this blocks no working run. It fails SOFT — a lookup that
+    // could not be reached is `unknown`, never `missing`, because refusing on a
+    // failed metadata probe would trade one false failure for another.
+    try {
+      const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
+      const nodesByType = {};
+      for (const n of liveNodes) {
+        const ty = typeof n?.type === "string" ? n.type : null;
+        if (!ty) continue;
+        (nodesByType[ty] ??= []).push(n.id);
+      }
+      const { missing, unknown } = await findUnregisteredTypes(
+        Object.keys(nodesByType),
+        async (cls) => {
+          const res = await api.fetchApi(`/object_info/${encodeURIComponent(cls)}`);
+          if (!res || res.ok === false) return null; // unreachable => unknown, not missing
+          return await res.json();
+        },
+      );
+      if (missing.length) {
+        throw new Error(missingNodeRunRefusal({ missing, nodesByType, unknown }));
+      }
+    } catch (err) {
+      // Only OUR refusal propagates. Anything else (a broken fetch, a frontend
+      // without api.fetchApi) leaves the run exactly as it was before this existed —
+      // a pre-flight that becomes a new failure mode is worse than no pre-flight.
+      if (err instanceof Error && /^NOT queued:/.test(err.message)) throw err;
     }
     // Clamp batch_count to a sane range: coerce to a positive integer and cap it,
     // so an absurd value can't queue thousands of prompts (each of which would
