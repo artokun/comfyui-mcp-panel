@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import {
   describeGraphStateDifference,
   describeOpenRebindOutcome,
+  describeRepaintSourceBinding,
   graphRootCarriesOpenProof,
   graphRootMatchesState,
   graphRootWorkflowUuidMatches,
@@ -759,4 +760,309 @@ test("#702: the fence note is ONLY on the content-unverified outcome", () => {
   // probe would otherwise be invited against a binding that was never proven.
   assert.doesNotMatch(unproven, /Reloading the panel is NOT required/);
   assert.match(unproven, /reload the panel before graph edits/);
+});
+
+// ---------------------------------------------------------------------------
+// #1089 — the SOURCE of the repaint, which no post-load proof looks at.
+//
+// The reporter got a clean success: right path, right filename, right
+// workflow_uuid, modified:false — and the PREVIOUS workflow's graph on the
+// canvas. Their next calls were panel_remove_node, and Save-As preserves ids,
+// so those deletions would largely have LANDED on the wrong workflow.
+//
+// Nothing was fooled. All four parts of resolveOpenRebindVerdict are taken
+// against the root the loader produced, so each was a true statement about a
+// poisoned SOURCE state. #968 closed the writer this repo owns and recorded
+// that an untagged root is still captured; a state already poisoned still
+// reaches the load, and the load is what makes it durable — it stamps the
+// target's identity onto the foreign graph, so a later save writes it to the
+// target's file.
+// ---------------------------------------------------------------------------
+
+/** A serialized tab state carrying the panel's durable workflow tag. */
+const taggedState = (uuid) => ({
+  nodes: [{ id: 1, type: "KSampler" }],
+  extra: uuid ? { [PANEL_GRAPH_META_KEY]: { workflow_uuid: uuid } } : {},
+});
+
+const OTHER_OPEN = () => true;
+const NO_OWNER = () => false;
+const CLAIMS_NOTHING = () => false;
+
+test("#1089: a state owned by another OPEN workflow is foreign — the open must not repaint from it", () => {
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: CLAIMS_NOTHING,
+      tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+    }),
+    "foreign",
+  );
+});
+
+test("#1089: the tab's own state is bound and repaints exactly as before", () => {
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState(UUID_A),
+      targetUuid: UUID_A,
+      // Neither predicate is consulted on the matching path. Throwing proves it:
+      // a match is decided by the tags alone.
+      targetClaimsTag: () => {
+        throw new Error("must not be consulted");
+      },
+      tagOwnedByOtherOpenWorkflow: () => {
+        throw new Error("must not be consulted");
+      },
+    }),
+    "bound",
+  );
+});
+
+test("#1089: a mismatch alone is NOT foreign — a predecessor's uuid residue must not refuse a good open", () => {
+  // workflowOwnsRootUuidTag's own header: a lagging activeState can carry a
+  // REPLACED PREDECESSOR's uuid, "indistinguishable from the genuine lineage
+  // stamp". Refusing on the bare mismatch would send that caller to a disk load,
+  // which discards the unsaved work on the canvas — so the false refusal is
+  // destructive too, and there is no safe default. Both escapes are asserted.
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      // the target's own lineage claims the conflicting tag (#545/#557 drift)
+      targetClaimsTag: (tag) => tag === "workflow-B",
+      tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+    }),
+    "unknown",
+  );
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: CLAIMS_NOTHING,
+      // registered to nobody currently open — residue, not another tab's graph
+      tagOwnedByOtherOpenWorkflow: NO_OWNER,
+    }),
+    "unknown",
+  );
+});
+
+test("#1089: the tab's dirty flag is NOT an input — it is wrong in both directions", () => {
+  // A `targetTabIsClean` gate existed here across two attempts and is gone. Both
+  // stronger remedies it was gating are gone with it, and the reason is that
+  // `isModified` cannot answer the question either of them needed:
+  //
+  //   spuriously FALSE — #874: ChangeTracker captures on USER INPUT events only, so a
+  //   value a NODE wrote (a populated wildcard, a rolled seed) is on the canvas, never
+  //   marks the tab modified, and was never saved. An auto-correct from disk gated on
+  //   "clean" would silently replace exactly what an agent just generated.
+  //
+  //   spuriously TRUE — a first-time open never runs clearSpuriousOpenModified (it is
+  //   gated on the freeze, and the freeze is scoped to wasOpen), so a cold-opened tab
+  //   reads modified for its whole life. Gating on it would have disarmed this guard
+  //   for that entire population — the #1089 report, unprevented.
+  //
+  // So the classification is evidence-only and the flag is not consulted. Passing one
+  // must change nothing, in either direction.
+  const foreignTagArgs = {
+    state: taggedState("workflow-B"),
+    targetUuid: UUID_A,
+    targetClaimsTag: CLAIMS_NOTHING,
+    tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+  };
+  assert.equal(describeRepaintSourceBinding(foreignTagArgs), "foreign");
+  for (const stray of [true, false, undefined, null, 0, "", 1, {}]) {
+    assert.equal(
+      describeRepaintSourceBinding({ ...foreignTagArgs, targetTabIsClean: stray }),
+      "foreign",
+      `a stray cleanliness reading must not change the answer: ${JSON.stringify(stray)}`,
+    );
+  }
+});
+
+test("#1089: the panel source does not gate this on the dirty flag anywhere", () => {
+  // Belt-and-braces for the above: the helper ignoring the input is only half of it if
+  // the call site re-introduces the gate with an `if`.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.doesNotMatch(src, /targetTabIsClean/, "the removed gate must not come back");
+  const guardAt = src.indexOf("describeRepaintSourceBinding({");
+  const callEnd = src.indexOf('}) === "foreign"', guardAt);
+  assert.ok(callEnd > guardAt);
+  assert.doesNotMatch(
+    src.slice(guardAt, callEnd),
+    /wasDirty|isModified/,
+    "the classification must not consult the dirty flag",
+  );
+});
+
+test("#1089: absent evidence changes nothing — the #968 residual stays a residual, not a refusal", () => {
+  // An UNTAGGED state is the case #968 left open, and this must not manufacture a
+  // verdict for it: older frontends and never-stamped canvases behave as before.
+  for (const args of [
+    { state: taggedState(null), targetUuid: UUID_A },
+    { state: { nodes: [] }, targetUuid: UUID_A },
+    { state: null, targetUuid: UUID_A },
+    { state: undefined, targetUuid: UUID_A },
+    // no resolvable identity for the TARGET is equally inconclusive
+    { state: taggedState("workflow-B"), targetUuid: null },
+    { state: taggedState("workflow-B"), targetUuid: "" },
+    // a non-string tag is not a tag
+    { state: { extra: { [PANEL_GRAPH_META_KEY]: { workflow_uuid: 7 } } }, targetUuid: UUID_A },
+  ]) {
+    assert.equal(
+      describeRepaintSourceBinding({
+        ...args,
+        targetClaimsTag: CLAIMS_NOTHING,
+        tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+        // clean, so `unknown` here is the ABSENT EVIDENCE talking and not the
+        // cleanliness gate standing in for it
+      }),
+      "unknown",
+      `inconclusive input must answer unknown: ${JSON.stringify(args.state)}`,
+    );
+  }
+  assert.equal(describeRepaintSourceBinding(), "unknown", "no arguments at all is inconclusive");
+});
+
+test("#1089: a predicate that throws is inconclusive, never a refusal", () => {
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: () => {
+        throw new Error("owner map unreadable");
+      },
+      tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+    }),
+    "unknown",
+  );
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: CLAIMS_NOTHING,
+      tagOwnedByOtherOpenWorkflow: () => {
+        throw new Error("openWorkflows unreadable");
+      },
+    }),
+    "unknown",
+  );
+  // Missing predicates are the same story — an unasked question is not an answer.
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+    }),
+    "unknown",
+  );
+});
+
+test("#1089: the open CORRECTS the source instead of refusing — refusing wedges the session", () => {
+  // codex NO-SHIP, round 1 (second finding, and the one that killed the approach).
+  // Refusing before loadGraphData removes the repaint's root re-stamp, which is the
+  // ONE documented heal for a conflicting root tag. The pointer is already on the
+  // target while app.graph carries the OTHER workflow's uuid, and there
+  // assertGraphBoundToActiveWorkflow refuses every graph_* command — including the
+  // panel_load_workflow the refusal recommended (graph_load is a MUTATION, and
+  // rootContentProvesActiveWorkflow is false because sealProofExclusive is killed by
+  // the real owner being open and clean with a state matching the root). It throws
+  // [root-workflow-uuid-mismatch], whose own remedy is "re-open the active workflow
+  // tab", which re-enters the refusal. A hard loop, on true positives too.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const guardAt = src.indexOf("describeRepaintSourceBinding({");
+  assert.notEqual(guardAt, -1, "the open path must classify the state it repaints from");
+  const loadAt = src.indexOf("await app.loadGraphData(repaintState, true, true, target)");
+  assert.notEqual(loadAt, -1);
+  assert.ok(guardAt < loadAt, "the source is classified before the load...");
+
+  // ...but the classification must NOT gate the load. The whole defect above is that
+  // a refusal here strands the root tag, so this branch may never set rebindFailed.
+  // Anchored on the block's own comment, not on the call: the assignment precedes the
+  // call, so a slice starting at the call would miss it and pass vacuously.
+  const classifyAt = src.indexOf("#1089 — is the state we are about to repaint FROM");
+  assert.notEqual(classifyAt, -1);
+  assert.ok(classifyAt < loadAt);
+  const classifyBlock = src.slice(classifyAt, loadAt);
+  assert.doesNotMatch(
+    classifyBlock,
+    /rebindFailed = new Error\(/,
+    "a foreign source must never refuse the open — that removes the root re-stamp and wedges every graph command",
+  );
+  assert.match(classifyBlock, /sourceForeign =/, "it records the fact instead");
+
+  // The CALL's arguments only. The classification now shares a block with the repaint,
+  // which legitimately does use the embedding resolver, so the wider slice cannot carry
+  // these assertions.
+  const callEnd = src.indexOf('}) === "foreign"', guardAt);
+  assert.ok(callEnd > guardAt, "the classification must be a single expression");
+  const callBlock = src.slice(guardAt, callEnd);
+  // NOT the embedding resolver: `{ embed: true }` writes the identity stamp, which
+  // belongs to the repaint, not to a question about the payload it is handed.
+  assert.doesNotMatch(callBlock, /workflowStableUuid\(target, \{ embed: true \}\)/);
+  assert.match(callBlock, /workflowObjectUuid\(target\) \|\| workflowStableUuid\(target\)/);
+  // OPEN, not merely registered — the predecessor-residue escape (see the helper).
+  assert.match(callBlock, /openWorkflows/);
+  assert.match(callBlock, /sameWorkflowObject\(w, owner\)/);
+  // Cleanliness is the PRE-AWAIT snapshot, not a live re-read: clearSpuriousOpenModified
+  // force-clears isModified, so `target.isModified` would read clean for a tab that
+  // arrived dirty and would authorize the destructive disk re-read over real work.
+});
+
+test("#1089: a foreign source must NOT trigger an automatic disk re-read", () => {
+  // The second removed remedy. It reused #442's re-read — freeze, section ownership,
+  // __cmcpKeepInstance, all of it — and was still wrong, because #442's trigger is
+  // "the FILE provably changed since this tab loaded it", which is independent evidence
+  // that the disk copy is the newer one. A foreign source tag is no evidence about the
+  // file at all, and #874's user-input-only capture means a tab reporting no unsaved
+  // edits can still hold node-written values that only exist on the canvas.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.doesNotMatch(src, /reloadWanted/, "the combined reload trigger must be gone");
+  assert.doesNotMatch(src, /reloadForForeignSource/);
+  // #442's own three branches must be back on their own trigger, untouched.
+  assert.match(src, /if \(staleInfo\.reload && !dirtyNow && !wasDirty && priorInteraction === null\)/);
+  assert.match(src, /staleInfo\.reload &&\r?\n\s*!dirtyNow &&\r?\n\s*!wasDirty &&\r?\n\s*!ownsWorkflowReloadGuard/);
+  assert.match(src, /\} else if \(staleInfo\.reload && !dirtyNow && !wasDirty\) \{/);
+  // And `sourceForeign` must reach the reply only — never a load, never a refusal.
+  const decl = src.indexOf("sourceForeign =");
+  assert.notEqual(decl, -1);
+  for (const forbidden of [/sourceForeign[^;\n]*loadGraphData/, /sourceForeign[^;\n]*rebindFailed/]) {
+    assert.doesNotMatch(src, forbidden, "a foreign source may neither load nor refuse");
+  }
+});
+
+test("#1089: the outcome is disclosed on its own key, both when corrected and when not", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const keyAt = src.indexOf("foreign_source_state:");
+  assert.notEqual(keyAt, -1, "the caller must be told the state was another workflow's");
+  // Its OWN key, OUTSIDE the stale branch. `reloaded` is only surfaced inside
+  // `stale === true`, so a re-read triggered by this condition while the file never
+  // changed would set it and surface nothing at all — folding this into stale_hint
+  // would report a bare success for exactly the case being fixed.
+  const staleBranchAt = src.indexOf("...(staleInfo.stale === true");
+  assert.notEqual(staleBranchAt, -1);
+  assert.ok(keyAt < staleBranchAt, "it must not live inside the stale === true branch");
+  // `stale_hint` occurs earlier in the file for unrelated commands, so bound the slice
+  // by the next one AFTER this key rather than the first in the file.
+  const block = src.slice(keyAt, src.indexOf("stale_hint:", keyAt));
+  assert.ok(block.length > 0);
+  // It must say what to DO, and the action is a comparison the caller can make — the
+  // panel cannot make it (see below), so telling them to verify is the whole remedy.
+  assert.match(block, /VERIFY THE GRAPH BEFORE EDITING/);
+  assert.match(block, /panel_graph_outline/, "it must name the read that lets them check");
+  // It must explain why nothing else on the reply warned. Those fields are TRUE of the
+  // tab; that is exactly why the reporter proceeded on them.
+  assert.match(block, /is TRUE\b/, "the other fields are true, not broken");
+  // MAY, not IS — #817 residue is indistinguishable from a foreign graph, so a definite
+  // claim would be an overclaim, and an overclaim here sends people to a destructive load.
+  assert.match(block, /MAY be, not IS/);
+  assert.match(block, /#817/);
+  // The recovery is named WITH its cost, including the #874 trap that a clean-looking
+  // tab can still lose node-written values to it.
+  assert.match(block, /panel_load_workflow/);
+  assert.match(block, /REPLACES the canvas/);
+  assert.match(block, /#874/, "the node-written-values trap must be named");
+  assert.match(block, /a plain save/, "…and the save-over-the-target trap");
+  // It must NOT claim the panel corrected anything: it did not.
+  assert.doesNotMatch(block, /RE-READ FROM DISK/);
+  assert.doesNotMatch(block, /was therefore/);
 });

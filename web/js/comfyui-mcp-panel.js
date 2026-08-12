@@ -421,6 +421,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  describeRepaintSourceBinding,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
   MUTATION_BINDING_BAR,
@@ -13107,6 +13108,10 @@ const GRAPH_TOOL_EXECUTORS = {
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
     let canvasDivergence = null; // #968
+    // #1089 — the tab's own in-memory state provably carried ANOTHER open workflow's
+    // identity, so the repaint below reproduced a graph that is not this workflow's.
+    // Drives the disk re-read that corrects it, and is disclosed either way.
+    let sourceForeign = false;
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -13309,6 +13314,47 @@ const GRAPH_TOOL_EXECUTORS = {
                 "loadGraphData. The open may have switched the active workflow; reload the panel before graph edits.",
             );
           } else {
+            // #1089 — is the state we are about to repaint FROM even this tab's?
+            //
+            // Recorded, NOT acted on here, and the first attempt at this fix got that
+            // wrong in a way worth keeping written down. It refused before the load. The
+            // repaint's root re-stamp is the ONE documented heal for a conflicting root
+            // tag, so refusing removes it: the pointer is already on the target while
+            // app.graph still carries the OTHER workflow's uuid, and in that state
+            // assertGraphBoundToActiveWorkflow refuses every graph_* command. The refusal
+            // named panel_load_workflow as the recovery, but `graph_load` is a MUTATION
+            // and its own guard hits rootUuidMismatch with no rebind available —
+            // rootTagClaimedByActiveWorkflow false, canvas non-empty, and
+            // rootContentProvesActiveWorkflow false because sealProofExclusive is killed
+            // by the real owner being open and clean with a state matching the root. It
+            // throws [root-workflow-uuid-mismatch], whose own remedy text is "re-open the
+            // active workflow tab", which re-enters the refusal. A hard loop with a panel
+            // reload as the only exit — and it fires on TRUE positives too, so it is worse
+            // than the bug for every caller who hits it.
+            //
+            // So the load must proceed and the SOURCE gets corrected instead, below, by
+            // the #442 disk re-read that already exists in this function with the freeze,
+            // the guard section and __cmcpKeepInstance. That lands the right graph AND
+            // lets the load re-stamp the root, which is what heals the tag.
+            sourceForeign =
+              describeRepaintSourceBinding({
+                state: st,
+                // The pair #708 resolves ownership with, and for the same reason: the
+                // live object's own uuid first, and the root-blind resolver only as the
+                // fallback, so the stale root this is trying to detect can never supply
+                // the answer.
+                targetUuid: workflowObjectUuid(target) || workflowStableUuid(target),
+                targetClaimsTag: (tag) => workflowOwnsRootUuidTag(target, tag),
+                tagOwnedByOtherOpenWorkflow: (tag) => {
+                  const owner = workflowUuidOwner(tag);
+                  if (!owner || sameWorkflowObject(owner, target)) return false;
+                  // OPEN, not merely registered: a replaced predecessor stays in the
+                  // owner map, and its uuid residue in a lagging `activeState` is the
+                  // documented look-alike this must not act on (see the helper).
+                  const openNow = app?.extensionManager?.workflow?.openWorkflows;
+                  return Array.isArray(openNow) && openNow.some((w) => sameWorkflowObject(w, owner));
+                },
+              }) === "foreign";
             // A graph shape is not ownership proof: two dirty tabs can have the same
             // nodes, and the normal read guard intentionally stays inconclusive for a
             // dirty, un-stamped root. Stamp THIS target's live-object identity into the
@@ -13571,6 +13617,22 @@ const GRAPH_TOOL_EXECUTORS = {
         // staleInfo.stale === true, and it never downgrades that to "fresh" — so the
         // false-fresh window codex closed (read stale → file changes → report fresh) still
         // cannot open. The provably-fresh and "unknown" paths reach the return with no await.
+        // #1089 — an AUTOMATIC disk re-read was built here and removed. It is the obvious
+        // correction (the file is the one source the contamination cannot reach, and it is
+        // what both reporters did by hand) and it is not safe, for a reason this function
+        // already documents 400 lines up: #874 records that ComfyUI's ChangeTracker
+        // captures on USER INPUT events only. Every value a NODE wrote — an
+        // ImpactWildcardEncode populate, a control_after_generate roll, a subgraph proxy
+        // fill — is on the canvas and in the tab buffer, never marks the tab modified, and
+        // was never saved. `!dirtyNow && !wasDirty` therefore does not mean "the file is
+        // this tab's content", so an automatic re-read would silently replace exactly the
+        // values an agent just generated and was about to reuse.
+        //
+        // #442's own re-read survives that argument because it fires only when the FILE
+        // provably changed since the tab loaded it, which is independent evidence that the
+        // disk copy is the newer one. A foreign source tag is not evidence about the file
+        // at all. So this discloses and lets the caller decide, with the cost of the
+        // recovery named — see the reply's `foreign_source_state`.
         if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null) {
           // NO reliable freeze on this frontend ⇒ do NOT perform the automatic destructive
           // reload at all (codex). Serving a stale graph with a loud flag is recoverable;
@@ -13766,6 +13828,40 @@ const GRAPH_TOOL_EXECUTORS = {
       // being the file's graph at all, and a caller may hit one without the other.
       ...(canvasFileDivergenceNote(canvasDivergence, target.path)
         ? { canvas_file_divergence: canvasFileDivergenceNote(canvasDivergence, target.path) }
+        : {}),
+      // #1089 — its OWN key, for the same reason canvas_file_divergence has one: this is
+      // not about the FILE changing (stale) and not about the canvas sharing no ids with
+      // its file (divergence), it is about the tab's own in-memory state having carried
+      // another workflow's identity, which the repaint then faithfully reproduced. A
+      // caller can hit this with neither of the others firing.
+      //
+      // It must not fold into `stale_hint` for a mechanical reason as well: `reloaded` is
+      // only surfaced inside the `stale === true` branch, so a re-read triggered by THIS
+      // condition while the file never changed would set it and surface nothing at all.
+      ...(sourceForeign
+        ? {
+            foreign_source_state:
+              "VERIFY THE GRAPH BEFORE EDITING. This tab's in-memory state carried a DIFFERENT " +
+              "open workflow's identity, and the canvas was repainted from that state — so the " +
+              "graph on screen may be that other workflow's, faithfully reproduced under this " +
+              "workflow's identity. That is #1089, where the reporter's next node deletions " +
+              "would have landed on the wrong workflow with every call reporting success. " +
+              "Everything else on this reply (path, filename, workflow_uuid, modified) is TRUE " +
+              "of the tab and says nothing about which graph the state held, which is why none " +
+              "of it warned. Read the graph (panel_graph_outline / panel_query_graph) and " +
+              "compare it against what you expect this workflow to contain. " +
+              "MAY be, not IS: the panel cannot tell a foreign graph from this tab's own graph " +
+              "sitting under another tab's metadata residue, which a tab switch can leave behind " +
+              "(#817) — so this fires on both, and only your comparison separates them. " +
+              "If it IS the wrong graph, panel_load_workflow with this workflow's path loads the " +
+              "saved copy from disk. Weigh that: it REPLACES the canvas, and the tab's " +
+              "modified flag does not account for values a NODE wrote rather than you — a " +
+              "populated wildcard, a rolled seed (#874) — so a tab reporting no unsaved edits " +
+              "can still lose work to it. If the graph is the OTHER workflow's and holds work " +
+              "you need, preserve it to a NEW path (Save As or an export) first: a plain save " +
+              "would write it over the workflow you asked for, because the active identity " +
+              "already names that one.",
+          }
         : {}),
       ...(staleInfo.stale === true
         ? {
