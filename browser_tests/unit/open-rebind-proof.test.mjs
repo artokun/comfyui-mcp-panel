@@ -126,7 +126,27 @@ test("#604/#603/#616: the reported failure — a faithful repaint the frontend N
     contentSurfaces: describeGraphStateDifference({ rootGraph, state: loaded }).surfaces,
   });
   assert.match(text, /canvas IS bound to a\.json/, "the settled half must be stated as settled");
-  assert.match(text, /You are NOT on the wrong workflow/, "the old message's worst implication is retracted");
+  // The retraction survives — the identity IS settled and must be stated as such —
+  // but it is now scoped to the identity (#1111/#1089). The old sentence read as
+  // "everything is fine except presentation", and two reporters proceeded on that
+  // while the PREVIOUS workflow's graph sat on the canvas.
+  assert.match(text, /The identity is settled/, "the old message's worst implication is retracted");
+  assert.match(text, /IS the active one/, "…and the settled half is still stated plainly");
+  assert.match(
+    text,
+    /not about the nodes/,
+    "…but it no longer implies the graph is this workflow's",
+  );
+  assert.match(
+    text,
+    /PREVIOUS workflow's graph still on the canvas/,
+    "the reported outcome is named, so a re-read is not taken at face value",
+  );
+  assert.match(
+    text,
+    /panel_load_workflow with this workflow's path reloads it/,
+    "and the recovery that actually worked for both reporters is named",
+  );
   assert.match(text, /UNKNOWN/, "...while the unsettled half stays unknown");
   assert.match(text, /nodes/, "the disclosure must name WHICH surface disagreed");
 });
