@@ -1519,7 +1519,10 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
       `PREVIOUS workflow's graph still on the canvas, which a re-read then returns as if it were ` +
       `this workflow's. So compare what you read against what you expect, and if it is the wrong ` +
       `graph, panel_load_workflow with this workflow's path reloads it — that is what recovered ` +
-      `it for both reporters, and neither panel_graph_outline nor a fence refresh will.` +
+      `it for both reporters, and neither panel_graph_outline nor a fence refresh will. It loads ` +
+      `from DISK, so whatever is on the canvas right now is replaced: if the graph you are looking ` +
+      `at holds unsaved work — and if it is the previous workflow's, it may — save or export that ` +
+      `FIRST. Recovering the binding is not worth losing a graph to.` +
       FENCE_NOT_REFRESHED
     );
   }
