@@ -242,6 +242,7 @@ import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
+import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import {
   findUnregisteredTypes,
   missingNodeRunRefusal,
@@ -425,6 +426,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  describeRepaintSourceBinding,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
   MUTATION_BINDING_BAR,
@@ -456,6 +458,7 @@ import {
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  shouldNudgeAfterMidTaskReconnect,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -479,6 +482,7 @@ import {
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
+import { bridgeFallbackPlan } from "./lib/bridge-liveness-fallback.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -1011,7 +1015,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.14.14";
+const PANEL_VERSION = "0.14.18";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -3375,7 +3379,7 @@ function populateModelSelect(sel, backend) {
     const hint = document.createElement("option");
     hint.value = SETTINGS_PLACEHOLDER;
     hint.disabled = true;
-    hint.textContent = `Connect to ${BACKEND_TEXT[backend] || backend} to load its models`;
+    hint.textContent = tr("panel.connect_to_backend_to_load_models", "Connect to {backend} to load its models", { backend: BACKEND_TEXT[backend] || backend });
     sel.appendChild(hint);
   }
   if (saved && !seen.has(saved)) {
@@ -3383,9 +3387,9 @@ function populateModelSelect(sel, backend) {
     o.value = saved;
     if (rows) {
       o.disabled = true;
-      o.textContent = `${saved} (not available for this backend)`;
+      o.textContent = tr("panel.saved_not_available_for_this_backend", "{saved} (not available for this backend)", { saved });
     } else {
-      o.textContent = `${saved} (saved)`;
+      o.textContent = tr("panel.saved_suffix", "{saved} (saved)", { saved });
       seen.add(saved);
     }
     sel.appendChild(o);
@@ -5044,11 +5048,28 @@ async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
  *  frontend, api.fetchApi resolves the identical URL the UI hits — so this works
  *  against the bundled Desktop Manager without the MCP/cm-cli path. */
 async function managerV2(route, { method = "GET", body, signal } = {}) {
-  const res = await api.fetchApi(`/v2/${route}`, {
-    method,
-    ...(signal ? { signal } : {}),
-    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
-  });
+  let res;
+  try {
+    res = await api.fetchApi(`/v2/${route}`, {
+      method,
+      ...(signal ? { signal } : {}),
+      ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+  } catch (err) {
+    // comfyui-mcp#1472 — a THROW here reached the caller as bare "Failed to fetch",
+    // with no route, no status and no body, so an install could not be diagnosed at
+    // all. There is no status or body to report (no usable response arrived), but the
+    // ROUTE exists and was being discarded.
+    //
+    // It does NOT decide whether a re-send is safe, which is what an earlier version of
+    // this comment claimed. A fetch rejection establishes neither delivery nor
+    // non-delivery — a CORS block, or a connection dropped after the request was
+    // delivered, look identical from here — so the message tells the caller to check
+    // current state before retrying a MUTATING call.
+    // An abort is the caller's own doing and must pass through untouched.
+    if (err?.name === "AbortError") throw err;
+    throw new Error(managerFetchFailureMessage(route, err), { cause: err });
+  }
   if (!res) {
     throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
   }
@@ -13146,6 +13167,10 @@ const GRAPH_TOOL_EXECUTORS = {
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
     let canvasDivergence = null; // #968
+    // #1089 — the tab's own in-memory state provably carried ANOTHER open workflow's
+    // identity, so the repaint below reproduced a graph that is not this workflow's.
+    // Drives the disk re-read that corrects it, and is disclosed either way.
+    let sourceForeign = false;
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -13348,6 +13373,47 @@ const GRAPH_TOOL_EXECUTORS = {
                 "loadGraphData. The open may have switched the active workflow; reload the panel before graph edits.",
             );
           } else {
+            // #1089 — is the state we are about to repaint FROM even this tab's?
+            //
+            // Recorded, NOT acted on here, and the first attempt at this fix got that
+            // wrong in a way worth keeping written down. It refused before the load. The
+            // repaint's root re-stamp is the ONE documented heal for a conflicting root
+            // tag, so refusing removes it: the pointer is already on the target while
+            // app.graph still carries the OTHER workflow's uuid, and in that state
+            // assertGraphBoundToActiveWorkflow refuses every graph_* command. The refusal
+            // named panel_load_workflow as the recovery, but `graph_load` is a MUTATION
+            // and its own guard hits rootUuidMismatch with no rebind available —
+            // rootTagClaimedByActiveWorkflow false, canvas non-empty, and
+            // rootContentProvesActiveWorkflow false because sealProofExclusive is killed
+            // by the real owner being open and clean with a state matching the root. It
+            // throws [root-workflow-uuid-mismatch], whose own remedy text is "re-open the
+            // active workflow tab", which re-enters the refusal. A hard loop with a panel
+            // reload as the only exit — and it fires on TRUE positives too, so it is worse
+            // than the bug for every caller who hits it.
+            //
+            // So the load must proceed and the SOURCE gets corrected instead, below, by
+            // the #442 disk re-read that already exists in this function with the freeze,
+            // the guard section and __cmcpKeepInstance. That lands the right graph AND
+            // lets the load re-stamp the root, which is what heals the tag.
+            sourceForeign =
+              describeRepaintSourceBinding({
+                state: st,
+                // The pair #708 resolves ownership with, and for the same reason: the
+                // live object's own uuid first, and the root-blind resolver only as the
+                // fallback, so the stale root this is trying to detect can never supply
+                // the answer.
+                targetUuid: workflowObjectUuid(target) || workflowStableUuid(target),
+                targetClaimsTag: (tag) => workflowOwnsRootUuidTag(target, tag),
+                tagOwnedByOtherOpenWorkflow: (tag) => {
+                  const owner = workflowUuidOwner(tag);
+                  if (!owner || sameWorkflowObject(owner, target)) return false;
+                  // OPEN, not merely registered: a replaced predecessor stays in the
+                  // owner map, and its uuid residue in a lagging `activeState` is the
+                  // documented look-alike this must not act on (see the helper).
+                  const openNow = app?.extensionManager?.workflow?.openWorkflows;
+                  return Array.isArray(openNow) && openNow.some((w) => sameWorkflowObject(w, owner));
+                },
+              }) === "foreign";
             // A graph shape is not ownership proof: two dirty tabs can have the same
             // nodes, and the normal read guard intentionally stays inconclusive for a
             // dirty, un-stamped root. Stamp THIS target's live-object identity into the
@@ -13610,6 +13676,22 @@ const GRAPH_TOOL_EXECUTORS = {
         // staleInfo.stale === true, and it never downgrades that to "fresh" — so the
         // false-fresh window codex closed (read stale → file changes → report fresh) still
         // cannot open. The provably-fresh and "unknown" paths reach the return with no await.
+        // #1089 — an AUTOMATIC disk re-read was built here and removed. It is the obvious
+        // correction (the file is the one source the contamination cannot reach, and it is
+        // what both reporters did by hand) and it is not safe, for a reason this function
+        // already documents 400 lines up: #874 records that ComfyUI's ChangeTracker
+        // captures on USER INPUT events only. Every value a NODE wrote — an
+        // ImpactWildcardEncode populate, a control_after_generate roll, a subgraph proxy
+        // fill — is on the canvas and in the tab buffer, never marks the tab modified, and
+        // was never saved. `!dirtyNow && !wasDirty` therefore does not mean "the file is
+        // this tab's content", so an automatic re-read would silently replace exactly the
+        // values an agent just generated and was about to reuse.
+        //
+        // #442's own re-read survives that argument because it fires only when the FILE
+        // provably changed since the tab loaded it, which is independent evidence that the
+        // disk copy is the newer one. A foreign source tag is not evidence about the file
+        // at all. So this discloses and lets the caller decide, with the cost of the
+        // recovery named — see the reply's `foreign_source_state`.
         if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null) {
           // NO reliable freeze on this frontend ⇒ do NOT perform the automatic destructive
           // reload at all (codex). Serving a stale graph with a loud flag is recoverable;
@@ -13707,7 +13789,34 @@ const GRAPH_TOOL_EXECUTORS = {
       releaseCanvasInteractionLock(priorInteraction, canvasView);
     }
     if (openFailed) throw failOpen(openFailed);
-    if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);
+    if (rebindFailed) {
+      // #1089 follow-up — the foreign-source finding rides the FAILURE too.
+      //
+      // It was only on the success reply, and that dropped it on the combination that
+      // matters most: an open that ALSO fails content verification. #1111 is exactly
+      // that report — a mismatch WAS announced and the canvas was still the previous
+      // workflow's. The content warning tells the caller to re-read the graph; it does
+      // not tell them the state was another workflow's, which is the part that explains
+      // why the re-read will look perfectly plausible.
+      //
+      // Appended rather than folded into `describeOpenRebindOutcome`: that function is
+      // pure and knows only about the four proof parts, and this is a fact about the
+      // payload the load was handed. Keeping it out preserves that separation.
+      if (sourceForeign) {
+        rebindFailed = new Error(
+          `${coerceMessageText(rebindFailed.message ?? rebindFailed)} ALSO, AND SEPARATELY: this ` +
+            `tab's in-memory state carried a DIFFERENT open workflow's identity, and the repaint ` +
+            `read that state — so when you re-read the graph as advised above, treat "it does not ` +
+            `look like this workflow" as the LIKELY answer rather than a surprise, and compare ` +
+            `against what you expect this workflow to contain. panel_load_workflow with this ` +
+            `workflow's path loads the saved copy from disk, which is the one source that cannot ` +
+            `carry the other tab's graph. It REPLACES the canvas, and the modified flag does not ` +
+            `account for values a NODE wrote rather than you — a populated wildcard, a rolled seed ` +
+            `(#874) — so preserve anything you need to a NEW path first (#1089).`,
+        );
+      }
+      throw failOpenRebindUnknown(rebindFailed);
+    }
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",
       rid,
@@ -13805,6 +13914,40 @@ const GRAPH_TOOL_EXECUTORS = {
       // being the file's graph at all, and a caller may hit one without the other.
       ...(canvasFileDivergenceNote(canvasDivergence, target.path)
         ? { canvas_file_divergence: canvasFileDivergenceNote(canvasDivergence, target.path) }
+        : {}),
+      // #1089 — its OWN key, for the same reason canvas_file_divergence has one: this is
+      // not about the FILE changing (stale) and not about the canvas sharing no ids with
+      // its file (divergence), it is about the tab's own in-memory state having carried
+      // another workflow's identity, which the repaint then faithfully reproduced. A
+      // caller can hit this with neither of the others firing.
+      //
+      // It must not fold into `stale_hint` for a mechanical reason as well: `reloaded` is
+      // only surfaced inside the `stale === true` branch, so a re-read triggered by THIS
+      // condition while the file never changed would set it and surface nothing at all.
+      ...(sourceForeign
+        ? {
+            foreign_source_state:
+              "VERIFY THE GRAPH BEFORE EDITING. This tab's in-memory state carried a DIFFERENT " +
+              "open workflow's identity, and the canvas was repainted from that state — so the " +
+              "graph on screen may be that other workflow's, faithfully reproduced under this " +
+              "workflow's identity. That is #1089, where the reporter's next node deletions " +
+              "would have landed on the wrong workflow with every call reporting success. " +
+              "Everything else on this reply (path, filename, workflow_uuid, modified) is TRUE " +
+              "of the tab and says nothing about which graph the state held, which is why none " +
+              "of it warned. Read the graph (panel_graph_outline / panel_query_graph) and " +
+              "compare it against what you expect this workflow to contain. " +
+              "MAY be, not IS: the panel cannot tell a foreign graph from this tab's own graph " +
+              "sitting under another tab's metadata residue, which a tab switch can leave behind " +
+              "(#817) — so this fires on both, and only your comparison separates them. " +
+              "If it IS the wrong graph, panel_load_workflow with this workflow's path loads the " +
+              "saved copy from disk. Weigh that: it REPLACES the canvas, and the tab's " +
+              "modified flag does not account for values a NODE wrote rather than you — a " +
+              "populated wildcard, a rolled seed (#874) — so a tab reporting no unsaved edits " +
+              "can still lose work to it. If the graph is the OTHER workflow's and holds work " +
+              "you need, preserve it to a NEW path (Save As or an export) first: a plain save " +
+              "would write it over the workflow you asked for, because the active identity " +
+              "already names that one.",
+          }
         : {}),
       ...(staleInfo.stale === true
         ? {
@@ -16934,6 +17077,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       void sendHello();
     }, ROUTE_REFUSAL_RETRY_MS);
   }
+  /**
+   * Display label per connection status. The KEY of this map is the state token, which stays
+   * English because it is compared (`s !== "connected"` below) and keyed on elsewhere; only
+   * the VALUE is translated. Lazily via a function because this sits at module-adjacent scope
+   * and would otherwise capture the fallback before the catalog loads.
+   *
+   * Every key is a literal so `i18n-extract` can see it. That is the whole point: the previous
+   * shape built the key at runtime, which no static scan can follow.
+   */
+  const STATUS_LABEL = {
+    connected: () => tr("panel.status_connected", "connected"),
+    connecting: () => tr("panel.status_connecting", "connecting"),
+    disconnected: () => tr("panel.status_disconnected", "disconnected"),
+  };
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
@@ -20407,7 +20564,7 @@ function buildPanel() {
   const dot = document.createElement("span");
   dot.className = "cmcp-dot";
   const statusText = document.createElement("span");
-  statusText.textContent = "disconnected";
+  statusText.textContent = tr("panel.status_disconnected", "disconnected");
   const caret = document.createElement("i");
   caret.className = "pi pi-angle-down";
   // #753 — assigned through style.fontSize rather than a `font-size:` declaration, so the
@@ -20429,9 +20586,9 @@ function buildPanel() {
 
   const actions = document.createElement("span");
   actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
-  const newChatBtn = iconBtn("pi-plus", "New chat");
-  const historyBtn = iconBtn("pi-history", "Chat history");
-  const remoteBtn = iconBtn("pi-qrcode", "Remote control — pair a phone");
+  const newChatBtn = iconBtn("pi-plus", tr("panel.new_chat", "New chat"));
+  const historyBtn = iconBtn("pi-history", tr("panel.chat_history", "Chat history"));
+  const remoteBtn = iconBtn("pi-qrcode", tr("panel.remote_control_pair_a_phone", "Remote control — pair a phone"));
   remoteBtn.addEventListener("click", () => openPairModal());
   // Feature-flagged behind Settings → "Control via Mobile app (beta)": the mobile
   // client is beta, so the pairing entry point stays hidden until opted in.
@@ -20782,8 +20939,10 @@ function buildPanel() {
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
-  helpDiv.textContent =
-    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:";
+  helpDiv.textContent = tr(
+    "panel.click_connect_to_start_an_autonomous_agent",
+    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:",
+  );
   // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
   // host on connect (browser-host targeting), so it drives whatever you're viewing
   // — local or a remote pod. Offer the command per shell: PowerShell needs a
@@ -20822,7 +20981,13 @@ function buildPanel() {
     "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
   advToggle.addEventListener("click", () => {
     advWrap.hidden = !advWrap.hidden;
-    advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
+    // Both arrow states need a key of their own. The FIRST render went through tr(), but
+    // this handler rewrote the label from a literal — so one click reverted the control to
+    // English and nothing ever put it back. A coverage check cannot see this: the key
+    // exists, is translated, and is used; it is just overwritten on interaction.
+    advToggle.textContent = advWrap.hidden
+      ? tr("panel.advanced", "Advanced ▸")
+      : tr("panel.advanced_expanded", "Advanced ▾");
   });
 
   // NOTE: the provider switcher (backendLabel + backendChips) moved INTO the model
@@ -21624,13 +21789,13 @@ function buildPanel() {
   function refreshModelChip() {
     const name = prefs.modelAuto ? tr("panel.auto", "Auto") : modelLabel(modelCatalog, prefs.model);
     modelChipLabel.textContent = name;
-    modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
+    modelChipEffort.textContent = prefs.effort ? ` · ${effortMeta(prefs.effort).label}` : "";
     // The name ellipsises in a narrow panel, so the hover has to carry the full
     // value — otherwise a truncated model id is unrecoverable without widening
     // the panel, which is the thing we're avoiding.
     modelChip.title =
       (prefs.effort
-        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: prefs.effort })
+        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: effortMeta(prefs.effort).label })
         : tr("panel.model_name", "Model: {name}", { name })) +
       "\n" +
       tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
@@ -22779,7 +22944,7 @@ function buildPanel() {
   // ComfyUI APP-mode config) into a named, one-click app; runs headless via
   // the pack's py/apps_routes.py (canvas never touched). Grid of four rounded
   // squares (mini-app launcher mark), currentColor like the neighbors.
-  const appsBtn = toolbarBtn("pi-circle", "Apps");
+  const appsBtn = toolbarBtn("pi-circle", tr("sidepanel_ui.apps", "Apps"));
   appsBtn.querySelector(".pi").remove();
   appsBtn.title = tr("panel.apps_one_click_micro_apps_built_from", "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.");
   appsBtn.addEventListener("click", () => toggleSidePanelTab("apps", () => openApps()));
@@ -22802,7 +22967,7 @@ function buildPanel() {
   // LoRA Training — the dataset gather/label/launch/monitor wizard for the
   // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
   // Same side-panel treatment as the CivitAI browser; dumbbell mark via currentColor.
-  const trainingBtn = toolbarBtn("pi-circle", "Training");
+  const trainingBtn = toolbarBtn("pi-circle", tr("sidepanel_ui.training", "Training"));
   trainingBtn.querySelector(".pi").remove();
   trainingBtn.title = tr("panel.lora_training_train_a_character_lora_locally", "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).");
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
@@ -23455,6 +23620,14 @@ function buildPanel() {
       b.appendChild(badge);
     }
     if (opts.mid) b.dataset.mid = opts.mid;
+    // Keep the message's own text next to the bubble, because ✎-edit falls back to reading
+    // the bubble when the pending record has been evicted — and `b.textContent` is the
+    // WHOLE subtree, which by now includes the workflow-version badge ("{count} nodes · …")
+    // and any attachment chips. Those are translated, so the fallback would paste UI text
+    // into the composer, in a different language than the one that was tested. Only live
+    // messages carry a mid and only those are reachable from editMsg, so this stays bounded
+    // to the send queue rather than every replayed bubble in history.
+    if (opts.mid) b.dataset.raw = typeof text === "string" ? text : String(text ?? "");
     // Hover edit/rollback button — only on live messages (those with a mid).
     // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
     if (opts.mid) {
@@ -24750,7 +24923,9 @@ function buildPanel() {
   function editMsg(mid) {
     const entry = pendingMsgs.get(mid);
     const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
-    const raw = entry?.raw ?? bubble?.textContent ?? "";
+    // `bubble.textContent` is the last resort only: it flattens the badge and chips that
+    // paintUser appends, all of which are translated (see the dataset.raw note there).
+    const raw = entry?.raw ?? bubble?.dataset?.raw ?? bubble?.textContent ?? "";
     deleteMsg(mid); // cancels on server + removes bubble + trailing record
     setComposerValue(raw);
     input.focus();
@@ -26343,7 +26518,22 @@ function buildPanel() {
   let pendingPair = null;
   const client = createBridgeClient({
     onStatus(state, socketId) {
-      statusText.textContent = state;
+      // Translate at the RENDER boundary, never at the source. `state` is a state TOKEN —
+      // emitStatus compares it (`s !== "connected"`) and the comment below keys behaviour on
+      // it — so translating `emitStatus("connected")` would make those comparisons
+      // permanently false in every non-English language. That is exactly the bug the backend
+      // chip had, where a translated `title` was read back as state.
+      //
+      // This is also the shape no literal-scanner can find: the assignment is a VARIABLE, so
+      // "connected"/"connecting" reached the screen untranslated while every gate was green.
+      //
+      // Written as an explicit map rather than interpolating the token into the key: a key
+      // ASSEMBLED at runtime is invisible to the extractor, so English would never gain those
+      // keys and no gate could tell whether a status was translated. (Proven immediately —
+      // the catalog validator rejected two of the three keys for exactly that reason.) An
+      // unknown status falls back to the raw token, which is the current behaviour anyway.
+      // Described, not illustrated: writing the rejected form here would trip the guard.
+      statusText.textContent = STATUS_LABEL[state]?.() ?? state;
       // #952 — a card painted on a connection that has since been REPLACED can no longer
       // deliver an answer. The trigger is the socket's identity, not the status string:
       // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
@@ -26374,7 +26564,15 @@ function buildPanel() {
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
-      connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      // The status pill three lines up routes through STATUS_LABEL; this button was missed
+      // in the same sweep, so the pill translated and the control beside it stayed English
+      // in every locale. The raw token still drives the branch (and `disabled` above) —
+      // only the rendered label goes through tr(), which is the whole point of fixing this
+      // at the render boundary rather than translating the state.
+      connectBtn.textContent =
+        state === "connecting"
+          ? tr("panel.connecting_button", "Connecting…")
+          : tr("panel.connect", "Connect");
       // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
       // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
       // again. The bound only prevents a loop WITHIN one unsuccessful connect. Also
@@ -26871,7 +27069,7 @@ function buildPanel() {
         const persistKey = ctxPersistKey();
         if (persistKey) ssSet(persistKey, String(s.context_pct)); // skip when no conversation owns it yet
         if (forActiveView && typeof s.cost_usd === "number") {
-          ringTitle.textContent = `Context ~${Math.round(s.context_pct * 100)}% used · $${s.cost_usd.toFixed(3)}`;
+          ringTitle.textContent = tr("panel.context_used_cost", "Context ~{pct}% used · ${cost}", { pct: Math.round(s.context_pct * 100), cost: s.cost_usd.toFixed(3) });
         }
       }
       // Keep the chip in sync if the agent reports a concrete model id we know.
@@ -27134,7 +27332,28 @@ function buildPanel() {
         // the agent's turn kept running — so a "you dropped" nudge is false AND
         // would inject a spurious turn into a live session. A real ComfyUI restart
         // takes many seconds to come back, so a long gap since the drop = real.
-        if (Date.now() - lastBridgeDownAt < 6000) return;
+        //
+        // #1138 — AND the bridge must actually have dropped. `lastBridgeDownAt` is 0
+        // until the bridge socket closes, and 0 does not mean "no drop" to the
+        // subtraction below: `Date.now() - 0` is ~56 years, the LONGEST possible gap,
+        // which this heuristic reads as the most certain evidence of a real restart.
+        // So the guard was exactly inverted in the case it exists to catch — the
+        // better established it is that nothing dropped, the more confidently it
+        // nudged. The intent above was right from the start; only the sentinel's
+        // arithmetic betrayed it.
+        //
+        // Reachable on a LIVE socket because `ready` repeats on one (see the client's
+        // own note): a re-advertise draws a fresh handshake, and #310 re-advertises
+        // after every successful free_vram by design. So a user who freed VRAM
+        // mid-task could be told their connection had dropped — and the agent told to
+        // resume work it was still doing — with no drop anywhere in the session.
+        //
+        // The decision moved into session-rebind.js so it is unit-tested by BEHAVIOUR.
+        // A source-scan over this file could only assert the guard's tokens are present,
+        // and #1096's review demonstrated by mutation that such a test stays green when
+        // the guard is inverted — which is the one regression that matters here.
+        if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: lastBridgeDownAt, now: Date.now() }))
+          return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         client.sendUserMessage(
@@ -28383,10 +28602,36 @@ function buildPanel() {
   // no agent answers on the bridge. Reset on each user Connect AND on a successful
   // handshake (both call resetAutoReclaim) so it can re-appear for a later drop.
   let externalHintShown = false;
+  /** Bridges this session already fell back to, so two dead ports cannot loop. */
+  const bridgeFallbacksTried = new Set();
   function showExternalHintOnce() {
     if (externalHintShown) return;
-    externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
+    // #1136 — before declaring nobody is listening, try the bridge that SHOULD be
+    // there. A configured URL can outlive the process that owned it (a migrated
+    // ephemeral port, or one the user typed before the orchestrator moved), and in
+    // external-orchestrator mode nothing corrects it: /connect is deliberately not
+    // POSTed, so the advertised bridge_url never arrives. Liveness is already known
+    // HERE — this runs precisely because the dial failed — so no guess about who
+    // chose the URL is needed.
+    const plan = bridgeFallbackPlan({
+      configured: bridge,
+      fallback: defaultBridgeUrlFor(selectedBackend),
+      attempted: bridgeFallbacksTried,
+    });
+    if (plan) {
+      bridgeFallbacksTried.add(plan.key);
+      appendSystem(plan.notice);
+      // { persist: false } is REQUIRED, not incidental. setUrl saves the URL as the
+      // bridge default unless told otherwise, so persisting here would (a) make the
+      // notice's "your configured URL has NOT been changed" a lie, and (b) write the
+      // fallback in as a new default that can itself go stale later — manufacturing
+      // the very bug this fixes. The flag exists for exactly this: "ephemeral URLs
+      // ... so they don't get saved as the bridge default and go stale next load".
+      client.setUrl(plan.url, { persist: false });
+      return; // the hint is only true once the fallback has failed too
+    }
+    externalHintShown = true;
     appendSystem(
       tr(
         "panel.no_agent_is_listening_on_the_bridge",
@@ -29164,7 +29409,7 @@ function buildPanel() {
     disconnectBtn.hidden = true;
     connectBtn.disabled = false;
     connectBtn.textContent = tr("panel.connect", "Connect");
-    statusText.textContent = "disconnected";
+    statusText.textContent = tr("panel.status_disconnected", "disconnected");
     dot.className = "cmcp-dot";
     settingsBox.hidden = false;
     try {
@@ -29239,10 +29484,10 @@ function buildPanel() {
         const label = outcome?.snapshot?.label;
         appendSystem(
           describeRevertOutcome(outcome, {
-            // `action` is spliced INTO describeRevertOutcome's own English refusal/failure
-            // sentences (lib/graph-revert.js), so translating it here would produce a
-            // half-translated line. It stays English until that lib is converted too.
-            action: "revert",
+            // `action` is spliced INTO describeRevertOutcome's own refusal/failure
+            // sentences (lib/graph-revert.js). Those are translated now, and the lib
+            // supplies this same word as its default — so passing it here would only
+            // duplicate the key.
             // Two whole sentences rather than one with a conditional clause: the label is
             // the user's own snapshot title, and a language that reorders the sentence
             // needs the placeholder to move with it.
@@ -29389,11 +29634,16 @@ function buildPanel() {
     const q = query.toLowerCase();
     const items = [];
     const wf = getWorkflowTitle();
-    if (!q || "workflow".includes(q) || wf.toLowerCase().includes(q)) {
+    // `workflow` is a match token, a display label, AND the literal the agent parses out of
+    // `insert` — three jobs for one word. Only the LABEL is translated; the token stays
+    // English so `@wo` keeps working on a Latin keyboard, and the translated label is added
+    // as a second match so the word in the user's own language matches too.
+    const wfLabel = tr("panel.at_menu_workflow", "workflow — {title}", { title: wf });
+    if (!q || "workflow".includes(q) || wfLabel.toLowerCase().includes(q) || wf.toLowerCase().includes(q)) {
       items.push({
         icon: "pi-file",
-        label: `workflow — ${wf}`,
-        small: "context",
+        label: wfLabel,
+        small: tr("panel.at_menu_context", "context"),
         insert: `@workflow:"${wf}" `,
       });
     }
@@ -29406,7 +29656,9 @@ function buildPanel() {
           items.push({
             icon: n.subgraph ? "pi-sitemap" : "pi-circle",
             label,
-            small: n.subgraph ? "subgraph" : n.type,
+            // `n.type` is a registered node-type id and must stay raw; the word beside it
+            // is ours to translate.
+            small: n.subgraph ? tr("panel.at_menu_subgraph", "subgraph") : n.type,
             insert: `@node:${n.id}(${name}) `,
           });
         }
@@ -29421,7 +29673,12 @@ function buildPanel() {
         let added = 0;
         for (const t of Object.keys(LG.registered_node_types)) {
           if (t.toLowerCase().includes(q)) {
-            items.push({ icon: "pi-box", label: t, small: "node type", insert: `@type:${t} ` });
+            items.push({
+              icon: "pi-box",
+              label: t,
+              small: tr("panel.at_menu_node_type", "node type"),
+              insert: `@type:${t} `,
+            });
             added += 1;
             if (added >= 5) break;
           }
@@ -30166,9 +30423,9 @@ function buildPanel() {
     if (!reverted) {
       appendSystem(
         describeRevertOutcome(outcome, {
-          // English on purpose — see the /revert call site: `action` is interpolated into
-          // the lib's own untranslated refusal/failure sentences.
-          action: "rewind the canvas",
+          // Interpolated into the lib's own sentences as {action}; both sides are
+          // translated now, so a language that needs to reorder can move the hole.
+          action: tr("graph_revert.action_rewind_the_canvas", "rewind the canvas"),
           restoredText: "",
           noneText: recalled
             ? tr(
@@ -30269,8 +30526,8 @@ function buildPanel() {
         const outcome = await revertGraphSnapshotByMid(mid);
         appendSystem(
           describeRevertOutcome(outcome, {
-            // English on purpose — see the /revert call site.
-            action: "roll back the canvas",
+            // See the /revert call site: {action} rides into a translated sentence.
+            action: tr("graph_revert.action_roll_back_the_canvas", "roll back the canvas"),
             restoredText: tr("panel.canvas_reverted_to_before_this_message", "↩ Canvas reverted to before this message."),
             noneText: tr("panel.no_graph_snapshot_for_this_message_canvas", "No graph snapshot for this message — canvas left as-is."),
           }),
@@ -31155,7 +31412,7 @@ function buildPanel() {
       return;
     }
     paintSecret({
-      label: `${friendly} API key`,
+      label: tr("panel.friendly_api_key", "{friendly} API key", { friendly }),
       get hint() { return tr("panel.sent_straight_to_the_orchestrator_s_0600", "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context."); },
     })
       .then((value) => {

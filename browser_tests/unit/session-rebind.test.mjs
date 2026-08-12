@@ -4,10 +4,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+// #1138 adds one structural test (the call site's polarity), which the rest of this
+// pure-logic file does not need.
+import { readFileSync } from "node:fs";
 
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  shouldNudgeAfterMidTaskReconnect,
   planSoftReloadRecovery,
   performSoftReloadRecovery,
   isTransientReconnectError,
@@ -519,4 +523,103 @@ test("#419: N open tabs each independently reconnect — no subset left dead", a
     assert.deepEqual(r.events, ["stop", "start"]); // this tab reconnected
     assert.equal(r.result.reconnect, true);
   }
+});
+
+// ── #1138: a mid-task "you dropped" nudge needs a drop to have happened ──────
+//
+// The nudge injects a user message and writes to the durable transcript. Both are false,
+// and the injection is harmful, unless the orchestrator really died: telling a working
+// agent to resume makes it restart or duplicate what it is doing.
+//
+// The gap heuristic was right; the sentinel's arithmetic betrayed it. lastBridgeDownAt is
+// 0 until the bridge socket CLOSES, and `Date.now() - 0` is ~56 years — the longest
+// possible gap, read as the strongest possible evidence of a real restart. So the guard
+// was inverted exactly where it mattered: the better established that nothing dropped, the
+// more confidently it nudged. Reachable on a live socket because `ready` repeats on one and
+// #310 re-advertises after every successful free_vram.
+
+test("#1138: NEVER dropped must not nudge, however long the session has run", () => {
+  // The reported shape: a live socket, a re-advertise, a ready ack, and no drop anywhere.
+  // A real Date.now() against the 0 sentinel is ~56 years, which the old guard passed.
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: 0, now: Date.now() }),
+    false,
+  );
+  for (const noDrop of [undefined, null, 0, -1, NaN, Infinity, "0", "1700000000000", {}]) {
+    assert.equal(
+      shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: noDrop, now: Date.now() }),
+      false,
+      `no recorded drop must never nudge: ${JSON.stringify(noDrop)}`,
+    );
+  }
+  assert.equal(shouldNudgeAfterMidTaskReconnect(), false, "no arguments must not nudge");
+});
+
+test("#1138: a REAL restart still nudges — the fix must not disable the feature", () => {
+  // The behaviour #278/#588 rely on: a long gap after an actual drop is a real restart.
+  const now = 1_700_000_000_000;
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 30_000, now }),
+    true,
+  );
+  // Exactly at the boundary counts as real (>= minGapMs), so the threshold is not
+  // silently exclusive.
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 6000, now }),
+    true,
+  );
+});
+
+test("#1138: a FAST reconnect after a real drop still does not nudge", () => {
+  // The pre-existing half of the rule, preserved: a sidebar remount or a brief WS blip
+  // means the orchestrator never died, so the turn kept running.
+  const now = 1_700_000_000_000;
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 1, now }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 5999, now }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now, now }), false);
+});
+
+test("#1138: a NEGATIVE gap is not evidence of a long outage", () => {
+  // A wall-clock adjustment, or a drop stamped after this read, must not read as an
+  // ancient drop — the same class of mistake as the 0 sentinel, one step along.
+  const now = 1_700_000_000_000;
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now + 60_000, now }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ now, bridgeDroppedAt: now + 1 }), false);
+  // …and an unreadable clock decides nothing.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 30_000, now: NaN }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 30_000, now: "later" }), false);
+});
+
+test("#1138: the guard is INVERSION-SENSITIVE, unlike a source scan", () => {
+  // #1096's review proved by mutation that a token-presence source scan stays green when
+  // the guard is inverted. This asserts the two sides disagree, so an inverted or dropped
+  // condition cannot pass: the never-dropped case and the real-restart case must differ.
+  const now = 1_700_000_000_000;
+  const neverDropped = shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: 0, now });
+  const realRestart = shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: now - 30_000, now });
+  assert.notEqual(
+    neverDropped,
+    realRestart,
+    "if these ever agree, the guard has stopped distinguishing no-drop from a real restart",
+  );
+  assert.equal(neverDropped, false);
+  assert.equal(realRestart, true);
+});
+
+test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
+  // The predicate is tested by behaviour above; this covers the one thing a pure test
+  // cannot see — that the call site consults it in the right POLARITY. Dropping the
+  // negation would invert the fix into "nudge only when nothing dropped", which is worse
+  // than the original bug. An exact-substring claim on purpose: #1096's review proved by
+  // mutation that loose token-presence scans over this file assert nothing at all.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.ok(
+    src.includes(
+      "if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: lastBridgeDownAt, now: Date.now() }))",
+    ),
+    "the ready-ack mid-task branch must NEGATE the predicate and read the live drop stamp",
+  );
+  // The reverted sessionStorage twin must not return without its own review: every
+  // confirmed leak on this branch came from persisting that timestamp.
+  assert.doesNotMatch(src, /BRIDGE_DOWN_AT_KEY/, "the persisted drop timestamp stays reverted");
 });
