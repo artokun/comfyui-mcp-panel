@@ -125,8 +125,172 @@ test("#886 WIRING: the content proof consults it for a definitions surface", () 
   const src = readFileSync(join(ROOT, "web/js/lib/graph-binding.js"), "utf8");
   assert.match(src, /import \{ definitionsDifferOnlyByLinkRenumber \} from "\.\/definitions-renumber\.js";/);
   assert.match(src, /definitionsDifferOnlyByLinkRenumber\(state\?\.definitions, actualState\?\.definitions\)/);
-  // Any OTHER extra surface must still refuse outright.
-  assert.match(src, /else if \(extra\.length > 0\) \{\s*\n\s*return NOT_PROVEN;/);
-  // And `nodes` must still be required — this widened the tolerated set, not the gate.
-  assert.match(src, /if \(!surfaces\.includes\("nodes"\)\) return NOT_PROVEN;/);
+  // The surface set must be a SUBSET of { nodes, definitions }; anything else refuses.
+  assert.match(src, /s !== "nodes" && s !== "definitions"\)\) return NOT_PROVEN;/);
+  // `nodes` must NOT be mandatory. Requiring it refused the reported case outright:
+  // #886 is a graph where `definitions` is the ONLY differing surface, so the earlier
+  // gate wired this fix into a branch its own bug report could never reach (review).
+  assert.doesNotMatch(src, /if \(!surfaces\.includes\("nodes"\)\) return NOT_PROVEN;/);
+  assert.match(src, /if \(!unique\.includes\("nodes"\)\)/);
+});
+
+// ── The P0 direction: a genuinely different graph must NEVER read as renumbering ──
+//
+// Review found the first version waiving `links`, `inputs` and `outputs` wholesale, so
+// a re-wire or a renamed subgraph port passed as "only renumbering". Accepting a wrong
+// graph as bound is silent and destroys work; a false refusal is visible and
+// recoverable. These pin the asymmetry.
+
+const sgP0 = (over = {}) => ({
+  subgraphs: [
+    {
+      id: "sub-1",
+      name: "Detailer",
+      inputs: [{ name: "image", type: "IMAGE" }],
+      outputs: [{ name: "out", type: "IMAGE" }],
+      state: { lastLinkId: 2092, lastNodeId: 12 },
+      links: [
+        [11, 3, 0, 4, 0, "IMAGE"],
+        [12, 4, 0, 5, 1, "MASK"],
+      ],
+      nodes: [
+        { id: 3, type: "LoadImage", outputs: [{ links: [11] }] },
+        { id: 4, type: "VAEEncode", inputs: [{ link: 11 }], outputs: [{ links: [12] }] },
+        { id: 5, type: "KSampler", inputs: [{ link: null }, { link: 12 }] },
+      ],
+      ...over,
+    },
+  ],
+});
+
+/** The same graph after a load: every link id advanced, topology untouched. */
+const renumberedP0 = () =>
+  sgP0({
+    state: { lastLinkId: 2106, lastNodeId: 12 },
+    links: [
+      [211, 3, 0, 4, 0, "IMAGE"],
+      [212, 4, 0, 5, 1, "MASK"],
+    ],
+    nodes: [
+      { id: 3, type: "LoadImage", outputs: [{ links: [211] }] },
+      { id: 4, type: "VAEEncode", inputs: [{ link: 211 }], outputs: [{ links: [212] }] },
+      { id: 5, type: "KSampler", inputs: [{ link: null }, { link: 212 }] },
+    ],
+  });
+
+test("#886 the MEASURED case still passes: pure link renumbering", () => {
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), renumberedP0()), true);
+});
+
+test("#886 P0: a RE-WIRED link is not renumbering", () => {
+  // Same link count, same ids, different target slot. The waived-links version accepted
+  // this; it is a different graph.
+  const rewired = sgP0({
+    links: [
+      [11, 3, 0, 4, 0, "IMAGE"],
+      [12, 4, 0, 5, 0, "MASK"],
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), rewired), false);
+});
+
+test("#886 P0: a link pointing at a DIFFERENT node is not renumbering", () => {
+  const moved = sgP0({
+    links: [
+      [11, 3, 0, 4, 0, "IMAGE"],
+      [12, 4, 0, 3, 1, "MASK"],
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), moved), false);
+});
+
+test("#886 P0: an ADDED or REMOVED link is not renumbering", () => {
+  const added = sgP0({ links: [...sgP0().subgraphs[0].links, [13, 3, 0, 5, 0, "IMAGE"]] });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), added), false);
+  const removed = sgP0({ links: [sgP0().subgraphs[0].links[0]] });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), removed), false);
+});
+
+test("#886 P0: a RENAMED or RETYPED interface port is not renumbering", () => {
+  // inputs/outputs are the subgraph contract with the outside graph.
+  assert.equal(
+    definitionsDifferOnlyByLinkRenumber(sgP0(), sgP0({ inputs: [{ name: "picture", type: "IMAGE" }] })),
+    false,
+  );
+  assert.equal(
+    definitionsDifferOnlyByLinkRenumber(sgP0(), sgP0({ outputs: [{ name: "out", type: "MASK" }] })),
+    false,
+  );
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), sgP0({ inputs: [] })), false);
+});
+
+test("#886 P0: a changed node TYPE or widget value is not renumbering", () => {
+  const retyped = sgP0({
+    nodes: [
+      { id: 3, type: "LoadImageMask", outputs: [{ links: [11] }] },
+      ...sgP0().subgraphs[0].nodes.slice(1),
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), retyped), false);
+  const rewidgeted = sgP0({
+    nodes: [
+      { id: 3, type: "LoadImage", outputs: [{ links: [11] }], widgets_values: ["b.png"] },
+      ...sgP0().subgraphs[0].nodes.slice(1),
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), rewidgeted), false);
+});
+
+test("#886 P0: a slot that GAINED a connection is not renumbering", () => {
+  const gained = sgP0({
+    nodes: [
+      { id: 3, type: "LoadImage", outputs: [{ links: [11, 99] }] },
+      ...sgP0().subgraphs[0].nodes.slice(1),
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), gained), false);
+});
+
+test("#886 P1: duplicate node identities refuse rather than overwrite", () => {
+  // A Map that lets a later entry overwrite an earlier one can hide a change in the
+  // overwritten node. Not addressable => cannot tell => refuse.
+  const dup = sgP0({
+    nodes: [
+      { id: 3, type: "LoadImage", outputs: [{ links: [11] }] },
+      { id: 3, type: "LoadImage", outputs: [{ links: [11] }] },
+    ],
+  });
+  // Two DISTINCT instances: passing the same object twice short-circuits as identical,
+  // which would test nothing.
+  const dup2 = sgP0({
+    nodes: [
+      { id: 3, type: "LoadImage", outputs: [{ links: [11] }] },
+      { id: 3, type: "LoadImage", outputs: [{ links: [11] }] },
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(dup, dup2), false);
+});
+
+test("#886 P1: a node missing an id or type refuses", () => {
+  const noId = sgP0({ nodes: [{ type: "LoadImage" }] });
+  const noType = sgP0({ nodes: [{ id: 3 }] });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(noId, sgP0({ nodes: [{ type: "LoadImage" }] })), false);
+  assert.equal(definitionsDifferOnlyByLinkRenumber(noType, sgP0({ nodes: [{ id: 3 }] })), false);
+});
+
+test("#886 P2: a cyclic structure fails closed instead of throwing", () => {
+  // JSON.stringify threw here, turning a "not proven" answer into an exception on the
+  // guard path.
+  const a = sgP0();
+  const b = renumberedP0();
+  b.subgraphs[0].extra = {};
+  b.subgraphs[0].extra.self = b.subgraphs[0].extra;
+  assert.doesNotThrow(() => definitionsDifferOnlyByLinkRenumber(a, b));
+  assert.equal(definitionsDifferOnlyByLinkRenumber(a, b), false);
+});
+
+test("#886 a differing subgraph COUNT refuses", () => {
+  const two = sgP0();
+  two.subgraphs.push(sgP0().subgraphs[0]);
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), two), false);
 });

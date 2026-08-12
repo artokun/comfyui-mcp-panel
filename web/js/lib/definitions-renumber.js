@@ -1,43 +1,39 @@
 /**
- * #886 — a `definitions` difference that is ONLY link renumbering.
+ * comfyui-mcp-panel#886 — `panel_open_workflow` reported an UNCONFIRMED failure even
+ * though the binding was correct.
  *
- * ## Measured, not inferred
+ * Measured on the rig: loading a persisted workflow REGENERATES link identity inside
+ * `definitions.subgraphs` (`state.lastLinkId` 2092 -> 2106) without changing anything
+ * a user would call a difference. The binding check saw the `definitions` surface
+ * differ and refused, so a correct binding was reported as unproven.
  *
- * Diffing a real saved workflow's raw disk JSON against its serialized state after
- * load (`Anima Wojak Batch.json`, 4 subgraph definitions, panel 0.14.14 / frontend
- * 1.48.7):
+ * ## The danger this file has to respect
  *
- *   - node count, node ids and node types inside each subgraph: IDENTICAL
- *   - the only differing node field: `inputs` — and each entry's `localized_name`,
- *     `name` and `type` are byte-identical, so what moved is the link reference
- *   - `links`: differ
- *   - `state.lastLinkId`: 2092 -> 2106
+ * This predicate feeds the guard that decides whether the panel's graph writes are
+ * allowed to land. Its two error directions are NOT symmetric:
  *
- * The frontend regenerates link identity inside subgraph definitions when it loads a
- * workflow. Nothing semantic moves — same nodes, same ids, same types, same topology.
+ *   - too strict  -> a false refusal. Annoying, recoverable, visible.
+ *   - too lenient -> writes applied to the WRONG graph. Silent, and destroys work.
  *
- * ## Why this exists
+ * A first version of this file was refused by review for being too lenient in exactly
+ * that way: it waived whole fields (`links`, `inputs`, `outputs`) without comparing
+ * them, so a re-wired link or a renamed subgraph port read as "only renumbering". Two
+ * P0s. Everything below is written to fail CLOSED — anything it cannot fully account
+ * for returns false, which the caller reads as "not proven", never as "changed".
  *
- * `graphRootReproducesStateContent` refuses any surface other than `nodes`, so a
- * faithful open of ANY workflow containing subgraphs reported CONTENT_UNVERIFIED:
- * binding proven, node comparison perfect, refused on a surface nobody had
- * characterised. That is #886, and it is why the node-geometry allowlist (which made
- * the `nodes` surface tolerant) did not close it — the difference is not in `nodes`.
+ * ## What renumbering actually is
  *
- * ## Why it is this narrow
- *
- * The guard's failure mode is a wrong-graph open reported as SUCCESS (#968), so
- * "tolerate `definitions`" is not available. This tolerates one named normalisation
- * and nothing else: a node added, removed, retyped, or a changed widget value still
- * fails, exactly as before. Same discipline as the node-geometry rule — name the
- * normalisation, admit only it.
+ * Link IDS are reassigned; link TOPOLOGY is not. So a difference is renumbering only if
+ * every link still connects the same origin node+slot to the same target node+slot, in
+ * the same quantity — and every other surface is byte-identical. Identity is compared
+ * by POSITION-INDEPENDENT endpoint signature, never by id.
  */
 
-/** Fields inside a subgraph definition that link renumbering is allowed to move.
- *  `nodes` is here because node slots carry the link references that get rewritten —
- *  it is NOT waved through: `nodesDifferOnlyInLinkRefs` then checks every node field
- *  and every slot, so the only thing that may actually differ is the link id. */
-const RENUMBER_FIELDS = new Set(["links", "state", "inputs", "outputs", "nodes"]);
+/** Fields inside a subgraph definition that renumbering may touch AT ALL. Anything
+ *  outside this set must be deep-equal. `inputs`/`outputs` are deliberately NOT here:
+ *  they are the subgraph's interface ports, and renaming or retyping one is a semantic
+ *  change to the graph (review found the earlier version waving them through). */
+const RENUMBER_FIELDS = new Set(["links", "state", "nodes"]);
 
 /** The `state` counters renumbering may advance. Everything else in `state` is
  *  structural (how many nodes/groups the subgraph has ever had) and must match. */
@@ -45,79 +41,214 @@ const RENUMBER_STATE_KEYS = new Set(["lastLinkId", "lastRerouteId"]);
 
 const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 
+/**
+ * Deep equality that cannot throw and cannot recurse forever.
+ *
+ * The earlier version compared with `JSON.stringify`, which throws on a cyclic
+ * structure — turning a "not proven" answer into an exception on the guard path.
+ * Depth-bounded, cycle-aware, and key-order independent.
+ */
+function deepEqual(a, b, seen = new Set(), depth = 0) {
+  if (a === b) return true;
+  if (depth > 64) return false; // deeper than any real definition; fail closed
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object") return Number.isNaN(a) && Number.isNaN(b);
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  // A cycle on either side means we cannot decide; fail closed rather than loop.
+  if (seen.has(a) || seen.has(b)) return false;
+  seen.add(a);
+  seen.add(b);
+  try {
+    if (Array.isArray(a)) {
+      if (a.length !== b.length) return false;
+      return a.every((v, i) => deepEqual(v, b[i], seen, depth + 1));
+    }
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    return ka.every(
+      (k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k], seen, depth + 1),
+    );
+  } finally {
+    seen.delete(a);
+    seen.delete(b);
+  }
+}
+
 /** Same keys, and every key outside `allowed` deep-equal. */
 function differsOnlyIn(a, b, allowed) {
   if (!isObj(a) || !isObj(b)) return false;
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
   for (const k of keys) {
     if (allowed.has(k)) continue;
-    if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) return false;
+    if (!deepEqual(a[k], b[k])) return false;
   }
   return true;
 }
 
-/** The node SET and TYPES must be identical — that is the part that makes this safe.
- *  Ids are compared as strings because a definition may carry either. */
-function sameNodeIdentity(a, b) {
-  const list = (d) => (Array.isArray(d?.nodes) ? d.nodes : null);
-  const an = list(a);
-  const bn = list(b);
-  if (!an || !bn || an.length !== bn.length) return false;
-  const key = (n) => `${String(n?.id)}|${String(n?.type)}`;
-  const as = an.map(key).sort();
-  const bs = bn.map(key).sort();
-  return as.every((v, i) => v === bs[i]);
+/**
+ * A link's ENDPOINTS, ignoring its id.
+ *
+ * Litegraph serializes a link as either an array
+ * `[id, originId, originSlot, targetId, targetSlot, type]` or an object. Both shapes
+ * appear across frontend versions, so both are read; an unrecognised shape returns
+ * null, which fails the comparison closed.
+ */
+function linkEndpoints(link) {
+  if (Array.isArray(link)) {
+    if (link.length < 5) return null;
+    const [, oId, oSlot, tId, tSlot, type] = link;
+    return `${String(oId)}:${String(oSlot)}>${String(tId)}:${String(tSlot)}|${String(type ?? "")}`;
+  }
+  if (isObj(link)) {
+    const o = link.origin_id ?? link.originId;
+    const os = link.origin_slot ?? link.originSlot;
+    const t = link.target_id ?? link.targetId;
+    const ts = link.target_slot ?? link.targetSlot;
+    if (o === undefined || t === undefined) return null;
+    return `${String(o)}:${String(os)}>${String(t)}:${String(ts)}|${String(link.type ?? "")}`;
+  }
+  return null;
 }
 
-/** Every node's fields match except `inputs`/`outputs`, whose entries match except
- *  for their link references. A changed widget value or a moved node still fails. */
+/**
+ * Do two link collections describe the SAME wiring, differing only in ids?
+ *
+ * Compared as multisets of endpoint signatures, so order is irrelevant and a duplicate
+ * connection is not silently collapsed. Any link whose shape cannot be read fails the
+ * whole comparison — this is the surface the earlier version waived entirely, and it is
+ * where a re-wire would hide.
+ */
+function linksDifferOnlyById(a, b) {
+  const listA = Array.isArray(a) ? a : a == null ? [] : null;
+  const listB = Array.isArray(b) ? b : b == null ? [] : null;
+  if (listA === null || listB === null) return false;
+  if (listA.length !== listB.length) return false;
+  const count = (list) => {
+    const m = new Map();
+    for (const l of list) {
+      const sig = linkEndpoints(l);
+      if (sig === null) return null;
+      m.set(sig, (m.get(sig) ?? 0) + 1);
+    }
+    return m;
+  };
+  const ma = count(listA);
+  const mb = count(listB);
+  if (!ma || !mb || ma.size !== mb.size) return false;
+  for (const [sig, n] of ma) if (mb.get(sig) !== n) return false;
+  return true;
+}
+
+/** Identity of a node inside a definition. Requires BOTH id and type: a node missing
+ *  either cannot be matched, and guessing would let an unmatched node pass. */
+function nodeKey(n) {
+  const id = n?.id;
+  const type = n?.type;
+  if (id === undefined || id === null) return null;
+  if (typeof type !== "string" || !type) return null;
+  return `${typeof id}:${String(id)}|${type}`;
+}
+
+/**
+ * Index nodes by identity, refusing on duplicates.
+ *
+ * The earlier version built a Map and let a later entry overwrite an earlier one, so
+ * two nodes sharing a key could hide a change in the one that was overwritten (review).
+ * A duplicate key means the set is not addressable, so the answer is "cannot tell".
+ */
+function indexNodes(list) {
+  if (!Array.isArray(list)) return null;
+  const m = new Map();
+  for (const n of list) {
+    const k = nodeKey(n);
+    if (k === null || m.has(k)) return null;
+    m.set(k, n);
+  }
+  return m;
+}
+
+/** Nodes match as a set, and each node differs at most in the link ids its slots
+ *  reference. Slot COUNTS and every non-link field must be identical. */
 function nodesDifferOnlyInLinkRefs(a, b) {
-  const byId = (d) => new Map((d.nodes ?? []).map((n) => [String(n?.id), n]));
-  const bm = byId(b);
-  for (const an of a.nodes ?? []) {
-    const bn = bm.get(String(an?.id));
-    if (!bn) return false;
-    if (!differsOnlyIn(an, bn, new Set(["inputs", "outputs"]))) return false;
+  const ia = indexNodes(a);
+  const ib = indexNodes(b);
+  if (!ia || !ib || ia.size !== ib.size) return false;
+  for (const [k, na] of ia) {
+    const nb = ib.get(k);
+    if (!nb) return false;
+    if (!differsOnlyIn(na, nb, new Set(["inputs", "outputs"]))) return false;
+    // Slot arrays may differ ONLY in the link ids they carry.
     for (const side of ["inputs", "outputs"]) {
-      const ai = Array.isArray(an[side]) ? an[side] : [];
-      const bi = Array.isArray(bn[side]) ? bn[side] : [];
-      if (ai.length !== bi.length) return false;
-      for (let i = 0; i < ai.length; i++) {
-        // `link`/`links` are the regenerated identity; everything else about the
-        // slot (name, localized_name, type, widget, shape) must be unchanged.
-        if (!differsOnlyIn(ai[i], bi[i], new Set(["link", "links", "slot_index"]))) return false;
+      const sa = na[side];
+      const sb = nb[side];
+      if (sa == null && sb == null) continue;
+      if (!Array.isArray(sa) || !Array.isArray(sb) || sa.length !== sb.length) return false;
+      for (let i = 0; i < sa.length; i += 1) {
+        if (!differsOnlyIn(sa[i], sb[i], new Set(["link", "links", "_layoutElement"]))) return false;
+        // The link REFERENCES may be renumbered, but their COUNT may not change:
+        // a slot that gained or lost a connection is a re-wire, not a renumber.
+        const la = sa[i]?.links;
+        const lb = sb[i]?.links;
+        if (Array.isArray(la) !== Array.isArray(lb)) return false;
+        if (Array.isArray(la) && la.length !== lb.length) return false;
+        const oneA = sa[i]?.link;
+        const oneB = sb[i]?.link;
+        if ((oneA == null) !== (oneB == null)) return false;
       }
     }
   }
   return true;
 }
 
+/** One subgraph definition, compared. */
+function definitionDiffersOnlyByRenumber(a, b) {
+  if (!isObj(a) || !isObj(b)) return false;
+  if (!differsOnlyIn(a, b, RENUMBER_FIELDS)) return false;
+  if (!linksDifferOnlyById(a.links, b.links)) return false;
+  if (!nodesDifferOnlyInLinkRefs(a.nodes ?? [], b.nodes ?? [])) return false;
+  if (!differsOnlyIn(a.state ?? {}, b.state ?? {}, RENUMBER_STATE_KEYS)) return false;
+  return true;
+}
+
 /**
- * Is the whole `definitions` difference explained by link renumbering?
+ * Do two `definitions` blocks differ ONLY by link renumbering?
  *
- * Returns false for anything it cannot fully account for — an unreadable shape, a
- * different subgraph set, a changed node set, a moved widget value. The caller must
- * treat false as "not proven", never as "changed".
+ * Returns false for anything it cannot fully account for. The caller reads false as
+ * "not proven" and refuses — which is the safe direction.
  */
 export function definitionsDifferOnlyByLinkRenumber(a, b) {
-  if (a === undefined && b === undefined) return false; // nothing to explain
+  // Shape check FIRST, before any identity shortcut. `undefined === undefined` is not
+  // evidence of anything: two sides we cannot read must fail closed, not compare equal.
   if (!isObj(a) || !isObj(b)) return false;
-  // Only `subgraphs` is understood; a future key appearing here must NOT be waved
-  // through by a rule written before it existed.
-  if (!differsOnlyIn(a, b, new Set(["subgraphs"]))) return false;
-
-  const as = Array.isArray(a.subgraphs) ? a.subgraphs : null;
-  const bs = Array.isArray(b.subgraphs) ? b.subgraphs : null;
-  if (!as || !bs || as.length !== bs.length) return false;
-
-  const bById = new Map(bs.map((d) => [String(d?.id), d]));
-  for (const ad of as) {
-    const bd = bById.get(String(ad?.id));
-    if (!bd) return false;
-    if (!differsOnlyIn(ad, bd, RENUMBER_FIELDS)) return false;
-    if (!sameNodeIdentity(ad, bd)) return false;
-    if (!nodesDifferOnlyInLinkRefs(ad, bd)) return false;
-    if (!differsOnlyIn(ad.state ?? {}, bd.state ?? {}, RENUMBER_STATE_KEYS)) return false;
+  if (a === b) return true;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    if (k !== "subgraphs") {
+      if (!deepEqual(a[k], b[k])) return false;
+      continue;
+    }
+    const sa = a.subgraphs;
+    const sb = b.subgraphs;
+    if (sa == null && sb == null) continue;
+    // Subgraphs appear as an array or a keyed map depending on version.
+    const listA = Array.isArray(sa) ? sa : isObj(sa) ? Object.entries(sa) : null;
+    const listB = Array.isArray(sb) ? sb : isObj(sb) ? Object.entries(sb) : null;
+    if (listA === null || listB === null || listA.length !== listB.length) return false;
+    if (Array.isArray(sa) !== Array.isArray(sb)) return false;
+    if (Array.isArray(sa)) {
+      for (let i = 0; i < listA.length; i += 1) {
+        if (!definitionDiffersOnlyByRenumber(listA[i], listB[i])) return false;
+      }
+    } else {
+      const mapB = new Map(listB);
+      if (mapB.size !== listA.length) return false;
+      for (const [key, defA] of listA) {
+        if (!mapB.has(key)) return false;
+        if (!definitionDiffersOnlyByRenumber(defA, mapB.get(key))) return false;
+      }
+    }
   }
   return true;
 }
