@@ -13333,7 +13333,12 @@ const GRAPH_TOOL_EXECUTORS = {
                 "— but it replaces what is on the canvas, and the canvas may be another workflow's " +
                 "with ITS unsaved work on it. So do NOT plain-save first: the active identity already " +
                 "names the workflow you asked for, so a save would write that other graph over it. " +
-                "Preserve it to a NEW path (Save As or an export) if you need it, then load.",
+                "Preserve it to a NEW path (Save As or an export) if you need it, then load. Call " +
+                "panel_list_workflows BEFORE the load: this reply carries no fence refresh — a refused " +
+                "open publishes no workflow_uuid — and panel_load_workflow is NOT exempt from the " +
+                "fence, so a command stamped from an older identity is refused as a workflow instance " +
+                "mismatch. panel_list_workflows is exempt (#932) and republishes the active identity, " +
+                "which permits the load. Reloading the panel is NOT required (#702).",
             );
           } else {
             // A graph shape is not ownership proof: two dirty tabs can have the same

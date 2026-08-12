@@ -986,6 +986,14 @@ test("#1089: the refusal is wired BEFORE loadGraphData, and says the canvas was 
   // workflow's with its own unsaved work, which the disk load replaces.
   assert.match(guardBlock, /the tab had no unsaved edits/);
   assert.match(guardBlock, /it replaces what is on the canvas/);
+  // #932/#702 — the recovery must be REACHABLE. A refused open publishes no
+  // workflow_uuid, and panel_load_workflow is not canvas-targetless, so a stamped
+  // load is refused as an instance mismatch. Naming it without naming the exempt
+  // probe first is the circularity #932's own header warns about: "the refusal text
+  // advertising a recovery that was itself refused for the same reason."
+  assert.match(guardBlock, /panel_list_workflows BEFORE the load/);
+  assert.match(guardBlock, /carries no fence refresh/);
+  assert.match(guardBlock, /Reloading the panel is NOT required/);
   // And it must be a REFUSAL, not a disclosure riding a success.
   assert.match(guardBlock, /rebindFailed = new Error\(/);
 });
