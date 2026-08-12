@@ -288,3 +288,52 @@ test("#1085 (codex): an equal object is NOT aliased to the definition's default"
   assert.equal(node.widgets[0].value, widgetValue, "still the widget's own object");
   assert.notEqual(node.widgets[0].value, defDefault, "and not the definition's");
 });
+
+// ---- codex round 4: a live value can be hostile ----------------------------
+
+test("#1085 (codex r4): a revoked or throwing PROXY answers 'different', never throws", () => {
+  // The path this replaced was a bare `!==`, which touches nothing. Every structural read
+  // here — Array.isArray, getPrototypeOf, Reflect.ownKeys, getOwnPropertyDescriptor, a
+  // property read — is a proxy trap point, so without a guard adding a node could FAIL
+  // where it used to succeed.
+  const { proxy, revoke } = Proxy.revocable({ x: 1 }, {});
+  revoke();
+  let corrections;
+  assert.doesNotThrow(() => {
+    corrections = applyCurrentDefWidgetValues(nodeWith("cfg", proxy), defWith("cfg", { default: { x: 1 } }));
+  });
+  assert.equal(corrections.length, 1, "answers 'different' — the pre-fix behaviour");
+
+  const hostile = new Proxy(
+    { x: 1 },
+    {
+      ownKeys() {
+        throw new Error("trap");
+      },
+    },
+  );
+  assert.doesNotThrow(() => {
+    applyCurrentDefWidgetValues(nodeWith("cfg", hostile), defWith("cfg", { default: { x: 1 } }));
+  });
+});
+
+test("#1085 (codex r4): a DEEP but finite equal default is not falsely corrected", () => {
+  // The cap was 8, so any structurally-equal default nested beyond nine levels reported a
+  // spurious correction — the very thing this fix exists to remove — and then reassigned,
+  // re-aliasing the widget to the definition's object. The cap now exists only to bound a
+  // cycle, well past any real widget default.
+  const deep = (n) => (n === 0 ? { leaf: 1 } : { nest: deep(n - 1) });
+  const node = nodeWith("cfg", deep(30));
+  assert.deepEqual(
+    applyCurrentDefWidgetValues(node, defWith("cfg", { default: deep(30) })),
+    [],
+    "30 levels of identical structure is not a change",
+  );
+  // A difference at the bottom of that same depth is still found.
+  const changed = nodeWith("cfg", deep(30));
+  const other = deep(30);
+  let cur = other;
+  while (cur.nest) cur = cur.nest;
+  cur.leaf = 2;
+  assert.equal(applyCurrentDefWidgetValues(changed, defWith("cfg", { default: other })).length, 1);
+});

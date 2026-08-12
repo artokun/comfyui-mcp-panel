@@ -689,12 +689,29 @@ function isArrayIndexKey(key) {
  *  second mechanism. Prototypes must match too, so a plain object never compares equal to a
  *  class instance that happens to carry the same keys.
  *
- *  DEPTH-CAPPED, and it fails toward TODAY'S behaviour: a structure deeper than any real
- *  widget value — or a cyclic one, which a live widget could hold even though an
- *  /object_info default cannot — returns "different", which is exactly what `!==` answered
- *  before this existed. So the cap can cost a spurious correction, never a missed one.
+ *  FAILS TOWARD TODAY'S BEHAVIOUR throughout: a cyclic value, a proxy that throws, or any
+ *  other refusal answers "different", which is exactly what `!==` answered before this
+ *  existed. Every guard here can therefore cost a spurious correction and never a missed one.
  */
-function sameWidgetValue(a, b, depth = 0) {
+function sameWidgetValue(a, b) {
+  // GUARDED ENTRY (codex). Everything below can touch a live widget value, and a live value
+  // can be a PROXY: Array.isArray, getPrototypeOf, Reflect.ownKeys,
+  // getOwnPropertyDescriptor, hasOwnProperty and a plain property read are all trap points,
+  // and a REVOKED proxy throws on the first of them. The path this replaced was a bare
+  // `!==`, which touches nothing — so without this, adding a node could fail outright where
+  // it used to succeed. Any throw (including a RangeError from an over-deep structure)
+  // answers "different", which is exactly what `!==` said.
+  //
+  // A trap that HANGS rather than throws is not guardable from here, and is not introduced
+  // by this change alone — any structural read of such a value has the same exposure.
+  try {
+    return sameWidgetValueDeep(a, b, 0);
+  } catch {
+    return false;
+  }
+}
+
+function sameWidgetValueDeep(a, b, depth) {
   // Numbers first, so the two IEEE oddities are answered deliberately rather than by
   // whichever operator happened to be used: NaN equals NaN (a NaN default would otherwise
   // "change" on every single add), and -0 equals +0 (Object.is alone says they differ, which
@@ -703,7 +720,12 @@ function sameWidgetValue(a, b, depth = 0) {
     return a === b || (Number.isNaN(a) && Number.isNaN(b));
   }
   if (Object.is(a, b)) return true;
-  if (depth > 8) return false;
+  // CYCLE BOUND, not a shape limit (codex). At 8 this reported a SPURIOUS correction for any
+  // structurally-equal default nested beyond nine levels — the very thing this fix exists to
+  // stop — and then reassigned it, re-aliasing the widget to the definition's object. Raised
+  // well past anything a widget default can plausibly be, so only a cycle reaches it; a cycle
+  // then answers "different", which is what `!==` said and is the safe direction.
+  if (depth > 100) return false;
   if (a === null || b === null) return false;
   if (typeof a !== "object" || typeof b !== "object") return false;
 
@@ -727,7 +749,7 @@ function sameWidgetValue(a, b, depth = 0) {
     if (!aIdx.every(isArrayIndexKey) || !bIdx.every(isArrayIndexKey)) return false;
     for (const key of aIdx) {
       if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
-      if (!sameWidgetValue(a[key], b[key], depth + 1)) return false;
+      if (!sameWidgetValueDeep(a[key], b[key], depth + 1)) return false;
     }
     return true;
   }
@@ -752,7 +774,7 @@ function sameWidgetValue(a, b, depth = 0) {
   if (!aKeys || !bKeys) return false;
   if (aKeys.length !== bKeys.length) return false;
   return aKeys.every(
-    (k) => Object.prototype.hasOwnProperty.call(b, k) && sameWidgetValue(a[k], b[k], depth + 1),
+    (k) => Object.prototype.hasOwnProperty.call(b, k) && sameWidgetValueDeep(a[k], b[k], depth + 1),
   );
 }
 
