@@ -100,17 +100,25 @@ test("#996 the report states what would settle it, and names no suspect", () => 
     describeQueuePromptChain({ app: makeApp({ shadowed: true }), api: makeApi({ shadowed: true }) }),
   );
   assert.match(shadowed, /observed, not a diagnosis/);
-  assert.match(shadowed, /whether the replacement passes its THIRD argument through/);
+  assert.match(shadowed, /whether whatever is installed passes its THIRD argument through/);
   // The suspect-naming codex killed.
   assert.doesNotMatch(shadowed, /the thing to look at/i);
   assert.doesNotMatch(shadowed, /PATCHED by an extension/i);
-  // …and it acknowledges that shadowing is ordinary rather than incriminating.
-  assert.match(shadowed, /which is normal/);
+  // codex round 2: nor "something REPLACED it" — a frontend binding its own method
+  // in a constructor produces the same own property.
+  assert.doesNotMatch(shadowed, /replaced one of those methods/i);
+  assert.match(shadowed, /is ordinary/);
+  assert.match(shadowed, /where to look, not who to blame/);
 
   const unshadowed = describeQueuePromptChainForReport(
     describeQueuePromptChain({ app: makeApp(), api: makeApi() }),
   );
-  assert.match(unshadowed, /Neither method is shadowed here/);
+  // codex round 2: absence of shadowing rules out ONE PLACEMENT. A wrapper on the
+  // prototype leaves no own property, so this must not be read as "the frontend's
+  // own code had it".
+  assert.match(unshadowed, /rules out one placement only/);
+  assert.match(unshadowed, /installed on the PROTOTYPE leaves no own property/);
+  assert.doesNotMatch(unshadowed, /reached the frontend's own code and was lost/);
 });
 
 test("#996 arity is NOT reported — it reads like a signal and is noise", () => {
@@ -133,7 +141,8 @@ test("#996 stops asking for the datum that already failed twice", () => {
 });
 
 test("#996 never throws on hostile input — it runs on a failure path", () => {
-  for (const bad of [undefined, {}, { app: null, api: null }, { app: 1, api: "x" }]) {
+  // `null` included: destructuring in the signature threw on it (codex round 2).
+  for (const bad of [undefined, null, {}, { app: null, api: null }, { app: 1, api: "x" }]) {
     const chain = describeQueuePromptChain(bad);
     assert.equal(typeof chain.summary, "string");
     assert.equal(typeof describeQueuePromptChainForReport(chain), "string");

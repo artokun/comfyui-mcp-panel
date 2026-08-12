@@ -80,7 +80,11 @@ function prototypeMentionsOption(api) {
  *   this is testable without a browser, and so the CALLER's property access is not
  *   this module's failure mode.
  */
-export function describeQueuePromptChain({ app, api } = {}) {
+export function describeQueuePromptChain(deps) {
+  // Destructuring in the signature throws on an explicit `null` — which a
+  // failure-path helper must not do, whatever its current callers pass (codex).
+  const app = readProp(deps, "app");
+  const api = readProp(deps, "api");
   const appShadowed = shadowsPrototype(app, "queuePrompt");
   const apiShadowed = shadowsPrototype(api, "queuePrompt");
   const protoMentionsOption = prototypeMentionsOption(api);
@@ -113,11 +117,17 @@ export function describeQueuePromptChainForReport(chain) {
   if (!chain) return "";
   const shadowed = chain.appShadowed || chain.apiShadowed;
   const next = shadowed
-    ? ` Something on this page replaced one of those methods, which is normal — many extensions ` +
-      `do, and most forward their arguments correctly. What would settle it is whether the ` +
-      `replacement passes its THIRD argument through.`
-    : ` Neither method is shadowed here, so the argument reached the frontend's own code and was ` +
-      `lost at or after that point.`;
+    ? // NOT "something replaced it": an own property is shadowing, and a frontend
+      // that binds its own method in a constructor looks identical (codex round 2).
+      ` An own property shadowing the prototype is ordinary — a frontend may bind its own, and ` +
+      `many extensions wrap these — so this is where to look, not who to blame. What would ` +
+      `settle it is whether whatever is installed passes its THIRD argument through.`
+    : // NOT "so it reached the frontend's own code": a wrapper installed ON THE
+      // PROTOTYPE leaves no own property, so absence of shadowing rules out one
+      // placement, not interception (codex round 2).
+      ` Nothing shadows either method at the instance level. That rules out one placement only — ` +
+      `a wrapper installed on the PROTOTYPE leaves no own property and looks exactly like this — ` +
+      `so it does not establish that the argument reached the frontend's own code.`;
   return (
     ` QUEUE CHAIN (observed, not a diagnosis): ${chain.summary}.${next} Please include THIS line ` +
     `if you report it, together with the body keys above — the ComfyUI_frontend version alone has ` +
