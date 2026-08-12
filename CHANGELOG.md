@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.14] - 2026-08-12
+
+### Fixed
+
+- **The panel now says WHICH tool vocabulary it vendored, at connect (#236).**
+  The panel calls MCP tool names as bare string literals and validates them
+  against a vendored copy of the vocabulary — which proves the literals match
+  that copy, never that the copy matches the server it is talking to. When the
+  two disagreed, the failure surfaced at call time as `unknown tool`, which
+  reads as a broken panel and gives an agent nothing to act on.
+  The hello now carries a hash of the vendored vocabulary, and the orchestrator
+  compares it at connect (comfyui-mcp 0.51.13). A version string cannot do this
+  job: two builds of one version can carry different vocabularies, and two
+  versions can carry identical ones.
+  Safe in both directions of skew — an orchestrator that predates the check
+  ignores the field, and one that has it reads an ABSENT hash as unverified,
+  never as disagreement.
+- **Re-vendored the tool vocabulary.** The first live run of that handshake
+  found real drift: the vendored copy was missing `panel_remove_widget`, 91
+  panel tools against the server's 92. Found by the mechanism built for it
+  rather than by someone hitting `unknown tool`.
+
 ## [0.14.13] - 2026-08-11
 
 ### Fixed
