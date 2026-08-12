@@ -240,6 +240,7 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
+import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
   describeQueuePromptChainForReport,
@@ -15417,7 +15418,16 @@ const GRAPH_TOOL_EXECUTORS = {
       ds.offset[0] = fit.offsetX;
       ds.offset[1] = fit.offsetY;
       canvas.setDirty?.(true, true);
-      canvas.draw(true, true); // synchronous redraw at the fitted transform
+      // #1108 — a THROW from here is the frontend's render path, not ours. Raw, it
+      // surfaced as "Cannot read properties of undefined (reading 'name')" to a
+      // reporter who was trying to screenshot a frozen canvas: the one tool that
+      // could have shown them the problem, failing with a message that reads like a
+      // panel bug. Say what it is, what still works, and what clears it.
+      try {
+        canvas.draw(true, true); // synchronous redraw at the fitted transform
+      } catch (err) {
+        throw new Error(describeCanvasDrawFailure(err));
+      }
       const MAXW = 1600;
       if (cv.width > MAXW) {
         const s = MAXW / cv.width;
