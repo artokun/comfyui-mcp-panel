@@ -2831,6 +2831,10 @@ const RELOAD_POST_TIMEOUT_MS = 10000;
 // resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
 // (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
 const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
+// #1138 — the bridge-drop timestamp, persisted alongside MID_TASK_KEY so the two are read
+// symmetrically. The mid-task marker survives a page reload; without this the timestamp it
+// is weighed against would not, and a reload after a REAL restart would stop nudging.
+const BRIDGE_DOWN_AT_KEY = "comfyui-mcp.panel.lastBridgeDownAt";
 // Wall-clock (ms) of the last bridge drop — module-scoped so it survives panel
 // remounts. A FAST reconnect (panel swap / WS blip; orchestrator alive) vs a
 // SLOW one (real ComfyUI restart; orchestrator died + respawned) is how we tell
@@ -18144,6 +18148,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       pendingCalls.clear();
       clearHandshake();
       lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
+      // #1138 — PERSISTED, because the flag it is weighed against is. MID_TASK_KEY lives
+      // in sessionStorage and so survives a page reload, while this timestamp is module
+      // state and does not. Requiring a recorded drop (the fix) would therefore have
+      // silently retired the nudge for "reloaded the browser after a real restart" — a
+      // case the nudge is genuinely for, and one users depend on (#278/#588). Writing it
+      // beside the marker keeps the two readings symmetric, so only a session that never
+      // observed a drop AT ALL suppresses — which is exactly the case where the panel
+      // cannot tell whether the agent kept running, and suppressing is the safe answer.
+      try {
+        ssSet(BRIDGE_DOWN_AT_KEY, String(lastBridgeDownAt));
+      } catch {
+        // sessionStorage unavailable ⇒ the module value still serves this page's own
+        // lifetime; only the across-reload case degrades, and it degrades to no nudge.
+      }
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
         // connecting-vs-terminal based on the patience window). Do NOT flip to
@@ -27270,7 +27288,24 @@ function buildPanel() {
         // A source-scan over this file could only assert the guard's tokens are present,
         // and #1096's review demonstrated by mutation that such a test stays green when
         // the guard is inverted — which is the one regression that matters here.
-        if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: lastBridgeDownAt, now: Date.now() }))
+        // The module value first (this page's own observation), falling back to the
+        // persisted one so a drop observed BEFORE a reload still counts — see
+        // BRIDGE_DOWN_AT_KEY. Number() of a null/absent value is NaN, which the predicate
+        // refuses, so an unreadable store means "no drop recorded" rather than 0-as-a-date.
+        const droppedAt = lastBridgeDownAt || Number(ssGet(BRIDGE_DOWN_AT_KEY));
+        // CONSUMED here, exactly like MID_TASK_KEY above, and for the same reason. A drop
+        // authorizes ONE nudge. Left standing, an hours-old timestamp would keep passing
+        // the long-gap test, so the next mid-task `ready` — a free_vram re-advertise draws
+        // one (#310) — would nudge on evidence from a drop already accounted for. That is
+        // the false positive this whole change removes, re-entering by the door the
+        // persistence opened, so the persistence has to close it.
+        lastBridgeDownAt = 0;
+        try {
+          ssSet(BRIDGE_DOWN_AT_KEY, null);
+        } catch {
+          /* best effort — the module value is already cleared */
+        }
+        if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: droppedAt, now: Date.now() }))
           return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
