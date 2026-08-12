@@ -62,6 +62,9 @@
 // shim can throw synchronously and deadlock the module loader. We grab them from
 // window.comfyAPI once it's ready instead (see registerExtensionWhenReady at the
 // bottom). Deferral approach contributed by @FreesoSaiFared.
+// Used by the unpack preflight's divergence scan. It was called without ever being imported,
+// so that path threw ReferenceError rather than refusing cleanly (#1136 sweep).
+import { resolvePromotedInnerTarget } from "./lib/widget-write.js";
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
@@ -518,6 +521,30 @@ let armRunReconcileSweepRef = null;
 // no perpetual timer; a redundant sweep is harmless (reconcile is idempotent — the
 // delivered/terminal fences make double-delivery unreachable).
 const RUN_RECONCILE_SWEEP_MS = 20000;
+
+/**
+ * Display label per connection status. The KEY is the state token, which stays English because
+ * it is compared and keyed on all over the panel; only the VALUE is translated. Each value is a
+ * function so the catalog is read at paint time — a plain string here would capture the English
+ * fallback at import, before loadCatalog() has run, and freeze the pill in English forever.
+ *
+ * Every key is a literal so `i18n-extract` can see it. That is the whole point: the shape this
+ * replaced built the key at runtime, which no static scan can follow.
+ *
+ * MODULE SCOPE, deliberately (#1136). This was first written inside `createBridgeClient`, while
+ * its only reader — `onStatus` — lives in `buildPanel`. Those are sibling functions, so the name
+ * was never in scope at the point of use and `onStatus` threw `ReferenceError` on the FIRST
+ * status frame. The socket still connected and chat worked normally, so the visible symptom was
+ * a status pill frozen on "disconnected" during a perfectly healthy session — and everything
+ * below that line in the handler (the Connect button label, the dot class, the dead-bridge
+ * liveness fallback) silently never ran either. Keep this at module scope; the guard in
+ * browser_tests/unit/status-label-scope.test.mjs fails if it moves back inside a function.
+ */
+const STATUS_LABEL = {
+  connected: () => tr("panel.status_connected", "connected"),
+  connecting: () => tr("panel.status_connecting", "connecting"),
+  disconnected: () => tr("panel.status_disconnected", "disconnected"),
+};
 
 // Execution-error capture so graph_get_errors can report the most recent failure
 // even if it predates the agent's question. Wired once `api` is ready (via
@@ -17077,20 +17104,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       void sendHello();
     }, ROUTE_REFUSAL_RETRY_MS);
   }
-  /**
-   * Display label per connection status. The KEY of this map is the state token, which stays
-   * English because it is compared (`s !== "connected"` below) and keyed on elsewhere; only
-   * the VALUE is translated. Lazily via a function because this sits at module-adjacent scope
-   * and would otherwise capture the fallback before the catalog loads.
-   *
-   * Every key is a literal so `i18n-extract` can see it. That is the whole point: the previous
-   * shape built the key at runtime, which no static scan can follow.
-   */
-  const STATUS_LABEL = {
-    connected: () => tr("panel.status_connected", "connected"),
-    connecting: () => tr("panel.status_connecting", "connecting"),
-    disconnected: () => tr("panel.status_disconnected", "disconnected"),
-  };
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
@@ -17098,7 +17111,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // working), the provider-onboarding card is moot — hide it regardless of the
     // readiness probe, which can be wrong (e.g. a CLI the orchestrator's PATH
     // can't see). try/catch guards the case where the card isn't built yet.
-    if (s === "connected") { try { onboard.hidden = true; } catch {} }
+    // The onboarding card is hidden by the PANEL's own onStatus handler, which is where
+    // `onboard` actually lives. This used to reach for it from here — a sibling scope — so it
+    // threw ReferenceError on every connect, and the try/catch that was meant to guard "the
+    // card isn't built yet" swallowed that instead. The card simply never auto-hid.
     // #952 — the SOCKET this status is about. `"connected"` re-fires on every
     // re-handshake, so the string alone cannot distinguish a replacement connection
     // from the live one saying hello again; the id can, and a consumer that ignores
@@ -21120,6 +21136,11 @@ function buildPanel() {
     custom: { label: tr("panel.custom_endpoint_any_openai_compatible", "Custom endpoint (any OpenAI-compatible)"), install: "", login: tr("panel.set_the_base_url_and_api_key", "Set the base URL (and API key if needed) in Settings › Custom endpoint") },
   };
   let anyReady = false;
+  // The last connection status THIS panel was told about. The bridge client keeps its own
+  // `lastStatus` for de-duping, but that lives in `createBridgeClient` — a sibling scope — so
+  // reading it from here threw ReferenceError and took the whole provider-list render with it
+  // (#1136). The panel has to remember what it was handed.
+  let liveStatus = null;
   // (autoPickDone is module-scoped now — once per PAGE, not per mount, so workflow
   // switches can't re-arm the spurious provider fallback.)
   const onboard = document.createElement("div");
@@ -21225,7 +21246,7 @@ function buildPanel() {
     anyReady = typeof data?.any_ready === "boolean" ? data.any_ready : list.some((b) => b.ready);
     // Never show the setup card while connected — a live agent means a provider
     // works, whatever the probe reports.
-    if (list.length && !anyReady && lastStatus !== "connected") {
+    if (list.length && !anyReady && liveStatus !== "connected") {
       renderOnboard(list);
       onboard.hidden = false;
     } else {
@@ -26534,6 +26555,12 @@ function buildPanel() {
       // unknown status falls back to the raw token, which is the current behaviour anyway.
       // Described, not illustrated: writing the rejected form here would trip the guard.
       statusText.textContent = STATUS_LABEL[state]?.() ?? state;
+      liveStatus = state;
+      // Once the agent is up, a provider demonstrably works, so the setup card is moot
+      // whatever the readiness probe says. This side effect used to live in the client's
+      // emitStatus, which cannot see `onboard`. try/catch still guards the genuine case the
+      // original comment described: a status arriving before the card is built.
+      if (state === "connected") { try { onboard.hidden = true; } catch {} }
       // #952 — a card painted on a connection that has since been REPLACED can no longer
       // deliver an answer. The trigger is the socket's identity, not the status string:
       // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
