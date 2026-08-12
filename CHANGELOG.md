@@ -6,6 +6,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.21] - 2026-08-12
+
+### Added
+- Brazilian Portuguese (pt-BR) panel catalog — 1107 keys + 52 settings (#1156)
+- Russian (ru) panel catalog — 1161 keys, all four plural forms (#1155)
+- complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
+- Spanish (es) panel catalog (#1152)
+- add the Arabic (ar) panel catalog (#1143)
+- add the Traditional Chinese (zh-TW) panel catalog (#1153)
+- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
+- add the Turkish (tr) panel catalog (#1148)
+- add the Persian (fa) panel catalog (#1147)
+- complete the Japanese panel translation (999 keys) (#1140)
+
+### Fixed
+- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
+- a definitions difference that is only link renumbering is not a content change (#1125)
+- the status pill froze because onStatus threw on every status frame (#1154)
+- name every uninstalled node type before queueing, not one rejection at a time (#1129)
+- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
+
+### Changed
+- 0.14.20 (#1157)
+- 0.14.19 (#1149)
+
+
 ## [0.14.20] - 2026-08-12
 
 ### Added
