@@ -17,13 +17,15 @@ import { dirname, join } from "node:path";
 import {
   isManualBridgeOverride,
   isInheritedBridgeUrl,
-  migratedBridgeUrlKey,
 } from "../../web/js/lib/bridge-url-provenance.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
 const DEFAULT_URL = "ws://127.0.0.1:9180";
 const STALE_MIGRATED = "ws://127.0.0.1:52727";
+// The legacy pre-per-backend setting the migration copied FROM. Equality with it IS
+// the provenance now -- derived, so it cannot drift from the value it describes.
+const LEGACY_URL = STALE_MIGRATED;
 
 test("#1136 the reporter's stale migrated port stops outranking the live bridge", () => {
   // The whole bug in one assertion: 52727 differs from the default, so the old rule
@@ -33,7 +35,7 @@ test("#1136 the reporter's stale migrated port stops outranking the live bridge"
       wanted: STALE_MIGRATED,
       backendDefault: DEFAULT_URL,
       lastAutoUrl: "",
-      migratedUrl: STALE_MIGRATED,
+      legacyUrl: STALE_MIGRATED,
     }),
     false,
   );
@@ -47,7 +49,7 @@ test("#1136 a port the user actually typed still wins", () => {
       wanted: "ws://127.0.0.1:9999",
       backendDefault: DEFAULT_URL,
       lastAutoUrl: "",
-      migratedUrl: STALE_MIGRATED,
+      legacyUrl: STALE_MIGRATED,
     }),
     true,
   );
@@ -59,14 +61,14 @@ test("#1136 a custom port that MATCHES nothing migrated is still honoured", () =
       wanted: "ws://127.0.0.1:9999",
       backendDefault: DEFAULT_URL,
       lastAutoUrl: "",
-      migratedUrl: undefined,
+      legacyUrl: undefined,
     }),
     true,
   );
 });
 
 test("#1136 the pre-existing rule is otherwise unchanged", () => {
-  const base = { backendDefault: DEFAULT_URL, migratedUrl: STALE_MIGRATED };
+  const base = { backendDefault: DEFAULT_URL, legacyUrl: STALE_MIGRATED };
   // empty -> not an override
   assert.equal(isManualBridgeOverride({ ...base, wanted: "", lastAutoUrl: "" }), false);
   assert.equal(isManualBridgeOverride({ ...base, wanted: "   ", lastAutoUrl: "" }), false);
@@ -87,7 +89,7 @@ test("#1136 whitespace cannot promote an inherited value into a chosen one", () 
       wanted: `  ${STALE_MIGRATED} `,
       backendDefault: DEFAULT_URL,
       lastAutoUrl: "",
-      migratedUrl: STALE_MIGRATED,
+      legacyUrl: STALE_MIGRATED,
     }),
     false,
   );
@@ -103,7 +105,7 @@ test("#1136 whitespace in the STORED value cannot re-trust a dead port", () => {
       wanted: STALE_MIGRATED,
       backendDefault: DEFAULT_URL,
       lastAutoUrl: "",
-      migratedUrl: `  ${STALE_MIGRATED}
+      legacyUrl: `  ${STALE_MIGRATED}
 `,
     }),
     false,
@@ -112,28 +114,21 @@ test("#1136 whitespace in the STORED value cannot re-trust a dead port", () => {
 
 test("#1136 inheritance is never inferred from empty or non-string values", () => {
   for (const bad of [undefined, null, "", "   ", 0, {}]) {
-    assert.equal(isInheritedBridgeUrl(bad, STALE_MIGRATED), false, String(bad));
-    assert.equal(isInheritedBridgeUrl(STALE_MIGRATED, bad), false, String(bad));
+    assert.equal(isInheritedBridgeUrl(bad, LEGACY_URL), false, String(bad));
+    assert.equal(isInheritedBridgeUrl(LEGACY_URL, bad), false, String(bad));
   }
 });
 
-test("#1136 the provenance key is per-backend", () => {
-  assert.notEqual(migratedBridgeUrlKey("claude"), migratedBridgeUrlKey("codex"));
-  assert.match(migratedBridgeUrlKey("claude"), /claude$/);
-});
-
-test("#1136 WIRING: the migration records what it wrote", () => {
+test("#1136 WIRING: provenance is derived, not remembered", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
   assert.match(
     src,
-    /import \{ isManualBridgeOverride, migratedBridgeUrlKey \} from "\.\/lib\/bridge-url-provenance\.js";/,
+    /import \{ isManualBridgeOverride \} from "\.\/lib\/bridge-url-provenance\.js";/,
   );
-  // The record must be written at the SAME place the migration writes the value —
-  // otherwise the provenance is lost and the override rule has nothing to consult.
-  const at = src.indexOf("setSetting(SETTING_BRIDGE_URL.claude, lu);");
-  assert.ok(at > 0, "migration site must exist");
-  const block = src.slice(at, at + 700);
-  assert.match(block, /lsSet\(migratedBridgeUrlKey\("claude"\), lu\)/);
+  // Provenance is DERIVED: the migration copies the legacy setting, so equality with
+  // it is the record. Nothing is written, and nothing can fall out of step.
+  assert.ok(src.indexOf("setSetting(SETTING_BRIDGE_URL.claude, lu);") > 0, "migration site must exist");
+  assert.equal((src.match(/migratedBridgeUrlKey/g) ?? []).length, 0, "no remembered marker may survive");
 });
 
 test("#1136 WIRING: BOTH manual-override sites consult provenance", () => {
@@ -147,5 +142,5 @@ test("#1136 WIRING: BOTH manual-override sites consult provenance", () => {
     src.match(/!!wanted && wanted !== defaultBridgeUrlFor\(selectedBackend\) && wanted !== lastAutoUrl/g) ??
     [];
   assert.equal(stale.length, 0, "no inline override rule may survive");
-  assert.equal((src.match(/migratedUrl: lsGet\(migratedBridgeUrlKey\(selectedBackend\)\)/g) ?? []).length, 2);
+  assert.equal((src.match(/legacyUrl: getSetting\(LEGACY_SETTING_BRIDGE_URL\)/g) ?? []).length, 2);
 });

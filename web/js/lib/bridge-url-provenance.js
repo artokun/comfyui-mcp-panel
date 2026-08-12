@@ -40,25 +40,23 @@
  * rather than chosen. A port the user actually types still outranks everything, which
  * is the behaviour the override rule exists to protect.
  *
- * KNOWN LIMITATION, stated because the first draft of this comment claimed otherwise.
- * The record is NOT cleared when the user edits the field. Two consequences, both real:
+ * Provenance is DERIVED, not remembered. The migration's whole action is to copy the
+ * legacy `comfyui-mcp.bridgeUrl` into the per-backend key, so "the per-backend value is
+ * still identical to the legacy one" IS the record — no second store, nothing to keep
+ * in step.
  *
- *   - A user who changes the URL and later deliberately retypes the value the migration
- *     once wrote is still classified as inherited, and their choice is disregarded.
- *   - The record lives in localStorage while the URL is a SYNCED ComfyUI setting, so on
- *     a second tab or device the setting can arrive without its record (wrongly manual),
- *     or a stale local record can suppress a legitimately re-entered URL.
+ * That choice came out of review, which found two P1s in the remembered version: a
+ * localStorage marker that never cleared when the user edited the field, and a marker
+ * that could desynchronise from the SYNCED ComfyUI setting it described, so a second
+ * tab or device could read it either way. Deriving removes both at once — the moment
+ * the user edits the URL it stops matching the legacy value and becomes manual on its
+ * own, and both halves are settings, so they travel together.
  *
- * Neither is the reported bug and neither makes it worse, but both are ways this can be
- * wrong, and a reader deserves to know before extending it. The clearing path belongs
- * wherever the user's own edit is committed; storing provenance beside the setting
- * rather than in localStorage would close the sync hole.
+ * Residual, and much narrower: a user who deliberately types exactly the legacy value
+ * is read as inherited. They are then given the live single-port bridge instead, which
+ * is the address that actually answers — so the failure mode is "you got a working
+ * connection you did not ask for", not a dead port.
  */
-
-/** localStorage key holding the URL the migration wrote for `backend`. */
-export function migratedBridgeUrlKey(backend) {
-  return `comfyui-mcp.panel.migratedBridgeUrl.${String(backend ?? "")}`;
-}
 
 /**
  * Is `url` the value a migration deposited, rather than one the user chose?
@@ -67,10 +65,10 @@ export function migratedBridgeUrlKey(backend) {
  * whitespace through a settings round-trip, and a trailing space must not be enough
  * to promote an inherited value into a deliberate one.
  */
-export function isInheritedBridgeUrl(url, migratedUrl) {
-  if (typeof url !== "string" || typeof migratedUrl !== "string") return false;
+export function isInheritedBridgeUrl(url, legacyUrl) {
+  if (typeof url !== "string" || typeof legacyUrl !== "string") return false;
   const a = url.trim();
-  const b = migratedUrl.trim();
+  const b = legacyUrl.trim();
   if (!a || !b) return false;
   return a === b;
 }
@@ -79,8 +77,9 @@ export function isInheritedBridgeUrl(url, migratedUrl) {
  * Should `wanted` be honoured as a deliberate manual override?
  *
  * `wanted` is what the URL field holds; `backendDefault` is the backend's default
- * bridge URL; `lastAutoUrl` is the last URL the panel applied by itself; `migratedUrl`
- * is what a migration deposited for this backend, if anything.
+ * bridge URL; `lastAutoUrl` is the last URL the panel applied by itself; `legacyUrl` is
+ * the pre-per-backend `comfyui-mcp.bridgeUrl` setting, which is what the migration
+ * copied — so a `wanted` still equal to it was inherited rather than chosen.
  *
  * This reproduces the existing rule exactly and subtracts ONE case — the inherited
  * value — so a genuinely custom port keeps winning and a stale migrated one stops.
@@ -89,13 +88,13 @@ export function isManualBridgeOverride({
   wanted,
   backendDefault,
   lastAutoUrl,
-  migratedUrl,
+  legacyUrl,
 } = {}) {
   const w = typeof wanted === "string" ? wanted.trim() : "";
   if (!w) return false;
   if (w === backendDefault) return false;
   if (w === lastAutoUrl) return false;
   // The one subtraction: a value this panel inherited is not a value the user chose.
-  if (isInheritedBridgeUrl(w, migratedUrl)) return false;
+  if (isInheritedBridgeUrl(w, legacyUrl)) return false;
   return true;
 }

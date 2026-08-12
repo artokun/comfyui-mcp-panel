@@ -476,7 +476,7 @@ import {
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
-import { isManualBridgeOverride, migratedBridgeUrlKey } from "./lib/bridge-url-provenance.js";
+import { isManualBridgeOverride } from "./lib/bridge-url-provenance.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -21807,12 +21807,6 @@ function buildPanel() {
         getSetting(SETTING_BRIDGE_URL.claude) == null
       ) {
         setSetting(SETTING_BRIDGE_URL.claude, lu);
-        // #1136 — REMEMBER that we wrote this, because the value is an ephemeral
-        // orchestrator port and will outlive the process that owned it. Without the
-        // record, the connect path cannot tell this from a port the user typed on
-        // purpose, honours it as a manual override forever, and dials a dead socket
-        // while the live single-port bridge answers next door.
-        lsSet(migratedBridgeUrlKey("claude"), lu);
       }
       lsSet(SETTINGS_GROUPS_MIGRATED_KEY, "1");
     }
@@ -28802,7 +28796,7 @@ function buildPanel() {
       wanted,
       backendDefault: defaultBridgeUrlFor(selectedBackend),
       lastAutoUrl,
-      migratedUrl: lsGet(migratedBridgeUrlKey(selectedBackend)),
+      legacyUrl: getSetting(LEGACY_SETTING_BRIDGE_URL),
     });
     if (manualOverride) return; // a user-typed Advanced Bridge URL is never clobbered
     const secure = await fetchAdvertisedBridgeUrl();
@@ -28871,7 +28865,7 @@ function buildPanel() {
       wanted,
       backendDefault: defaultBridgeUrlFor(selectedBackend),
       lastAutoUrl,
-      migratedUrl: lsGet(migratedBridgeUrlKey(selectedBackend)),
+      legacyUrl: getSetting(LEGACY_SETTING_BRIDGE_URL),
     });
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     // EXTERNAL/LOCAL ORCHESTRATOR MODE: the agent is run by the user on THEIR
