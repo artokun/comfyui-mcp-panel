@@ -75,6 +75,66 @@ const vocab = JSON.parse(readFileSync(join(root, "vendor", "tool-vocabulary.json
     process.exit(1);
   }
 }
+// #236 — the BAKED copy of the hash must still match the artefact.
+//
+// web/js/lib/vocabulary-hash.js duplicates `vocabularyHash` because `vendor/` is not
+// served to the browser (WEB_DIRECTORY is ./web), so the panel cannot read the artefact
+// at runtime. A duplicated constant is only honest with a gate on it: without this, a
+// re-vendor would leave the panel advertising the PREVIOUS vocabulary, and the
+// orchestrator would report a mismatch that is not real — worse than no handshake at
+// all, and indistinguishable from a genuine skew.
+{
+  // Read defensively (codex review, P2). A packaging or re-vendor change that drops
+  // this file must produce the checker's own FAIL — an uncaught ENOENT reads as the
+  // gate crashing, which is exactly the state where someone shrugs and reruns CI
+  // rather than noticing the pack is incomplete.
+  const bakedPath = join(root, "web", "js", "lib", "vocabulary-hash.js");
+  let baked;
+  try {
+    baked = readFileSync(bakedPath, "utf8");
+  } catch (err) {
+    console.error(
+      `
+[check-tool-vocabulary] FAIL
+
+` +
+        `Could not read web/js/lib/vocabulary-hash.js (${err?.code ?? err?.message ?? err}).
+
+` +
+        `The panel advertises this hash in its hello so the orchestrator can detect a
+` +
+        `tool-surface skew at connect (#236). Without the file the panel advertises
+` +
+        `nothing and every connection reads "unverified". Restore it with:
+
+` +
+        `  export const VENDORED_VOCABULARY_HASH = "${vocab.vocabularyHash}";
+`,
+    );
+    process.exit(1);
+  }
+  const m = baked.match(/VENDORED_VOCABULARY_HASH\s*=\s*"([0-9a-f]{64})"/);
+  if (!m) {
+    console.error(
+      `\n[check-tool-vocabulary] FAIL\n\n` +
+        `web/js/lib/vocabulary-hash.js does not declare a readable VENDORED_VOCABULARY_HASH.\n` +
+        `Expected a 64-character hex literal — the panel advertises it in its hello (#236).\n`,
+    );
+    process.exit(1);
+  }
+  if (m[1] !== vocab.vocabularyHash) {
+    console.error(
+      `\n[check-tool-vocabulary] FAIL\n\n` +
+        `The vocabulary hash the panel ADVERTISES is stale.\n\n` +
+        `  web/js/lib/vocabulary-hash.js  ${m[1]}\n` +
+        `  vendor/tool-vocabulary.json    ${vocab.vocabularyHash}\n\n` +
+        `Left as is, every connection reports a vocabulary mismatch that is not real\n` +
+        `(#236). Fix by replacing the constant with:\n\n` +
+        `  export const VENDORED_VOCABULARY_HASH = "${vocab.vocabularyHash}";\n`,
+    );
+    process.exit(1);
+  }
+}
 const CORE = new Set(vocab.core);
 const PANEL = new Set(vocab.panel);
 const DEAD = new Map(vocab.dead.map((d) => [d.name, d]));

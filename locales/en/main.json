@@ -366,6 +366,7 @@
       "chat_title": "Chat title",
       "chatgpt": "ChatGPT",
       "chatgpt_codex": "ChatGPT (Codex)",
+      "chatgpt_direct_oauth": "ChatGPT (direct OAuth)",
       "checked_errors_none": "Checked errors — none",
       "checked_errors_none_unchecked_one": "Checked errors — none found ({count} node could not be checked)",
       "checked_errors_none_unchecked_other": "Checked errors — none found ({count} nodes could not be checked)",

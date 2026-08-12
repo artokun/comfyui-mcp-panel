@@ -6,6 +6,314 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.15] - 2026-08-12
+
+### Fixed
+
+- **`panel_open_workflow` no longer claims a refresh it never performed (#1448).**
+  The refusal said the file "isn't among the saved/open workflows even after a
+  refresh" — for a file the reporter had confirmed on disk INSIDE that folder,
+  twice. Both ways the refresh can fail to happen were silent: a frontend without
+  `syncWorkflows` skipped it entirely, and a throw was swallowed by a
+  `console.warn` no agent session reads. It now reports which actually occurred —
+  list re-read, no sync method on this frontend, or re-read failed with the reason
+  — and says outright that a skipped or failed re-read is NOT evidence the file is
+  absent.
+  Its remedy also stopped naming the wrong cause: "for a file outside the
+  workflows folder" reads as a diagnosis, and sent someone away from a file that
+  was exactly where they thought. `panel_load_workflow` is still offered, as a
+  branch rather than a verdict.
+  The refusal now also shows the selector SHAPES the store actually holds, which
+  are not guessable from outside: `path` is `workflows/X.json`, `filename` carries
+  NO extension, and `key` does.
+
+## [0.14.14] - 2026-08-12
+
+### Fixed
+
+- **The panel now says WHICH tool vocabulary it vendored, at connect (#236).**
+  The panel calls MCP tool names as bare string literals and validates them
+  against a vendored copy of the vocabulary — which proves the literals match
+  that copy, never that the copy matches the server it is talking to. When the
+  two disagreed, the failure surfaced at call time as `unknown tool`, which
+  reads as a broken panel and gives an agent nothing to act on.
+  The hello now carries a hash of the vendored vocabulary, and the orchestrator
+  compares it at connect (comfyui-mcp 0.51.13). A version string cannot do this
+  job: two builds of one version can carry different vocabularies, and two
+  versions can carry identical ones.
+  Safe in both directions of skew — an orchestrator that predates the check
+  ignores the field, and one that has it reads an ABSENT hash as unverified,
+  never as disagreement.
+- **Re-vendored the tool vocabulary.** The first live run of that handshake
+  found real drift: the vendored copy was missing `panel_remove_widget`, 91
+  panel tools against the server's 92. Found by the mechanism built for it
+  rather than by someone hitting `unknown tool`.
+
+## [0.14.13] - 2026-08-11
+
+### Fixed
+
+- **A numeric `from_output` no longer mints a junk rail slot named "4" (#1114).**
+  Inside a subgraph, `panel_connect({ from_output: 4, ... })` replied `exposed`
+  rather than `connected` and left a permanent rail input literally named `"4"`,
+  visible on the parent subgraph node too. The rail lookup gated its index branch
+  on `typeof ref === "number"`, but MCP argument coercion delivers `4` as the
+  string `"4"` — so the lookup missed, and the caller read the miss as "no such
+  slot" and created one. A lookup that failed closed would have been a refusal;
+  this one edited the graph.
+  The index parse is deliberately strict (`"04"` and `"007"` are names, not
+  index 4 and 7), so a mistyped name cannot land silently on an unrelated slot.
+  And when a ref matches BOTH a slot name and a different index — a rail whose
+  slots are digit-named out of order — it now refuses and names both candidates
+  instead of guessing, because nothing at that point can tell which was meant.
+
+## [0.14.12] - 2026-08-11
+
+### Fixed
+- panel_screenshot stops throwing when a node has no type (#1115)
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.11 (#1113)
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.11] - 2026-08-11
+
+### Fixed
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.10] - 2026-08-11
+
+### Fixed
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.9] - 2026-08-11
+
+> #1085: adding an ImageCropV2 warned that this tab's node definitions were out of date and
+> that a value had been replaced — showing the old and new values side by side, identical.
+
+### Fixed
+- adding a node no longer reports a value as "corrected" when nothing about it changed. The
+  check compared values by identity rather than by content, and a value that is a group of
+  numbers — like ImageCropV2's crop region — is a fresh group every time it is read, so it
+  never matched itself. Every add of such a node raised the warning and told you to reload
+  the tab.
+
+### Changed
+- values are now compared by what they contain, at any nesting depth. A value that genuinely
+  changed is still corrected and still reported — that warning exists for a real case and it
+  keeps working.
+- anything the comparison cannot read faithfully is treated as changed rather than guessed
+  at, which is what it did before. That is the safe direction: it can mention a correction
+  that was not needed, but it will never stay silent about one that was.
+
+## [0.14.8] - 2026-08-11
+
+> #1087: setting a widget inside a subgraph reported success and changed nothing about the
+> render — a run asked for 10 steps and sampled at 14, with nothing to indicate the value
+> had been ignored.
+
+### Fixed
+- setting a widget that is fed by a connection now tells you it will not affect the render.
+  When a subgraph promotes a widget to its outer node, the inner copy is driven by that
+  connection and the outer value is what actually runs — so writing the inner one stored a
+  number nothing reads. The write still happens (that inner value is the subgraph's stored
+  default, and setting it is a reasonable thing to want), but the reply now says plainly that
+  it will not change the output, and points at the outer node to set instead.
+
+### Changed
+- the check reuses exactly what the graph outline already shows for these widgets, so it
+  reports the same connection the outline names rather than a second opinion.
+- writing the widget on the OUTER subgraph node is unchanged and still the way to make it
+  take effect — that path already updates both copies, and it does not warn.
+
+## [0.14.7] - 2026-08-11
+
+> #1084: the provider picker showed "ChatGPT" next to a lowercase "chatgpt", which looked
+> like an accidental duplicate and gave you nothing to choose between.
+
+### Fixed
+- both ways of reaching ChatGPT are now named. They are genuinely different routes to the
+  same subscription — **ChatGPT (Codex)** runs it through the Codex app-server, **ChatGPT
+  (direct OAuth)** talks to it directly with no extra process — and only the first had a
+  name, so the second showed its raw id.
+- the panel now knows which provider it is connected to when you use the direct-OAuth route.
+  This was the larger half: the panel decided whether a provider was "known" by whether it
+  had a display name for it, so the unnamed one skipped the step that records the connection
+  — leaving the remembered provider, the "Ask …" prompt and the highlighted chip all showing
+  the previous one.
+
+### Changed
+- a provider your agent machine reports but this panel version has never heard of is now
+  accepted rather than ignored, and shown under its own id until a release names it. New
+  providers can land before the panel ships a label for them, and that ordering is normal.
+- ComfyUI's Settings dropdown lists both routes too, so the default provider can be set to
+  either.
+
+## [0.14.6] - 2026-08-11
+
+> #1083: connect to ChatGPT, reopen the model picker, and LM Studio, llama.cpp, Custom
+> endpoint and Copilot are gone — with no way back to a Custom endpoint you had configured.
+
+### Fixed
+- the provider list no longer loses providers after connecting. The panel learns which
+  providers exist from two places: the machine actually running your agents, which knows
+  about all of them, and ComfyUI itself, which only knows a shorter built-in list. A routine
+  background refresh from ComfyUI was replacing the full list with the short one, so
+  everything past OpenRouter disappeared from the picker.
+
+### Changed
+- the shorter list is now merged into the fuller one instead of replacing it. A provider
+  ComfyUI knows about but your agent machine did not mention is still added, and one it has
+  stopped reporting can still go away — what it can no longer do is delete a provider the
+  agent machine told us about.
+- a provider's Running indicator still updates from those refreshes, so this does not trade
+  a disappearing provider for one that looks permanently idle.
+- the "(experimental)" marking and its terms-of-service warning on GitHub Copilot are now
+  held back from those refreshes too, so a routine poll cannot quietly drop the warning.
+
+## [0.14.5] - 2026-08-11
+
+> #968: opening one workflow could silently give it a DIFFERENT workflow's graph — and
+> every check said it was fine, honestly. This is the cause, found and fixed.
+
+### Fixed
+- switching to a workflow no longer copies the previous tab's graph into it. The panel
+  switched tabs, then took a snapshot of the canvas, then repainted — and the snapshot ran
+  while the canvas still showed the tab you were leaving. So the workflow you opened had the
+  OTHER one's graph written into its unsaved state, was marked as edited, and was then
+  repainted from exactly that. Every check afterwards compared the canvas to that state and
+  agreed, because by then they genuinely matched. Only the file on disk disagreed, which is
+  why reloading from disk was the one thing that fixed it.
+
+### Changed
+- the snapshot is now skipped when the canvas provably belongs to another workflow. When it
+  provably belongs to the one being opened — the ordinary case, and the one the snapshot was
+  added for — nothing changes at all.
+- one case is knowingly not covered: a canvas the panel has never tagged cannot be attributed
+  to anyone, so it is still snapshotted as before. Guessing there would mean either
+  overwriting your live edits or writing the wrong graph, and neither is worth doing on a
+  guess.
+
+
+## [0.14.4] - 2026-08-11
+
+### Fixed
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.3] - 2026-08-11
+
+> #1339: a batch of ten came back as ten identical images, with nothing said about it. The
+> warning that exists for exactly this looked for ComfyUI's own `control_after_generate`
+> widget — and rgthree's Seed node DELETES that widget, so the most widely used custom seed
+> node was invisible to it.
+
+### Fixed
+
+- a batch that will reuse one seed now says so when the seed comes from an rgthree Seed node.
+
+### Changed
+
+- it reports the thing that actually decides the outcome: whether the node is ARMED (its
+  seed widget holding `-1`, `-2` or `-3`) or holds a concrete number that is submitted
+  verbatim for every item. It stays quiet when the node genuinely varies — measured, an
+  armed node gets a fresh seed per item even in a scoped batch, so the older warning's
+  reasoning does not apply to it and is not reused.
+- an armed node can still repeat when its `randomMin`/`randomMax` properties — or the seed
+  widget's step — admit a single value. Measured over 200 draws, `min=0 max=5 step=100`
+  returns ONE value while `min < max` looks perfectly healthy. That case is named too, with
+  the remedy that fits it.
+- a muted or bypassed seed node is not named, since it contributes nothing to the run.
+
+### Notes
+
+- your seeds are never rewritten. This says what will happen; it does not change your values.
+
+
 ## [0.14.2] - 2026-08-11
 
 > #1062: asking the agent to add `SaveGLB` always failed. It is the only core node that

@@ -159,7 +159,12 @@ import {
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
 import { findStalePlaceholders, stalePlaceholderNote } from "./lib/stale-placeholders.js";
-import { findRepeatingControlWidgets, scopedBatchSeedNote } from "./lib/scoped-batch-seed.js";
+import {
+  findRepeatingControlWidgets,
+  scopedBatchSeedNote,
+  findRgthreeSeedNodes,
+  rgthreeFixedSeedNote,
+} from "./lib/scoped-batch-seed.js";
 import {
   materializePromotedValues,
   materializedValuesNote,
@@ -235,6 +240,21 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
+import { findExistingRailSlot } from "./lib/rail-slot.js";
+import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
+import {
+  knownSelectorSample,
+  openWorkflowNotFoundMessage,
+} from "./lib/open-workflow-not-found.js";
+import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
+import {
+  describeQueuePromptChain,
+  describeQueuePromptChainForReport,
+  queuePromptChainDeps,
+} from "./lib/queue-prompt-chain.js";
+
+
+import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
@@ -255,6 +275,10 @@ import {
   promptRelayDerivedRefusal,
   recordPreLoadPromptRelayEditors,
 } from "./lib/prompt-relay-timeline.js";
+import {
+  classifyRgthreeFastGroupsWrite,
+  rgthreeFastGroupsRefusal,
+} from "./lib/rgthree-fast-groups.js";
 import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
@@ -342,6 +366,7 @@ import {
   canvasFileDivergence,
   canvasFileDivergenceNote,
 } from "./lib/canvas-file-divergence.js";
+import { mergeProviderSnapshots } from "./lib/provider-snapshot-merge.js";
 import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
@@ -982,7 +1007,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.14.3";
+const PANEL_VERSION = "0.14.16";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -3214,7 +3239,12 @@ const BACKEND_SECTION = {
 };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+// Kept in step with BACKEND_LABELS (#1084). `chatgpt` and `copilot` were both absent, and
+// every read of this map below interpolates it with NO fallback — so the moment a settings
+// row exists for either, its description reads "the undefined background agent". No row does
+// today (they are instantiated one by one, not from this map), which is exactly why the gap
+// was invisible: the entries are added here so the next row added cannot ship that string.
+const BACKEND_TEXT = /* null-prototype: see BACKEND_LABELS (#1084 codex) */ Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -3988,7 +4018,12 @@ function panelSettingsList() {
       get options() {
         return [
           { value: "claude", text: tr("panel.claude", "Claude") },
-          { value: "codex", text: tr("panel.chatgpt", "ChatGPT") },
+          // #1084 — the two ChatGPT routes are named apart here too, or this dropdown
+          // reproduces the picker's "ChatGPT vs chatgpt" confusion one dialog over. `codex`
+          // reuses `panel.chatgpt_codex`, which the panel ALREADY ships translated for the
+          // sign-in card, rather than minting a near-duplicate key for the same words.
+          { value: "codex", text: tr("panel.chatgpt_codex", "ChatGPT (Codex)") },
+          { value: "chatgpt", text: tr("panel.chatgpt_direct_oauth", "ChatGPT (direct OAuth)") },
           { value: "gemini", text: tr("panel.gemini", "Gemini") },
           { value: "antigravity", text: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)") },
           // Comma, not the middot this row used to carry: the panel already ships this exact
@@ -7049,7 +7084,7 @@ const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
 const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
 function widgetName(liveGraph, nodeId, i) {
   try {
-    const w = liveGraph?.getNodeById?.(Number(nodeId))?.widgets?.[i];
+    const w = liveGraph?.getNodeById?.(canonicalNodeId(nodeId))?.widgets?.[i];
     if (w && w.name) return w.name;
   } catch {}
   return `#${i}`;
@@ -7948,8 +7983,24 @@ function nodeDescription(node) {
   return String(node?.constructor?.nodeData?.description ?? node?.description ?? "");
 }
 
+/**
+ * artokun/comfyui-mcp#1425 — a SUBGRAPH-QUALIFIED node id (`120:104`, `263:78`).
+ *
+ * Unpacking a subgraph leaves genuine ROOT-level nodes carrying these ids, and the
+ * read tools hand them out. `Number("263:78")` is NaN, so every write that went
+ * through `getNodeById(Number(id))` reported the node as missing — readable graph,
+ * uneditable nodes.
+ *
+ * Passing the qualified form THROUGH is what resolves it: LiteGraph's getNodeById
+ * is a `_nodes_by_id[id]` object lookup, and object keys are strings, so the id the
+ * reader printed is the key the node is stored under. (Measured against a live
+ * ComfyUI: node ids there are already strings, and lookup by string resolves.)
+ *
+ * Numbers still go through `Number()` unchanged — a plain id must keep behaving
+ * exactly as before, including the numeric-string compatibility surface.
+ */
 function resolveNode(graph, nodeId) {
-  const node = graph.getNodeById(Number(nodeId));
+  const node = graph.getNodeById(canonicalNodeId(nodeId));
   // #697 — a node the READS just listed can be unresolvable here: reads span every
   // scope, while a write applies to the graph being VIEWED. Say WHERE it actually is
   // instead of only that it is not here. Diagnostic-only: runs on the failure path,
@@ -7995,7 +8046,10 @@ function normalizeLegacyNodeId(nodeId) {
     const normalized = Number(nodeId);
     if (Number.isSafeInteger(normalized)) return normalized;
   }
-  throw new Error("node_id must be an integer");
+  // #1425 — a subgraph-qualified id stays a STRING. Coercing it is the bug: it
+  // would resolve to NaN here, and to the wrong node upstream if parsed instead.
+  if (isQualifiedNodeId(nodeId)) return nodeId;
+  throw new Error("node_id must be an integer or a subgraph-qualified id (e.g. 120:104)");
 }
 
 // ---- Node-type resolution guard (#458) ------------------------------------
@@ -8144,15 +8198,6 @@ function isEmptyRailSlotRef(ref) {
 
 /** Find an EXISTING rail slot (SubgraphInput/SubgraphOutput) by name or index,
  *  or null if none matches. */
-function findExistingRailSlot(slots, ref) {
-  if (ref == null) return null;
-  if (typeof ref === "number" && Number.isInteger(ref)) {
-    return ref >= 0 && ref < (slots?.length ?? 0) ? slots[ref] : null;
-  }
-  const name = String(ref).toLowerCase();
-  return (slots ?? []).find((s) => s?.name?.toLowerCase() === name) ?? null;
-}
-
 // ---- Group boxes (LiteGraph LGraphGroup) helpers --------------------------
 
 /** Resolve a group box by id (with an index fallback for graphs whose groups
@@ -10745,6 +10790,16 @@ const GRAPH_TOOL_EXECUTORS = {
         setDirty: () => graph.setDirtyCanvas(true, true),
       });
     }
+    // #983: rgthree's Fast Groups Muter/Bypasser toggle rows are DERIVED READOUTS of whether
+    // the matched group has an active node — the node re-reads each one from the group on
+    // every refresh and declares `serialize_widgets = false`, so a write is reverted and
+    // never reaches the workflow. The reported shape was a clean success followed immediately
+    // by the old value. Refused loudly, keyed to BOTH the node type and the widget name so
+    // nothing else on those nodes is affected. See the lib for the three source facts and for
+    // why this refuses rather than driving the node's own toggle().
+    if (classifyRgthreeFastGroupsWrite(node, widget) === "derived") {
+      throw new Error(rgthreeFastGroupsRefusal(widget, node.id, node.type));
+    }
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
     // write can never decide "never seen" against an un-seeded history — a pack present
     // at page load that is removed mid-session is thus recorded before its removal and
@@ -11075,9 +11130,15 @@ const GRAPH_TOOL_EXECUTORS = {
     if (rail && fields.some((field) => field !== "pos" && own(field))) {
       throw new Error("a subgraph boundary rail only supports pos edits");
     }
-    const realNode = !rail && hasNodeId && Number.isFinite(Number(args.node_id)) && typeof graph.getNodeById === "function"
-      ? graph.getNodeById(Number(args.node_id))
-      : null;
+    const realNode =
+      !rail &&
+      hasNodeId &&
+      // #1425 — a subgraph-qualified id is id-shaped too. Number("263:78") is NaN,
+      // so the finite check alone called a real node unreal.
+      (isQualifiedNodeId(args.node_id) || Number.isFinite(Number(args.node_id))) &&
+      typeof graph.getNodeById === "function"
+        ? graph.getNodeById(canonicalNodeId(args.node_id))
+        : null;
     if (!rail && !realNode && hasNodeId && graph === rootGraph && railKindFor(args.node_id)) {
       throw new Error(`${args.node_id} is a subgraph boundary rail, which only exists inside a subgraph — enter the subgraph first (panel_enter_subgraph).`);
     }
@@ -11835,6 +11896,21 @@ const GRAPH_TOOL_EXECUTORS = {
         repeatingControls = []; /* a warning must never take down the run */
       }
     }
+    // #1339 — rgthree seeds, on ANY batch > 1. NOT gated on `partialTargets`, unlike the
+    // scan above: #988 is about a scoped run skipping the queue-time widget hooks, while a
+    // FIXED rgthree seed is submitted verbatim for every item whether the run is scoped or
+    // not. Gating it the same way would have kept it invisible for exactly the unscoped
+    // batch a user reaches for when they want ten different images.
+    let rgthreeSeeds = [];
+    if (batch > 1) {
+      try {
+        rgthreeSeeds = findRgthreeSeedNodes(
+          collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
+        );
+      } catch {
+        rgthreeSeeds = []; /* a warning must never take down the run */
+      }
+    }
     if (!partialTargets) {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
@@ -11987,6 +12063,13 @@ const GRAPH_TOOL_EXECUTORS = {
       accept.repeating_controls = repeatingControls;
       accept.repeating_controls_note = repeatingNote;
     }
+    // #1339 — the same class of surprise from a node the scan above cannot see, because
+    // rgthree deletes the `control_after_generate` widget it matches on.
+    const fixedSeedNote = rgthreeFixedSeedNote(rgthreeSeeds, batch);
+    if (fixedSeedNote) {
+      accept.fixed_seed_nodes = rgthreeSeeds.filter((s) => s && s.armed === false);
+      accept.fixed_seed_note = fixedSeedNote;
+    }
     // #572 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
     // excluded queue-time hook inputs (beforeQueued carriers + their linked,
     // serialized targets — e.g. a control_after_generate seed reroll). A user
@@ -12066,8 +12149,15 @@ const GRAPH_TOOL_EXECUTORS = {
         `behaves differently — so this fallback is not expected on that build, and ` +
         `trying ComfyUI_frontend 1.48.7 may be the quickest workaround. Which OTHER ` +
         `builds take which shape is not something the panel can determine from inside ` +
-        `one of them, so please report this build (#996), including your ` +
-        `ComfyUI_frontend version.`;
+        `one of them.` +
+        // #996 — ASK FOR WHAT DISCRIMINATES. Two reports arrived with the build and
+        // the frontend version, and neither identified the cause: the version is
+        // not what differs. Measured on 1.48.7, BOTH links in the chain are
+        // routinely patched by extensions (a custom node wraps app.queuePrompt,
+        // rgthree wraps api.queuePrompt), and a wrapper that forwards its
+        // arguments is harmless while one that does not drops the scope silently.
+        // That is invisible in a version number, so the note carries it directly.
+        describeQueuePromptChainForReport(describeQueuePromptChain(queuePromptChainDeps()));
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
@@ -12946,21 +13036,35 @@ const GRAPH_TOOL_EXECUTORS = {
     // downloaded example) won't appear until the store re-reads the workflows dir.
     // If the first search misses, REFRESH the store and search again so a freshly
     // staged file is found + opened natively (no need for a separate refresh call).
-    if (!target && typeof s.syncWorkflows === "function") {
-      try {
-        await s.syncWorkflows();
-      } catch (err) {
-        console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
+    // #1448 — RECORD WHAT THE REFRESH ACTUALLY DID. The refusal below used to say
+    // "even after a refresh" unconditionally, while both ways the refresh can fail to
+    // happen were silent: a frontend without `syncWorkflows` skipped it entirely, and a
+    // throw was swallowed by a console.warn nobody reads from an agent session. The
+    // reporter was told a refresh had happened and still could not find a file they had
+    // just confirmed on disk, so the one fact that would have pointed anywhere — whether
+    // the list was ever re-read — was the fact being asserted without being checked.
+    let refresh = "not-needed";
+    if (!target) {
+      if (typeof s.syncWorkflows !== "function") {
+        refresh = "unavailable";
+      } else {
+        try {
+          await s.syncWorkflows();
+          refresh = "ok";
+        } catch (err) {
+          refresh = `failed: ${err?.message ?? err}`;
+          console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
+        }
       }
       target = find();
     }
     if (!target) {
-      throw failOpen(
-        new Error(
-          `no workflow matching "${path}" — it isn't among the saved/open workflows even after a refresh. ` +
-            `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
-        ),
-      );
+      // Sampled HERE, after any refresh, never from a snapshot taken before it
+      // (codex review). A successful re-read REMOVES stale entries — measured on a
+      // live rig, the store went 109 to 107 — so a pre-refresh snapshot can offer a
+      // workflow the re-read just deleted as an example of what is addressable.
+      const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
+      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known })));
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
@@ -13097,16 +13201,92 @@ const GRAPH_TOOL_EXECUTORS = {
           //
           // Best-effort. A frontend without `checkState` behaves exactly as before —
           // this must never be the thing that fails an open.
-          try {
-            // AWAITED (codex). A frontend whose tracker captures asynchronously would
-            // otherwise have `activeState` read before the capture landed — the silent
-            // revert intact, and a late rejection escaping this try/catch to become an
-            // unhandled rejection. Awaiting a non-promise is free, so the synchronous
-            // trackers this ships against are unaffected.
-            await target.changeTracker?.checkState?.();
-          } catch {
-            // A tracker that refuses to capture leaves the stale snapshot in place,
-            // which is today's behaviour, not a new failure.
+          // #968 — ONLY when the canvas is PROVEN to be this workflow's. This capture is
+          // the silent wrong-graph edit, and it is worth being exact about why, because
+          // the intent above is right and only the PLACEMENT is wrong.
+          //
+          // We arrive here having just moved the pointer (`s.openWorkflow(target)`) and
+          // NOT yet repainted — the repaint reads `activeState` a few lines below. So on
+          // a switch FROM another tab the configuration is:
+          //
+          //   activeWorkflow      = target          (the pointer moved)
+          //   app.rootGraph       = the OTHER tab   (nothing has repainted yet)
+          //
+          // `checkState()` calls ComfyUI's `captureCanvasState()`, which serializes
+          // `app.rootGraph` into the ACTIVE tracker's `activeState`. Its two guards both
+          // assume the pointer and the canvas agree: `ChangeTracker.isLoadingGraph` is
+          // false (nothing is loading — this is our own switch, not `loadGraphData`), and
+          // `isActiveTracker(target)` is true (target genuinely IS active). Both pass, and
+          // the previous tab's graph lands in TARGET's state.
+          //
+          // The repaint below then faithfully reproduces that state, and the content proof
+          // compares the canvas against the same poisoned state and PASSES. Every binding
+          // surface afterwards reports healthy and is telling the truth — the canvas really
+          // does match the workflow object's state. The object's state is what is wrong.
+          // Only a read of the FILE disagrees, which is why `panel_load_workflow` was the
+          // one recovery reporters found.
+          //
+          // Reproduced live: pointer moved to an empty tab while a 7-node canvas was
+          // mounted, one `checkState()`, and the empty tab came back holding 7 nodes,
+          // `isModified: true`, and the OTHER workflow's `activeState.id`. No reconnect, no
+          // concurrency — which is what the reports without a reconnect storm were telling
+          // us all along.
+          //
+          // The guard is the #708 oracle, already used for exactly this hazard on the SAVE
+          // path: a positive, durable identity conflict refuses the capture. "unknown"
+          // still captures, so older frontends and first observation behave as before —
+          // this only ever REMOVES a capture we can prove is reading someone else's canvas.
+          // When the target IS already the painted tab (the `wasOpen`/already-current case
+          // #874 was written for) the binding is "bound" and the capture runs unchanged.
+          // The question is ONLY "is the mounted canvas this target's graph?", and it must
+          // be answered with POSITIVE proof, because BOTH answers can destroy data:
+          // capturing a foreign canvas writes another workflow's graph into this one
+          // (#968), and skipping a legitimate capture lets the repaint below overwrite live
+          // canvas work with a stale snapshot (#874). There is no safe default, so this
+          // never guesses from "did the pointer move" — that says nothing about who owns
+          // the canvas, and an earlier draft of this fix got both directions wrong with it
+          // (codex).
+          //
+          //   "bound"   — the root graph carries THIS workflow's identity tag. Proof. This
+          //               is the already-current case #874 was written for, and it captures
+          //               exactly as it always did.
+          //   "foreign" — the root positively belongs to another workflow. Skip.
+          //   "unknown" — cannot tell. CAPTURES, exactly as it does today.
+          //
+          // "unknown" deliberately changes NOTHING, which is the same discipline #708
+          // already applies with this oracle: only a POSITIVE, durable identity conflict
+          // refuses, so older frontends and a first observation behave as they always have.
+          // This fix therefore closes the provable case and introduces no regression
+          // anywhere else — it can only ever REMOVE a capture proven to be reading another
+          // workflow's canvas.
+          //
+          // I tried to do better and the attempt was unsound, so it is recorded here rather
+          // than repeated: falling back to node-id OVERLAP against the target's own state
+          // (via canvasFileDivergence) looks like ownership evidence and is not. ComfyUI
+          // assigns node ids as small integers from 1, so any two non-trivial graphs share
+          // ids 1..n — overlap would have answered "yours" for almost every foreign canvas,
+          // making the fallback worse than useless. That helper is built for the opposite
+          // reading (DISJOINT is suspicious) and its own header warns that a refusal built
+          // on it would be a wrong-graph refusal of its own (codex).
+          //
+          // KNOWN RESIDUAL, stated rather than hidden: an UNTAGGED root graph is still
+          // captured, so the contamination remains reachable on a canvas the panel has
+          // never stamped. Closing that needs ownership evidence that does not exist yet —
+          // not a guess dressed as one — and the reported cases are saved, panel-driven
+          // workflows whose roots carry the tag, which is the case this does close.
+          const captureBinding = describeLiveCanvasBinding(target);
+          if (captureBinding !== "foreign") {
+            try {
+              // AWAITED (codex). A frontend whose tracker captures asynchronously would
+              // otherwise have `activeState` read before the capture landed — the silent
+              // revert intact, and a late rejection escaping this try/catch to become an
+              // unhandled rejection. Awaiting a non-promise is free, so the synchronous
+              // trackers this ships against are unaffected.
+              await target.changeTracker?.checkState?.();
+            } catch {
+              // A tracker that refuses to capture leaves the stale snapshot in place,
+              // which is today's behaviour, not a new failure.
+            }
           }
           // `activeWorkflowNodeCount` deliberately accepts both tracker-owned and flat
           // activeState shapes. Use that SAME state source here: otherwise a frontend
@@ -14245,7 +14425,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const store = getSubgraphStore();
     let target = null;
     if (node_id != null) {
-      target = graph.getNodeById(Number(node_id));
+      target = graph.getNodeById(canonicalNodeId(node_id));
       if (!target) throw new Error(`No node with id ${node_id} in the current graph`);
       if (!target.subgraph) {
         throw new Error(`Node ${node_id} (${target.type}) is not a subgraph node`);
@@ -15249,7 +15429,31 @@ const GRAPH_TOOL_EXECUTORS = {
       ds.offset[0] = fit.offsetX;
       ds.offset[1] = fit.offsetY;
       canvas.setDirty?.(true, true);
-      canvas.draw(true, true); // synchronous redraw at the fitted transform
+      // #1108 — a THROW from here is the frontend's render path, not ours. Raw, it
+      // surfaced as "Cannot read properties of undefined (reading 'name')" to a
+      // reporter who was trying to screenshot a frozen canvas: the one tool that
+      // could have shown them the problem, failing with a message that reads like a
+      // panel bug. Say what it is, what still works, and what clears it.
+      try {
+        canvas.draw(true, true); // synchronous redraw at the fitted transform
+      } catch (err) {
+        // Put the user's view back BEFORE failing (codex review). The fit above moved
+        // it, the restore that normally undoes that is further down, and a throw
+        // jumps over it — so a failed screenshot silently left them zoomed into the
+        // framing it had chosen. Values only: re-drawing here would very likely throw
+        // again, and the frontend repaints on its own once it can.
+        try {
+          ds.scale = saved.scale;
+          ds.offset[0] = saved.ox;
+          ds.offset[1] = saved.oy;
+          canvas.setDirty?.(true, true);
+        } catch {
+          /* best-effort: never replace the draw failure with a restore failure */
+        }
+        // `cause` keeps the original type and stack: the draw-site frames are the
+        // only thing that says WHICH draw failed (codex review).
+        throw new Error(describeCanvasDrawFailure(err), { cause: err });
+      }
       const MAXW = 1600;
       if (cv.width > MAXW) {
         const s = MAXW / cv.width;
@@ -17892,6 +18096,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // Our build version, so the orchestrator can auto-stamp it into the
             // agent's ENV block (bug reports get version-pinned without digging).
             panelVersion: PANEL_VERSION,
+            // #236 — lets the orchestrator detect a tool-surface skew at CONNECT.
+            vocabularyHash: VENDORED_VOCABULARY_HASH,
             backend,
             // Blind content mode (issue #90): the orchestrator spawns this tab's
             // comfyui tool server with pixel-withholding env when true.
@@ -20248,7 +20454,20 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
+  // #1084 — `codex` and `chatgpt` are TWO ways to reach the same ChatGPT subscription, not a
+  // duplicate: `codex` runs it through a `codex app-server` subprocess, `chatgpt` speaks the
+  // Codex Responses OAuth API directly with no subprocess. The panel labelled only the first,
+  // as a bare "ChatGPT", so the second fell through to its raw id and the picker showed
+  // "ChatGPT" next to "chatgpt" — which reads as an accident and gives no basis for choosing.
+  // Both are named now; the orchestrator's own ready banner says "direct OAuth", so the panel
+  // matches that wording rather than inventing a second vocabulary for the same thing.
+  // NULL-PROTOTYPE, and it is load-bearing rather than tidiness (#1084 codex). Every read is
+  // `BACKEND_LABELS[id] || id`, and on a normal object literal that lookup walks the
+  // prototype chain: `BACKEND_LABELS["constructor"]` returns Object's constructor FUNCTION
+  // and `["__proto__"]` returns an object, so the `|| id` fallback never fires and a
+  // function would be interpolated into a sentence. Harmless while the gate below only let
+  // known ids through; reachable the moment it accepts an id this map has never seen.
+  const BACKEND_LABELS = Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
   // Appends a visible "(experimental)" marker to a backend's display label when
   // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
   // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
@@ -20280,6 +20499,37 @@ function buildPanel() {
   // PROVIDER section can render them (the switcher now lives there, not in
   // settings). Defaults to claude-only until discovery lands.
   let knownBackends = [{ backend: "claude", running: false }];
+  // #1083 — the ORCHESTRATOR's provider list, kept separate from `knownBackends` and from
+  // readiness. It is the merge baseline that stops a shorter ComfyUI-host probe from
+  // deleting `lmstudio`/`llamacpp`/`custom`/`copilot` from the picker.
+  //
+  // Two distinctions this must NOT collapse, both found in review (codex):
+  //
+  //  * NOT `readinessFromOrchestrator`. That flag means "readiness came from the agent
+  //    machine", and a bare `ready` ack sets it carrying NO provider list at all. Treating
+  //    it as proof of an authoritative list would merge a host probe against whatever
+  //    `knownBackends` happened to hold — possibly still the claude-only default — and
+  //    strand the picker without the configured providers.
+  //  * NOT `knownBackends`. That is the RENDERED list, so it also contains host-only
+  //    entries, and feeding it back in would make those entries permanently authoritative:
+  //    a host-only provider would keep its membership after the host stopped reporting it,
+  //    since the merge never removes an authoritative id. (An earlier version of this note
+  //    said it would also freeze that provider's LIVENESS. That was true of the helper's
+  //    first draft, which refused the probe's fields wholesale, and stopped being true when
+  //    the overlay became per-field — `running` refreshes for any shared id now. Corrected
+  //    rather than deleted because the stale reading is what this comment is here to
+  //    prevent, codex.)
+  //
+  // Set ONLY from a real bridge `backends` frame carrying an ARRAY — including an empty
+  // one, which CLEARS a stale baseline rather than asserting "render nothing"; see the
+  // assignment for why. Null until the first such frame, which is exactly the "no
+  // authoritative snapshot" case the merge passes through unchanged.
+  //
+  // (This sentence said "non-empty" for two commits after that stopped being true. Stale
+  // comments on a guard are how the earlier drafts of this fix went wrong, so it is worth
+  // the line: the merge's behaviour is not obvious from the call site, and a reader who
+  // trusts a description instead of the code is the exact failure mode being guarded.)
+  let orchestratorBackends = null;
   // Durable per-provider readiness (cli/auth/ready), keyed by backend id. Owned by
   // applyReadiness from GET /backends. Kept SEPARATE from knownBackends because
   // renderBackendChips is also called from connect/handshake paths that reconstruct
@@ -20396,7 +20646,20 @@ function buildPanel() {
       const res = await api.fetchApi("/comfyui_mcp_panel/backends");
       const data = await res.json().catch(() => ({}));
       if (Array.isArray(data?.backends)) {
-        renderBackendChips(data.backends);
+        // #1083 — MERGE, never replace, once the orchestrator has spoken. The host's
+        // `_BACKEND_PORTS` ends at `openrouter`, so a plain repaint here replaced the
+        // authoritative list with a shorter one and silently deleted `lmstudio`,
+        // `llamacpp`, `custom` and `copilot` from the picker — leaving no UI path back to
+        // a configured Custom endpoint. `applyReadiness` below already refuses this probe,
+        // but it ran one line too late: `renderBackendChips` assigns `knownBackends`
+        // wholesale, and the model popup rebuilds its Provider section from that.
+        // The baseline is `orchestratorBackends`, NOT `readinessFromOrchestrator` and NOT
+        // the rendered `knownBackends` — see the declaration for why each of those is
+        // wrong. Host-only providers are absent from the baseline by construction, so they
+        // are re-read from every probe and their liveness stays current.
+        renderBackendChips(
+          mergeProviderSnapshots({ authoritative: orchestratorBackends, probe: data.backends }),
+        );
         applyReadiness(data);
       }
     } catch {
@@ -26654,7 +26917,28 @@ function buildPanel() {
       // AUTHORITATIVE source of which provider we're actually connected to. Resolve
       // the switch BEFORE applying the catalog, so the effort scale + nearest-level
       // mapping in applyModelCatalog uses the NEW backend's scale (fix #5).
-      const known = typeof backend === "string" && BACKEND_LABELS[backend];
+      // #1084 — a backend id the orchestrator reports on its own handshake is AUTHORITATIVE,
+      // whether or not this panel build happens to have a pretty name for it. This gate used
+      // to be `BACKEND_LABELS[backend]`, which quietly made the label map a registry of
+      // KNOWN backends — so the missing `chatgpt` entry did not merely look wrong in the
+      // picker, it skipped this whole block: `connectedBackend` was never updated from the
+      // handshake, the preference was never persisted, and the placeholder kept naming the
+      // previous provider. A panel connected to direct-OAuth ChatGPT did not know it.
+      //
+      // Adding the label fixes today's case; keying the gate on the id fixes the class,
+      // because the orchestrator can add a backend before the panel ships a name for it and
+      // that is a normal ordering, not an error. Every label read below falls back to the
+      // raw id, so an unnamed backend degrades to showing "chatgpt" rather than "undefined".
+      //
+      // SHAPE-CHECKED rather than merely non-empty (codex). This block persists the value to
+      // localStorage and keys a per-backend catalog cache on it, so accepting anything at all
+      // would let a malformed handshake — `" "`, or a stray sentence — become the saved
+      // provider preference and outlive the session that produced it. The pattern is
+      // deliberately permissive about WHICH id (that is the whole point of not using the
+      // label map) and strict only about it being id-SHAPED: a leading alphanumeric, then
+      // alphanumerics, hyphens or underscores. Every backend this panel has ever shipped
+      // matches, and so does one it has never heard of.
+      const known = typeof backend === "string" && /^[a-z0-9][a-z0-9_-]*$/i.test(backend);
       if (known) {
         // A real provider switch = the connected backend changed AND we were
         // already connected to something (not the first connect, not a re-pick).
@@ -26664,7 +26948,9 @@ function buildPanel() {
             tr(
               "panel.switched_to_sessions_aren_t_shared_across",
               "Switched to {backend} — sessions aren't shared across providers, so this starts a fresh chat.",
-              { backend: BACKEND_LABELS[backend] },
+              // Falls back to the raw id (#1084): with the gate above no longer requiring a
+              // label, an unnamed backend would otherwise render "Switched to undefined".
+              { backend: BACKEND_LABELS[backend] || backend },
             ),
           );
         }
@@ -26702,6 +26988,45 @@ function buildPanel() {
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
       applyReadiness(data, { fromOrchestrator: true });
+      // #1083 — THIS is the only thing that establishes an authoritative provider list: a
+      // real bridge frame carrying an ARRAY. Recorded before the repaint so a host probe
+      // racing this frame merges against it rather than against the rendered list.
+      //
+      // A PRESENT array counts even when EMPTY (codex). An earlier draft required
+      // non-empty, reasoning that `[]` "told us nothing" — but the array's presence is what
+      // makes the frame a provider report. Ignoring `[]` left an orchestrator that had
+      // genuinely dropped to zero with its PREVIOUS list still authoritative, so later host
+      // probes kept re-asserting providers that no longer exist.
+      //
+      // WHAT `[]` DOES, precisely — a second correction, because the first version of this
+      // comment claimed more than the code delivers (codex): it CLEARS the baseline. It does
+      // not assert "show nothing". With no baseline left, the merge falls through to its
+      // pass-through case and the host probe becomes the only source again, exactly as
+      // before any frame arrived. That is the whole intended effect: the stale
+      // orchestrator-only entries stop being re-asserted. Making `[]` mean "render nothing"
+      // would need a coherent answer for whether the host's own providers may still be
+      // appended, and there is no evidence-backed answer to that — an orchestrator reporting
+      // zero providers is not a shape observed in practice.
+      //
+      // THE REPAINT BELOW IS NOT MERGED, and what that does and does not buy (codex):
+      //
+      // It is passed `data.backends` DIRECTLY, so this frame renders exactly what the
+      // orchestrator just said — including dropping a provider it no longer lists. On an
+      // empty frame that is `renderBackendChips([])`, which falls back to the renderer's
+      // claude-only default, so the picker shows one chip rather than none.
+      //
+      // That removal is only good for THIS repaint, and an earlier version of this comment
+      // wrongly claimed otherwise. If the ComfyUI host keeps reporting the dropped provider,
+      // the next `loadBackends` probe merges against the new baseline, sees an id the
+      // baseline lacks, and appends it again. So a provider the orchestrator stops listing
+      // reappears on the following poll whenever the host still knows it.
+      //
+      // Left that way on purpose: suppressing it would require telling "the orchestrator
+      // deliberately dropped this" apart from "the orchestrator never knew about it", and
+      // nothing in either snapshot carries that. Re-appending a provider the host can see is
+      // also the benign direction — an extra entry the user may not need, versus the missing
+      // entry with no way back that this whole issue is about.
+      if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).

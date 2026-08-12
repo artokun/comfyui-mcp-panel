@@ -1514,7 +1514,19 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
         : `the panel could not READ the graph on it to compare against the state that was loaded, so ` +
           `whether the whole graph landed is unestablished — NOT established as wrong. `) +
       `Treat the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} ` +
-      `You are NOT on the wrong workflow: ${workflow} IS the active one.` + FENCE_NOT_REFRESHED
+      `The identity is settled — ${workflow} IS the active one — but that is a statement about ` +
+      `the IDENTITY, not about the nodes: this outcome has been reported (#1111, #1089) with the ` +
+      `PREVIOUS workflow's graph still on the canvas, which a re-read then returns as if it were ` +
+      `this workflow's. So compare what you read against what you expect, and if it is the wrong ` +
+      `graph, panel_load_workflow with this workflow's path reloads it — that is what recovered ` +
+      `it for both reporters, and neither panel_graph_outline nor a fence refresh will. It loads ` +
+      `from DISK, so whatever is on the canvas right now is replaced: if the graph you are looking ` +
+      `at holds unsaved work — and if it is the previous workflow's, it may — preserve it FIRST. ` +
+      `To a NEW path, with Save As or an export: a plain save would write it to ${workflow}, ` +
+      `because that is what the active identity already names, and the stale graph would land on ` +
+      `top of the workflow you were trying to open. Recovering the binding is not worth losing a ` +
+      `graph to, and neither is preserving one.` +
+      FENCE_NOT_REFRESHED
     );
   }
   if (verdict?.status === OPEN_REBIND_STATUS.UNPROVEN) {
