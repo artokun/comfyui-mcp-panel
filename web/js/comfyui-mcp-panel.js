@@ -348,6 +348,7 @@ import {
   canvasFileDivergence,
   canvasFileDivergenceNote,
 } from "./lib/canvas-file-divergence.js";
+import { mergeProviderSnapshots } from "./lib/provider-snapshot-merge.js";
 import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
@@ -20511,7 +20512,19 @@ function buildPanel() {
       const res = await api.fetchApi("/comfyui_mcp_panel/backends");
       const data = await res.json().catch(() => ({}));
       if (Array.isArray(data?.backends)) {
-        renderBackendChips(data.backends);
+        // #1083 — MERGE, never replace, once the orchestrator has spoken. The host's
+        // `_BACKEND_PORTS` ends at `openrouter`, so a plain repaint here replaced the
+        // authoritative list with a shorter one and silently deleted `lmstudio`,
+        // `llamacpp`, `custom` and `copilot` from the picker — leaving no UI path back to
+        // a configured Custom endpoint. `applyReadiness` below already refuses this probe,
+        // but it ran one line too late: `renderBackendChips` assigns `knownBackends`
+        // wholesale, and the model popup rebuilds its Provider section from that.
+        renderBackendChips(
+          mergeProviderSnapshots({
+            authoritative: readinessFromOrchestrator ? knownBackends : null,
+            probe: data.backends,
+          }),
+        );
         applyReadiness(data);
       }
     } catch {
