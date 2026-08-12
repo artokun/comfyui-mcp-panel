@@ -90,6 +90,22 @@ test("a translation carrying a category its language never uses is still rejecte
   assert.match(r.stderr, /has "_one", which ko never uses/);
 });
 
+test("an undecoded backslash escape is rejected", () => {
+  // The extractor used to slice literals out of the source with their escapes intact, so a
+  // confirm dialog rendered a backslash and an `n` instead of breaking the line. Thirteen
+  // English strings shipped that way and Korean copied six. Every other check stayed green:
+  // the keys, the placeholders and the plural categories were all still exactly right.
+  const BS = String.fromCharCode(92);
+  const r = run(fixture("ko", { about: "정보" + BS + "n다음" }));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /undecoded escape/);
+});
+
+test("a real line break in a translation is fine", () => {
+  const r = run(fixture("ko", { about: "정보\n다음" }));
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+});
+
 test("a plural base the language has not started at all is NOT a failure", () => {
   // Incompleteness renders English through tr()'s fallback. Failing it would make adding a
   // counted string to English instantly break every language that has not caught up.
