@@ -348,6 +348,7 @@ import {
   canvasFileDivergence,
   canvasFileDivergenceNote,
 } from "./lib/canvas-file-divergence.js";
+import { mergeProviderSnapshots } from "./lib/provider-snapshot-merge.js";
 import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
@@ -20395,6 +20396,37 @@ function buildPanel() {
   // PROVIDER section can render them (the switcher now lives there, not in
   // settings). Defaults to claude-only until discovery lands.
   let knownBackends = [{ backend: "claude", running: false }];
+  // #1083 — the ORCHESTRATOR's provider list, kept separate from `knownBackends` and from
+  // readiness. It is the merge baseline that stops a shorter ComfyUI-host probe from
+  // deleting `lmstudio`/`llamacpp`/`custom`/`copilot` from the picker.
+  //
+  // Two distinctions this must NOT collapse, both found in review (codex):
+  //
+  //  * NOT `readinessFromOrchestrator`. That flag means "readiness came from the agent
+  //    machine", and a bare `ready` ack sets it carrying NO provider list at all. Treating
+  //    it as proof of an authoritative list would merge a host probe against whatever
+  //    `knownBackends` happened to hold — possibly still the claude-only default — and
+  //    strand the picker without the configured providers.
+  //  * NOT `knownBackends`. That is the RENDERED list, so it also contains host-only
+  //    entries, and feeding it back in would make those entries permanently authoritative:
+  //    a host-only provider would keep its membership after the host stopped reporting it,
+  //    since the merge never removes an authoritative id. (An earlier version of this note
+  //    said it would also freeze that provider's LIVENESS. That was true of the helper's
+  //    first draft, which refused the probe's fields wholesale, and stopped being true when
+  //    the overlay became per-field — `running` refreshes for any shared id now. Corrected
+  //    rather than deleted because the stale reading is what this comment is here to
+  //    prevent, codex.)
+  //
+  // Set ONLY from a real bridge `backends` frame carrying an ARRAY — including an empty
+  // one, which CLEARS a stale baseline rather than asserting "render nothing"; see the
+  // assignment for why. Null until the first such frame, which is exactly the "no
+  // authoritative snapshot" case the merge passes through unchanged.
+  //
+  // (This sentence said "non-empty" for two commits after that stopped being true. Stale
+  // comments on a guard are how the earlier drafts of this fix went wrong, so it is worth
+  // the line: the merge's behaviour is not obvious from the call site, and a reader who
+  // trusts a description instead of the code is the exact failure mode being guarded.)
+  let orchestratorBackends = null;
   // Durable per-provider readiness (cli/auth/ready), keyed by backend id. Owned by
   // applyReadiness from GET /backends. Kept SEPARATE from knownBackends because
   // renderBackendChips is also called from connect/handshake paths that reconstruct
@@ -20511,7 +20543,20 @@ function buildPanel() {
       const res = await api.fetchApi("/comfyui_mcp_panel/backends");
       const data = await res.json().catch(() => ({}));
       if (Array.isArray(data?.backends)) {
-        renderBackendChips(data.backends);
+        // #1083 — MERGE, never replace, once the orchestrator has spoken. The host's
+        // `_BACKEND_PORTS` ends at `openrouter`, so a plain repaint here replaced the
+        // authoritative list with a shorter one and silently deleted `lmstudio`,
+        // `llamacpp`, `custom` and `copilot` from the picker — leaving no UI path back to
+        // a configured Custom endpoint. `applyReadiness` below already refuses this probe,
+        // but it ran one line too late: `renderBackendChips` assigns `knownBackends`
+        // wholesale, and the model popup rebuilds its Provider section from that.
+        // The baseline is `orchestratorBackends`, NOT `readinessFromOrchestrator` and NOT
+        // the rendered `knownBackends` — see the declaration for why each of those is
+        // wrong. Host-only providers are absent from the baseline by construction, so they
+        // are re-read from every probe and their liveness stays current.
+        renderBackendChips(
+          mergeProviderSnapshots({ authoritative: orchestratorBackends, probe: data.backends }),
+        );
         applyReadiness(data);
       }
     } catch {
@@ -26800,6 +26845,45 @@ function buildPanel() {
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
       applyReadiness(data, { fromOrchestrator: true });
+      // #1083 — THIS is the only thing that establishes an authoritative provider list: a
+      // real bridge frame carrying an ARRAY. Recorded before the repaint so a host probe
+      // racing this frame merges against it rather than against the rendered list.
+      //
+      // A PRESENT array counts even when EMPTY (codex). An earlier draft required
+      // non-empty, reasoning that `[]` "told us nothing" — but the array's presence is what
+      // makes the frame a provider report. Ignoring `[]` left an orchestrator that had
+      // genuinely dropped to zero with its PREVIOUS list still authoritative, so later host
+      // probes kept re-asserting providers that no longer exist.
+      //
+      // WHAT `[]` DOES, precisely — a second correction, because the first version of this
+      // comment claimed more than the code delivers (codex): it CLEARS the baseline. It does
+      // not assert "show nothing". With no baseline left, the merge falls through to its
+      // pass-through case and the host probe becomes the only source again, exactly as
+      // before any frame arrived. That is the whole intended effect: the stale
+      // orchestrator-only entries stop being re-asserted. Making `[]` mean "render nothing"
+      // would need a coherent answer for whether the host's own providers may still be
+      // appended, and there is no evidence-backed answer to that — an orchestrator reporting
+      // zero providers is not a shape observed in practice.
+      //
+      // THE REPAINT BELOW IS NOT MERGED, and what that does and does not buy (codex):
+      //
+      // It is passed `data.backends` DIRECTLY, so this frame renders exactly what the
+      // orchestrator just said — including dropping a provider it no longer lists. On an
+      // empty frame that is `renderBackendChips([])`, which falls back to the renderer's
+      // claude-only default, so the picker shows one chip rather than none.
+      //
+      // That removal is only good for THIS repaint, and an earlier version of this comment
+      // wrongly claimed otherwise. If the ComfyUI host keeps reporting the dropped provider,
+      // the next `loadBackends` probe merges against the new baseline, sees an id the
+      // baseline lacks, and appends it again. So a provider the orchestrator stops listing
+      // reappears on the following poll whenever the host still knows it.
+      //
+      // Left that way on purpose: suppressing it would require telling "the orchestrator
+      // deliberately dropped this" apart from "the orchestrator never knew about it", and
+      // nothing in either snapshot carries that. Re-appending a provider the host can see is
+      // also the benign direction — an extra entry the user may not need, versus the missing
+      // entry with no way back that this whole issue is about.
+      if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
