@@ -44,6 +44,9 @@ test("#1108 it says where the throw came from WITHOUT excluding the graph", () =
   // The two tools that DID work for the reporter, named so the next one uses them.
   assert.match(text, /panel_graph_outline/);
   assert.match(text, /panel_get_errors/);
+  // codex round 5, P2: an outline names nodes regardless of fault, so "if either
+  // names a node, look at it" pointed at every node in the graph.
+  assert.match(text, /an outline names nodes whether or not one is at fault/);
 });
 
 test("#1108 it connects the failed screenshot to the frozen canvas", () => {
@@ -90,7 +93,13 @@ test("#1108 it names the remedy and admits the panel cannot apply it", () => {
   assert.doesNotMatch(text, /are what is left to look at/);
   assert.doesNotMatch(text, /the cause is in the graph rather than/);
   // And a refresh discards unsaved work, which must be said BEFORE they do it.
-  assert.match(text, /a refresh discards unsaved canvas work, so offer the user a save FIRST/);
+  // codex round 5, P1: the warning used to sit AFTER the F5 recommendation, so a
+  // reader acting top-to-bottom could refresh before reaching it.
+  assert.match(text, /SAVE FIRST/);
+  assert.ok(
+    text.indexOf("SAVE FIRST") < text.indexOf("(F5)"),
+    "the data-loss warning must precede the step that causes it",
+  );
 });
 
 test("#1108 it does not key on the message shape it happened to see", () => {

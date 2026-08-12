@@ -50,17 +50,24 @@ export function describeCanvasDrawFailure(err, opts = {}) {
     `(${raw || "no message"}). The throw is from the frontend's render path, which does NOT rule ` +
     `out the graph as its cause: a node or widget the renderer cannot draw throws here while ` +
     `panel_graph_outline still reads that same graph perfectly well. Use panel_graph_outline and ` +
-    `panel_get_errors now — if either names a node, that node is the first thing to look at.\n\n` +
+    `panel_get_errors now: an outline names nodes whether or not one is at fault, but a node ` +
+    `panel_get_errors flags is worth looking at first.\n\n` +
     `WHAT IT MAY MEAN FOR THE CANVAS: a render loop that cannot complete a draw is also what a ` +
     `frozen canvas looks like from the user's side — no pan, no zoom, clicks dead. ${freeze}\n\n` +
-    `WHAT TO TRY: a hard refresh of the ComfyUI browser tab (F5) is what cleared it for the one ` +
-    `report of this, and the panel cannot repair the frontend's render state from here, so ` +
-    `re-taking the screenshot is unlikely to succeed before then. If a refresh does NOT clear it, ` +
-    `that is worth knowing but proves less than it looks: a render that is still running can ` +
-    `recreate the same state immediately, so try it with the queue idle before concluding ` +
-    `anything. If it still returns with nothing running, the graph and any extension that draws ` +
-    `on the canvas are worth checking — though a stock ComfyUI or browser rendering defect ` +
-    `produces this too, so none of that is a shortlist, only a place to start. Either way a refresh discards unsaved canvas ` +
-    `work, so offer the user a save FIRST.`
+    // The data-loss warning comes FIRST (codex round 5, P1). It used to sit at the
+    // end, after the F5 recommendation — a reader acting top-to-bottom could refresh
+    // before reaching it, which is the loss it exists to prevent.
+    `WHAT TO TRY — BUT SAVE FIRST: the step below reloads the ComfyUI tab and discards ` +
+    `unsaved canvas work, so offer the user a save before suggesting it.
+
+` +
+    `A hard refresh of the ComfyUI browser tab (F5) is what cleared it for the one report of ` +
+    `this, and the panel cannot repair the frontend's render state from here, so re-taking the ` +
+    `screenshot is unlikely to succeed before then. If a refresh does NOT clear it, that is ` +
+    `worth knowing but proves less than it looks: a render that is still running can recreate ` +
+    `the same state immediately, so try it with the queue idle before concluding anything. If ` +
+    `it still returns with nothing running, the graph and any extension that draws on the ` +
+    `canvas are worth checking — though a stock ComfyUI or browser rendering defect produces ` +
+    `this too, so none of that is a shortlist, only a place to start.`
   );
 }
