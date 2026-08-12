@@ -40,8 +40,19 @@
  * rather than chosen. A port the user actually types still outranks everything, which
  * is the behaviour the override rule exists to protect.
  *
- * The record is cleared as soon as the value diverges: once the user edits that field,
- * what is stored is theirs, and this module must never speak for it again.
+ * KNOWN LIMITATION, stated because the first draft of this comment claimed otherwise.
+ * The record is NOT cleared when the user edits the field. Two consequences, both real:
+ *
+ *   - A user who changes the URL and later deliberately retypes the value the migration
+ *     once wrote is still classified as inherited, and their choice is disregarded.
+ *   - The record lives in localStorage while the URL is a SYNCED ComfyUI setting, so on
+ *     a second tab or device the setting can arrive without its record (wrongly manual),
+ *     or a stale local record can suppress a legitimately re-entered URL.
+ *
+ * Neither is the reported bug and neither makes it worse, but both are ways this can be
+ * wrong, and a reader deserves to know before extending it. The clearing path belongs
+ * wherever the user's own edit is committed; storing provenance beside the setting
+ * rather than in localStorage would close the sync hole.
  */
 
 /** localStorage key holding the URL the migration wrote for `backend`. */
