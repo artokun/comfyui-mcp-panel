@@ -916,6 +916,11 @@ test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED fr
   // api.queuePrompt wrapped by rgthree). That is a stronger check than a grep for
   // a sentence, which is why the sentence moved.
   assert.match(note, /describeQueuePromptChainForReport\(/, "the ask survives, via the shared builder");
+  // …and it reads the globals through the GUARDED accessor. Inlining `window.app`
+  // here would put a throwing getter outside every guard in the library — a
+  // mutation doing exactly that survived every behavioural test, because the call
+  // site is only reachable in a browser.
+  assert.match(note, /queuePromptChainDeps\(\)/, "the globals are read through the guarded accessor");
   assert.doesNotMatch(
     note,
     /including your ComfyUI_frontend version/,

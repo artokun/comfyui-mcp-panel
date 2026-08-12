@@ -243,7 +243,10 @@ import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-lo
 import {
   describeQueuePromptChain,
   describeQueuePromptChainForReport,
+  queuePromptChainDeps,
 } from "./lib/queue-prompt-chain.js";
+
+
 import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
@@ -12156,9 +12159,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // rgthree wraps api.queuePrompt), and a wrapper that forwards its
         // arguments is harmless while one that does not drops the scope silently.
         // That is invisible in a version number, so the note carries it directly.
-        describeQueuePromptChainForReport(
-          describeQueuePromptChain({ app, api: app?.api ?? window.comfyAPI?.api?.api }),
-        );
+        describeQueuePromptChainForReport(describeQueuePromptChain(queuePromptChainDeps()));
     }
     // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
     // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
