@@ -16,44 +16,43 @@
  * moment `panel_get_errors` and `panel_graph_outline` both answered correctly. The
  * fault is in the frontend's own draw path, and the panel is only the caller.
  *
- * So the panel says that. It cannot repair LiteGraph's render loop, and it must not
- * pretend the failure came from somewhere it can act on — but it can name the one
- * thing that reliably clears it, and it can point out that a frozen canvas and a
- * failed screenshot are the SAME fault rather than two problems.
+ * So the panel says what it saw. It cannot repair LiteGraph's render loop, and it
+ * must not pretend to know more than where the throw came from — see the function
+ * below for what was claimed and then retracted.
  */
-
-/** A draw failure inside LiteGraph, as opposed to a panel-side precondition. */
-export function isCanvasDrawFailure(err) {
-  // Anything thrown out of canvas.draw() qualifies: the panel has already checked
-  // its own preconditions (canvas present, scope resolvable) before reaching it, so
-  // a throw from here is the renderer's. Deliberately NOT pattern-matched on the
-  // message — "reading 'name'" is one shape of it, and keying on that would let the
-  // next shape through as an opaque TypeError again.
-  return err instanceof Error || typeof err === "string";
-}
 
 /**
  * What to say when the redraw throws.
  *
- * States what failed, what is known to be healthy, what it means for the canvas the
- * user is looking at, and the one remedy that is known to work. It claims nothing
- * about the cause beyond where the throw came from.
+ * It says what it saw and no more (codex review). It does NOT exclude the graph as
+ * the cause — a node or widget the renderer cannot draw throws here while a graph
+ * READ of that same node succeeds, so "not the graph" would have sent someone away
+ * from the likeliest lead. It does not assert that the freeze and the failed draw
+ * are one fault; shared timing is not a shared cause. And it offers the refresh as
+ * the thing that cleared it for the one report of this, not as a remedy the panel
+ * can promise.
  */
 export function describeCanvasDrawFailure(err, opts = {}) {
   const raw = err instanceof Error ? err.message : String(err ?? "");
   const alsoFrozen = opts.canvasReportedFrozen === true;
+  const freeze = alsoFrozen
+    ? `That was reported here, so it is worth treating as one fault rather than two — though ` +
+      `shared timing is not proof of a shared cause.`
+    : `If the user reports that too, they may be one fault seen from two directions rather than ` +
+      `two problems.`;
   return (
     `The screenshot could not be taken: the ComfyUI canvas threw while REDRAWING itself ` +
-    `(${raw || "no message"}). That throw comes from the frontend's own render path, not from ` +
-    `the graph or the backend — a graph read (panel_graph_outline) and the error surface ` +
-    `(panel_get_errors) are unaffected and worth using instead right now.\n\n` +
-    `WHAT IT MEANS FOR THE CANVAS: a render loop that cannot complete a draw is also what a ` +
-    `frozen canvas looks like from the user's side — no pan, no zoom, clicks dead. ` +
-    `${alsoFrozen ? "That is what was reported here, and " : "If the user reports that too, "}` +
-    `they are the same fault seen from two directions, not two problems.\n\n` +
-    `WHAT CLEARS IT: a hard refresh of the ComfyUI browser tab (F5). The panel cannot repair ` +
-    `the frontend's render state from here, and re-taking the screenshot will fail the same ` +
-    `way until the tab is reloaded. Unsaved canvas work survives a refresh only if it was ` +
-    `saved — offer that to the user before they reload.`
+    `(${raw || "no message"}). The throw is from the frontend's render path, which does NOT rule ` +
+    `out the graph as its cause: a node or widget the renderer cannot draw throws here while ` +
+    `panel_graph_outline still reads that same graph perfectly well. Use panel_graph_outline and ` +
+    `panel_get_errors now — if either names a node, that node is the first thing to look at.\n\n` +
+    `WHAT IT MAY MEAN FOR THE CANVAS: a render loop that cannot complete a draw is also what a ` +
+    `frozen canvas looks like from the user's side — no pan, no zoom, clicks dead. ${freeze}\n\n` +
+    `WHAT TO TRY: a hard refresh of the ComfyUI browser tab (F5) is what cleared it for the one ` +
+    `report of this, and the panel cannot repair the frontend's render state from here, so ` +
+    `re-taking the screenshot is unlikely to succeed before then. If a refresh does NOT clear it, ` +
+    `the cause is in the graph rather than in the render state and will still be there ` +
+    `afterwards. Either way a refresh discards unsaved canvas work, so offer the user a save ` +
+    `FIRST.`
   );
 }

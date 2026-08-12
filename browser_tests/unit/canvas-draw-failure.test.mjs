@@ -7,18 +7,17 @@
 // LTX render), so the one tool that could have shown them the state is the one that
 // failed, with a message that reads like a panel bug.
 //
-// It is not one, and it is not the graph or the backend: panel_get_errors and
-// panel_graph_outline both answered correctly at that moment.
+// It is not a panel bug. It is NOT, however, safe to say it is not the graph: a node
+// or widget the renderer cannot draw throws here while panel_graph_outline reads that
+// same node perfectly well — which is exactly what the reporter observed, and the
+// likeliest lead. The first version of this message excluded the graph outright.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import {
-  describeCanvasDrawFailure,
-  isCanvasDrawFailure,
-} from "../../web/js/lib/canvas-draw-failure.js";
+import { describeCanvasDrawFailure } from "../../web/js/lib/canvas-draw-failure.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -32,10 +31,14 @@ test("#1108 the raw exception is preserved, not swallowed", () => {
   assert.match(text, /Cannot read properties of undefined \(reading 'name'\)/);
 });
 
-test("#1108 it says where the throw came from, and what still works", () => {
+test("#1108 it says where the throw came from WITHOUT excluding the graph", () => {
+  // codex review, P1: "not from the graph or the backend" is unsupported — a node or
+  // widget the renderer cannot draw throws here while a graph READ of that same node
+  // succeeds, which is the likeliest lead and the one that sentence sent you away from.
   const text = describeCanvasDrawFailure(REPORTED);
   assert.match(text, /threw while REDRAWING itself/);
-  assert.match(text, /not from the graph or the backend/);
+  assert.match(text, /does NOT rule out the graph as its cause/);
+  assert.doesNotMatch(text, /not from the graph or the backend/);
   // The two tools that DID work for the reporter, named so the next one uses them.
   assert.match(text, /panel_graph_outline/);
   assert.match(text, /panel_get_errors/);
@@ -45,31 +48,40 @@ test("#1108 it connects the failed screenshot to the frozen canvas", () => {
   // The reporter worked this out themselves, twice, before calling the tool. The
   // tool should not make them.
   const text = describeCanvasDrawFailure(REPORTED, { canvasReportedFrozen: true });
-  assert.match(text, /same fault seen from two directions, not two problems/);
-  assert.match(text, /That is what was reported here/);
+  assert.match(text, /worth treating as one fault rather than two/);
+  // codex review, P1: shared timing is not a shared cause, and saying "the same
+  // fault" asserted one.
+  assert.match(text, /shared timing is not proof of a shared cause/);
+  assert.doesNotMatch(text, /not two problems\./);
 
-  // …and when nobody has reported a freeze, it offers the connection conditionally
-  // rather than asserting it.
   const unreported = describeCanvasDrawFailure(REPORTED);
   assert.match(unreported, /If the user reports that too/);
-  assert.doesNotMatch(unreported, /That is what was reported here/);
+  assert.doesNotMatch(unreported, /That was reported here/);
 });
 
 test("#1108 it names the remedy and admits the panel cannot apply it", () => {
   const text = describeCanvasDrawFailure(REPORTED);
   assert.match(text, /hard refresh of the ComfyUI browser tab/);
   assert.match(text, /cannot repair the frontend's render state from here/);
-  // Retrying is explicitly ruled out — the reporter would otherwise try it.
-  assert.match(text, /will fail the same way until the tab is reloaded/);
+  // codex review, P2: offered as what cleared it, not as a promise — and the case
+  // where it does NOT clear is named, because that is the informative one.
+  //
+  // Asserted on MEANING, not on the sentence. A literal match here ("the one report
+  // of this") was tried and removed: a control mutation that changed nothing but
+  // "report"→"reports" killed it, which is a test that punishes rewording rather
+  // than protecting behaviour.
+  assert.doesNotMatch(text, /will clear it|this will fix|guaranteed/i, "no promise is made");
+  assert.match(text, /unlikely to succeed before then/, "retrying is discouraged, not forbidden");
+  assert.match(text, /If a refresh does NOT clear it/, "and the informative case is named");
   // And a refresh discards unsaved work, which must be said BEFORE they do it.
-  assert.match(text, /Unsaved canvas work survives a refresh only if it was saved/);
+  assert.match(text, /a refresh discards unsaved canvas work, so offer the user a save FIRST/);
 });
 
 test("#1108 it does not key on the message shape it happened to see", () => {
   // "reading 'name'" is one shape of this. Matching on it would let the next shape
-  // through as an opaque TypeError again — which is the whole bug.
-  assert.equal(isCanvasDrawFailure(new Error("something else entirely")), true);
-  assert.equal(isCanvasDrawFailure("a string throw"), true);
+  // through as an opaque TypeError again — which is the whole bug. (A predicate that
+  // "classified" throws was written and REMOVED: it returned true for anything and
+  // would have misled a reader into thinking something was being distinguished.)
   const other = describeCanvasDrawFailure(new Error("ctx.measureText is not a function"));
   assert.match(other, /ctx\.measureText is not a function/);
   assert.match(other, /threw while REDRAWING itself/);
@@ -91,5 +103,9 @@ test("#1108 WIRING: the synchronous redraw is actually wrapped", () => {
   assert.ok(i > 0, "graph_screenshot must exist");
   const body = src.slice(i, i + 6000);
   assert.match(body, /try \{\s*\n\s*canvas\.draw\(true, true\);/, "the redraw is inside a try");
-  assert.match(body, /throw new Error\(describeCanvasDrawFailure\(err\)\)/, "and its throw is translated");
+  assert.match(
+    body,
+    /throw new Error\(describeCanvasDrawFailure\(err\), \{ cause: err \}\)/,
+    "its throw is translated, and the original is kept as `cause`",
+  );
 });

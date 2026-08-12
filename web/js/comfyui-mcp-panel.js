@@ -15426,7 +15426,9 @@ const GRAPH_TOOL_EXECUTORS = {
       try {
         canvas.draw(true, true); // synchronous redraw at the fitted transform
       } catch (err) {
-        throw new Error(describeCanvasDrawFailure(err));
+        // `cause` keeps the original type and stack: the draw-site frames are the
+        // only thing that says WHICH draw failed (codex review).
+        throw new Error(describeCanvasDrawFailure(err), { cause: err });
       }
       const MAXW = 1600;
       if (cv.width > MAXW) {
