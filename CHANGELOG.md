@@ -8,6 +8,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **The mid-task nudge no longer fires on a turn you just started, and now fires when the
+  panel itself respawns a wedged orchestrator (#1163).** Two defects in the outage
+  accounting added for #1145, found by review of that change rather than in the wild.
+  A turn beginning while the bridge was still down zeroed the measured outage but left
+  the outage itself running, so it was later measured from before that turn existed.
+  Reachable in ordinary use: sending a message needs only an open socket, not a completed
+  handshake, and the socket comes back well before the model list does — so typing into
+  that gap could draw "your connection dropped mid-task — continue exactly what you were
+  doing" on top of the message just sent, making the agent restart or duplicate the work
+  it was asked to do. A turn start now ENDS the outage rather than only zeroing the
+  total, which is also better evidence than the clock it replaces: the frame that starts a
+  turn comes FROM the orchestrator, so receiving it proves the orchestrator is alive. That
+  settles the reconnect case for the right reason — an orchestrator that survived
+  re-announces its live turn and is left alone, while one that died has no turn to
+  re-announce, so its nudge still fires.
+  Separately, the panel's own automatic recovery — reclaiming, respawning or redialling a
+  wedged orchestrator — tore the socket down by a path that never recorded an outage at
+  all. That is a real orchestrator death with the turn already lost, so the resumed
+  session had nothing pending and no nudge was sent: the agent simply stopped, after the
+  panel's own recovery killed its work. All three teardowns now record the outage they
+  cause. Deliberate teardowns (Disconnect, provider switch, reload) are unaffected, as
+  they retire the pending turn on their own paths.
+
 - **The mid-task resume nudge now measures the outage instead of one backoff step, so a
   ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
   resumed agent its connection dropped mid-task and to continue what it was doing, and it

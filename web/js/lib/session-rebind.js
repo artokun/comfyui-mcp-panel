@@ -154,6 +154,29 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       startedAt = null;
     },
     noteTurnStarted() {
+      // #1163 — CLOSE the outage, do not merely zero the total.
+      //
+      // Zeroing alone left `startedAt` running across the turn boundary, so an outage
+      // that began before the turn was still measured from before the turn existed.
+      // That is reachable, not theoretical: `sendUserMessage` requires only an OPEN
+      // socket, not a completed handshake, and the socket reopens well before the
+      // `models` frame — up to 45s earlier on a cold backend. A user who types into
+      // that gap gets `turn:working`, then the late handshake measures the pre-turn
+      // drop, and the `ready` ack tells the agent its connection dropped mid-task and
+      // to resume — on top of the message the user sent seconds ago. The agent
+      // restarts or duplicates the work it was just asked to do: the exact
+      // false-nudge-into-a-live-session harm #1138 exists to prevent.
+      //
+      // Closing here is not merely a repair, it is better evidence. `turn:working` is a
+      // frame FROM the orchestrator, so receiving it proves the bridge is carrying
+      // traffic and the orchestrator is alive — which is what the clock was only ever
+      // estimating. It also settles the reconnect re-announce correctly and for the
+      // right reason: an orchestrator that SURVIVED re-announces its live turn, and
+      // that announcement now ends the outage, so no nudge fires for a turn that never
+      // died. One that died has no turn to re-announce, so nothing arrives before the
+      // `ready` ack, the outage stands, and the nudge fires. The panel stops guessing
+      // from elapsed time in the one case where it holds proof.
+      startedAt = null;
       outageMs = 0;
     },
     /** The outage the current turn has seen, in ms (0 = none).

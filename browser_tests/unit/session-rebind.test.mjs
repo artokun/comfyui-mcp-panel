@@ -635,9 +635,24 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
     ["the socket close handler must open the outage", "bridgeOutage.noteBridgeClosed();"],
     ["the models handshake must close it", "bridgeOutage.noteHandshake();"],
     ["a turn start must scope the evidence to that turn", "bridgeOutage.noteTurnStarted();"],
+    // #1163 — the FOURTH write site. The socket close listener is guarded by isActive(),
+    // and every panel-driven teardown nulls `sock` first, so the automatic recovery
+    // paths (tryAutoReclaim / tryAutoRespawn / tryHandshakeRedial) reach the tracker
+    // only through here. Without it they respawn the orchestrator with a turn armed and
+    // never nudge — #1145's failure by another route.
+    ["a panel-driven teardown must open the outage", "if (had) bridgeOutage.noteBridgeClosed();"],
   ]) {
     assert.ok(src.includes(snippet), site);
   }
+  // …and each teardown must actually route through that helper rather than dropping the
+  // socket itself. An inlined `sock = null` would bypass the tracker silently.
+  // Counts CALL STATEMENTS only — a line whose whole content is the call — so the
+  // definition and the prose that names it are not mistaken for call sites.
+  assert.equal(
+    (src.match(/^\s*dropSocketForTeardown\(\);/gm) || []).length,
+    3, // stop() + setUrl() + destroy()
+    "stop(), setUrl() and destroy() must all drop the socket through the tracked helper",
+  );
 });
 
 // ── #1145: the interval must be the OUTAGE, not one backoff step ─────────────
@@ -840,6 +855,75 @@ test("#1145: a never-dropped bridge reads 0 live, not the age of the session", (
   assert.equal(tracker.isDown(), false);
   assert.equal(tracker.outageMs(), 0);
   assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
+});
+
+// ── #1163: a turn start CLOSES the outage, it does not merely zero the total ──
+//
+// Zeroing alone left `startedAt` running across the turn boundary, so an outage that
+// began before the turn was still measured from before the turn existed. Reachable
+// because sendUserMessage needs only an OPEN socket, not a handshake, and the socket
+// reopens well before the `models` frame — so a user can type into the gap and have the
+// reply nudged as though their connection had just dropped.
+
+test("#1163: a turn started during an open outage is not charged with it", () => {
+  // The reported sequence. Bridge drops; the socket is back but unhandshaken; the user
+  // sends a message; the late handshake must NOT measure from before that turn.
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed(); // t=0, the real drop
+  clock.t += 5000; // socket reopens; `models` still pending
+  tracker.noteTurnStarted(); // the user's new message draws turn:working
+  assert.equal(tracker.isDown(), false, "a frame from the orchestrator ends the outage");
+  assert.equal(tracker.outageMs(), 0);
+
+  clock.t += 30_000; // the models frame finally lands
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 0, "the pre-turn drop must not be measured here");
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    false,
+    "a turn the user just started must never be told its connection dropped",
+  );
+});
+
+test("#1163: a live turn's reconnect re-announce ends the outage, so it is not nudged", () => {
+  // turn:working is a frame FROM the orchestrator, so receiving it proves the bridge is
+  // carrying traffic. An orchestrator that SURVIVED re-announces its live turn; one that
+  // died has no turn to re-announce. So the re-announce arriving before the ready ack is
+  // exactly the evidence that no nudge is due — better than any clock reading.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted(); // turn begins
+  tracker.noteBridgeClosed(); // ComfyUI bounces, orchestrator survives
+  clock.t += 30_000;
+  tracker.noteTurnStarted(); // the surviving turn re-announces on reconnect
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    false,
+    "a turn that never died must not be told to resume",
+  );
+});
+
+test("#1163: an orchestrator that DIED still nudges — no re-announce arrives first", () => {
+  // The complement, so the fix cannot be satisfied by never nudging: a dead orchestrator
+  // has no live turn to re-announce, so nothing closes the outage before the ready ack.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed();
+  clock.t += 30_000;
+  tracker.noteHandshake(); // only the handshake arrives — no turn:working
+  assert.equal(tracker.outageMs(), 30_000);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1163: a drop AFTER the turn start is still measured in full", () => {
+  // Closing on a turn start must not blunt the live path: a drop that happens after the
+  // turn begins is entirely this turn's, including when read before the handshake.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  clock.t += 1000;
+  tracker.noteBridgeClosed();
+  clock.t += 20_000;
+  assert.equal(tracker.outageMs(), 20_000, "live read, ready ahead of models");
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
 });
 
 test("#1145: a second outage measures itself, not the gap since the first", () => {

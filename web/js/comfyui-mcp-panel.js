@@ -18258,13 +18258,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // clock to the last backoff step. The tracker ignores all but the first; the
       // outage stands until markConnected() ends it.
       //
-      // A panel-DRIVEN teardown never reaches here, and that is deliberate rather than
-      // a gap: stop() nulls `sock` synchronously, so the late close fails the isActive()
-      // guard above and no outage opens. Every such path — Disconnect, provider switch,
-      // soft reload — routes through endTurnLocally() or its own ready-ack branch and
-      // clears MID_TASK_KEY, so there is no mid-task nudge left to decide. Opening an
-      // outage for them would only invent evidence about a drop the user asked for. The
-      // pre-#1145 stamp sat behind this same guard, so this is unchanged behaviour.
+      // A panel-DRIVEN teardown never reaches here — stop()/setUrl()/destroy() null
+      // `sock` synchronously, so their late close fails the isActive() guard above.
+      // #1146 called that harmless on the grounds that every such path clears
+      // MID_TASK_KEY. #1163 found that reasoning covers only Disconnect, provider switch
+      // and soft reload; the AUTOMATIC recovery paths (tryAutoReclaim / tryAutoRespawn /
+      // tryHandshakeRedial) restart the orchestrator with a turn still armed and were
+      // silently losing the nudge. They open their outage in dropSocketForTeardown()
+      // instead, which is the one place that knows a teardown happened at all.
       bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
@@ -18553,6 +18554,35 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     }, delay);
   }
 
+  /** #1163 — drop the socket for a PANEL-DRIVEN teardown, and open the outage while
+   *  doing it.
+   *
+   *  The close listener cannot do this job for these paths. It is guarded by
+   *  `isActive()`, and every caller here nulls `sock` synchronously, so by the time the
+   *  browser delivers `close` the socket is already superseded and the handler returns
+   *  before recording anything. #1146 called that harmless because Disconnect, provider
+   *  switch and soft reload all clear MID_TASK_KEY on their own paths — true for those
+   *  three, and wrong for the AUTOMATIC recovery paths, which is where it mattered:
+   *  tryAutoReclaim, tryAutoRespawn and tryHandshakeRedial restart the orchestrator
+   *  through setUrl/stop with a turn still armed. That respawn IS a real orchestrator
+   *  death — the turn is gone and the resumed session has nothing pending — but with no
+   *  outage ever opened, the ready ack read no drop, cleared the marker and returned
+   *  silently. The agent never resumed the work the panel's own reclaim killed: #1145's
+   *  failure, reached through the recovery path instead of through the backoff.
+   *
+   *  Only when a socket actually existed. A teardown of a client that never connected
+   *  has no outage to open, and inventing one would let the next handshake measure idle
+   *  time as downtime. */
+  function dropSocketForTeardown() {
+    const had = !!sock;
+    try {
+      sock?.close();
+    } catch {}
+    sock = null;
+    handshakenSock = null;
+    if (had) bridgeOutage.noteBridgeClosed();
+  }
+
   return {
     // Public re-hello so the panel can re-target this socket to a new workflow's
     // tab id (per-workflow sessions) without opening a second client.
@@ -18776,11 +18806,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-      try {
-        sock?.close();
-      } catch {}
-      sock = null;
-      handshakenSock = null;
+      // #1163 — opens the outage; tryAutoReclaim / tryAutoRespawn / tryHandshakeRedial
+      // all redial through here with a turn still armed.
+      dropSocketForTeardown();
       connect();
     },
     currentUrl() {
@@ -18800,11 +18828,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // Cancel the shared handshake timer so a stopped-before-handshake socket can't
       // fire onHandshakeTimeout against a later reconnect (#379 race hardening).
       clearHandshake();
-      try {
-        sock?.close();
-      } catch {}
-      sock = null;
-      handshakenSock = null;
+      dropSocketForTeardown(); // #1163 — the wedge-unstick path stops before restarting
     },
     destroy() {
       closed = true;
@@ -18813,11 +18837,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-      try {
-        sock?.close();
-      } catch {}
-      sock = null;
-      handshakenSock = null;
+      // #1163 — an unmount really does take the bridge down, and the tracker is
+      // module-scoped so a remount inherits the open outage. A live turn re-announces
+      // `turn:working` on the remount's reconnect, which CLOSES it, so a surviving turn
+      // is never nudged for the time the panel was unmounted.
+      dropSocketForTeardown();
     },
   };
 }
