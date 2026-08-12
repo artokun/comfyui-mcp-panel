@@ -20922,7 +20922,13 @@ function buildPanel() {
     "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
   advToggle.addEventListener("click", () => {
     advWrap.hidden = !advWrap.hidden;
-    advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
+    // Both arrow states need a key of their own. The FIRST render went through tr(), but
+    // this handler rewrote the label from a literal — so one click reverted the control to
+    // English and nothing ever put it back. A coverage check cannot see this: the key
+    // exists, is translated, and is used; it is just overwritten on interaction.
+    advToggle.textContent = advWrap.hidden
+      ? tr("panel.advanced", "Advanced ▸")
+      : tr("panel.advanced_expanded", "Advanced ▾");
   });
 
   // NOTE: the provider switcher (backendLabel + backendChips) moved INTO the model
@@ -23555,6 +23561,14 @@ function buildPanel() {
       b.appendChild(badge);
     }
     if (opts.mid) b.dataset.mid = opts.mid;
+    // Keep the message's own text next to the bubble, because ✎-edit falls back to reading
+    // the bubble when the pending record has been evicted — and `b.textContent` is the
+    // WHOLE subtree, which by now includes the workflow-version badge ("{count} nodes · …")
+    // and any attachment chips. Those are translated, so the fallback would paste UI text
+    // into the composer, in a different language than the one that was tested. Only live
+    // messages carry a mid and only those are reachable from editMsg, so this stays bounded
+    // to the send queue rather than every replayed bubble in history.
+    if (opts.mid) b.dataset.raw = typeof text === "string" ? text : String(text ?? "");
     // Hover edit/rollback button — only on live messages (those with a mid).
     // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
     if (opts.mid) {
@@ -24850,7 +24864,9 @@ function buildPanel() {
   function editMsg(mid) {
     const entry = pendingMsgs.get(mid);
     const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
-    const raw = entry?.raw ?? bubble?.textContent ?? "";
+    // `bubble.textContent` is the last resort only: it flattens the badge and chips that
+    // paintUser appends, all of which are translated (see the dataset.raw note there).
+    const raw = entry?.raw ?? bubble?.dataset?.raw ?? bubble?.textContent ?? "";
     deleteMsg(mid); // cancels on server + removes bubble + trailing record
     setComposerValue(raw);
     input.focus();
@@ -26489,7 +26505,15 @@ function buildPanel() {
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
-      connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      // The status pill three lines up routes through STATUS_LABEL; this button was missed
+      // in the same sweep, so the pill translated and the control beside it stayed English
+      // in every locale. The raw token still drives the branch (and `disabled` above) —
+      // only the rendered label goes through tr(), which is the whole point of fixing this
+      // at the render boundary rather than translating the state.
+      connectBtn.textContent =
+        state === "connecting"
+          ? tr("panel.connecting_button", "Connecting…")
+          : tr("panel.connect", "Connect");
       // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
       // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
       // again. The bound only prevents a loop WITHIN one unsuccessful connect. Also
@@ -29354,10 +29378,10 @@ function buildPanel() {
         const label = outcome?.snapshot?.label;
         appendSystem(
           describeRevertOutcome(outcome, {
-            // `action` is spliced INTO describeRevertOutcome's own English refusal/failure
-            // sentences (lib/graph-revert.js), so translating it here would produce a
-            // half-translated line. It stays English until that lib is converted too.
-            action: "revert",
+            // `action` is spliced INTO describeRevertOutcome's own refusal/failure
+            // sentences (lib/graph-revert.js). Those are translated now, and the lib
+            // supplies this same word as its default — so passing it here would only
+            // duplicate the key.
             // Two whole sentences rather than one with a conditional clause: the label is
             // the user's own snapshot title, and a language that reorders the sentence
             // needs the placeholder to move with it.
@@ -29504,11 +29528,16 @@ function buildPanel() {
     const q = query.toLowerCase();
     const items = [];
     const wf = getWorkflowTitle();
-    if (!q || "workflow".includes(q) || wf.toLowerCase().includes(q)) {
+    // `workflow` is a match token, a display label, AND the literal the agent parses out of
+    // `insert` — three jobs for one word. Only the LABEL is translated; the token stays
+    // English so `@wo` keeps working on a Latin keyboard, and the translated label is added
+    // as a second match so the word in the user's own language matches too.
+    const wfLabel = tr("panel.at_menu_workflow", "workflow — {title}", { title: wf });
+    if (!q || "workflow".includes(q) || wfLabel.toLowerCase().includes(q) || wf.toLowerCase().includes(q)) {
       items.push({
         icon: "pi-file",
-        label: `workflow — ${wf}`,
-        small: "context",
+        label: wfLabel,
+        small: tr("panel.at_menu_context", "context"),
         insert: `@workflow:"${wf}" `,
       });
     }
@@ -29521,7 +29550,9 @@ function buildPanel() {
           items.push({
             icon: n.subgraph ? "pi-sitemap" : "pi-circle",
             label,
-            small: n.subgraph ? "subgraph" : n.type,
+            // `n.type` is a registered node-type id and must stay raw; the word beside it
+            // is ours to translate.
+            small: n.subgraph ? tr("panel.at_menu_subgraph", "subgraph") : n.type,
             insert: `@node:${n.id}(${name}) `,
           });
         }
@@ -29536,7 +29567,12 @@ function buildPanel() {
         let added = 0;
         for (const t of Object.keys(LG.registered_node_types)) {
           if (t.toLowerCase().includes(q)) {
-            items.push({ icon: "pi-box", label: t, small: "node type", insert: `@type:${t} ` });
+            items.push({
+              icon: "pi-box",
+              label: t,
+              small: tr("panel.at_menu_node_type", "node type"),
+              insert: `@type:${t} `,
+            });
             added += 1;
             if (added >= 5) break;
           }
@@ -30281,9 +30317,9 @@ function buildPanel() {
     if (!reverted) {
       appendSystem(
         describeRevertOutcome(outcome, {
-          // English on purpose — see the /revert call site: `action` is interpolated into
-          // the lib's own untranslated refusal/failure sentences.
-          action: "rewind the canvas",
+          // Interpolated into the lib's own sentences as {action}; both sides are
+          // translated now, so a language that needs to reorder can move the hole.
+          action: tr("graph_revert.action_rewind_the_canvas", "rewind the canvas"),
           restoredText: "",
           noneText: recalled
             ? tr(
@@ -30384,8 +30420,8 @@ function buildPanel() {
         const outcome = await revertGraphSnapshotByMid(mid);
         appendSystem(
           describeRevertOutcome(outcome, {
-            // English on purpose — see the /revert call site.
-            action: "roll back the canvas",
+            // See the /revert call site: {action} rides into a translated sentence.
+            action: tr("graph_revert.action_roll_back_the_canvas", "roll back the canvas"),
             restoredText: tr("panel.canvas_reverted_to_before_this_message", "↩ Canvas reverted to before this message."),
             noneText: tr("panel.no_graph_snapshot_for_this_message_canvas", "No graph snapshot for this message — canvas left as-is."),
           }),
