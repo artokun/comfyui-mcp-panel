@@ -28519,7 +28519,13 @@ function buildPanel() {
     if (plan) {
       bridgeFallbacksTried.add(plan.key);
       appendSystem(plan.notice);
-      client.setUrl(plan.url);
+      // { persist: false } is REQUIRED, not incidental. setUrl saves the URL as the
+      // bridge default unless told otherwise, so persisting here would (a) make the
+      // notice's "your configured URL has NOT been changed" a lie, and (b) write the
+      // fallback in as a new default that can itself go stale later — manufacturing
+      // the very bug this fixes. The flag exists for exactly this: "ephemeral URLs
+      // ... so they don't get saved as the bridge default and go stale next load".
+      client.setUrl(plan.url, { persist: false });
       return; // the hint is only true once the fallback has failed too
     }
     externalHintShown = true;

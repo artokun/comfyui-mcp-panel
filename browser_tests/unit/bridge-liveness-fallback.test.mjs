@@ -101,7 +101,11 @@ test("#1136 WIRING: the fallback runs where liveness is already known", () => {
   const body = src.slice(at, at + 1800);
   // It runs precisely because the dial failed — no separate liveness probe needed.
   assert.match(body, /bridgeFallbackPlan\(\{/);
-  assert.match(body, /client\.setUrl\(plan\.url\)/);
+  // The fallback must NOT persist: setUrl saves the URL as the bridge default unless
+  // told otherwise, which would both falsify the notice and write the fallback in as a
+  // new default that can go stale in turn. Found by review, which asked whether setUrl
+  // persists — it does.
+  assert.match(body, /client\.setUrl\(plan\.url, \{ persist: false \}\)/);
   assert.match(body, /bridgeFallbacksTried\.add\(plan\.key\)/);
 });
 
@@ -116,6 +120,16 @@ test("#1136 WIRING: the 'nobody is listening' hint waits for the fallback to fai
   assert.ok(planAt > -1 && latchAt > -1);
   assert.ok(planAt < latchAt, "the fallback must be attempted before the hint latches");
   assert.match(body, /return; \/\/ the hint is only true once the fallback has failed too/);
+});
+
+test("#1136 the notice's promise matches what the code does", () => {
+  // The notice says the configured URL was not changed. That is only true because the
+  // switch passes { persist: false }; without it setUrl calls saveBridgeUrl and the
+  // message becomes a lie — the same defect class as the bug being fixed.
+  const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
+  const n = bridgeFallbackNotice(DEAD, LIVE);
+  assert.match(n, /has NOT been changed/);
+  assert.match(src, /client\.setUrl\(plan\.url, \{ persist: false \}\)/);
 });
 
 test("#1136 WIRING: the refuted provenance rule is gone", () => {
