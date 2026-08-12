@@ -453,6 +453,7 @@ import {
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  shouldNudgeAfterMidTaskReconnect,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -27249,7 +27250,28 @@ function buildPanel() {
         // the agent's turn kept running — so a "you dropped" nudge is false AND
         // would inject a spurious turn into a live session. A real ComfyUI restart
         // takes many seconds to come back, so a long gap since the drop = real.
-        if (Date.now() - lastBridgeDownAt < 6000) return;
+        //
+        // #1138 — AND the bridge must actually have dropped. `lastBridgeDownAt` is 0
+        // until the bridge socket closes, and 0 does not mean "no drop" to the
+        // subtraction below: `Date.now() - 0` is ~56 years, the LONGEST possible gap,
+        // which this heuristic reads as the most certain evidence of a real restart.
+        // So the guard was exactly inverted in the case it exists to catch — the
+        // better established it is that nothing dropped, the more confidently it
+        // nudged. The intent above was right from the start; only the sentinel's
+        // arithmetic betrayed it.
+        //
+        // Reachable on a LIVE socket because `ready` repeats on one (see the client's
+        // own note): a re-advertise draws a fresh handshake, and #310 re-advertises
+        // after every successful free_vram by design. So a user who freed VRAM
+        // mid-task could be told their connection had dropped — and the agent told to
+        // resume work it was still doing — with no drop anywhere in the session.
+        //
+        // The decision moved into session-rebind.js so it is unit-tested by BEHAVIOUR.
+        // A source-scan over this file could only assert the guard's tokens are present,
+        // and #1096's review demonstrated by mutation that such a test stays green when
+        // the guard is inverted — which is the one regression that matters here.
+        if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: lastBridgeDownAt, now: Date.now() }))
+          return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         client.sendUserMessage(
