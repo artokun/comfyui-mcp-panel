@@ -10743,7 +10743,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
+  async graph_set_widget({ node_id, widget, value, allow_unlisted, workflow_uuid }) {
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
@@ -10823,6 +10823,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // invalid value stays rejected against the FRESH list (#338/#317/#299/#288/
     // #284/#304, keeping #240 strictness).
     const result = await runSetWidget(node, widget, value, {
+      // #1126 — compared against `true` explicitly. This arrives over the bridge as
+      // caller JSON, and a truthy string ("false", "0") must never be read as the
+      // assertion that switches off a validation guard.
+      allowUnlisted: allow_unlisted === true,
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT

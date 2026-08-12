@@ -70,9 +70,16 @@ function describeThrown(err) {
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message, { combo = false, emptyOptions = false } = {}) {
+  constructor(message, { combo = false, emptyOptions = false, offList = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // #1126 — `offList` narrows `combo` to the other actionable case: the option list was
+    // READ, is NON-EMPTY, and the value is not a member. Named for the same reason
+    // `emptyOptions` is, so runSetWidget's `allow_unlisted` escape is offered on exactly
+    // that rejection and never inferred from a message match. Destructured explicitly:
+    // this constructor drops meta it does not name, so a new flag that is not added here
+    // is silently lost — which is how the first version of this fix appeared to do nothing.
+    this.offList = offList;
     // `emptyOptions` narrows `combo` to the ONE case runSetWidget's #507 last-resort
     // path may act on: the option list was READ successfully and is EMPTY. It is set
     // ONLY by that branch, so the caller never has to pattern-match a message, and a
@@ -306,7 +313,7 @@ export function coerceWidgetValue(
   value,
   mergeBaseWidget = widget,
   subFieldPath = null,
-  { acceptEmptyComboOptions = false, out } = {},
+  { acceptEmptyComboOptions = false, allowUnlistedComboValue = false, out } = {},
 ) {
   const name = widget?.name ?? "(widget)";
 
@@ -450,12 +457,49 @@ export function coerceWidgetValue(
     // (options ["alpha","beta","gamma"] with value 1 matches no label).
     const labelIdx = optionLabelIndex(options, value);
     if (labelIdx >= 0) return options[labelIdx];
+    // #1126 — the live list is NOT authoritative when the SERVER declares this input's
+    // option list empty. #507 already accepts that case, but only when the live list is
+    // empty TOO, and the reported combo was `["empty"]`: a single placeholder its own
+    // frontend JS inserted into an enum /object_info publishes as `[]`. Semantically the
+    // same state — the option set is not knowable from here — in a shape the length check
+    // could not see, so a node that accepts an absolute path at runtime refused every
+    // path and the widget was unwritable without copying the file into ComfyUI's input dir.
+    //
+    // The evidence is the SERVER's declaration, never the option NAMES. A placeholder
+    // denylist ("empty"/"none"/"None") was the obvious alternative and is unsound:
+    // `None` is a real, meaningful option on plenty of nodes (a LoRA slot's "no lora"),
+    // so matching on it would refuse legitimate writes and silently accept off-list ones.
+    //
+    // It is NOT inferred, and the attempt to infer it is why this is an explicit opt-in.
+    // Keying it on "the server declares the list empty" broke three #507 invariants, and
+    // they were right: that case is ALSO the StarNodes combo whose own JS populates a list
+    // of REAL models, where the live list is genuinely richer than the server's empty one
+    // and an off-list value is a typo worth refusing. Nothing available here separates
+    // "placeholder" from "real options the server could not enumerate" — not the option
+    // names (`None` is a real option on plenty of nodes), and not the server declaration.
+    //
+    // So the caller asserts it, per call, because the caller is the one who knows the node
+    // accepts values its dropdown cannot list. #240 stays intact by construction: STRING
+    // only, so a number can never be reinterpreted as an INDEX into the live list. And the
+    // reply says the value was written unvalidated — see `off_list_value_accepted`.
+    if (allowUnlistedComboValue && typeof value === "string") {
+      // Its OWN marker, deliberately NOT `emptyAcceptanceUsed`. That one gates the
+      // promoted-write sibling cross-check, whose argument is "the inner list is empty so
+      // the server declaration governs" — an argument this path does not make. Reusing it
+      // would have made a rail with a real list refuse on the caller's assertion about the
+      // INNER widget. The sibling check for this path is asserted separately below.
+      if (out) out.offListAcceptanceUsed = true;
+      return value;
+    }
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
         `"${name}". Valid options (${options.length}): ${preview}` +
         (options.length > 40 ? ", …" : ""),
-      { combo: true },
+      // #1126 — distinguishes an off-list miss from the empty-list branch, so the
+      // recovery in set-widget.js can consult the server's declaration for this case
+      // too without treating every combo rejection as a candidate.
+      { combo: true, offList: true },
     );
   }
 
@@ -971,6 +1015,10 @@ export function applyWidgetWrite(
     // and take the value as written. Default false ⇒ the empty case is a RETRYABLE
     // combo rejection, so a merely-stale empty list is refreshed before any decision.
     acceptEmptyComboOptions = false,
+    // #1126: the caller's per-call assertion that this combo accepts values its dropdown
+    // cannot enumerate — a node whose runtime handler takes an absolute path. Default
+    // false ⇒ strict membership, unchanged.
+    allowUnlistedComboValue = false,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -988,8 +1036,10 @@ export function applyWidgetWrite(
   let { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
+      allowUnlistedComboValue,
       // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
-      // membership) is what admitted the value. Read below — never re-derived.
+      // membership) is what admitted the value, and separately when the #1126 unlisted
+      // acceptance did. Read below — never re-derived.
       out: coerceOutcome,
     });
 
@@ -1716,6 +1766,13 @@ export function applyWidgetWrite(
     widget: w.name,
     previous: parentWidget ? previousParent : previous,
     value: w.value,
+    // #1126 — the COERCION-TIME verdict for which acceptance admitted the value, so the
+    // caller reports what happened rather than inferring it from the rejection that led
+    // here. With a stateful options function the final attempt can be admitted by the
+    // empty-list branch even though the rejection was an off-list miss, and the reverse;
+    // re-deriving it from the error would then describe the wrong one. Same
+    // never-read-twice discipline `emptyAcceptanceUsed` already follows.
+    ...(coerceOutcome.offListAcceptanceUsed ? { off_list_value_accepted: true } : {}),
     ...(writeWarning
       ? {
           write_warning: writeWarning,
