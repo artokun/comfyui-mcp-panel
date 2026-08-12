@@ -637,6 +637,46 @@ function inputValueConfig(spec) {
  * Pure apart from the node it is handed; returns [] when there is nothing current to
  * compare against, so a frontend-only type is untouched.
  */
+/** #1085 — whether two widget values are the SAME VALUE, not the same reference.
+ *
+ *  `!==` is the right question for a scalar and the wrong one for an OBJECT default, where
+ *  it is true for every pair of distinct references no matter what they contain. Core
+ *  `ImageCropV2` declares `crop_region` as `{x, y, width, height}`, and each `/object_info`
+ *  read materialises a fresh object — so every add "corrected" that widget from
+ *  `{"x":0,"y":0,"width":512,"height":512}` to the identical `{"x":0,"y":0,"width":512,
+ *  "height":512}` and warned that the tab's schema was STALE. Nothing had changed, and the
+ *  advice that came with it (reload the tab before editing further) was work the user did
+ *  not need to do.
+ *
+ *  Structural, not `JSON.stringify`: key ORDER differs freely between two readings of the
+ *  same definition, and stringify would call those unequal — reproducing the bug through a
+ *  second mechanism. Prototypes must match too, so a plain object never compares equal to a
+ *  class instance that happens to carry the same keys.
+ *
+ *  DEPTH-CAPPED, and it fails toward TODAY'S behaviour: a structure deeper than any real
+ *  widget value — or a cyclic one, which a live widget could hold even though an
+ *  /object_info default cannot — returns "different", which is exactly what `!==` answered
+ *  before this existed. So the cap can cost a spurious correction, never a missed one.
+ */
+function sameWidgetValue(a, b, depth = 0) {
+  if (Object.is(a, b)) return true;
+  if (depth > 8) return false;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+  const aIsArray = Array.isArray(a);
+  if (aIsArray !== Array.isArray(b)) return false;
+  if (aIsArray) {
+    if (a.length !== b.length) return false;
+    return a.every((item, i) => sameWidgetValue(item, b[i], depth + 1));
+  }
+  if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every(
+    (k) => Object.prototype.hasOwnProperty.call(b, k) && sameWidgetValue(a[k], b[k], depth + 1),
+  );
+}
+
 export function applyCurrentDefWidgetValues(node, currentDef, out) {
   const required = currentDef?.input?.required;
   if (!required || typeof required !== "object") return [];
@@ -677,7 +717,14 @@ export function applyCurrentDefWidgetValues(node, currentDef, out) {
     //    or coerced: there is no defensible way to pick a replacement from an option list
     //    the node author evidently did not mean, and the value the widget already holds
     //    came from the registered schema and is at least a real member.
-    if (Object.prototype.hasOwnProperty.call(config, "default") && widget.value !== config.default) {
+    // #1085 — VALUE equality, not reference equality. An object default is a fresh object on
+    // every /object_info read, so `!==` reported a correction on every add of a node whose
+    // default is structured (ImageCropV2's `crop_region`), and the "schema is STALE" warning
+    // that follows was raised about a value that had not changed.
+    if (
+      Object.prototype.hasOwnProperty.call(config, "default") &&
+      !sameWidgetValue(widget.value, config.default)
+    ) {
       const comboOptions = Array.isArray(spec?.[0])
         ? spec[0]
         : Array.isArray(config.options)
@@ -695,7 +742,9 @@ export function applyCurrentDefWidgetValues(node, currentDef, out) {
       if (typeof config.min === "number" && widget.value < config.min) widget.value = config.min;
       if (typeof config.max === "number" && widget.value > config.max) widget.value = config.max;
     }
-    if (widget.value !== before) corrections.push({ name, from: before, to: widget.value });
+    // Same reason (#1085): after an assignment above, `before` and the new value can be
+    // distinct objects holding identical content, and only a structural compare can say so.
+    if (!sameWidgetValue(widget.value, before)) corrections.push({ name, from: before, to: widget.value });
   }
   // Reported through an OPT-IN out-param rather than as a property on the returned array.
   // The first cut attached `corrections.rejected` and claimed every existing caller was
