@@ -3263,16 +3263,19 @@ test("#1126: the assertion does NOT weaken #507 — a real list still refuses a 
     type: "StarOllamaPromptHelper",
     widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b", "llama3.2:3b"] }, value: "qwen3-vl:8b" }],
   };
-  // Without the assertion: refused, exactly as #507 requires.
+  // With NEITHER opt-in: refused, exactly as #507 requires.
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "not-installed:70b", HOOKS),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  // And with acceptEmptyComboOptions — the OTHER opt-in — still refused: it is scoped to
+  // an EMPTY list and must never admit an off-list value on a real one. The two opt-ins
+  // stay separate concerns and neither implies the other.
+  // (Both calls previously passed ACCEPT_EMPTY, so the second asserted nothing at all —
+  // caught in review.)
   assert.throws(
     () => applyWidgetWrite(node, "model", "not-installed:70b", ACCEPT_EMPTY),
     (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
-  );
-  // acceptEmptyComboOptions must NOT admit an off-list value on a non-empty list —
-  // the two opt-ins stay separate concerns and neither implies the other.
-  assert.throws(
-    () => applyWidgetWrite(node, "model", "not-installed:70b", ACCEPT_EMPTY),
-    (err) => err instanceof WidgetWriteError,
   );
   assert.equal(node.widgets[0].value, "qwen3-vl:8b", "no mutation on either refusal");
 });
