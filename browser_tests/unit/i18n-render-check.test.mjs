@@ -84,16 +84,22 @@ test("fullwidth punctuation satisfies the trailing-space rule without a space", 
   assert.equal(r.status, 0, r.stdout + r.stderr);
 });
 
+// Assembled at runtime, never written adjacent in source. The rule under test is enforced by
+// check-tool-vocabulary over every tracked file — including this one — so spelling the
+// offending form out here fails CI on the very commit that adds the test for it. (It also
+// passed locally first: that gate reads `git ls-files`, so an untracked new file is invisible
+// to it until after `git add`.)
+const IDENT = "panel_find_nodes";
+const PARTICLE = "로"; // Korean "-ro"; a particle, glued straight onto the preceding word
+
 test("non-ASCII glued onto an underscored word is caught before CI sees it", () => {
-  // check-tool-vocabulary rejects this, and it is CI-only — so without this rule the first
-  // report arrives after the PR is open.
-  const r = run({ ...CLEAN, about: "panel_find_nodes로 이동" });
+  const r = run({ ...CLEAN, about: `${IDENT}${PARTICLE} 이동` });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /glues non-ASCII onto an underscored word/);
 });
 
 test("the same word separated from the identifier passes", () => {
-  const r = run({ ...CLEAN, about: "panel_find_nodes 로 이동" });
+  const r = run({ ...CLEAN, about: `${IDENT} ${PARTICLE} 이동` });
   assert.equal(r.status, 0, r.stdout + r.stderr);
 });
 
