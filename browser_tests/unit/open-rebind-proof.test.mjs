@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import {
   describeGraphStateDifference,
   describeOpenRebindOutcome,
+  describeRepaintSourceBinding,
   graphRootCarriesOpenProof,
   graphRootMatchesState,
   graphRootWorkflowUuidMatches,
@@ -759,4 +760,176 @@ test("#702: the fence note is ONLY on the content-unverified outcome", () => {
   // probe would otherwise be invited against a binding that was never proven.
   assert.doesNotMatch(unproven, /Reloading the panel is NOT required/);
   assert.match(unproven, /reload the panel before graph edits/);
+});
+
+// ---------------------------------------------------------------------------
+// #1089 — the SOURCE of the repaint, which no post-load proof looks at.
+//
+// The reporter got a clean success: right path, right filename, right
+// workflow_uuid, modified:false — and the PREVIOUS workflow's graph on the
+// canvas. Their next calls were panel_remove_node, and Save-As preserves ids,
+// so those deletions would largely have LANDED on the wrong workflow.
+//
+// Nothing was fooled. All four parts of resolveOpenRebindVerdict are taken
+// against the root the loader produced, so each was a true statement about a
+// poisoned SOURCE state. #968 closed the writer this repo owns and recorded
+// that an untagged root is still captured; a state already poisoned still
+// reaches the load, and the load is what makes it durable — it stamps the
+// target's identity onto the foreign graph, so a later save writes it to the
+// target's file.
+// ---------------------------------------------------------------------------
+
+/** A serialized tab state carrying the panel's durable workflow tag. */
+const taggedState = (uuid) => ({
+  nodes: [{ id: 1, type: "KSampler" }],
+  extra: uuid ? { [PANEL_GRAPH_META_KEY]: { workflow_uuid: uuid } } : {},
+});
+
+const OTHER_OPEN = () => true;
+const NO_OWNER = () => false;
+const CLAIMS_NOTHING = () => false;
+
+test("#1089: a state owned by another OPEN workflow is foreign — the open must not repaint from it", () => {
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: CLAIMS_NOTHING,
+      tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+    }),
+    "foreign",
+  );
+});
+
+test("#1089: the tab's own state is bound and repaints exactly as before", () => {
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState(UUID_A),
+      targetUuid: UUID_A,
+      // Neither predicate is consulted on the matching path. Throwing proves it:
+      // a match is decided by the tags alone.
+      targetClaimsTag: () => {
+        throw new Error("must not be consulted");
+      },
+      tagOwnedByOtherOpenWorkflow: () => {
+        throw new Error("must not be consulted");
+      },
+    }),
+    "bound",
+  );
+});
+
+test("#1089: a mismatch alone is NOT foreign — a predecessor's uuid residue must not refuse a good open", () => {
+  // workflowOwnsRootUuidTag's own header: a lagging activeState can carry a
+  // REPLACED PREDECESSOR's uuid, "indistinguishable from the genuine lineage
+  // stamp". Refusing on the bare mismatch would send that caller to a disk load,
+  // which discards the unsaved work on the canvas — so the false refusal is
+  // destructive too, and there is no safe default. Both escapes are asserted.
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      // the target's own lineage claims the conflicting tag (#545/#557 drift)
+      targetClaimsTag: (tag) => tag === "workflow-B",
+      tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+    }),
+    "unknown",
+  );
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: CLAIMS_NOTHING,
+      // registered to nobody currently open — residue, not another tab's graph
+      tagOwnedByOtherOpenWorkflow: NO_OWNER,
+    }),
+    "unknown",
+  );
+});
+
+test("#1089: absent evidence changes nothing — the #968 residual stays a residual, not a refusal", () => {
+  // An UNTAGGED state is the case #968 left open, and this must not manufacture a
+  // verdict for it: older frontends and never-stamped canvases behave as before.
+  for (const args of [
+    { state: taggedState(null), targetUuid: UUID_A },
+    { state: { nodes: [] }, targetUuid: UUID_A },
+    { state: null, targetUuid: UUID_A },
+    { state: undefined, targetUuid: UUID_A },
+    // no resolvable identity for the TARGET is equally inconclusive
+    { state: taggedState("workflow-B"), targetUuid: null },
+    { state: taggedState("workflow-B"), targetUuid: "" },
+    // a non-string tag is not a tag
+    { state: { extra: { [PANEL_GRAPH_META_KEY]: { workflow_uuid: 7 } } }, targetUuid: UUID_A },
+  ]) {
+    assert.equal(
+      describeRepaintSourceBinding({
+        ...args,
+        targetClaimsTag: CLAIMS_NOTHING,
+        tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+      }),
+      "unknown",
+      `inconclusive input must answer unknown: ${JSON.stringify(args.state)}`,
+    );
+  }
+  assert.equal(describeRepaintSourceBinding(), "unknown", "no arguments at all is inconclusive");
+});
+
+test("#1089: a predicate that throws is inconclusive, never a refusal", () => {
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: () => {
+        throw new Error("owner map unreadable");
+      },
+      tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+    }),
+    "unknown",
+  );
+  assert.equal(
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetClaimsTag: CLAIMS_NOTHING,
+      tagOwnedByOtherOpenWorkflow: () => {
+        throw new Error("openWorkflows unreadable");
+      },
+    }),
+    "unknown",
+  );
+  // Missing predicates are the same story — an unasked question is not an answer.
+  assert.equal(
+    describeRepaintSourceBinding({ state: taggedState("workflow-B"), targetUuid: UUID_A }),
+    "unknown",
+  );
+});
+
+test("#1089: the refusal is wired BEFORE loadGraphData, and says the canvas was left alone", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const guardAt = src.indexOf("describeRepaintSourceBinding({");
+  assert.notEqual(guardAt, -1, "the open path must classify the state it repaints from");
+  // BEFORE the load. Every other rebind failure is detected after loadGraphData,
+  // which is fine for this tab's own payload; here the load is the step that paints
+  // the foreign graph and stamps this workflow's identity onto it.
+  const loadAt = src.indexOf("await app.loadGraphData(repaintState, true, true, target)");
+  assert.notEqual(loadAt, -1);
+  assert.ok(guardAt < loadAt, "the source must be classified before the graph is loaded");
+  // The refusal branch ONLY — the repaint's own `else` follows it and legitimately
+  // does use the embedding resolver, so slicing to the load would prove nothing.
+  const branchEnd = src.indexOf("} else {", guardAt);
+  assert.ok(branchEnd > guardAt && branchEnd < loadAt, "the refusal must be its own branch");
+  const guardBlock = src.slice(guardAt, branchEnd);
+  // It must NOT be the embedding resolver: `{ embed: true }` writes the identity
+  // stamp, which belongs to a repaint that is about to be refused.
+  assert.doesNotMatch(guardBlock, /workflowStableUuid\(target, \{ embed: true \}\)/);
+  assert.match(guardBlock, /workflowObjectUuid\(target\) \|\| workflowStableUuid\(target\)/);
+  // OPEN, not merely registered — the predecessor-residue escape (see the helper).
+  assert.match(guardBlock, /openWorkflows/);
+  assert.match(guardBlock, /sameWorkflowObject\(w, owner\)/);
+  // The message: nothing was loaded, and the recovery that works, with its trap.
+  assert.match(guardBlock, /nothing was overwritten/, "it must say the canvas was left alone");
+  assert.match(guardBlock, /panel_load_workflow/, "it must name the recovery that reads from disk");
+  assert.match(guardBlock, /NOT save first/, "it must name the save-over trap");
+  // And it must be a REFUSAL, not a disclosure riding a success.
+  assert.match(guardBlock, /rebindFailed = new Error\(/);
 });

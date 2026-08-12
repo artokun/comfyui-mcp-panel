@@ -1188,6 +1188,74 @@ export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
   return typeof seen === "string" && seen === proofMarker;
 }
 
+/**
+ * #1089 — does the STATE this open is about to repaint FROM belong to the tab
+ * being opened?
+ *
+ * Every proof `resolveOpenRebindVerdict` weighs is taken AFTER the load, against
+ * the root the loader produced. None of them looks at the state the load was
+ * handed. So when that state holds another workflow's graph, the open repaints it
+ * faithfully, stamps the target's identity onto it, and all four parts pass — not
+ * by being fooled, but because each one is a TRUE statement about a poisoned
+ * source. That is #1089 exactly: a clean success, `modified: false`, and the
+ * previous workflow's graph on the canvas.
+ *
+ * #968 closed the writer this repo owns (the pre-repaint `checkState` capture) and
+ * recorded its own residual: an UNTAGGED root is still captured. A state poisoned
+ * before that fix shipped, through the residual, or by any capture the panel does
+ * not mediate, still reaches this load — and the load is the step that turns it
+ * into durable loss, because the stamp makes a later save write the foreign graph
+ * to the target's file.
+ *
+ * The evidence rule is `describeLiveCanvasBinding`'s (#708/#349), applied to the
+ * source state instead of the live canvas, plus ONE additional requirement:
+ *
+ *   bound   — the state carries the target's own identity. Repaint, unchanged.
+ *   foreign — the state carries a tag the target does not claim AND that tag is
+ *             owned by a DIFFERENT, currently-open workflow. Refuse.
+ *   unknown — anything else: no tag, no resolvable target identity, or a
+ *             conflicting tag with no live owner. Repaint, unchanged.
+ *
+ * The extra requirement is not caution for its own sake — it answers a documented
+ * hazard. `workflowOwnsRootUuidTag`'s header records that a lagging `activeState`
+ * can carry a REPLACED PREDECESSOR's uuid residue, "indistinguishable from the
+ * genuine lineage stamp". A bare mismatch would therefore refuse good opens, and a
+ * false refusal here is not a harmless no-op: it sends the caller to a disk load,
+ * which discards whatever unsaved work is on the canvas. Demanding a live owner
+ * separates the two — a predecessor is not an open tab, and a tag owned by another
+ * open tab is that tab's, not residue.
+ *
+ * Pure, so the ownership questions arrive as injected predicates. A predicate that
+ * throws is inconclusive, never a refusal.
+ */
+export function describeRepaintSourceBinding({
+  state,
+  targetUuid,
+  targetClaimsTag,
+  tagOwnedByOtherOpenWorkflow,
+} = {}) {
+  try {
+    const tag = state?.extra?.[PANEL_GRAPH_META_KEY]?.workflow_uuid;
+    if (typeof tag !== "string" || !tag) return "unknown";
+    if (typeof targetUuid !== "string" || !targetUuid) return "unknown";
+    if (tag === targetUuid) return "bound";
+    // A conflicting tag the target's own lineage claims is its own drifted stamp
+    // (#545/#557), not another tab's graph.
+    try {
+      if (targetClaimsTag?.(tag) === true) return "unknown";
+    } catch {
+      return "unknown";
+    }
+    try {
+      return tagOwnedByOtherOpenWorkflow?.(tag) === true ? "foreign" : "unknown";
+    } catch {
+      return "unknown";
+    }
+  } catch {
+    return "unknown";
+  }
+}
+
 export const OPEN_REBIND_STATUS = Object.freeze({
   /** The canvas is provably the requested workflow AND holds what was loaded. */
   PROVEN: "proven",

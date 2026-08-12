@@ -416,6 +416,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  describeRepaintSourceBinding,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
   MUTATION_BINDING_BAR,
@@ -13288,6 +13289,46 @@ const GRAPH_TOOL_EXECUTORS = {
             rebindFailed = new Error(
               "workflow_open could not rebind the active canvas because this frontend does not expose " +
                 "loadGraphData. The open may have switched the active workflow; reload the panel before graph edits.",
+            );
+          } else if (
+            describeRepaintSourceBinding({
+              state: st,
+              // The pair #708 resolves ownership with, and for the same reason: the
+              // live object's own uuid first, and the root-blind resolver only as the
+              // fallback, so the stale root this is trying to detect can never supply
+              // the answer. NOT `{ embed: true }` — the embedding stamp belongs to the
+              // repaint below, which must not happen at all if the source is foreign.
+              targetUuid: workflowObjectUuid(target) || workflowStableUuid(target),
+              targetClaimsTag: (tag) => workflowOwnsRootUuidTag(target, tag),
+              tagOwnedByOtherOpenWorkflow: (tag) => {
+                const owner = workflowUuidOwner(tag);
+                if (!owner || sameWorkflowObject(owner, target)) return false;
+                // OPEN, not merely registered: a replaced predecessor stays in the
+                // owner map, and its uuid residue in a lagging `activeState` is the
+                // documented look-alike this must not refuse on (see the helper).
+                const openNow = app?.extensionManager?.workflow?.openWorkflows;
+                return Array.isArray(openNow) && openNow.some((w) => sameWorkflowObject(w, owner));
+              },
+            }) === "foreign"
+          ) {
+            // #1089 — REFUSE BEFORE THE LOAD. Every other rebind failure below is
+            // detected after `loadGraphData`, which is fine when the payload is this
+            // tab's own; here it is another tab's graph, and the load is the step that
+            // makes the damage durable: it paints the foreign graph and stamps the
+            // target's identity onto it, so a later save writes it to the target's
+            // file. Nothing is loaded, so the canvas is exactly as the caller left it.
+            rebindFailed = new Error(
+              "workflow_open did NOT repaint the canvas: the tab's in-memory state holds a graph that " +
+                "positively belongs to a DIFFERENT open workflow, so repainting from it would have put " +
+                "that workflow's nodes on the canvas under this workflow's identity — reported as a " +
+                "clean success, which is #1089. Nothing was loaded and nothing was overwritten; the " +
+                "canvas still holds whatever it held before this call, and the active workflow pointer " +
+                "HAS moved to the requested one. Recover with panel_load_workflow on this workflow's " +
+                "path: it reads the file from DISK, which is the only source not affected by this. Do " +
+                "NOT save first — the graph in memory is the other workflow's, and a plain save writes " +
+                "it to the workflow you asked for, because that is what the active identity already " +
+                "names. If the canvas holds unsaved work you need, preserve it to a NEW path (Save As " +
+                "or an export) before the load.",
             );
           } else {
             // A graph shape is not ownership proof: two dirty tabs can have the same
