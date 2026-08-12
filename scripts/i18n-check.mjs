@@ -53,6 +53,20 @@ function schemaFor(node, trail = '') {
 /** `{name}` placeholders must survive translation or the value silently never appears. */
 const holes = (s) => (String(s).match(/\{[a-zA-Z0-9_]+\}/g) || []).sort().join(',');
 
+/**
+ * A backslash-escape that was never decoded, so it will be PAINTED rather than obeyed.
+ *
+ * The extractor used to slice literals straight out of the source, escapes and all, so
+ * `"…?\n\nThis DELETES…"` reached the catalog as a backslash followed by an `n` and a confirm
+ * dialog rendered it verbatim. Thirteen English strings shipped that way, and Korean — the
+ * only catalog complete enough to reach them — copied six of them. Nothing could see it: keys,
+ * placeholders and plural categories were all still exactly right.
+ *
+ * Only the sequences the extractor could produce are matched, so a genuine Windows path in a
+ * catalog value (a backslash before an uppercase letter) is not a false positive.
+ */
+const mangled = (s) => (String(s).match(/\\[ntr"'`]/g) || []).length;
+
 const PLURAL_SUFFIXES = ['zero', 'one', 'two', 'few', 'many', 'other'];
 const pluralSplit = (key) => {
   const m = key.match(/^(.*)_(zero|one|two|few|many|other)$/);
@@ -230,6 +244,14 @@ for (const file of FILES) {
       // counted in coverage below, not checked for placeholder parity against itself.
       if (!targetFlat.has(key)) continue;
       const tr = targetFlat.get(key);
+      if (mangled(tr) > mangled(en)) {
+        note(
+          `${locale}/${file} @ ${key}: contains an undecoded escape (a backslash before n/t/r/quote) — ` +
+            `it will be printed literally, not obeyed. Write a real line break or quote instead.`,
+        );
+        placeholderBad++;
+        continue;
+      }
       if (holes(en) !== holes(tr)) {
         note(`${locale}/${file} @ ${key}: placeholders differ — English has [${holes(en) || 'none'}], ${locale} has [${holes(tr) || 'none'}]`);
         placeholderBad++;
@@ -265,6 +287,14 @@ for (const file of FILES) {
       // A plural base English does not declare at all is an unknown key; pluralIssues and the
       // schema own that verdict, and reporting it twice would just be noise.
       if (en === undefined) continue;
+      if (mangled(value) > mangled(en)) {
+        note(
+          `${locale}/${file} @ ${key}: contains an undecoded escape (a backslash before n/t/r/quote) — ` +
+            `it will be printed literally, not obeyed.`,
+        );
+        placeholderBad++;
+        continue;
+      }
       if (holes(en) !== holes(value)) {
         note(
           `${locale}/${file} @ ${key}: placeholders differ — English has [${holes(en) || 'none'}], ${locale} has [${holes(value) || 'none'}]`,
