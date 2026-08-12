@@ -1,3 +1,4 @@
+import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
 /**
  * Detect a graph READ that is out of sync with the ACTIVE workflow (panel#389).
  *
@@ -880,7 +881,41 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
     // unexplained by anything the node comparison establishes.
-    if (surfaces.length !== 1 || surfaces[0] !== "nodes") return NOT_PROVEN;
+    // #886 — a `definitions` surface may accompany `nodes`, but ONLY when the whole
+    // of it is link renumbering. Measured: the frontend regenerates link identity
+    // inside subgraph definitions on load (state.lastLinkId advanced 2092 -> 2106 on
+    // a real 4-subgraph workflow) while node ids, types and topology stay identical.
+    // Before this, a faithful open of ANY workflow containing subgraphs reported
+    // CONTENT_UNVERIFIED — binding proven, nodes perfect, refused on a surface nobody
+    // had characterised.
+    //
+    // Everything else still refuses. `definitionsDifferOnlyByLinkRenumber` returns
+    // false for anything it cannot fully account for, and the caller reads that as
+    // "not proven" — never as "changed".
+    // The surface set must be a subset of { nodes, definitions } — nothing else is
+    // accounted for, and an unaccounted surface refuses.
+    //
+    // `definitions` is admitted ONLY when the difference there is pure link
+    // renumbering, which is what loading a persisted workflow does to
+    // definitions.subgraphs (measured: state.lastLinkId 2092 -> 2106).
+    //
+    // `nodes` is NOT required to be present. The earlier version demanded it, which
+    // review caught: the reported #886 case is a graph where definitions is the ONLY
+    // differing surface, so requiring `nodes` refused exactly the case this exists to
+    // prove — a fix wired into a branch its own bug report cannot reach.
+    const unique = [...new Set(surfaces)];
+    if (!unique.length) return NOT_PROVEN;
+    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return NOT_PROVEN;
+    if (unique.includes("definitions")) {
+      if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
+        return NOT_PROVEN;
+      }
+    }
+    // A definitions-only difference is fully accounted for once the renumber check
+    // passes: there is no node difference to classify.
+    if (!unique.includes("nodes")) {
+      return { proven: true, exact: false, fields: [] };
+    }
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
     // mutation: `classifyNodeDifference` only computes `fields` once the sets match, so
