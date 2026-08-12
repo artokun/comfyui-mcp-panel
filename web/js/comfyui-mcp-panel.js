@@ -476,6 +476,7 @@ import {
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
+import { bridgeFallbackPlan } from "./lib/bridge-liveness-fallback.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -28522,10 +28523,36 @@ function buildPanel() {
   // no agent answers on the bridge. Reset on each user Connect AND on a successful
   // handshake (both call resetAutoReclaim) so it can re-appear for a later drop.
   let externalHintShown = false;
+  /** Bridges this session already fell back to, so two dead ports cannot loop. */
+  const bridgeFallbacksTried = new Set();
   function showExternalHintOnce() {
     if (externalHintShown) return;
-    externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
+    // #1136 — before declaring nobody is listening, try the bridge that SHOULD be
+    // there. A configured URL can outlive the process that owned it (a migrated
+    // ephemeral port, or one the user typed before the orchestrator moved), and in
+    // external-orchestrator mode nothing corrects it: /connect is deliberately not
+    // POSTed, so the advertised bridge_url never arrives. Liveness is already known
+    // HERE — this runs precisely because the dial failed — so no guess about who
+    // chose the URL is needed.
+    const plan = bridgeFallbackPlan({
+      configured: bridge,
+      fallback: defaultBridgeUrlFor(selectedBackend),
+      attempted: bridgeFallbacksTried,
+    });
+    if (plan) {
+      bridgeFallbacksTried.add(plan.key);
+      appendSystem(plan.notice);
+      // { persist: false } is REQUIRED, not incidental. setUrl saves the URL as the
+      // bridge default unless told otherwise, so persisting here would (a) make the
+      // notice's "your configured URL has NOT been changed" a lie, and (b) write the
+      // fallback in as a new default that can itself go stale later — manufacturing
+      // the very bug this fixes. The flag exists for exactly this: "ephemeral URLs
+      // ... so they don't get saved as the bridge default and go stale next load".
+      client.setUrl(plan.url, { persist: false });
+      return; // the hint is only true once the fallback has failed too
+    }
+    externalHintShown = true;
     appendSystem(
       tr(
         "panel.no_agent_is_listening_on_the_bridge",
