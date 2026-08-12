@@ -247,6 +247,20 @@ function definitionDiffersOnlyByRenumber(a, b) {
  * "not proven" and refuses — which is the safe direction.
  */
 export function definitionsDifferOnlyByLinkRenumber(a, b) {
+  // ONE guard at the boundary, rather than one per risky call. Review found throws
+  // escaping from places the inner wrappers did not cover — Object.keys on a Proxy
+  // whose ownKeys trap throws, a throwing property getter, a link Proxy read before
+  // the JSON encode. Chasing each site is a losing game: the honest statement is that
+  // NOTHING in here may escape, because an exception on this path takes out the guard
+  // that decides whether writes land instead of answering "not proven".
+  try {
+    return compareDefinitions(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function compareDefinitions(a, b) {
   // Shape check FIRST, before any identity shortcut. `undefined === undefined` is not
   // evidence of anything: two sides we cannot read must fail closed, not compare equal.
   if (!isObj(a) || !isObj(b)) return false;

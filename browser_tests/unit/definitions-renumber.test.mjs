@@ -365,3 +365,66 @@ test("#886 P1: a legitimately DEEP acyclic definition still compares", () => {
   };
   assert.equal(definitionsDifferOnlyByLinkRenumber(withDeep(false), withDeep(true)), true);
 });
+
+// ── Round 3: nothing may escape this predicate, from anywhere ──
+//
+// Review found throws escaping past the inner wrappers: Object.keys on a Proxy whose
+// ownKeys trap throws, a throwing property getter, a link Proxy read before the JSON
+// encode. An exception on this path takes out the guard that decides whether graph
+// writes land, instead of answering "not proven".
+
+test("#886 a throwing property GETTER fails closed", () => {
+  const g = sgP0();
+  Object.defineProperty(g.subgraphs[0], "name", {
+    get() {
+      throw new Error("hostile getter");
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  assert.doesNotThrow(() => definitionsDifferOnlyByLinkRenumber(g, sgP0()));
+  assert.equal(definitionsDifferOnlyByLinkRenumber(g, sgP0()), false);
+});
+
+test("#886 a Proxy whose ownKeys trap throws fails closed", () => {
+  const hostile = new Proxy(
+    { subgraphs: [] },
+    {
+      ownKeys() {
+        throw new Error("hostile ownKeys");
+      },
+    },
+  );
+  assert.doesNotThrow(() => definitionsDifferOnlyByLinkRenumber(hostile, sgP0()));
+  assert.equal(definitionsDifferOnlyByLinkRenumber(hostile, sgP0()), false);
+  assert.doesNotThrow(() => definitionsDifferOnlyByLinkRenumber(sgP0(), hostile));
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), hostile), false);
+});
+
+test("#886 a throwing getter on a LINK endpoint fails closed", () => {
+  const link = [11, 3, 0, 4, 0, "IMAGE"];
+  Object.defineProperty(link, "1", {
+    get() {
+      throw new Error("hostile link id");
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  const bad = sgP0({ links: [link, [12, 4, 0, 5, 1, "MASK"]] });
+  assert.doesNotThrow(() => definitionsDifferOnlyByLinkRenumber(sgP0(), bad));
+  assert.equal(definitionsDifferOnlyByLinkRenumber(sgP0(), bad), false);
+});
+
+test("#886 failing closed never reports a WRONG graph as proven", () => {
+  // The property that matters: every hostile shape above must answer false, which the
+  // caller reads as "not proven" and refuses. None of them may answer true.
+  const g = sgP0();
+  Object.defineProperty(g.subgraphs[0], "state", {
+    get() {
+      throw new Error("boom");
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  assert.equal(definitionsDifferOnlyByLinkRenumber(g, renumberedP0()), false);
+});
