@@ -20408,10 +20408,14 @@ function buildPanel() {
   //    `knownBackends` happened to hold — possibly still the claude-only default — and
   //    strand the picker without the configured providers.
   //  * NOT `knownBackends`. That is the RENDERED list, so it also contains host-only
-  //    entries. Feeding it back in as authoritative would freeze those entries at their
-  //    first-seen value: a host-only provider that later starts or stops would keep showing
-  //    stale liveness forever, because the merge deliberately refuses to overwrite anything
-  //    it considers authoritative.
+  //    entries, and feeding it back in would make those entries permanently authoritative:
+  //    a host-only provider would keep its membership after the host stopped reporting it,
+  //    since the merge never removes an authoritative id. (An earlier version of this note
+  //    said it would also freeze that provider's LIVENESS. That was true of the helper's
+  //    first draft, which refused the probe's fields wholesale, and stopped being true when
+  //    the overlay became per-field — `running` refreshes for any shared id now. Corrected
+  //    rather than deleted because the stale reading is what this comment is here to
+  //    prevent, codex.)
   //
   // Set ONLY from a real bridge `backends` frame carrying an ARRAY — including an empty
   // one, which CLEARS a stale baseline rather than asserting "render nothing"; see the

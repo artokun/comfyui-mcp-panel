@@ -43,8 +43,10 @@
 // reads the durable `backendReady` map FIRST and only falls back to the entry — so holding
 // these three keys back is belt-and-braces rather than the load-bearing guard.
 //
-// With NO authoritative snapshot yet, the probe is all there is and is used as-is —
-// unchanged behaviour for a panel that has not connected.
+// With NO authoritative snapshot yet, the probe is all there is and is returned on its own
+// — unchanged behaviour for a panel that has not connected. Not literally untouched: both
+// snapshots are filtered for a usable `backend` id first, so a malformed entry is dropped
+// rather than rendered as a nameless chip.
 //
 // Pure and dependency-free (no DOM), so the ordering bug this fixes is unit-testable.
 
@@ -62,8 +64,9 @@
  *
  *  SCOPE OF THAT GUARANTEE, stated precisely because an earlier version of this comment
  *  overclaimed it (codex): it covers providers the AUTHORITATIVE snapshot describes. A
- *  provider only the probe reports keeps its own entry verbatim, flag included, and so does
- *  every entry when there is no authoritative snapshot at all. That is deliberate rather
+ *  provider only the probe reports keeps its OWN entry's flag — nothing overrides it — and so
+ *  does every entry when there is no authoritative snapshot at all. ("Its own entry" rather
+ *  than "verbatim": a probe that names the same id twice still collapses to one chip.) That is deliberate rather
  *  than an oversight — for a provider the orchestrator never described there is no better
  *  claim to fall back on, and of the two ways to be wrong, showing a warning that may not
  *  apply is the safe one and hiding one that does is not. */

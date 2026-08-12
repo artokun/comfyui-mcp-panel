@@ -117,8 +117,8 @@ test("#1083 (codex): an authoritative REMOVAL does not persist against a host th
 
 test("#1083 (codex): the experimental guarantee is scoped to DESCRIBED providers", () => {
   // Pinning the limit of the rule above, because an earlier version of its comment
-  // overclaimed it. A provider only the PROBE reports keeps its own entry verbatim — there
-  // is no authoritative claim to prefer — and so does every entry when no authoritative
+  // overclaimed it. A provider only the PROBE reports keeps its own entry's flag — there is
+  // no authoritative claim to prefer — and so does every entry when no authoritative
   // snapshot exists. Deliberate: of the two ways to be wrong, showing a warning that may
   // not apply is the safe one; hiding one that does is not.
   //
@@ -182,7 +182,7 @@ test("#1083: a provider only the HOST knows about is ADDED, never dropped", () =
   assert.deepEqual(ids(merged), [...ids(ORCHESTRATOR), "brand-new"]);
 });
 
-test("#1083: with NO authoritative snapshot the probe is used as-is (unchanged behaviour)", () => {
+test("#1083: with NO authoritative snapshot the probe alone is returned (unchanged behaviour)", () => {
   // A panel that has not connected yet has only the host to go on. This is the path that
   // must not change, or a fresh panel would render nothing.
   assert.deepEqual(ids(mergeProviderSnapshots({ authoritative: null, probe: HOST })), ids(HOST));
@@ -229,10 +229,11 @@ test("#1083: merging is stable — repeated host refreshes converge, never grow 
 
 test("#1083 (codex): a HOST-ONLY provider keeps refreshing its running state", () => {
   // The regression the first draft introduced. A host-only entry is appended to the merged
-  // list; if that merged list is then reused as the next baseline, the entry is suddenly
-  // "authoritative" and the merge refuses to overwrite it — so a provider that later starts
-  // or stops shows stale liveness forever. `backendReady` cannot repair it: that map holds
-  // only cli/auth/ready, while the chip and the picker both read `b.running`.
+  // list; if that merged list is then reused as the next baseline, the entry becomes
+  // permanently "authoritative" and the merge will never drop it, so it outlives the host
+  // that reported it. (The helper's FIRST draft also froze its liveness, because it refused
+  // the probe's fields wholesale; the overlay is per-field now, so `running` does refresh —
+  // this test pins the fixed-baseline behaviour, not that older failure. codex)
   //
   // Keeping the baseline pinned to the ORCHESTRATOR snapshot is what fixes it — a host-only
   // provider is never in that baseline, so it is re-read from every probe.
@@ -263,7 +264,7 @@ test("#1083 (codex): a ready ack alone is not an authoritative provider list", (
   // at that moment, which is what the caller now passes.
   const DEFAULT_ONLY = [{ backend: "claude", running: false }];
   const duringWindow = mergeProviderSnapshots({ authoritative: null, probe: HOST });
-  assert.deepEqual(ids(duringWindow), ids(HOST), "the probe is used as-is, nothing is invented");
+  assert.deepEqual(ids(duringWindow), ids(HOST), "the probe alone is returned, nothing is invented");
   assert.ok(
     !ids(duringWindow).includes("custom") && ids(DEFAULT_ONLY).length === 1,
     "and no authoritative claim is manufactured from the default list",
