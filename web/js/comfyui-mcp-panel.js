@@ -1008,7 +1008,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.14.15";
+const PANEL_VERSION = "0.14.16";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -3372,7 +3372,7 @@ function populateModelSelect(sel, backend) {
     const hint = document.createElement("option");
     hint.value = SETTINGS_PLACEHOLDER;
     hint.disabled = true;
-    hint.textContent = `Connect to ${BACKEND_TEXT[backend] || backend} to load its models`;
+    hint.textContent = tr("panel.connect_to_backend_to_load_models", "Connect to {backend} to load its models", { backend: BACKEND_TEXT[backend] || backend });
     sel.appendChild(hint);
   }
   if (saved && !seen.has(saved)) {
@@ -3380,9 +3380,9 @@ function populateModelSelect(sel, backend) {
     o.value = saved;
     if (rows) {
       o.disabled = true;
-      o.textContent = `${saved} (not available for this backend)`;
+      o.textContent = tr("panel.saved_not_available_for_this_backend", "{saved} (not available for this backend)", { saved });
     } else {
-      o.textContent = `${saved} (saved)`;
+      o.textContent = tr("panel.saved_suffix", "{saved} (saved)", { saved });
       seen.add(saved);
     }
     sel.appendChild(o);
@@ -16991,6 +16991,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       void sendHello();
     }, ROUTE_REFUSAL_RETRY_MS);
   }
+  /**
+   * Display label per connection status. The KEY of this map is the state token, which stays
+   * English because it is compared (`s !== "connected"` below) and keyed on elsewhere; only
+   * the VALUE is translated. Lazily via a function because this sits at module-adjacent scope
+   * and would otherwise capture the fallback before the catalog loads.
+   *
+   * Every key is a literal so `i18n-extract` can see it. That is the whole point: the previous
+   * shape built the key at runtime, which no static scan can follow.
+   */
+  const STATUS_LABEL = {
+    connected: () => tr("panel.status_connected", "connected"),
+    connecting: () => tr("panel.status_connecting", "connecting"),
+    disconnected: () => tr("panel.status_disconnected", "disconnected"),
+  };
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
@@ -20464,7 +20478,7 @@ function buildPanel() {
   const dot = document.createElement("span");
   dot.className = "cmcp-dot";
   const statusText = document.createElement("span");
-  statusText.textContent = "disconnected";
+  statusText.textContent = tr("panel.status_disconnected", "disconnected");
   const caret = document.createElement("i");
   caret.className = "pi pi-angle-down";
   // #753 — assigned through style.fontSize rather than a `font-size:` declaration, so the
@@ -20486,9 +20500,9 @@ function buildPanel() {
 
   const actions = document.createElement("span");
   actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
-  const newChatBtn = iconBtn("pi-plus", "New chat");
-  const historyBtn = iconBtn("pi-history", "Chat history");
-  const remoteBtn = iconBtn("pi-qrcode", "Remote control — pair a phone");
+  const newChatBtn = iconBtn("pi-plus", tr("panel.new_chat", "New chat"));
+  const historyBtn = iconBtn("pi-history", tr("panel.chat_history", "Chat history"));
+  const remoteBtn = iconBtn("pi-qrcode", tr("panel.remote_control_pair_a_phone", "Remote control — pair a phone"));
   remoteBtn.addEventListener("click", () => openPairModal());
   // Feature-flagged behind Settings → "Control via Mobile app (beta)": the mobile
   // client is beta, so the pairing entry point stays hidden until opted in.
@@ -20839,8 +20853,10 @@ function buildPanel() {
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
-  helpDiv.textContent =
-    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:";
+  helpDiv.textContent = tr(
+    "panel.click_connect_to_start_an_autonomous_agent",
+    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:",
+  );
   // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
   // host on connect (browser-host targeting), so it drives whatever you're viewing
   // — local or a remote pod. Offer the command per shell: PowerShell needs a
@@ -21681,13 +21697,13 @@ function buildPanel() {
   function refreshModelChip() {
     const name = prefs.modelAuto ? tr("panel.auto", "Auto") : modelLabel(modelCatalog, prefs.model);
     modelChipLabel.textContent = name;
-    modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
+    modelChipEffort.textContent = prefs.effort ? ` · ${effortMeta(prefs.effort).label}` : "";
     // The name ellipsises in a narrow panel, so the hover has to carry the full
     // value — otherwise a truncated model id is unrecoverable without widening
     // the panel, which is the thing we're avoiding.
     modelChip.title =
       (prefs.effort
-        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: prefs.effort })
+        ? tr("panel.model_name_effort", "Model: {name} · effort: {effort}", { name, effort: effortMeta(prefs.effort).label })
         : tr("panel.model_name", "Model: {name}", { name })) +
       "\n" +
       tr("panel.model_reasoning_effort_for_the_background_agent", "Model & reasoning effort for the background agent");
@@ -22836,7 +22852,7 @@ function buildPanel() {
   // ComfyUI APP-mode config) into a named, one-click app; runs headless via
   // the pack's py/apps_routes.py (canvas never touched). Grid of four rounded
   // squares (mini-app launcher mark), currentColor like the neighbors.
-  const appsBtn = toolbarBtn("pi-circle", "Apps");
+  const appsBtn = toolbarBtn("pi-circle", tr("sidepanel_ui.apps", "Apps"));
   appsBtn.querySelector(".pi").remove();
   appsBtn.title = tr("panel.apps_one_click_micro_apps_built_from", "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.");
   appsBtn.addEventListener("click", () => toggleSidePanelTab("apps", () => openApps()));
@@ -22859,7 +22875,7 @@ function buildPanel() {
   // LoRA Training — the dataset gather/label/launch/monitor wizard for the
   // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
   // Same side-panel treatment as the CivitAI browser; dumbbell mark via currentColor.
-  const trainingBtn = toolbarBtn("pi-circle", "Training");
+  const trainingBtn = toolbarBtn("pi-circle", tr("sidepanel_ui.training", "Training"));
   trainingBtn.querySelector(".pi").remove();
   trainingBtn.title = tr("panel.lora_training_train_a_character_lora_locally", "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).");
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
@@ -26400,7 +26416,22 @@ function buildPanel() {
   let pendingPair = null;
   const client = createBridgeClient({
     onStatus(state, socketId) {
-      statusText.textContent = state;
+      // Translate at the RENDER boundary, never at the source. `state` is a state TOKEN —
+      // emitStatus compares it (`s !== "connected"`) and the comment below keys behaviour on
+      // it — so translating `emitStatus("connected")` would make those comparisons
+      // permanently false in every non-English language. That is exactly the bug the backend
+      // chip had, where a translated `title` was read back as state.
+      //
+      // This is also the shape no literal-scanner can find: the assignment is a VARIABLE, so
+      // "connected"/"connecting" reached the screen untranslated while every gate was green.
+      //
+      // Written as an explicit map rather than interpolating the token into the key: a key
+      // ASSEMBLED at runtime is invisible to the extractor, so English would never gain those
+      // keys and no gate could tell whether a status was translated. (Proven immediately —
+      // the catalog validator rejected two of the three keys for exactly that reason.) An
+      // unknown status falls back to the raw token, which is the current behaviour anyway.
+      // Described, not illustrated: writing the rejected form here would trip the guard.
+      statusText.textContent = STATUS_LABEL[state]?.() ?? state;
       // #952 — a card painted on a connection that has since been REPLACED can no longer
       // deliver an answer. The trigger is the socket's identity, not the status string:
       // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
@@ -26928,7 +26959,7 @@ function buildPanel() {
         const persistKey = ctxPersistKey();
         if (persistKey) ssSet(persistKey, String(s.context_pct)); // skip when no conversation owns it yet
         if (forActiveView && typeof s.cost_usd === "number") {
-          ringTitle.textContent = `Context ~${Math.round(s.context_pct * 100)}% used · $${s.cost_usd.toFixed(3)}`;
+          ringTitle.textContent = tr("panel.context_used_cost", "Context ~{pct}% used · ${cost}", { pct: Math.round(s.context_pct * 100), cost: s.cost_usd.toFixed(3) });
         }
       }
       // Keep the chip in sync if the agent reports a concrete model id we know.
@@ -29221,7 +29252,7 @@ function buildPanel() {
     disconnectBtn.hidden = true;
     connectBtn.disabled = false;
     connectBtn.textContent = tr("panel.connect", "Connect");
-    statusText.textContent = "disconnected";
+    statusText.textContent = tr("panel.status_disconnected", "disconnected");
     dot.className = "cmcp-dot";
     settingsBox.hidden = false;
     try {
@@ -31212,7 +31243,7 @@ function buildPanel() {
       return;
     }
     paintSecret({
-      label: `${friendly} API key`,
+      label: tr("panel.friendly_api_key", "{friendly} API key", { friendly }),
       get hint() { return tr("panel.sent_straight_to_the_orchestrator_s_0600", "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context."); },
     })
       .then((value) => {
