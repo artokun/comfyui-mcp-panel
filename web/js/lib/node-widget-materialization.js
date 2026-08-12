@@ -637,6 +637,188 @@ function inputValueConfig(spec) {
  * Pure apart from the node it is handed; returns [] when there is nothing current to
  * compare against, so a frontend-only type is untouched.
  */
+/** Own ENUMERABLE DATA keys, or null when the object carries anything a key-by-key
+ *  comparison cannot faithfully see (#1085 codex): a SYMBOL key, a NON-ENUMERABLE own
+ *  property, or an ACCESSOR. Accessors matter twice over — a getter would be INVOKED by the
+ *  comparison, so two different shapes can read equal, and a THROWING getter would crash a
+ *  path that used to be a bare `!==`. `allowLength` skips an array's own non-enumerable
+ *  `length`, which every array has.
+ *
+ *  Returning null means "cannot compare structurally", and the caller then falls back to
+ *  identity — the answer `!==` gave before any of this existed. */
+function plainDataKeys(obj, allowLength) {
+  const out = [];
+  for (const key of Reflect.ownKeys(obj)) {
+    if (typeof key === "symbol") return null;
+    if (allowLength && key === "length") continue;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (!desc || !desc.enumerable || !("value" in desc)) return null;
+    out.push(key);
+  }
+  return out;
+}
+
+/** A canonical ARRAY INDEX key. `String(Number(k)) === k` is NOT this test: it accepts
+ *  "Infinity", "1.5" and "1e+21" (codex).
+ *
+ *  REDUNDANT TODAY, and said plainly rather than implied otherwise — mutation-verified:
+ *  loosening this predicate breaks no test. What actually closed that hole was switching
+ *  the array branch from a 0..length WALK to a comparison of the PRESENT KEY SET, which
+ *  visits every own key including the ones that are not indices. This kept as an explicit
+ *  refusal because a key that is not an index has no business in a value being compared as
+ *  an array, and because it is what would still hold if the loop ever went back to walking
+ *  indices. */
+function isArrayIndexKey(key) {
+  const n = Number(key);
+  return Number.isInteger(n) && n >= 0 && n < 2 ** 32 - 1 && String(n) === key;
+}
+
+/** #1085 — whether two widget values are the SAME VALUE, not the same reference.
+ *
+ *  `!==` is the right question for a scalar and the wrong one for an OBJECT default, where
+ *  it is true for every pair of distinct references no matter what they contain. Core
+ *  `ImageCropV2` declares `crop_region` as `{x, y, width, height}`, and each `/object_info`
+ *  read materialises a fresh object — so every add "corrected" that widget from
+ *  `{"x":0,"y":0,"width":512,"height":512}` to the identical `{"x":0,"y":0,"width":512,
+ *  "height":512}` and warned that the tab's schema was STALE. Nothing had changed, and the
+ *  advice that came with it (reload the tab before editing further) was work the user did
+ *  not need to do.
+ *
+ *  Structural, not `JSON.stringify`: key ORDER differs freely between two readings of the
+ *  same definition, and stringify would call those unequal — reproducing the bug through a
+ *  second mechanism. Prototypes must match too, so a plain object never compares equal to a
+ *  class instance that happens to carry the same keys.
+ *
+ *  FAILS TOWARD TODAY'S BEHAVIOUR wherever it declines to compare: a proxy that throws, an
+ *  exotic object, an accessor or a symbol key all answer "different", which is exactly what
+ *  `!==` answered before this existed — a spurious correction at worst, never a missed one.
+ *  A CYCLE is the one case that is decided rather than refused: re-encountering a pair means
+ *  the traversal closed a loop, and two structures that agree everywhere else agree there.
+ *
+ *  ON HANGING PROXY TRAPS, since a structural compare reads what `!==` did not: for an
+ *  OBJECT-valued widget this exposure is not new. `!==` was true for every object, so a
+ *  correction was always recorded, and the caller's disclosure interpolates
+ *  `JSON.stringify(c.from)` — which invokes the same ownKeys/get/getOwnPropertyDescriptor
+ *  traps. A non-returning trap already hung there. Comparing first REDUCES the exposure:
+ *  when the values are equal there is now no correction, so nothing is stringified.
+ *
+ *  NOT full parity, and the difference is named rather than glossed (codex): this also calls
+ *  `Object.getPrototypeOf`, which JSON serialization does not, so a proxy whose
+ *  `getPrototypeOf` trap never returns is newly reachable. There is no general defence — a
+ *  non-returning trap cannot be interrupted from JS, and no reliable proxy detection exists —
+ *  and a widget value of that shape means custom-node code that already runs in the page.
+ */
+function sameWidgetValue(a, b) {
+  // GUARDED ENTRY (codex). Everything below can touch a live widget value, and a live value
+  // can be a PROXY: Array.isArray, getPrototypeOf, Reflect.ownKeys,
+  // getOwnPropertyDescriptor, hasOwnProperty and a plain property read are all trap points,
+  // and a REVOKED proxy throws on the first of them. The path this replaced was a bare
+  // `!==`, which touches nothing — so without this, adding a node could fail outright where
+  // it used to succeed. Any throw (including a RangeError from an over-deep structure)
+  // answers "different", which is exactly what `!==` said.
+  //
+  // A trap that HANGS rather than throws is not guardable from here, and is not introduced
+  // by this change alone — any structural read of such a value has the same exposure.
+  try {
+    return sameWidgetValueDeep(a, b, new WeakMap());
+  } catch {
+    return false;
+  }
+}
+
+function sameWidgetValueDeep(a, b, seen) {
+  // Numbers first, so the two IEEE oddities are answered deliberately rather than by
+  // whichever operator happened to be used: NaN equals NaN (a NaN default would otherwise
+  // "change" on every single add), and -0 equals +0 (Object.is alone says they differ, which
+  // would invent a correction `!==` never reported). Everything else uses Object.is.
+  if (typeof a === "number" && typeof b === "number") {
+    return a === b || (Number.isNaN(a) && Number.isNaN(b));
+  }
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+
+  // CYCLE DETECTION, replacing a depth cap. Two successive caps (8, then 100) were both
+  // wrong in the same way (codex): a cap is a limit on SHAPE, and any equal structure past
+  // it received the exact spurious correction this fix exists to remove — then got
+  // reassigned, re-aliasing the widget to the definition's object. There is no depth at
+  // which that is the right answer.
+  //
+  // Tracking the (a, b) pairs already compared bounds a cycle EXACTLY. A finite structure is
+  // then limited only by the CALL STACK rather than by a constant — which is not the same as
+  // unlimited (codex), and the earlier wording claiming otherwise was wrong. Past that the
+  // recursion overflows, the guarded entry catches the RangeError, and the answer degrades to
+  // "different" — the pre-fix answer. Materially better than a cap of 8 or 100, which real
+  // values could reach; a JSON widget default cannot approach the stack. Re-encountering a pair means the traversal closed a loop, and the
+  // standard reading is co-inductive: the pair is equal unless something else proves
+  // otherwise. A stack deep enough to overflow still ends in the guarded entry's catch,
+  // which answers "different".
+  //
+  // Pairs are retained for the WHOLE traversal, not just the current path (codex) — that is
+  // ordinary bisimulation and is what makes sibling branches cheap; it is stated here
+  // because "on this path" was the wrong description of it.
+  //
+  // ACCEPTED LIMIT of that reading: it compares SHAPE, not aliasing topology. A self-cycle
+  // (`a.self === a`) and a two-object mutual cycle (`b.self = c; c.self = b`) are bisimilar
+  // and compare EQUAL though the objects differ. Unreachable in this function's actual job:
+  // the value being compared against is `config.default`, which comes from /object_info and
+  // is therefore JSON — and JSON cannot express a cycle at all. Recorded rather than fixed,
+  // because distinguishing topologies costs real complexity for a case the input format
+  // rules out.
+  let partners = seen.get(a);
+  if (partners?.has(b)) return true;
+  if (!partners) seen.set(a, (partners = new Set()));
+  partners.add(b);
+
+  const aIsArray = Array.isArray(a);
+  if (aIsArray !== Array.isArray(b)) return false;
+  if (aIsArray) {
+    // Array subclasses are not plain arrays; compare them by identity like any other
+    // exotic object (the check below would otherwise be skipped for the array branch).
+    if (Object.getPrototypeOf(a) !== Array.prototype || Object.getPrototypeOf(b) !== Array.prototype) {
+      return false;
+    }
+    if (a.length !== b.length) return false;
+    // Compare the PRESENT INDEX KEYS rather than walking 0..length (codex). A single valid
+    // sparse index of 4294967294 sets length to 4294967295, and a length walk would spin
+    // through billions of absent slots and freeze the tab. This also compares hole-ness for
+    // free: a hole simply has no own key, so `[,1]` and `[0,1]` differ by key set.
+    const aIdx = plainDataKeys(a, true);
+    const bIdx = plainDataKeys(b, true);
+    if (!aIdx || !bIdx) return false;
+    if (aIdx.length !== bIdx.length) return false;
+    if (!aIdx.every(isArrayIndexKey) || !bIdx.every(isArrayIndexKey)) return false;
+    for (const key of aIdx) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+      if (!sameWidgetValueDeep(a[key], b[key], seen)) return false;
+    }
+    return true;
+  }
+
+  // PLAIN OBJECTS ONLY (codex). `Object.keys` sees no content on a Date, Map, Set,
+  // ArrayBuffer or DataView, so two instances of any of them compared EQUAL whatever they
+  // held — again a real change reported as none. An /object_info default is JSON and can be
+  // none of these, but a live widget value can, so the structural path is restricted to the
+  // shape it was written for and everything else falls back to the identity answer
+  // `Object.is` already gave — which is exactly what `!==` did before this existed.
+  //
+  const aProto = Object.getPrototypeOf(a);
+  if (aProto !== Object.getPrototypeOf(b)) return false;
+  if (aProto !== Object.prototype && aProto !== null) return false;
+  // A PLAIN object can still carry symbol-keyed or non-enumerable own properties, which
+  // Object.keys does not see (codex). An earlier version of this comment claimed the
+  // prototype restriction disposed of them — it does not, and a test asserted that false
+  // negative under a title saying it could not happen. Refuse to compare structurally when
+  // either side has any such property; identity then answers, as it did before this existed.
+  const aKeys = plainDataKeys(a, false);
+  const bKeys = plainDataKeys(b, false);
+  if (!aKeys || !bKeys) return false;
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(
+    (k) => Object.prototype.hasOwnProperty.call(b, k) && sameWidgetValueDeep(a[k], b[k], seen),
+  );
+}
+
 export function applyCurrentDefWidgetValues(node, currentDef, out) {
   const required = currentDef?.input?.required;
   if (!required || typeof required !== "object") return [];
@@ -677,7 +859,14 @@ export function applyCurrentDefWidgetValues(node, currentDef, out) {
     //    or coerced: there is no defensible way to pick a replacement from an option list
     //    the node author evidently did not mean, and the value the widget already holds
     //    came from the registered schema and is at least a real member.
-    if (Object.prototype.hasOwnProperty.call(config, "default") && widget.value !== config.default) {
+    // #1085 — VALUE equality, not reference equality. An object default is a fresh object on
+    // every /object_info read, so `!==` reported a correction on every add of a node whose
+    // default is structured (ImageCropV2's `crop_region`), and the "schema is STALE" warning
+    // that follows was raised about a value that had not changed.
+    if (
+      Object.prototype.hasOwnProperty.call(config, "default") &&
+      !sameWidgetValue(widget.value, config.default)
+    ) {
       const comboOptions = Array.isArray(spec?.[0])
         ? spec[0]
         : Array.isArray(config.options)
@@ -695,7 +884,9 @@ export function applyCurrentDefWidgetValues(node, currentDef, out) {
       if (typeof config.min === "number" && widget.value < config.min) widget.value = config.min;
       if (typeof config.max === "number" && widget.value > config.max) widget.value = config.max;
     }
-    if (widget.value !== before) corrections.push({ name, from: before, to: widget.value });
+    // Same reason (#1085): after an assignment above, `before` and the new value can be
+    // distinct objects holding identical content, and only a structural compare can say so.
+    if (!sameWidgetValue(widget.value, before)) corrections.push({ name, from: before, to: widget.value });
   }
   // Reported through an OPT-IN out-param rather than as a property on the returned array.
   // The first cut attached `corrections.rejected` and claimed every existing caller was
