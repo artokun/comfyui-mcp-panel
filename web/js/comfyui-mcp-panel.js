@@ -476,6 +476,7 @@ import {
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
+import { isManualBridgeOverride, migratedBridgeUrlKey } from "./lib/bridge-url-provenance.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -21806,6 +21807,12 @@ function buildPanel() {
         getSetting(SETTING_BRIDGE_URL.claude) == null
       ) {
         setSetting(SETTING_BRIDGE_URL.claude, lu);
+        // #1136 — REMEMBER that we wrote this, because the value is an ephemeral
+        // orchestrator port and will outlive the process that owned it. Without the
+        // record, the connect path cannot tell this from a port the user typed on
+        // purpose, honours it as a manual override forever, and dials a dead socket
+        // while the live single-port bridge answers next door.
+        lsSet(migratedBridgeUrlKey("claude"), lu);
       }
       lsSet(SETTINGS_GROUPS_MIGRATED_KEY, "1");
     }
@@ -28787,8 +28794,16 @@ function buildPanel() {
   async function reclaimAdvertisedBridgeUrl() {
     if (location.protocol !== "https:") return;
     const wanted = urlInput.value.trim();
-    const manualOverride =
-      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
+    // #1136 — same rule as before, minus ONE case: a URL this panel INHERITED from
+    // the pre-per-backend migration is not a URL the user chose, and must not outrank
+    // the live single-port bridge. A hand-typed port still wins, which is the whole
+    // point of the override.
+    const manualOverride = isManualBridgeOverride({
+      wanted,
+      backendDefault: defaultBridgeUrlFor(selectedBackend),
+      lastAutoUrl,
+      migratedUrl: lsGet(migratedBridgeUrlKey(selectedBackend)),
+    });
     if (manualOverride) return; // a user-typed Advanced Bridge URL is never clobbered
     const secure = await fetchAdvertisedBridgeUrl();
     if (!secure || secure === client.currentUrl()) return;
@@ -28848,8 +28863,16 @@ function buildPanel() {
     // user-CUSTOMIZED non-default per-backend URL must survive the switch and not be
     // overwritten by /connect's default bridge_url. A per-backend DEFAULT url still
     // isn't an override, so a normal switch keeps following /connect's bridge_url.
-    const manualOverride =
-      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
+    // #1136 — same rule as before, minus ONE case: a URL this panel INHERITED from
+    // the pre-per-backend migration is not a URL the user chose, and must not outrank
+    // the live single-port bridge. A hand-typed port still wins, which is the whole
+    // point of the override.
+    const manualOverride = isManualBridgeOverride({
+      wanted,
+      backendDefault: defaultBridgeUrlFor(selectedBackend),
+      lastAutoUrl,
+      migratedUrl: lsGet(migratedBridgeUrlKey(selectedBackend)),
+    });
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     // EXTERNAL/LOCAL ORCHESTRATOR MODE: the agent is run by the user on THEIR
     // machine, not spawned by this ComfyUI host — so do NOT POST /connect (this
