@@ -222,9 +222,17 @@ for (const commandUuid of [undefined, "   "]) {
 
 test("#718 wiring: graph_set_widget passes the execution-time workflow fence into runSetWidget", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  const start = src.indexOf("async graph_set_widget({ node_id, widget, value, workflow_uuid })");
+  // Located loosely, then the stamp is asserted separately below: pinning the exact
+  // destructuring made this fail on every added argument (#1126 added `allow_unlisted`),
+  // reporting "must accept the bridge-owned stamp" for a signature that still accepts it.
+  const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
   const end = src.indexOf("\n  graph_set_node_property(", start);
-  assert.notEqual(start, -1, "graph_set_widget executor must accept the bridge-owned stamp");
+  assert.notEqual(start, -1, "graph_set_widget executor must exist");
+  assert.match(
+    src.slice(start, src.indexOf(")", start)),
+    /workflow_uuid/,
+    "graph_set_widget executor must accept the bridge-owned stamp",
+  );
   assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
   const body = src.slice(start, end);
   assert.match(

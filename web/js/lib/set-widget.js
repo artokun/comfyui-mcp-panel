@@ -80,6 +80,12 @@ export async function runSetWidget(
     assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
+    // #1126 — the caller's per-call assertion that this combo accepts values its dropdown
+    // cannot enumerate (a custom node whose runtime handler takes an absolute path, whose
+    // enum is a convenience list or a bare placeholder). It ONLY converts a would-be
+    // off-list refusal into an unvalidated write, and only for a string; it can never
+    // pre-empt the authoritative recoveries above, and it is disclosed on the reply.
+    allowUnlisted = false,
   } = {},
 ) {
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
@@ -650,10 +656,57 @@ export async function runSetWidget(
       });
     }
 
+    // #1126 — the caller EXPLICITLY asserted this combo accepts values its dropdown
+    // cannot enumerate. Last, after every authoritative mechanism above, so the assertion
+    // can never pre-empt a refresh, an upload confirmation, or the server's own empty
+    // declaration — it only decides what would otherwise be a flat refusal.
+    //
+    // It is an assertion and not an inference because inference was tried and was wrong:
+    // keying on "the server declares the list empty" broke three #507 invariants that are
+    // correct, since that same condition covers the combo whose own JS populates REAL
+    // options and where an off-list value is a typo worth refusing. See coerceWidgetValue.
+    if (latest?.offList && allowUnlisted) {
+      const set = write({ allowUnlistedComboValue: true });
+      return withWarning({
+        set,
+        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+        // The coercion-time verdict, never re-derived: with a stateful options function
+        // the retry can be admitted by ordinary membership after a list change, and
+        // claiming an unvalidated write then would be false.
+        ...(set?.off_list_value_accepted
+          ? {
+              off_list_value_accepted: true,
+              off_list_note:
+                `Written UNVALIDATED at your request: this value is not in the widget's dropdown, ` +
+                `and allow_unlisted told the panel the node accepts values the dropdown cannot ` +
+                `list (#1126). Nothing checked it — if the node rejects it at runtime that is the ` +
+                `node's answer, not a panel refusal to retry around. The graph now holds a value ` +
+                `no option list vouches for, so a later reader (including the ComfyUI dropdown ` +
+                `itself) may show it as out-of-range.`,
+            }
+          : {}),
+      });
+    }
+
     // No recovery succeeded — refuse honestly with the freshest rejection.
+    //
+    // #1126 — an off-list refusal names `allow_unlisted`. Without this the escape is
+    // undiscoverable: the reporter's only visible options were the enumerated values, so
+    // they copied the file into ComfyUI's input directory to work around a node that
+    // already accepted their path. It is offered ONLY on the off-list case, and only as a
+    // branch with its condition stated — a node that genuinely has a closed option set
+    // must not be handed a way to write nonsense into it, and the message must not read as
+    // "retry with this flag" when the real answer is usually a value from the list.
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
-        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}`,
+        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}` +
+        (latest?.offList && !allowUnlisted
+          ? ` If this node accepts values its dropdown cannot list — a file field whose enum is a ` +
+            `placeholder, or one whose runtime handler takes an absolute path — retry with ` +
+            `allow_unlisted:true to write it UNVALIDATED. Only do that when you know the node ` +
+            `accepts it: nothing will check the value, and for a combo with a genuinely closed ` +
+            `option set the right fix is a value from the list above (#1126).`
+          : ""),
     );
   }
 }

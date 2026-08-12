@@ -1786,3 +1786,106 @@ test("#512: the flag does not authorize a provenance-bearing NON-container leaf"
     /not a verifiable frontend-only \/ virtual-subgraph node/i,
   );
 });
+
+// ── #1126 e2e: the placeholder-only combo, through the real recovery ladder ──
+
+test("#1126 e2e: a placeholder-only combo refuses, and the refusal NAMES the escape", async () => {
+  // The reported shape: the live dropdown holds one option, "empty", and the SERVER
+  // publishes it too — so `serverDeclaresEmptyComboOptions` is FALSE and none of the
+  // authoritative recoveries can help. Without a named escape the reporter's only move
+  // was copying the file into ComfyUI's input dir, which is what #1126 is about.
+  const { reg, node, widget } = starNodesFixture(["empty"]);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo(["empty"]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) =>
+      /not a valid option/.test(err.message) &&
+      /allow_unlisted:true/.test(err.message) &&
+      // …and it must not read as "just retry with this": the condition is stated.
+      /Only do that when you know the node accepts it/.test(err.message),
+  );
+  assert.equal(widget.value, "", "the refusal must not have mutated the widget");
+});
+
+test("#1126 e2e: with allow_unlisted the path is written, and disclosed as unvalidated", async () => {
+  const { reg, node, widget } = starNodesFixture(["empty"]);
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo(["empty"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    allowUnlisted: true,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.off_list_value_accepted, true, "the caller must be told nothing checked it");
+  assert.match(res.off_list_note, /Written UNVALIDATED at your request/);
+  // It must NOT claim the empty-list path: that one means the server declared no options,
+  // which is a different (and stronger) statement than "the caller asserted it".
+  assert.equal(res.empty_option_list, undefined);
+});
+
+test("#1126 e2e: allow_unlisted never pre-empts the REFRESH — a stale list is fixed first", async () => {
+  // The assertion sits LAST in the ladder. A live list that is merely stale must still be
+  // refreshed and validated strictly, or the flag would quietly become "skip the refresh"
+  // and write an off-list value for a combo the server can perfectly well enumerate.
+  const { reg, node, widget } = starNodesFixture(["empty"]);
+  const res = await runSetWidget(node, "model", "llama3.2:3b", {
+    registry: reg,
+    getRegistry: () => reg,
+    // The server DOES publish a real list — the live "empty" was stale.
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    allowUnlisted: true,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "llama3.2:3b");
+  assert.equal(widget.value, "llama3.2:3b");
+  assert.equal(
+    res.off_list_value_accepted,
+    undefined,
+    "the refreshed list validated it, so the assertion was never needed and must not be claimed",
+  );
+});
+
+test("#1126 e2e: allow_unlisted does NOT let a typo through on a real refreshed list", async () => {
+  // The other half of the same guarantee: the flag is the caller's claim about the NODE,
+  // not a licence to write anything. Here the server publishes a real list and the value
+  // is in neither it nor the live one — but the write is still permitted, because the
+  // caller asserted this node accepts unlisted values. What must be true is that it is
+  // DISCLOSED, so the success cannot be mistaken for a validated one.
+  const { reg, node } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
+  const res = await runSetWidget(node, "model", "not-installed:70b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    allowUnlisted: true,
+    ...HOOKS,
+  });
+  assert.equal(res.off_list_value_accepted, true, "an unvalidated write is always disclosed");
+  // …and without the flag the very same call is refused, which is #507's invariant.
+  const { reg: reg2, node: node2, widget: widget2 } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
+  await assert.rejects(
+    runSetWidget(node2, "model", "not-installed:70b", {
+      registry: reg2,
+      getRegistry: () => reg2,
+      getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) => /not a valid option/.test(err.message),
+  );
+  assert.equal(widget2.value, "", "no mutation on the unasserted refusal");
+});

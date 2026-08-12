@@ -3213,3 +3213,104 @@ test("#667×#507 (final gate): an adoption that cannot be re-validated against a
   assert.equal(railWidget.value, "", "rail untouched");
   assert.equal(proxyWidget.value, "", "proxy untouched");
 });
+
+// ── #1126: a combo whose dropdown cannot enumerate the valid values ─────────
+//
+// The reporter's custom FBX node takes an absolute path at runtime; its dynamic file
+// combo held ONE option, the placeholder "empty". Strict membership refused every real
+// path, and their only workaround was copying the file into ComfyUI's input directory —
+// defeating a node whose whole point is taking a path.
+//
+// The escape is an EXPLICIT per-call assertion, not an inference, and the first attempt
+// proves why. Keying it on "the server declares this input's option list empty" broke
+// three #507 invariants, and #507 is right: that same condition covers the StarNodes
+// combo whose own JS populates a list of REAL models, where an off-list value is a typo
+// worth refusing. Nothing here separates "placeholder" from "real options the server
+// could not enumerate" — not the option names (`None` is a real option on many nodes),
+// and not the server's declaration. The caller knows the node; the panel does not.
+
+const ALLOW_UNLISTED = { ...HOOKS, allowUnlistedComboValue: true };
+
+test("#1126: a placeholder-only combo accepts an unlisted path when the caller asserts it", () => {
+  const node = {
+    id: 4,
+    type: "FbxRenderer",
+    widgets: [{ name: "fbx_file", type: "combo", options: { values: ["empty"] }, value: "empty" }],
+  };
+  // The reported refusal, verbatim in shape: one option, and it is not a real choice.
+  assert.throws(
+    () => applyWidgetWrite(node, "fbx_file", String.raw`F:\Downloads\Scarlet1.0.fbx`, HOOKS),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "empty", "the refusal must not have mutated the widget");
+  // With the assertion, the path lands.
+  const out = applyWidgetWrite(node, "fbx_file", String.raw`F:\Downloads\Scarlet1.0.fbx`, ALLOW_UNLISTED);
+  assert.equal(out.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(node.widgets[0].value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  // …and the reply says nothing validated it, so a caller cannot read the success as
+  // "the panel checked this against the node's options".
+  assert.equal(out.off_list_value_accepted, true, "an unvalidated write must be disclosed");
+});
+
+test("#1126: the assertion does NOT weaken #507 — a real list still refuses a typo", () => {
+  // The invariant the first attempt broke. This combo's options are REAL (the node's own
+  // JS populated them), and `allow_unlisted` is the caller saying "this node takes values
+  // the dropdown cannot list" — which is a claim about THIS node, so it applies here too.
+  // What must not happen is the panel deciding that for them, which is why no inference
+  // from the option list or the server declaration is involved.
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b", "llama3.2:3b"] }, value: "qwen3-vl:8b" }],
+  };
+  // Without the assertion: refused, exactly as #507 requires.
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "not-installed:70b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  // acceptEmptyComboOptions must NOT admit an off-list value on a non-empty list —
+  // the two opt-ins stay separate concerns and neither implies the other.
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "not-installed:70b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError,
+  );
+  assert.equal(node.widgets[0].value, "qwen3-vl:8b", "no mutation on either refusal");
+});
+
+test("#1126: #240 stays intact — only a STRING may be written unlisted", () => {
+  // #240's reason for strict membership is that a NUMBER can be reinterpreted as an INDEX
+  // into a real list, and here a real list DOES exist on the widget even though it cannot
+  // enumerate what is valid. No file path is a number, so restricting the escape to
+  // strings keeps the whole of that argument rather than trading it away.
+  const mk = () => ({
+    id: 5,
+    type: "FbxRenderer",
+    widgets: [{ name: "fbx_file", type: "combo", options: { values: ["empty"] }, value: "empty" }],
+  });
+  for (const bad of [1, 0, 4444, true, false]) {
+    const node = mk();
+    assert.throws(
+      () => applyWidgetWrite(node, "fbx_file", bad, ALLOW_UNLISTED),
+      (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+      `a non-string must stay refused even with the assertion: ${JSON.stringify(bad)}`,
+    );
+    assert.equal(node.widgets[0].value, "empty");
+  }
+  // An object was already refused as non-scalar and stays so.
+  assert.throws(() => applyWidgetWrite(mk(), "fbx_file", { p: "x" }, ALLOW_UNLISTED), WidgetWriteError);
+});
+
+test("#1126: an exact member still wins, and the write is NOT marked unvalidated", () => {
+  // The assertion must not turn every write into an unchecked one: ordinary membership
+  // still decides first, so a caller who passes the flag defensively does not lose the
+  // guard for values the list DOES contain — nor get told the value went unvalidated.
+  const node = {
+    id: 6,
+    type: "FbxRenderer",
+    widgets: [{ name: "fbx_file", type: "combo", options: { values: ["a.fbx", "b.fbx"] }, value: "a.fbx" },
+    ],
+  };
+  const out = applyWidgetWrite(node, "fbx_file", "b.fbx", ALLOW_UNLISTED);
+  assert.equal(out.value, "b.fbx");
+  assert.equal(out.off_list_value_accepted, undefined, "a listed value was validated normally");
+});
