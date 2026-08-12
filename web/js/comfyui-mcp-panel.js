@@ -242,6 +242,10 @@ import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
+import {
+  knownSelectorSample,
+  openWorkflowNotFoundMessage,
+} from "./lib/open-workflow-not-found.js";
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -13027,26 +13031,40 @@ const GRAPH_TOOL_EXECUTORS = {
         all.find((w) => workflowRecordMatchesSelector(w, path))
       );
     };
+    // A SAMPLE of what the store actually holds, for the refusal. The reporter's file
+    // was inside the workflows folder, so "it isn't there" was not the useful thing to
+    // say — "here is the shape of the names that ARE there" is, because the selector
+    // forms differ (`workflows/x.json`, `x.json`, and a `filename` with no extension).
+    const all = [...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])];
     let target = find();
     // The frontend's workflow list is CACHED, so a just-saved/staged file (e.g. a
     // downloaded example) won't appear until the store re-reads the workflows dir.
     // If the first search misses, REFRESH the store and search again so a freshly
     // staged file is found + opened natively (no need for a separate refresh call).
-    if (!target && typeof s.syncWorkflows === "function") {
-      try {
-        await s.syncWorkflows();
-      } catch (err) {
-        console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
+    // #1448 — RECORD WHAT THE REFRESH ACTUALLY DID. The refusal below used to say
+    // "even after a refresh" unconditionally, while both ways the refresh can fail to
+    // happen were silent: a frontend without `syncWorkflows` skipped it entirely, and a
+    // throw was swallowed by a console.warn nobody reads from an agent session. The
+    // reporter was told a refresh had happened and still could not find a file they had
+    // just confirmed on disk, so the one fact that would have pointed anywhere — whether
+    // the list was ever re-read — was the fact being asserted without being checked.
+    let refresh = "not-needed";
+    if (!target) {
+      if (typeof s.syncWorkflows !== "function") {
+        refresh = "unavailable";
+      } else {
+        try {
+          await s.syncWorkflows();
+          refresh = "ok";
+        } catch (err) {
+          refresh = `failed: ${err?.message ?? err}`;
+          console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
+        }
       }
       target = find();
     }
     if (!target) {
-      throw failOpen(
-        new Error(
-          `no workflow matching "${path}" — it isn't among the saved/open workflows even after a refresh. ` +
-            `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
-        ),
-      );
+      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known: knownSelectorSample(all) })));
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
