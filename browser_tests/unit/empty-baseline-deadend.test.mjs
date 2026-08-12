@@ -76,7 +76,7 @@ test("#803 the note names the real cause and the live count", () => {
 
 test("#803 the remedy names the step that WORKS", () => {
   const r = emptyBaselineRemedy();
-  assert.match(r, /Reload the panel/);
+  assert.match(r, /reload the panel/i);
   assert.match(r, /known to clear this/);
 });
 
@@ -88,10 +88,24 @@ test("#803 the remedy warns that re-opening may not clear it", () => {
   assert.match(r, /the repair\s+that would refresh it is itself blocked/);
 });
 
-test("#803 the remedy still allows for a genuinely wrong canvas", () => {
-  // The refusal may be correct. If a reload does not clear it, say what that means
-  // rather than leaving the reader believing the tool is simply broken.
-  assert.match(emptyBaselineRemedy(), /really is bound elsewhere/);
+test("#803 the remedy warns about unsaved work BEFORE advising a reload", () => {
+  // Review caught this as a data-loss risk, and it is: a reload discards unsaved graph
+  // edits, and this is a READ refusing — nothing here is worth losing work over.
+  const r = emptyBaselineRemedy();
+  assert.match(r, /SAVE ANY UNSAVED CANVAS WORK FIRST/);
+  assert.match(r, /discards unsaved graph edits/);
+  // The warning must come before the instruction, not as a trailing footnote.
+  assert.ok(r.indexOf("SAVE ANY UNSAVED") < r.indexOf("reload the panel"));
+});
+
+test("#803 the remedy does not swap one over-claim for another", () => {
+  // The first cut removed "bound to a different graph" and then asserted "the canvas
+  // really IS bound elsewhere" if a reload did not help — the same defect, in the fix
+  // for it. A reload can fail to re-capture for other reasons.
+  const r = emptyBaselineRemedy();
+  assert.doesNotMatch(r, /really is bound elsewhere/);
+  assert.match(r, /no longer\s+the likely explanation/);
+  assert.match(r, /does not prove the canvas is bound elsewhere/);
 });
 
 test("#803 WIRING: the empty-baseline branch replaces claim AND remedy", () => {

@@ -80,11 +80,15 @@ export function emptyBaselineNote(live) {
  */
 export function emptyBaselineRemedy() {
   return (
-    `Reload the panel (or the browser tab) to rebuild the captured state — that is the ` +
-    `step known to clear this. Re-opening the workflow may NOT: the captured state is ` +
-    `refreshed only after a command SUCCEEDS, so while this refusal stands, the repair ` +
-    `that would refresh it is itself blocked (comfyui-mcp#803). If a reload does not ` +
-    `clear it, the canvas really is bound elsewhere — check which workflow tab is ` +
-    `active before retrying.`
+    `SAVE ANY UNSAVED CANVAS WORK FIRST, then reload the panel (or the browser tab) to ` +
+    `rebuild the captured state — that is the step known to clear this. The save warning ` +
+    `is not boilerplate: a reload discards unsaved graph edits, and this is a READ ` +
+    `refusing, so nothing here is worth losing work over. Re-opening the workflow may ` +
+    `NOT clear it: the captured state is refreshed only after a command SUCCEEDS, so ` +
+    `while this refusal stands, the repair that would refresh it is itself blocked ` +
+    `(comfyui-mcp#803). If a reload does not clear it, the empty baseline is no longer ` +
+    `the likely explanation — check which workflow tab is actually active before ` +
+    `retrying, but note a reload can also fail to re-capture for other reasons, so this ` +
+    `still does not prove the canvas is bound elsewhere.`
   );
 }
