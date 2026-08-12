@@ -796,6 +796,7 @@ test("#1089: a state owned by another OPEN workflow is foreign — the open must
       targetUuid: UUID_A,
       targetClaimsTag: CLAIMS_NOTHING,
       tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+      targetTabIsClean: true,
     }),
     "foreign",
   );
@@ -842,9 +843,44 @@ test("#1089: a mismatch alone is NOT foreign — a predecessor's uuid residue mu
       targetClaimsTag: CLAIMS_NOTHING,
       // registered to nobody currently open — residue, not another tab's graph
       tagOwnedByOtherOpenWorkflow: NO_OWNER,
+      targetTabIsClean: true,
     }),
     "unknown",
   );
+});
+
+test("#1089: a DIRTY tab is never refused — the #817 false-positive codex found, and its cost", () => {
+  // codex NO-SHIP, round 1. The tag cannot prove the GRAPH is foreign. #817: a tab
+  // switch leaves the previous workflow's tag on the reused app.graph, and the
+  // guard's rebind re-stamps that root on CONTENT proof
+  // (rootContentProvesActiveWorkflow), not on a claimed tag. stampGraphRootWorkflowUuid
+  // writes rootGraph.extra and nothing else, so a capture taken before the heal leaves
+  // this tab's OWN content under the other tab's meta block — and the whole
+  // comfyui_mcp block travels together, so no field in it separates that from a
+  // genuinely foreign graph.
+  //
+  // The refusal is therefore justified by its COST, not by proof. On a clean tab a
+  // wrong refusal costs one extra panel_load_workflow and loses nothing, because the
+  // file IS the tab's content. On a dirty tab that same advice discards unsaved work,
+  // so a dirty tab repaints exactly as it does today.
+  const foreignTagArgs = {
+    state: taggedState("workflow-B"),
+    targetUuid: UUID_A,
+    targetClaimsTag: CLAIMS_NOTHING,
+    tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+  };
+  assert.equal(describeRepaintSourceBinding({ ...foreignTagArgs, targetTabIsClean: false }), "unknown");
+  // Compared against `true` explicitly: an unreadable dirty flag is not a clean tab.
+  for (const notClean of [undefined, null, 0, "", "true", 1, {}]) {
+    assert.equal(
+      describeRepaintSourceBinding({ ...foreignTagArgs, targetTabIsClean: notClean }),
+      "unknown",
+      `a non-true cleanliness reading must not license the refusal: ${JSON.stringify(notClean)}`,
+    );
+  }
+  // ...and the clean tab still is refused, so the gate narrows the refusal without
+  // removing it. #1089's own tab reported modified:false.
+  assert.equal(describeRepaintSourceBinding({ ...foreignTagArgs, targetTabIsClean: true }), "foreign");
 });
 
 test("#1089: absent evidence changes nothing — the #968 residual stays a residual, not a refusal", () => {
@@ -866,6 +902,9 @@ test("#1089: absent evidence changes nothing — the #968 residual stays a resid
         ...args,
         targetClaimsTag: CLAIMS_NOTHING,
         tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+        // clean, so `unknown` here is the ABSENT EVIDENCE talking and not the
+        // cleanliness gate standing in for it
+        targetTabIsClean: true,
       }),
       "unknown",
       `inconclusive input must answer unknown: ${JSON.stringify(args.state)}`,
@@ -883,6 +922,7 @@ test("#1089: a predicate that throws is inconclusive, never a refusal", () => {
         throw new Error("owner map unreadable");
       },
       tagOwnedByOtherOpenWorkflow: OTHER_OPEN,
+      targetTabIsClean: true,
     }),
     "unknown",
   );
@@ -894,12 +934,17 @@ test("#1089: a predicate that throws is inconclusive, never a refusal", () => {
       tagOwnedByOtherOpenWorkflow: () => {
         throw new Error("openWorkflows unreadable");
       },
+      targetTabIsClean: true,
     }),
     "unknown",
   );
   // Missing predicates are the same story — an unasked question is not an answer.
   assert.equal(
-    describeRepaintSourceBinding({ state: taggedState("workflow-B"), targetUuid: UUID_A }),
+    describeRepaintSourceBinding({
+      state: taggedState("workflow-B"),
+      targetUuid: UUID_A,
+      targetTabIsClean: true,
+    }),
     "unknown",
   );
 });
@@ -926,10 +971,21 @@ test("#1089: the refusal is wired BEFORE loadGraphData, and says the canvas was 
   // OPEN, not merely registered — the predecessor-residue escape (see the helper).
   assert.match(guardBlock, /openWorkflows/);
   assert.match(guardBlock, /sameWorkflowObject\(w, owner\)/);
+  // Cleanliness comes from the PRE-AWAIT snapshot, not a live re-read:
+  // clearSpuriousOpenModified force-clears isModified, so `target.isModified` here
+  // would read clean for a tab that arrived dirty and license the refusal whose cost
+  // is only bounded when the tab really is clean (#442/codex).
+  assert.match(guardBlock, /targetTabIsClean: !wasDirty/);
+  assert.doesNotMatch(guardBlock, /targetTabIsClean: !target\.isModified/);
   // The message: nothing was loaded, and the recovery that works, with its trap.
   assert.match(guardBlock, /nothing was overwritten/, "it must say the canvas was left alone");
   assert.match(guardBlock, /panel_load_workflow/, "it must name the recovery that reads from disk");
-  assert.match(guardBlock, /NOT save first/, "it must name the save-over trap");
+  assert.match(guardBlock, /NOT plain-save first/, "it must name the save-over trap");
+  // The recovery is safe for THIS workflow precisely because the tab was clean, and
+  // the message must not overstate that into "safe" — the CANVAS may be another
+  // workflow's with its own unsaved work, which the disk load replaces.
+  assert.match(guardBlock, /the tab had no unsaved edits/);
+  assert.match(guardBlock, /it replaces what is on the canvas/);
   // And it must be a REFUSAL, not a disclosure riding a success.
   assert.match(guardBlock, /rebindFailed = new Error\(/);
 });

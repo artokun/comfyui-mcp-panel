@@ -1208,22 +1208,43 @@ export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
  * to the target's file.
  *
  * The evidence rule is `describeLiveCanvasBinding`'s (#708/#349), applied to the
- * source state instead of the live canvas, plus ONE additional requirement:
+ * source state instead of the live canvas, plus TWO additional requirements:
  *
  *   bound   — the state carries the target's own identity. Repaint, unchanged.
- *   foreign — the state carries a tag the target does not claim AND that tag is
- *             owned by a DIFFERENT, currently-open workflow. Refuse.
- *   unknown — anything else: no tag, no resolvable target identity, or a
- *             conflicting tag with no live owner. Repaint, unchanged.
+ *   foreign — the state carries a tag the target does not claim, that tag is owned
+ *             by a DIFFERENT currently-open workflow, AND the target tab is CLEAN.
+ *             Refuse.
+ *   unknown — anything else. Repaint, unchanged.
  *
- * The extra requirement is not caution for its own sake — it answers a documented
- * hazard. `workflowOwnsRootUuidTag`'s header records that a lagging `activeState`
- * can carry a REPLACED PREDECESSOR's uuid residue, "indistinguishable from the
- * genuine lineage stamp". A bare mismatch would therefore refuse good opens, and a
- * false refusal here is not a harmless no-op: it sends the caller to a disk load,
- * which discards whatever unsaved work is on the canvas. Demanding a live owner
- * separates the two — a predecessor is not an open tab, and a tag owned by another
- * open tab is that tab's, not residue.
+ * WHY THE LIVE OWNER. `workflowOwnsRootUuidTag`'s header records that a lagging
+ * `activeState` can carry a REPLACED PREDECESSOR's uuid residue, "indistinguishable
+ * from the genuine lineage stamp". A predecessor is not an open tab, so requiring a
+ * live owner separates residue from another tab's graph.
+ *
+ * WHY THE CLEAN TAB, which is the part that makes this refusal SOUND rather than
+ * merely careful (codex NO-SHIP, round 1). The tag alone cannot prove the GRAPH is
+ * foreign, and #817 is the counter-example: a tab switch leaves the previous
+ * workflow's tag on the reused `app.graph`, and the guard's rebind then re-stamps
+ * that root on CONTENT proof — `rootContentProvesActiveWorkflow`, not a claimed tag.
+ * `stampGraphRootWorkflowUuid` writes `rootGraph.extra` and nothing else, so a
+ * capture taken before the heal leaves the tab's OWN content sitting under the other
+ * tab's meta block, indefinitely. The whole `comfyui_mcp` block travels together as
+ * residue, so no field in it — uuid or path — can tell that apart from a genuinely
+ * foreign graph.
+ *
+ * So the refusal is not justified by proving the state foreign. It is justified by
+ * its COST BEING ZERO when it is wrong: on a clean tab the recovery it names
+ * (`panel_load_workflow`, which reads the file) is exactly what the tab already
+ * holds, so a false refusal costs one extra call and loses nothing. On a DIRTY tab
+ * that same advice discards unsaved work, and there the false refusal would be
+ * destructive — which is why a dirty tab is `unknown` and repaints exactly as it
+ * does today.
+ *
+ * STATED RESIDUAL: that leaves a dirty tab with a foreign source state repainting
+ * as before. It is the harder half — its state cannot be recovered from disk by
+ * definition — and closing it needs evidence that separates residue from a foreign
+ * graph, which this does not have. Deciding it on the tag would refuse good opens
+ * and take unsaved work with them.
  *
  * Pure, so the ownership questions arrive as injected predicates. A predicate that
  * throws is inconclusive, never a refusal.
@@ -1233,6 +1254,7 @@ export function describeRepaintSourceBinding({
   targetUuid,
   targetClaimsTag,
   tagOwnedByOtherOpenWorkflow,
+  targetTabIsClean,
 } = {}) {
   try {
     const tag = state?.extra?.[PANEL_GRAPH_META_KEY]?.workflow_uuid;
@@ -1246,6 +1268,9 @@ export function describeRepaintSourceBinding({
     } catch {
       return "unknown";
     }
+    // Compared against `true` explicitly: an unreadable dirty flag is not a clean
+    // tab, and only a clean tab bounds the cost of being wrong.
+    if (targetTabIsClean !== true) return "unknown";
     try {
       return tagOwnedByOtherOpenWorkflow?.(tag) === true ? "foreign" : "unknown";
     } catch {

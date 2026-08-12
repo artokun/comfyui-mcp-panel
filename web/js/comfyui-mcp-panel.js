@@ -13309,6 +13309,10 @@ const GRAPH_TOOL_EXECUTORS = {
                 const openNow = app?.extensionManager?.workflow?.openWorkflows;
                 return Array.isArray(openNow) && openNow.some((w) => sameWorkflowObject(w, owner));
               },
+              // The snapshot taken before any await (#442/codex), which is the only
+              // reading that survives `clearSpuriousOpenModified`. It is what bounds
+              // the cost of a wrong refusal to one extra call — see the helper.
+              targetTabIsClean: !wasDirty,
             }) === "foreign"
           ) {
             // #1089 — REFUSE BEFORE THE LOAD. Every other rebind failure below is
@@ -13318,17 +13322,18 @@ const GRAPH_TOOL_EXECUTORS = {
             // target's identity onto it, so a later save writes it to the target's
             // file. Nothing is loaded, so the canvas is exactly as the caller left it.
             rebindFailed = new Error(
-              "workflow_open did NOT repaint the canvas: the tab's in-memory state holds a graph that " +
-                "positively belongs to a DIFFERENT open workflow, so repainting from it would have put " +
-                "that workflow's nodes on the canvas under this workflow's identity — reported as a " +
-                "clean success, which is #1089. Nothing was loaded and nothing was overwritten; the " +
-                "canvas still holds whatever it held before this call, and the active workflow pointer " +
-                "HAS moved to the requested one. Recover with panel_load_workflow on this workflow's " +
-                "path: it reads the file from DISK, which is the only source not affected by this. Do " +
-                "NOT save first — the graph in memory is the other workflow's, and a plain save writes " +
-                "it to the workflow you asked for, because that is what the active identity already " +
-                "names. If the canvas holds unsaved work you need, preserve it to a NEW path (Save As " +
-                "or an export) before the load.",
+              "workflow_open did NOT repaint the canvas: this tab's in-memory state carries the " +
+                "identity of a DIFFERENT open workflow, so repainting from it risked putting that " +
+                "workflow's nodes on the canvas under this workflow's identity and reporting a clean " +
+                "success — which is #1089, where the caller's next node deletions would have landed on " +
+                "the wrong workflow. Nothing was loaded and nothing was overwritten: the canvas still " +
+                "holds whatever it held before this call, and the active workflow pointer HAS moved to " +
+                "the requested one. Recover with panel_load_workflow on this workflow's path. That is " +
+                "safe for THIS workflow — the tab had no unsaved edits, so its file is its own content " +
+                "— but it replaces what is on the canvas, and the canvas may be another workflow's " +
+                "with ITS unsaved work on it. So do NOT plain-save first: the active identity already " +
+                "names the workflow you asked for, so a save would write that other graph over it. " +
+                "Preserve it to a NEW path (Save As or an export) if you need it, then load.",
             );
           } else {
             // A graph shape is not ownership proof: two dirty tabs can have the same
