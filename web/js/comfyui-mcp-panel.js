@@ -242,6 +242,7 @@ import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
+import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import {
   knownSelectorSample,
   openWorkflowNotFoundMessage,
@@ -5040,11 +5041,23 @@ async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
  *  frontend, api.fetchApi resolves the identical URL the UI hits — so this works
  *  against the bundled Desktop Manager without the MCP/cm-cli path. */
 async function managerV2(route, { method = "GET", body, signal } = {}) {
-  const res = await api.fetchApi(`/v2/${route}`, {
-    method,
-    ...(signal ? { signal } : {}),
-    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
-  });
+  let res;
+  try {
+    res = await api.fetchApi(`/v2/${route}`, {
+      method,
+      ...(signal ? { signal } : {}),
+      ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+  } catch (err) {
+    // comfyui-mcp#1472 — a THROW here reached the caller as bare "Failed to fetch",
+    // with no route, no status and no body, so an install could not be diagnosed at
+    // all. There is no status or body to report (the request never completed), but
+    // the ROUTE exists and so does the fact that this is a transport failure rather
+    // than a Manager rejection — which is what decides whether a re-send is safe.
+    // An abort is the caller's own doing and must pass through untouched.
+    if (err?.name === "AbortError") throw err;
+    throw new Error(managerFetchFailureMessage(route, err), { cause: err });
+  }
   if (!res) {
     throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
   }
