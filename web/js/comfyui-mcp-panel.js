@@ -476,7 +476,7 @@ import {
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
-import { isManualBridgeOverride } from "./lib/bridge-url-provenance.js";
+import { bridgeFallbackPlan } from "./lib/bridge-liveness-fallback.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -28499,10 +28499,30 @@ function buildPanel() {
   // no agent answers on the bridge. Reset on each user Connect AND on a successful
   // handshake (both call resetAutoReclaim) so it can re-appear for a later drop.
   let externalHintShown = false;
+  /** Bridges this session already fell back to, so two dead ports cannot loop. */
+  const bridgeFallbacksTried = new Set();
   function showExternalHintOnce() {
     if (externalHintShown) return;
-    externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
+    // #1136 — before declaring nobody is listening, try the bridge that SHOULD be
+    // there. A configured URL can outlive the process that owned it (a migrated
+    // ephemeral port, or one the user typed before the orchestrator moved), and in
+    // external-orchestrator mode nothing corrects it: /connect is deliberately not
+    // POSTed, so the advertised bridge_url never arrives. Liveness is already known
+    // HERE — this runs precisely because the dial failed — so no guess about who
+    // chose the URL is needed.
+    const plan = bridgeFallbackPlan({
+      configured: bridge,
+      fallback: defaultBridgeUrlFor(selectedBackend),
+      attempted: bridgeFallbacksTried,
+    });
+    if (plan) {
+      bridgeFallbacksTried.add(plan.key);
+      appendSystem(plan.notice);
+      client.setUrl(plan.url);
+      return; // the hint is only true once the fallback has failed too
+    }
+    externalHintShown = true;
     appendSystem(
       tr(
         "panel.no_agent_is_listening_on_the_bridge",
@@ -28788,16 +28808,8 @@ function buildPanel() {
   async function reclaimAdvertisedBridgeUrl() {
     if (location.protocol !== "https:") return;
     const wanted = urlInput.value.trim();
-    // #1136 — same rule as before, minus ONE case: a URL this panel INHERITED from
-    // the pre-per-backend migration is not a URL the user chose, and must not outrank
-    // the live single-port bridge. A hand-typed port still wins, which is the whole
-    // point of the override.
-    const manualOverride = isManualBridgeOverride({
-      wanted,
-      backendDefault: defaultBridgeUrlFor(selectedBackend),
-      lastAutoUrl,
-      legacyUrl: getSetting(LEGACY_SETTING_BRIDGE_URL),
-    });
+    const manualOverride =
+      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
     if (manualOverride) return; // a user-typed Advanced Bridge URL is never clobbered
     const secure = await fetchAdvertisedBridgeUrl();
     if (!secure || secure === client.currentUrl()) return;
@@ -28857,16 +28869,8 @@ function buildPanel() {
     // user-CUSTOMIZED non-default per-backend URL must survive the switch and not be
     // overwritten by /connect's default bridge_url. A per-backend DEFAULT url still
     // isn't an override, so a normal switch keeps following /connect's bridge_url.
-    // #1136 — same rule as before, minus ONE case: a URL this panel INHERITED from
-    // the pre-per-backend migration is not a URL the user chose, and must not outrank
-    // the live single-port bridge. A hand-typed port still wins, which is the whole
-    // point of the override.
-    const manualOverride = isManualBridgeOverride({
-      wanted,
-      backendDefault: defaultBridgeUrlFor(selectedBackend),
-      lastAutoUrl,
-      legacyUrl: getSetting(LEGACY_SETTING_BRIDGE_URL),
-    });
+    const manualOverride =
+      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     // EXTERNAL/LOCAL ORCHESTRATOR MODE: the agent is run by the user on THEIR
     // machine, not spawned by this ComfyUI host — so do NOT POST /connect (this
