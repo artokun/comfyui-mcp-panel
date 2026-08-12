@@ -483,12 +483,25 @@ export function coerceWidgetValue(
     // only, so a number can never be reinterpreted as an INDEX into the live list. And the
     // reply says the value was written unvalidated — see `off_list_value_accepted`.
     if (allowUnlistedComboValue && typeof value === "string") {
-      // Its OWN marker, deliberately NOT `emptyAcceptanceUsed`. That one gates the
-      // promoted-write sibling cross-check, whose argument is "the inner list is empty so
-      // the server declaration governs" — an argument this path does not make. Reusing it
-      // would have made a rail with a real list refuse on the caller's assertion about the
-      // INNER widget. The sibling check for this path is asserted separately below.
-      if (out) out.offListAcceptanceUsed = true;
+      // TWO markers, and both matter.
+      //
+      // `offListAcceptanceUsed` is this path's own, and only it drives the reply's
+      // `off_list_value_accepted` — the empty-list acceptance is a different (stronger)
+      // statement and must not be reported as this one.
+      //
+      // `emptyAcceptanceUsed` is set TOO, because it gates the promoted-write sibling
+      // cross-check below, and that check is needed here for exactly the reason it exists:
+      // a promoted write assigns this value to the parent's authoritative RAIL widget and
+      // every display proxy, whose own option lists can be real and closed. Without it an
+      // unlisted value would land there with nothing validating it, which is the #507
+      // hazard with a different trigger. My first version skipped it on the reasoning that
+      // a rail refusal would be "refusing on the caller's assertion about the INNER
+      // widget" — that has it backwards: refusing is recoverable and the caller can address
+      // the rail directly, whereas a corrupted rail in the serialized parent graph is not.
+      if (out) {
+        out.offListAcceptanceUsed = true;
+        out.emptyAcceptanceUsed = true;
+      }
       return value;
     }
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
