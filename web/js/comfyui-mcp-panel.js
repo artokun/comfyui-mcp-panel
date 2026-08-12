@@ -13031,11 +13031,6 @@ const GRAPH_TOOL_EXECUTORS = {
         all.find((w) => workflowRecordMatchesSelector(w, path))
       );
     };
-    // A SAMPLE of what the store actually holds, for the refusal. The reporter's file
-    // was inside the workflows folder, so "it isn't there" was not the useful thing to
-    // say — "here is the shape of the names that ARE there" is, because the selector
-    // forms differ (`workflows/x.json`, `x.json`, and a `filename` with no extension).
-    const all = [...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])];
     let target = find();
     // The frontend's workflow list is CACHED, so a just-saved/staged file (e.g. a
     // downloaded example) won't appear until the store re-reads the workflows dir.
@@ -13064,7 +13059,12 @@ const GRAPH_TOOL_EXECUTORS = {
       target = find();
     }
     if (!target) {
-      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known: knownSelectorSample(all) })));
+      // Sampled HERE, after any refresh, never from a snapshot taken before it
+      // (codex review). A successful re-read REMOVES stale entries — measured on a
+      // live rig, the store went 109 to 107 — so a pre-refresh snapshot can offer a
+      // workflow the re-read just deleted as an example of what is addressable.
+      const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
+      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known })));
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas

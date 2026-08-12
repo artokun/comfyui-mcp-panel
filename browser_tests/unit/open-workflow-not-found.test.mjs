@@ -100,7 +100,16 @@ test("#1448 WIRING: the caller records the outcome instead of assuming one", () 
   assert.match(panel, /refresh = "unavailable"/, "a frontend without syncWorkflows");
   assert.match(panel, /refresh = "ok"/, "a successful re-read");
   assert.match(panel, /refresh = `failed: \$\{err\?\.message \?\? err\}`/, "a thrown re-read");
-  assert.match(panel, /openWorkflowNotFoundMessage\(\{ path, refresh, known: knownSelectorSample\(all\) \}\)/);
+  // The sample must be taken AFTER the refresh (codex review). A successful re-read
+  // removes stale entries — measured 109 -> 107 on a live rig — so a snapshot taken
+  // before it can offer a workflow that no longer exists as an example.
+  assert.match(panel, /const known = knownSelectorSample\(\[\.\.\.\(s\?\.openWorkflows \?\? \[\]\), \.\.\.\(s\?\.workflows \?\? \[\]\)\]\);/);
+  assert.match(panel, /openWorkflowNotFoundMessage\(\{ path, refresh, known \}\)/);
+  const failSite = panel.slice(panel.indexOf("const known = knownSelectorSample"));
+  assert.ok(
+    failSite.indexOf("openWorkflowNotFoundMessage") < 400,
+    "the sample is computed immediately before the refusal it feeds",
+  );
   // And the old sentence is no longer EMITTED. Scoped to non-comment lines: the fix
   // quotes the old wording in a comment to explain itself, and a bare doesNotMatch
   // over the whole file forbade describing the very defect being fixed.
