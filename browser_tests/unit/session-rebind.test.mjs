@@ -4,6 +4,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+// #1138 adds one structural test (the call site's polarity), which the rest of this
+// pure-logic file does not need.
+import { readFileSync } from "node:fs";
 
 import {
   shouldResumeAfterComfyReconnect,
@@ -601,4 +604,22 @@ test("#1138: the guard is INVERSION-SENSITIVE, unlike a source scan", () => {
   );
   assert.equal(neverDropped, false);
   assert.equal(realRestart, true);
+});
+
+test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
+  // The predicate is tested by behaviour above; this covers the one thing a pure test
+  // cannot see — that the call site consults it in the right POLARITY. Dropping the
+  // negation would invert the fix into "nudge only when nothing dropped", which is worse
+  // than the original bug. An exact-substring claim on purpose: #1096's review proved by
+  // mutation that loose token-presence scans over this file assert nothing at all.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.ok(
+    src.includes(
+      "if (!shouldNudgeAfterMidTaskReconnect({ bridgeDroppedAt: lastBridgeDownAt, now: Date.now() }))",
+    ),
+    "the ready-ack mid-task branch must NEGATE the predicate and read the live drop stamp",
+  );
+  // The reverted sessionStorage twin must not return without its own review: every
+  // confirmed leak on this branch came from persisting that timestamp.
+  assert.doesNotMatch(src, /BRIDGE_DOWN_AT_KEY/, "the persisted drop timestamp stays reverted");
 });
