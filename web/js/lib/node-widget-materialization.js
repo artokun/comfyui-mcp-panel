@@ -637,6 +637,20 @@ function inputValueConfig(spec) {
  * Pure apart from the node it is handed; returns [] when there is nothing current to
  * compare against, so a frontend-only type is untouched.
  */
+/** True when every own property is an enumerable STRING key — no symbols, no
+ *  non-enumerables. Object.keys sees only those, so anything else would be invisible to a
+ *  key-by-key comparison and a real difference could hide there (#1085 codex). */
+function hasOnlyEnumerableStringKeys(obj) {
+  return Reflect.ownKeys(obj).length === Object.keys(obj).length;
+}
+
+/** True when an array's own properties are exactly its present indices plus `length`.
+ *  `arr.extra = 1`, a symbol, or a non-enumerable would be skipped by an index walk. */
+function hasOnlyIndexProperties(arr) {
+  if (Reflect.ownKeys(arr).length !== Object.keys(arr).length + 1) return false; // +1 = length
+  return Object.keys(arr).every((k) => String(Number(k)) === k && Number(k) >= 0);
+}
+
 /** #1085 — whether two widget values are the SAME VALUE, not the same reference.
  *
  *  `!==` is the right question for a scalar and the wrong one for an OBJECT default, where
@@ -680,6 +694,10 @@ function sameWidgetValue(a, b, depth = 0) {
       return false;
     }
     if (a.length !== b.length) return false;
+    // An array can carry own properties that are not indices — `arr.extra = 1`, a symbol,
+    // or a non-enumerable — and the index walk below would never see them (codex). Refuse
+    // to compare structurally when either side has any, which falls back to identity.
+    if (!hasOnlyIndexProperties(a) || !hasOnlyIndexProperties(b)) return false;
     for (let i = 0; i < a.length; i++) {
       // HOLES are compared, not skipped (codex). `every`/`map` jump over a sparse array's
       // gaps, so `[,1]` and `[0,1]` came out equal — a real change reported as none, which
@@ -698,11 +716,15 @@ function sameWidgetValue(a, b, depth = 0) {
   // shape it was written for and everything else falls back to the identity answer
   // `Object.is` already gave — which is exactly what `!==` did before this existed.
   //
-  // This also disposes of symbol-keyed and non-enumerable own properties: they can only
-  // appear on objects this branch now refuses to compare structurally.
   const aProto = Object.getPrototypeOf(a);
   if (aProto !== Object.getPrototypeOf(b)) return false;
   if (aProto !== Object.prototype && aProto !== null) return false;
+  // A PLAIN object can still carry symbol-keyed or non-enumerable own properties, which
+  // Object.keys does not see (codex). An earlier version of this comment claimed the
+  // prototype restriction disposed of them — it does not, and a test asserted that false
+  // negative under a title saying it could not happen. Refuse to compare structurally when
+  // either side has any such property; identity then answers, as it did before this existed.
+  if (!hasOnlyEnumerableStringKeys(a) || !hasOnlyEnumerableStringKeys(b)) return false;
 
   const aKeys = Object.keys(a);
   if (aKeys.length !== Object.keys(b).length) return false;

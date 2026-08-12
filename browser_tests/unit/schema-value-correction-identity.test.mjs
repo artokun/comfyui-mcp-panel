@@ -133,6 +133,12 @@ test("#1085 (codex): SPARSE array holes are compared, not skipped", () => {
   const node = nodeWith("cfg", { size: [, 1] });
   const corrections = applyCurrentDefWidgetValues(node, defWith("cfg", { default: { size: [0, 1] } }));
   assert.equal(corrections.length, 1, "a hole is not the value 0");
+  // The RECIPROCAL direction too — value where the other has a hole.
+  const reciprocal = nodeWith("cfg", { size: [0, 1] });
+  assert.equal(
+    applyCurrentDefWidgetValues(reciprocal, defWith("cfg", { default: { size: [, 1] } })).length,
+    1,
+  );
   // …and a hole matching a hole is still equal.
   const same = nodeWith("cfg", { size: [, 1] });
   assert.deepEqual(applyCurrentDefWidgetValues(same, defWith("cfg", { default: { size: [, 1] } })), []);
@@ -145,6 +151,8 @@ test("#1085 (codex): built-ins with no enumerable keys are not all equal", () =>
     [new Date(1), new Date(2)],
     [new Map([["a", 1]]), new Map([["a", 2]])],
     [new Set([1]), new Set([2])],
+    [new ArrayBuffer(8), new ArrayBuffer(16)],
+    [new DataView(new ArrayBuffer(8)), new DataView(new ArrayBuffer(16))],
   ]) {
     const node = nodeWith("cfg", x);
     assert.equal(
@@ -162,17 +170,42 @@ test("#1085 (codex): an Array SUBCLASS is not a plain array", () => {
   assert.equal(applyCurrentDefWidgetValues(node, defWith("cfg", { default: { size: [1, 2] } })).length, 1);
 });
 
-test("#1085 (codex): symbol-keyed differences cannot hide inside a compared object", () => {
-  // Only plain objects are compared structurally, and a symbol key does not change that —
-  // but the value it hangs off does, so assert the containing comparison still notices when
-  // the plain content differs, and that an exotic carrier is refused outright.
+test("#1085 (codex r2): a symbol or non-enumerable own key refuses the structural compare", () => {
+  // My first version of this test asserted [] here and called it "symbol keys are outside
+  // the compared surface". That was the false negative itself, wearing a reassuring title:
+  // Object.keys misses symbol and non-enumerable own keys, so a real difference hid there.
+  // The compare now REFUSES any object carrying one, which falls back to identity — the
+  // pre-fix answer — so the difference is reported rather than swallowed.
   const sym = Symbol("k");
-  const withSym = { x: 1, [sym]: 1 };
-  const node = nodeWith("cfg", withSym);
+  const node = nodeWith("cfg", { x: 1, [sym]: 1 });
+  assert.equal(
+    applyCurrentDefWidgetValues(node, defWith("cfg", { default: { x: 1, [sym]: 2 } })).length,
+    1,
+    "a differing symbol value must not be invisible",
+  );
+
+  // Same for a non-enumerable own property.
+  const hidden = { x: 1 };
+  Object.defineProperty(hidden, "secret", { value: 1, enumerable: false });
+  const other = { x: 1 };
+  Object.defineProperty(other, "secret", { value: 2, enumerable: false });
+  assert.equal(applyCurrentDefWidgetValues(nodeWith("cfg", hidden), defWith("cfg", { default: other })).length, 1);
+
+  // And an ARRAY with a non-index own property, which the index walk would never see.
+  const arr = [1];
+  arr.extra = 1;
+  const arr2 = [1];
+  arr2.extra = 2;
+  assert.equal(
+    applyCurrentDefWidgetValues(nodeWith("cfg", { size: arr }), defWith("cfg", { default: { size: arr2 } })).length,
+    1,
+    "arr.extra differences must not hide behind the index walk",
+  );
+
+  // The ordinary JSON shape — the only one /object_info can produce — still compares equal.
   assert.deepEqual(
-    applyCurrentDefWidgetValues(node, defWith("cfg", { default: { x: 1, [sym]: 2 } })),
+    applyCurrentDefWidgetValues(nodeWith("cfg", { x: 1, y: [2] }), defWith("cfg", { default: { x: 1, y: [2] } })),
     [],
-    "symbol keys are outside the compared surface — documented, not silently assumed",
   );
 });
 
