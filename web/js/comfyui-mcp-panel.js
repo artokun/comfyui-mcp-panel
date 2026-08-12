@@ -3221,7 +3221,12 @@ const BACKEND_SECTION = {
 };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+// Kept in step with BACKEND_LABELS (#1084). `chatgpt` and `copilot` were both absent, and
+// every read of this map below interpolates it with NO fallback — so the moment a settings
+// row exists for either, its description reads "the undefined background agent". No row does
+// today (they are instantiated one by one, not from this map), which is exactly why the gap
+// was invisible: the entries are added here so the next row added cannot ship that string.
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -3995,7 +4000,12 @@ function panelSettingsList() {
       get options() {
         return [
           { value: "claude", text: tr("panel.claude", "Claude") },
-          { value: "codex", text: tr("panel.chatgpt", "ChatGPT") },
+          // #1084 — the two ChatGPT routes are named apart here too, or this dropdown
+          // reproduces the picker's "ChatGPT vs chatgpt" confusion one dialog over. `codex`
+          // reuses `panel.chatgpt_codex`, which the panel ALREADY ships translated for the
+          // sign-in card, rather than minting a near-duplicate key for the same words.
+          { value: "codex", text: tr("panel.chatgpt_codex", "ChatGPT (Codex)") },
+          { value: "chatgpt", text: tr("panel.chatgpt_direct_oauth", "ChatGPT (direct OAuth)") },
           { value: "gemini", text: tr("panel.gemini", "Gemini") },
           { value: "antigravity", text: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)") },
           // Comma, not the middot this row used to carry: the panel already ships this exact
@@ -20364,7 +20374,14 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
+  // #1084 — `codex` and `chatgpt` are TWO ways to reach the same ChatGPT subscription, not a
+  // duplicate: `codex` runs it through a `codex app-server` subprocess, `chatgpt` speaks the
+  // Codex Responses OAuth API directly with no subprocess. The panel labelled only the first,
+  // as a bare "ChatGPT", so the second fell through to its raw id and the picker showed
+  // "ChatGPT" next to "chatgpt" — which reads as an accident and gives no basis for choosing.
+  // Both are named now; the orchestrator's own ready banner says "direct OAuth", so the panel
+  // matches that wording rather than inventing a second vocabulary for the same thing.
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
   // Appends a visible "(experimental)" marker to a backend's display label when
   // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
   // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
@@ -26797,7 +26814,19 @@ function buildPanel() {
       // AUTHORITATIVE source of which provider we're actually connected to. Resolve
       // the switch BEFORE applying the catalog, so the effort scale + nearest-level
       // mapping in applyModelCatalog uses the NEW backend's scale (fix #5).
-      const known = typeof backend === "string" && BACKEND_LABELS[backend];
+      // #1084 — a backend id the orchestrator reports on its own handshake is AUTHORITATIVE,
+      // whether or not this panel build happens to have a pretty name for it. This gate used
+      // to be `BACKEND_LABELS[backend]`, which quietly made the label map a registry of
+      // KNOWN backends — so the missing `chatgpt` entry did not merely look wrong in the
+      // picker, it skipped this whole block: `connectedBackend` was never updated from the
+      // handshake, the preference was never persisted, and the placeholder kept naming the
+      // previous provider. A panel connected to direct-OAuth ChatGPT did not know it.
+      //
+      // Adding the label fixes today's case; keying the gate on the id fixes the class,
+      // because the orchestrator can add a backend before the panel ships a name for it and
+      // that is a normal ordering, not an error. Every label read below falls back to the
+      // raw id, so an unnamed backend degrades to showing "chatgpt" rather than "undefined".
+      const known = typeof backend === "string" && !!backend;
       if (known) {
         // A real provider switch = the connected backend changed AND we were
         // already connected to something (not the first connect, not a re-pick).
@@ -26807,7 +26836,9 @@ function buildPanel() {
             tr(
               "panel.switched_to_sessions_aren_t_shared_across",
               "Switched to {backend} — sessions aren't shared across providers, so this starts a fresh chat.",
-              { backend: BACKEND_LABELS[backend] },
+              // Falls back to the raw id (#1084): with the gate above no longer requiring a
+              // label, an unnamed backend would otherwise render "Switched to undefined".
+              { backend: BACKEND_LABELS[backend] || backend },
             ),
           );
         }

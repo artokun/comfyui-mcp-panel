@@ -389,8 +389,13 @@ test("translating a combo changes only its TEXT, never the value that gets store
   assert.notEqual(at, -1, "the default-backend setting must still exist");
   const block = body.slice(at, body.indexOf("defaultValue:", at));
   const values = [...block.matchAll(/\{ value: "([^"]*)", text:/g)].map((m) => m[1]);
+  // `chatgpt` sits next to `codex` (#1084): they are two routes to the same ChatGPT
+  // subscription — a `codex app-server` subprocess and the direct Codex Responses OAuth
+  // API — and the panel named only the first, so the picker showed "ChatGPT" beside a raw
+  // "chatgpt". Both are ids on the wire and neither may ever be translated, which is what
+  // this list is here to hold.
   assert.deepEqual(values, [
-    "claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "claude", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
     "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
   ]);
   // Every one of those labels must go through tr() — a bare string here is a row that
