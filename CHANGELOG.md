@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.19] - 2026-08-12
+
+### Added
+- complete the Japanese panel translation (999 keys) (#1140)
+
+### Fixed
+- name every uninstalled node type before queueing, not one rejection at a time (#1129)
+- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
+
+
 ## [0.14.18] - 2026-08-12
 
 ### Fixed
