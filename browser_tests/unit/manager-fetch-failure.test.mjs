@@ -164,5 +164,8 @@ test("#1472 WIRING: the source comment no longer claims a re-send verdict", () =
   const at = src.indexOf("comfyui-mcp#1472 — a THROW here reached the caller");
   assert.ok(at > 0);
   const block = src.slice(at, at + 900);
-  assert.match(block, /establishes neither delivery nor\s+non-delivery/);
+  assert.ok(
+    /establishes neither delivery nor[\s\S]{0,12}non-delivery/.test(block),
+    "the comment must say the rejection establishes neither",
+  );
 });

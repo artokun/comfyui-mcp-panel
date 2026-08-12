@@ -12,9 +12,13 @@
  * be inventing them.
  *
  * What DOES exist, and was being thrown away, is which route was attempted and the
- * fact that this is a transport failure rather than a Manager rejection. Those are
- * different problems with different next steps: a rejection means Manager considered
- * the request and said no; a transport failure means Manager never saw it.
+ * fact that no usable response arrived at all. That is different from Manager
+ * rejecting the call: a rejection means Manager considered the request and said no.
+ *
+ * It does NOT mean Manager never saw it. That inference is wrong and this file used to
+ * make it here — a CORS-blocked reply, a connection dropped after delivery, and a
+ * proxy that failed after forwarding are indistinguishable from the browser, and in
+ * each of them the request may well have been received and applied.
  *
  * ## Why that distinction is load-bearing, and how far it actually goes
  *
