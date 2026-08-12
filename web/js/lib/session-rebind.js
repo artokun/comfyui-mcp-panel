@@ -236,14 +236,35 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
 // ("same-socket re-hello … the shared session continues", #884). So the uncovered case
 // is exactly the bridge-survived one, and the remedy is the cheapest frame there is.
 //
-// NOT free: the orchestrator runs its panel sync on every hello. Measured on a live
-// install that is ~1s, and it is the step that blocks on the panel operation lock — a
-// stale lock made it time out at 60s per hello. So this must not fire per WS blip; the
-// caller debounces, and this predicate answers only "is this the uncovered case".
-export function shouldRehelloAfterComfyReconnect({ bridgeConnected = false } = {}) {
-  // Compared against `true` explicitly: an unreadable connection state is not a live
-  // bridge, and the reconnect path will hello anyway when it turns out to be down.
-  return bridgeConnected === true;
+// NOT free, in two ways that both bound this.
+//
+// COST: the orchestrator runs its panel sync on every hello. Measured on a live install
+// that is ~1s, and it is the step that blocks on the panel operation lock — a stale lock
+// from a dead pid made it time out at 60s per hello. So this must not fire per WS blip;
+// the caller debounces.
+//
+// SIDE EFFECT, and this is why a resumable session is REQUIRED rather than incidental.
+// `sendHello`'s own header records that a hello BINDS the socket to an agent session and
+// "not always the one it was bound to a moment ago" — and that with the session key
+// CLEARED, the hello "spawns a clean agent outright". A re-advertise is therefore only a
+// rebind when there is a session to rebind TO. Without one it would spawn an agent in
+// response to a ComfyUI reconnect, which is the spurious-resume class #278 removed,
+// arriving through a different door. And it would buy nothing: with no session there is
+// no agent for a graph tool to route to, so a dropped tab mapping harms nobody until the
+// next connect, which hellos on its own.
+//
+// (A hello also bumps `agentSessionEpoch`, which is how the panel tells a straggler
+// command from the outgoing agent apart from evidence about the new one. That affects the
+// canvas-tool DISCLOSURE inference, not whether a command executes — worth knowing, and
+// the reason this stays debounced and conditional rather than fired freely.)
+export function shouldRehelloAfterComfyReconnect({
+  bridgeConnected = false,
+  hasResumableSession = false,
+} = {}) {
+  // Both compared against `true` explicitly: an unreadable connection state is not a live
+  // bridge, and an unreadable session state is not a session worth re-advertising for.
+  if (bridgeConnected !== true) return false;
+  return hasResumableSession === true;
 }
 
 // #332 — During the post-restart reconnect window a Manager-backed fetch (e.g.

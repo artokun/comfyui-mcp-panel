@@ -30175,7 +30175,16 @@ function buildPanel() {
       // each one (~1s measured, and the step that blocks on the panel operation lock — a
       // stale lock made it 60s per hello). `reconnected` can fire repeatedly during a
       // flapping window, and re-advertising per blip would queue that work behind itself.
-      if (shouldRehelloAfterComfyReconnect({ bridgeConnected: client.isConnected() })) {
+      // `hasResumableSession` is REQUIRED, not decorative: a hello with the session key
+      // cleared spawns a clean agent (see sendHello), which would turn a ComfyUI blip
+      // into a spurious agent start. With a session present it rebinds, which is the
+      // whole intent. Reuses the value computed above for the resume decision.
+      if (
+        shouldRehelloAfterComfyReconnect({
+          bridgeConnected: client.isConnected(),
+          hasResumableSession,
+        })
+      ) {
         const now = monotonicNow();
         if (now - lastReconnectRehelloAt >= RECONNECT_REHELLO_MIN_GAP_MS) {
           lastReconnectRehelloAt = now;
