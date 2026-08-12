@@ -85,12 +85,22 @@ const findings = [];
 for (const file of sources()) {
   const rel = path.relative(ROOT, file).replace(/\\/g, '/');
   const src = fs.readFileSync(file, 'utf8');
-  src.split('\n').forEach((line, i) => {
+  const lines = src.split('\n');
+  lines.forEach((line, i) => {
     // 1) literal flowing straight into a sink
     const STR = /(["'`])((?:\\.|(?!\1)[^\\])*)\1/g;
     let m;
     while ((m = STR.exec(line)) !== null) {
-      const before = line.slice(0, m.index);
+      const head = line.slice(0, m.index);
+      // A sink and its literal are ROUTINELY on different lines — a formatter breaks after
+      // `=` whenever the string is long, and long strings are exactly the prose worth
+      // translating. Testing only the current line missed `helpDiv.textContent =\n "Click
+      // Connect to start…"`, the largest single block of English on the connect screen.
+      // This is the SAME multi-line blind spot the original extractor had, reproduced in the
+      // detector written to catch what that extractor missed — so join the previous line when
+      // the literal starts one.
+      const prev = i > 0 && /^\s*$/.test(head) ? lines[i - 1].trimEnd() : '';
+      const before = prev ? prev + head : head;
       const text = m[2];
       if (notProse(text)) continue;
       if (/\btr\(/.test(before)) continue;                       // already translated

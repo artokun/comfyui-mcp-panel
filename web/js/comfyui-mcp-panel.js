@@ -20494,8 +20494,10 @@ function buildPanel() {
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
-  helpDiv.textContent =
-    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:";
+  helpDiv.textContent = tr(
+    "panel.click_connect_to_start_an_autonomous_agent",
+    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:",
+  );
   // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
   // host on connect (browser-host targeting), so it drives whatever you're viewing
   // — local or a remote pod. Offer the command per shell: PowerShell needs a

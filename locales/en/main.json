@@ -379,6 +379,7 @@
       "cleared_canvas_nodes_one": "Cleared canvas — removed {count} node (one Ctrl+Z restores all)",
       "cleared_canvas_nodes_other": "Cleared canvas — removed {count} nodes (one Ctrl+Z restores all)",
       "clearing": "Clearing…",
+      "click_connect_to_start_an_autonomous_agent": "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:",
       "click_to_copy": "Click to copy",
       "click_to_preview": "Click to preview",
       "close_esc": "Close (Esc)",

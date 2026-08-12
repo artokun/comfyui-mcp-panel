@@ -786,7 +786,8 @@
       "saved_not_available_for_this_backend": "{saved} (이 백엔드에서는 사용할 수 없음)",
       "saved_suffix": "{saved} (저장됨)",
       "context_used_cost": "컨텍스트 약 {pct}% 사용 · ${cost}",
-      "friendly_api_key": "{friendly} API 키"
+      "friendly_api_key": "{friendly} API 키",
+      "click_connect_to_start_an_autonomous_agent": "연결을 누르면 사용자의 AI 구독이나 로컬 모델로 자율 에이전트가 시작됩니다 — API 키가 필요 없습니다. 먼저 제공자에 한 번 로그인하세요(예: `claude` 실행, `codex login`, `gemini`). 직접 실행하고 싶다면 오케스트레이터를 시작한 뒤 연결하세요:"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "노드까지 실행 범위가 적용되지 않아 대기열에 아무것도 추가되지 않았습니다"
