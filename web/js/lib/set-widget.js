@@ -34,6 +34,7 @@ import {
   freshBackendDefinesType,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
+import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
@@ -426,8 +427,61 @@ export async function runSetWidget(
   // and the caller would then "retry" a write that already happened. Refuse before the
   // action; DISCLOSE after it. So the advisory is computed inside a guard, and its
   // failure downgrades to a disclosed gap, never to a failed write.
+  // #1087 — a DIRECT write to a widget that is LINK-DRIVEN does not reach the render.
+  //
+  // The reported case: an inner subgraph node whose `steps` is driven from a promoted
+  // parent rail. Writing it directly reported a clean success — `{previous:14, value:10}` —
+  // and the queue still sampled at 14, because the rail's value is what serializes. A
+  // silent wrong OUTPUT, not a cosmetic gap.
+  //
+  // Detection reuses `linkDrivenWidgets`, the SAME read `panel_graph_outline` already marks
+  // these widgets with. That is the whole reason this can be added safely: the information
+  // was demonstrably available and simply not consulted here. Nothing new walks the graph,
+  // and no new write path is introduced — `widget-write.js`'s fail-closed object-identity
+  // rules are untouched.
+  //
+  // THE FALSE POSITIVE TO AVOID, and what actually avoids it. On the working PARENT→inner
+  // path the inner widget is ALSO link-driven (from the subgraph input rail), so a check
+  // aimed at the WRITE TARGET would fire on exactly the writes that are correct — the ones
+  // already reporting `parent_widget_synced: true`.
+  //
+  // What prevents that is reading `node` — the node the CALLER ADDRESSED — rather than
+  // `authTarget`. A parent-addressed promoted write asks the question of the SubgraphNode,
+  // whose host input carries `_widget`/`_subgraphSlot` and no `link`, so it is not
+  // link-driven and nothing warns. (An externally-linked host input, the one case where the
+  // parent DOES carry a link, already fails closed in resolveHostPromotedWidgets and never
+  // reaches here.)
+  //
+  // The `isResolvedPromotion` check below is therefore belt-and-braces, and is REDUNDANT
+  // today — verified by mutation: removing it leaves the parent-path test green. It is kept
+  // because it states the intent at the point of decision, and because it is what would
+  // still hold if this ever moved to the resolved target. Not described as load-bearing,
+  // since it is not.
+  //
+  // WARNS rather than refuses, per the report's own preference order. Setting an inner
+  // widget is a legitimate thing to want — it is the subgraph's stored default — so
+  // refusing would block real work to prevent a misunderstanding. What was missing is the
+  // truth about what serializes.
+  const linkDrivenWarning = () => {
+    if (isResolvedPromotion) return null;
+    const src = linkDrivenWidgets(node)?.[writeTargetWidgetName ?? widgetName];
+    if (!src) return null;
+    const name = writeTargetWidgetName ?? widgetName;
+    return (
+      `The write SUCCEEDED and was verified, but it will NOT change the render: widget ` +
+      `"${name}" on node ${node?.id} is link-driven${drivenTag(src)}, so the value arriving ` +
+      `on that link is what serializes at queue time and this stored value is ignored. When ` +
+      `the link comes from a promoted subgraph input, set the widget on the ENCLOSING ` +
+      `subgraph node instead (panel_exit_subgraph, then panel_set_widget there) — that path ` +
+      `syncs both and reports parent_widget_synced.`
+    );
+  };
   const withWarning = (result) => {
     try {
+      // Checked FIRST: "this write does not reach the render at all" outranks "it will be
+      // overwritten after the next generation", and the two can both be true on a seed.
+      const driven = linkDrivenWarning();
+      if (driven) return { ...result, warning: driven };
       const warnNode = authTarget ?? resolvedTargetNode;
       const warnWidget = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
       const entry = controlEntryForWidget(warnNode, warnWidget);
