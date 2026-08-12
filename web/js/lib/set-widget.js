@@ -702,10 +702,15 @@ export async function runSetWidget(
         `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}` +
         (latest?.offList && !allowUnlisted
           ? ` If this node accepts values its dropdown cannot list — a file field whose enum is a ` +
-            `placeholder, or one whose runtime handler takes an absolute path — retry with ` +
-            `allow_unlisted:true to write it UNVALIDATED. Only do that when you know the node ` +
-            `accepts it: nothing will check the value, and for a combo with a genuinely closed ` +
-            `option set the right fix is a value from the list above (#1126).`
+            `placeholder, or one whose runtime handler takes an absolute path — and your client ` +
+            `exposes an allow_unlisted option on panel_set_widget, set it to write this value ` +
+            `UNVALIDATED. Only do that when you know the node accepts it: nothing will check the ` +
+            `value, and for a combo with a genuinely closed option set the right fix is a value ` +
+            `from the list above. MEASURED: if your client answers "Unrecognized key: ` +
+            `allow_unlisted" it predates the option and CANNOT reach it however you phrase the ` +
+            `call — the orchestrator declares this tool with additionalProperties:false, so do ` +
+            `not retry variants. Copy the file into ComfyUI's input directory instead, or update ` +
+            `comfyui-mcp (#1126).`
           : ""),
     );
   }

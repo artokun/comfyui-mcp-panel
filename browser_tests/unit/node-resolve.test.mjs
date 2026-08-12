@@ -1806,9 +1806,16 @@ test("#1126 e2e: a placeholder-only combo refuses, and the refusal NAMES the esc
     }),
     (err) =>
       /not a valid option/.test(err.message) &&
-      /allow_unlisted:true/.test(err.message) &&
+      /exposes an allow_unlisted option/.test(err.message) &&
       // …and it must not read as "just retry with this": the condition is stated.
-      /Only do that when you know the node accepts it/.test(err.message),
+      /Only do that when you know the node accepts it/.test(err.message) &&
+      // MEASURED against the live orchestrator (0.51.16): the tool is declared with
+      // additionalProperties:false, so a client that predates the option answers
+      // `-32602 Unrecognized key: allow_unlisted`. The refusal must say that outright,
+      // or it sends an agent into a retry loop against a schema that can never accept
+      // the argument — the #932 circularity in a new form.
+      /Unrecognized key/.test(err.message) &&
+      /do \r?\n?\s*not retry variants|do not retry variants/.test(err.message),
   );
   assert.equal(widget.value, "", "the refusal must not have mutated the widget");
 });
