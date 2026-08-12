@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-08-11
+
+> #1083: connect to ChatGPT, reopen the model picker, and LM Studio, llama.cpp, Custom
+> endpoint and Copilot are gone — with no way back to a Custom endpoint you had configured.
+
+### Fixed
+- the provider list no longer loses providers after connecting. The panel learns which
+  providers exist from two places: the machine actually running your agents, which knows
+  about all of them, and ComfyUI itself, which only knows a shorter built-in list. A routine
+  background refresh from ComfyUI was replacing the full list with the short one, so
+  everything past OpenRouter disappeared from the picker.
+
+### Changed
+- the shorter list is now merged into the fuller one instead of replacing it. A provider
+  ComfyUI knows about but your agent machine did not mention is still added, and one it has
+  stopped reporting can still go away — what it can no longer do is delete a provider the
+  agent machine told us about.
+- a provider's Running indicator still updates from those refreshes, so this does not trade
+  a disappearing provider for one that looks permanently idle.
+- the "(experimental)" marking and its terms-of-service warning on GitHub Copilot are now
+  held back from those refreshes too, so a routine poll cannot quietly drop the warning.
+
 ## [0.14.5] - 2026-08-11
 
 > #968: opening one workflow could silently give it a DIFFERENT workflow's graph — and
