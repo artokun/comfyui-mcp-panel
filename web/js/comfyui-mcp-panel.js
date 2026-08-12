@@ -244,6 +244,11 @@ import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import {
+  unrunnableNodeIds,
+  describeUnrunnable,
+  missingNodeRunRefusal,
+} from "./lib/missing-node-preflight.js";
+import {
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
@@ -11756,6 +11761,40 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
+    }
+    // comfyui-mcp#1460 — PRE-FLIGHT the node types. An unregistered type still draws
+    // on the canvas and is still included by ComfyUI's own graphToPrompt, with
+    // `class_type: undefined` — so the server answers "has no class_type" for ONE
+    // node, and the caller removes it, retries, and meets the next. Measured on a
+    // live rig; every missing type is knowable before the first queue.
+    //
+    // Refusing is safe here and nowhere else: a run carrying an unregistered type
+    // cannot succeed, so this blocks no working run. It fails SOFT — a lookup that
+    // could not be reached is `unknown`, never `missing`, because refusing on a
+    // failed metadata probe would trade one false failure for another.
+    try {
+      // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already
+      // dropped or rewritten every virtual and frontend-only node (Note, Reroute,
+      // PrimitiveNode, an extension's own display node), so what survives with no
+      // class_type is exactly what the server cannot execute — and nothing else.
+      //
+      // The earlier version probed /object_info per canvas type, which refused runs
+      // that would have SUCCEEDED because those virtual nodes have no object_info
+      // entry (review). It also cost one sequential round trip per type, capped at
+      // 200, against a snapshot that could drift from what the run actually sent.
+      // None of that applies here: no network, no cap, and the bytes inspected are
+      // the bytes that would have been POSTed.
+      const built = await app.graphToPrompt();
+      const badIds = unrunnableNodeIds(built);
+      if (badIds.length) {
+        const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
+        throw new Error(missingNodeRunRefusal(describeUnrunnable(badIds, liveNodes)));
+      }
+    } catch (err) {
+      // Only OUR refusal propagates. Anything else (a broken fetch, a frontend
+      // without api.fetchApi) leaves the run exactly as it was before this existed —
+      // a pre-flight that becomes a new failure mode is worse than no pre-flight.
+      if (err instanceof Error && /^NOT queued:/.test(err.message)) throw err;
     }
     // Clamp batch_count to a sane range: coerce to a positive integer and cap it,
     // so an absurd value can't queue thousands of prompts (each of which would
