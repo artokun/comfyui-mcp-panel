@@ -152,7 +152,13 @@ test("#604/#603/#616: the reported failure — a faithful repaint the frontend N
   // destroys it. Naming a destructive step as "the recovery" without saying so is
   // how a message meant to prevent data loss causes it.
   assert.match(text, /It loads from DISK/, "the cost of the recovery is stated");
-  assert.match(text, /save or export that FIRST/, "…and what to do before taking it");
+  assert.match(text, /preserve it FIRST/, "…and what to do before taking it");
+  // codex round 2, P1: a PLAIN save is itself destructive here. The active identity
+  // already names the requested workflow, so saving the stale graph writes it over
+  // exactly the file the user was trying to open — the safety advice creating a
+  // worse data-loss path than the one it was preventing.
+  assert.match(text, /To a NEW path, with Save As or an export/, "preservation must not overwrite");
+  assert.match(text, /a plain save would write it to a\.json/, "…and the trap is named explicitly");
   assert.match(text, /UNKNOWN/, "...while the unsettled half stays unknown");
   assert.match(text, /nodes/, "the disclosure must name WHICH surface disagreed");
 });
