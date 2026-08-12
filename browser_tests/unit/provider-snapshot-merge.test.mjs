@@ -95,6 +95,25 @@ test("#1083 (codex): the probe cannot erase or invent the EXPERIMENTAL safety di
   assert.equal(invented[0].experimental, undefined, "nor invent it for a provider that is not");
 });
 
+test("#1083 (codex): the experimental guarantee is scoped to DESCRIBED providers", () => {
+  // Pinning the limit of the rule above, because an earlier version of its comment
+  // overclaimed it. A provider only the PROBE reports keeps its own entry verbatim — there
+  // is no authoritative claim to prefer — and so does every entry when no authoritative
+  // snapshot exists. Deliberate: of the two ways to be wrong, showing a warning that may
+  // not apply is the safe one; hiding one that does is not.
+  const probeOnly = mergeProviderSnapshots({
+    authoritative: [{ backend: "claude", running: false, ready: true }],
+    probe: [{ backend: "claude", running: false }, { backend: "odd-one", experimental: true }],
+  });
+  assert.equal(
+    probeOnly.find((b) => b.backend === "odd-one").experimental,
+    true,
+    "a probe-only provider carries its own flag — the warning is shown, not suppressed",
+  );
+  // And the described provider is still protected, in the same call.
+  assert.equal(probeOnly.find((b) => b.backend === "claude").experimental, undefined);
+});
+
 test("#1083 (codex): a provider only the HOST reports is selectable even against a stale baseline", () => {
   // Codex read this as unreachable during a reconnect window. It is not: a probe-only id is
   // appended, so a provider the NEW orchestrator has and the retained baseline does not is

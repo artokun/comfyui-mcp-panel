@@ -58,8 +58,15 @@
  *  GitHub's Copilot API terms" tooltip on the chip, so picking a ToS-risk provider is a
  *  deliberate, informed act. The host's entries are sparse `{backend, running}`, so a
  *  catch-all overlay would silently DELETE the flag on the next probe and quietly remove
- *  that warning — and, in the other direction, would let the host invent it. Neither is the
- *  host's call to make. */
+ *  that warning.
+ *
+ *  SCOPE OF THAT GUARANTEE, stated precisely because an earlier version of this comment
+ *  overclaimed it (codex): it covers providers the AUTHORITATIVE snapshot describes. A
+ *  provider only the probe reports keeps its own entry verbatim, flag included, and so does
+ *  every entry when there is no authoritative snapshot at all. That is deliberate rather
+ *  than an oversight — for a provider the orchestrator never described there is no better
+ *  claim to fall back on, and of the two ways to be wrong, showing a warning that may not
+ *  apply is the safe one and hiding one that does is not. */
 const AUTHORITATIVE_ONLY_KEYS = ["ready", "cli", "auth", "experimental"];
 
 /** A usable provider entry: an object naming a non-empty `backend` id. */
