@@ -43,17 +43,40 @@ export function railSlotIndex(ref) {
 }
 
 /**
- * The existing rail slot `ref` names, or null.
+ * The existing rail slot `ref` names, or null — and a THROW when it could be two.
  *
- * NAME FIRST, then index. A slot genuinely called "4" must still win — renaming a
- * rail input to a digit is legal, and a caller who passes that name means it.
+ * There is NO precedence between name and index, and saying "name first" would
+ * describe one that does not exist: when both match the SAME slot the order cannot
+ * matter, and when they match DIFFERENT slots this refuses rather than picking
+ * (codex review). A mutation swapping the two proved it — it changed nothing,
+ * which is the only honest reading of code that has no ordering left. A rail whose slots are digit-named out
+ * of index order — `[{name:"1"}, {name:"0"}]` — makes `from_output: 1` mean either
+ * the slot called "1" (index 0) or index 1 (called "0"), and the wire cannot tell
+ * which the caller meant: MCP coercion flattens the number 4 and the string "4" to
+ * the same value before this is reached.
+ *
+ * Guessing there is a silent connection to the wrong input, which is the failure
+ * class this whole fix exists to remove. A refusal is recoverable and says what to
+ * do; a wrong link is neither.
  */
 export function findExistingRailSlot(slots, ref) {
   if (ref == null) return null;
   const list = slots ?? [];
   const name = String(ref).toLowerCase();
   const byName = list.find((s) => s?.name?.toLowerCase() === name) ?? null;
-  if (byName) return byName;
   const idx = railSlotIndex(ref);
-  return idx !== null && idx < list.length ? list[idx] : null;
+  const byIndex = idx !== null && idx < list.length ? list[idx] : null;
+  if (byName && byIndex && byName !== byIndex) {
+    const namedIdx = list.indexOf(byName);
+    throw new Error(
+      `"${ref}" is ambiguous on this boundary rail: a slot is NAMED "${byName.name}" ` +
+        `(at index ${namedIdx}), and index ${idx} is a different slot ` +
+        `(named "${byIndex.name ?? "unnamed"}"). This rail has digit-named slots that do not ` +
+        `sit at the matching index, and nothing here can tell which one you meant — the value ` +
+        `arrives as a string either way. Rename the digit-named slot to something that is not ` +
+        `a number, and this becomes unambiguous for every caller.`,
+    );
+  }
+  // Whichever matched; they cannot disagree by the time we are here.
+  return byName ?? byIndex;
 }

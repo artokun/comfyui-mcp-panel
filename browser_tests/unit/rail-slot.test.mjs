@@ -42,10 +42,10 @@ test("#1114 an out-of-range index is null — never a new slot's worth of null",
   assert.equal(findExistingRailSlot([], "0"), null);
 });
 
-test("#1114 a slot genuinely NAMED '4' wins over the index", () => {
-  // Renaming a rail input to a digit is legal, and a caller passing that name means
-  // it. Index-first would have connected them to the wrong slot silently — worse
-  // than the junk slot this fixes.
+test("#1114 a slot genuinely NAMED '4' resolves when no index competes", () => {
+  // Renaming a rail input to a digit is legal. There is no name-vs-index precedence
+  // here — a mutation swapping the two changed nothing, because a genuine conflict
+  // now refuses (below) and anything else has only one match to return.
   const named = [{ name: "zero", slot: 0 }, { name: "4", slot: 1 }, { name: "two", slot: 2 }];
   assert.equal(findExistingRailSlot(named, "4")?.slot, 1);
   // And a real NUMBER 4 finds it too, because the wire cannot tell the two apart:
@@ -121,4 +121,35 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
   // Both rail branches must go through it: outputs (to_input) and inputs (from_output).
   const uses = panel.match(/findExistingRailSlot\(graph\.(inputs|outputs),/g) ?? [];
   assert.equal(uses.length, 2, "both rail branches resolve through it");
+});
+
+test("#1114 an AMBIGUOUS ref refuses instead of guessing (codex round 2)", () => {
+  // Digit-named slots out of index order: `from_output: 1` means either the slot
+  // NAMED "1" (index 0) or index 1 (named "0"). The wire cannot tell — coercion
+  // flattens 1 and "1" — so name-first would have connected to the wrong input
+  // silently, which is the failure this whole fix removes.
+  const crossed = [{ name: "1", slot: 0 }, { name: "0", slot: 1 }];
+  assert.throws(() => findExistingRailSlot(crossed, "1"), /ambiguous on this boundary rail/);
+  assert.throws(() => findExistingRailSlot(crossed, 1), /ambiguous on this boundary rail/);
+  // It names BOTH candidates and what to do about it.
+  try {
+    findExistingRailSlot(crossed, "1");
+    assert.fail("must throw");
+  } catch (e) {
+    assert.match(e.message, /NAMED "1" \(at index 0\)/);
+    assert.match(e.message, /index 1 is a different slot \(named "0"\)/);
+    assert.match(e.message, /Rename the digit-named slot/);
+  }
+});
+
+test("#1114 a digit-named slot AT its own index is not ambiguous", () => {
+  // name and index agree — one slot, no conflict, no refusal.
+  const aligned = [{ name: "0", slot: 0 }, { name: "1", slot: 1 }];
+  assert.equal(findExistingRailSlot(aligned, "1")?.slot, 1);
+  assert.equal(findExistingRailSlot(aligned, 1)?.slot, 1);
+});
+
+test("#1114 a digit name with NO matching index still resolves by name", () => {
+  const named = [{ name: "a", slot: 0 }, { name: "7", slot: 1 }];
+  assert.equal(findExistingRailSlot(named, "7")?.slot, 1); // index 7 does not exist
 });
