@@ -6,6 +6,57 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.16] - 2026-08-12
+
+### Fixed
+
+- **`panel_open_workflow` now warns when the graph it painted may be another
+  workflow's (#1089).** The reporter got a clean success — right path, right
+  filename, right `workflow_uuid`, `modified: false` — while the canvas held the
+  graph of the workflow they had just saved-as FROM. No warning of any kind. Their
+  next calls were `panel_remove_node`, and Save-As preserves ids, so those
+  deletions would largely have LANDED, on the wrong workflow, silently.
+  Nothing was fooled, which is why no existing check caught it. All four parts of
+  the post-repaint proof are taken against the root the LOADER produced; none of
+  them looks at the state the load was handed. When that state holds another
+  workflow's graph, the open reproduces it faithfully and every part passes — each
+  a true statement about a poisoned SOURCE. That is also why the other report on
+  the same end state (#1111) DID warn while this one did not: there the state had
+  not been contaminated, so the comparison had something to disagree with.
+  The reply now carries `foreign_source_state` when the state provably held a
+  different OPEN workflow's identity. It says to verify the graph before editing,
+  explains that every other field on the reply is TRUE of the tab and says nothing
+  about which graph the state held, and names the disk recovery together with its
+  cost — a tab reporting no unsaved edits can still lose values a NODE wrote
+  rather than the user (a populated wildcard, a rolled seed, #874).
+  It says MAY be, not IS, and deliberately: a tab switch can leave this tab's OWN
+  graph sitting under another tab's metadata residue (#817), which is
+  indistinguishable from a foreign graph, so only the caller's comparison
+  separates them.
+  **This warns, it does not prevent.** Two stronger remedies were built and
+  removed, and both are recorded in the code so they are not tried again. Refusing
+  the open removes the repaint's root re-stamp — the one documented heal for a
+  conflicting root tag — and strands every `graph_*` command, including the
+  `panel_load_workflow` the refusal recommended, whose own error sends the caller
+  back into the refusal. Auto-correcting from disk cannot be gated safely, because
+  the tab's modified flag is wrong in both directions: it misses node-written
+  values, and it stays spuriously set for the life of any tab the panel opened
+  cold.
+
+- **The same finding now rides a FAILING open too (#1089).** It was attached to the
+  success reply only, so an open that also failed content verification dropped it —
+  the worse combination, and the one #1111 reported: a mismatch WAS announced and
+  the canvas was still the previous workflow's. The content warning says to re-read
+  the graph; it did not say the state was another workflow's, which is the part
+  that explains why the re-read looks plausible rather than alarming.
+
+### Changed
+
+- **Korean is complete — every panel string now has a translation (#1080).** The
+  visible chrome had been left untranslated at 37% coverage; the connect-screen
+  blurb, the effort label (which rendered its raw token rather than a name), and a
+  set of strings no coverage metric could see are now wired.
+
 ## [0.14.15] - 2026-08-12
 
 ### Fixed
