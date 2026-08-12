@@ -20413,9 +20413,15 @@ function buildPanel() {
   //    stale liveness forever, because the merge deliberately refuses to overwrite anything
   //    it considers authoritative.
   //
-  // Set ONLY from a real bridge `backends` frame carrying a non-empty array. Null until
-  // then, which is exactly the "no authoritative snapshot" case the merge passes through
-  // unchanged.
+  // Set ONLY from a real bridge `backends` frame carrying an ARRAY — including an empty
+  // one, which CLEARS a stale baseline rather than asserting "render nothing"; see the
+  // assignment for why. Null until the first such frame, which is exactly the "no
+  // authoritative snapshot" case the merge passes through unchanged.
+  //
+  // (This sentence said "non-empty" for two commits after that stopped being true. Stale
+  // comments on a guard are how the earlier drafts of this fix went wrong, so it is worth
+  // the line: the merge's behaviour is not obvious from the call site, and a reader who
+  // trusts a description instead of the code is the exact failure mode being guarded.)
   let orchestratorBackends = null;
   // Durable per-provider readiness (cli/auth/ready), keyed by backend id. Owned by
   // applyReadiness from GET /backends. Kept SEPARATE from knownBackends because
@@ -26854,6 +26860,14 @@ function buildPanel() {
       // would need a coherent answer for whether the host's own providers may still be
       // appended, and there is no evidence-backed answer to that — an orchestrator reporting
       // zero providers is not a shape observed in practice.
+      //
+      // TRANSIENT STATE, named because it is not obvious from this line (codex): the repaint
+      // immediately below is passed `data.backends` DIRECTLY, not the merge. On an empty
+      // frame that is `renderBackendChips([])`, which falls back to its claude-only default
+      // — so the picker shows one chip until the next host probe repopulates it, rather than
+      // showing nothing. Deliberately left alone: routing this repaint through the merge
+      // would make an authoritative frame unable to REMOVE a provider, which is the one
+      // thing it should always be able to do.
       if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an

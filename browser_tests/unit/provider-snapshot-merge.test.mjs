@@ -145,8 +145,12 @@ test("#1083 (codex): an explicitly EMPTY authoritative snapshot CLEARS the basel
   assert.ok(ids(beforeClear).includes("gone-provider"), "stale entry survives while it is the baseline");
 
   const afterClear = mergeProviderSnapshots({ authoritative: [], probe: HOST });
-  assert.deepEqual(ids(afterClear), ids(HOST), "and is gone once the orchestrator reports none");
+  assert.deepEqual(ids(afterClear), ids(HOST), "and is gone once the baseline is cleared");
   assert.ok(!ids(afterClear).includes("gone-provider"));
+  // SCOPE (codex): this exercises the merge helper, not the bridge-frame path. The frame
+  // handler repaints from `data.backends` directly, so an empty frame transiently shows the
+  // renderer's claude-only default until the next probe — see the comment at that call.
+  // Asserting that here would be asserting about a function this file does not import.
 });
 
 test("#1083: a provider only the HOST knows about is ADDED, never dropped", () => {
