@@ -233,9 +233,14 @@ test("#1085 (codex): an Array SUBCLASS is not a plain array", () => {
   assert.equal(applyCurrentDefWidgetValues(node, defWith("cfg", { default: { size: [1, 2] } })).length, 1);
 });
 
-test("#1085 (codex r2): a symbol or non-enumerable own key refuses the structural compare", () => {
-  // My first version of this test asserted [] here and called it "symbol keys are outside
-  // the compared surface". That was the false negative itself, wearing a reassuring title:
+test("#1085 (codex r2): a difference behind a symbol or non-enumerable own key is REPORTED", () => {
+  // Titled by OUTCOME, not mechanism (codex): this proves the difference is reported, which
+  // is the caller-visible contract. The implementation gets there by refusing to compare
+  // such objects at all, but a comparator that safely compared symbol keys would satisfy
+  // this too, and that would also be correct.
+  //
+  // My first version asserted [] here and called it "symbol keys are outside the compared
+  // surface". That was the false negative itself, wearing a reassuring title:
   // Object.keys misses symbol and non-enumerable own keys, so a real difference hid there.
   // The compare now REFUSES any object carrying one, which falls back to identity — the
   // pre-fix answer — so the difference is reported rather than swallowed.
@@ -338,8 +343,9 @@ test("#1085 (codex r4): a DEEP but finite equal default is not falsely corrected
     [],
     "30 levels of identical structure is not a change",
   );
-  // Far past BOTH retired caps (8, then 100), which is the point: there is no depth at
-  // which two equal structures should be called different.
+  // Far past BOTH retired caps (8, then 100), which is the point: no CONSTANT is the right
+  // depth at which to call two equal structures different. The remaining bound is the call
+  // stack, which a JSON widget default cannot approach.
   assert.deepEqual(
     applyCurrentDefWidgetValues(nodeWith("cfg", deep(400)), defWith("cfg", { default: deep(400) })),
     [],

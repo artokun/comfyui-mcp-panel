@@ -701,6 +701,12 @@ function isArrayIndexKey(key) {
  *  `JSON.stringify(c.from)` — which invokes the same ownKeys/get/getOwnPropertyDescriptor
  *  traps. A non-returning trap already hung there. Comparing first REDUCES the exposure:
  *  when the values are equal there is now no correction, so nothing is stringified.
+ *
+ *  NOT full parity, and the difference is named rather than glossed (codex): this also calls
+ *  `Object.getPrototypeOf`, which JSON serialization does not, so a proxy whose
+ *  `getPrototypeOf` trap never returns is newly reachable. There is no general defence — a
+ *  non-returning trap cannot be interrupted from JS, and no reliable proxy detection exists —
+ *  and a widget value of that shape means custom-node code that already runs in the page.
  */
 function sameWidgetValue(a, b) {
   // GUARDED ENTRY (codex). Everything below can touch a live widget value, and a live value
@@ -738,8 +744,12 @@ function sameWidgetValueDeep(a, b, seen) {
   // reassigned, re-aliasing the widget to the definition's object. There is no depth at
   // which that is the right answer.
   //
-  // Tracking the (a, b) pairs already compared bounds a cycle EXACTLY, with no ceiling on a
-  // finite structure. Re-encountering a pair means the traversal closed a loop, and the
+  // Tracking the (a, b) pairs already compared bounds a cycle EXACTLY. A finite structure is
+  // then limited only by the CALL STACK rather than by a constant — which is not the same as
+  // unlimited (codex), and the earlier wording claiming otherwise was wrong. Past that the
+  // recursion overflows, the guarded entry catches the RangeError, and the answer degrades to
+  // "different" — the pre-fix answer. Materially better than a cap of 8 or 100, which real
+  // values could reach; a JSON widget default cannot approach the stack. Re-encountering a pair means the traversal closed a loop, and the
   // standard reading is co-inductive: the pair is equal unless something else proves
   // otherwise. A stack deep enough to overflow still ends in the guarded entry's catch,
   // which answers "different".
