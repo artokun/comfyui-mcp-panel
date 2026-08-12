@@ -473,8 +473,17 @@ test("#721 P1: an already-active workflow requires state even when empty, then p
   assert.ok(repaintAt !== -1 && proofAt > repaintAt && openedAt > proofAt, "must prove the repaint before success");
   // A failed/missing repaint is an honest unknown after s.openWorkflow may have
   // switched tabs, never the old fabricated {opened} receipt.
-  assert.match(body, /if \(rebindFailed\) throw failOpenRebindUnknown\(rebindFailed\);/);
+  // The throw itself, not the one-line `if` it used to be — #1089's follow-up wraps it
+  // in a block to append a foreign-source finding to the message. The guarantee is the
+  // same: a failed/missing repaint is an honest unknown, never a fabricated {opened}.
+  assert.match(body, /throw failOpenRebindUnknown\(rebindFailed\);/);
   assert.match(body, /workflow_open could not rebind the active canvas/);
+  // Whatever that block does, it may not turn a failure into a success.
+  const failAt = body.indexOf("if (rebindFailed) {");
+  if (failAt !== -1) {
+    const failBlock = body.slice(failAt, body.indexOf("throw failOpenRebindUnknown(rebindFailed);", failAt));
+    assert.doesNotMatch(failBlock, /applied: true/, "the failure path must never emit a success receipt");
+  }
 });
 
 test("#721 P1: dirty rebind success requires the target UUID, never only a read-shaped comparison", () => {
@@ -512,8 +521,19 @@ test("#721 P1: a failed rebind never re-baselines, reads disk, or reloads the st
   assert.match(successOnly, /await clearSpuriousOpenModified\(target, \{/);
   assert.match(successOnly, /await withDeadline\(/);
   assert.match(successOnly, /await app\.loadGraphData\(diskGraph/);
-  const unknownAt = body.indexOf("if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);");
+  // Anchored on the THROW, not on the one-line `if` it used to be: #1089's follow-up
+  // wraps this in a block so a foreign-source finding can be appended to the message
+  // first. What must hold is unchanged â the unknown receipt is still emitted only
+  // after the guarded success-only work.
+  const unknownAt = body.indexOf("throw failOpenRebindUnknown(rebindFailed);");
+  assert.notEqual(unknownAt, -1);
   assert.ok(unknownAt > body.indexOf("if (!rebindFailed)"), "the unknown receipt is emitted only after the guarded success-only work");
+  // ...and nothing between the success-only block and that throw may re-baseline, read
+  // disk, or load: the appended message is the only thing allowed there.
+  const between = body.slice(body.indexOf("if (openFailed)"), unknownAt);
+  for (const forbidden of [/clearSpuriousOpenModified/, /withDeadline\(/, /loadGraphData\(/]) {
+    assert.doesNotMatch(between, forbidden, "the failure path must stay side-effect free");
+  }
 });
 
 test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no silent data loss)", () => {
