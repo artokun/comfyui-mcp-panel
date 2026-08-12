@@ -26861,13 +26861,24 @@ function buildPanel() {
       // appended, and there is no evidence-backed answer to that — an orchestrator reporting
       // zero providers is not a shape observed in practice.
       //
-      // TRANSIENT STATE, named because it is not obvious from this line (codex): the repaint
-      // immediately below is passed `data.backends` DIRECTLY, not the merge. On an empty
-      // frame that is `renderBackendChips([])`, which falls back to its claude-only default
-      // — so the picker shows one chip until the next host probe repopulates it, rather than
-      // showing nothing. Deliberately left alone: routing this repaint through the merge
-      // would make an authoritative frame unable to REMOVE a provider, which is the one
-      // thing it should always be able to do.
+      // THE REPAINT BELOW IS NOT MERGED, and what that does and does not buy (codex):
+      //
+      // It is passed `data.backends` DIRECTLY, so this frame renders exactly what the
+      // orchestrator just said — including dropping a provider it no longer lists. On an
+      // empty frame that is `renderBackendChips([])`, which falls back to the renderer's
+      // claude-only default, so the picker shows one chip rather than none.
+      //
+      // That removal is only good for THIS repaint, and an earlier version of this comment
+      // wrongly claimed otherwise. If the ComfyUI host keeps reporting the dropped provider,
+      // the next `loadBackends` probe merges against the new baseline, sees an id the
+      // baseline lacks, and appends it again. So a provider the orchestrator stops listing
+      // reappears on the following poll whenever the host still knows it.
+      //
+      // Left that way on purpose: suppressing it would require telling "the orchestrator
+      // deliberately dropped this" apart from "the orchestrator never knew about it", and
+      // nothing in either snapshot carries that. Re-appending a provider the host can see is
+      // also the benign direction — an extra entry the user may not need, versus the missing
+      // entry with no way back that this whole issue is about.
       if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an

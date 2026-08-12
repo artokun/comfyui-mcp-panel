@@ -95,6 +95,26 @@ test("#1083 (codex): the probe cannot erase or invent the EXPERIMENTAL safety di
   assert.equal(invented[0].experimental, undefined, "nor invent it for a provider that is not");
 });
 
+test("#1083 (codex): an authoritative REMOVAL does not persist against a host that still reports it", () => {
+  // The sequence the comment at the bridge frame now describes, made executable rather than
+  // asserted in prose. The orchestrator drops `openrouter`; the direct repaint renders the
+  // new list without it; then the next host probe merges against that baseline, finds an id
+  // the baseline lacks, and appends it again.
+  const afterDrop = ORCHESTRATOR.filter((b) => b.backend !== "openrouter");
+  const nextProbe = mergeProviderSnapshots({ authoritative: afterDrop, probe: HOST });
+  assert.ok(
+    ids(nextProbe).includes("openrouter"),
+    "the dropped provider returns on the following poll while the host still reports it",
+  );
+  // It comes back as a HOST entry, so it carries no orchestrator readiness — which is the
+  // honest representation: nothing authoritative vouches for it any more.
+  const returned = nextProbe.find((b) => b.backend === "openrouter");
+  assert.equal(returned.ready, undefined);
+  // A provider the host does NOT report stays gone, so this is not "removal never works".
+  const alsoDropped = ORCHESTRATOR.filter((b) => b.backend !== "custom");
+  assert.ok(!ids(mergeProviderSnapshots({ authoritative: alsoDropped, probe: HOST })).includes("custom"));
+});
+
 test("#1083 (codex): the experimental guarantee is scoped to DESCRIBED providers", () => {
   // Pinning the limit of the rule above, because an earlier version of its comment
   // overclaimed it. A provider only the PROBE reports keeps its own entry verbatim — there
