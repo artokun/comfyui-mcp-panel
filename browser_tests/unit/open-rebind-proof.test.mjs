@@ -126,7 +126,39 @@ test("#604/#603/#616: the reported failure — a faithful repaint the frontend N
     contentSurfaces: describeGraphStateDifference({ rootGraph, state: loaded }).surfaces,
   });
   assert.match(text, /canvas IS bound to a\.json/, "the settled half must be stated as settled");
-  assert.match(text, /You are NOT on the wrong workflow/, "the old message's worst implication is retracted");
+  // The retraction survives — the identity IS settled and must be stated as such —
+  // but it is now scoped to the identity (#1111/#1089). The old sentence read as
+  // "everything is fine except presentation", and two reporters proceeded on that
+  // while the PREVIOUS workflow's graph sat on the canvas.
+  assert.match(text, /The identity is settled/, "the old message's worst implication is retracted");
+  assert.match(text, /IS the active one/, "…and the settled half is still stated plainly");
+  assert.match(
+    text,
+    /not about the nodes/,
+    "…but it no longer implies the graph is this workflow's",
+  );
+  assert.match(
+    text,
+    /PREVIOUS workflow's graph still on the canvas/,
+    "the reported outcome is named, so a re-read is not taken at face value",
+  );
+  assert.match(
+    text,
+    /panel_load_workflow with this workflow's path reloads it/,
+    "and the recovery that actually worked for both reporters is named",
+  );
+  // codex review, P1: that recovery loads from DISK. If the stale canvas holds
+  // unsaved work — and if it is the previous workflow's, it may — reloading
+  // destroys it. Naming a destructive step as "the recovery" without saying so is
+  // how a message meant to prevent data loss causes it.
+  assert.match(text, /It loads from DISK/, "the cost of the recovery is stated");
+  assert.match(text, /preserve it FIRST/, "…and what to do before taking it");
+  // codex round 2, P1: a PLAIN save is itself destructive here. The active identity
+  // already names the requested workflow, so saving the stale graph writes it over
+  // exactly the file the user was trying to open — the safety advice creating a
+  // worse data-loss path than the one it was preventing.
+  assert.match(text, /To a NEW path, with Save As or an export/, "preservation must not overwrite");
+  assert.match(text, /a plain save would write it to a\.json/, "…and the trap is named explicitly");
   assert.match(text, /UNKNOWN/, "...while the unsettled half stays unknown");
   assert.match(text, /nodes/, "the disclosure must name WHICH surface disagreed");
 });
