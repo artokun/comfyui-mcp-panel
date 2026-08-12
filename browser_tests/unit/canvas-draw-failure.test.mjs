@@ -7,7 +7,9 @@
 // LTX render), so the one tool that could have shown them the state is the one that
 // failed, with a message that reads like a panel bug.
 //
-// It is not a panel bug. It is NOT, however, safe to say it is not the graph: a node
+// It is not obviously a panel bug — though this path sets the canvas transform to a
+// computed fit before drawing, so the zoom it chose could be what exposes the fault.
+// It is NOT safe to say it is not the graph either: a node
 // or widget the renderer cannot draw throws here while panel_graph_outline reads that
 // same node perfectly well — which is exactly what the reporter observed, and the
 // likeliest lead. The first version of this message excluded the graph outright.
@@ -76,7 +78,10 @@ test("#1108 it names the remedy and admits the panel cannot apply it", () => {
   // codex round 2, P1: "then the cause is in the graph" was a false dichotomy — a
   // persistent frontend issue, an extension, or other browser state survives a
   // reload without the graph being at fault.
-  assert.match(text, /not \(only\) stale render state/);
+  // codex round 3, P2: surviving a reload proves less than it looks — a render that
+  // is still running can recreate the bad state immediately.
+  assert.match(text, /proves less than it looks/);
+  assert.match(text, /try it with the queue idle/);
   assert.match(text, /any extension that draws on the canvas/);
   assert.doesNotMatch(text, /the cause is in the graph rather than/);
   // And a refresh discards unsaved work, which must be said BEFORE they do it.
