@@ -1,0 +1,210 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "Étoile sur GitHub",
+    "tooltip": "Le panneau agent ComfyUI vous plaît ? Une étoile GitHub aide vraiment. Ouvre le dépôt dans un nouvel onglet."
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "Nouveautés",
+    "tooltip": "Affiche les changements récents dans la transcription du panneau — ce qui a été livré dans cette version et dans les précédentes. Le panneau peut se mettre à jour depuis le Comfy Registry sans que vous le demandiez : c'est donc ici qu'il faut regarder quand quelque chose se comporte autrement que dans votre souvenir."
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "Documentation",
+    "tooltip": "Guides du panneau, des outils, des LLM locaux et du dépannage — comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "Communauté",
+    "tooltip": "Rejoignez le Discord comfyui-mcp — annonces, astuces et entraide. S'ouvre dans un nouvel onglet."
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "Besoin d'aide ?",
+    "tooltip": "Bloqué ? Ceci copie un court résumé de diagnostic (version du panneau, backend, ComfyUI, système) dans votre presse-papiers et ouvre le Discord — collez-le dans votre message pour qu'on puisse vous aider vite."
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "Backend d'agent par défaut",
+    "tooltip": "L'agent d'arrière-plan auquel le panneau se connecte par défaut. Claude tourne sur votre abonnement Claude ; ChatGPT sur votre compte Codex (ChatGPT) ; Gemini sur votre connexion Google (Gemini). Amorce le backend du panneau (et détermine quel groupe ci-dessous amorce le runtime) ; vous pouvez toujours changer à chaud dans le sélecteur de modèles (un changement à chaud ne vaut que pour la session et ne modifie PAS cette valeur par défaut)."
+  },
+  "comfyui-mcp_chatScope": {
+    "name": "Portée des conversations",
+    "tooltip": "Panneau : une seule conversation suit tous les canevas. Workflow : chaque workflow enregistré possède son propre jeu persistant de conversations, identifié par un UUID intégré, de sorte que les renommages conservent l'historique et que les copies restent séparées. Demander : vous choisissez à chaque changement de workflow si la conversation en cours doit suivre. Tous les modes survivent à un redémarrage complet de ComfyUI/MCP."
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "Connexion automatique au chargement",
+    "tooltip": "Connecte automatiquement l'agent (en démarrant l'orchestrateur local) à l'ouverture du panneau, sans cliquer sur Connecter. Désactivé par défaut — sinon l'orchestrateur n'est démarré que par un clic explicite sur Connecter."
+  },
+  "comfyui-mcp_language": {
+    "name": "Langue du panneau",
+    "tooltip": "Langue du texte propre au panneau. « Détecter » suit le réglage de langue de ComfyUI : changer la langue de ComfyUI change donc aussi celle du panneau. Tout ce qui n'est pas encore traduit retombe sur l'anglais. Prend effet à la réouverture ou au rechargement du panneau."
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "Contrôle via l'appli mobile (bêta)",
+    "tooltip": "Affiche le bouton d'appairage du contrôle à distance (QR) dans l'en-tête du panneau, ainsi que les liens de téléchargement de l'appli bêta ci-dessous. L'appli mobile est en BÊTA et évolue vite — attendez-vous à des imperfections, à des ruptures entre builds et à des réappairages occasionnels. L'appairage reste sur votre machine et votre réseau, sauf si vous choisissez explicitement le mode Internet."
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "Afficher Apps",
+    "tooltip": "Affiche le bouton Apps dans la barre d'outils — la couche micro-apps (convertir un workflow en app en un clic, l'exécuter en local ou sur un pod, publier et explorer). Désactivé par défaut ; l'indicateur est aussi transmis à une appli mobile connectée."
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "Afficher Entraînement",
+    "tooltip": "Affiche le bouton Entraînement dans la barre d'outils — l'assistant d'entraînement LoRA (rassemblement, légendage, lancement et suivi du dataset). Désactivé par défaut ; l'indicateur est aussi transmis à une appli mobile connectée."
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "Afficher RunPod / Local",
+    "tooltip": "Affiche le bouton d'hôte RunPod / Local dans la barre d'outils — déployer, démarrer, arrêter ou connecter un pod GPU cloud, ou revenir en local. Désactivé par défaut ; l'indicateur est aussi transmis à une appli mobile connectée."
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "Obtenir l'appli bêta",
+    "tooltip": "Téléchargements réservés aux testeurs de l'appli mobile ComfyUI MCP. iOS s'installe via Apple TestFlight ; Android via Firebase App Distribution. Les deux canaux sont en bêta : les builds sont mis à jour souvent et peuvent exiger un réappairage avec ce panneau."
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "Échelle de l'interface du panneau (%)",
+    "tooltip": "Met à l'échelle toute la barre latérale Agent — texte, icônes et espacements ensemble. Augmentez-la si le panneau est difficile à lire sur un écran haute densité ou de grande taille. 100 % par défaut ; de 100 à 250. S'applique immédiatement, à tous les panneaux ouverts. À noter : redéfinir `.cmcp-root { font-size }` dans une feuille de style utilisateur ne fonctionne PAS — les tailles internes du panneau sont en `rem`, qui se résolvent par rapport à la racine de la page et non au panneau, si bien que la plupart des textes l'ignorent. Ce réglage est la façon prise en charge de mettre le panneau à l'échelle."
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "Alerte de rendu bloqué (secondes)",
+    "tooltip": "Durée pendant laquelle un rendu ComfyUI peut n'enregistrer AUCUNE progression avant que l'agent soit averti que son rendu semble bloqué ou coincé (par ex. une étape d'échantillonnage figée par un dépassement de mémoire) et qu'on lui demande d'annuler ou de relancer plutôt que de lancer une exécution de plus. Les étapes vidéo sont légitimement lentes : restez généreux. 180 s par défaut ; plage 15–3600. S'applique au prochain démarrage de l'orchestrateur — Déconnecter puis Connecter (ou /restart) pour le changer sur un agent en cours."
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "URL d'un ComfyUI distant (avancé)",
+    "tooltip": "Pointe l'AGENT vers un ComfyUI distant plutôt que vers cette machine — par ex. un pod RunPod sur https://xxxxxxxx-8188.proxy.runpod.net. Laissez VIDE pour piloter le ComfyUI local (par défaut). Une fois renseignée, les outils de l'agent (file d'attente, modèles, historique, envois) visent le serveur distant, et les outils purement locaux (download_model, packs d'installation, analyses de modèles) sont désactivés. S'applique au prochain démarrage de l'orchestrateur — Déconnecter puis Connecter pour la changer. Votre canevas en direct suit toujours le ComfyUI que vous avez ouvert dans le navigateur."
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "URL du pont (avancé)",
+    "tooltip": "URL WebSocket du pont de l'orchestrateur du panneau — UN seul pont dessert désormais tous les fournisseurs (par défaut ws://127.0.0.1:9180). Ne la changez que si vous démarrez l'orchestrateur sur un port non standard (COMFYUI_MCP_BRIDGE_PORT). S'applique au prochain Connecter."
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "Zoomer sur les modifications de l'agent",
+    "tooltip": "Quand l'agent change la valeur d'un nœud, la vue se déplace en douceur vers ce nœud (avec une marge) pour vous faire voir le changement arriver, puis dézoome pour recadrer tout le graphe une fois les modifications terminées. Limité aux modifications de valeurs — le câblage et le placement des nœuds ne bougent pas la vue. Activé par défaut ; désactivez-le pour garder le canevas immobile."
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "Modèles préférés",
+    "tooltip": "Vos modèles favoris, séparés par des virgules — tags Ollama (artokun/gemma4-comfyui-mcp:e4b — notre fine-tune ComfyUI, gemma4:12b, qwen3:4b) et/ou identifiants OpenRouter (xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). Ils sont épinglés EN HAUT du sélecteur de modèles (marqués ★ lorsqu'ils ne figurent pas dans le catalogue découvert). Conservés par l'orchestrateur : ils survivent aux redémarrages et s'appliquent immédiatement."
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "Type d'endpoint",
+    "tooltip": "Comment le backend Ollama dialogue avec son endpoint. « Ollama (local) » utilise nativement /api/chat sur votre Ollama local. « Compatible OpenAI » parle /chat/completions — à utiliser pour OpenRouter, vLLM, LM Studio, DeepSeek, etc. (renseignez l'URL de base ci-dessous ; la clé API provient de l'environnement de l'orchestrateur, par ex. OPENROUTER_API_KEY). S'applique aux NOUVELLES sessions — Déconnecter puis Connecter après changement."
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "URL de base de l'endpoint",
+    "tooltip": "URL de base de l'endpoint ci-dessus. Laissez VIDE pour Ollama en local (http://127.0.0.1:11434). Pour les endpoints compatibles OpenAI, incluez le /v1 (par ex. https://openrouter.ai/api/v1). S'applique aux NOUVELLES sessions — Déconnecter puis Connecter après changement."
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "URL de base de l'endpoint",
+    "tooltip": "N'importe quel endpoint compatible OpenAI — vLLM, DeepSeek, Together, Azure OpenAI, un llama-server sur une autre machine… Incluez le /v1 (par ex. http://192.168.1.20:8000/v1). Conservée par l'orchestrateur et appliquée immédiatement ; si le serveur exige une clé, utilisez « Définir la clé API… » ci-dessous. Laissez vide pour désactiver ce fournisseur."
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Claude, choisi parmi les modèles récupérés pour Claude (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Claude, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan ChatGPT, choisi parmi les modèles récupérés pour ChatGPT (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à ChatGPT, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Gemini, choisi parmi les modèles récupérés pour Gemini (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Gemini, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Antigravity, choisi parmi les modèles récupérés pour Antigravity (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Antigravity, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Pi, choisi parmi les modèles récupérés pour Pi (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Pi, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Grok, choisi parmi les modèles récupérés pour Grok (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Grok, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Kimi, choisi parmi les modèles récupérés pour Kimi (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Kimi, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Kimi K3, choisi parmi les modèles récupérés pour Kimi K3 (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Kimi K3, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan GLM (z.ai), choisi parmi les modèles récupérés pour GLM (z.ai) (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à GLM (z.ai), seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan MiniMax, choisi parmi les modèles récupérés pour MiniMax (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à MiniMax, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Ollama, choisi parmi les modèles récupérés pour Ollama (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Ollama, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan OpenRouter, choisi parmi les modèles récupérés pour OpenRouter (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à OpenRouter, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan LM Studio, choisi parmi les modèles récupérés pour LM Studio (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à LM Studio, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan llama.cpp, choisi parmi les modèles récupérés pour llama.cpp (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à llama.cpp, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Endpoint personnalisé, choisi parmi les modèles récupérés pour l'endpoint personnalisé (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à l'endpoint personnalisé, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Effort de raisonnement par défaut de l'agent Claude, sur son échelle (faible–max). « Défaut du modèle » le laisse non défini."
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Effort de raisonnement par défaut de l'agent ChatGPT, sur son échelle (aucun–ultra). « Défaut du modèle » le laisse non défini."
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Gemini n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Antigravity n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Pi n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Grok n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Kimi n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Kimi K3 n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "GLM (z.ai) n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "MiniMax n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "Clé API OpenRouter",
+    "tooltip": "Stockez votre clé API OpenRouter en toute sécurité. Ouvre une saisie masquée ; la valeur va directement dans le stockage 0600 de l'orchestrateur (~/.comfyui-mcp) — elle n'est JAMAIS écrite dans les réglages ComfyUI, les journaux, l'historique des conversations ou le contexte de l'agent. Ne nécessite que le pont (cliquez d'abord sur Connecter — aucun fournisseur n'a besoin d'être prêt)."
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "Clé API de l'endpoint personnalisé",
+    "tooltip": "Stockez en toute sécurité la clé API de votre endpoint personnalisé. Ouvre une saisie masquée ; la valeur va directement dans le stockage 0600 de l'orchestrateur (~/.comfyui-mcp) — elle n'est JAMAIS écrite dans les réglages ComfyUI, les journaux, l'historique des conversations ou le contexte de l'agent. Ne nécessite que le pont (cliquez d'abord sur Connecter — aucun fournisseur n'a besoin d'être prêt)."
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "Jeton CivitAI",
+    "tooltip": "Stockez votre jeton d'API CivitAI en toute sécurité. Ouvre une saisie masquée ; la valeur va directement dans le stockage 0600 de l'orchestrateur (~/.comfyui-mcp) — elle n'est JAMAIS écrite dans les réglages ComfyUI, les journaux, l'historique des conversations ou le contexte de l'agent. Ne nécessite que le pont (cliquez d'abord sur Connecter — aucun fournisseur n'a besoin d'être prêt)."
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "Jeton HuggingFace",
+    "tooltip": "Stockez votre jeton d'API HuggingFace en toute sécurité. Ouvre une saisie masquée ; la valeur va directement dans le stockage 0600 de l'orchestrateur (~/.comfyui-mcp) — elle n'est JAMAIS écrite dans les réglages ComfyUI, les journaux, l'historique des conversations ou le contexte de l'agent. Ne nécessite que le pont (cliquez d'abord sur Connecter — aucun fournisseur n'a besoin d'être prêt)."
+  }
+}
