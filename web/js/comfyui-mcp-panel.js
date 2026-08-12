@@ -240,6 +240,7 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
+import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
   describeQueuePromptChainForReport,
@@ -15417,7 +15418,31 @@ const GRAPH_TOOL_EXECUTORS = {
       ds.offset[0] = fit.offsetX;
       ds.offset[1] = fit.offsetY;
       canvas.setDirty?.(true, true);
-      canvas.draw(true, true); // synchronous redraw at the fitted transform
+      // #1108 — a THROW from here is the frontend's render path, not ours. Raw, it
+      // surfaced as "Cannot read properties of undefined (reading 'name')" to a
+      // reporter who was trying to screenshot a frozen canvas: the one tool that
+      // could have shown them the problem, failing with a message that reads like a
+      // panel bug. Say what it is, what still works, and what clears it.
+      try {
+        canvas.draw(true, true); // synchronous redraw at the fitted transform
+      } catch (err) {
+        // Put the user's view back BEFORE failing (codex review). The fit above moved
+        // it, the restore that normally undoes that is further down, and a throw
+        // jumps over it — so a failed screenshot silently left them zoomed into the
+        // framing it had chosen. Values only: re-drawing here would very likely throw
+        // again, and the frontend repaints on its own once it can.
+        try {
+          ds.scale = saved.scale;
+          ds.offset[0] = saved.ox;
+          ds.offset[1] = saved.oy;
+          canvas.setDirty?.(true, true);
+        } catch {
+          /* best-effort: never replace the draw failure with a restore failure */
+        }
+        // `cause` keeps the original type and stack: the draw-site frames are the
+        // only thing that says WHICH draw failed (codex review).
+        throw new Error(describeCanvasDrawFailure(err), { cause: err });
+      }
       const MAXW = 1600;
       if (cv.width > MAXW) {
         const s = MAXW / cv.width;
