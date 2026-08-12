@@ -37,6 +37,48 @@ export function shouldRehelloAfterCommand(cmd, reply) {
   return cmd === "free_vram" && Boolean(reply && reply.ok);
 }
 
+// #1138 — may a `ready` ack arriving mid-task nudge the agent to resume?
+//
+// The nudge injects a user message ("your connection dropped mid-task … continue exactly
+// what you were doing") and writes a line into the durable transcript. Both are false, and
+// the injection is actively harmful, unless the orchestrator really did die: a turn that
+// kept running does not need resuming, and telling a working agent to resume makes it
+// restart or duplicate what it is doing.
+//
+// The panel's existing rule is a gap heuristic — a real ComfyUI restart takes many seconds
+// to come back, so a LONG gap since the drop means the restart was real, while a fast
+// reconnect (a sidebar remount, a brief WS blip) means it was not. That rule is right.
+//
+// What it missed is that "no drop at all" is not the same as "a very old drop", and the
+// subtraction cannot tell them apart: the panel's `lastBridgeDownAt` is 0 until the bridge
+// socket closes, and `Date.now() - 0` is ~56 years — the LONGEST possible gap, which the
+// heuristic reads as the strongest possible evidence of a real restart. So the guard was
+// exactly inverted where it mattered most: the better established it was that nothing had
+// dropped, the more confidently it nudged.
+//
+// That is reachable on a LIVE socket, because `ready` repeats on one — a re-advertise draws
+// a fresh handshake, and #310 re-advertises after every successful free_vram by design. So
+// freeing VRAM mid-task could tell a user their connection had dropped when nothing had.
+//
+// `bridgeDroppedAt` is therefore required to be a positive timestamp: absent, zero or
+// unreadable means no drop was recorded, and no drop means no nudge.
+export function shouldNudgeAfterMidTaskReconnect({
+  bridgeDroppedAt = 0,
+  now = 0,
+  minGapMs = 6000,
+} = {}) {
+  if (typeof bridgeDroppedAt !== "number" || !Number.isFinite(bridgeDroppedAt)) return false;
+  // Not `> 0` by accident: a drop is stamped with Date.now(), so any real value is far
+  // above zero, and a non-positive one is the never-dropped sentinel or a corrupt clock.
+  if (bridgeDroppedAt <= 0) return false;
+  if (typeof now !== "number" || !Number.isFinite(now)) return false;
+  // A gap that reads NEGATIVE (a clock adjustment, or a drop stamped after this read)
+  // is not evidence of a long outage either — treat it as fast, i.e. no nudge.
+  const gap = now - bridgeDroppedAt;
+  if (gap < 0) return false;
+  return gap >= minGapMs;
+}
+
 // #332 — During the post-restart reconnect window a Manager-backed fetch (e.g.
 // panel_list_nodes) throws a bare transport error ("Failed to fetch") before any
 // HTTP status exists, so the usual 404/"unreachable" handling never fires. Match
