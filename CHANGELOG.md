@@ -6,6 +6,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.15] - 2026-08-12
+
+### Fixed
+
+- **`panel_open_workflow` no longer claims a refresh it never performed (#1448).**
+  The refusal said the file "isn't among the saved/open workflows even after a
+  refresh" — for a file the reporter had confirmed on disk INSIDE that folder,
+  twice. Both ways the refresh can fail to happen were silent: a frontend without
+  `syncWorkflows` skipped it entirely, and a throw was swallowed by a
+  `console.warn` no agent session reads. It now reports which actually occurred —
+  list re-read, no sync method on this frontend, or re-read failed with the reason
+  — and says outright that a skipped or failed re-read is NOT evidence the file is
+  absent.
+  Its remedy also stopped naming the wrong cause: "for a file outside the
+  workflows folder" reads as a diagnosis, and sent someone away from a file that
+  was exactly where they thought. `panel_load_workflow` is still offered, as a
+  branch rather than a verdict.
+  The refusal now also shows the selector SHAPES the store actually holds, which
+  are not guessable from outside: `path` is `workflows/X.json`, `filename` carries
+  NO extension, and `key` does.
+
 ## [0.14.14] - 2026-08-12
 
 ### Fixed
