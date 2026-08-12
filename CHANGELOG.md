@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-08-11
+
+> #1085: adding an ImageCropV2 warned that this tab's node definitions were out of date and
+> that a value had been replaced — showing the old and new values side by side, identical.
+
+### Fixed
+- adding a node no longer reports a value as "corrected" when nothing about it changed. The
+  check compared values by identity rather than by content, and a value that is a group of
+  numbers — like ImageCropV2's crop region — is a fresh group every time it is read, so it
+  never matched itself. Every add of such a node raised the warning and told you to reload
+  the tab.
+
+### Changed
+- values are now compared by what they contain, at any nesting depth. A value that genuinely
+  changed is still corrected and still reported — that warning exists for a real case and it
+  keeps working.
+- anything the comparison cannot read faithfully is treated as changed rather than guessed
+  at, which is what it did before. That is the safe direction: it can mention a correction
+  that was not needed, but it will never stay silent about one that was.
+
 ## [0.14.8] - 2026-08-11
 
 > #1087: setting a widget inside a subgraph reported success and changed nothing about the
