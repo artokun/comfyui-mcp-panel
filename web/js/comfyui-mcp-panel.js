@@ -20396,6 +20396,27 @@ function buildPanel() {
   // PROVIDER section can render them (the switcher now lives there, not in
   // settings). Defaults to claude-only until discovery lands.
   let knownBackends = [{ backend: "claude", running: false }];
+  // #1083 — the ORCHESTRATOR's provider list, kept separate from `knownBackends` and from
+  // readiness. It is the merge baseline that stops a shorter ComfyUI-host probe from
+  // deleting `lmstudio`/`llamacpp`/`custom`/`copilot` from the picker.
+  //
+  // Two distinctions this must NOT collapse, both found in review (codex):
+  //
+  //  * NOT `readinessFromOrchestrator`. That flag means "readiness came from the agent
+  //    machine", and a bare `ready` ack sets it carrying NO provider list at all. Treating
+  //    it as proof of an authoritative list would merge a host probe against whatever
+  //    `knownBackends` happened to hold — possibly still the claude-only default — and
+  //    strand the picker without the configured providers.
+  //  * NOT `knownBackends`. That is the RENDERED list, so it also contains host-only
+  //    entries. Feeding it back in as authoritative would freeze those entries at their
+  //    first-seen value: a host-only provider that later starts or stops would keep showing
+  //    stale liveness forever, because the merge deliberately refuses to overwrite anything
+  //    it considers authoritative.
+  //
+  // Set ONLY from a real bridge `backends` frame carrying a non-empty array. Null until
+  // then, which is exactly the "no authoritative snapshot" case the merge passes through
+  // unchanged.
+  let orchestratorBackends = null;
   // Durable per-provider readiness (cli/auth/ready), keyed by backend id. Owned by
   // applyReadiness from GET /backends. Kept SEPARATE from knownBackends because
   // renderBackendChips is also called from connect/handshake paths that reconstruct
@@ -20519,11 +20540,12 @@ function buildPanel() {
         // a configured Custom endpoint. `applyReadiness` below already refuses this probe,
         // but it ran one line too late: `renderBackendChips` assigns `knownBackends`
         // wholesale, and the model popup rebuilds its Provider section from that.
+        // The baseline is `orchestratorBackends`, NOT `readinessFromOrchestrator` and NOT
+        // the rendered `knownBackends` — see the declaration for why each of those is
+        // wrong. Host-only providers are absent from the baseline by construction, so they
+        // are re-read from every probe and their liveness stays current.
         renderBackendChips(
-          mergeProviderSnapshots({
-            authoritative: readinessFromOrchestrator ? knownBackends : null,
-            probe: data.backends,
-          }),
+          mergeProviderSnapshots({ authoritative: orchestratorBackends, probe: data.backends }),
         );
         applyReadiness(data);
       }
@@ -26813,6 +26835,12 @@ function buildPanel() {
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
       applyReadiness(data, { fromOrchestrator: true });
+      // #1083 — THIS is the only thing that establishes an authoritative provider list:
+      // a real bridge frame carrying a non-empty array. Recorded before the repaint so a
+      // host probe racing this frame merges against it rather than against the rendered
+      // list. An empty/absent array leaves the previous baseline alone — it is a frame that
+      // told us nothing about providers, not one that told us there are none.
+      if (Array.isArray(data?.backends) && data.backends.length) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).

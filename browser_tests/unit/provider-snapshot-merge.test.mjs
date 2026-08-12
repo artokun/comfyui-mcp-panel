@@ -84,10 +84,58 @@ test("#1083: a duplicated id yields ONE chip, first writer wins", () => {
 });
 
 test("#1083: merging is stable — repeated host refreshes converge, never grow or shrink", () => {
-  // loadBackends runs on a timer, so the merge is applied to its own output repeatedly.
-  let current = ORCHESTRATOR;
+  // loadBackends runs on a timer, so the merge is applied repeatedly against the SAME
+  // fixed orchestrator baseline. Feeding the merge's own OUTPUT back in as the baseline is
+  // the mistake the caller must not make — see the host-only liveness test below.
+  let current = null;
   for (let i = 0; i < 5; i++) {
-    current = mergeProviderSnapshots({ authoritative: current, probe: HOST });
+    current = mergeProviderSnapshots({ authoritative: ORCHESTRATOR, probe: HOST });
   }
   assert.deepEqual(ids(current), ids(ORCHESTRATOR), "no drift across repeated refreshes");
+});
+
+test("#1083 (codex): a HOST-ONLY provider keeps refreshing its running state", () => {
+  // The regression the first draft introduced. A host-only entry is appended to the merged
+  // list; if that merged list is then reused as the next baseline, the entry is suddenly
+  // "authoritative" and the merge refuses to overwrite it — so a provider that later starts
+  // or stops shows stale liveness forever. `backendReady` cannot repair it: that map holds
+  // only cli/auth/ready, while the chip and the picker both read `b.running`.
+  //
+  // Keeping the baseline pinned to the ORCHESTRATOR snapshot is what fixes it — a host-only
+  // provider is never in that baseline, so it is re-read from every probe.
+  const idle = [...HOST, { backend: "host-only", running: false }];
+  const busy = [...HOST, { backend: "host-only", running: true }];
+
+  const first = mergeProviderSnapshots({ authoritative: ORCHESTRATOR, probe: idle });
+  assert.equal(first.find((b) => b.backend === "host-only").running, false);
+
+  const second = mergeProviderSnapshots({ authoritative: ORCHESTRATOR, probe: busy });
+  assert.equal(
+    second.find((b) => b.backend === "host-only").running,
+    true,
+    "host-only liveness follows the probe instead of freezing at first sight",
+  );
+
+  // And the reverse, so this is not passing on a one-way latch.
+  const third = mergeProviderSnapshots({ authoritative: ORCHESTRATOR, probe: idle });
+  assert.equal(third.find((b) => b.backend === "host-only").running, false);
+});
+
+test("#1083 (codex): a ready ack alone is not an authoritative provider list", () => {
+  // `readinessFromOrchestrator` is set by a bare `ready` ack that carries NO providers, and
+  // the surrounding code documents that such an ack can arrive BEFORE the backends frame.
+  // If list authority were inferred from it, a host probe landing in that window would be
+  // merged against the claude-only default and treated as authoritative — stranding the
+  // picker without the configured providers. Modelled here as the baseline still being null
+  // at that moment, which is what the caller now passes.
+  const DEFAULT_ONLY = [{ backend: "claude", running: false }];
+  const duringWindow = mergeProviderSnapshots({ authoritative: null, probe: HOST });
+  assert.deepEqual(ids(duringWindow), ids(HOST), "the probe is used as-is, nothing is invented");
+  assert.ok(
+    !ids(duringWindow).includes("custom") && ids(DEFAULT_ONLY).length === 1,
+    "and no authoritative claim is manufactured from the default list",
+  );
+  // Once the real frame lands, the full set is protected from the very next probe.
+  const afterFrame = mergeProviderSnapshots({ authoritative: ORCHESTRATOR, probe: HOST });
+  assert.deepEqual(ids(afterFrame), ids(ORCHESTRATOR));
 });
