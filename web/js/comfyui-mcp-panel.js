@@ -262,6 +262,10 @@ import {
   recordPreLoadPromptRelayEditors,
 } from "./lib/prompt-relay-timeline.js";
 import {
+  classifyRgthreeFastGroupsWrite,
+  rgthreeFastGroupsRefusal,
+} from "./lib/rgthree-fast-groups.js";
+import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
@@ -10780,6 +10784,16 @@ const GRAPH_TOOL_EXECUTORS = {
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
       });
+    }
+    // #983: rgthree's Fast Groups Muter/Bypasser toggle rows are DERIVED READOUTS of whether
+    // the matched group has an active node — the node re-reads each one from the group on
+    // every refresh and declares `serialize_widgets = false`, so a write is reverted and
+    // never reaches the workflow. The reported shape was a clean success followed immediately
+    // by the old value. Refused loudly, keyed to BOTH the node type and the widget name so
+    // nothing else on those nodes is affected. See the lib for the three source facts and for
+    // why this refuses rather than driving the node's own toggle().
+    if (classifyRgthreeFastGroupsWrite(node, widget) === "derived") {
+      throw new Error(rgthreeFastGroupsRefusal(widget, node.id, node.type));
     }
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
     // write can never decide "never seen" against an un-seeded history — a pack present
