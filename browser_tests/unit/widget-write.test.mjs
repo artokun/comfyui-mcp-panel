@@ -3314,3 +3314,36 @@ test("#1126: an exact member still wins, and the write is NOT marked unvalidated
   assert.equal(out.value, "b.fbx");
   assert.equal(out.off_list_value_accepted, undefined, "a listed value was validated normally");
 });
+
+test("#1126: the unlisted acceptance sets the marker that GATES the rail cross-check", () => {
+  // The gap this closes was mine. The unlisted acceptance originally set only its own
+  // marker, so it skipped the #507 promoted-write cross-check entirely — and a promoted
+  // write assigns the value to the parent's authoritative RAIL widget and every display
+  // proxy, whose lists can be real and closed. An unlisted value would have landed there
+  // with nothing validating it. Refusing is recoverable; a corrupted rail in the
+  // serialized parent graph is not.
+  //
+  // Asserted at coercion time because that marker is exactly what the cross-check keys
+  // on, mirroring #507's own confirmation-round test: a refactor that stops setting it
+  // silently disables the rail check, and must fail here.
+  const placeholder = { name: "fbx_file", type: "combo", options: { values: ["empty"] }, value: "empty" };
+  const out = {};
+  assert.equal(
+    coerceWidgetValue(placeholder, String.raw`F:\Downloads\Scarlet1.0.fbx`, placeholder, null, { allowUnlistedComboValue: true, out }),
+    String.raw`F:\Downloads\Scarlet1.0.fbx`,
+  );
+  assert.equal(out.offListAcceptanceUsed, true, "its own marker drives the disclosure");
+  assert.equal(out.emptyAcceptanceUsed, true, "…and it must ALSO arm the rail cross-check");
+
+  // A value the list DOES contain is admitted by ordinary membership, so neither marker
+  // is set and neither the disclosure nor the rail check is triggered.
+  const real = { name: "fbx_file", type: "combo", options: { values: ["a.fbx", "b.fbx"] }, value: "a.fbx" };
+  const outReal = {};
+  assert.equal(coerceWidgetValue(real, "b.fbx", real, null, { allowUnlistedComboValue: true, out: outReal }), "b.fbx");
+  assert.equal(outReal.offListAcceptanceUsed, undefined);
+  assert.equal(outReal.emptyAcceptanceUsed, undefined);
+});
+
+// The end-to-end rail refusal itself is covered by #507's existing cross-check tests:
+// this change routes into the SAME gate (emptyAcceptanceUsed), so a separate promoted
+// fixture here would re-test their machinery rather than anything new.
