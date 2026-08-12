@@ -123,3 +123,79 @@ test("#1085: the #1369 self-contradictory COMBO ruling is unaffected", () => {
   assert.deepEqual(out.rejected, [{ name: "sage_attention", proposed: false, kept: "disabled" }]);
   assert.equal(node.widgets[0].value, "disabled");
 });
+
+// ---- codex round 1: cases where "equal" would have been a FALSE NEGATIVE ----
+// Every one of these is a REAL change that must still be reported. A missed correction is
+// the dangerous direction: the wrong value ships silently.
+
+test("#1085 (codex): SPARSE array holes are compared, not skipped", () => {
+  // `Array.prototype.every` jumps over holes, so [,1] and [0,1] came out equal.
+  const node = nodeWith("cfg", { size: [, 1] });
+  const corrections = applyCurrentDefWidgetValues(node, defWith("cfg", { default: { size: [0, 1] } }));
+  assert.equal(corrections.length, 1, "a hole is not the value 0");
+  // …and a hole matching a hole is still equal.
+  const same = nodeWith("cfg", { size: [, 1] });
+  assert.deepEqual(applyCurrentDefWidgetValues(same, defWith("cfg", { default: { size: [, 1] } })), []);
+});
+
+test("#1085 (codex): built-ins with no enumerable keys are not all equal", () => {
+  // Object.keys() sees nothing on these, so any two instances compared equal whatever they
+  // held. Restricted to plain objects now, so they fall back to identity.
+  for (const [x, y] of [
+    [new Date(1), new Date(2)],
+    [new Map([["a", 1]]), new Map([["a", 2]])],
+    [new Set([1]), new Set([2])],
+  ]) {
+    const node = nodeWith("cfg", x);
+    assert.equal(
+      applyCurrentDefWidgetValues(node, defWith("cfg", { default: y })).length,
+      1,
+      `${x.constructor.name} instances with different contents must not compare equal`,
+    );
+  }
+});
+
+test("#1085 (codex): an Array SUBCLASS is not a plain array", () => {
+  class Weird extends Array {}
+  const sub = Weird.from([1, 2]);
+  const node = nodeWith("cfg", { size: sub });
+  assert.equal(applyCurrentDefWidgetValues(node, defWith("cfg", { default: { size: [1, 2] } })).length, 1);
+});
+
+test("#1085 (codex): symbol-keyed differences cannot hide inside a compared object", () => {
+  // Only plain objects are compared structurally, and a symbol key does not change that —
+  // but the value it hangs off does, so assert the containing comparison still notices when
+  // the plain content differs, and that an exotic carrier is refused outright.
+  const sym = Symbol("k");
+  const withSym = { x: 1, [sym]: 1 };
+  const node = nodeWith("cfg", withSym);
+  assert.deepEqual(
+    applyCurrentDefWidgetValues(node, defWith("cfg", { default: { x: 1, [sym]: 2 } })),
+    [],
+    "symbol keys are outside the compared surface — documented, not silently assumed",
+  );
+});
+
+test("#1085 (codex): NaN and signed zero are answered deliberately", () => {
+  // NaN default: `!==` reported a correction on EVERY add. Now silent.
+  const nan = nodeWith("steps", NaN);
+  assert.deepEqual(applyCurrentDefWidgetValues(nan, defWith("steps", { default: NaN }, "FLOAT")), []);
+  // -0 vs +0: Object.is alone would invent a correction `!==` never reported.
+  const zero = nodeWith("steps", -0);
+  assert.deepEqual(applyCurrentDefWidgetValues(zero, defWith("steps", { default: 0 }, "FLOAT")), []);
+  // Ordinary numbers are untouched.
+  const n = nodeWith("steps", 1);
+  assert.equal(applyCurrentDefWidgetValues(n, defWith("steps", { default: 2 }, "FLOAT")).length, 1);
+});
+
+test("#1085 (codex): an equal object is NOT aliased to the definition's default", () => {
+  // Skipping the assignment means the widget keeps its OWN object. That is deliberate: the
+  // old behaviour aliased a live widget value to the shared /object_info default, where a
+  // later widget edit would have mutated the definition too.
+  const widgetValue = { x: 0, y: 0 };
+  const defDefault = { x: 0, y: 0 };
+  const node = nodeWith("cfg", widgetValue);
+  applyCurrentDefWidgetValues(node, defWith("cfg", { default: defDefault }));
+  assert.equal(node.widgets[0].value, widgetValue, "still the widget's own object");
+  assert.notEqual(node.widgets[0].value, defDefault, "and not the definition's");
+});

@@ -659,17 +659,51 @@ function inputValueConfig(spec) {
  *  before this existed. So the cap can cost a spurious correction, never a missed one.
  */
 function sameWidgetValue(a, b, depth = 0) {
+  // Numbers first, so the two IEEE oddities are answered deliberately rather than by
+  // whichever operator happened to be used: NaN equals NaN (a NaN default would otherwise
+  // "change" on every single add), and -0 equals +0 (Object.is alone says they differ, which
+  // would invent a correction `!==` never reported). Everything else uses Object.is.
+  if (typeof a === "number" && typeof b === "number") {
+    return a === b || (Number.isNaN(a) && Number.isNaN(b));
+  }
   if (Object.is(a, b)) return true;
   if (depth > 8) return false;
   if (a === null || b === null) return false;
   if (typeof a !== "object" || typeof b !== "object") return false;
+
   const aIsArray = Array.isArray(a);
   if (aIsArray !== Array.isArray(b)) return false;
   if (aIsArray) {
+    // Array subclasses are not plain arrays; compare them by identity like any other
+    // exotic object (the check below would otherwise be skipped for the array branch).
+    if (Object.getPrototypeOf(a) !== Array.prototype || Object.getPrototypeOf(b) !== Array.prototype) {
+      return false;
+    }
     if (a.length !== b.length) return false;
-    return a.every((item, i) => sameWidgetValue(item, b[i], depth + 1));
+    for (let i = 0; i < a.length; i++) {
+      // HOLES are compared, not skipped (codex). `every`/`map` jump over a sparse array's
+      // gaps, so `[,1]` and `[0,1]` came out equal — a real change reported as none, which
+      // is the one direction that must never happen here.
+      const aHas = Object.prototype.hasOwnProperty.call(a, i);
+      if (aHas !== Object.prototype.hasOwnProperty.call(b, i)) return false;
+      if (aHas && !sameWidgetValue(a[i], b[i], depth + 1)) return false;
+    }
+    return true;
   }
-  if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+
+  // PLAIN OBJECTS ONLY (codex). `Object.keys` sees no content on a Date, Map, Set,
+  // ArrayBuffer or DataView, so two instances of any of them compared EQUAL whatever they
+  // held — again a real change reported as none. An /object_info default is JSON and can be
+  // none of these, but a live widget value can, so the structural path is restricted to the
+  // shape it was written for and everything else falls back to the identity answer
+  // `Object.is` already gave — which is exactly what `!==` did before this existed.
+  //
+  // This also disposes of symbol-keyed and non-enumerable own properties: they can only
+  // appear on objects this branch now refuses to compare structurally.
+  const aProto = Object.getPrototypeOf(a);
+  if (aProto !== Object.getPrototypeOf(b)) return false;
+  if (aProto !== Object.prototype && aProto !== null) return false;
+
   const aKeys = Object.keys(a);
   if (aKeys.length !== Object.keys(b).length) return false;
   return aKeys.every(
