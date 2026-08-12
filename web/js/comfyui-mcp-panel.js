@@ -13730,7 +13730,34 @@ const GRAPH_TOOL_EXECUTORS = {
       releaseCanvasInteractionLock(priorInteraction, canvasView);
     }
     if (openFailed) throw failOpen(openFailed);
-    if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);
+    if (rebindFailed) {
+      // #1089 follow-up — the foreign-source finding rides the FAILURE too.
+      //
+      // It was only on the success reply, and that dropped it on the combination that
+      // matters most: an open that ALSO fails content verification. #1111 is exactly
+      // that report — a mismatch WAS announced and the canvas was still the previous
+      // workflow's. The content warning tells the caller to re-read the graph; it does
+      // not tell them the state was another workflow's, which is the part that explains
+      // why the re-read will look perfectly plausible.
+      //
+      // Appended rather than folded into `describeOpenRebindOutcome`: that function is
+      // pure and knows only about the four proof parts, and this is a fact about the
+      // payload the load was handed. Keeping it out preserves that separation.
+      if (sourceForeign) {
+        rebindFailed = new Error(
+          `${coerceMessageText(rebindFailed.message ?? rebindFailed)} ALSO, AND SEPARATELY: this ` +
+            `tab's in-memory state carried a DIFFERENT open workflow's identity, and the repaint ` +
+            `read that state — so when you re-read the graph as advised above, treat "it does not ` +
+            `look like this workflow" as the LIKELY answer rather than a surprise, and compare ` +
+            `against what you expect this workflow to contain. panel_load_workflow with this ` +
+            `workflow's path loads the saved copy from disk, which is the one source that cannot ` +
+            `carry the other tab's graph. It REPLACES the canvas, and the modified flag does not ` +
+            `account for values a NODE wrote rather than you — a populated wildcard, a rolled seed ` +
+            `(#874) — so preserve anything you need to a NEW path first (#1089).`,
+        );
+      }
+      throw failOpenRebindUnknown(rebindFailed);
+    }
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",
       rid,

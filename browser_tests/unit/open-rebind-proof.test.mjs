@@ -1066,3 +1066,34 @@ test("#1089: the outcome is disclosed on its own key, both when corrected and wh
   assert.doesNotMatch(block, /RE-READ FROM DISK/);
   assert.doesNotMatch(block, /was therefore/);
 });
+
+test("#1089 follow-up: the foreign-source finding rides a FAILING open too", () => {
+  // It was only on the success reply. That dropped it on the combination that matters
+  // most — an open that ALSO fails content verification — which is exactly what #1111
+  // reported: a mismatch WAS announced and the canvas was still the previous
+  // workflow's. The content warning says "re-read the graph"; without this it never
+  // says the state was another workflow's, which is what makes the re-read look
+  // plausible rather than alarming.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = src.indexOf("if (rebindFailed) {");
+  assert.notEqual(at, -1, "the failure path must be a block, so the finding can be appended");
+  const block = src.slice(at, src.indexOf("throw failOpenRebindUnknown(rebindFailed);", at));
+  assert.match(block, /if \(sourceForeign\)/, "the failure path must consult the finding");
+  assert.match(block, /ALSO, AND SEPARATELY/, "it must read as a second, independent fact");
+  assert.match(block, /LIKELY answer/, "it must reframe the re-read the content warning already advises");
+  assert.match(block, /panel_load_workflow/, "the disk recovery is named");
+  assert.match(block, /#874/, "…with the node-written-values cost");
+  // The pure outcome helper must NOT learn about this: it knows only the four proof
+  // parts, and this is a fact about the payload the load was handed.
+  const gb = readFileSync(
+    fileURLToPath(new URL("../../web/js/lib/graph-binding.js", import.meta.url)),
+    "utf8",
+  );
+  const describeAt = gb.indexOf("export function describeOpenRebindOutcome");
+  assert.notEqual(describeAt, -1);
+  assert.doesNotMatch(
+    gb.slice(describeAt),
+    /sourceForeign/,
+    "describeOpenRebindOutcome must stay ignorant of the source-state question",
+  );
+});
