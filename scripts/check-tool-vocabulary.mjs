@@ -84,7 +84,35 @@ const vocab = JSON.parse(readFileSync(join(root, "vendor", "tool-vocabulary.json
 // orchestrator would report a mismatch that is not real — worse than no handshake at
 // all, and indistinguishable from a genuine skew.
 {
-  const baked = readFileSync(join(root, "web", "js", "lib", "vocabulary-hash.js"), "utf8");
+  // Read defensively (codex review, P2). A packaging or re-vendor change that drops
+  // this file must produce the checker's own FAIL — an uncaught ENOENT reads as the
+  // gate crashing, which is exactly the state where someone shrugs and reruns CI
+  // rather than noticing the pack is incomplete.
+  const bakedPath = join(root, "web", "js", "lib", "vocabulary-hash.js");
+  let baked;
+  try {
+    baked = readFileSync(bakedPath, "utf8");
+  } catch (err) {
+    console.error(
+      `
+[check-tool-vocabulary] FAIL
+
+` +
+        `Could not read web/js/lib/vocabulary-hash.js (${err?.code ?? err?.message ?? err}).
+
+` +
+        `The panel advertises this hash in its hello so the orchestrator can detect a
+` +
+        `tool-surface skew at connect (#236). Without the file the panel advertises
+` +
+        `nothing and every connection reads "unverified". Restore it with:
+
+` +
+        `  export const VENDORED_VOCABULARY_HASH = "${vocab.vocabularyHash}";
+`,
+    );
+    process.exit(1);
+  }
   const m = baked.match(/VENDORED_VOCABULARY_HASH\s*=\s*"([0-9a-f]{64})"/);
   if (!m) {
     console.error(
