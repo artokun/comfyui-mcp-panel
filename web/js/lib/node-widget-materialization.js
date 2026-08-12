@@ -694,6 +694,13 @@ function isArrayIndexKey(key) {
  *  `!==` answered before this existed — a spurious correction at worst, never a missed one.
  *  A CYCLE is the one case that is decided rather than refused: re-encountering a pair means
  *  the traversal closed a loop, and two structures that agree everywhere else agree there.
+ *
+ *  ON HANGING PROXY TRAPS, since a structural compare reads what `!==` did not: for an
+ *  OBJECT-valued widget this exposure is not new. `!==` was true for every object, so a
+ *  correction was always recorded, and the caller's disclosure interpolates
+ *  `JSON.stringify(c.from)` — which invokes the same ownKeys/get/getOwnPropertyDescriptor
+ *  traps. A non-returning trap already hung there. Comparing first REDUCES the exposure:
+ *  when the values are equal there is now no correction, so nothing is stringified.
  */
 function sameWidgetValue(a, b) {
   // GUARDED ENTRY (codex). Everything below can touch a live widget value, and a live value
@@ -731,11 +738,23 @@ function sameWidgetValueDeep(a, b, seen) {
   // reassigned, re-aliasing the widget to the definition's object. There is no depth at
   // which that is the right answer.
   //
-  // Tracking the (a, b) pairs already being compared on this path bounds a cycle EXACTLY,
-  // with no ceiling on a finite one. Re-encountering a pair means the traversal has closed a
-  // loop, and the standard reading is the co-inductive one: the pair is equal unless
-  // something else on the path proves otherwise. A stack deep enough to overflow still ends
-  // in the guarded entry's catch, which answers "different".
+  // Tracking the (a, b) pairs already compared bounds a cycle EXACTLY, with no ceiling on a
+  // finite structure. Re-encountering a pair means the traversal closed a loop, and the
+  // standard reading is co-inductive: the pair is equal unless something else proves
+  // otherwise. A stack deep enough to overflow still ends in the guarded entry's catch,
+  // which answers "different".
+  //
+  // Pairs are retained for the WHOLE traversal, not just the current path (codex) — that is
+  // ordinary bisimulation and is what makes sibling branches cheap; it is stated here
+  // because "on this path" was the wrong description of it.
+  //
+  // ACCEPTED LIMIT of that reading: it compares SHAPE, not aliasing topology. A self-cycle
+  // (`a.self === a`) and a two-object mutual cycle (`b.self = c; c.self = b`) are bisimilar
+  // and compare EQUAL though the objects differ. Unreachable in this function's actual job:
+  // the value being compared against is `config.default`, which comes from /object_info and
+  // is therefore JSON — and JSON cannot express a cycle at all. Recorded rather than fixed,
+  // because distinguishing topologies costs real complexity for a case the input format
+  // rules out.
   let partners = seen.get(a);
   if (partners?.has(b)) return true;
   if (!partners) seen.set(a, (partners = new Set()));

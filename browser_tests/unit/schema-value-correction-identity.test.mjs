@@ -327,10 +327,10 @@ test("#1085 (codex r4): a revoked or throwing PROXY answers 'different', never t
 });
 
 test("#1085 (codex r4): a DEEP but finite equal default is not falsely corrected", () => {
-  // The cap was 8, so any structurally-equal default nested beyond nine levels reported a
-  // spurious correction — the very thing this fix exists to remove — and then reassigned,
-  // re-aliasing the widget to the definition's object. The cap now exists only to bound a
-  // cycle, well past any real widget default.
+  // Two successive depth caps (8, then 100) each reported a spurious correction for any
+  // structurally-equal default nested past them — the very thing this fix removes — and then
+  // reassigned, re-aliasing the widget to the definition's object. There is no cap now;
+  // cycles are detected directly, so depth is unbounded for a finite structure.
   const deep = (n) => (n === 0 ? { leaf: 1 } : { nest: deep(n - 1) });
   const node = nodeWith("cfg", deep(30));
   assert.deepEqual(
@@ -351,4 +351,24 @@ test("#1085 (codex r4): a DEEP but finite equal default is not falsely corrected
   while (cur.nest) cur = cur.nest;
   cur.leaf = 2;
   assert.equal(applyCurrentDefWidgetValues(changed, defWith("cfg", { default: other })).length, 1);
+});
+
+test("#1085 (codex r5): ACCEPTED LIMIT — bisimilar cycles of different topology compare equal", () => {
+  // A self-cycle and a two-object mutual cycle are bisimilar: same shape at every step,
+  // different objects. This comparator calls them equal. Asserted rather than left silent,
+  // so the limit is visible to whoever reads this next.
+  //
+  // Unreachable in this function's actual job: the other side is always `config.default`,
+  // which comes from /object_info and is therefore JSON — and JSON cannot express a cycle.
+  const selfCycle = { x: 0 };
+  selfCycle.self = selfCycle;
+  const b = { x: 0 };
+  const c = { x: 0 };
+  b.self = c;
+  c.self = b;
+  assert.deepEqual(
+    applyCurrentDefWidgetValues(nodeWith("cfg", selfCycle), defWith("cfg", { default: b })),
+    [],
+    "documented limit: shape is compared, aliasing topology is not",
+  );
 });
