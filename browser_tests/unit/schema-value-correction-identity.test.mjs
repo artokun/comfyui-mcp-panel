@@ -99,22 +99,29 @@ test("#1085: null and undefined are not confused with an empty object", () => {
   assert.equal(applyCurrentDefWidgetValues(nodeWith("cfg", undefined), defWith("cfg", { default: null })).length, 1);
 });
 
-test("#1085: a CYCLIC live value fails toward today's behaviour, never a crash", () => {
-  // An /object_info default cannot be cyclic, but a live widget value could be. The first
-  // version of this test never reached the cycle — it bailed on a key-count mismatch one
-  // level in, so it would have passed with no depth cap at all (codex). Both sides now
-  // MATCH structurally all the way down, so the traversal really does recurse and only the
-  // depth cap ends it.
+test("#1085: a CYCLIC value terminates, and two identical cycles are equal", () => {
+  // An /object_info default cannot be cyclic, but a live widget value could be. This used to
+  // assert a spurious correction, because a depth CAP answered "different" for anything past
+  // it. Cycle detection replaced the cap, so the honest answer is available: two structures
+  // that close the same loop and agree everywhere else are equal.
   const cyclic = { x: 0 };
   cyclic.self = cyclic;
   const otherCyclic = { x: 0 };
   otherCyclic.self = otherCyclic;
-  const node = nodeWith("cfg", cyclic);
   let corrections;
   assert.doesNotThrow(() => {
-    corrections = applyCurrentDefWidgetValues(node, defWith("cfg", { default: otherCyclic }));
+    corrections = applyCurrentDefWidgetValues(nodeWith("cfg", cyclic), defWith("cfg", { default: otherCyclic }));
   });
-  assert.equal(corrections.length, 1, "the cap answers 'different' — a spurious correction, never a hang");
+  assert.deepEqual(corrections, [], "identical cycles are not a change");
+
+  // A cycle that differs OUTSIDE the loop is still a change, so this is not "cycles are
+  // always equal".
+  const differing = { x: 9 };
+  differing.self = differing;
+  assert.equal(
+    applyCurrentDefWidgetValues(nodeWith("cfg", cyclic), defWith("cfg", { default: differing })).length,
+    1,
+  );
 });
 
 test("#1085 (codex r3): non-index own keys and huge sparse arrays are handled", () => {
@@ -312,9 +319,11 @@ test("#1085 (codex r4): a revoked or throwing PROXY answers 'different', never t
       },
     },
   );
+  let hostileCorrections;
   assert.doesNotThrow(() => {
-    applyCurrentDefWidgetValues(nodeWith("cfg", hostile), defWith("cfg", { default: { x: 1 } }));
+    hostileCorrections = applyCurrentDefWidgetValues(nodeWith("cfg", hostile), defWith("cfg", { default: { x: 1 } }));
   });
+  assert.equal(hostileCorrections.length, 1, "a throwing trap also ANSWERS 'different', not just survives");
 });
 
 test("#1085 (codex r4): a DEEP but finite equal default is not falsely corrected", () => {
@@ -328,6 +337,12 @@ test("#1085 (codex r4): a DEEP but finite equal default is not falsely corrected
     applyCurrentDefWidgetValues(node, defWith("cfg", { default: deep(30) })),
     [],
     "30 levels of identical structure is not a change",
+  );
+  // Far past BOTH retired caps (8, then 100), which is the point: there is no depth at
+  // which two equal structures should be called different.
+  assert.deepEqual(
+    applyCurrentDefWidgetValues(nodeWith("cfg", deep(400)), defWith("cfg", { default: deep(400) })),
+    [],
   );
   // A difference at the bottom of that same depth is still found.
   const changed = nodeWith("cfg", deep(30));
