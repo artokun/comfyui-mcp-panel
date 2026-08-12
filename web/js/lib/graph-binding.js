@@ -2323,10 +2323,16 @@ export function graphBindingRefusalMessage(verdict) {
   // this refusal stands the repair that would refresh it is itself blocked, and the
   // retry fails identically. A reload is the step known to break the loop.
   const finalRemedy = emptyBaseline ? emptyBaselineRemedy() : remedy;
-  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation} ${cause} ${finalRemedy}`.replace(
-    /\s+/g,
-    " ",
+  // Join the non-empty parts rather than collapsing whitespace across the whole
+  // string. The collapse was only there to absorb the empty `cause` in this branch,
+  // and review was right that it overreached: it rewrote INTERPOLATED content too
+  // (verdict.reason, the existing remedy), so a value carrying meaningful newlines or
+  // repeated spaces would have been silently reflowed. This change is scoped to the
+  // claim and the remedy; it has no business touching either of those.
+  const parts = [emptyBaseline ? expectation : `${expectation}.`, cause, finalRemedy].filter(
+    (s) => typeof s === "string" && s.trim() !== "",
   );
+  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${parts.join(" ")}`;
 }
 
 /**

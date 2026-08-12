@@ -123,3 +123,19 @@ test("#803 WIRING: the ordinary size-disagreement wording survives", () => {
   const src = readFileSync(join(ROOT, "web/js/lib/graph-binding.js"), "utf8");
   assert.match(src, /it is bound to a `? ?\+?\s*`?different graph/);
 });
+
+test("#803 WIRING: interpolated content is not reflowed", () => {
+  // The empty `cause` in this branch was absorbed with a global whitespace collapse,
+  // which also rewrote verdict.reason and the existing remedy — a disclosure regression
+  // outside this change's stated scope (review). Non-empty parts are joined instead.
+  //
+  // Asserted with plain string containment: a regex spanning a line break here is how
+  // this test got written wrong twice.
+  const src = readFileSync(join(ROOT, "web/js/lib/graph-binding.js"), "utf8");
+  assert.ok(
+    !src.includes('.replace(\n    /\\s+/g,'),
+    "the whole-message whitespace collapse must be gone",
+  );
+  assert.ok(src.includes("const parts = [emptyBaseline ? expectation :"));
+  assert.ok(src.includes('parts.join(" ")'));
+});
