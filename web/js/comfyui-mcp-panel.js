@@ -772,6 +772,20 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  *
  * So the budget is halved against the READ default rather than the command budget: two
  * serialized runs must fit inside it with margin, and one run has to be worth making.
+ *
+ * WHAT THIS COSTS, stated rather than left for someone to discover. 2733ms per attempt is
+ * 16x the 167ms measured on a 63-pack install (#767) and 7.5x the ~366ms measured live on
+ * 4304 types — but an install whose /object_info consistently takes LONGER than that fails
+ * all three attempts and gets `object_info_fetch_failed`, where an unbounded main would
+ * eventually have succeeded. That is a real narrowing, and it is the direction this repo
+ * has regressed in before: refusing something main serves.
+ *
+ * It is accepted here because the alternative is the reported bug — a command that never
+ * ends — and because the refusal is recoverable and worded, where the hang is neither. The
+ * number to revisit is this budget, not the per-attempt bound: two serialized runs must
+ * still fit the read default, so raising it is bounded at about 9800ms (3000ms per
+ * attempt), which is not much. A genuinely slow install needs the attempts to ESCALATE
+ * rather than the budget to grow, and that is a bigger change than this issue.
  */
 const BRIDGE_READ_DEFAULT_MS = 20000;
 const NODE_DEFS_RETRY_BUDGET_MS = 9000;
