@@ -35,6 +35,7 @@
 // grown a frontend-injected `upload` input, and #700's error comes back.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -61,6 +62,10 @@ import {
 // unavailable", which is how this harness caught the omission.
 import { isRegisteredNodeType } from "../../web/js/lib/node-resolve.js";
 import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
+
+// #1180 — mirrors the panel's module-scope sentinel so the rebuilt executor compares
+// against the same value the bounded fetch resolves.
+const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -224,8 +229,29 @@ function realGraphAddNode(comfy, overrides = {}) {
     isRegisteredNodeType,
     fetchSingleNodeDef,
     describeUnmaterializedRequiredWidgets,
+    // #1180 — the panel's bounded api.getNodeDefs() and its sentinel. Module-scope in the
+    // real file; this harness rebuilds the executor in a synthetic scope, so they are
+    // injected. Real withTimeout, so the bound is exercised rather than stubbed away.
+    NODE_DEFS_NO_ANSWER,
     ...overrides,
   };
+  // Resolved from `deps` at CALL time: tests pass their own `api` through overrides, and a
+  // helper closed over the default would call the wrong one.
+  if (!("boundedGetNodeDefs" in deps)) {
+    deps.boundedGetNodeDefs = (timeoutMs = 10000) => {
+      const live = deps.api;
+      if (typeof live?.getNodeDefs !== "function") return Promise.resolve(null);
+      return withTimeout(
+        Promise.resolve().then(() => live.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+        timeoutMs,
+        () => NODE_DEFS_NO_ANSWER,
+      ).then((settled) => {
+        if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+        if ("err" in settled) throw settled.err;
+        return settled.value;
+      });
+    };
+  }
 
   const names = Object.keys(deps);
   const factory = new Function(

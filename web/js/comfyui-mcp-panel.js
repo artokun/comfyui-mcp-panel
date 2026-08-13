@@ -71,6 +71,9 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
+// #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
+// it is how this repo keeps producing near-duplicate bugs, per that file's own header.
+import { withTimeout } from "./lib/bounded-step.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
@@ -722,6 +725,58 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
   recordOpenReceipt(openReceipts, receipt);
   return receipt;
 }
+/**
+ * #1180 — how long any ONE `api.getNodeDefs()` may take before the caller gives up on it.
+ *
+ * #1161 established the failure: after a ComfyUI restart the tab can hold a half-open
+ * connection, so `api.getNodeDefs()` never settles — it does not throw, it simply never
+ * answers. That issue bounded the `/object_info` oracle, which fixed `set_widget`; the
+ * sibling call sites were left unbounded and still hang, which is the worse shape of the
+ * two because it makes the behaviour hard to report: after a restart, setting a widget
+ * works and adding a node does not.
+ *
+ * SIZED FROM THE SAME MEASUREMENT, not a fresh guess. The bounded work is one call for the
+ * whole node-definition document: measured in this repo at 5,413,770 bytes / 167 ms on a
+ * 63-pack install (#767), and live at ~366ms on a 4304-type install while fixing #1161.
+ * 10s is roughly 27x the slowest of those and matches the share #1161's oracle gives its
+ * own client route, so the two paths agree about what "too long" means. It stays well
+ * inside the bridge's 30s command budget, so the caller sees its own refusal rather than a
+ * bare timeout naming nothing.
+ *
+ * Do NOT re-size this from the ~14.5s figure in #610: that measures the forced refresh —
+ * the download plus registerNodesFromDefs plus rebuilding every combo — which is a
+ * different operation. Sizing a bound from it cost #1161 three review rounds.
+ */
+const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
+
+/** Sentinel: this call did not answer in time, as distinct from anything it could return. */
+const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+
+/**
+ * `api.getNodeDefs()`, bounded. Resolves the sentinel when the call does not answer, so a
+ * caller can tell "never answered" apart from "answered nothing" — the distinction #982
+ * was about, and the reason this does not simply resolve null for both.
+ */
+async function boundedGetNodeDefs(timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) {
+  if (typeof api?.getNodeDefs !== "function") return null;
+  // REIFY BEFORE BOUNDING. `withTimeout` never rejects by contract — it degrades a
+  // rejection through `onTimeout()` exactly as it does a timeout — so wrapping the call
+  // directly would collapse "it threw" into "it never answered" and lose the error. The
+  // refresh path attributes a getNodeDefs throw to the fetch, with its detail, and existing
+  // tests pin that wording; a first version of this swallowed it with `.catch(() => null)`
+  // and broke four of them. Same shape #1161's oracle uses, for the same reason.
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(() => api.getNodeDefs())
+      .then((value) => ({ value }), (err) => ({ err })),
+    timeoutMs,
+    () => NODE_DEFS_NO_ANSWER,
+  );
+  if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+  if ("err" in settled) throw settled.err;
+  return settled.value;
+}
+
 // Monotonic "now" — performance.now() when available (never runs backwards),
 // falling back to Date.now() only if the environment lacks it.
 function monotonicNow() {
@@ -856,7 +911,20 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // and fatal to a tool call. Bounded (~800ms worst case) because this blocks the call,
       // and the LAST error is rethrown so a genuine outage still reports what it always did.
       // (~800ms is the added WAITING; the three requests themselves are unbounded — codex.)
-      defs = await fetchNodeDefsWithRetry(() => api.getNodeDefs());
+      // #1180 — each ATTEMPT is bounded, not just the waiting between them. The comment
+      // above is explicit that the ~800ms is added waiting and "the three requests
+      // themselves are unbounded", so one half-open connection parked `panel_refresh_nodes`
+      // indefinitely: the retry loop only advances once an attempt SETTLES, and this one
+      // never did. A bounded attempt that does not answer is a failed attempt, which is
+      // exactly what the retry loop is for — so a transient stall now costs a retry
+      // instead of the whole command, and a genuine outage still rethrows as before.
+      defs = await fetchNodeDefsWithRetry(async () => {
+        const result = await boundedGetNodeDefs();
+        if (result === NODE_DEFS_NO_ANSWER) {
+          throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_FETCH_TIMEOUT_MS}ms`);
+        }
+        return result;
+      });
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -10105,9 +10173,14 @@ const GRAPH_TOOL_EXECUTORS = {
             return freshDefs;
           }
         }
-        freshDefs = recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-        );
+        // #1180 — BOUNDED. Unbounded, a half-open connection after a ComfyUI restart hung
+        // `graph_add_node` here until the caller's own 30s timeout, which is the #1161
+        // failure this command was left out of. A call that does not answer is treated as
+        // one that answered nothing: `recordObjectInfoTypes(null)` yields no defs, and the
+        // add then fails closed on the same path an empty payload already takes, rather
+        // than parking.
+        const whole = await boundedGetNodeDefs();
+        freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
@@ -10161,7 +10234,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // and #780's 1,667x saving is kept for every add that does not need it.
     const widenSocketProof = freshDefsAreSingleClass
       ? async () => {
-          const whole = typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null;
+          // #1180 — BOUNDED, and the timeout lands on the SAFE side by construction. This
+          // helper already answers null for every doubtful payload, and the caller keeps
+          // the proof it holds when it gets null; a call that never answers is the most
+          // doubtful case there is, so it takes that same path. Unbounded, this hung the
+          // add on the very path that was about to refuse — the worst place to park,
+          // because the user is already being told something went wrong.
+          const fetched = await boundedGetNodeDefs();
+          const whole = fetched === NODE_DEFS_NO_ANSWER ? null : fetched;
           // "I did not find out" is not "nothing outputs anything", and the difference
           // matters because the caller REPLACES its proof with whatever comes back.
           // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is

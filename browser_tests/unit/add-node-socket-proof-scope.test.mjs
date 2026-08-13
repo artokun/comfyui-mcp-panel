@@ -34,6 +34,7 @@
 // entirely in which payload the CALL SITE hands to which question.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -180,6 +181,10 @@ function makeComfy() {
   return { app, LG, graph, registry };
 }
 
+// #1180 — mirrors the panel's module-scope sentinel so the rebuilt executor can compare
+// against the same value the bounded fetch resolves.
+const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
 function realGraphAddNode(comfy, overrides = {}) {
   const { app, LG, graph } = comfy;
@@ -227,8 +232,33 @@ function realGraphAddNode(comfy, overrides = {}) {
     isRegisteredNodeType,
     fetchSingleNodeDef,
     describeUnmaterializedRequiredWidgets,
+    // #1180 — the panel's bounded `api.getNodeDefs()` and its timeout sentinel. Both are
+    // module-scope in the real file; this harness rebuilds `graph_add_node` in a synthetic
+    // scope, so every collaborator it names has to be injected here. Real `withTimeout`, so
+    // the bound is exercised rather than stubbed away.
+    NODE_DEFS_NO_ANSWER,
     ...overrides,
   };
+
+  // Resolved from `deps` at CALL time, not closed over the `api` above: several tests pass
+  // their own `api` through `overrides` to drive the widen (null / {} / non-object), and a
+  // helper bound to the default would quietly call the wrong one and report the default's
+  // healthy schema instead of the payload under test.
+  if (!("boundedGetNodeDefs" in deps)) {
+    deps.boundedGetNodeDefs = (timeoutMs = 10000) => {
+      const live = deps.api;
+      if (typeof live?.getNodeDefs !== "function") return Promise.resolve(null);
+      return withTimeout(
+        Promise.resolve().then(() => live.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+        timeoutMs,
+        () => NODE_DEFS_NO_ANSWER,
+      ).then((settled) => {
+        if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+        if ("err" in settled) throw settled.err;
+        return settled.value;
+      });
+    };
+  }
 
   const names = Object.keys(deps);
   const factory = new Function(

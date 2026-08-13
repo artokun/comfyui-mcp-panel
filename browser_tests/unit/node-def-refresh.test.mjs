@@ -15,6 +15,25 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { fetchNodeDefsWithRetry } from "../../web/js/lib/object-info-retry.js";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
+
+// #1180 — the panel bounds each getNodeDefs attempt and throws on the sentinel so the
+// retry loop treats a stalled attempt as a failed one. Both names are module-scope in
+// the real file, so this harness injects them alongside the collaborators it already does.
+const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
+const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) =>
+  typeof apiValue?.getNodeDefs !== "function"
+    ? Promise.resolve(null)
+    : withTimeout(
+        Promise.resolve().then(() => apiValue.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+        timeoutMs,
+        () => NODE_DEFS_NO_ANSWER,
+      ).then((settled) => {
+        if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+        if ("err" in settled) throw settled.err;
+        return settled.value;
+      });
 
 /** #716 — records invalidate() calls so a test can assert the refresh drops the cache. */
 let cacheInvalidations = 0;
@@ -356,8 +375,24 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
     "fetchNodeDefsWithRetry",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
     "objectInfoCache",
-    `let nodeDefsRefreshConfirmed = false;
+    `// #1180 — defined HERE, from the api this scope already has, so each factory site
+     // gets its own stub without threading a helper through every call.
+     const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
+       if (typeof api?.getNodeDefs !== "function") return null;
+       const settled = await withTimeout(
+         Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+         ms,
+         () => NODE_DEFS_NO_ANSWER,
+       );
+       if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+       if ("err" in settled) throw settled.err;
+       return settled.value;
+     };
+     let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
   );
@@ -369,6 +404,9 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     describeNodeDefRefresh,
     // No real waiting: the delays are the shipped ones, the sleep is not.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,
@@ -482,8 +520,24 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
     "fetchNodeDefsWithRetry",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
     "objectInfoCache",
-    `let nodeDefsRefreshConfirmed = false;
+    `// #1180 — defined HERE, from the api this scope already has, so each factory site
+     // gets its own stub without threading a helper through every call.
+     const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
+       if (typeof api?.getNodeDefs !== "function") return null;
+       const settled = await withTimeout(
+         Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+         ms,
+         () => NODE_DEFS_NO_ANSWER,
+       );
+       if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+       if ("err" in settled) throw settled.err;
+       return settled.value;
+     };
+     let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs };`,
   );
@@ -503,6 +557,9 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     describeNodeDefRefresh,
     // No real waiting: the shipped delays, an instant sleep.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,
@@ -542,8 +599,24 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
     "fetchNodeDefsWithRetry",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
     "objectInfoCache",
-    `let nodeDefsRefreshConfirmed = false;
+    `// #1180 — defined HERE, from the api this scope already has, so each factory site
+     // gets its own stub without threading a helper through every call.
+     const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
+       if (typeof api?.getNodeDefs !== "function") return null;
+       const settled = await withTimeout(
+         Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+         ms,
+         () => NODE_DEFS_NO_ANSWER,
+       );
+       if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+       if ("err" in settled) throw settled.err;
+       return settled.value;
+     };
+     let nodeDefsRefreshConfirmed = false;
      ${body}
      return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
   );
@@ -561,6 +634,9 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     describeNodeDefRefresh,
     // No real waiting: the shipped delays, an instant sleep.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,

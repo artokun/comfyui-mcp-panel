@@ -135,8 +135,17 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   const call = body.indexOf("fetchSingleNodeDef(class_type");
   assert.ok(guard > 0, "the registered-type gate must be present");
   assert.ok(call > guard, "…and the single-class fetch must sit INSIDE it");
-  // The full fetch must still be there as the fallback, unchanged.
-  assert.match(body, /api\?\.getNodeDefs === "function" \? await api\.getNodeDefs\(\) : null/);
+  // The full fetch must still be there as the fallback. #1180 bounded it — a half-open
+  // connection after a restart hung `graph_add_node` here — so the shape is now the
+  // bounded call rather than a bare `await api.getNodeDefs()`. What this pins is that the
+  // WHOLE-schema fallback still exists behind the gate, which is the safety property; the
+  // literal it used to match was incidental to that.
+  assert.match(body, /await boundedGetNodeDefs\(\)/, "the whole-schema fallback must still be there");
+  assert.match(
+    body,
+    /NODE_DEFS_NO_ANSWER \? null :/,
+    "…and a call that never answers must degrade to 'no defs', not park the add",
+  );
   // And the snapshot must be taken on BOTH paths — #700 turns on it.
   assert.equal(
     (body.match(/snapshotBackendDef\(freshDefs, class_type\)/g) ?? []).length,
