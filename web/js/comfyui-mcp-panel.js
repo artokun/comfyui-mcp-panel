@@ -983,6 +983,9 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let defsRegistered = false;
   let comboApiPresent = false;
   let comboRan = false;
+  // Whether the combo phase FAILED, tracked apart from the value it failed with — see the
+  // note at the assignment. A falsy rejection is still a failure.
+  let comboFailed = false;
   let phase = "fetch";
   // #1180 — ONE deadline for this whole run. Every bounded phase below draws from what is
   // left of it, so the run's cost is this budget rather than the sum of numbers that each
@@ -1212,6 +1215,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
       );
       comboRan = comboSettled === COMBO_OK;
       if (!comboRan) {
+        // A SEPARATE FLAG, for the third time on this path and the same reason each time:
+        // `throw null` and `throw undefined` are failures a backend can really produce, so
+        // a falsy `thrown` cannot mean "nothing failed". Reading the phase guard below off
+        // `thrown` alone put #635's hole back at this new site — a combo that rejected with
+        // a falsy value advanced the phase to "done" and vanished from the verdict's
+        // `failed` test. The `!comboRan` backstop still names the right reason, which is
+        // exactly why this was invisible.
+        comboFailed = true;
         // `thrown` is provably null here: a throw inside this try would have jumped to the
         // catch. The `?? ` that used to guard this assignment could never fire.
         thrown =
@@ -1233,7 +1244,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // fact just succeeded a few lines above. The comment that used to sit here asserted
     // the opposite outcome, `combo_refresh_failed`, which the code has never produced:
     // `thrown` is set without `didThrow`, and the verdict's `failed` test accepts either.
-    if (!thrown) phase = "done";
+    if (!comboFailed) phase = "done";
   } catch (e) {
     thrown = e;
     didThrow = true;

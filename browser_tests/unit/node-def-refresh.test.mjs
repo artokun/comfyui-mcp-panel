@@ -773,7 +773,7 @@ test("#1180: the shipped combo phase is bounded, and its outcomes stay apart", (
   // `phase: "combo"` and concluded `combo_refresh_failed`. The shipped code was sending
   // `phase: "done"`, so the one scenario the test appeared to prove was a state the panel
   // never reached. A test may not supply the input whose production is the thing in doubt.
-  const combo = SRC.slice(SRC.indexOf('phase = "combo";'), SRC.indexOf('if (!thrown) phase = "done";'));
+  const combo = SRC.slice(SRC.indexOf('phase = "combo";'), SRC.indexOf('if (!comboFailed) phase = "done";'));
   assert.ok(combo.length > 0, "could not locate the combo phase");
   assert.match(
     combo,
@@ -801,8 +801,16 @@ test("#1180: the shipped combo phase is bounded, and its outcomes stay apart", (
   // names the wrong cause entirely.
   assert.match(
     SRC,
-    /if \(!thrown\) phase = "done";/,
+    /if \(!comboFailed\) phase = "done";/,
     "an unconditional done here reports a combo failure as register_failed",
+  );
+  // …and the guard must read a FLAG, not the thrown value. `throw null` is a real failure,
+  // so `if (!thrown)` let a falsy combo rejection advance the phase and vanish from the
+  // verdict's `failed` test — #635's hole, reopened at a new site.
+  assert.match(
+    combo,
+    /comboFailed = true;/,
+    "a falsy combo rejection must still register as a failure",
   );
 });
 
@@ -1060,4 +1068,36 @@ test("#1180: with two real errors before a stall, the LAST one is reported", asy
   assert.match(verdict.detail, /502 from the proxy/, "the most recent real failure is the one to report");
   assert.doesNotMatch(verdict.detail, /connection refused/, "…not the one the backend has since moved on from");
   assert.equal(calls, 3, "both cheap failures were retried; the stall ended the loop");
+});
+
+test("#1180: a combo refresh that rejects with a FALSY value is still a failure", async () => {
+  // #635's hole, reopened at the combo site. `if (!thrown) phase = "done"` reads the failure
+  // off the thrown VALUE, and `throw null` / `throw undefined` are failures a backend can
+  // really produce — so a falsy rejection advanced the phase to "done" and disappeared from
+  // the verdict's `failed` test.
+  //
+  // The `!comboRan` backstop still names combo_refresh_failed, which is exactly why this was
+  // invisible: the reason came out right while the phase was wrong. Asserting the phase is
+  // what catches it, so this checks the remedy text that only the combo phase produces.
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: async () => {
+        throw null; // a real failure whose value carries nothing
+      },
+    },
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "combo_refresh_failed", "a falsy rejection is still a combo failure");
+  assert.match(verdict.remedy, /combo lists/, "…and gets the combo remedy, not the registration one");
+  assert.doesNotMatch(
+    verdict.remedy,
+    /re-registering the node definitions failed/,
+    "registration succeeded here — blaming it is the defect this phase guard exists to prevent",
+  );
+  assert.equal(getConfirmed(), false, "an unrefreshed combo list must not be trusted");
 });
