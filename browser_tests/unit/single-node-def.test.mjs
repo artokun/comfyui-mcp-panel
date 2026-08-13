@@ -388,36 +388,64 @@ test("#1180: the widen's bound fits INSIDE the registration deadline it runs und
   );
 });
 
-test("#1180: graph_add_node's bounds are SEQUENTIAL and must sum inside the command budget", () => {
-  // The individual constants were pinned only by a loose `< 30000` range check, which each
-  // one passes at 29,000ms while three of them together consume the budget several times
-  // over. What actually matters is the worst case of ONE add, and these bounds run in
-  // sequence: the fast path first, the whole-schema fallback when it does not confirm, then
-  // the widen when the proof is single-class.
+test("#1180: graph_add_node's bounds are SEQUENTIAL, and their sum is tracked (#1192)", () => {
+  // This test used to assert `single + single + widen < 30000` and pass, which was wrong in
+  // both directions. It omitted the two terms that dominate — the refresh run, paid TWICE
+  // because makeRefreshCoalescer waits for the in-flight run before starting its own, and
+  // the custom-widget registration wait — so it certified an arithmetic the path does not
+  // perform. A budget test that models the wrong composition is worse than none: it reads
+  // as coverage.
+  //
+  // The real worst case EXCEEDS the command budget, and that is filed as #1192 rather than
+  // fixed here. It is not a regression — before this issue these steps were unbounded, so
+  // the same path could hang forever. The purpose of this test is now to stop the sum
+  // GROWING while #1192 is open.
   const src = readFileSync(PANEL_JS, "utf8");
-  const num = (re) => Number((src.match(re) || [])[1]);
-  const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/);
-  const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/);
-  // READ the divisor from source. Computing it here makes the test agree with itself
-  // rather than with the panel: changing the shipped `/ 2` to `/ 1` — which makes the
-  // widen exactly as long as the wait it runs inside — survived until this did.
-  const divisor = Number(
-    (src.match(/WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/) || [])[1],
-  );
-  assert.ok(divisor >= 2, `the widen must get a FRACTION of its caller's deadline, saw /${divisor}`);
-  const widen = Math.floor(registration / divisor);
-  assert.ok(single > 0 && registration > 0, "both constants must be findable");
+  const num = (re, what) => {
+    const m = src.match(re);
+    assert.ok(m, `${what} must be findable`);
+    return Number(m[1]);
+  };
+  const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/, "the single-call fetch bound");
+  const run = num(/const NODE_DEFS_RUN_BUDGET_MS = (\d+);/, "the refresh run budget");
+  const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/, "the registration deadline");
 
-  const worstCase = single + single + widen;
+  // Two paths, and the branch that skips the fast path is the expensive one.
+  //
+  // ALREADY REGISTERED: the fast path runs and, on a hang, times out and falls through to
+  // the whole-schema fetch — they compose rather than exclude each other, because a
+  // timeout is doubt and doubt takes the full fetch. No refresh: the type is registered.
+  const registeredPath = single + single + registration;
+  // NOT REGISTERED: no fast path (it is gated on already-registered), then the whole-schema
+  // fetch, then the resolver hands the payload to refreshComfyNodeDefs — which waits for
+  // any in-flight run and then performs its own, so the run budget is paid twice.
+  const unregisteredPath = single + run + run + registration;
+  const worstCase = Math.max(registeredPath, unregisteredPath);
+
+  // The widen is INSIDE the registration wait, not added to it — that is what its divisor
+  // is for — so it must not appear as a separate term.
+  const widen = Math.floor(
+    registration /
+      num(
+        /WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/,
+        "the widen divisor",
+      ),
+  );
+  assert.ok(widen < registration, "the widen is spent inside the registration wait, not alongside it");
+
+  // The known ceiling while #1192 is open. Not a target — a ratchet.
+  const TRACKED_CEILING_MS = 33000;
+  assert.ok(
+    worstCase <= TRACKED_CEILING_MS,
+    `one add's serialized bounds now sum to ${worstCase}ms, above the ${TRACKED_CEILING_MS}ms recorded in #1192 — ` +
+      "raising a bound on this path makes an already-over-budget command worse",
+  );
+  // …and the fact that it is over budget is stated, so nobody reads the pass above as fine.
   const COMMAND_BUDGET_MS = 30000;
   assert.ok(
-    worstCase < COMMAND_BUDGET_MS,
-    `one add can spend ${worstCase}ms on node-def fetches against a ${COMMAND_BUDGET_MS}ms budget`,
-  );
-  // And with real headroom, not by a hair: the add still has to build the node, wait for
-  // widget registration, and get its reply back through the bridge.
-  assert.ok(
-    worstCase <= COMMAND_BUDGET_MS * 0.8,
-    `${worstCase}ms leaves too little of the ${COMMAND_BUDGET_MS}ms budget for the rest of the add`,
+    worstCase > COMMAND_BUDGET_MS,
+    `#1192 says this path exceeds the ${COMMAND_BUDGET_MS}ms command budget; it now sums to ` +
+      `${worstCase}ms. If that is genuinely fixed, close #1192 and replace this with the ` +
+      "assertion that it FITS.",
   );
 });

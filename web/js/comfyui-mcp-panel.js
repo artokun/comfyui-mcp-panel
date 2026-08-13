@@ -1028,9 +1028,16 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // above is explicit that the ~800ms is added waiting and "the three requests
       // themselves are unbounded", so one half-open connection parked `panel_refresh_nodes`
       // indefinitely: the retry loop only advances once an attempt SETTLES, and this one
-      // never did. A bounded attempt that does not answer is a failed attempt, which is
-      // exactly what the retry loop is for — so a transient stall now costs a retry
-      // instead of the whole command, and a genuine outage still rethrows as before.
+      // never did. A bounded attempt that does not answer is a failed attempt, so a
+      // transient stall now costs ONE attempt instead of the whole command, and a genuine
+      // outage still rethrows as before.
+      //
+      // ONE attempt, not a retried one, and that is deliberate — see `shouldRetry` below.
+      // This sentence used to say a stall "costs a retry", which was true of an earlier
+      // version of this fix and stopped being true when the retry decision moved to the
+      // caller. A stalled attempt is still downloading, so retrying it races the retry
+      // against its own predecessor; the loop stops instead. Only failures that cost
+      // nothing — a connection refused while the backend restarts — get all three.
       //
       // ABANDONED ATTEMPTS ARE NOT CANCELLED, and this bound CREATES that. An earlier version
       // of this comment claimed the overlap predated it; that was wrong and worth correcting
