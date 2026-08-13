@@ -1018,8 +1018,10 @@ test("#695: graph_add_node consumes the report and message, and names the class"
   );
   assert.match(
     src,
-    /unavailableRequiredWidgetMessage\(unavailable, classType, Date\.now\(\) - startedAt\)/,
-    "the refusal is built from the report, with the elapsed wait",
+    // #1180 — monotonicNow, not Date.now. `startedAt` is read from the monotonic clock, so
+    // subtracting a wall-clock reading from it reports an elapsed wait of roughly 1.7e12 ms.
+    /unavailableRequiredWidgetMessage\(unavailable, classType, monotonicNow\(\) - startedAt\)/,
+    "the refusal is built from the report, with the elapsed wait — measured on ONE clock",
   );
   assert.match(
     src,

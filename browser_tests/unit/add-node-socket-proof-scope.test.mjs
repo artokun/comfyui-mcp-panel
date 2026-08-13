@@ -190,10 +190,35 @@ function makeComfy() {
 // #1180 — mirrors the panel's module-scope sentinel so the rebuilt executor can compare
 // against the same value the bounded fetch resolves.
 const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
-// #1180 — the widen runs inside the 5s custom-widget registration wait, so its bound is
-// half that rather than the generic node-defs bound, which would consume the whole wait.
-const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(5000 / 2);
-const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
+// #1180 — the widen runs inside the custom-widget registration wait, so its bound is a
+// FRACTION of that rather than the generic node-defs bound, which would consume the whole
+// wait. READ from the panel, never restated: this harness is what exercises the widen, and
+// a hardcoded `Math.floor(5000 / 2)` here went on passing no matter what the panel said —
+// the same recomputed-value trap the divisor assertion was added for, one level up.
+const widenSrcForConsts = readFileSync(
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  "utf8",
+);
+const readPanelNumber = (re, what) => {
+  const m = widenSrcForConsts.match(re);
+  if (!m) throw new Error(`${what} is no longer findable in the panel — update this harness`);
+  return Number(m[1]);
+};
+const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = readPanelNumber(
+  /const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/,
+  "the registration deadline",
+);
+const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(
+  CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS /
+    readPanelNumber(
+      /WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/,
+      "the widen divisor",
+    ),
+);
+const NODE_DEFS_FETCH_TIMEOUT_MS = readPanelNumber(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/, "the fetch bound");
+// The registration wait measures elapsed time on the monotonic clock; the rebuilt scope
+// needs the same function the panel uses.
+const monotonicNow = () => performance.now();
 
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
 function realGraphAddNode(comfy, overrides = {}) {
@@ -248,6 +273,7 @@ function realGraphAddNode(comfy, overrides = {}) {
     // the bound is exercised rather than stubbed away.
     NODE_DEFS_NO_ANSWER,
     WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+    monotonicNow,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     withTimeout,
     ...overrides,
@@ -651,4 +677,24 @@ test("#1180 EXECUTED: a widen whose getNodeDefs never answers returns rather tha
   );
   assert.equal(await settled(answering(5), "the 5ms bound"), NODE_DEFS_NO_ANSWER, "a 5ms bound must cut off a 30ms answer");
   assert.deepEqual(await settled(answering(1000), "the 1s bound"), { A: { output: ["T"] } }, "…and a 1s bound must not");
+});
+
+test("#1180: the registration wait measures itself on the monotonic clock", () => {
+  // This deadline gates #580's protection: it is how long the panel waits for a V3 class's
+  // custom widgets to finish registering before refusing to build the node. Measured on the
+  // wall clock, an NTP correction, a DST change or a VM resume between the two reads either
+  // ends the wait instantly — reporting widgets unmaterialised without ever having polled
+  // for them — or extends it past the command budget entirely.
+  //
+  // The panel already settled this question once, for the /object_info oracle, and it cost
+  // three review rounds. Asserted here because the fix is two characters and reverting it is
+  // invisible: the mutation back to Date.now() passed the entire suite.
+  const fn = widenSrcForConsts.slice(
+    widenSrcForConsts.indexOf("async function awaitRequiredCustomWidgetRegistration("),
+    widenSrcForConsts.indexOf("\n}", widenSrcForConsts.indexOf("async function awaitRequiredCustomWidgetRegistration(")),
+  );
+  assert.ok(fn.length > 0, "the registration wait must be findable");
+  assert.match(fn, /const startedAt = monotonicNow\(\);/, "the deadline must be taken on the monotonic clock");
+  assert.match(fn, /while \(monotonicNow\(\) < deadline\)/, "…and the poll must read the SAME clock it was set on");
+  assert.doesNotMatch(fn, /Date\.now\(\)/, "no wall-clock reading may survive in this function");
 });

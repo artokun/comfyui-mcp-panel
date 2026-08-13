@@ -8771,8 +8771,27 @@ const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
  * add would report unmaterialized widgets having never actually looked for them.
  *
  * Half the registration deadline, derived from it rather than picked, so the two cannot
- * drift apart. The widen is one whole-document fetch, measured at 167ms (#767) and ~366ms
- * live, so half of 5s is still an order of magnitude of headroom.
+ * drift apart.
+ *
+ * The widen runs BEFORE the polling loop and inside its deadline, so every millisecond it
+ * spends is one #580's wait does not get — which is why it takes a fraction and not the
+ * generic node-defs bound, and why it cannot simply be raised. The add path already
+ * composes to roughly 26.5s of bounds against the bridge's 30s command budget.
+ *
+ * WHAT THAT COSTS ON A SLOW LINK, stated because the earlier note here quietly implied it
+ * could not happen. This is one whole-document fetch. Measured on this rig today it is
+ * 7,440,820 bytes answering in 532ms — so the headroom is about 4.7x, not the order of
+ * magnitude claimed when the figures cited were #767's 167ms and a ~366ms live reading.
+ * The document grows with the installed pack count, and the panel supports a ComfyUI
+ * reached over a configured bridge URL rather than localhost. Where the whole schema takes
+ * longer than this bound, the widen is abandoned, the caller keeps its single-class proof,
+ * and #821's case comes back: a class is refused for a link datatype that a SIBLING node
+ * on the canvas already outputs.
+ *
+ * That is a real narrowing and it is accepted for the same reason as the rest of this
+ * issue — the refusal is worded and clears on a retry, where the hang it replaced was
+ * neither. What it is NOT is headroom, and the number to revisit when the add path's total
+ * has room is this one.
  */
 const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 2);
 
@@ -8785,7 +8804,12 @@ async function awaitRequiredCustomWidgetRegistration(
   widenSocketProof,
   liveNodeOfClass,
 ) {
-  const startedAt = Date.now();
+  // MONOTONIC, like every other elapsed-time measurement in this panel. On the wall clock
+  // an NTP correction, a DST change or a VM resume between these two reads either ends the
+  // wait instantly — reporting widgets unmaterialised without having polled for them — or
+  // extends it far past the command budget. This deadline gates #580's protection, so it
+  // is the wrong one to measure on a clock that can move.
+  const startedAt = monotonicNow();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   let socketTypes = knownSocketTypes;
   const check = () =>
@@ -8810,7 +8834,7 @@ async function awaitRequiredCustomWidgetRegistration(
       unavailable = check();
     }
   }
-  while (Date.now() < deadline) {
+  while (monotonicNow() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
     unavailable = check();
@@ -8845,7 +8869,7 @@ async function awaitRequiredCustomWidgetRegistration(
   // a message that says which input is stuck and which of the two causes it is, instead of
   // asserting the single cause that sent #695's reporter to the wrong place.
   throw new Error(
-    unavailableRequiredWidgetMessage(unavailable, classType, Date.now() - startedAt),
+    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt),
   );
 }
 
