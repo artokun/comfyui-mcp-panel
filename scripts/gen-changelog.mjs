@@ -85,14 +85,28 @@ function computePrevTag() {
       // The release commit wins only when it is a DESCENDANT of the tag. Ancestry, not
       // dates: a rebase or an out-of-order merge can leave a commit dated before a tag it
       // sits after, and "which contains which" is the question actually being asked.
+      // ONE `git log`, and its failure must not escape past the `return t` below. The first
+      // version of the warning re-ran this command outside the guard, so a throw skipped the
+      // return, hit the OUTER catch as "no version tags", and dropped the base to
+      // `rev-list --max-parents=0` — the first commit. That regenerates the entire history
+      // into one entry: the #932/#1191 catastrophe, caused by the diagnostic added to
+      // announce it. Not hypothetical either — execSync's default 1 MiB maxBuffer against an
+      // output already past 130 KB and growing with every commit, or any transient non-zero
+      // exit such as a concurrent gc holding index.lock.
+      let newestRelease = null;
+      let historyUnreadable = false;
       try {
-        const sha = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
-        if (sha) {
-          git(`merge-base --is-ancestor ${t} ${sha}`); // throws when it is NOT an ancestor
-          return sha;
-        }
+        newestRelease = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
       } catch {
-        /* the tag is at or ahead of the newest release commit — use the tag */
+        historyUnreadable = true;
+      }
+      if (newestRelease) {
+        try {
+          git(`merge-base --is-ancestor ${t} ${newestRelease}`); // throws when NOT an ancestor
+          return newestRelease;
+        } catch {
+          /* the tag is at or ahead of the newest release commit — use the tag */
+        }
       }
       // #1191 — SAY SO. Falling back to the tag is legitimate, and it is also exactly what
       // happens when this file has stopped recognising the repo's release commits — which
@@ -104,10 +118,11 @@ function computePrevTag() {
       //
       // A warning rather than a hard failure: a genuinely fresh tag is the normal case on a
       // repo that tags, and this script also runs inside `set-version.mjs` during a release.
-      const newestRelease = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
-      const detail = newestRelease
-        ? `newest release commit ${newestRelease.slice(0, 8)} is not a descendant of it`
-        : "NO commit in history is recognised as a release — the subject predicate may no longer match this repo's release shape (see scripts/lib/changelog-match.mjs)";
+      const detail = historyUnreadable
+        ? "the commit history could not be READ, so no release commit could be considered — this is a git failure, not a predicate one"
+        : newestRelease
+          ? `newest release commit ${newestRelease.slice(0, 8)} is not a descendant of it`
+          : "NO commit in history is recognised as a release — the subject predicate may no longer match this repo's release shape (see scripts/lib/changelog-match.mjs)";
       console.error(`changelog: WARNING — bounding the range at tag ${t}; ${detail}.`);
       console.error("changelog: if that is wrong, the entry below will re-list work that already shipped.");
       return t;
