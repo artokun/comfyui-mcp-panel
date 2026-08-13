@@ -1024,9 +1024,13 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   const endTurn = at(/^[ \t]*endTurnLocally\(\);/m);
   const reconnect = at(/^[ \t]*client\.start\(\);/m);
 
+  // EVERY probe gets a found-check. A `search` miss is -1, which silently satisfies
+  // "release > endTurn" and would let this test pass while asserting nothing about a
+  // statement that is no longer there.
   assert.notEqual(release, -1, `the guard \`${guard}\` must still be released`);
   assert.notEqual(reconnect, -1, "expected the reconnect");
   assert.notEqual(invalidate, -1, "expected the durable invalidation in the tail");
+  assert.notEqual(endTurn, -1, "expected the turn to be ended in the tail");
 
   // IN A `finally`, not merely before the reconnect. A plain assignment sitting between the
   // tail and client.start() satisfies every positional check below while LATCHING the flag

@@ -2214,8 +2214,15 @@ test('#1171 flush() SETTLES even when IndexedDB never answers', async () => {
   // `result.ok === true`, because the shadow write is complete. (An earlier comment here
   // claimed flush() got there by mapping a null result to true; that is a different branch
   // and not the one this case takes.)
+  //
+  // WORTH BEING PRECISE ABOUT WHAT THAT TRUE MEANS: the CANONICAL IndexedDB write did not
+  // happen — the open was capped — so success here rests on the local shadow alone. The
+  // panel's caller is named `invalidateDurableAgentSession`, and on this path it reports
+  // durable invalidation when only the shadow carries it. That is the store's existing
+  // contract rather than anything this branch changes, but it is the reason the word
+  // "durable" is doing less work than it looks like it is.
   assert.equal(result, true, 'a capped open must not read as a failed write for a small history')
-  store.close?.()
+  store.close()
 })
 
 test('#1171 a capped open reports failure exactly past the local shadow boundary', async () => {
@@ -2260,6 +2267,6 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
       assert.notEqual(result, true, `${label}: a partial shadow must not claim a durable write`)
       assert.equal(result?.ok, false, `${label}: and it reports why`)
     }
-    store.close?.()
+    store.close()
   }
 })
