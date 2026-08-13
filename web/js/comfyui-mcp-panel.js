@@ -8800,15 +8800,25 @@ const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
  * generic node-defs bound, and why it cannot simply be raised. The add path already
  * composes to roughly 26.5s of bounds against the bridge's 30s command budget.
  *
- * WHAT THAT COSTS ON A SLOW LINK, stated because the earlier note here quietly implied it
- * could not happen. This is one whole-document fetch. Measured on this rig today it is
- * 7,440,820 bytes answering in 532ms — so the headroom is about 4.7x, not the order of
- * magnitude claimed when the figures cited were #767's 167ms and a ~366ms live reading.
- * The document grows with the installed pack count, and the panel supports a ComfyUI
- * reached over a configured bridge URL rather than localhost. Where the whole schema takes
- * longer than this bound, the widen is abandoned, the caller keeps its single-class proof,
- * and #821's case comes back: a class is refused for a link datatype that a SIBLING node
- * on the canvas already outputs.
+ * WHAT THAT COSTS, stated because the earlier note here quietly implied it could not
+ * happen. This is one whole-document fetch. Measured on this rig, ComfyUI 0.32.0 with 4304
+ * types, and the three numbers disagree enough to be worth separating:
+ *
+ *     transfer alone (curl)                    7,440,820 bytes    532 ms
+ *     api.getNodeDefs() in the page, warm       median of 5       354 ms  (max seen 767)
+ *     api.getNodeDefs() in the page, COLD       first call       1062 ms
+ *
+ * The cold figure is the relevant one and it is the one nobody measured before: this runs
+ * during an add, which is typically the first whole-schema read after a page load or a
+ * backend restart. Against it, 2500ms is about 2.4x — not the 4.7x the transfer number
+ * suggests, and nowhere near the "order of magnitude" this comment used to claim from
+ * #767's 167ms and a ~366ms reading. The document also grows with the installed pack count
+ * (it was 5,413,770 bytes when #767 measured it), and the panel supports a ComfyUI reached
+ * over a configured bridge URL rather than localhost.
+ *
+ * Where the whole schema takes longer than this bound, the widen is abandoned, the caller
+ * keeps its single-class proof, and #821's case comes back: a class is refused for a link
+ * datatype that a SIBLING node on the canvas already outputs.
  *
  * That is a real narrowing and it is accepted for the same reason as the rest of this
  * issue — the refusal is worded and clears on a retry, where the hang it replaced was
