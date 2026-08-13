@@ -66,10 +66,40 @@ export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
 export const OBJECT_INFO_CACHE_TTL_MS = 1500;
 
 /**
+ * #1161 — how long a read will WAIT for a fetch before giving up on THIS call.
+ *
+ * Unbounded was the P1: after a ComfyUI restart the tab can hold a half-open connection,
+ * so `getNodeDefs()` never settles. `graph_set_widget` is the only command that consults
+ * /object_info before writing, so it alone parked forever — every other command on the
+ * same tab answered instantly, which is exactly how the report reads.
+ *
+ * The coalescing below is what made it permanent rather than transient: a hung request
+ * stays in the `inflight` slot, so every later read JOINS the same dead promise instead
+ * of issuing its own. Nothing settles it, so nothing clears it, and the command is broken
+ * for the rest of the session.
+ *
+ * This is the same hazard the startup seed already bounds, in the same words: "a request
+ * that never settles (a hung/half-open connection) would otherwise block the awaiting
+ * tool FOREVER. Bounding the wait converts that hang into the correct outcome." Matching
+ * that 8s deliberately — the two waits are the same decision about the same endpoint, and
+ * a reader comparing them should not have to wonder why they differ.
+ */
+export const OBJECT_INFO_READ_WAIT_MS = 8000;
+
+/**
  * @param {{ttlMs?: number, now?: () => number}} [opts] `now` is injectable so tests do not
  *   depend on wall-clock timing, which is how a cache test becomes a flaky test.
  */
-export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = () => Date.now() } = {}) {
+export function createObjectInfoCache({
+  ttlMs = OBJECT_INFO_CACHE_TTL_MS,
+  now = () => Date.now(),
+  waitMs = OBJECT_INFO_READ_WAIT_MS,
+  // Injectable so the bound can be tested without a real 8s wait — the same reason `now`
+  // is injectable. A test that sleeps for the timeout is a slow test that eventually
+  // becomes a flaky one.
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (t) => clearTimeout(t),
+} = {}) {
   let value = null;
   let at = 0;
   let inflight = null;
@@ -156,7 +186,43 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
       inflight = request;
       inflightGeneration = issuedAt;
       inflightId = requestId;
-      return request;
+      if (!(waitMs > 0)) return request;
+      // #1161 — BOUND the wait, and retire the slot when it fires.
+      //
+      // Bounding alone would not fix the reported bug. The hung request would stay in
+      // `inflight`, so the next read would join it and bound out too: a permanent 8s tax
+      // in place of a permanent hang. Better, and still broken. Releasing the slot is what
+      // lets the NEXT call issue a fresh request — which is the one that recovers once the
+      // connection is healthy again.
+      //
+      // The request is NOT cancelled. A late response still runs the generation check and
+      // still populates the cache, so the recovery costs one refused call rather than a
+      // reload — the same contract the startup seed states: giving up on the WAIT is the
+      // absence of evidence, and must not latch anything.
+      let timer = null;
+      const timedOut = Symbol("object-info-read-timeout");
+      const outcome = await Promise.race([
+        // A rejection must reach the caller unchanged on the fast path, so it is not
+        // wrapped here; only the timeout arm needs a sentinel.
+        request,
+        new Promise((resolve) => {
+          timer = setTimer(() => resolve(timedOut), waitMs);
+        }),
+      ]).finally(() => {
+        if (timer !== null) clearTimer(timer);
+      });
+      if (outcome !== timedOut) return outcome;
+      // Abandoned: keep the promise's rejection observed, or a fetch that fails after the
+      // bound becomes an unhandled rejection that this file did nothing about.
+      request.catch(() => {});
+      if (inflightId === requestId) {
+        inflight = null;
+        inflightGeneration = -1;
+        inflightId = 0;
+      }
+      // No payload: the caller's fence fails closed and refuses THIS call with "retry in a
+      // moment", exactly as it does for a fetch that failed outright.
+      return null;
     },
 
     /**

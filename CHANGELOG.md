@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Setting a widget no longer hangs for 30 seconds after a ComfyUI restart (#1161).**
+  Once ComfyUI had been restarted mid-session, setting any widget on any node timed out,
+  every time, while every other panel command answered instantly — reading the graph,
+  renaming a node, listing workflows, queueing a run. Setting a widget is the one action
+  that checks the backend's node definitions before it writes, and that check could wait
+  forever: a restart can leave the browser holding a connection that never answers and
+  never fails.
+  It stayed broken rather than recovering because callers share one in-flight request, so
+  every later attempt waited on the same dead one. The check now gives up after a few
+  seconds and refuses that single call with a retry hint, and the abandoned request is
+  discarded so the next attempt makes a fresh one — which succeeds as soon as the backend
+  is reachable. A slow answer that arrives late is still used, so recovery costs one
+  refused call rather than reloading the tab.
+
 ## [0.14.24] - 2026-08-12
 
 ### Fixed

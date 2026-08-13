@@ -237,3 +237,97 @@ test("#716: a retired request cannot overwrite a newer value — deterministical
     "the retired response must not have replaced the newer value",
   );
 });
+
+// ── #1161: a fetch that never settles must not park the tool forever ─────────
+//
+// The only open P1. After a ComfyUI restart the tab can hold a half-open connection, so
+// `getNodeDefs()` never settles. `graph_set_widget` is the one command that consults
+// /object_info before writing, so it alone hung — 30s timeouts on every node while every
+// other command answered instantly. The coalescing below made it PERMANENT rather than
+// transient: the hung request stays in the inflight slot and every later read joins the
+// same dead promise, so nothing ever clears it.
+//
+// A hand-driven timer, so these assert the behaviour rather than sleep for 8 seconds.
+function boundedCache({ waitMs = 8000 } = {}) {
+  const timers = [];
+  const cache = createObjectInfoCache({
+    waitMs,
+    setTimer: (fn, ms) => {
+      const t = { fn, ms };
+      timers.push(t);
+      return t;
+    },
+    clearTimer: (t) => {
+      const i = timers.indexOf(t);
+      if (i !== -1) timers.splice(i, 1);
+    },
+  });
+  return { cache, fireTimers: () => [...timers].forEach((t) => t.fn()) };
+}
+
+test("#1161: a fetch that never settles is bounded instead of parking the caller", async () => {
+  const { cache, fireTimers } = boundedCache();
+  const read = cache.read(() => new Promise(() => {})); // never settles, like a half-open socket
+  fireTimers();
+  assert.equal(await read, null, "the read gives up on THIS call rather than hanging");
+});
+
+test("#1161: the abandoned request is retired, so the next read does not join it", async () => {
+  // This is the half that bounding alone would miss. If the dead promise stayed in the
+  // inflight slot, the next read would join it and bound out too — a permanent 8s tax in
+  // place of a permanent hang. The next read must issue its OWN request.
+  const { cache, fireTimers } = boundedCache();
+  let calls = 0;
+  const hang = () => {
+    calls++;
+    return new Promise(() => {});
+  };
+  const first = cache.read(hang);
+  fireTimers();
+  assert.equal(await first, null);
+  assert.equal(calls, 1);
+
+  const defs = { KSampler: {} };
+  const second = await cache.read(() => {
+    calls++;
+    return Promise.resolve(defs);
+  });
+  assert.equal(calls, 2, "the second read must issue a fresh request, not join the dead one");
+  assert.deepEqual(second, defs, "…and it recovers as soon as the backend answers");
+});
+
+test("#1161: a healthy fetch is unaffected by the bound", async () => {
+  const { cache } = boundedCache();
+  const defs = { KSampler: {} };
+  assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
+});
+
+test("#1161: a rejection still reaches the caller unchanged", async () => {
+  // Only the timeout arm is sentinel-wrapped; a real failure must propagate as before,
+  // or the fence would read "the fetch failed" as "I did not wait long enough".
+  const { cache } = boundedCache();
+  await assert.rejects(cache.read(() => Promise.reject(new Error("backend down"))), /backend down/);
+});
+
+test("#1161: a late response still populates the cache — giving up on the wait latches nothing", async () => {
+  // The startup seed's contract, which this must match: the request is not cancelled, so a
+  // response arriving after the bound still establishes the payload and the NEXT call
+  // succeeds. The recovery costs one refused call, not a tab reload.
+  const { cache, fireTimers } = boundedCache();
+  const defs = { KSampler: {} };
+  let release;
+  const slow = new Promise((resolve) => { release = resolve; });
+  const first = cache.read(() => slow);
+  fireTimers();
+  assert.equal(await first, null, "the bounded call refuses");
+  release(defs);
+  await slow;
+  await new Promise((r) => setTimeout(r, 0)); // let the abandoned request settle
+  let refetched = 0;
+  const second = await cache.read(() => {
+    refetched++;
+    return Promise.resolve({ other: {} });
+  });
+  assert.equal(refetched, 0, "the late response seeded the cache, so no refetch was needed");
+  assert.deepEqual(second, defs);
+});
