@@ -23356,10 +23356,6 @@ function buildPanel() {
     });
   }
 
-  // #1171 — how long the durable-invalidation flush may take before this reports that it
-  // could not confirm one. The flush is IndexedDB-backed and can stall; both callers await
-  // it while holding something, so an unbounded wait here is a wedge rather than a delay.
-  //
   async function invalidateDurableAgentSession() {
     ssSet(SESSION_KEY, null);
     if (thread) historyStore.reviseThread(thread, { sessionId: null });
@@ -23377,6 +23373,13 @@ function buildPanel() {
     // `onerror`, `onabort`), `db.transaction(...)` is itself wrapped in try/catch, and
     // `openDb` is capped by `IDB_OPEN_TIMEOUT_MS` and resolves null past it. There is no
     // modelled path on which this promise simply never settles.
+    //
+    // MEASURED, against a store whose IndexedDB `open` fires no handler at all — the worst
+    // slow store there is: `flush()` returned `true` after 2017ms, so this reports SUCCESS
+    // rather than hanging or failing. `idbMergeWrite` yields null when the open is capped,
+    // the write chain passes that null through, and `flush()` maps a null result to true.
+    // So a slow store does not reach the two exits below either; that was checked because
+    // review suggested it did.
     //
     // WHAT THE BOUND COST. `flush()` awaits the WHOLE queued chain — including the
     // full-snapshot write `persistThreads()` enqueues one line above — so a timeout meant
