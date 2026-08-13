@@ -209,11 +209,21 @@ test("#1180: every getNodeDefs call that can hang a command is bounded", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .split(/\r?\n/)
     .map((l) => l.replace(/\/\/.*$/, ""));
-  const bare = code.filter((l) => /await api\.getNodeDefs\(\)/.test(l));
+  // BOTH hanging shapes, not just the awaited one. A broader "any call" match is wrong
+  // here — it also catches the thunks handed to the /object_info oracle, which bounds them
+  // itself, and an error string that merely names the function. What actually hangs a
+  // command is awaiting the call, or chaining off it, without a bound.
+  const awaited = code.filter((l) => /await api\??\.getNodeDefs\s*\(/.test(l));
   assert.equal(
-    bare.length,
+    awaited.length,
     1,
-    `only the startup seed may await getNodeDefs unbounded; found ${bare.length}: ${bare.join(" | ")}`,
+    `only the startup seed may await getNodeDefs unbounded; found ${awaited.length}: ${awaited.map((l) => l.trim()).join(" | ")}`,
+  );
+  const chained = code.filter((l) => /api\??\.getNodeDefs\s*\(\s*\)\s*\.then\s*\(/.test(l));
+  assert.deepEqual(
+    chained,
+    [],
+    "a chained api.getNodeDefs().then(...) hangs exactly as an awaited one does, and must be bounded too",
   );
   const seedAt = src.indexOf("function seedObjectInfoHistory(");
   const seedBody = src.slice(seedAt, src.indexOf("\n}", seedAt));
