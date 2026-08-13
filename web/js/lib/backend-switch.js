@@ -74,11 +74,10 @@ export async function runBackendSwitch(id, effects) {
   } = effects;
 
   const startedOn = liveBackend();
-  const switching = startedOn !== null && startedOn !== id;
   // Computed from `connectedBackend`, which none of the commits below touch — it is written
   // only at its declaration and by the `onModels` handshake. That is what makes deciding
   // this before committing anything equivalent to deciding it after.
-  const prevBackend = startedOn || pickedBackend();
+  const switching = startedOn !== null && startedOn !== id;
 
   if (switching) {
     // THE ONLY AWAIT BEFORE A COMMIT, and the non-switching path must never reach it: a
@@ -104,6 +103,14 @@ export async function runBackendSwitch(id, effects) {
   }
 
   // From here everything commits, in the panel's original order.
+  //
+  // `pickedBackend()` is consulted ONLY when there is no live backend — and that is exactly
+  // the path with no await, so nothing can move underneath it. Reading it before or after
+  // the guard above is therefore unobservable, and it was briefly changed to a late read on
+  // the theory that the `backends` auto-pick (which writes `selectedBackend` WITHOUT
+  // `connectedBackend`, so it does slip past the supersede check) could stale it. It cannot:
+  // when that writer can run, this expression has already resolved to `startedOn`.
+  const prevBackend = startedOn || pickedBackend();
   if (id !== prevBackend) seedPrefs(id);
   commitSelection(id);
 
