@@ -113,6 +113,86 @@ export function createObjectInfoCache({
   // rather than merely forgetting the value it will produce.
   let generation = 0;
 
+  // #1161 — the sentinel is module-scoped, not allocated per read: a fresh Symbol per call
+  // is behaviourally identical and only makes garbage on the hot path.
+  const TIMED_OUT = Symbol("object-info-read-timeout");
+
+  /**
+   * Hand a caller the in-flight request, but never let it wait forever.
+   *
+   * Applied to EVERY caller — issuer and joiner alike — because the bound belongs where a
+   * promise is handed out, not where it is created. Bounding only the issuer left every
+   * concurrent reader on the raw promise, which is how the first attempt at this fix
+   * failed to fix the burst case the bug was reported on.
+   *
+   * @param {Promise<any>} request the in-flight fetch
+   * @param {number} requestId its identity, so only its OWN waiter retires it
+   */
+  async function boundRead(request, requestId) {
+    if (!(waitMs > 0)) return request;
+    let timer = null;
+    let outcome;
+    try {
+      outcome = await Promise.race([
+        // A rejection must reach the caller unchanged, so the request arm is not wrapped;
+        // only the timeout arm needs a sentinel.
+        request,
+        new Promise((resolve) => {
+          // Armed OUTSIDE the executor's throw path would be cleaner still, but the
+          // executor is where `resolve` lives. A throwing setTimer must not reject the
+          // read and discard a fetch that already succeeded, so it degrades to "no bound"
+          // rather than to a failure.
+          try {
+            timer = setTimer(() => resolve(TIMED_OUT), waitMs);
+          } catch {
+            /* no timer — this arm simply never resolves, and the request arm decides */
+          }
+        }),
+      ]);
+    } finally {
+      if (timer !== null) {
+        try {
+          clearTimer(timer);
+        } catch {
+          /* a throwing clear must not turn a successful read into a failure */
+        }
+      }
+    }
+    if (outcome !== TIMED_OUT) return outcome;
+    // Abandoned. Keep the rejection observed, or a fetch that fails after the bound becomes
+    // an unhandled rejection this file did nothing about.
+    request.catch(() => {});
+    // A payload may have landed WHILE we waited — an invalidation plus a successful
+    // refetch on another path. Refusing then would tell the user to reconnect ComfyUI at
+    // the exact moment the panel holds a fresh authoritative schema.
+    if (value !== null && now() - at < ttlMs) return value;
+    if (inflightId === requestId) {
+      inflight = null;
+      inflightGeneration = -1;
+      inflightId = 0;
+      // ADVANCE THE GENERATION, which the first attempt did not. Releasing the slot alone
+      // left the abandoned request still matching `issuedAt === generation`, so a late
+      // pre-restart payload could overwrite a NEWER schema and re-stamp its TTL — the
+      // fabricated-success hole #458 exists to close. Two requests were never live in one
+      // generation before this bound existed; retiring by generation is how this file
+      // already retires a request it no longer trusts.
+      generation++;
+    }
+    // The #982 outcome wrapper, not a bare null: the refusal must say WHY. Without it both
+    // call sites compute an empty failure list, and the user is told to hand-check a
+    // backend that answers /object_info perfectly well, against a route list that is
+    // absent — a hung read misdiagnosed as an unreachable one.
+    return {
+      [CACHE_OUTCOME]: true,
+      defs: null,
+      failures: [
+        `/object_info did not answer within ${waitMs}ms — the request was abandoned for this ` +
+          `call and a fresh one will be issued on the next. This is what a half-open ` +
+          `connection after a ComfyUI restart looks like; the backend itself may be healthy.`,
+      ],
+    };
+  }
+
   return {
     /**
      * Read through the cache.
@@ -125,7 +205,14 @@ export function createObjectInfoCache({
       // that check an invalidation could be overtaken by the very request it was meant to
       // retire. Coalescing matters: a burst arriving faster than the fetch completes would
       // otherwise still issue one request per caller, which is the reported symptom moved.
-      if (inflight && inflightGeneration === generation) return inflight;
+      // #1161 — a JOINER is bounded too. The first version of this fix installed the bound
+      // only below, on the path that ISSUES the request, so this early return handed every
+      // concurrent caller the raw unbounded promise and the P1 survived for exactly the
+      // case that matters: #716 built this cache for BURSTS of widget writes, so after a
+      // restart the issuing call gave up at the bound while every overlapping call parked
+      // until the orchestrator's 30s timeout. The bound belongs where a promise is handed
+      // to a caller, not where it is created.
+      if (inflight && inflightGeneration === generation) return boundRead(inflight, inflightId);
       const issuedAt = generation;
       // An id captured BEFORE the promise exists, because `finally` must not name the
       // binding it is being assigned to: a fetchDefs() that throws SYNCHRONOUSLY runs the
@@ -186,43 +273,7 @@ export function createObjectInfoCache({
       inflight = request;
       inflightGeneration = issuedAt;
       inflightId = requestId;
-      if (!(waitMs > 0)) return request;
-      // #1161 — BOUND the wait, and retire the slot when it fires.
-      //
-      // Bounding alone would not fix the reported bug. The hung request would stay in
-      // `inflight`, so the next read would join it and bound out too: a permanent 8s tax
-      // in place of a permanent hang. Better, and still broken. Releasing the slot is what
-      // lets the NEXT call issue a fresh request — which is the one that recovers once the
-      // connection is healthy again.
-      //
-      // The request is NOT cancelled. A late response still runs the generation check and
-      // still populates the cache, so the recovery costs one refused call rather than a
-      // reload — the same contract the startup seed states: giving up on the WAIT is the
-      // absence of evidence, and must not latch anything.
-      let timer = null;
-      const timedOut = Symbol("object-info-read-timeout");
-      const outcome = await Promise.race([
-        // A rejection must reach the caller unchanged on the fast path, so it is not
-        // wrapped here; only the timeout arm needs a sentinel.
-        request,
-        new Promise((resolve) => {
-          timer = setTimer(() => resolve(timedOut), waitMs);
-        }),
-      ]).finally(() => {
-        if (timer !== null) clearTimer(timer);
-      });
-      if (outcome !== timedOut) return outcome;
-      // Abandoned: keep the promise's rejection observed, or a fetch that fails after the
-      // bound becomes an unhandled rejection that this file did nothing about.
-      request.catch(() => {});
-      if (inflightId === requestId) {
-        inflight = null;
-        inflightGeneration = -1;
-        inflightId = 0;
-      }
-      // No payload: the caller's fence fails closed and refuses THIS call with "retry in a
-      // moment", exactly as it does for a fetch that failed outright.
-      return null;
+      return boundRead(request, requestId);
     },
 
     /**

@@ -8,7 +8,13 @@
 // real clock is a slow test that eventually becomes a flaky one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { OBJECT_INFO_CACHE_TTL_MS, createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import {
+  OBJECT_INFO_CACHE_TTL_MS,
+  // #1161 — the timeout arm returns the outcome WRAPPER so the refusal can state its
+  // cause; the tests assert that shape rather than a bare null.
+  CACHE_OUTCOME,
+  createObjectInfoCache,
+} from "../../web/js/lib/object-info-cache.js";
 
 const DEFS = { KSampler: {}, CLIPTextEncode: {} };
 const clock = (start = 1000) => {
@@ -238,96 +244,144 @@ test("#716: a retired request cannot overwrite a newer value — deterministical
   );
 });
 
-// ── #1161: a fetch that never settles must not park the tool forever ─────────
+
+// ── #1161: a fetch that never settles must not park the tool ─────────────────
 //
 // The only open P1. After a ComfyUI restart the tab can hold a half-open connection, so
-// `getNodeDefs()` never settles. `graph_set_widget` is the one command that consults
+// getNodeDefs() never settles. graph_set_widget is the one command that consults
 // /object_info before writing, so it alone hung — 30s timeouts on every node while every
-// other command answered instantly. The coalescing below made it PERMANENT rather than
-// transient: the hung request stays in the inflight slot and every later read joins the
-// same dead promise, so nothing ever clears it.
+// other command answered instantly — and coalescing made it permanent, because every
+// later read joined the same dead promise.
 //
-// A hand-driven timer, so these assert the behaviour rather than sleep for 8 seconds.
-function boundedCache({ waitMs = 8000 } = {}) {
-  const timers = [];
+// These never await a promise that may not settle: a test that detects its bug by hanging
+// `node --test` (which has no default timeout) reports a wedged suite instead of naming
+// the broken invariant. Every wait here is resolved by firing the injected timer, and the
+// clock is injected too, matching the rest of this file.
+function boundedCache({ waitMs = 8000, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) {
+  const timers = new Set();
+  const clock = { t: 1_000_000 };
   const cache = createObjectInfoCache({
+    ttlMs,
     waitMs,
+    now: () => clock.t,
     setTimer: (fn, ms) => {
       const t = { fn, ms };
-      timers.push(t);
+      timers.add(t);
       return t;
     },
-    clearTimer: (t) => {
-      const i = timers.indexOf(t);
-      if (i !== -1) timers.splice(i, 1);
-    },
+    clearTimer: (t) => timers.delete(t),
   });
-  return { cache, fireTimers: () => [...timers].forEach((t) => t.fn()) };
+  return {
+    cache,
+    clock,
+    armed: () => timers.size,
+    fireTimers: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }),
+  };
 }
+
+const timedOut = (outcome) =>
+  outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true && outcome.defs === null;
 
 test("#1161: a fetch that never settles is bounded instead of parking the caller", async () => {
   const { cache, fireTimers } = boundedCache();
-  const read = cache.read(() => new Promise(() => {})); // never settles, like a half-open socket
+  const read = cache.read(() => new Promise(() => {})); // half-open socket
   fireTimers();
-  assert.equal(await read, null, "the read gives up on THIS call rather than hanging");
+  const outcome = await read;
+  assert.ok(timedOut(outcome), "the read gives up on THIS call rather than hanging");
+  // The refusal must say WHY: a bare null makes the caller's note misdiagnose a hung read
+  // as an unreachable backend, naming a route list it never printed.
+  assert.match(String(outcome.failures?.[0] ?? ""), /did not answer within 8000ms/);
 });
 
-test("#1161: the abandoned request is retired, so the next read does not join it", async () => {
-  // This is the half that bounding alone would miss. If the dead promise stayed in the
-  // inflight slot, the next read would join it and bound out too — a permanent 8s tax in
-  // place of a permanent hang. The next read must issue its OWN request.
+test("#1161: a JOINER is bounded too — the burst case the bug was reported on", async () => {
+  // The defect the first attempt shipped: read() returned the in-flight promise BEFORE the
+  // bound was installed, so only the issuing call was bounded and every overlapping call
+  // parked until the orchestrator's 30s timeout. #716 built this cache for bursts, so that
+  // is the case that matters most.
+  const { cache, fireTimers, armed } = boundedCache();
+  const issuer = cache.read(() => new Promise(() => {}));
+  const joinerA = cache.read(() => new Promise(() => {}));
+  const joinerB = cache.read(() => new Promise(() => {}));
+  assert.equal(armed(), 3, "every caller must arm its own bound, not just the issuer");
+  fireTimers();
+  for (const [name, p] of [["issuer", issuer], ["joinerA", joinerA], ["joinerB", joinerB]]) {
+    assert.ok(timedOut(await p), `${name} must give up rather than park`);
+  }
+});
+
+test("#1161: the abandoned request is retired, so the next read issues a fresh one", async () => {
   const { cache, fireTimers } = boundedCache();
   let calls = 0;
-  const hang = () => {
-    calls++;
-    return new Promise(() => {});
-  };
-  const first = cache.read(hang);
+  const first = cache.read(() => { calls++; return new Promise(() => {}); });
   fireTimers();
-  assert.equal(await first, null);
+  assert.ok(timedOut(await first));
   assert.equal(calls, 1);
-
   const defs = { KSampler: {} };
-  const second = await cache.read(() => {
-    calls++;
-    return Promise.resolve(defs);
-  });
-  assert.equal(calls, 2, "the second read must issue a fresh request, not join the dead one");
+  const second = await cache.read(() => { calls++; return Promise.resolve(defs); });
+  assert.equal(calls, 2, "the next read must not join the dead request");
   assert.deepEqual(second, defs, "…and it recovers as soon as the backend answers");
 });
 
-test("#1161: a healthy fetch is unaffected by the bound", async () => {
+test("#1161: an abandoned request cannot overwrite a NEWER schema", async () => {
+  // The generation must advance when the slot is abandoned. Releasing it alone left the
+  // abandoned request still matching `issuedAt === generation`, so a late pre-restart
+  // payload could overwrite a newer one and re-stamp its TTL — a write authorized against
+  // a pack that was uninstalled during the restart, reported as success (#458).
+  const { cache, clock, fireTimers } = boundedCache();
+  let releaseStale;
+  const stale = new Promise((resolve) => { releaseStale = resolve; });
+  const first = cache.read(() => stale);
+  fireTimers();
+  assert.ok(timedOut(await first));
+
+  const fresh = { KSampler: {} };
+  assert.deepEqual(await cache.read(() => Promise.resolve(fresh)), fresh);
+
+  releaseStale({ GoneNode: {}, KSampler: {} }); // the pre-restart map lands late
+  await stale;
+  await new Promise((r) => setTimeout(r, 0));
+
+  clock.t += 1; // still inside the TTL of the FRESH value
+  let refetched = 0;
+  const after = await cache.read(() => { refetched++; return Promise.resolve({}); });
+  assert.equal(refetched, 0, "the fresh value is still cached");
+  assert.deepEqual(after, fresh, "the retired request must not have overwritten it");
+});
+
+test("#1161: a payload that lands WHILE we wait is used, not refused", async () => {
+  // Refusing here would tell the user to reconnect ComfyUI at the exact moment the panel
+  // holds a fresh authoritative schema.
+  const { cache, fireTimers } = boundedCache();
+  const pending = cache.read(() => new Promise(() => {}));
+  cache.invalidate();
+  const defs = { KSampler: {} };
+  assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
+  fireTimers();
+  assert.deepEqual(await pending, defs, "the waiting read must use the payload that arrived");
+});
+
+test("#1161: a healthy fetch and a rejection are both unaffected by the bound", async () => {
   const { cache } = boundedCache();
   const defs = { KSampler: {} };
   assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
+  const other = boundedCache().cache;
+  await assert.rejects(other.read(() => Promise.reject(new Error("backend down"))), /backend down/);
 });
 
-test("#1161: a rejection still reaches the caller unchanged", async () => {
-  // Only the timeout arm is sentinel-wrapped; a real failure must propagate as before,
-  // or the fence would read "the fetch failed" as "I did not wait long enough".
-  const { cache } = boundedCache();
-  await assert.rejects(cache.read(() => Promise.reject(new Error("backend down"))), /backend down/);
-});
-
-test("#1161: a late response still populates the cache — giving up on the wait latches nothing", async () => {
-  // The startup seed's contract, which this must match: the request is not cancelled, so a
-  // response arriving after the bound still establishes the payload and the NEXT call
-  // succeeds. The recovery costs one refused call, not a tab reload.
-  const { cache, fireTimers } = boundedCache();
+test("#1161: a throwing timer degrades to no bound, never to a failed read", async () => {
   const defs = { KSampler: {} };
-  let release;
-  const slow = new Promise((resolve) => { release = resolve; });
-  const first = cache.read(() => slow);
-  fireTimers();
-  assert.equal(await first, null, "the bounded call refuses");
-  release(defs);
-  await slow;
-  await new Promise((r) => setTimeout(r, 0)); // let the abandoned request settle
-  let refetched = 0;
-  const second = await cache.read(() => {
-    refetched++;
-    return Promise.resolve({ other: {} });
+  const cache = createObjectInfoCache({
+    waitMs: 8000,
+    setTimer: () => { throw new Error("no timers here"); },
+    clearTimer: () => {},
   });
-  assert.equal(refetched, 0, "the late response seeded the cache, so no refetch was needed");
-  assert.deepEqual(second, defs);
+  assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
+});
+
+test("#1161: the timer is cleared when the fetch wins the race", async () => {
+  // Without the cleanup an 8s timer is left armed for every read — invisible in behaviour
+  // and exactly the kind of thing no assertion notices.
+  const { cache, armed } = boundedCache();
+  await cache.read(() => Promise.resolve({ KSampler: {} }));
+  assert.equal(armed(), 0, "a settled read must leave no timer armed");
 });
