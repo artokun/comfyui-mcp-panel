@@ -476,7 +476,14 @@ test("#508 codex R3: a command arriving on an ALREADY-superseded socket is refus
   assert.ok(parseAt !== -1 && guardAt !== -1, "the listener must parse before the instance guard");
   assert.ok(parseAt < guardAt, "the frame must be parsed BEFORE the superseded early return");
   // …and the refusal must be rid-correlated, explicitly NOT-APPLIED, and delivered/journaled.
-  const guarded = listener.slice(guardAt, guardAt + 1600);
+  // Bounded by the guard block's OWN closing brace, not a fixed character count. The
+  // count stood in for "inside this block" and stopped meaning it the moment the block
+  // grew a comment (#1095 added one) — a passing assertion turning into a failing one for
+  // a reason unrelated to what it checks, the same trap corrected for markConnected in
+  // #1146. `\n      }` is this block's indent level, so it cannot match an inner brace.
+  const guardEnd = listener.indexOf("\n      }", guardAt);
+  assert.notEqual(guardEnd, -1, "could not locate the end of the superseded guard");
+  const guarded = listener.slice(guardAt, guardEnd);
   assert.match(guarded, /if \(isCommandFrame\) \{/, "only command frames get a refusal");
   assert.match(guarded, /rid: msg\.rid/, "the refusal must correlate to the command");
   assert.match(guarded, /ok: false/, "a stale command is refused, never reported as done");
@@ -561,4 +568,73 @@ test("#508 wiring: self-heal re-registers via sendHello ONLY — it can never pi
   // workflow — no id argument, no list lookup, no adoption of another tab.
   assert.equal(/tab_id|tabMigrations|attach_tab|openWorkflows/.test(body), false, "self-heal must not select a target tab");
   assert.match(body, /reRegisterExhaustedHint\(\)/, "an exhausted budget must surface a user action");
+});
+
+// ── #1095: a workflow re-target must not withdraw a route mid-command ─────────
+//
+// rehelloForWorkflow's own note says the backend DROPS the socket's prior tab mapping
+// when the panel re-advertises. That is correct — it stops a background workflow's output
+// leaking into this tab — but it must not happen while a command is routed to that
+// mapping: the orchestrator loses the route mid-command and reports OUTCOME UNKNOWN for
+// work that actually applied, then "Connected: none" until the new mapping settles.
+// Creating a workflow and immediately applying a batch of mutations is exactly that
+// window, since the workflow poll ticks every 600ms — between two commands.
+//
+// Structural, because the claim is about WHERE the counter moves relative to the command
+// branch and the reply. Statements are matched as statements: this region's comments name
+// every one of these calls while explaining the ordering.
+test("#1095: the in-flight command count is paired, and read before a re-target", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = (re) => src.search(re);
+
+  // Every increment must be paired with the single decrement in deliverReply, or the
+  // count drifts: too high strands the tab on the old route until the budget runs out,
+  // too low reopens the race. Both command paths that reach deliverReply increment.
+  const incs = (src.match(/^\s*commandsInFlight\+\+;/gm) || []).length;
+  const decs = (src.match(/^\s*if \(commandsInFlight > 0\) commandsInFlight--;/gm) || []).length;
+  assert.equal(incs, 2, "both command paths that deliver a reply must mark it in flight");
+  assert.equal(decs, 1, "the count is released in exactly one place — deliverReply");
+
+  // The decrement must live INSIDE deliverReply, which every command path reaches once.
+  const dStart = src.indexOf("const deliverReply = (reply, cmd, superseded) => {");
+  assert.notEqual(dStart, -1, "could not locate deliverReply");
+  const dEnd = src.indexOf("\n    };", dStart);
+  assert.notEqual(dEnd, -1, "could not locate the end of deliverReply");
+  assert.match(
+    src.slice(dStart, dEnd),
+    /if \(commandsInFlight > 0\) commandsInFlight--;/,
+    "the command is finished when its reply is handed over, whatever happens to it after",
+  );
+
+  // The superseded-socket refusal replies too, so it must balance the pair. The count is
+  // CLIENT-scoped while that branch runs on a RETIRED socket, so an unpaired decrement
+  // there would discount a command still running on the live socket — reintroducing the
+  // race through the bookkeeping meant to close it.
+  const gStart = src.indexOf("if (!isActive()) {");
+  const gEnd = src.indexOf("\n      }", gStart);
+  assert.ok(gStart !== -1 && gEnd !== -1, "could not bound the superseded guard");
+  assert.match(
+    src.slice(gStart, gEnd),
+    /commandsInFlight\+\+;/,
+    "the superseded refusal must balance the decrement its deliverReply performs",
+  );
+
+  // The poll must consult the count BEFORE it commits the new workflow id. Advancing the
+  // id and deferring only the hello would swallow the change forever, because the next
+  // tick's `wfid === currentWorkflowId` early return would treat it as handled.
+  const wStart = src.indexOf("function onWorkflowMaybeChanged() {");
+  const wEnd = src.indexOf("\n  }", wStart);
+  assert.ok(wStart !== -1 && wEnd !== -1, "could not bound onWorkflowMaybeChanged");
+  const body = src.slice(wStart, wEnd);
+  const readAt = body.search(/client\?\.commandsInFlight\?\.\(\) > 0/);
+  const commitAt = body.search(/^\s*currentWorkflowId = /m);
+  assert.notEqual(readAt, -1, "the re-target must consult the in-flight count");
+  assert.notEqual(commitAt, -1, "the re-target must still commit the new workflow id");
+  assert.ok(readAt < commitAt, "the count must be read BEFORE the id is committed");
+
+  // …and the wait must be BOUNDED: unbounded turns a race into a wedge, which is worse.
+  assert.match(body, /workflowRetargetDeferrals < MAX_WORKFLOW_RETARGET_DEFERRALS/,
+    "the deferral must be bounded so a stuck command cannot strand the tab");
+  assert.match(body, /^\s*workflowRetargetDeferrals = 0;/m,
+    "…and the budget must reset once the re-target proceeds");
 });

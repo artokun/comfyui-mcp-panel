@@ -18331,6 +18331,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     }
   }
   let socketSeq = 0;
+  // #1095 — orchestrator→panel commands currently executing on this client.
+  //
+  // A re-hello makes the backend DROP this socket's prior tab mapping (deliberately —
+  // it is what stops a background workflow's output leaking into this tab). If a command
+  // is in flight against that mapping when it is withdrawn, the orchestrator loses the
+  // route mid-command and reports OUTCOME UNKNOWN for work that actually applied. The
+  // workflow poll cannot see that on its own, so the client — which owns the window
+  // between a command frame arriving and its reply going out — counts it and the panel
+  // reads it before re-targeting.
+  //
+  // Incremented where the command branch begins, decremented in deliverReply, which
+  // every command path reaches exactly once. A leak here can only DELAY a re-target,
+  // never block it: the reader bounds its own waiting (see onWorkflowMaybeChanged), so
+  // the worst case degrades to today's behaviour rather than wedging the tab.
+  let commandsInFlight = 0;
   function markConnected() {
     handshakeDone = true;
     handshakenSock = sock;
@@ -18620,6 +18635,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
      *  impossible, journal the outcome (for replay) and run the bounded self-heal.
      *  Returns true only when the frame was actually handed to an open socket. */
     const deliverReply = (reply, cmd, superseded) => {
+      // #1095 — the command is finished the moment its reply is handed over, whatever
+      // happens to it after. Decremented here rather than at each `return` because every
+      // command path reaches this exactly once, and floored at 0 so a double-delivery
+      // (a retry, a future refactor) can never drive the count negative and permanently
+      // convince the workflow poll that nothing is running.
+      if (commandsInFlight > 0) commandsInFlight--;
       const socketOpen = thisSock.readyState === WebSocket.OPEN;
       let sendThrew = false;
       if (socketOpen) {
@@ -18685,6 +18706,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // is a clean, safe-to-retry negative — and deliver/journal that refusal like any
         // other reply.
         if (isCommandFrame) {
+          // #1095 — deliverReply decrements the in-flight count, so this refusal must
+          // balance it. The count is CLIENT-scoped while this branch runs on a RETIRED
+          // socket, so an unpaired decrement here would discount a command still running
+          // on the live socket and let the workflow poll re-target out from under it —
+          // the exact race this counter exists to prevent, reintroduced by its own
+          // bookkeeping. Nothing is executed either way; this keeps the pair balanced.
+          commandsInFlight++;
           deliverReply(
             {
               rid: msg.rid,
@@ -18701,6 +18729,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         return;
       }
       if (isCommandFrame) {
+        // #1095 — the command is now IN FLIGHT against this socket's tab mapping, and
+        // stays so until deliverReply hands its reply over. Marked here, at the top of
+        // the branch, so an executor that suspends (run/save await; ask_user blocks on
+        // the user) is covered for its whole duration — that suspension is precisely the
+        // window a workflow-change re-hello would withdraw the route in.
+        commandsInFlight++;
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
         // ANY command frame is real turn activity (incl. the SILENT_CMDS that
@@ -19934,6 +19968,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     },
     isConnected() {
       return !!sock && sock.readyState === WebSocket.OPEN;
+    },
+    /** #1095 — how many orchestrator→panel commands are mid-execution. Read by the
+     *  workflow poll before it re-targets this socket, because a re-hello withdraws the
+     *  tab mapping those commands are routed to. Read-only by design: only the command
+     *  path may move it, and a caller that could reset it would be able to manufacture
+     *  the very race this exists to close. */
+    commandsInFlight() {
+      return commandsInFlight;
     },
     stop() {
       // Close the socket and stop reconnecting, but stay re-startable (unlike
@@ -26999,11 +27041,41 @@ function buildPanel() {
       /* reconnect path retries the hello */
     }
   }
+  // #1095 — how many consecutive polls have deferred a workflow re-target because a
+  // command was in flight. At 600ms per tick this budget is ~3s, comfortably longer than
+  // a normal graph mutation and far shorter than any command timeout, so a healthy batch
+  // finishes inside it while a stuck command cannot strand the tab on the old route.
+  const MAX_WORKFLOW_RETARGET_DEFERRALS = 5;
+  let workflowRetargetDeferrals = 0;
   function onWorkflowMaybeChanged() {
     const wf = activeWorkflowRef();
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
     if (wfid === currentWorkflowId) return; // case 1: no change
+
+    // #1095 — a workflow change re-targets this socket, and rehelloForWorkflow's own note
+    // says the backend DROPS the socket's prior tab mapping when it does. That is correct
+    // (it stops a background workflow's output leaking here) but it must not happen while
+    // a command is routed to that mapping: the orchestrator loses the route mid-command
+    // and reports OUTCOME UNKNOWN for work that actually applied, then "Connected: none"
+    // until the new mapping settles. Creating a workflow and immediately applying a batch
+    // of mutations is exactly that window — this poll runs every 600ms, so a tick lands
+    // between two commands.
+    //
+    // Deferred BEFORE `currentWorkflowId` is committed, which is the whole subtlety:
+    // advancing the id and deferring only the hello would swallow the change forever,
+    // because the next tick's early return above would treat it as already handled.
+    // Returning here leaves the id untouched, so the poll IS the retry — no new timer.
+    //
+    // BOUNDED, because an unbounded wait converts a race into a wedge, which is worse:
+    // a command whose reply is never delivered would strand the tab on the old workflow's
+    // route permanently. After the budget the re-target proceeds regardless, degrading to
+    // exactly today's behaviour rather than to something new.
+    if (client?.commandsInFlight?.() > 0 && workflowRetargetDeferrals < MAX_WORKFLOW_RETARGET_DEFERRALS) {
+      workflowRetargetDeferrals++;
+      return;
+    }
+    workflowRetargetDeferrals = 0;
 
     const initial = currentWorkflowId == null;
     const followsPanel = historyScopeFollowsPanel();
