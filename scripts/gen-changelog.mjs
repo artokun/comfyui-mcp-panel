@@ -83,6 +83,22 @@ function prevTag() {
       } catch {
         /* the tag is at or ahead of the newest release commit — use the tag */
       }
+      // #1191 — SAY SO. Falling back to the tag is legitimate, and it is also exactly what
+      // happens when this file has stopped recognising the repo's release commits — which
+      // has now shipped twice (#932, #1191), both times silently, and the second time for
+      // nine consecutive releases. The generator already refuses to drop a commit without
+      // reporting it; the RANGE deserves the same treatment, because a wrong range is the
+      // failure that produces a plausible-looking entry crediting a release with work it
+      // did not contain.
+      //
+      // A warning rather than a hard failure: a genuinely fresh tag is the normal case on a
+      // repo that tags, and this script also runs inside `set-version.mjs` during a release.
+      const newestRelease = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
+      const detail = newestRelease
+        ? `newest release commit ${newestRelease.slice(0, 8)} is not a descendant of it`
+        : "NO commit in history is recognised as a release — the subject predicate may no longer match this repo's release shape (see scripts/lib/changelog-match.mjs)";
+      console.error(`changelog: WARNING — bounding the range at tag ${t}; ${detail}.`);
+      console.error("changelog: if that is wrong, the entry below will re-list work that already shipped.");
       return t;
     }
   } catch {
