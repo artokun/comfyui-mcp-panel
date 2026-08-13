@@ -789,9 +789,21 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  */
 const BRIDGE_READ_DEFAULT_MS = 20000;
 const NODE_DEFS_RETRY_BUDGET_MS = 9000;
+//
+// FEWER ATTEMPTS, EACH GIVEN MORE TIME. The shipped schedule is three attempts, and with
+// a bound that does not cancel that means up to THREE concurrent whole-document downloads
+// contending on a link that is merely slow — each one making the next attempt slower, so
+// the retry actively works against itself in exactly the case it exists to survive.
+//
+// Dropping to two attempts improves both numbers at once: at most two downloads overlap,
+// and each attempt gets 4400ms instead of 2733ms — 61% more time on a link the first
+// attempt has already shown to be slow. The retry keeps its purpose (#954's transient
+// blip during a reconnect window still gets a second chance) and the whole run still
+// fits: two runs at 9000ms each is 18,000ms against the 20,000ms read default.
+const NODE_DEFS_RETRY_DELAYS_MS = [OBJECT_INFO_RETRY_DELAYS_MS[0] ?? 200];
 const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor(
-  (NODE_DEFS_RETRY_BUDGET_MS - OBJECT_INFO_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)) /
-    (OBJECT_INFO_RETRY_DELAYS_MS.length + 1),
+  (NODE_DEFS_RETRY_BUDGET_MS - NODE_DEFS_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)) /
+    (NODE_DEFS_RETRY_DELAYS_MS.length + 1),
 );
 
 /** Sentinel: this call did not answer in time, as distinct from anything it could return. */
@@ -1016,7 +1028,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
           throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_ATTEMPT_TIMEOUT_MS}ms`);
         }
         return result;
-      });
+      }, { delays: NODE_DEFS_RETRY_DELAYS_MS });
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.

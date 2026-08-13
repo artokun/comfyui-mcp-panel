@@ -25,7 +25,10 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 // #1180 — the retried path gets a SMALLER per-attempt bound so three attempts plus the
 // retry module's own waiting stay well inside the 30s command budget. Derived here the
 // same way the panel derives it, so the harness cannot drift from the shipped number.
-const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor((9000 - 800) / 3);
+// #1180 — the refresh uses its OWN schedule: fewer attempts, each given more time,
+// because abandoned attempts keep downloading and three of them contend.
+const NODE_DEFS_RETRY_DELAYS_MS = [200];
+const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor((9000 - 200) / 2);
 const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) =>
   typeof apiValue?.getNodeDefs !== "function"
     ? Promise.resolve(null)
@@ -383,6 +386,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "NODE_DEFS_NO_ANSWER",
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
+    "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
@@ -413,6 +417,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     NODE_DEFS_NO_ANSWER,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_ATTEMPT_TIMEOUT_MS,
+    NODE_DEFS_RETRY_DELAYS_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,
@@ -530,6 +535,7 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     "NODE_DEFS_NO_ANSWER",
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
+    "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
@@ -568,6 +574,7 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
     NODE_DEFS_NO_ANSWER,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_ATTEMPT_TIMEOUT_MS,
+    NODE_DEFS_RETRY_DELAYS_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,
@@ -611,6 +618,7 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     "NODE_DEFS_NO_ANSWER",
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
+    "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
@@ -647,6 +655,7 @@ test("#635: the shipping register run treats a falsy throw as a failure everywhe
     NODE_DEFS_NO_ANSWER,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_ATTEMPT_TIMEOUT_MS,
+    NODE_DEFS_RETRY_DELAYS_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,

@@ -256,15 +256,24 @@ test("#1180: the RETRIED fetch's worst case stays inside the command budget", ()
     `two serialized refresh runs cost ${budget * 2}ms against a ${read}ms read default`,
   );
 
-  // DERIVED from the retry module, not hardcoded, so the arithmetic cannot drift when the
-  // retry schedule changes.
+  // DERIVED from a schedule, not hardcoded, so the arithmetic cannot drift.
   assert.match(
     src,
-    /OBJECT_INFO_RETRY_DELAYS_MS\.reduce\(/,
-    "the per-attempt bound must be derived from the retry schedule itself",
+    /NODE_DEFS_RETRY_DELAYS_MS\.reduce\(/,
+    "the per-attempt bound must be derived from the schedule it actually uses",
   );
-  const attempts = OBJECT_INFO_RETRY_DELAYS_MS.length + 1;
-  const waiting = OBJECT_INFO_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
+  // FEWER ATTEMPTS THAN THE DEFAULT SCHEDULE, each given more time. A bound that does not
+  // cancel makes abandoned attempts keep downloading, so three attempts put up to three
+  // concurrent whole-document responses on a link that is merely slow — each making the
+  // next attempt slower, so the retry works against the very case it exists to survive.
+  const shipped = src.match(/const NODE_DEFS_RETRY_DELAYS_MS = \[([^\]]*)\]/);
+  assert.ok(shipped, "the refresh must state its own retry schedule");
+  const attempts = 2;
+  const waiting = OBJECT_INFO_RETRY_DELAYS_MS[0];
+  assert.ok(
+    attempts < OBJECT_INFO_RETRY_DELAYS_MS.length + 1,
+    "the refresh must retry FEWER times than the default schedule, not the same or more",
+  );
   const perAttempt = Math.floor((budget - waiting) / attempts);
   assert.ok(perAttempt > 0, `each attempt must get a real bound, got ${perAttempt}ms`);
   assert.ok(
