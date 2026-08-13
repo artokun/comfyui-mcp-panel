@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.28] - 2026-08-13
+
 ### Fixed
 
 - **Adding a node no longer waits forever on a ComfyUI that stopped answering (#1180) (#1186).**
