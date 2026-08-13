@@ -19,8 +19,9 @@ All notable changes to this project are documented here. This project adheres to
   every later attempt waited on the same dead one. The check now gives up after a few
   seconds and refuses that single call with a retry hint, and the abandoned request is
   discarded so the next attempt makes a fresh one — which succeeds as soon as the backend
-  is reachable. A slow answer that arrives late is still used, so recovery costs one
-  refused call rather than reloading the tab.
+  is reachable. An answer that arrives after the panel has given up is discarded rather
+  than used, so it cannot overwrite a newer one — the cost is re-asking, never a write
+  authorized against a stale picture of the backend.
 
 ## [0.14.24] - 2026-08-12
 
