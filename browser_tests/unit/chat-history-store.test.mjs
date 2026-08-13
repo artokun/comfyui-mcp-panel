@@ -2238,13 +2238,16 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
   // not invalidate durably", so for any user past these limits a two-second disk hiccup
   // answers false — which its callers must treat as "could not CONFIRM" rather than "the
   // store is broken" (#1184).
-  const hungIndexedDb = {
-    open: () => ({
-      set onsuccess(_) {},
-      set onerror(_) {},
-      set onblocked(_) {},
-      set onupgradeneeded(_) {}
-    })
+  // FAILS immediately rather than hanging. What this test needs is "the canonical write did
+  // not happen", and openDb() resolves null on onerror exactly as it does on its 2s cap —
+  // same downstream path, no wall-clock wait. Hanging here cost four seconds of suite time
+  // per case to prove something the settle test above already proves once.
+  const failingIndexedDb = {
+    open: () => {
+      const req = {}
+      queueMicrotask(() => req.onerror?.())
+      return req
+    }
   }
   const thread = (id, n) => ({ id, ts: 1, title: id, msgs: Array.from({ length: n }, (_, i) => ({ id: id + i, role: 'user', text: 'x' })) })
   const cases = [
@@ -2256,7 +2259,7 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
   for (const [label, threads, expectOk] of cases) {
     const store = new ChatHistoryStore({
       storage: createMemoryStorage(),
-      indexedDb: hungIndexedDb,
+      indexedDb: failingIndexedDb,
       broadcastFactory: null
     })
     store.persist(threads, {}, { maxThreads: 500, maxMessages: 1000 })
