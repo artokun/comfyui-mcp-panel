@@ -788,3 +788,66 @@ test("#1161: outcomeKind names all four outcomes, including both Symbols", () =>
     assert.ok(kind === "not-tried" || kind === "no-answer", `a sentinel must be named, got ${kind}`);
   }
 });
+
+test("#1161: the shares are the ones documented — 10s / 5s / 5s on the shipped budget", async () => {
+  // Review found BODY_SHARE 1 -> 0.5 and FALLBACK_RESPONSE_SHARE 0.5 -> 0.4 both left the
+  // suite green: the split the module documents in three places was asserted nowhere, so
+  // the numbers a reader checks could drift from the numbers that run.
+  const granted = [];
+  await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    deadlineMs: OBJECT_INFO_DEADLINE_MS,
+    timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+  });
+  assert.deepEqual(granted, [10000, 5000, 5000], "client route, then the response and body of the fallback");
+  assert.equal(granted.reduce((a, b) => a + b, 0), OBJECT_INFO_DEADLINE_MS, "and they are exactly the budget");
+});
+
+test("#1161: a refusal quotes the budget in force, not the argument it was given", async () => {
+  // Reverting the three failure strings from `${budget}` to `${deadlineMs}` survived the
+  // whole suite. It matters because the two now DIFFER: a value that cannot be a budget is
+  // replaced by the default, and a refusal saying "within its 10000ms share of the
+  // Infinityms budget" states something that was never true.
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: () => new Promise(() => {}),
+    fetchApi: () => new Promise(() => {}),
+    deadlineMs: Infinity,
+    timers: { setTimer: (fn) => { fn(); return {}; }, clearTimer: () => {} },
+  });
+  const note = result.failures.join(" | ");
+  assert.match(note, new RegExp(`share of the ${OBJECT_INFO_DEADLINE_MS}ms budget`), "the budget actually in force");
+  assert.doesNotMatch(note, /Infinity/, "never the uninterpretable argument");
+});
+
+test("#1161: a tiny budget still ISSUES the fallback rather than attempting nothing", async () => {
+  // `Math.floor(left * share)` truncates to 0 on a small budget, and a zero grant is not a
+  // short wait — it is the step never being attempted. Verified before the fix: deadlineMs
+  // of 1 or 2 gave fetchApi call count 0, the exact signature this change exists to remove.
+  for (const deadlineMs of [2, 3, 5, 50]) {
+    let calls = 0;
+    await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs,
+    });
+    assert.equal(calls, 1, `deadlineMs=${deadlineMs}: the fallback must still be issued`);
+  }
+  // At 1ms there is genuinely nothing to divide across three steps. It must still fail
+  // CLOSED and, critically, must not claim a budget was "already spent" when none was.
+  const one = await fetchWholeObjectInfo({ getNodeDefs: async () => null, fetchApi: async () => ({ ok: true }), deadlineMs: 1 });
+  assert.equal(one.defs, null);
+  assert.doesNotMatch(one.failures.join(" | "), /already spent/, "nothing had been spent when the first step ran");
+});
+
+test("#1161: an explicitly NULL timers object is not a rejection", async () => {
+  // `timers: null` is not `timers: undefined`, and only the latter reaches withTimeout's own
+  // default — an explicit null read `.setTimer` off null and rejected out of a module whose
+  // header promises every failure path returns `defs: null`, to callers with no catch.
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    timers: null,
+  });
+  assert.deepEqual(result.defs, DEFS_1161);
+});

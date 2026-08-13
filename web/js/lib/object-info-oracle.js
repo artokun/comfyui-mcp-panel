@@ -168,10 +168,21 @@ function describeFailure(label, err, extra = "") {
  * repo's measurement — a loop that turned an unmeasured number into a fact. Anyone
  * re-sizing this bound should re-measure rather than trust either figure secondhand.
  *
- * SO 20s IS GENEROUS, NOT TIGHT, and it stays that way once split: the smallest share any
- * single step gets is 10s, which is ~60x the measured download and ~20x the slowest
- * figure actually observed. It remains inside the bridge's 30s command timeout, so the
- * caller sees this oracle's own answer rather than a bare timeout.
+ * SO 20s IS GENEROUS, NOT TIGHT, and it stays that way once split three ways: 10s for the
+ * client route, then 5s for the fallback's response and 5s for its body. The SMALLEST of
+ * those is 5s — about 30x the measured download and 10x the slowest figure actually
+ * observed. (An earlier revision of this sentence still said 10s after the body was given
+ * its own share, which is the same stale-number trap the ~14.5s figure came from; the
+ * arithmetic is spelled out here so a later change to the shares has to update it.)
+ *
+ * WHY A SIBLING FILE LEGITIMATELY USES 14.5s. `get-errors-budget.js` sizes
+ * GET_ERRORS_REFRESH_CAP_MS at 15000 citing that same #610 figure, and it is CORRECT to:
+ * it bounds the forced refresh — the download plus registerNodesFromDefs plus rebuilding
+ * every combo in the graph. This module bounds only the fetch. Two files, two operations,
+ * two right answers; noticing that they disagree is what produced the wrong number here.
+ *
+ * It remains inside the bridge's 30s command timeout, so the caller sees this oracle's own
+ * answer rather than a bare timeout.
  */
 export const OBJECT_INFO_DEADLINE_MS = 20000;
 
@@ -304,9 +315,17 @@ export async function fetchWholeObjectInfo({
    */
   const runStep = async (attempt, share) => {
     const left = budget - consumed;
-    const grant = left > 0 ? Math.floor(left * share) : 0;
+    // AT LEAST A MILLISECOND WHILE ANY BUDGET REMAINS. Plain `Math.floor(left * share)`
+    // truncates to 0 on a tiny budget, and a zero grant is not a small wait — it is the
+    // step never being attempted. Verified: at deadlineMs of 1 or 2 the fallback was never
+    // issued (fetchApi call count 0), which is the exact signature this whole change exists
+    // to remove, reproduced by the arithmetic meant to prevent it.
+    const grant = left > 0 ? Math.max(1, Math.floor(left * share)) : 0;
     consumed += grant;
-    const outcome = await runTransport(attempt, grant, timers);
+    // `timers: null` is not `timers: undefined`, and only the latter reaches `withTimeout`'s
+    // own default — an explicit null read `.setTimer` off null and REJECTED out of a module
+    // that documents it always resolves, which two callers await with no catch of their own.
+    const outcome = await runTransport(attempt, grant, timers ?? undefined);
     return { outcome, grant };
   };
   // On the shipped 20s budget: 10s for the client route, 5s for the response, 5s for the
@@ -321,9 +340,11 @@ export async function fetchWholeObjectInfo({
     const { outcome, grant: clientMs } = await runStep(getNodeDefs, CLIENT_ROUTE_SHARE);
     const kind = outcomeKind(outcome);
     if (kind === "not-tried") {
-      // Cannot happen while this is the FIRST step (it holds the full budget minus the
-      // fallback's floor), but it is stated rather than assumed.
-      failures.push("api.getNodeDefs() was not attempted — the budget was already spent");
+      // TRUE OF THE FIRST STEP, WHICH HAS SPENT NOTHING. "the budget was already spent" is
+      // a false cause here: on a degenerate budget nothing had been drawn when this ran.
+      // Naming a cause that did not happen is #982's original defect, and it is no more
+      // acceptable in a branch that is hard to reach than in one that is not.
+      failures.push(`api.getNodeDefs() was not attempted — the ${budget}ms budget leaves it no time`);
     } else if (kind === "no-answer") {
       // The #1161 case. Recorded as a failure like any other, and — critically — execution
       // CONTINUES to the second transport, which is what this bound exists to reach.
