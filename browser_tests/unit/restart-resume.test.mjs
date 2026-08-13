@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+// #1166 adds one structural test over the panel source (where a call sits relative to
+// the restart's I/O), which the rest of this pure-logic file does not need.
+import { readFileSync } from "node:fs";
 
 import {
   adoptRebootRuns,
@@ -906,4 +909,57 @@ test("#585: an unavailable tracker reports every watched run as owed — never n
 test("#585: run ids normalize to strings so a numeric prompt_id survives the sessionStorage round-trip", () => {
   const raw = encodeRebootMarker({ at: 1, runs: [7, "7", null, undefined, 8] });
   assert.deepEqual(decodeRebootMarker(raw).runs, ["7", "8"]);
+});
+
+// ── #1166: a deliberate restart retires the turn on EVERY exit ────────────────
+//
+// hardRestart() cleared MID_TASK_KEY inside its `if (ok)` branch, so every failure exit
+// left the marker armed — the pack refusing, the POST throwing, and the invalidate path
+// that returns early all skipped it. The panel was then asserting a pending turn that
+// nothing would complete or retire, and because client.stop() sets closed=true (so the
+// socket's onclose suppresses the onStatus that hides the indicator) the working
+// indicator could spin forever too. The Disconnect handler already calls endTurnLocally()
+// immediately after its own client.stop(), for exactly this reason.
+//
+// Structural on purpose: the claim is about WHERE the call sits relative to the restart's
+// I/O, which is the whole content of the fix. Bounded to hardRestart's own body, with
+// both ends asserted — an unfound end silently turns `slice` into a near-whole-file scan
+// that passes wherever the tokens happen to sit (the trap corrected in #1146/#1163).
+test("#1166: hardRestart retires the turn BEFORE any I/O, so no exit can leave it armed", () => {
+  const src = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  );
+  const start = src.indexOf("async function hardRestart(");
+  assert.notEqual(start, -1, "could not locate hardRestart");
+  const end = src.indexOf("\n  }", start);
+  assert.notEqual(end, -1, "could not locate the end of hardRestart");
+  const body = src.slice(start, end);
+
+  // Matched as STATEMENTS (a line whose whole content is the call), never as bare
+  // tokens: this function's comments name `client.stop()` and `endTurnLocally()` while
+  // explaining the ordering, and a token search happily matches the prose — which is how
+  // the first draft of this very test passed the wrong claim. Same defect a reviewer
+  // found in the #1163 wiring assertions.
+  const at = (re) => body.search(re);
+  const retireAt = at(/^[ \t]*endTurnLocally\(\);/m);
+  const stopAt = at(/^[ \t]*client\.stop\(\);/m);
+  const tryAt = at(/^[ \t]*try \{/m);
+  assert.notEqual(retireAt, -1, "a deliberate restart must retire the turn locally");
+  assert.notEqual(stopAt, -1, "hardRestart must still drop the bridge");
+  assert.ok(
+    retireAt < stopAt,
+    "the turn must be retired BEFORE client.stop(), so a throw from stop() cannot skip it",
+  );
+  assert.ok(
+    retireAt < tryAt,
+    "…and before the try, so every failure exit has already retired it",
+  );
+  // The marker must NOT be retired only on the success branch, which is the defect.
+  const okBranchAt = at(/^[ \t]*if \(ok\) \{/m);
+  assert.notEqual(okBranchAt, -1, "expected the success branch to still exist");
+  assert.ok(
+    retireAt < okBranchAt,
+    "retiring the turn only inside `if (ok)` is the #1166 defect — every failure exit skips it",
+  );
 });

@@ -29455,6 +29455,23 @@ function buildPanel() {
     if (reloading) return;
     reloading = true;
     appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
+    // #1166 — retire the turn HERE, before any I/O, because a deliberate restart
+    // abandons it whatever the outcome. It used to be retired inside the `if (ok)`
+    // branch, which left every failure exit asserting a pending turn that nothing would
+    // ever complete: the pack refusing, the POST throwing, and the invalidate path that
+    // returns early all skipped it. Two things then went wrong at once — the working
+    // indicator span forever, because `client.stop()` sets closed=true and the socket's
+    // onclose suppresses the onStatus that would hide it (the same reason the Disconnect
+    // handler calls this immediately after its own stop()), and MID_TASK_KEY stayed armed
+    // as standing evidence of a live turn for the next reconnect to act on.
+    //
+    // Before the stop, not after, so a throw from stop() cannot skip it — the marker must
+    // not outlive the decision to restart, and this is the decision.
+    //
+    // Safe against the fresh agent's first turn: endTurnLocally() opens a 300ms
+    // straggler window (STALE_WORKING_GUARD_MS) to ignore a dying turn's late
+    // `turn:working`, and a backend restart cannot complete inside it.
+    endTurnLocally();
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -29490,10 +29507,17 @@ function buildPanel() {
             "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
           ),
         );
+        // #1166 — this early return DELIBERATELY skips the client.start() below, and is
+        // left that way. It looks like the #379/#419 "a reload never leaves a bridge
+        // dead" invariant being violated, but reconnecting here would restore the very
+        // session the restart exists to discard, and the pause is disclosed to the user
+        // in the line above rather than silent. What was actually wrong on this path was
+        // the marker outliving it, and that is now retired at the top.
         return;
       }
       ssSet(SOFT_RELOAD_KEY, null);
-      ssSet(MID_TASK_KEY, null);
+      // MID_TASK_KEY is already retired by the endTurnLocally() above, on every exit
+      // rather than only this one (#1166).
       appendSystem(
         tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
       );

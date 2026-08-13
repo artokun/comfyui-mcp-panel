@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed agent restart no longer leaves the panel showing a turn that will never
+  finish (#1166).** Restarting the agent backend retired the in-flight turn only when the
+  restart SUCCEEDED. Every other outcome — the pack refusing, ComfyUI being unreachable,
+  or the old session failing to invalidate — skipped it, so the panel went on asserting a
+  pending turn that nothing would ever complete. The working indicator could spin
+  indefinitely, because dropping the bridge suppresses the status change that would
+  normally hide it, and the mid-task marker stayed armed as standing evidence of a live
+  turn for the next reconnect to act on. The turn is now retired the moment the restart
+  is requested, before any of it can fail, which is what the Disconnect button has always
+  done for the same reason.
+
 ## [0.14.23] - 2026-08-12
 
 ### Fixed
