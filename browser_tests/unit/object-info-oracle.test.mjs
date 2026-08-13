@@ -499,11 +499,20 @@ test("#1161: the SHIPPED budget is a real bound, sized for the payload not a pin
   // shipped constant being set to 0 — which disables the bound entirely by withTimeout's
   // contract and reinstates the P1 with a green suite. Review caught that gap twice.
   assert.ok(OBJECT_INFO_DEADLINE_MS > 0, "a non-positive budget disables the bound");
-  // The bounded work is a ~5.4MB download, measured at ~14.5s in this repo (#610) — not
-  // the ~167ms LAN response an earlier version of this bound was mistakenly sized from.
+  // WHAT THE MEASUREMENT IS. The bounded work is one GET of the whole document: 5,413,770
+  // bytes / 167ms on a 63-pack install (#767), cited independently in object-info-cache.js
+  // and single-node-def.js, and measured live at ~450ms on a 4304-type install. The ~14.5s
+  // figure from #610 measures "/object_info + combo refresh" — the download PLUS
+  // registerNodesFromDefs plus rebuilding every combo widget — which this oracle does not
+  // do. An earlier revision of this file asserted 14.5s here as the download time, and
+  // three review rounds then cited that assertion back as the repo's measurement.
+  //
+  // So the floor is set against the real figure with room to spare: the smallest share any
+  // single step gets is half the deadline, which must still clear the measured download by
+  // a wide margin rather than merely exceed it.
   assert.ok(
-    OBJECT_INFO_DEADLINE_MS >= 15000,
-    "below the measured payload time this refuses ordinary installs, and pays for a second download doing it",
+    OBJECT_INFO_DEADLINE_MS / 2 >= 5000,
+    "a step's own share must clear the ~167ms measured download by a wide margin, not merely exceed it",
   );
   // …and it must still land inside the bridge's 30s command timeout, so the caller sees
   // this oracle's own answer rather than a bare timeout with no routes named.

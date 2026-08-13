@@ -145,13 +145,25 @@ function describeFailure(label, err, extra = "") {
  * second one — which is what actually happens when the client route fails instantly and
  * the fallback has a 5MB payload to move.
  *
- * SIZED FROM THE PAYLOAD, NOT FROM A PING. The first version of this used 6s, justified by
- * a ~167ms figure — but that measures a fast LAN RESPONSE, while the thing being bounded
- * is a 5,413,770-byte DOWNLOAD, which this repo measured at ~14.5s (#610). 6s would have
- * refused an ordinary install, and because the bound does not cancel, it would have paid
- * for a second full download on the way to refusing. 20s sits above that measurement with
- * headroom and still inside the bridge's 30s command timeout, so the caller sees this
- * oracle's own answer rather than a bare timeout.
+ * WHAT THE MEASUREMENT ACTUALLY IS, because a wrong one was written here and then reasoned
+ * from twice. This repo has measured the thing being bounded — ONE GET of the whole
+ * document — on a 63-pack install: **5,413,770 bytes / 167 ms** (#767). The same pair of
+ * numbers is cited independently in `object-info-cache.js`, `single-node-def.js` and the
+ * panel's own add_node path. Measured again live while fixing this issue, on a 4304-type
+ * install: `api.getNodeDefs()` 366ms, the raw GET plus its JSON parse ~450ms.
+ *
+ * ~14.5s (#610) IS A DIFFERENT OPERATION and must not be used to size this. That issue
+ * measured "the forced /object_info + combo refresh" — the download PLUS
+ * registerNodesFromDefs plus rebuilding every combo widget in the graph. This oracle does
+ * none of that; it fetches a document and reads it. An earlier revision of this comment
+ * cited 14.5s as the download time, and later reviews then cited THIS COMMENT back as the
+ * repo's measurement — a loop that turned an unmeasured number into a fact. Anyone
+ * re-sizing this bound should re-measure rather than trust either figure secondhand.
+ *
+ * SO 20s IS GENEROUS, NOT TIGHT, and it stays that way once split: the smallest share any
+ * single step gets is 10s, which is ~60x the measured download and ~20x the slowest
+ * figure actually observed. It remains inside the bridge's 30s command timeout, so the
+ * caller sees this oracle's own answer rather than a bare timeout.
  */
 export const OBJECT_INFO_DEADLINE_MS = 20000;
 
@@ -221,7 +233,9 @@ export async function fetchWholeObjectInfo({
   // So each step may spend at most what is left MINUS a reserve for the steps after it.
   // The fallback is the point of this oracle; it must be guaranteed a chance to answer.
   // The client route may use at most half, so the other half is still there when the
-  // fallback is reached — enough for the ~14.5s payload measurement to be attempted.
+  // fallback is reached. Half of the shipped budget is 10s against a 167ms measured
+  // download (#767) and a ~450ms live measurement — see the header for why the ~14.5s
+  // figure that once sat here measures a different operation entirely.
   const FALLBACK_FLOOR = Number.isFinite(deadlineMs) && deadlineMs > 0 ? Math.floor(deadlineMs / 2) : 0;
   const clientRouteBudget = () => {
     const left = deadlineMs - spent() - FALLBACK_FLOOR;
