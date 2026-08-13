@@ -18261,11 +18261,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // A panel-DRIVEN teardown never reaches here — stop()/setUrl()/destroy() null
       // `sock` synchronously, so their late close fails the isActive() guard above.
       // #1146 called that harmless on the grounds that every such path clears
-      // MID_TASK_KEY. #1163 found that reasoning covers only Disconnect, provider switch
-      // and soft reload; the AUTOMATIC recovery paths (tryAutoReclaim / tryAutoRespawn /
-      // tryHandshakeRedial) restart the orchestrator with a turn still armed and were
-      // silently losing the nudge. They open their outage in dropSocketForTeardown()
-      // instead, which is the one place that knows a teardown happened at all.
+      // MID_TASK_KEY, and that is not quite true: connectBackend() clears it only when
+      // `switching`, and hardRestart() only on its success branch (#1166).
+      //
+      // A WEDGED orchestrator is not covered here either: it holds its socket OPEN and
+      // answers nothing, so no close ever fires and no outage is recorded for a death
+      // the panel then resolves by force-respawning it. Both gaps are real and are
+      // tracked as their own issue rather than patched from here — two attempts to
+      // record those deaths from the teardown side turned a MISSED nudge into a FALSE
+      // one, because the teardown functions cannot distinguish "the orchestrator died"
+      // from "the user changed the bridge URL" or "the agent has not booted yet".
       bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
@@ -28934,13 +28939,6 @@ function buildPanel() {
     if (timedOutUrl !== client.currentUrl()) return false;
     handshakeRedialsLeft -= 1;
     appendSystem(tr("panel.the_panel_agent_isn_t_answering_yet", "The panel agent isn't answering yet — reconnecting…"));
-    // #1163 — the OUTAGE begins here, and only the panel can say so. The socket never
-    // closed: it is open with nothing behind it, which is why the close listener that
-    // normally opens an outage never ran. From the agent's point of view the bridge has
-    // been down since the orchestrator stopped answering, and this redial is the panel
-    // declaring exactly that. Without it the eventual handshake measures no outage, the
-    // ready ack reads no drop, and a turn killed by the wedge is never resumed.
-    bridgeOutage.noteBridgeClosed();
     client.setUrl(client.currentUrl()); // close + reopen on the same url → fresh hello
     return true;
   }
@@ -28981,13 +28979,6 @@ function buildPanel() {
           autoReclaimsLeft = 0;
           return;
         }
-        // #1163 — the reclaim KILLED the wedged orchestrator and spawned a fresh one, so
-        // any turn it was running is definitively gone. Stamped here rather than in the
-        // teardown helpers because only this path knows a death occurred: the socket was
-        // open the whole time (wedged, not closed), so the close listener that normally
-        // opens an outage never ran, and the fresh handshake would otherwise measure
-        // nothing and leave the killed turn unresumed.
-        bridgeOutage.noteBridgeClosed();
         if (data?.bridge_url && data.bridge_url !== client.currentUrl()) {
           client.setUrl(data.bridge_url); // setUrl reconnects
         } else {

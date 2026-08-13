@@ -638,42 +638,13 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
   ]) {
     assert.ok(src.includes(snippet), site);
   }
-  // #1163 — a WEDGED orchestrator never closes its socket, so the close listener above
-  // cannot see that death. The two recoveries that REPLACE one must open the outage
-  // themselves, or the fresh handshake measures nothing and the turn the wedge killed is
-  // never resumed. Pinned per-FUNCTION rather than by counting occurrences: a population
-  // count only says "three of these exist somewhere", which stays true if one moves to a
-  // path that must NOT open an outage — the exact mistake the first attempt at #1163 made.
-  for (const [fn, label] of [
-    ["function tryHandshakeRedial(timedOutUrl) {", "the handshake redial"],
-    ["function tryAutoReclaim(timedOutUrl) {", "the force-reclaim"],
-  ]) {
-    const at = src.indexOf(fn);
-    assert.notEqual(at, -1, `could not locate ${label}`);
-    const end = src.indexOf('\n  }', at);
-    assert.notEqual(end, -1, `could not locate the end of ${label}`);
-    assert.match(
-      src.slice(at, end),
-      /bridgeOutage\.noteBridgeClosed\(\);/,
-      `${label} replaces a wedged orchestrator and must open the outage itself`,
-    );
-  }
-  // …and the DELIBERATE teardowns must NOT. stop()/setUrl()/destroy() carry Disconnect,
-  // provider switch, soft reload and every user-driven bridge re-point; opening an outage
-  // there tells an agent whose orchestrator never died that its connection dropped. That
-  // is precisely what the first attempt at #1163 shipped, so it is pinned in both
-  // directions rather than left to the next reviewer.
-  for (const fn of ["    stop() {", "    setUrl(next, opts) {", "    destroy() {"]) {
-    const at = src.indexOf(fn);
-    assert.notEqual(at, -1, `could not locate ${fn.trim()}`);
-    const end = src.indexOf('\n    },', at);
-    assert.notEqual(end, -1, `could not locate the end of ${fn.trim()}`);
-    assert.doesNotMatch(
-      src.slice(at, end),
-      /bridgeOutage\./,
-      `${fn.trim()} is a deliberate teardown and must not record an outage`,
-    );
-  }
+  // NOTE: two attempts to also pin the WEDGE-death paths were removed with the code
+  // they described. A wedged orchestrator holds its socket open and never fires a
+  // close, so nothing records that death — a real gap, tracked separately. It is not
+  // pinned here because the assertions that tried to were themselves wrong: the
+  // negative half scanned stop()/setUrl()/destroy() for a literal `bridgeOutage.`,
+  // while the design it claimed to reject put the stamp in a shared helper CALLED
+  // from those bodies — so it would have passed against the very regression it named.
 });
 
 // ── #1145: the interval must be the OUTAGE, not one backoff step ─────────────
@@ -906,11 +877,15 @@ test("#1163: a turn started during an open outage is not charged with it", () =>
   );
 });
 
-test("#1163: a live turn's reconnect re-announce ends the outage, so it is not nudged", () => {
-  // turn:working is a frame FROM the orchestrator, so receiving it proves the bridge is
-  // carrying traffic. An orchestrator that SURVIVED re-announces its live turn; one that
-  // died has no turn to re-announce. So the re-announce arriving before the ready ack is
-  // exactly the evidence that no nudge is due — better than any clock reading.
+test("#1163: any turn start during an outage ends it — a working agent is never nudged", () => {
+  // Deliberately stated as the TRACKER's contract, not as a claim about frame ordering.
+  // An earlier version of this test asserted that a surviving orchestrator's re-announce
+  // beats the `ready` ack; the panel guarantees no such ordering, so that test pinned an
+  // assumption rather than a behaviour. What is true without any ordering assumption:
+  // whenever a turn start is seen, a turn is in flight, and the nudge exists only to
+  // rescue an IDLE agent — so from that moment there is nothing to rescue. If the ack
+  // arrives FIRST the outage still stands and the nudge fires, which is correct too:
+  // nothing had yet said a turn was running.
   const { clock, tracker } = trackerAt();
   tracker.noteTurnStarted(); // turn begins
   tracker.noteBridgeClosed(); // ComfyUI bounces, orchestrator survives

@@ -8,32 +8,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
-- **The mid-task nudge no longer fires on a turn you just started, and now fires when the
-  panel itself respawns a wedged orchestrator (#1163).** Two defects in the outage
-  accounting added for #1145, found by review of that change rather than in the wild.
-  A turn beginning while the bridge was still down zeroed the measured outage but left
-  the outage itself running, so it was later measured from before that turn existed.
-  Reachable in ordinary use: sending a message needs only an open socket, not a completed
-  handshake, and the socket comes back well before the model list does — so typing into
-  that gap could draw "your connection dropped mid-task — continue exactly what you were
-  doing" on top of the message just sent, making the agent restart or duplicate the work
-  it was asked to do. A turn start now ENDS the outage rather than only zeroing the
-  total, which is also better evidence than the clock it replaces: the frame that starts a
-  turn comes FROM the orchestrator, so receiving it proves the orchestrator is alive. That
-  settles the reconnect case for the right reason — an orchestrator that survived
-  re-announces its live turn and is left alone, while one that died has no turn to
-  re-announce, so its nudge still fires.
-  Separately, when the panel itself replaces a WEDGED orchestrator — one holding an open
-  socket while answering nothing — no outage was recorded at all. A wedged orchestrator
-  never closes its connection, so the drop that normally starts the clock never happens,
-  and the panel force-kills and respawns it instead. That is a real death with the turn
-  already lost, so the resumed session had nothing pending and no nudge was sent: the
-  agent simply stopped, after the panel's own recovery killed its work. The two
-  recoveries that replace a wedged orchestrator now record it. Deliberate teardowns —
-  Disconnect, provider switch, reload, and any change of bridge address — deliberately do
-  not, since nothing died; they are pinned against it in both directions, because an
-  earlier attempt at this fix recorded an outage for all of them and would have told
-  agents whose orchestrator never died that their connection had dropped.
+- **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
+  the outage accounting added for #1145, found by review of that change rather than in
+  the wild. A turn beginning while the bridge was still down zeroed the measured outage
+  but left the outage itself running, so it was later measured from before that turn
+  existed. Reachable in ordinary use: sending a message needs only an open socket, not a
+  completed handshake, and the socket comes back well before the model list does — so
+  typing into that gap could draw "your connection dropped mid-task — continue exactly
+  what you were doing" on top of the message just sent, making the agent restart or
+  duplicate the work it was asked to do.
+  A turn start now ENDS the outage rather than only zeroing the total. What that frame
+  proves is narrow but sufficient: a turn is in flight. The nudge exists solely to
+  rescue an agent left IDLE — a session resumed with full context and nothing pending —
+  so once a turn is running there is nothing to rescue, whether it is the original turn
+  re-announced by an orchestrator that survived or a new one just typed into a replaced
+  agent. Nudging either is the harm. The converse still holds and is covered by tests:
+  an orchestrator that died has no turn to announce, so its nudge fires as before.
 
 - **The mid-task resume nudge now measures the outage instead of one backoff step, so a
   ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
