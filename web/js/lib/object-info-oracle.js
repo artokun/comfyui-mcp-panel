@@ -362,15 +362,23 @@ export async function fetchWholeObjectInfo({
   // than the unbounded original gave. NaN and Infinity are not budgets a caller can have
   // meant, so they take the shipped default. A non-positive NUMBER is a real choice and is
   // obeyed — every step is then unattempted, and says so.
-  // …and CLAMPED to what a timer can actually express. `setTimeout` coerces a delay above
-  // 2^31-1 to 1ms, so a budget past that would hand every step a grant its timer fires
-  // almost immediately — the bound silently becoming no bound at all, which is the failure
-  // this module exists to remove. Clamping honours a caller asking for "very long" (2^31-1
-  // is ~24.8 days) instead of quietly inverting it.
+  // …and a budget a TIMER CANNOT EXPRESS is treated exactly like one that is not a number.
+  //
+  // `setTimeout` coerces a delay above 2^31-1 to 1ms, so an over-range budget hands every
+  // step a grant whose timer fires immediately — the bound silently becoming no bound.
+  // CLAMPING to 2^31-1 was tried first and is worse: it turns the nonsense input into a
+  // ~24.8-DAY grant, so a hung client route parks instead of failing fast. Measured on real
+  // timers at deadlineMs 5e9 — the unclamped version answered in 3ms with the fallback
+  // issued, the clamped one never returned at all, fetchApi call count 0. That is the
+  // canonical #1161 signature, reintroduced by a guard written to prevent it.
+  //
+  // Neither behaviour is what a caller meant by a nine-digit millisecond count, so it takes
+  // the shipped default like any other unusable value.
   const MAX_EXPRESSIBLE_MS = 2 ** 31 - 1;
-  const budget = Number.isFinite(deadlineMs)
-    ? Math.min(MAX_EXPRESSIBLE_MS, Math.max(0, deadlineMs))
-    : OBJECT_INFO_DEADLINE_MS;
+  const budget =
+    Number.isFinite(deadlineMs) && deadlineMs <= MAX_EXPRESSIBLE_MS
+      ? Math.max(0, deadlineMs)
+      : OBJECT_INFO_DEADLINE_MS;
   let consumed = 0;
   /**
    * Run one step CAPPED at `share` of what is LEFT, charging it for what it used — its

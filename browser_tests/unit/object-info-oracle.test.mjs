@@ -991,12 +991,16 @@ test("#1161: an unreadable elapsed reading charges the FULL grant, never zero", 
   );
 });
 
-test("#1161: a budget beyond the timer's range cannot silently become no bound", async () => {
-  // setTimeout coerces a delay above 2^31-1 to 1ms. An unclamped budget therefore hands
-  // every step a grant whose timer fires almost immediately — the bound inverting into no
-  // bound, which is precisely the hang this module exists to remove, reached by asking for
-  // MORE time rather than less.
-  for (const deadlineMs of [3e9, Number.MAX_SAFE_INTEGER, 2 ** 31]) {
+test("#1161: a budget beyond the timer's range takes the default, and does not park", async () => {
+  // setTimeout coerces a delay above 2^31-1 to 1ms, so an over-range budget hands every step
+  // a grant whose timer fires immediately — the bound silently becoming no bound.
+  //
+  // CLAMPING to 2^31-1 was the first fix and was worse: it turns the nonsense input into a
+  // ~24.8-day grant, so a hung client route PARKS instead of failing fast. Measured on real
+  // timers at deadlineMs 5e9, the clamped version never returned at all with fetchApi call
+  // count 0 — the canonical #1161 signature, reintroduced by a guard written to prevent it.
+  // Both halves are pinned here so neither fix can be undone in favour of the other.
+  for (const deadlineMs of [2 ** 31, 5e9, Number.MAX_SAFE_INTEGER, Infinity, NaN]) {
     const granted = [];
     let calls = 0;
     const result = await fetchWholeObjectInfo({
@@ -1007,24 +1011,42 @@ test("#1161: a budget beyond the timer's range cannot silently become no bound",
     });
     assert.equal(calls, 1, `deadlineMs=${deadlineMs}: the fallback is still issued`);
     assert.deepEqual(result.defs, DEFS_1161);
-    for (const ms of granted) {
-      assert.ok(ms <= 2 ** 31 - 1, `granted ${ms}ms, which a timer cannot express and fires at 1ms`);
-    }
-    // PIN THE BOUNDARY ITSELF. Grants alone cannot see it: at a budget of exactly 2**31 the
-    // largest grant still lands a millisecond or two under the ceiling, so setting the cap
-    // to 2**31 survived every grant assertion. The refusal quotes the budget in force, so
-    // it is the one observable that distinguishes the two.
+    assert.equal(
+      granted[0],
+      OBJECT_INFO_DEADLINE_MS / 2,
+      `deadlineMs=${deadlineMs}: an unusable budget must take the DEFAULT, not a multi-day clamp`,
+    );
+  }
+  // A hung route on an over-range budget must fail fast rather than park for days.
+  {
+    let calls = 0;
     const refused = await fetchWholeObjectInfo({
       getNodeDefs: () => new Promise(() => {}),
-      fetchApi: () => new Promise(() => {}),
-      deadlineMs,
+      fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs: 5e9,
       timers: { setTimer: (fn) => { fn(); return {}; }, clearTimer: () => {} },
     });
+    // Timers fire immediately here, so every step times out by construction — the point is
+    // not that it answers, but that it REACHES the fallback and reports, rather than sitting
+    // on a multi-day grant with the raw route never contacted.
+    assert.equal(calls, 1, "the fallback is reached instead of the call parking");
+    assert.equal(refused.defs, null, "with every timer firing at once nothing can answer");
     assert.match(
       refused.failures.join(" | "),
-      /share of the 2147483647ms budget/,
-      "the budget in force must be exactly the largest a timer can express",
+      new RegExp(`share of the ${OBJECT_INFO_DEADLINE_MS}ms budget`),
+      "and the refusal quotes the budget actually in force, not a nine-digit one",
     );
+  }
+  // A budget AT the ceiling is expressible, so it is honoured rather than overridden.
+  {
+    const granted = [];
+    await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+      deadlineMs: 2 ** 31 - 1,
+      timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+    });
+    assert.equal(granted[0], Math.floor((2 ** 31 - 1) / 2), "an expressible budget is the caller's to choose");
   }
 });
 
