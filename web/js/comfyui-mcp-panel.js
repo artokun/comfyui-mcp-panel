@@ -18729,12 +18729,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         return;
       }
       if (isCommandFrame) {
-        // #1095 — the command is now IN FLIGHT against this socket's tab mapping, and
-        // stays so until deliverReply hands its reply over. Marked here, at the top of
-        // the branch, so an executor that suspends (run/save await; ask_user blocks on
-        // the user) is covered for its whole duration — that suspension is precisely the
-        // window a workflow-change re-hello would withdraw the route in.
-        commandsInFlight++;
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
         // ANY command frame is real turn activity (incl. the SILENT_CMDS that
@@ -18829,6 +18823,25 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
           return;
         }
+        // #1095 — the command is now IN FLIGHT against this socket's tab mapping, and
+        // stays so until deliverReply hands its reply over. That covers an executor that
+        // SUSPENDS (run/save await; ask_user blocks on the user), which is precisely the
+        // window a workflow-change re-hello would withdraw the route in.
+        //
+        // Marked HERE, past the #517 dedupe/retry region, not at the top of the branch.
+        // Everything above returns on five paths that never reach deliverReply — a
+        // superseded socket after a retry mismatch, a rejected retry, a defensive ledger
+        // catch, a superseded socket after the duplicate await, and the duplicate replay —
+        // and the last two answer with a direct `thisSock.send`, not deliverReply. An
+        // increment above would leak on every one of them, and a leaked count is not
+        // harmless: it never returns to 0, so EVERY later workflow switch waits out the
+        // full deferral budget. Found by parsing the branch; two hand reads of it missed
+        // these paths entirely.
+        //
+        // From here to deliverReply there is no other exit: the executor's throws are
+        // caught below and turned into a reply, so increment and decrement are exactly
+        // paired.
+        commandsInFlight++;
         const settleRid = commandRidLedger.begin(msg.rid, fingerprint, commandEpoch);
         let reply;
         // #581 — retain the tracker belonging to the command's completed edit.
