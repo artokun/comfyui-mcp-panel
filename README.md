@@ -12,6 +12,17 @@ Claude or ChatGPT (your own subscription, no API key).**
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — or hit **🆘 Need help?** in the panel's Settings → About (it copies a diagnostics summary and opens the Discord for you).
 
+### 🌐 Speaks your language
+
+The whole panel — chat, settings, the CivitAI browser, the training wizard, the RunPod controls,
+every tooltip — is translated into **12 languages**, and it follows ComfyUI's own language setting
+automatically. Change it any time in **Settings → Panel language**.
+
+**English · 한국어 · 日本語 · 中文 (简体) · 中文 (繁體) · Русский · Français · Español · Português (BR) · Türkçe · العربية · فارسی**
+
+Arabic and Persian render right-to-left. Counted strings use each language's real plural rules —
+Russian's four forms and Arabic's six, not an English one/other pair bolted on.
+
 Pick a provider — **Claude** or **ChatGPT** — and the matching agent runs in the background on
 *your* subscription, sees the graph you're looking at, and edits it live. Every provider is
 **offered the same surface**: the same live-canvas tools, the same model knowledge, the same
