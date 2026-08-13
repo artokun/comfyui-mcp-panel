@@ -18262,7 +18262,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // `sock` synchronously, so their late close fails the isActive() guard above.
       // #1146 called that harmless on the grounds that every such path clears
       // MID_TASK_KEY, and that is not quite true: connectBackend() clears it only when
-      // `switching`, and hardRestart() only on its success branch (#1166).
+      // `switching`. (hardRestart() had the same hole and no longer does — #1166.)
       //
       // A WEDGED orchestrator is not covered here either: it holds its socket OPEN and
       // answers nothing, so no close ever fires and no outage is recorded for a death
@@ -29472,6 +29472,13 @@ function buildPanel() {
     // straggler window (STALE_WORKING_GUARD_MS) to ignore a dying turn's late
     // `turn:working`, and a backend restart cannot complete inside it.
     endTurnLocally();
+    // …and its TWIN, for the same reason. A hard restart supersedes any pending soft
+    // reload, and this was cleared only on the success branch — the identical defect one
+    // line apart, which is worth saying plainly because fixing one marker and leaving the
+    // other is exactly how this class survives a fix. A stale soft-reload marker sends
+    // the next `ready` ack down the reload branch, announcing "Agent reloaded — session
+    // resumed" for a restart that never happened.
+    ssSet(SOFT_RELOAD_KEY, null);
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -29515,9 +29522,8 @@ function buildPanel() {
         // the marker outliving it, and that is now retired at the top.
         return;
       }
-      ssSet(SOFT_RELOAD_KEY, null);
-      // MID_TASK_KEY is already retired by the endTurnLocally() above, on every exit
-      // rather than only this one (#1166).
+      // Both markers are already retired at the top, on every exit rather than only this
+      // one (#1166).
       appendSystem(
         tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
       );

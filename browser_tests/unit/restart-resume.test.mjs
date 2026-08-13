@@ -962,4 +962,22 @@ test("#1166: hardRestart retires the turn BEFORE any I/O, so no exit can leave i
     retireAt < okBranchAt,
     "retiring the turn only inside `if (ok)` is the #1166 defect — every failure exit skips it",
   );
+  // The TWIN marker, held to the same rule. Review caught SOFT_RELOAD_KEY still being
+  // cleared only on success — the identical defect one line from the one being fixed,
+  // which is how this class survives a fix. A stale soft-reload marker sends the next
+  // `ready` ack down the reload branch, announcing a reload that never happened.
+  const softReloadAt = at(/^[ \t]*ssSet\(SOFT_RELOAD_KEY, null\);/m);
+  assert.notEqual(softReloadAt, -1, "hardRestart must still retire the soft-reload marker");
+  assert.ok(
+    softReloadAt < okBranchAt,
+    "SOFT_RELOAD_KEY must be retired on every exit too, not only on success",
+  );
+  // Neither marker may ALSO be set inside the success branch — a leftover write there
+  // would mean the pair had drifted back apart without either assertion above noticing.
+  const successBranch = body.slice(okBranchAt);
+  assert.doesNotMatch(
+    successBranch,
+    /ssSet\((?:MID_TASK_KEY|SOFT_RELOAD_KEY), null\);/,
+    "the success branch must not re-retire what the top already retired",
+  );
 });
