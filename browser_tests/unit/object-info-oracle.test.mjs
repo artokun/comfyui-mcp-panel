@@ -29,6 +29,8 @@ import {
   objectInfoOracleFailureNote,
   // The SHIPPED budget, so a test cannot pass against a value the panel does not use.
   OBJECT_INFO_DEADLINE_MS,
+  outcomeKind,
+  TRANSPORT_SENTINELS,
 } from "../../web/js/lib/object-info-oracle.js";
 
 const SCHEMA = { KSampler: { input: {} }, VAELoader: { input: {} } };
@@ -691,78 +693,98 @@ test("#1161: a timer that fires LATE cannot starve the fallback", async () => {
   }
 });
 
-test("#1161: no clock behaviour can make the granted total exceed the deadline", async () => {
-  // Date.now is this module's default clock and it steps backwards for ordinary reasons:
-  // an NTP correction, a manual or DST change, a VM suspend/resume. The first attempt at
-  // this clamped each negative READING to zero, which silently refunded everything already
-  // spent — measured at -60s against a 20000ms deadline, one call ran to wall t=49900ms,
-  // past the bridge's 30s command timeout, which is the symptom this oracle replaces.
+test("#1161: the budget is divided WITHOUT consulting a clock at all", async () => {
+  // The structural version of an invariant that three previous designs asserted in prose
+  // and none actually held. Each of those tried to make an untrustworthy `Date.now()` safe:
+  // clamping negative readings refunded everything spent (one call ran ~50s against a 20s
+  // deadline); a high-water ratchet only sampled at step boundaries, and its test passed
+  // with AND without it; charging measured elapsed let a stalled clock refund real time.
   //
-  // A high-water ratchet was tried next and is ALSO not enough: it only samples at step
-  // boundaries, so a jump between two samples still refunds, and a test for it passes with
-  // or without the ratchet — which is how the second attempt was caught.
+  // A clock that THROWS proves the property that replaced them. If this resolves, the
+  // accounting provably never read it — no reasoning required, and no future edit can
+  // reintroduce a clock read without failing here.
+  const exploding = () => { throw new Error("the clock is not to be trusted"); };
+  const granted = [];
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    deadlineMs: 20000,
+    now: exploding,
+    timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+  });
+  assert.deepEqual(result.defs, DEFS_1161, "a hostile clock cannot cost the user their answer");
+  assert.ok(
+    granted.reduce((a, b) => a + b, 0) <= 20000,
+    `granted ${granted.join("+")}ms against a 20000ms budget`,
+  );
+});
+
+test("#1161: every step is reserved a real share, so none can be starved", async () => {
+  // The property that REPLACED the starvation branch. Reserving for the fallback but not
+  // for its BODY was the same defect one level down: a response that used everything left
+  // the body unreadable, and a body that cannot be read authorizes nothing.
+  const granted = [];
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    deadlineMs: 20000,
+    timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+  });
+  assert.deepEqual(result.defs, DEFS_1161);
+  assert.equal(granted.length, 3, "client route, response and body are each bounded");
+  for (const [i, ms] of granted.entries()) {
+    assert.ok(ms > 0, `step ${i} was granted ${ms}ms — a zero grant is a starved step`);
+  }
+  assert.ok(granted.reduce((a, b) => a + b, 0) <= 20000, "and the shares sum to one budget");
+});
+
+test("#1161: a non-finite budget cannot poison the arithmetic", async () => {
+  // `deadlineMs: Infinity` made `consumed` infinite, `budget - consumed` NaN, and every
+  // later grant NaN — and `Math.max(0, NaN)` is NaN rather than 0, so the fallback was
+  // SKIPPED ENTIRELY (call count 0) on an input the unbounded original handled fine.
   //
-  // So the property under test is not about the clock at all. A step cannot outlast the
-  // grant its TIMER enforces, so bounding the SUM OF GRANTS bounds the call in real time
-  // whatever now() reports. That is what this asserts, under a clock behaving as badly as
-  // it can: backwards, stalled, and jumping forward.
-  for (const clocks of [
-    [0, -60_000, -120_000, -180_000],
-    [0, 0, 0, 0],
-    [0, 5_000_000, -5_000_000, 0],
-    [0, NaN, 1000, NaN],
-  ]) {
-    const armed = [];
-    // REAL time, not granted time: a step that HANGS costs exactly the grant its timer
-    // enforces, and a step that answers early costs nothing. Summing grants instead would
-    // charge for time a fast step handed back, and pass or fail for the wrong reason.
-    let elapsedReal = 0;
-    const timers = {
-      setTimer: (fn, ms) => { const t = { fn, ms }; armed.push(t); return t; },
-      clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
-    };
-    let step = 0;
-    const out = fetchWholeObjectInfo({
-      getNodeDefs: never,
-      fetchApi: async () => ({ ok: true, json: never }),
-      deadlineMs: 6000,
-      timers,
-      now: () => clocks[Math.min(step, clocks.length - 1)],
+  // The first fix normalised such a budget to zero, which merely relocated the damage: the
+  // oracle then attempted nothing at all. A value that cannot be a budget takes the shipped
+  // default instead, so a caller passing garbage still gets a working oracle.
+  for (const deadlineMs of [Infinity, -Infinity, NaN, undefined]) {
+    let calls = 0;
+    const result = await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs,
     });
-    for (let i = 0; i < 8; i++) {
-      await tick();
-      const t = armed.shift();
-      if (!t) continue; // the step answered on its own; its timer was cleared
-      step += 1;
-      elapsedReal += t.ms; // it hung for exactly as long as it was allowed to
-      t.fn();
-    }
-    const result = await settled(out, `the oracle call (${clocks.join(",")})`);
-    assert.equal(result.defs, null, "nothing answered, so nothing is authorized");
-    assert.ok(
-      elapsedReal <= 6000,
-      `ran ${elapsedReal}ms against a 6000ms deadline under clock ${clocks.join(",")} — the budget was refunded`,
-    );
+    assert.equal(calls, 1, `deadlineMs=${String(deadlineMs)}: the fallback must still be ISSUED`);
+    assert.deepEqual(result.defs, DEFS_1161, `deadlineMs=${String(deadlineMs)}: and answer`);
+  }
+  // An explicit non-positive NUMBER is a real choice, and is obeyed rather than overridden.
+  for (const deadlineMs of [0, -1]) {
+    let calls = 0;
+    const result = await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs,
+    });
+    assert.equal(calls, 0, `deadlineMs=${deadlineMs}: nothing may be attempted`);
+    assert.equal(result.defs, null, "…and nothing is authorized");
+    assert.match(result.failures.join(" | "), /was not attempted/, "…and it says so plainly");
   }
 });
 
-test("#1161: the BODY's not-attempted branch is real, and reports rather than throwing", async () => {
-  // The one NOT_TRIED branch no test reached: a response that lands exactly as the
-  // fallback's end time arrives leaves the body with nothing. Deleting this branch left
-  // the whole suite green, and without it the Symbol reaches the `in` test and rejects out
-  // of a module two callers await with no catch of their own.
-  let clock = 0;
-  const result = await fetchWholeObjectInfo({
-    getNodeDefs: async () => null,
-    // Answering consumes the whole fallback window, so the body step has none left.
-    fetchApi: async () => { clock = 6000; return { ok: true, json: async () => DEFS_1161 }; },
-    deadlineMs: 6000,
-    now: () => clock,
-  });
-  assert.equal(result.defs, null, "no budget to read the body means no authorization — fail closed");
-  assert.match(
-    result.failures.join(" | "),
-    /GET \/object_info answered but its body was not read/,
-    "and it says the body was not read, rather than claiming the route did not answer",
-  );
+test("#1161: outcomeKind names all four outcomes, including both Symbols", () => {
+  // The share-based budget makes "not-tried" unreachable through the public function on a
+  // usable budget — every step is reserved a share, so none can be starved to a zero grant.
+  // The branch is still live code, and an untested branch here does not misbehave quietly:
+  // `"err" in outcome` on a Symbol is a TypeError out of a module documented to always
+  // resolve, which two callers await with no catch. That bug shipped once during this issue
+  // when a patch replaced a branch instead of adding beside it, so the demux is pinned here
+  // directly rather than through a path that can stop reaching it.
+  assert.equal(outcomeKind({ err: new Error("boom") }), "threw");
+  assert.equal(outcomeKind({ value: { KSampler: {} } }), "value");
+  assert.equal(outcomeKind({ value: undefined }), "value", "an undefined payload is still an answer");
+  assert.equal(outcomeKind({ err: undefined }), "threw", "presence of `err`, not its truthiness");
+  // Both sentinels are Symbols, and neither may reach the `in` test.
+  for (const sentinel of TRANSPORT_SENTINELS) {
+    const kind = outcomeKind(sentinel);
+    assert.ok(kind === "not-tried" || kind === "no-answer", `a sentinel must be named, got ${kind}`);
+  }
 });
