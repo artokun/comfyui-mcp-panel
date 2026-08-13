@@ -700,9 +700,10 @@ test("#1161: an injected clock that THROWS cannot reject out of this module", as
   // deadline); a high-water ratchet only sampled at step boundaries, and its test passed
   // with AND without it; charging measured elapsed let a stalled clock refund real time.
   //
-  // A clock that THROWS proves the property that replaced them. If this resolves, the
-  // accounting provably never read it — no reasoning required, and no future edit can
-  // reintroduce a clock read without failing here.
+  // A clock that THROWS must not cost the caller their answer. The accounting DOES read a
+  // clock now — on `performance.now()`, which is monotonic — but `now` is an injected seam,
+  // and this module's header promises every failure path returns `defs: null` to two
+  // callers that await it with no catch of their own.
   const exploding = () => { throw new Error("the clock is not to be trusted"); };
   const granted = [];
   const result = await fetchWholeObjectInfo({
@@ -932,4 +933,31 @@ test("#1161: a clock returning a non-number cannot reject out of this module", a
     });
     assert.deepEqual(result.defs, DEFS_1161, `now returning ${String(typeof now())} must not cost the answer`);
   }
+});
+
+test("#1161: the DEFAULT clock is the monotonic one — the property everything rests on", () => {
+  // Nothing pinned this: swapping the default to Date.now left the whole suite green, while
+  // being the single choice the current design depends on. Every scenario that broke the
+  // three earlier clock-based designs — an NTP step, a DST or manual change, a VM
+  // suspend/resume, a frozen reading — is a WALL-CLOCK hazard specifically.
+  //
+  // A source guard, in the idiom this suite already uses for the #982 refusal wording,
+  // because the choice is a default the tests otherwise always override.
+  const src = readFileSync(new URL("../../web/js/lib/object-info-oracle.js", import.meta.url), "utf8");
+  assert.match(src, /performance\.now\(\)/, "the default reading must be the monotonic clock");
+  const dateNowUses = src.split("\n").filter((l) => /Date\.now\(\)/.test(l) && !/^\s*(\/\/|\*)/.test(l));
+  assert.equal(dateNowUses.length, 1, `Date.now may appear only as the last-resort fallback, found: ${dateNowUses.join(" | ")}`);
+  assert.match(dateNowUses[0], /=>\s*Date\.now\(\)/, "and only as the fallback arm of the clock selection");
+});
+
+test("#1161: an unreadable elapsed reading charges the FULL grant, never zero", () => {
+  // The documented conservative direction. Flipping this arm to charge 0 left the suite
+  // green, so a clock that cannot be read would have silently handed every later step a
+  // fresh budget — the refund defect that produced the ~50s overruns.
+  const src = readFileSync(new URL("../../web/js/lib/object-info-oracle.js", import.meta.url), "utf8");
+  assert.match(
+    src,
+    /Number\.isFinite\(spent\) && spent >= 0 \? Math\.min\(spent, grant\) : grant/,
+    "unmeasurable elapsed must fall back to the whole grant, not to nothing",
+  );
 });

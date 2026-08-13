@@ -306,37 +306,45 @@ export async function fetchWholeObjectInfo({
     // rather than at each of its uses.
     return typeof reading === "number" && Number.isFinite(reading) ? reading : NaN;
   };
-  // ONE budget for the whole question, DIVIDED IN ADVANCE — and no clock is consulted to
-  // do it. That is the whole point, and it was arrived at the hard way.
+  // ONE budget for the whole question, DIVIDED IN ADVANCE, with each step CAPPED at a share
+  // of what is left and charged only for what it actually used. Five designs were tried to
+  // get here; each is recorded because each looked correct and had a green suite.
   //
-  // Four designs were tried against a `Date.now()` that lies (an NTP correction, a DST or
-  // manual change, a VM suspend/resume, a coarse or frozen timer resolution). Each is
-  // recorded because each looked correct and had a green suite:
+  //   1. Measure with `Date.now()`, clamping each negative READING to zero. It refunded
+  //      everything already spent, so one call ran ~50s against a 20s deadline — past the
+  //      bridge's 30s command timeout, so the agent got a bare timeout naming no routes.
+  //      That IS the #1161 symptom, produced by the fix for it.
+  //   2. A high-water RATCHET over the same clock. It samples only at step boundaries, so a
+  //      jump between two samples still refunds — and the test written for it passed with
+  //      AND without the ratchet, which is how it was caught.
+  //   3. Charge the grant on timeout, measured elapsed otherwise, still on `Date.now()`. A
+  //      frozen clock then ran a call 49,998ms against 20,000ms, and the "unmeasurable" arm
+  //      charged a whole remaining grant for one bad reading, starving the step after it.
+  //   4. STOP MEASURING — charge every step its full grant. That bounded the total but
+  //      stranded the time a fast step never used, and it REFUSED payloads both the parent
+  //      and `main` delivered: a client route answering in 200ms was still charged 10s, so
+  //      a 5.4MB body served at 7.5s elsewhere was refused here at 5.5s.
   //
-  //   1. Clamp each negative READING to zero. It refunded everything already spent, so one
-  //      call ran ~50s against a 20s deadline — past the bridge's 30s command timeout, so
-  //      the agent got a bare timeout naming no routes. That IS the #1161 symptom, produced
-  //      by the fix for it.
-  //   2. A high-water RATCHET. It samples only at step boundaries, so a jump between two
-  //      samples still refunds — and the test written for it passed with AND without the
-  //      ratchet, which is how it was caught.
-  //   3. Charge the grant on timeout, the measured elapsed otherwise. The timeout half is
-  //      sound, but a step that ANSWERS was still charged by the clock, so a stalled or
-  //      under-reporting clock refunded real time; and the "unmeasurable" arm charged a
-  //      whole remaining grant for one bad reading, starving the step after it.
+  // The first three failed to a clock and the fourth failed by avoiding one, which is the
+  // actual lesson: every scenario that broke 1–3 is a WALL-CLOCK hazard, and the default
+  // was `Date.now()`. The available conclusion was never "do not measure" — it was "do not
+  // measure with the one clock in the platform that is allowed to lie." `performance.now()`
+  // is monotonic by specification, and this repo already measures its other elapsed windows
+  // on it (`monotonicNow()` in the panel, `session-rebind.js`, `reconnect-staleness.js`).
   //
-  // Every one of those moved the hole rather than closing it, because all three tried to
-  // make an untrustworthy measurement safe. So this one does not measure at all.
+  // SO: a step that TIMES OUT is charged its full grant with nothing measured — the timer
+  // is real-time truth. A step that ANSWERS is charged what the monotonic clock says it
+  // used, clamped to its grant, so the remainder goes back to the steps after it. The CAP
+  // is what stops a hung route starving the fallback; the RECLAIM is what stops a fast one
+  // spending time it never used. Both halves are load-bearing, and each was broken on its
+  // own in the rounds above.
   //
-  // EVERY STEP IS CHARGED ITS FULL GRANT, UNCONDITIONALLY. A step cannot outlast the grant
-  // its TIMER enforces in real wall time — true whatever `now()` reports, and the only
-  // thing here that is. So if the grants sum to at most the budget, the call takes at most
-  // the budget, with no clock anywhere in the argument.
-  //
-  // The cost is that a fast step does not hand its unused time to a later one. That is
-  // affordable precisely BECAUSE the shares are large: the smallest is a quarter of 20s
-  // against a measured 167ms download (#767) and ~450ms live — see the header for why the
-  // ~14.5s figure that once sat here measures a different operation.
+  // WHERE THIS STILL DEPENDS ON THE CLOCK, stated rather than glossed: the reclaim believes
+  // a clock that ADVANCES. One that under-reports without going backwards (a stub, or the
+  // `Date.now` fallback on a platform with no `performance`) charges an answering step too
+  // little, and real elapsed can then exceed the budget. `performance.now()` cannot do this,
+  // which is exactly why it is the default and why `now` is a test seam rather than a
+  // configuration knob.
   //
   // A NON-FINITE BUDGET IS NORMALISED ONCE, HERE. `deadlineMs: Infinity` used to make
   // `consumed` infinite, `budget - consumed` NaN, and every later grant NaN — and since
@@ -352,7 +360,8 @@ export async function fetchWholeObjectInfo({
   const budget = Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs) : OBJECT_INFO_DEADLINE_MS;
   let consumed = 0;
   /**
-   * Run one step on `share` of what is LEFT, and charge it in full.
+   * Run one step CAPPED at `share` of what is LEFT, charging it for what it used — its
+   * whole grant if it timed out, the measured elapsed if it answered early.
    *
    * The fractional share is what reserves room for the steps after it. The client route
    * takes half, so the fallback always has half; the fallback's RESPONSE takes half of what
@@ -373,6 +382,8 @@ export async function fetchWholeObjectInfo({
     // the fallback is not reached. That is arithmetic rather than a bug, but an earlier
     // revision of this comment claimed the floor made every budget reachable, which is the
     // kind of overclaim that later gets cited as established.
+    // `share` is never above 1 for any step here, so `floor(left * share) <= left` already;
+    // the min() is a guard for a future share, not something that binds today.
     const grant = left > 0 ? Math.max(1, Math.min(left, Math.floor(left * share))) : 0;
     const startedStep = readClock();
     // `timers: null` is not `timers: undefined`, and only the latter reaches `withTimeout`'s
