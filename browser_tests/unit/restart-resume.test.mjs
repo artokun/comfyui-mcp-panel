@@ -911,21 +911,27 @@ test("#585: run ids normalize to strings so a numeric prompt_id survives the ses
   assert.deepEqual(decodeRebootMarker(raw).runs, ["7", "8"]);
 });
 
-// ── #1166: a deliberate restart retires the turn on EVERY exit ────────────────
+// ── #1166: a successful restart retires its markers BEFORE it can bail ────────
 //
-// hardRestart() cleared MID_TASK_KEY inside its `if (ok)` branch, so every failure exit
-// left the marker armed — the pack refusing, the POST throwing, and the invalidate path
-// that returns early all skipped it. The panel was then asserting a pending turn that
-// nothing would complete or retire, and because client.stop() sets closed=true (so the
-// socket's onclose suppresses the onStatus that hides the indicator) the working
-// indicator could spin forever too. The Disconnect handler already calls endTurnLocally()
-// immediately after its own client.stop(), for exactly this reason.
+// hardRestart's success branch clears the markers that assert a live turn, but the
+// invalidate-failure path returns early — and every clear sat AFTER that return, so a
+// restart that killed the agent and then failed to invalidate left the turn, the
+// soft-reload marker and the restart-resume marker all armed against an agent that no
+// longer existed.
 //
-// Structural on purpose: the claim is about WHERE the call sits relative to the restart's
-// I/O, which is the whole content of the fix. Bounded to hardRestart's own body, with
-// both ends asserted — an unfound end silently turns `slice` into a near-whole-file scan
-// that passes wherever the tokens happen to sit (the trap corrected in #1146/#1163).
-test("#1166: hardRestart retires the turn BEFORE any I/O, so no exit can leave it armed", () => {
+// The clears belong inside `if (ok)`, NOT at the top of the function. An earlier
+// attempt hoisted them, reasoning that a deliberate restart abandons the turn whatever
+// happens. That is wrong for this pack: `/comfyui_mcp_panel/hard_restart` answers
+// `{"ok": false}` unconditionally ("orchestrator runs out-of-band"), so nothing is ever
+// killed and the old turn keeps running — hoisting cleared a LIVE turn's state on the
+// only path that actually runs.
+//
+// Structural because the claim is structural: WHERE the clears sit relative to the
+// branch and the early return is the whole content of the fix. Statements are matched
+// as statements, never as bare tokens — this function's comments name every one of
+// these calls while explaining the ordering, and an earlier draft of this test matched
+// the prose and asserted the wrong thing.
+test("#1166: a successful restart retires every marker before the invalidate can bail", () => {
   const src = readFileSync(
     new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
     "utf8",
@@ -935,63 +941,33 @@ test("#1166: hardRestart retires the turn BEFORE any I/O, so no exit can leave i
   const end = src.indexOf("\n  }", start);
   assert.notEqual(end, -1, "could not locate the end of hardRestart");
   const body = src.slice(start, end);
-
-  // Matched as STATEMENTS (a line whose whole content is the call), never as bare
-  // tokens: this function's comments name `client.stop()` and `endTurnLocally()` while
-  // explaining the ordering, and a token search happily matches the prose — which is how
-  // the first draft of this very test passed the wrong claim. Same defect a reviewer
-  // found in the #1163 wiring assertions.
   const at = (re) => body.search(re);
-  const retireAt = at(/^[ \t]*endTurnLocally\(\);/m);
-  const stopAt = at(/^[ \t]*client\.stop\(\);/m);
-  const tryAt = at(/^[ \t]*try \{/m);
-  assert.notEqual(retireAt, -1, "a deliberate restart must retire the turn locally");
-  assert.notEqual(stopAt, -1, "hardRestart must still drop the bridge");
-  assert.ok(
-    retireAt < stopAt,
-    "the turn must be retired BEFORE client.stop(), so a throw from stop() cannot skip it",
-  );
-  assert.ok(
-    retireAt < tryAt,
-    "…and before the try, so every failure exit has already retired it",
-  );
-  // The marker must NOT be retired only on the success branch, which is the defect.
+
   const okBranchAt = at(/^[ \t]*if \(ok\) \{/m);
-  assert.notEqual(okBranchAt, -1, "expected the success branch to still exist");
-  assert.ok(
-    retireAt < okBranchAt,
-    "retiring the turn only inside `if (ok)` is the #1166 defect — every failure exit skips it",
-  );
-  // The TWIN marker, held to the same rule. Review caught SOFT_RELOAD_KEY still being
-  // cleared only on success — the identical defect one line from the one being fixed,
-  // which is how this class survives a fix. A stale soft-reload marker sends the next
-  // `ready` ack down the reload branch, announcing a reload that never happened.
-  const softReloadAt = at(/^[ \t]*ssSet\(SOFT_RELOAD_KEY, null\);/m);
-  assert.notEqual(softReloadAt, -1, "hardRestart must still retire the soft-reload marker");
-  assert.ok(
-    softReloadAt < okBranchAt,
-    "SOFT_RELOAD_KEY must be retired on every exit too, not only on success",
-  );
-  // Neither marker may ALSO be set inside the success branch — a leftover write there
-  // would mean the pair had drifted back apart without either assertion above noticing.
-  const successBranch = body.slice(okBranchAt);
-  assert.doesNotMatch(
-    successBranch,
-    /ssSet\((?:MID_TASK_KEY|SOFT_RELOAD_KEY), null\);/,
-    "the success branch must not re-retire what the top already retired",
-  );
-  // The THIRD marker, found only after the first two were fixed. A hard restart discards
-  // the session, so a surviving restart-resume marker would resume the very conversation
-  // it exists to throw away, and the #585 watch would keep re-evaluating a revoked
-  // marker. All three are asserted together because the defect here was never one
-  // marker — it was retiring SOME of them.
+  const invalidateAt = at(/^[ \t]*if \(!await invalidateDurableAgentSession\(\)\) \{/m);
+  assert.notEqual(okBranchAt, -1, "expected the success branch");
+  assert.notEqual(invalidateAt, -1, "expected the invalidate guard");
+
+  // Every marker a restart retires, held to the same rule. Asserted together because
+  // the defect was never one marker — it was retiring SOME of them: three separate
+  // review rounds each found another that had been left behind.
   for (const [re, what] of [
+    [/^[ \t]*endTurnLocally\(\);/m, "the in-flight turn"],
+    [/^[ \t]*ssSet\(SOFT_RELOAD_KEY, null\);/m, "the soft-reload marker"],
     [/^[ \t]*ssSet\(REBOOT_KEY, null\);/m, "the restart-resume marker"],
     [/^[ \t]*stopRebootWatch\(\);/m, "the restart-resume watch"],
     [/^[ \t]*forgetRebootResumeAttempt\(\);/m, "the in-flight resume attempt"],
   ]) {
     const site = at(re);
-    assert.notEqual(site, -1, `a deliberate restart must retire ${what}`);
-    assert.ok(site < okBranchAt, `${what} must be retired on every exit, not only on success`);
+    assert.notEqual(site, -1, `a successful restart must retire ${what}`);
+    assert.ok(
+      site > okBranchAt,
+      `${what} must be retired only when the restart SUCCEEDED — this pack's ` +
+        `/hard_restart always answers ok:false, so retiring unconditionally clears a live turn`,
+    );
+    assert.ok(
+      site < invalidateAt,
+      `${what} must be retired BEFORE the invalidate, whose failure path returns early`,
+    );
   }
 });

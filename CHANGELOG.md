@@ -8,25 +8,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
-- **A failed agent restart no longer leaves stale state behind, and says so on screen
-  (#1166).** Restarting the agent backend retired the in-flight turn only when the
-  restart SUCCEEDED. Every other outcome — the pack refusing, ComfyUI being unreachable,
-  or the old session failing to invalidate — skipped it, so the panel went on asserting
-  a pending turn that nothing would ever complete. The working indicator could spin
-  indefinitely, because dropping the bridge suppresses the status change that would
-  normally hide it, and the mid-task marker stayed armed as standing evidence of a live
-  turn for the next reconnect to act on.
-  The same was true of the other two markers a restart is supposed to retire: a stale
-  soft-reload marker announced that the agent had reloaded and the session was resumed,
-  for a restart that never happened, and a surviving restart-resume marker would resume
-  the very conversation the restart exists to discard. All three are now retired the
-  moment the restart is requested, before any of it can fail — which is what the
-  Disconnect button has always done, for the same reason.
-  One failure is deliberately not recovered: when the old session cannot be invalidated,
-  the reconnect stays paused rather than restoring the session the restart was meant to
-  throw away. That pause was previously invisible — the status chip, dot and buttons
-  still showed a live connection, so the panel contradicted its own message and offered
-  no way to act on it. It now shows the real state and restores the Connect button.
+- **A successful agent restart no longer leaves the old turn's state armed against a
+  fresh agent (#1166).** When a restart genuinely replaces the agent, the panel retires
+  the markers that say a turn is in flight. Those clears all sat after a step that can
+  bail out — if the old session could not be invalidated durably, the restart returned
+  early and skipped every one of them. The killed turn, a pending soft-reload marker and
+  the restart-resume marker were all left armed against an agent that no longer existed,
+  so the next reconnect could announce a reload that never happened, or resume the very
+  conversation the restart was meant to discard. They are now retired before that step,
+  so nothing it does can skip them.
+  That pause itself is deliberate and stays: reconnecting there would restore the session
+  the restart exists to throw away. What it did not do was say so — the status chip, dot
+  and buttons still showed a live connection, so the panel contradicted its own message
+  and left no way to act on it. It now shows the real state and restores the Connect
+  button.
 
 ## [0.14.23] - 2026-08-12
 

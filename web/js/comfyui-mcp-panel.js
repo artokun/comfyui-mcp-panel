@@ -29455,41 +29455,6 @@ function buildPanel() {
     if (reloading) return;
     reloading = true;
     appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
-    // #1166 — retire the turn HERE, before any I/O, because a deliberate restart
-    // abandons it whatever the outcome. It used to be retired inside the `if (ok)`
-    // branch, which left every failure exit asserting a pending turn that nothing would
-    // ever complete: the pack refusing, the POST throwing, and the invalidate path that
-    // returns early all skipped it. Two things then went wrong at once — the working
-    // indicator span forever, because `client.stop()` sets closed=true and the socket's
-    // onclose suppresses the onStatus that would hide it (the same reason the Disconnect
-    // handler calls this immediately after its own stop()), and MID_TASK_KEY stayed armed
-    // as standing evidence of a live turn for the next reconnect to act on.
-    //
-    // Before the stop, not after, so a throw from stop() cannot skip it — the marker must
-    // not outlive the decision to restart, and this is the decision.
-    //
-    // Safe against the fresh agent's first turn: endTurnLocally() opens a 300ms
-    // straggler window (STALE_WORKING_GUARD_MS) to ignore a dying turn's late
-    // `turn:working`, and a backend restart cannot complete inside it.
-    endTurnLocally();
-    // …and its TWIN, for the same reason. A hard restart supersedes any pending soft
-    // reload, and this was cleared only on the success branch — the identical defect one
-    // line apart, which is worth saying plainly because fixing one marker and leaving the
-    // other is exactly how this class survives a fix. A stale soft-reload marker sends
-    // the next `ready` ack down the reload branch, announcing "Agent reloaded — session
-    // resumed" for a restart that never happened.
-    ssSet(SOFT_RELOAD_KEY, null);
-    // …and the THIRD, which review found after the first two: nothing here touched the
-    // restart-resume marker or its watch. A hard restart deliberately discards the
-    // session — that is its entire purpose — so a surviving REBOOT_KEY would resume the
-    // conversation this restart exists to throw away, and the #585 watch would keep
-    // re-evaluating a marker the restart just revoked. The Disconnect handler already
-    // retires all three together for the same reason, in the same order; this is that
-    // sequence minus the USER_DISCONNECTED_KEY latch, which belongs only to an explicit
-    // Disconnect (a restart intends to come back).
-    ssSet(REBOOT_KEY, null);
-    stopRebootWatch();
-    forgetRebootResumeAttempt();
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -29515,6 +29480,35 @@ function buildPanel() {
       reloading = false;
     }
     if (ok) {
+      // #1166 — retire everything that asserts a live turn HERE: inside the success
+      // branch, because only a restart that actually happened killed the turn, and
+      // BEFORE the invalidate below, whose failure path returns early and skipped all of
+      // it. That early return was the real defect — not the branch itself.
+      //
+      // Deliberately NOT hoisted to the top of the function. An earlier attempt did
+      // that, on the reasoning that a deliberate restart abandons the turn whatever the
+      // outcome, and it was wrong here: this pack's /hard_restart answers `{ok: false}`
+      // unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so `ok` is
+      // ALWAYS false, nothing is ever killed, and the old orchestrator's turn keeps
+      // running. Retiring at the top therefore cleared the state of a LIVE turn on the
+      // only path this pack takes — the working indicator vanishing while the agent
+      // works, and a follow-up message painting inline instead of queueing. The
+      // reconnect's `turn:working` re-announce normally repairs that, but endTurnLocally()
+      // opens a 300ms straggler window (STALE_WORKING_GUARD_MS) that can swallow it on a
+      // local bridge. The indicator staying up through a restart that did not happen is
+      // not a bug; the turn really is still running.
+      //
+      // All three markers, because retiring only some of them is how this class survives
+      // a fix: the turn itself, the soft-reload marker (a hard restart supersedes a
+      // pending reload), and the restart-resume marker plus its #585 watch (a fresh agent
+      // must not resume the conversation this restart discarded). The Disconnect handler
+      // retires the same set in the same order, minus its USER_DISCONNECTED_KEY latch,
+      // which belongs only to an explicit Disconnect because a restart intends to return.
+      endTurnLocally();
+      ssSet(SOFT_RELOAD_KEY, null);
+      ssSet(REBOOT_KEY, null);
+      stopRebootWatch();
+      forgetRebootResumeAttempt();
       // Start FRESH on reconnect: clear the saved session id so hello sends no
       // resume (resuming would restore the wedged shell). Don't arm the resume
       // nudge. The reconnect spins up a brand-new agent.
