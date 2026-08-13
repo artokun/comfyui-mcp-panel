@@ -302,3 +302,122 @@ test("#982 (codex r4) blank entries: the slice-first order is documented, not ac
   assert.equal(objectInfoOracleFailureNote(["", "", "", "", "x"]), "", "four blanks consume the window");
   assert.match(objectInfoOracleFailureNote(["x", "", "", "", ""]), /Tried 5 routes: x \(and 1 more not shown\)\./);
 });
+
+// ── #1161: a transport that never ANSWERS must not park the whole oracle ─────
+//
+// The P1. After a ComfyUI restart the tab can hold a half-open connection, so
+// `api.getNodeDefs()` never settles — it does not throw, it simply never answers. Both
+// awaits here were unbounded, so the oracle parked on the first transport and the second
+// route — added by #982 for exactly this failure — was never asked. Every command that
+// consults it hung until its caller timed out at 30s.
+//
+// The bound is not a way to fail faster. Its point is that the SECOND route usually
+// answers, so the write SUCCEEDS. That is why it belongs here and not around the cache,
+// where three attempts on #1178 could only choose how to give up.
+//
+// Timers are injected and fired by hand, so nothing here waits on a real clock and a
+// regression fails with a named assertion rather than wedging `node --test`.
+function harness() {
+  const timers = new Set();
+  return {
+    timers: {
+      setTimer: (fn, ms) => { const t = { fn, ms }; timers.add(t); return t; },
+      clearTimer: (t) => timers.delete(t),
+    },
+    armed: () => timers.size,
+    fire: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }),
+  };
+}
+const DEFS_1161 = { KSampler: {} };
+// Never await an oracle call unbounded: node --test has no default timeout, so a
+// regression would wedge the suite instead of naming itself. The previous branch was
+// caught doing exactly this.
+const settled = (p, what) =>
+  Promise.race([
+    p,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${what} never settled — a transport was not bounded`)), 250),
+    ),
+  ]);
+// Let the oracle reach its next await and arm THAT timer before firing. A macrotask
+// flushes every pending microtask, which counting ticks does not reliably do — an earlier
+// draft fired the response timer before it had unwrapped and timed out the wrong stage.
+const tick = () => new Promise((r) => setTimeout(r, 0));
+const never = () => new Promise(() => {});
+
+test("#1161: a hung client route falls through to the fallback, which ANSWERS", async () => {
+  // The whole point: not a faster refusal — a successful write.
+  const h = harness();
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    waitMs: 6000,
+    timers: h.timers,
+  });
+  await tick();
+  h.fire(); // the client route gives up
+  const result = await settled(out, "the oracle call");
+  assert.deepEqual(result.defs, DEFS_1161, "the fallback answered, so the caller is authorized");
+  assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) did not answer within 6000ms/);
+});
+
+test("#1161: the timeout is reported as a timeout, not as a throw", async () => {
+  // withTimeout never rejects by contract, so a naive wrap would collapse "it threw" into
+  // "it timed out" and the refusal would name the wrong cause — the trap that bit #1178.
+  const h = harness();
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: async () => { throw new Error("client exploded"); },
+    fetchApi: never,
+    waitMs: 6000,
+    timers: h.timers,
+  });
+  await tick();
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  const note = result.failures.join(" | ");
+  assert.match(note, /api\.getNodeDefs\(\) threw: client exploded/, "a throw keeps its own cause");
+  assert.match(note, /GET \/object_info did not answer within 6000ms/, "…and a hang keeps its own");
+});
+
+test("#1161: both transports hanging still returns, and names both", async () => {
+  const h = harness();
+  const out = fetchWholeObjectInfo({ getNodeDefs: never, fetchApi: never, waitMs: 6000, timers: h.timers });
+  await tick();
+  h.fire();
+  await tick();
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  assert.equal(result.defs, null, "nothing answered, so nothing is authorized — still fail-closed");
+  assert.equal(result.failures.length, 2, "each route reports for itself");
+  for (const f of result.failures) assert.match(f, /did not answer within 6000ms/);
+});
+
+test("#1161: a hung BODY is bounded too — the response is not the body", async () => {
+  // res.json() is a second I/O step and was inside the try/catch the bound replaced. A 5MB
+  // schema over a half-open connection can stall after the headers arrive.
+  const h = harness();
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => ({ ok: true, json: never }),
+    waitMs: 6000,
+    timers: h.timers,
+  });
+  await tick();
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  assert.equal(result.defs, null);
+  assert.match(result.failures.join(" | "), /body did not arrive within 6000ms/);
+});
+
+test("#1161: a healthy client route is untouched by the bound", async () => {
+  const h = harness();
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => DEFS_1161,
+    fetchApi: () => { throw new Error("must not be consulted"); },
+    waitMs: 6000,
+    timers: h.timers,
+  });
+  assert.deepEqual(result.defs, DEFS_1161);
+  assert.deepEqual(result.failures, [], "a route that answers records no failure");
+  assert.equal(h.armed(), 0, "and leaves no timer armed");
+});

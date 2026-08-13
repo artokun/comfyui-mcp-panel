@@ -42,6 +42,9 @@
  */
 
 import { CACHE_OUTCOME } from "./object-info-cache.js";
+// #1161 — the repo's one bounded-step primitive. A second timeout helper is how this
+// repo keeps producing near-duplicate bugs, per that file's own header.
+import { withTimeout } from "./bounded-step.js";
 
 /** A payload that can actually answer "does the backend define this type?" */
 function usableDefs(value) {
@@ -88,6 +91,51 @@ function describeFailure(label, err, extra = "") {
 }
 
 /**
+ * #1161 — how long ONE transport may take before this oracle moves on to the next.
+ *
+ * The P1: after a ComfyUI restart the tab can hold a half-open connection, so
+ * `api.getNodeDefs()` never settles — it does not throw, it simply never answers. Both
+ * awaits below were unbounded, so the whole oracle parked on the first transport and the
+ * second route, added by #982 for exactly this failure, was never asked. Every command
+ * that consults it hung until its caller timed out.
+ *
+ * This bound is what makes the fallback REACHABLE. It is not a way to fail faster: the
+ * point is that the second route usually answers, so the write succeeds. That is why the
+ * bound belongs here and not around the cache — a bound there can only choose how to give
+ * up, which is what three attempts on #1178 kept rediscovering.
+ *
+ * PER TRANSPORT, so the worst case is two bounds rather than one. Kept well inside the
+ * callers' own budgets (the bridge times a command out at 30s) so trying the second route
+ * is still useful, while long enough that a legitimately slow first route is not abandoned
+ * while it is still working — /object_info measures ~167ms on a 63-pack install (#767),
+ * so seconds of headroom is generous rather than tight.
+ */
+export const OBJECT_INFO_TRANSPORT_WAIT_MS = 6000;
+
+/** Distinguishes "this transport did not answer in time" from any value it could return. */
+const NO_ANSWER = Symbol("object-info-transport-timeout");
+
+/**
+ * Run one transport under a bound, preserving the difference between the three outcomes
+ * the failure list already distinguishes: it answered, it threw, or it never answered.
+ *
+ * `withTimeout` NEVER rejects by contract, so a naive wrap would collapse "threw" into
+ * "timed out" and the refusal would name the wrong cause — the trap that bit #1178. The
+ * outcome is therefore reified before bounding and unwrapped after.
+ */
+async function runTransport(attempt, waitMs, timers) {
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(attempt)
+      .then((value) => ({ value }), (err) => ({ err })),
+    waitMs,
+    () => NO_ANSWER,
+    timers,
+  );
+  return settled;
+}
+
+/**
  * Fetch the whole `/object_info` schema, trying the frontend client first and the raw
  * HTTP route second.
  *
@@ -95,12 +143,25 @@ function describeFailure(label, err, extra = "") {
  * payload, and `failures` names every route that did not, in order. An empty `failures`
  * with a null `defs` cannot happen: a route that answers nothing is itself a failure.
  */
-export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
+export async function fetchWholeObjectInfo({
+  getNodeDefs,
+  fetchApi,
+  // Injected so a test can drive the bound without waiting on a real clock.
+  waitMs = OBJECT_INFO_TRANSPORT_WAIT_MS,
+  timers,
+} = {}) {
   const failures = [];
 
   if (typeof getNodeDefs === "function") {
-    try {
-      const defs = await getNodeDefs();
+    const outcome = await runTransport(getNodeDefs, waitMs, timers);
+    if (outcome === NO_ANSWER) {
+      // The #1161 case. Recorded as a failure like any other, and — critically — execution
+      // CONTINUES to the second transport, which is what this bound exists to reach.
+      failures.push(`api.getNodeDefs() did not answer within ${waitMs}ms`);
+    } else if ("err" in outcome) {
+      failures.push(describeFailure("api.getNodeDefs() threw", outcome.err));
+    } else {
+      const defs = outcome.value;
       if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
       // AN EMPTY MAP IS AN ANSWER, NOT AN ABSENCE (codex). A client that deliberately
       // filters could express deny-all as `{}`, and consulting the raw route would then
@@ -118,8 +179,6 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
           ` (${defs === null ? "null" : Array.isArray(defs) ? "an array" : typeof defs})`,
         ),
       );
-    } catch (err) {
-      failures.push(describeFailure("api.getNodeDefs() threw", err));
     }
   } else {
     failures.push("api.getNodeDefs is not a function on this frontend");
@@ -128,17 +187,35 @@ export async function fetchWholeObjectInfo({ getNodeDefs, fetchApi } = {}) {
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    try {
-      const res = await fetchApi("/object_info");
+    const outcome = await runTransport(() => fetchApi("/object_info"), waitMs, timers);
+    if (outcome === NO_ANSWER) {
+      failures.push(`GET /object_info did not answer within ${waitMs}ms`);
+    } else if ("err" in outcome) {
+      failures.push(describeFailure("GET /object_info threw", outcome.err));
+    } else {
+      const res = outcome.value;
       if (!res || res.ok !== true) {
         failures.push(describeFailure("GET /object_info was not OK", null, ` (status ${res?.status ?? "unknown"})`));
       } else {
-        const defs = await res.json();
-        if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
-        failures.push("GET /object_info returned no usable schema (an empty or non-object body)");
+        // The BODY is a second I/O step, and it was inside the try/catch this bound
+        // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
+        // half-open connection can also stall, so it is bounded as well rather than merely
+        // re-caught: the response arriving is not the same event as the body arriving.
+        const body = await runTransport(() => res.json(), waitMs, timers);
+        if (body === NO_ANSWER) {
+          failures.push(`GET /object_info answered but its body did not arrive within ${waitMs}ms`);
+        } else if ("err" in body) {
+          // Deliberately the SAME wording as before. A parse failure used to surface
+          // through this route's catch, and an existing #982 test pins the sentence a user
+          // reads. This change is about bounding the waits, not about rewording refusals —
+          // improving the phrasing here would be a separate, reviewable decision.
+          failures.push(describeFailure("GET /object_info threw", body.err));
+        } else {
+          const defs = body.value;
+          if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
+          failures.push("GET /object_info returned no usable schema (an empty or non-object body)");
+        }
       }
-    } catch (err) {
-      failures.push(describeFailure("GET /object_info threw", err));
     }
   } else {
     failures.push("no fetchApi is wired for the fallback route");
