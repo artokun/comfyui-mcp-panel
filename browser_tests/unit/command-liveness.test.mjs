@@ -637,4 +637,10 @@ test("#1095: the in-flight command count is paired, and read before a re-target"
     "the deferral must be bounded so a stuck command cannot strand the tab");
   assert.match(body, /^\s*workflowRetargetDeferrals = 0;/m,
     "…and the budget must reset once the re-target proceeds");
+  // …and the budget must be released on the no-change path too, not only when a deferred
+  // switch proceeds. A counter that only ratchets one way leaves an ABANDONED switch
+  // (deferred a tick, then the id settles back) part-spent, so the next genuine switch
+  // gets fewer deferrals than it is owed.
+  const resets = (body.match(/^\s*workflowRetargetDeferrals = 0;/gm) || []).length;
+  assert.ok(resets >= 2, "the deferral budget must reset on the no-change path as well");
 });

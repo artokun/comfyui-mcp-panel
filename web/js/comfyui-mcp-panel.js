@@ -27064,7 +27064,17 @@ function buildPanel() {
     const wf = activeWorkflowRef();
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
-    if (wfid === currentWorkflowId) return; // case 1: no change
+    if (wfid === currentWorkflowId) {
+      // #1095 — nothing pending, so nothing is being deferred: release the budget here
+      // too. It is only reset once a deferred switch finally proceeds, and this early
+      // return skips that — so a switch that was deferred a tick or two and then ABANDONED
+      // (the user switches back, or the id settles to what it already was) would leave
+      // the budget part-spent, and the next genuine switch would get fewer deferrals than
+      // it is owed. A counter that only ever ratchets one way is the same shape as the
+      // stale-marker class this file keeps finding.
+      workflowRetargetDeferrals = 0;
+      return; // case 1: no change
+    }
 
     // #1095 — a workflow change re-targets this socket, and rehelloForWorkflow's own note
     // says the backend DROPS the socket's prior tab mapping when it does. That is correct
