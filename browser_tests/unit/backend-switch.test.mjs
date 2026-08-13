@@ -39,8 +39,11 @@ function recorder({ live = "claude", picked = "claude", invalidate = async () =>
       log.push("invalidate");
       return invalidate();
     },
-    seedPrefs: () => log.push("seedPrefs"),
-    commitSelection: () => log.push("commitSelection"),
+    // ARGUMENTS RECORDED, not just names. A recorder that logs only the effect name lets
+    // the module hand the WRONG backend id to every commit while the whole suite passes —
+    // it would prove the order and nothing about what was ordered.
+    seedPrefs: (b) => log.push(`seedPrefs:${b}`),
+    commitSelection: (b) => log.push(`commitSelection:${b}`),
     endTurn: () => log.push("endTurn"),
     buildReplay: () => {
       log.push("buildReplay");
@@ -55,6 +58,9 @@ function recorder({ live = "claude", picked = "claude", invalidate = async () =>
 
 /** Every effect that COMMITS to the new backend. None may run before the switch is legal. */
 const COMMITS = ["seedPrefs", "commitSelection", "endTurn", "buildReplay", "armContext", "teardownAndConnect"];
+/** Effects are logged as `name` or `name:arg`; match on the name half. */
+const at = (log, name) => log.findIndex((e) => e === name || e.startsWith(`${name}:`));
+const ran = (log, name) => at(log, name) !== -1;
 
 test("#1184 a failed invalidate commits NOTHING — asserted on every effect, not a sample", async () => {
   const { log, effects } = recorder({ live: "claude", invalidate: async () => false });
@@ -65,7 +71,7 @@ test("#1184 a failed invalidate commits NOTHING — asserted on every effect, no
   assert.deepEqual(log, ["invalidate", `disclose:${BACKEND_SWITCH.INVALIDATE_FAILED}`]);
   // …and stated per effect, so a failure names the leak rather than a diff of two arrays.
   for (const effect of COMMITS) {
-    assert.ok(!log.includes(effect), `${effect} ran despite the switch being illegal`);
+    assert.ok(!ran(log, effect), `${effect} ran despite the switch being illegal`);
   }
 });
 
@@ -78,10 +84,14 @@ test("#1184 the invalidate happens BEFORE every commit, not after them", async (
   assert.deepEqual(result, { switched: true, reason: BACKEND_SWITCH.SWITCHED });
   assert.equal(log[0], "invalidate", "the legality check must come first");
   for (const effect of COMMITS) {
-    const at = log.indexOf(effect);
-    assert.ok(at > 0, `${effect} must run on a successful switch`);
-    assert.ok(at > log.indexOf("invalidate"), `${effect} committed BEFORE the invalidate — this is the defect`);
+    const i = at(log, effect);
+    assert.ok(i > 0, `${effect} must run on a successful switch`);
+    assert.ok(i > log.indexOf("invalidate"), `${effect} committed BEFORE the invalidate — this is the defect`);
   }
+  // …and every commit must be told the backend the CALLER asked for. Order without
+  // identity is half a proof: the module could commit a different id in the right order.
+  assert.ok(log.includes("commitSelection:codex"), `the selection committed was not codex: ${log}`);
+  assert.ok(log.includes("seedPrefs:codex"), `prefs were seeded for the wrong backend: ${log}`);
   assert.equal(log[log.length - 1], "teardownAndConnect", "the connect must be last");
 });
 
@@ -94,12 +104,12 @@ test("#1184 a NON-switch never consults the history store", async () => {
 
     assert.equal(result.switched, false, `${label}: not a switch`);
     assert.equal(result.reason, BACKEND_SWITCH.CONNECTED, `${label}: but it DID connect`);
-    assert.ok(!log.includes("invalidate"), `${label}: must not invalidate`);
-    assert.ok(log.includes("commitSelection"), `${label}: must still commit the selection`);
-    assert.ok(log.includes("teardownAndConnect"), `${label}: must still connect`);
+    assert.ok(!ran(log, "invalidate"), `${label}: must not invalidate`);
+    assert.ok(ran(log, "commitSelection"), `${label}: must still commit the selection`);
+    assert.ok(ran(log, "teardownAndConnect"), `${label}: must still connect`);
     // Session-scoped work belongs to a switch only.
-    assert.ok(!log.includes("endTurn"), `${label}: no turn to end`);
-    assert.ok(!log.includes("armContext"), `${label}: nothing to replay`);
+    assert.ok(!ran(log, "endTurn"), `${label}: no turn to end`);
+    assert.ok(!ran(log, "armContext"), `${label}: nothing to replay`);
   }
 });
 
@@ -118,7 +128,7 @@ test("#1184 a handshake landing during the invalidate supersedes the switch", as
 
   assert.deepEqual(result, { switched: false, reason: BACKEND_SWITCH.SUPERSEDED });
   for (const effect of COMMITS) {
-    assert.ok(!rec.log.includes(effect), `${effect} ran against a backend state that had already moved`);
+    assert.ok(!ran(rec.log, effect), `${effect} ran against a backend state that had already moved`);
   }
 });
 
@@ -126,28 +136,41 @@ test("#1184 the reseed predicate is preserved: reseed iff the target differs", a
   // Seeding from the new backend's group is what stops the post-handshake push carrying the
   // previous backend's model/effort. A re-pick must NOT reseed — that would clobber a
   // user's in-session model choice.
+  // `prevBackend` is `startedOn || pickedBackend()`, so BOTH halves need a case. Running
+  // every case with `live: null` leaves the `startedOn` half unexercised — deleting it
+  // would not fail anything, and it is the half that decides a real switch.
   const differs = recorder({ live: null, picked: "claude" });
   await runBackendSwitch("codex", differs.effects);
-  assert.ok(differs.log.includes("seedPrefs"), "a different target reseeds");
+  assert.ok(ran(differs.log, "seedPrefs"), "no live backend: the PICK differs, so reseed");
 
   const same = recorder({ live: null, picked: "codex" });
   await runBackendSwitch("codex", same.effects);
-  assert.ok(!same.log.includes("seedPrefs"), "a re-pick of the same backend must not reseed");
+  assert.ok(!ran(same.log, "seedPrefs"), "no live backend: the pick already matches, so do not reseed");
+
+  // The `startedOn` half: a LIVE backend wins over the pick when deciding what prefs
+  // currently reflect, because the handshake is authoritative and the pick may be stale.
+  const liveDiffers = recorder({ live: "claude", picked: "codex" });
+  await runBackendSwitch("codex", liveDiffers.effects);
+  assert.ok(
+    ran(liveDiffers.log, "seedPrefs"),
+    "live claude vs target codex is a real switch — prefs hold claude's model/effort and must be reseeded, " +
+      "even though the stale pick already said codex",
+  );
 });
 
 test("#1184 the replay is built AFTER the turn ends, and only armed when non-empty", async () => {
   const withReplay = recorder({ live: "claude", replay: "User: hi" });
   await runBackendSwitch("codex", withReplay.effects);
   assert.ok(
-    withReplay.log.indexOf("buildReplay") > withReplay.log.indexOf("endTurn"),
+    at(withReplay.log, "buildReplay") > at(withReplay.log, "endTurn"),
     "the transcript is captured after the turn is closed out",
   );
-  assert.ok(withReplay.log.includes("armContext"));
+  assert.ok(ran(withReplay.log, "armContext"));
 
   const empty = recorder({ live: "claude", replay: "" });
   await runBackendSwitch("codex", empty.effects);
-  assert.ok(empty.log.includes("buildReplay"), "it still asks");
-  assert.ok(!empty.log.includes("armContext"), "…but arming an empty preamble would send a header with no chat");
+  assert.ok(ran(empty.log, "buildReplay"), "it still asks");
+  assert.ok(!ran(empty.log, "armContext"), "…but arming an empty preamble would send a header with no chat");
 });
 
 test("#1184 WIRING: the panel delegates, and keeps no commit above the guard", () => {
