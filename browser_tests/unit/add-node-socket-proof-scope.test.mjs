@@ -72,6 +72,12 @@ assert.ok(awaitWidgetsMatch, "could not locate awaitRequiredCustomWidgetRegistra
 const placementMatch = panelSrc.match(/\nfunction placementFor\(graph, pos\) \{[\s\S]*?\n\}/);
 assert.ok(placementMatch, "could not locate placementFor");
 
+// #1180 — the SHIPPED bounded fetch, extracted rather than re-implemented. A harness copy
+// can drift from the real one, and then these tests prove nothing about what ships. Same
+// extraction technique this file already uses for graph_add_node itself.
+const boundedMatch = panelSrc.match(/\nasync function boundedGetNodeDefs\([\s\S]*?\n\}/);
+assert.ok(boundedMatch, "could not locate boundedGetNodeDefs in panel source");
+
 // ---------------------------------------------------------------------------
 // The reporter's install: seedvr2_videoupscaler, freshly installed, ComfyUI restarted,
 // browser tab NOT reloaded (the panel reconnects on its own and registers the new defs).
@@ -252,19 +258,20 @@ function realGraphAddNode(comfy, overrides = {}) {
   // helper bound to the default would quietly call the wrong one and report the default's
   // healthy schema instead of the payload under test.
   if (!("boundedGetNodeDefs" in deps)) {
-    deps.boundedGetNodeDefs = (timeoutMs = 10000) => {
-      const live = deps.api;
-      if (typeof live?.getNodeDefs !== "function") return Promise.resolve(null);
-      return withTimeout(
-        Promise.resolve().then(() => live.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
-        timeoutMs,
-        () => NODE_DEFS_NO_ANSWER,
-      ).then((settled) => {
-        if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
-        if ("err" in settled) throw settled.err;
-        return settled.value;
-      });
-    };
+    // The SHIPPED helper, built from panel source. A hand-written copy here would let the
+    // real one regress while these tests stayed green — the exact way a harness can make a
+    // suite prove nothing. `api` is resolved from `deps` at call time because several tests
+    // pass their own through overrides to drive the widen.
+    const build = new Function(
+      "api",
+      "withTimeout",
+      "NODE_DEFS_NO_ANSWER",
+      "NODE_DEFS_FETCH_TIMEOUT_MS",
+      `${boundedMatch[0]}
+       return boundedGetNodeDefs;`,
+    );
+    deps.boundedGetNodeDefs = (timeoutMs) =>
+      build(deps.api, withTimeout, NODE_DEFS_NO_ANSWER, NODE_DEFS_FETCH_TIMEOUT_MS)(timeoutMs);
   }
 
   const names = Object.keys(deps);
@@ -587,4 +594,61 @@ test("#821: a failed widen leaves the guard exactly as it fails closed today", a
     /no installed node outputs "SEEDVR2_DIT"/,
   );
   assert.equal(comfy.graph._nodes.length, 0);
+});
+
+test("#1180 EXECUTED: a widen whose getNodeDefs never answers returns rather than parking", async () => {
+  // The other #1180 tests are structural. This one runs the SHIPPED bounded fetch — built
+  // from panel source above, not re-implemented — against a getNodeDefs that never settles,
+  // which is the half-open connection this issue is about.
+  //
+  // Two things must hold, and only execution shows them: it RETURNS, and it returns the
+  // answer that makes the caller KEEP its narrower proof rather than weaken it to an empty
+  // socket set (the #695/#700 false-cause message).
+  const build = new Function(
+    "api",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
+    `${boundedMatch[0]}
+     return boundedGetNodeDefs;`,
+  );
+  const shipped = build(
+    { getNodeDefs: () => new Promise(() => {}) },
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    10000,
+  );
+
+  // NEVER await this unbounded. node --test has no default timeout, so a helper that lost
+  // its bound would park the whole suite instead of naming itself — verified: removing the
+  // bound made `npm run test:unit` hang rather than fail. A regression must be a red test,
+  // not a hung CI job.
+  const settled = (p, what) =>
+    Promise.race([
+      p,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${what} never settled — the bound is gone`)), 3000),
+      ),
+    ]);
+
+  const started = Date.now();
+  const result = await settled(shipped(60), "the bounded fetch"); // scaled-down bound; the shipped defaults are pinned structurally
+  const elapsed = Date.now() - started;
+
+  assert.equal(result, NODE_DEFS_NO_ANSWER, "a call that never answers must resolve the sentinel");
+  assert.ok(elapsed < 2000, `it must return on the bound, took ${elapsed}ms`);
+
+  // …and the widen maps that to null, which is what "keep the proof you already have" is.
+  const whole = result === NODE_DEFS_NO_ANSWER ? null : result;
+  assert.equal(whole, null, "the widen must treat a non-answer as doubt, not as an empty schema");
+
+  // The bound is real, not decorative: a generous one lets the same call through.
+  const answering = build(
+    { getNodeDefs: () => new Promise((r) => setTimeout(() => r({ A: { output: ["T"] } }), 30)) },
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    10000,
+  );
+  assert.equal(await settled(answering(5), "the 5ms bound"), NODE_DEFS_NO_ANSWER, "a 5ms bound must cut off a 30ms answer");
+  assert.deepEqual(await settled(answering(1000), "the 1s bound"), { A: { output: ["T"] } }, "…and a 1s bound must not");
 });
