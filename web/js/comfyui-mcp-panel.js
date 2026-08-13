@@ -989,17 +989,23 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // would be buried under "did not answer" from attempt three, and the remedy would
       // blame the wrong thing. So the first real error is remembered and preferred: a
       // stall reports as a stall only when nothing better was learned.
+      // A SEPARATE FLAG, because the error's VALUE cannot be the sentinel. This module
+      // already learned that once: `#635: a FALSY thrown value still counts as a failure`
+      // exists because `throw null` and `throw undefined` are real failures a backend can
+      // produce. Testing `firstRealError === null` would forget exactly those and let a
+      // synthesized timeout speak for them.
+      let sawRealError = false;
       let firstRealError = null;
       defs = await fetchNodeDefsWithRetry(async () => {
         let result;
         try {
           result = await boundedGetNodeDefs(NODE_DEFS_ATTEMPT_TIMEOUT_MS);
         } catch (err) {
-          if (firstRealError === null) firstRealError = err;
+          if (!sawRealError) { sawRealError = true; firstRealError = err; }
           throw err;
         }
         if (result === NODE_DEFS_NO_ANSWER) {
-          if (firstRealError !== null) throw firstRealError;
+          if (sawRealError) throw firstRealError;
           throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_ATTEMPT_TIMEOUT_MS}ms`);
         }
         return result;

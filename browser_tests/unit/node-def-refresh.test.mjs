@@ -740,15 +740,22 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
   //
   // First real error wins; a stall reports as a stall only when nothing better was learned.
   const src = SRC;
-  const start = src.indexOf("defs = await fetchNodeDefsWithRetry(");
-  assert.notEqual(start, -1, "could not locate the retried fetch");
-  const body = src.slice(start, start + 900);
+  // Anchored to the DECLARATION, not the call: the flag is declared just above the retry,
+  // and a slice starting at the call misses it — the same fixed-window trap that has bitten
+  // several tests in this repo, including two on this branch.
+  const start = src.indexOf("let sawRealError = false;");
+  assert.notEqual(start, -1, "the presence flag must be declared");
+  const end = src.indexOf("registerComfyNodeDefs", start);
+  const body = src.slice(start, end === -1 ? start + 1400 : end);
   assert.match(body, /firstRealError/, "the first real error must be remembered");
   assert.match(
     body,
-    /if \(firstRealError !== null\) throw firstRealError;/,
+    /if \(sawRealError\) throw firstRealError;/,
     "…and preferred over the synthesized timeout",
   );
+  // A SEPARATE FLAG: the error VALUE cannot double as the not-yet-set sentinel, or a
+  // falsy throw is forgotten -- which this file already has a test about (codex r5).
+  assert.match(body, /let sawRealError = false;/, "presence must not be inferred from the value");
   // The timeout message is still there for the case where nothing better was learned.
   assert.match(body, /did not answer within \$\{NODE_DEFS_ATTEMPT_TIMEOUT_MS\}ms/);
 });
@@ -761,6 +768,9 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
   const NO_ANSWER = Symbol("node-defs-timeout");
   const run = async (outcomes) => {
     let i = 0;
+    // A separate flag, mirroring the panel: the error VALUE cannot double as the
+    // not-yet-set sentinel, or a falsy throw is forgotten.
+    let sawRealError = false;
     let firstRealError = null;
     try {
       return await fetchNodeDefsWithRetry(
@@ -769,13 +779,14 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
           let result;
           try {
             if (o === "throw") throw new Error("real backend error");
+            if (o === "falsy") throw null; // a real failure whose VALUE is falsy
             result = o === "timeout" ? NO_ANSWER : { KSampler: {} };
           } catch (err) {
-            if (firstRealError === null) firstRealError = err;
+            if (!sawRealError) { sawRealError = true; firstRealError = err; }
             throw err;
           }
           if (result === NO_ANSWER) {
-            if (firstRealError !== null) throw firstRealError;
+            if (sawRealError) throw firstRealError;
             throw new Error("did not answer within the attempt bound");
           }
           return result;
@@ -783,7 +794,10 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
         { sleep: async () => {} },
       );
     } catch (e) {
-      return `THREW: ${e.message}`;
+      // e?.message, not e.message: the falsy-throw case below throws null, and reading
+      // .message off it here would fail the test for the wrong reason — the same hazard the
+      // panel guards against, met in the test that checks it.
+      return `THREW: ${e?.message ?? String(e)}`;
     }
   };
 
@@ -796,4 +810,8 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
   // …and the retry still does its job: a transient stall or error must not cost the command.
   assert.deepEqual(await run(["timeout", "ok"]), { KSampler: {} });
   assert.deepEqual(await run(["throw", "ok"]), { KSampler: {} });
+  // A FALSY throw is still a real failure, and must outrank the synthesized timeout —
+  // inferring presence from the error's value would forget exactly these.
+  assert.match(await run(["falsy", "timeout", "timeout"]), /THREW: /);
+  assert.doesNotMatch(await run(["falsy", "timeout", "timeout"]), /did not answer/);
 });
