@@ -249,7 +249,8 @@ export async function fetchWholeObjectInfo({
   const failures = [];
 
   if (typeof getNodeDefs === "function") {
-    const outcome = await runTransport(getNodeDefs, clientRouteBudget(), timers);
+    const clientMs = clientRouteBudget();
+    const outcome = await runTransport(getNodeDefs, clientMs, timers);
     if (outcome === NOT_TRIED) {
       // Cannot happen while this is the FIRST step (it holds the full budget minus its
       // own reserve), but it is stated rather than assumed: `"err" in outcome` on a
@@ -258,7 +259,12 @@ export async function fetchWholeObjectInfo({
     } else if (outcome === NO_ANSWER) {
       // The #1161 case. Recorded as a failure like any other, and — critically — execution
       // CONTINUES to the second transport, which is what this bound exists to reach.
-      failures.push(`api.getNodeDefs() did not answer within the ${deadlineMs}ms budget`);
+      // THE STEP'S OWN BUDGET, not the whole deadline. Browser-verified against a live
+      // 4304-type install: the client route is capped at half, so quoting `deadlineMs`
+      // here told the reader it had waited 20000ms when it had waited 10000ms. Naming a
+      // number that was never spent is the same defect as #982's "unreachable or the
+      // fetch failed" — a refusal asserting something it did not establish.
+      failures.push(`api.getNodeDefs() did not answer within its ${Math.round(clientMs)}ms share of the ${deadlineMs}ms budget`);
     } else if ("err" in outcome) {
       failures.push(describeFailure("api.getNodeDefs() threw", outcome.err));
     } else {
@@ -288,14 +294,15 @@ export async function fetchWholeObjectInfo({
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    const outcome = await runTransport(() => fetchApi("/object_info"), fallbackBudget(), timers);
+    const fallbackMs = fallbackBudget();
+    const outcome = await runTransport(() => fetchApi("/object_info"), fallbackMs, timers);
     if (outcome === NOT_TRIED) {
       // TRUTHFUL ABOUT WHAT WAS NOT DONE. Saying this route "did not answer" when no
       // request was ever sent is #982's original defect — a refusal asserting a cause it
       // never established. The reserve above exists so this stays unreachable in practice.
       failures.push("GET /object_info was not attempted — the budget was spent before it was reached");
     } else if (outcome === NO_ANSWER) {
-      failures.push(`GET /object_info did not answer within the ${deadlineMs}ms budget`);
+      failures.push(`GET /object_info did not answer within its ${Math.round(fallbackMs)}ms share of the ${deadlineMs}ms budget`);
     } else if ("err" in outcome) {
       failures.push(describeFailure("GET /object_info threw", outcome.err));
     } else {
@@ -325,11 +332,12 @@ export async function fetchWholeObjectInfo({
         // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
         // half-open connection can also stall, so it is bounded as well rather than merely
         // re-caught: the response arriving is not the same event as the body arriving.
-        const body = await runTransport(() => res.json(), fallbackBudget(), timers);
+        const bodyMs = fallbackBudget();
+        const body = await runTransport(() => res.json(), bodyMs, timers);
         if (body === NOT_TRIED) {
           failures.push("GET /object_info answered but its body was not read — the budget was spent");
         } else if (body === NO_ANSWER) {
-          failures.push(`GET /object_info answered but its body did not arrive within the ${deadlineMs}ms budget`);
+          failures.push(`GET /object_info answered but its body did not arrive within its ${Math.round(bodyMs)}ms share of the ${deadlineMs}ms budget`);
         } else if ("err" in body) {
           // Deliberately the SAME wording as before. A parse failure used to surface
           // through this route's catch, and an existing #982 test pins the sentence a user

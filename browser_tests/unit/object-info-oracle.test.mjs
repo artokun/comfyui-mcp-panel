@@ -389,7 +389,7 @@ test("#1161: a hung client route falls through to the fallback, which ANSWERS", 
   // assertion alone cannot see that; a call count can.
   assert.equal(fetchCalls, 1, "the fallback must be ISSUED — a reserved floor is what guarantees it");
   assert.deepEqual(result.defs, DEFS_1161, "the fallback answered, so the caller is authorized");
-  assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) did not answer within the 6000ms budget/);
+  assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) did not answer within its \d+ms share of the 6000ms budget/);
 });
 
 test("#1161: no route is ever REPORTED as timing out when it was never sent", async () => {
@@ -446,7 +446,7 @@ test("#1161: the timeout is reported as a timeout, not as a throw", async () => 
   const result = await settled(out, "the oracle call");
   const note = result.failures.join(" | ");
   assert.match(note, /api\.getNodeDefs\(\) threw: client exploded/, "a throw keeps its own cause");
-  assert.match(note, /GET \/object_info did not answer within the 6000ms budget/, "…and a hang keeps its own");
+  assert.match(note, /GET \/object_info did not answer within its \d+ms share of the 6000ms budget/, "…and a hang keeps its own");
 });
 
 test("#1161: both transports hanging still returns, and names both", async () => {
@@ -459,7 +459,7 @@ test("#1161: both transports hanging still returns, and names both", async () =>
   const result = await settled(out, "the oracle call");
   assert.equal(result.defs, null, "nothing answered, so nothing is authorized — still fail-closed");
   assert.equal(result.failures.length, 2, "each route reports for itself");
-  for (const f of result.failures) assert.match(f, /did not answer within the 6000ms budget/);
+  for (const f of result.failures) assert.match(f, /did not answer within its \d+ms share of the 6000ms budget/);
 });
 
 test("#1161: a hung BODY is bounded too — the response is not the body", async () => {
@@ -477,7 +477,7 @@ test("#1161: a hung BODY is bounded too — the response is not the body", async
   h.fire();
   const result = await settled(out, "the oracle call");
   assert.equal(result.defs, null);
-  assert.match(result.failures.join(" | "), /body did not arrive within the 6000ms budget/);
+  assert.match(result.failures.join(" | "), /body did not arrive within its \d+ms share of the 6000ms budget/);
 });
 
 test("#1161: a healthy client route is untouched by the bound", async () => {
@@ -619,4 +619,28 @@ test("#1161: a thrown value that cannot be stringified is a failure, never a rej
   // And because it is only a FAILURE, the fallback still runs and the write is authorized.
   assert.deepEqual(result.defs, DEFS_1161, "a hostile error value must not cost the user their answer");
   assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) threw: \(an unprintable value\)/);
+});
+
+test("#1161: a refusal quotes the budget the step ACTUALLY got, not the whole deadline", async () => {
+  // Browser-verified against a live 4304-type install: the client route is capped at half
+  // the deadline, but the message quoted the deadline — telling the reader it had waited
+  // 20000ms when it had waited 10000ms. Naming a number that was never spent is the same
+  // defect as #982's "unreachable or the fetch failed": a refusal asserting what it did
+  // not establish. Both numbers appear, so the share and the whole are each readable.
+  const h = harness();
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: never,
+    deadlineMs: 6000,
+    timers: h.timers,
+    now: h.now,
+  });
+  await tick();
+  h.fire();
+  await tick();
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  const client = result.failures.find((f) => f.startsWith("api.getNodeDefs()"));
+  assert.match(client, /within its 3000ms share of the 6000ms budget/, "half the deadline, said plainly");
+  assert.doesNotMatch(client, /within the 6000ms budget/, "the un-spent whole must not be quoted as the wait");
 });
