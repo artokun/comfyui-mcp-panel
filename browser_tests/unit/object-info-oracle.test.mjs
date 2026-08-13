@@ -758,7 +758,10 @@ test("#1161: a hung route is CAPPED at its share; a fast one hands the rest back
   assert.equal(fast.length, 3, "client route, response and body are each bounded");
   assert.equal(fast[0], 10000, "the cap on the client route is unchanged");
   assert.ok(fast[1] > 9000, `the response kept ${fast[1]}ms the client route did not use`);
-  assert.ok(fast[2] > 9000, `and the body kept ${fast[2]}ms — main gave it ~19.5s, not 5s`);
+  // Bound tightly enough to SEE the share: with BODY_SHARE at 1 the body keeps what the
+  // response left (~20s); at 0.5 it would keep ~10s, which a looser bound accepted — that
+  // mutation survived the suite until this assertion was tightened.
+  assert.ok(fast[2] > 15000, `the body kept ${fast[2]}ms — main gave it ~19.5s, not 5s or 10s`);
   for (const [i, ms] of fast.entries()) assert.ok(ms > 0, `step ${i} was granted ${ms}ms`);
 });
 
@@ -913,4 +916,20 @@ test("#1161: a forward clock jump during a step cannot starve the steps after it
   });
   assert.equal(calls, 1, "the fallback must still be issued — a step cannot spend more than it was granted");
   assert.deepEqual(result.defs, DEFS_1161);
+});
+
+test("#1161: a clock returning a non-number cannot reject out of this module", async () => {
+  // Guarding the clock CALL was not enough: `readClock() - startedStep` is its own
+  // operation, and it throws for a Symbol ("Cannot convert a Symbol value to a number") and
+  // for a null-prototype object. This is the third time in this issue a guarded read was
+  // undone by an unguarded use of the same value, after `${responseStatus}` and
+  // `String(err)` — so the reading is normalised at the source instead.
+  for (const now of [() => Symbol("t"), () => Object.create(null), () => 1n, () => "later", () => ({}), () => null]) {
+    const result = await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+      now,
+    });
+    assert.deepEqual(result.defs, DEFS_1161, `now returning ${String(typeof now())} must not cost the answer`);
+  }
 });

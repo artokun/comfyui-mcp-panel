@@ -292,11 +292,19 @@ export async function fetchWholeObjectInfo({
   // two callers that await it with no catch. An unreadable clock yields NaN, which the
   // accounting below already treats as "unmeasurable" and charges in full.
   const readClock = () => {
+    let reading;
     try {
-      return clockSource();
+      reading = clockSource();
     } catch {
       return NaN;
     }
+    // A NUMBER, or nothing. Guarding the CALL is not enough — the ARITHMETIC below is its
+    // own operation, and `readClock() - startedStep` throws for a Symbol ("Cannot convert a
+    // Symbol value to a number") and for a null-prototype object. That is the third time in
+    // this issue a guarded READ was undone by an unguarded USE of the same value, after
+    // `${responseStatus}` and `String(err)`, so the value is normalised here at the source
+    // rather than at each of its uses.
+    return typeof reading === "number" && Number.isFinite(reading) ? reading : NaN;
   };
   // ONE budget for the whole question, DIVIDED IN ADVANCE — and no clock is consulted to
   // do it. That is the whole point, and it was arrived at the hard way.
@@ -356,9 +364,15 @@ export async function fetchWholeObjectInfo({
     const left = budget - consumed;
     // AT LEAST A MILLISECOND WHILE ANY BUDGET REMAINS. Plain `Math.floor(left * share)`
     // truncates to 0 on a tiny budget, and a zero grant is not a small wait — it is the
-    // step never being attempted. Verified: at deadlineMs of 1 or 2 the fallback was never
-    // issued (fetchApi call count 0), which is the exact signature this whole change exists
-    // to remove, reproduced by the arithmetic meant to prevent it.
+    // step never being attempted: at deadlineMs=2 the fallback was never issued (fetchApi
+    // call count 0), the exact signature this change exists to remove, reproduced by the
+    // arithmetic meant to prevent it.
+    //
+    // It does NOT rescue deadlineMs=1, and saying so matters: one millisecond cannot be
+    // divided across three steps that each need at least one. The client route takes it and
+    // the fallback is not reached. That is arithmetic rather than a bug, but an earlier
+    // revision of this comment claimed the floor made every budget reachable, which is the
+    // kind of overclaim that later gets cited as established.
     const grant = left > 0 ? Math.max(1, Math.min(left, Math.floor(left * share))) : 0;
     const startedStep = readClock();
     // `timers: null` is not `timers: undefined`, and only the latter reaches `withTimeout`'s
@@ -366,7 +380,19 @@ export async function fetchWholeObjectInfo({
     // that documents it always resolves, which two callers await with no catch of their own.
     const outcome = await runTransport(attempt, grant, timers ?? undefined);
     if (outcome === NO_ANSWER) {
-      // It ran out its whole grant — that much is certain without measuring anything.
+      // It ran out its whole grant — certain without measuring anything.
+      //
+      // A LATE TIMER IS DELIBERATELY NOT CHARGED, and this was tried the other way first.
+      // Chrome clamps hidden-tab timers to ~1/min after five minutes backgrounded, and a
+      // laptop resume does the same, so real elapsed can exceed the budget however this
+      // accounts for it — that is the environment, not the arithmetic. Charging the true
+      // overrun makes the accounting honest and the OUTCOME worse: a tab backgrounded for
+      // ten minutes reaches the fallback with a zero budget, so the write is refused
+      // outright instead of being retried by the route that still works. The command has
+      // already blown its 30s budget in that world; the useful thing left is to ASK, and
+      // the fallback usually answers in ~450ms. Preserving a number the environment has
+      // already broken, at the cost of the one route that can still answer, is exactly the
+      // trade that produced the earlier "refuses what main serves" regressions.
       consumed += grant;
     } else {
       // IT ANSWERED EARLY, so the time it did not use goes back. Charging the full grant
