@@ -211,3 +211,27 @@ test("#775 WIRING: the panel supplies the reader to the add-node resolver", () =
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(src, /readImportFailures: \(\) => readPackImportFailures\(api\)/);
 });
+
+test("#1180: a hanging log read cannot outlive the refusal it is explaining", async () => {
+  // readComfyLogText runs while EXPLAINING a refusal, against the same server whose
+  // half-open connection is the reason the refusal is being written. Its catch handles a
+  // fetch that FAILS; a fetch that never settles is caught by nothing — so graph_add_node
+  // parked here after every other fetch on that path had been bounded. A diagnostic must
+  // not outlive the thing it diagnoses.
+  const { readComfyLogText, COMFY_LOG_READ_TIMEOUT_MS } = await import("../../web/js/lib/comfy-log.js");
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = () => new Promise(() => {});
+    const started = Date.now();
+    const text = await Promise.race([
+      readComfyLogText({ fileURL: (r) => r }, { timeoutMs: 120 }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("the log read never settled")), 3000)),
+    ]);
+    assert.equal(text, "", "a log that cannot be read says nothing — its documented answer");
+    assert.ok(Date.now() - started < 2000, "…and says it on the bound, not eventually");
+  } finally {
+    globalThis.fetch = original;
+  }
+  // Real, but short: the log only sharpens a message the caller can already write.
+  assert.ok(COMFY_LOG_READ_TIMEOUT_MS > 0 && COMFY_LOG_READ_TIMEOUT_MS <= 5000);
+});
