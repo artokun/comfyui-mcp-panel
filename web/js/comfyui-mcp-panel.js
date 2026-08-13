@@ -29479,6 +29479,17 @@ function buildPanel() {
     // the next `ready` ack down the reload branch, announcing "Agent reloaded — session
     // resumed" for a restart that never happened.
     ssSet(SOFT_RELOAD_KEY, null);
+    // …and the THIRD, which review found after the first two: nothing here touched the
+    // restart-resume marker or its watch. A hard restart deliberately discards the
+    // session — that is its entire purpose — so a surviving REBOOT_KEY would resume the
+    // conversation this restart exists to throw away, and the #585 watch would keep
+    // re-evaluating a marker the restart just revoked. The Disconnect handler already
+    // retires all three together for the same reason, in the same order; this is that
+    // sequence minus the USER_DISCONNECTED_KEY latch, which belongs only to an explicit
+    // Disconnect (a restart intends to come back).
+    ssSet(REBOOT_KEY, null);
+    stopRebootWatch();
+    forgetRebootResumeAttempt();
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -29518,8 +29529,22 @@ function buildPanel() {
         // left that way. It looks like the #379/#419 "a reload never leaves a bridge
         // dead" invariant being violated, but reconnecting here would restore the very
         // session the restart exists to discard, and the pause is disclosed to the user
-        // in the line above rather than silent. What was actually wrong on this path was
-        // the marker outliving it, and that is now retired at the top.
+        // in the line above rather than silent.
+        //
+        // But a disclosure in the transcript is not enough on its own: the bridge is now
+        // down for good on this path, and until this the chip, dot and buttons still
+        // showed the connected state, so the panel contradicted its own message and left
+        // no affordance to act on it. Paint the real state and restore Connect, so the
+        // "paused" the line above describes is something the user can actually end. This
+        // is the Disconnect handler's UI block, minus its opt-out latch — the pause is
+        // this restart's, not a standing decision to stay disconnected.
+        connectBtn.hidden = false;
+        disconnectBtn.hidden = true;
+        connectBtn.disabled = false;
+        connectBtn.textContent = tr("panel.connect", "Connect");
+        statusText.textContent = tr("panel.status_disconnected", "disconnected");
+        dot.className = "cmcp-dot";
+        settingsBox.hidden = false;
         return;
       }
       // Both markers are already retired at the top, on every exit rather than only this

@@ -980,4 +980,18 @@ test("#1166: hardRestart retires the turn BEFORE any I/O, so no exit can leave i
     /ssSet\((?:MID_TASK_KEY|SOFT_RELOAD_KEY), null\);/,
     "the success branch must not re-retire what the top already retired",
   );
+  // The THIRD marker, found only after the first two were fixed. A hard restart discards
+  // the session, so a surviving restart-resume marker would resume the very conversation
+  // it exists to throw away, and the #585 watch would keep re-evaluating a revoked
+  // marker. All three are asserted together because the defect here was never one
+  // marker — it was retiring SOME of them.
+  for (const [re, what] of [
+    [/^[ \t]*ssSet\(REBOOT_KEY, null\);/m, "the restart-resume marker"],
+    [/^[ \t]*stopRebootWatch\(\);/m, "the restart-resume watch"],
+    [/^[ \t]*forgetRebootResumeAttempt\(\);/m, "the in-flight resume attempt"],
+  ]) {
+    const site = at(re);
+    assert.notEqual(site, -1, `a deliberate restart must retire ${what}`);
+    assert.ok(site < okBranchAt, `${what} must be retired on every exit, not only on success`);
+  }
 });
