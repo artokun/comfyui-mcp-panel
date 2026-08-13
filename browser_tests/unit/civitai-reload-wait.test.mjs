@@ -28,13 +28,17 @@ import {
 /** Fires the armed timer on demand, so no test has to sleep for a real budget. */
 function manualTimers() {
   let fire = null;
+  let armed = false;
+  let didClear = false;
   return {
     timers: {
       setTimer: (fn) => {
         fire = fn;
+        armed = true;
         return 1;
       },
       clearTimer: () => {
+        didClear = true;
         fire = null;
       },
     },
@@ -42,6 +46,8 @@ function manualTimers() {
       assert.ok(fire, "no timer was armed — the bound is not in effect");
       fire();
     },
+    /** True only if a timer was actually armed AND later cleared. */
+    cleared: () => armed && didClear,
   };
 }
 
@@ -143,18 +149,15 @@ test("BOTH drive methods actually go through the bound", async () => {
   );
 });
 
-test("a late reload cannot flip an answer already given", async () => {
-  // The bound does not cancel the fetch. If a late fulfilment could still
-  // resolve the returned promise, the caller's reply would change after it was
-  // composed.
-  const { timers, expire } = manualTimers();
-  let release;
-  const slow = new Promise((r) => {
-    release = r;
-  });
-  const p = awaitReloadWithin(slow, 12000, timers);
-  expire();
-  assert.equal(await p, false);
-  release("page1");
-  assert.equal(await p, false, "a late fulfilment rewrote a settled answer");
+test("a reload that wins the race clears the armed timer", async () => {
+  // The panel is long-lived and these two commands are polled. A bound that
+  // armed a timer per call and never cleared the ones it did not need would
+  // accumulate them for as long as the tab is open.
+  //
+  // This replaced a test that asserted a late fulfilment could not change an
+  // already-returned answer. That one could not fail: a settled promise cannot
+  // re-resolve, so it was restating the promise contract. Review caught it.
+  const { timers, cleared } = manualTimers();
+  assert.equal(await awaitReloadWithin(Promise.resolve("page1"), 12000, timers), true);
+  assert.equal(cleared(), true, "the timer armed for the bound was left pending");
 });
