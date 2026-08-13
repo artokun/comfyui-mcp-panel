@@ -525,7 +525,14 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   // falling through to begin + execute.
   const fpAt = src.indexOf("const fingerprint = commandFingerprint(msg);");
   assert.notEqual(fpAt, -1, "the command handler must fingerprint the frame");
-  const block = src.slice(fpAt, fpAt + 3600);
+  // Bounded by the executor's `try {`, which is the structural end of the dedupe region,
+  // not by a fixed character count. The count stood in for "the dedupe block" and stopped
+  // meaning it the moment the block grew a comment (#1095 added one) — a passing
+  // assertion failing for a reason unrelated to what it checks. Third instance of this
+  // trap in the suite, after markConnected and #508's codex R3.
+  const blockEnd = src.indexOf("\n        try {", fpAt);
+  assert.notEqual(blockEnd, -1, "could not locate the end of the dedupe block");
+  const block = src.slice(fpAt, blockEnd);
   assert.match(block, /const commandEpoch = thisSock\.__cmcpBridgeEpoch;/, "the command snapshots its socket epoch");
   assert.match(
     block,
