@@ -16,6 +16,7 @@ import {
   filtersDirty, bitmask, parseCreatorQuery, levelLabel,
 } from "./cmcp-civitai.js";
 import { summarizeSearchFilters } from "./lib/civitai-search-echo.js";
+import { awaitReloadWithin, RELOAD_WAIT_BUDGET_MS } from "./lib/civitai-reload-wait.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
@@ -373,6 +374,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     activeReloadPromise: null,
     activeLoadPromise: null,
   };
+
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
   }
@@ -2181,7 +2183,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     //
     // `loading` is still reported below — this only removes the window where the
     // honest answer was available and we returned the empty one instead.
-    try { await state.activeReloadPromise; } catch { /* surfaces via state.error below */ }
+    //
+    // Bounded since comfyui-mcp#1520: the wait is on CivitAI, so an unbounded
+    // one hands our reply deadline to a third party and the caller gets a bridge
+    // timeout carrying nothing. On expiry we answer with what we have —
+    // `loading: true` plus `reloadPending: true` — which is the same honest
+    // interim answer panel#793 was fine with, just arriving on time.
+    const reloadSettled = await awaitReloadWithin(state.activeReloadPromise, RELOAD_WAIT_BUDGET_MS);
     _assertOpen();
     const model = isModelTab();
     const source = model ? state.models : state.items;
@@ -2192,6 +2200,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       done: !!state.done,
       renderRev: state.renderRev,
       truncated: source.length > ser.items.length,
+      // True when we gave up waiting on the in-flight fetch rather than seeing
+      // it finish (#1520). Distinguishes "a reload is still running and I waited
+      // as long as I safely could" from "loading just started" — both report
+      // `loading: true`, but only the first means re-reading shortly is the
+      // right move rather than a busy-poll.
+      reloadPending: !reloadSettled,
       // Disambiguate an empty grid (issues #190/#375): `error` is a non-null
       // upstream failure (retry, don't narrow filters); `authenticated` reflects
       // the CivitAI session; on the favorites tab `favoritesStatus` explains an
@@ -2223,8 +2237,21 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     _assertOpen();
     const list = (Array.isArray(ids) ? ids : (ids != null ? [ids] : [])).map((x) => String(x));
     const rev = state.renderRev;
-    try { await state.activeReloadPromise; } catch { /* fetch error surfaces elsewhere */ }
+    // Bounded since comfyui-mcp#1520 — see RELOAD_WAIT_BUDGET_MS. On expiry we
+    // install NOTHING and say so, following the `superseded` path directly
+    // below: this function already establishes that returning `highlighted: 0`
+    // with the set untouched is the right answer when it cannot safely act.
+    //
+    // Deliberately not installing late in the background. Today a bridge timeout
+    // here is a false failure — the caller is told the command failed and the
+    // glow lands anyway — and quietly applying after we reported `pending` would
+    // keep exactly that confusion. The caller re-issues; `driveHighlight` clears
+    // before installing, so a retry is idempotent.
+    const reloadSettled = await awaitReloadWithin(state.activeReloadPromise, RELOAD_WAIT_BUDGET_MS);
     _assertOpen();
+    if (!reloadSettled) {
+      return { highlighted: 0, missing: list, renderRev: state.renderRev, pending: true };
+    }
     if (state.renderRev !== rev) {
       // A reload/tab/filter superseded this highlight while we awaited: these ids
       // belonged to the OLD search and MUST NOT be installed on the new
