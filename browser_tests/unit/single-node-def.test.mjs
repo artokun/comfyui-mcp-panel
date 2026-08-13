@@ -291,3 +291,30 @@ test("#1180: the widen's bound fits INSIDE the registration deadline it runs und
     "the widen must use its own bound, not the 10s single-call one",
   );
 });
+
+test("#1180: graph_add_node's bounds are SEQUENTIAL and must sum inside the command budget", () => {
+  // The individual constants were pinned only by a loose `< 30000` range check, which each
+  // one passes at 29,000ms while three of them together consume the budget several times
+  // over. What actually matters is the worst case of ONE add, and these bounds run in
+  // sequence: the fast path first, the whole-schema fallback when it does not confirm, then
+  // the widen when the proof is single-class.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const num = (re) => Number((src.match(re) || [])[1]);
+  const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/);
+  const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/);
+  const widen = Math.floor(registration / 2);
+  assert.ok(single > 0 && registration > 0, "both constants must be findable");
+
+  const worstCase = single + single + widen;
+  const COMMAND_BUDGET_MS = 30000;
+  assert.ok(
+    worstCase < COMMAND_BUDGET_MS,
+    `one add can spend ${worstCase}ms on node-def fetches against a ${COMMAND_BUDGET_MS}ms budget`,
+  );
+  // And with real headroom, not by a hair: the add still has to build the node, wait for
+  // widget registration, and get its reply back through the bridge.
+  assert.ok(
+    worstCase <= COMMAND_BUDGET_MS * 0.8,
+    `${worstCase}ms leaves too little of the ${COMMAND_BUDGET_MS}ms budget for the rest of the add`,
+  );
+});
