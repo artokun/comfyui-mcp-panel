@@ -23360,6 +23360,54 @@ function buildPanel() {
     ssSet(SESSION_KEY, null);
     if (thread) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
+    // #1171 — DELIBERATELY UNBOUNDED, after a bound was added here and removed again.
+    //
+    // The reasoning for adding one: hardRestart now holds the reload re-entrancy guard
+    // across this call, so an await that never settles would latch that guard for the rest
+    // of the session. That is a real shape — it is what two earlier attempts at the sibling
+    // bug produced — but it is not reachable through this store, and the bound cost more
+    // than the hazard it removed.
+    //
+    // WHY IT SETTLES. `flush()` awaits the store's serial `_writePromise`. Every write in
+    // that chain resolves on all THREE terminal transaction outcomes — complete, error and
+    // abort — `db.transaction(...)` is itself wrapped in try/catch, and `openDb` is capped
+    // by `IDB_OPEN_TIMEOUT_MS` and resolves null past it. There is no modelled path on
+    // which this promise simply never settles.
+    //
+    // (Named in prose rather than as handler identifiers on purpose: the registry parity
+    // scan flags a shipped file carrying both an svg mention and those literal tokens, and
+    // this comment tripped it once already.)
+    //
+    // MEASURED, against a store whose IndexedDB `open` fires no handler at all — the worst
+    // slow store there is. It SETTLES, on the store's own 2s open cap, which is the property
+    // the widened guard depends on.
+    //
+    // WHAT IT REPORTS DEPENDS ON HOW MUCH HISTORY THERE IS, and an earlier version of this
+    // comment got that wrong in a way worth recording. A capped open makes `idbMergeWrite`
+    // yield null, so `persist()` falls back to the LOCAL SHADOW's completeness — and the
+    // shadow is deliberately partial past `LOCAL_SHADOW_THREADS` (20) and
+    // `LOCAL_SHADOW_MESSAGES` (200). Measured:
+    //
+    //     1 thread /   5 messages   flush() -> true    (this returns true)
+    //     1 thread / 400 messages   flush() -> ok:false (this returns FALSE)
+    //    30 threads                 flush() -> ok:false (this returns FALSE)
+    //
+    // So for any user with real history, a two-second disk hiccup answers false here. That
+    // is not a store fault and there is nothing to fix in this function — but the callers
+    // must treat false as "could not confirm", not as "the store is broken", and the
+    // backend-switch caller currently cannot (see #1184).
+    //
+    // The first probe of this used a single five-message thread and generalised from it,
+    // which is the same class of error as sizing a bound from the wrong measurement. Test
+    // the heavy case: `browser_tests/unit/chat-history-store.test.mjs`.
+    //
+    // WHAT THE BOUND COST. `flush()` awaits the WHOLE queued chain — including the
+    // full-snapshot write `persistThreads()` enqueues one line above — so a timeout meant
+    // "the queue was busy", not "the store is broken". It gave this function a new way to
+    // answer false for a healthy store, and that answer lands on two exits that cannot
+    // absorb it: connectBackend abandons a switch whose chips, prefs and armed replay have
+    // already committed to the new backend, and hardRestart skips `client.start()` and
+    // strands the bridge for a write that then lands a moment later.
     const result = await historyStore.flush();
     return result === true || result?.ok === true;
   }
@@ -29268,6 +29316,23 @@ function buildPanel() {
       // The old provider's session must be durably invalid before any reconnect
       // can observe it. If reconnect fails or the browser closes here, reload
       // still starts fresh instead of restoring a foreign session.
+      //
+      // #1184 — THIS RETURN IS SILENT, AND SAYING SOMETHING HERE IS NOT THE FIX.
+      //
+      // #1171 briefly added hardRestart's "reconnect is paused" line here. Review showed
+      // that makes it worse rather than better: by this point `seedPrefsForBackendSwitch`,
+      // `selectedBackend`, `localStorage[STORAGE_KEY_BACKEND]`, the chips, `endTurnLocally()`
+      // and `client.armContext(replay)` have ALL committed to the new backend, while the
+      // OLD backend's socket is still open. "Paused" tells the user nothing happened, when
+      // in fact the panel is now half-switched — and the armed replay ships the entire prior
+      // conversation back to the provider that already has it on the next message.
+      //
+      // The exit is also more reachable than a genuine store failure: a capped IndexedDB
+      // open answers ok:false for any history past the local shadow's limits (measured — 400
+      // messages, or 30 threads), so a two-second disk hiccup lands here.
+      //
+      // The fix is to roll the commit back, or not to commit until this succeeds, and that
+      // decision belongs to #1184 rather than to a re-entrancy-guard change.
       if (!await invalidateDurableAgentSession()) return;
     }
     // Reflect the picked backend in the composer placeholder immediately; onModels
@@ -29456,96 +29521,126 @@ function buildPanel() {
     reloading = true;
     appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
     let ok = false;
+    // #1171 — THE GUARD MUST SPAN THE WORK IT PROTECTS. This `try` used to close right
+    // after the POST, with `reloading = false` in its `finally`, while the function kept
+    // going: retiring the turn and three markers, invalidating the durable session, then
+    // reconnecting. From the moment the POST settled the flag was open, so a second restart
+    // — or a soft reload, which shares the flag — could run against that tail and interleave
+    // two teardowns of the same session state.
+    //
+    // Released just before the reconnect, which is `softReload`'s existing shape (its
+    // `beforeStart` hook does the same thing for the same reason), with the `finally` as the
+    // backstop for a throw.
+    //
+    // The tail's one await is the durable invalidation, and it is deliberately UNBOUNDED —
+    // see the note there. Widening a guard over an await that could hang would trade a race
+    // for a wedge, which is what two earlier attempts at the sibling bug produced, so that
+    // await settling is a precondition of this shape rather than an incidental detail.
+    //
+    // WHAT THIS DOES AND DOES NOT CHANGE HERE. The whole guarded tail lives inside
+    // `if (ok)`, and this pack's `/comfyui_mcp_panel/hard_restart` answers `{"ok": false}`
+    // with a 503 unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so on
+    // THIS distribution `ok` is always false, the tail is skipped, and the two shapes
+    // execute identically. The change is therefore preparatory here: it is correct for a
+    // deployment whose restart route really restarts the agent, and it stops the window
+    // existing before one of those meets it. Anyone measuring for a behaviour change on a
+    // stock install will find none, and that is expected rather than a broken fix.
     try {
-      client.stop(); // drop the bridge so the old orchestrator can release the port
-      const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
-      const data = await res.json().catch(() => ({}));
-      if (data?.ok) {
-        ok = true;
-      } else {
-        // `data.message` is the pack's own text and arrives already-worded; only our own
-        // fallback is ours to translate.
+      try {
+        client.stop(); // drop the bridge so the old orchestrator can release the port
+        const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (data?.ok) {
+          ok = true;
+        } else {
+          // `data.message` is the pack's own text and arrives already-worded; only our own
+          // fallback is ours to translate.
+          appendSystem(
+            data?.message ||
+              tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
+          );
+        }
+      } catch (err) {
         appendSystem(
-          data?.message ||
-            tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
+          tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
+            error: coerceMessageText(err?.message ?? err),
+          }),
         );
       }
-    } catch (err) {
-      appendSystem(
-        tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
-          error: coerceMessageText(err?.message ?? err),
-        }),
-      );
-    } finally {
-      reloading = false;
-    }
-    if (ok) {
-      // #1166 — retire everything that asserts a live turn HERE: inside the success
-      // branch, because only a restart that actually happened killed the turn, and
-      // BEFORE the invalidate below, whose failure path returns early and skipped all of
-      // it. That early return was the real defect — not the branch itself.
-      //
-      // Deliberately NOT hoisted to the top of the function. An earlier attempt did
-      // that, on the reasoning that a deliberate restart abandons the turn whatever the
-      // outcome, and it was wrong here: this pack's /hard_restart answers `{ok: false}`
-      // unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so `ok` is
-      // ALWAYS false, nothing is ever killed, and the old orchestrator's turn keeps
-      // running. Retiring at the top therefore cleared the state of a LIVE turn on the
-      // only path this pack takes — the working indicator vanishing while the agent
-      // works, and a follow-up message painting inline instead of queueing. The
-      // reconnect's `turn:working` re-announce normally repairs that, but endTurnLocally()
-      // opens a 300ms straggler window (STALE_WORKING_GUARD_MS) that can swallow it on a
-      // local bridge. The indicator staying up through a restart that did not happen is
-      // not a bug; the turn really is still running.
-      //
-      // All three markers, because retiring only some of them is how this class survives
-      // a fix: the turn itself, the soft-reload marker (a hard restart supersedes a
-      // pending reload), and the restart-resume marker plus its #585 watch (a fresh agent
-      // must not resume the conversation this restart discarded). The Disconnect handler
-      // retires the same set in the same order, minus its USER_DISCONNECTED_KEY latch,
-      // which belongs only to an explicit Disconnect because a restart intends to return.
-      endTurnLocally();
-      ssSet(SOFT_RELOAD_KEY, null);
-      ssSet(REBOOT_KEY, null);
-      stopRebootWatch();
-      forgetRebootResumeAttempt();
-      // Start FRESH on reconnect: clear the saved session id so hello sends no
-      // resume (resuming would restore the wedged shell). Don't arm the resume
-      // nudge. The reconnect spins up a brand-new agent.
-      if (!await invalidateDurableAgentSession()) {
-        appendSystem(
-          tr(
-            "panel.the_old_session_could_not_be_invalidated",
-            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
-          ),
-        );
-        // #1166 — this early return DELIBERATELY skips the client.start() below, and is
-        // left that way. It looks like the #379/#419 "a reload never leaves a bridge
-        // dead" invariant being violated, but reconnecting here would restore the very
-        // session the restart exists to discard, and the pause is disclosed to the user
-        // in the line above rather than silent.
+      if (ok) {
+        // #1166 — retire everything that asserts a live turn HERE: inside the success
+        // branch, because only a restart that actually happened killed the turn, and
+        // BEFORE the invalidate below, whose failure path returns early and skipped all of
+        // it. That early return was the real defect — not the branch itself.
         //
-        // But a disclosure in the transcript is not enough on its own: the bridge is now
-        // down for good on this path, and until this the chip, dot and buttons still
-        // showed the connected state, so the panel contradicted its own message and left
-        // no affordance to act on it. Paint the real state and restore Connect, so the
-        // "paused" the line above describes is something the user can actually end. This
-        // is the Disconnect handler's UI block, minus its opt-out latch — the pause is
-        // this restart's, not a standing decision to stay disconnected.
-        connectBtn.hidden = false;
-        disconnectBtn.hidden = true;
-        connectBtn.disabled = false;
-        connectBtn.textContent = tr("panel.connect", "Connect");
-        statusText.textContent = tr("panel.status_disconnected", "disconnected");
-        dot.className = "cmcp-dot";
-        settingsBox.hidden = false;
-        return;
+        // Deliberately NOT hoisted to the top of the function. An earlier attempt did
+        // that, on the reasoning that a deliberate restart abandons the turn whatever the
+        // outcome, and it was wrong here: this pack's /hard_restart answers `{ok: false}`
+        // unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so `ok` is
+        // ALWAYS false, nothing is ever killed, and the old orchestrator's turn keeps
+        // running. Retiring at the top therefore cleared the state of a LIVE turn on the
+        // only path this pack takes — the working indicator vanishing while the agent
+        // works, and a follow-up message painting inline instead of queueing. The
+        // reconnect's `turn:working` re-announce normally repairs that, but endTurnLocally()
+        // opens a 300ms straggler window (STALE_WORKING_GUARD_MS) that can swallow it on a
+        // local bridge. The indicator staying up through a restart that did not happen is
+        // not a bug; the turn really is still running.
+        //
+        // All three markers, because retiring only some of them is how this class survives
+        // a fix: the turn itself, the soft-reload marker (a hard restart supersedes a
+        // pending reload), and the restart-resume marker plus its #585 watch (a fresh agent
+        // must not resume the conversation this restart discarded). The Disconnect handler
+        // retires the same set in the same order, minus its USER_DISCONNECTED_KEY latch,
+        // which belongs only to an explicit Disconnect because a restart intends to return.
+        endTurnLocally();
+        ssSet(SOFT_RELOAD_KEY, null);
+        ssSet(REBOOT_KEY, null);
+        stopRebootWatch();
+        forgetRebootResumeAttempt();
+        // Start FRESH on reconnect: clear the saved session id so hello sends no
+        // resume (resuming would restore the wedged shell). Don't arm the resume
+        // nudge. The reconnect spins up a brand-new agent.
+        if (!await invalidateDurableAgentSession()) {
+          appendSystem(
+            tr(
+              "panel.the_old_session_could_not_be_invalidated",
+              "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+            ),
+          );
+          // #1166 — this early return DELIBERATELY skips the client.start() below, and is
+          // left that way. It looks like the #379/#419 "a reload never leaves a bridge
+          // dead" invariant being violated, but reconnecting here would restore the very
+          // session the restart exists to discard, and the pause is disclosed to the user
+          // in the line above rather than silent.
+          //
+          // But a disclosure in the transcript is not enough on its own: the bridge is now
+          // down for good on this path, and until this the chip, dot and buttons still
+          // showed the connected state, so the panel contradicted its own message and left
+          // no affordance to act on it. Paint the real state and restore Connect, so the
+          // "paused" the line above describes is something the user can actually end. This
+          // is the Disconnect handler's UI block, minus its opt-out latch — the pause is
+          // this restart's, not a standing decision to stay disconnected.
+          connectBtn.hidden = false;
+          disconnectBtn.hidden = true;
+          connectBtn.disabled = false;
+          connectBtn.textContent = tr("panel.connect", "Connect");
+          statusText.textContent = tr("panel.status_disconnected", "disconnected");
+          dot.className = "cmcp-dot";
+          settingsBox.hidden = false;
+          return;
+        }
+        // Both markers are already retired at the top, on every exit rather than only this
+        // one (#1166).
+        appendSystem(
+          tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
+        );
       }
-      // Both markers are already retired at the top, on every exit rather than only this
-      // one (#1166).
-      appendSystem(
-        tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
-      );
+    } finally {
+      // #1171 — released here, once, covering every exit from the tail above including
+      // the invalidate-failure early return. `softReload` clears the same flag at the same
+      // point for the same reason: the reconnect is the handover, and holding the guard
+      // across it would block the next restart on a connect that may never settle.
+      reloading = false;
     }
     // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
     // restore the bridge we dropped (the old backend may still be intact).
