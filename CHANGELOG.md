@@ -20,12 +20,14 @@ All notable changes to this project are documented here. This project adheres to
   first one. The lookup now has an overall time budget, so a route that stops answering falls
   through to the one that does and the write simply succeeds. The budget covers the whole
   lookup rather than being handed to each step in turn, so the wait cannot stack — but the
-  second route is also guaranteed its own share of it, because a first route that stops
-  answering would otherwise use the budget up and leave nothing for the route that still
-  works. The budget is sized against the real payload — several megabytes on a large
-  install — rather than against a fast local reply. If nothing answers, the refusal names
-  every attempt, and says how long each one was actually given rather than quoting a wait
-  it never spent.
+  second route is also guaranteed a share of it, because a first route that stops answering
+  would otherwise use the budget up and leave nothing for the route that still works. A
+  route that answers quickly hands back the time it did not use, so a slow install still
+  gets the whole budget to finish in.
+  The budget is twenty seconds, which is generous rather than tight: fetching the whole
+  node-definition document was measured at well under a second even on a large install with
+  sixty-odd node packs. If nothing answers, the refusal names every attempt and says how
+  long each one was actually given, rather than quoting a wait it never spent.
 
 ## [0.14.24] - 2026-08-12
 
