@@ -148,6 +148,14 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
     /withTimeout\(\s*[\r\n]?\s*fetchSingleNodeDef\(class_type/,
     "the fast path must be bounded: it runs before the fallback and hangs the add on its own",
   );
+  // …with the CONSTANT, not a literal. withTimeout treats a non-positive ms as NO bound, so
+  // passing 0 here silently restores the hang while every other assertion still holds —
+  // verified: that mutation survived until this line existed.
+  assert.match(
+    body,
+    /fetchSingleNodeDef\(class_type[\s\S]{0,120}?NODE_DEFS_FETCH_TIMEOUT_MS/,
+    "the fast path must be bounded by the named constant, not an inline number",
+  );
   assert.ok(guard > 0, "the registered-type gate must be present");
   assert.ok(call > guard, "…and the single-class fetch must sit INSIDE it");
   // The full fetch must still be there as the fallback. #1180 bounded it — a half-open
@@ -304,7 +312,14 @@ test("#1180: the widen's bound fits INSIDE the registration deadline it runs und
     /const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ \d+\)/,
     "the widen's bound must be derived from the registration deadline",
   );
-  const widen = Math.floor(registration / 2);
+  // READ the divisor from source. Computing it here makes the test agree with itself
+  // rather than with the panel: changing the shipped `/ 2` to `/ 1` — which makes the
+  // widen exactly as long as the wait it runs inside — survived until this did.
+  const divisor = Number(
+    (src.match(/WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/) || [])[1],
+  );
+  assert.ok(divisor >= 2, `the widen must get a FRACTION of its caller's deadline, saw /${divisor}`);
+  const widen = Math.floor(registration / divisor);
   assert.ok(widen > 0 && widen < registration, `the widen bound must fit inside ${registration}ms, got ${widen}`);
 
   // …and the widen must actually use it rather than the generic node-defs bound.
@@ -325,7 +340,14 @@ test("#1180: graph_add_node's bounds are SEQUENTIAL and must sum inside the comm
   const num = (re) => Number((src.match(re) || [])[1]);
   const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/);
   const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/);
-  const widen = Math.floor(registration / 2);
+  // READ the divisor from source. Computing it here makes the test agree with itself
+  // rather than with the panel: changing the shipped `/ 2` to `/ 1` — which makes the
+  // widen exactly as long as the wait it runs inside — survived until this did.
+  const divisor = Number(
+    (src.match(/WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/) || [])[1],
+  );
+  assert.ok(divisor >= 2, `the widen must get a FRACTION of its caller's deadline, saw /${divisor}`);
+  const widen = Math.floor(registration / divisor);
   assert.ok(single > 0 && registration > 0, "both constants must be findable");
 
   const worstCase = single + single + widen;
