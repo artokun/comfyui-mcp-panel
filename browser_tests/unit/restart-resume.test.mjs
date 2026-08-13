@@ -992,13 +992,27 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   const body = src.slice(start, end);
   const at = (re) => body.search(re);
 
-  const release = at(/^[ \t]*reloading = false;/m);
-  const invalidate = at(/^[ \t]*if \(!await invalidateDurableAgentSession\(\)\) \{/m);
+  // DERIVE the guard's name from its own prologue rather than hardcoding it. The first
+  // version matched `reloading = false` literally, so a harmless rename failed this test
+  // while proving nothing about the property — and a rename that ALSO reintroduced the
+  // defect would fail it for the same irrelevant reason. The prologue is the definition of
+  // a re-entrancy guard: bail if set, then set it.
+  const prologue = body.match(/if \((\w+)\) return;\s*[\r\n]+\s*\1 = true;/);
+  assert.ok(prologue, "hardRestart must open with a re-entrancy guard: `if (X) return; X = true;`");
+  const guard = prologue[1];
+  const releaseRe = new RegExp(`^[ \\t]*${guard} = false;`, "m");
+
+  const release = at(releaseRe);
+  // Either shape — hardRestart takes a block (it repaints the UI before returning),
+  // connectBackend takes a bare return. Pinning one of them coupled this test to a
+  // detail of the other call site.
+  const invalidate = at(/^[ \t]*if \(!await invalidateDurableAgentSession\(\)\)/m);
   const endTurn = at(/^[ \t]*endTurnLocally\(\);/m);
   const reconnect = at(/^[ \t]*client\.start\(\);/m);
 
-  assert.notEqual(release, -1, "the guard must still be released");
+  assert.notEqual(release, -1, `the guard \`${guard}\` must still be released`);
   assert.notEqual(reconnect, -1, "expected the reconnect");
+  assert.notEqual(invalidate, -1, "expected the durable invalidation in the tail");
 
   // IN A `finally`, not merely before the reconnect. A plain assignment sitting between the
   // tail and client.start() satisfies every positional check below while LATCHING the flag
@@ -1034,7 +1048,7 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   // Exactly one release site. Two would mean the early `finally` came back alongside the
   // new one, which is the defect wearing the fix as a hat.
   assert.equal(
-    (body.match(/^[ \t]*reloading = false;/gm) || []).length,
+    (body.match(new RegExp(`^[ \\t]*${guard} = false;`, "gm")) || []).length,
     1,
     "the guard must be released in exactly one place",
   );
