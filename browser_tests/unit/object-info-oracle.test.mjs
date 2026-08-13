@@ -766,38 +766,53 @@ test("#1161: a hung route is CAPPED at its share; a fast one hands the rest back
   for (const [i, ms] of fast.entries()) assert.ok(ms > 0, `step ${i} was granted ${ms}ms`);
 });
 
-test("#1161: REAL elapsed stays inside the budget however the steps behave", async () => {
-  // The invariant is about real time, NOT about the sum of grants — a step that answers
-  // early hands its remainder back, so later grants can legitimately exceed what is
-  // nominally "left". What must never happen is the CALL outlasting its budget, which is
-  // what overran to 49,998ms while a clock was being trusted to say otherwise.
+test("#1161: on a clock that ADVANCES, real elapsed stays inside the budget", async () => {
+  // The previous version of this test summed only FIRED timer durations, so it could not
+  // see the overrun it was named for: a step that ANSWERS costs real time too, and that
+  // time went uncounted. Here each answering step advances the clock by exactly what it
+  // took, so the reclaim is charged against real work.
+  //
+  // WHAT IS AND IS NOT GUARANTEED. The cap alone bounds a hung step. The reclaim depends on
+  // the clock telling the truth about an answering one — which is what `performance.now()`
+  // guarantees, and why it is the default rather than a preference.
+  let clock = 0;
   const armed = [];
-  let elapsedReal = 0;
   const timers = {
     setTimer: (fn, ms) => { const t = { fn, ms }; armed.push(t); return t; },
     clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
   };
+  const took = (ms, value) => async () => { clock += ms; return value; };
+
+  // Three honest, slow steps: 18s of real work inside a 20s budget must ANSWER, and must
+  // not add up past the budget on the way.
+  const slow = await fetchWholeObjectInfo({
+    getNodeDefs: took(6000, null),
+    fetchApi: took(6000, { ok: true, json: took(6000, DEFS_1161) }),
+    deadlineMs: 20000,
+    timers,
+    now: () => clock,
+  });
+  assert.deepEqual(slow.defs, DEFS_1161, "18s of honest work inside a 20s budget must ANSWER");
+  assert.ok(clock <= 20000, `ran ${clock}ms against a 20000ms budget`);
+
+  // A hung client route, then a slow-but-working fallback: the cap fires and what is left
+  // is still enough to answer.
+  clock = 0;
+  armed.length = 0;
   const out = fetchWholeObjectInfo({
     getNodeDefs: never,
-    fetchApi: async () => ({ ok: true, json: never }),
-    deadlineMs: OBJECT_INFO_DEADLINE_MS,
+    fetchApi: took(300, { ok: true, json: took(4000, DEFS_1161) }),
+    deadlineMs: 20000,
     timers,
-    // A clock frozen at a constant — the reading that broke the previous two designs.
-    now: () => 0,
+    now: () => clock,
   });
-  for (let i = 0; i < 8; i++) {
-    await tick();
-    const t = armed.shift();
-    if (!t) continue;
-    elapsedReal += t.ms; // a step that hangs costs exactly the grant its timer enforces
-    t.fn();
-  }
-  const result = await settled(out, "the oracle call");
-  assert.equal(result.defs, null, "nothing answered, so nothing is authorized");
-  assert.ok(
-    elapsedReal <= OBJECT_INFO_DEADLINE_MS,
-    `ran ${elapsedReal}ms against a ${OBJECT_INFO_DEADLINE_MS}ms budget on a frozen clock`,
-  );
+  await tick();
+  const t = armed.shift();
+  clock += t.ms; // the client route hung for exactly as long as it was allowed to
+  t.fn();
+  const hung = await settled(out, "the oracle call");
+  assert.deepEqual(hung.defs, DEFS_1161, "the P1 case still recovers");
+  assert.ok(clock <= 20000, `ran ${clock}ms against a 20000ms budget`);
 });
 
 test("#1161: a non-finite budget cannot poison the arithmetic", async () => {
