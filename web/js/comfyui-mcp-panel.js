@@ -22445,10 +22445,20 @@ function buildPanel() {
     // #43: the LAST RUNTIME pick (STORAGE_KEY_BACKEND, already in selectedBackend)
     // must survive a panel REMOUNT — navigating away and back was silently swapping
     // an active Codex session to the durable default (Claude) and dropping the
-    // conversation. A Settings-dialog change to the default already writes
-    // STORAGE_KEY_BACKEND (via applyBackend→connectBackend), so the two only diverge
-    // after a session-only chip pick — and then the runtime pick wins. Fall back to
-    // the durable default ONLY when there's no runtime pick yet (first-ever load).
+    // conversation. A Settings-dialog change to the default USUALLY writes
+    // STORAGE_KEY_BACKEND too (via applyBackend→connectBackend), so the two normally
+    // diverge only after a session-only chip pick — and then the runtime pick wins. Fall
+    // back to the durable default ONLY when there's no runtime pick yet (first-ever load).
+    //
+    // #1184 — "usually", not "always", and the exception is deliberate. A switch whose
+    // session invalidation fails now commits NOTHING, including this key, so the runtime
+    // pick keeps naming the backend the panel is actually connected to. The Settings value
+    // and the runtime pick then disagree, and this resolves in favour of the runtime pick,
+    // which is the correct half: it is the one backed by a live connection. Before that
+    // fix the key was written first and the divergence resolved the other way — a reload
+    // adopting a backend the panel had never reached, which is the bug #1184 reports.
+    // (ComfyUI persists the Settings value before notifying us at all, so the dialog will
+    // still show the un-taken choice; that half is #1198.)
     let runtimePick = null;
     try {
       runtimePick = window.localStorage.getItem(STORAGE_KEY_BACKEND);
