@@ -23396,7 +23396,21 @@ function buildPanel() {
       SESSION_INVALIDATE_FLUSH_MS,
       () => ({ timedOut: true }),
     );
-    if (result?.timedOut) return false;
+    if (result?.timedOut) {
+      // BOTH CALLERS SEE THE SAME `false`, and that is correct — either way this cannot
+      // confirm the durable write, and either way the safe move is to pause. But the two
+      // causes call for different action from a HUMAN: a store that reported failure is a
+      // real fault, while a store that merely did not finish inside the bound will usually
+      // succeed on a retry. The transcript line is the same for both (the English catalog
+      // is frozen, #1135); the distinction is recorded here, where whoever is debugging a
+      // stranded panel will look.
+      console.warn(
+        `[comfyui-mcp-panel] durable session invalidation did not confirm within ` +
+          `${SESSION_INVALIDATE_FLUSH_MS}ms — the write was not cancelled and may still land; ` +
+          `retrying usually succeeds. Session id and thread binding are already cleared in memory.`,
+      );
+      return false;
+    }
     const r = result?.r;
     return r === true || r?.ok === true;
   }
