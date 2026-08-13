@@ -698,7 +698,7 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
   // one gets buried under "did not answer" from attempt three — and describeNodeDefRefresh's
   // remedy then blames the wrong thing, which is this codebase's own false-cause defect.
   //
-  // First real error wins; a stall reports as a stall only when nothing better was learned.
+  // A real error wins; a stall reports as a stall only when nothing better was learned.
   const src = SRC;
   // Anchored to the DECLARATION, not the call: the flag is declared just above the retry,
   // and a slice starting at the call misses it — the same fixed-window trap that has bitten
@@ -707,10 +707,10 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
   assert.notEqual(start, -1, "the presence flag must be declared");
   const end = src.indexOf("registerComfyNodeDefs", start);
   const body = src.slice(start, end === -1 ? start + 1400 : end);
-  assert.match(body, /firstRealError/, "the first real error must be remembered");
+  assert.match(body, /lastRealError/, "a real error must be remembered");
   assert.match(
     body,
-    /if \(sawRealError\) throw firstRealError;/,
+    /if \(sawRealError\) throw lastRealError;/,
     "…and preferred over the synthesized timeout",
   );
   // A SEPARATE FLAG: the error VALUE cannot double as the not-yet-set sentinel, or a
@@ -721,7 +721,12 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
 });
 
 test("#1180 EXECUTED: which error survives the retry, across every ordering", async () => {
-  // The structural test above pins that the preference EXISTS. This one runs the real
+  // MIRRORS the panel's loop rather than driving it, which is worth being plain about:
+  // its value is enumerating many orderings cheaply, and the structural test above is what
+  // ties the mirror to the source. The ordering that drives the SHIPPED executor is "a REAL
+  // error survives a later stall" at the end of this file, on virtual timers.
+  //
+  // This one runs the real
   // retry loop and shows what a user would actually be told, because "the last error wins"
   // plus "a timeout can be an error" silently changes the verdict for orderings nobody
   // enumerated — and the remedy attached to that verdict blames a specific thing.
@@ -731,7 +736,7 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
     // A separate flag, mirroring the panel: the error VALUE cannot double as the
     // not-yet-set sentinel, or a falsy throw is forgotten.
     let sawRealError = false;
-    let firstRealError = null;
+    let lastRealError = null;
     try {
       return await fetchNodeDefsWithRetry(
         async () => {
@@ -742,11 +747,12 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
             if (o === "falsy") throw null; // a real failure whose VALUE is falsy
             result = o === "timeout" ? NO_ANSWER : { KSampler: {} };
           } catch (err) {
-            if (!sawRealError) { sawRealError = true; firstRealError = err; }
+            sawRealError = true;
+            lastRealError = err;
             throw err;
           }
           if (result === NO_ANSWER) {
-            if (sawRealError) throw firstRealError;
+            if (sawRealError) throw lastRealError;
             throw new Error("did not answer within the attempt bound");
           }
           return result;
@@ -929,4 +935,140 @@ test("#1180 a combo refresh that never answers is NOT reported as a refresh", as
     false,
     "a combo refresh that never answered must not license trusting the combo lists to suppress missing assets",
   );
+});
+
+test("#1180: a REAL error survives a later stall — the synthesized timeout must not speak for it", async () => {
+  // Round 2 added a separate `sawRealError` flag rather than testing `lastRealError !==
+  // null`, because `throw null` and `throw undefined` are failures a backend can really
+  // produce — this file's own "#635: a FALSY thrown value still counts as a failure" exists
+  // for that. The flag's PURPOSE went untested: replacing it with a null check passed the
+  // entire suite, and the cost is a wrong remedy. A backend that refuses the connection and
+  // is then merely slow would report "did not answer" instead of what actually happened, so
+  // the user is sent after a timeout while the real cause goes unmentioned.
+  const timers = virtualTimers();
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError("Failed to fetch");
+        return new Promise(() => {}); // …and then the connection goes half-open
+      },
+    },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  // Drain unconditionally rather than waiting for the first armed timer. `withTimeout` arms
+  // its bound SYNCHRONOUSLY, before the promise it bounds has had a chance to reject, so
+  // stopping at "a timer exists" catches attempt one's — and firing that one turns the very
+  // real error this test is about into a stall, which is the outcome it exists to rule out.
+  // Attempt one's timer is cleared when it rejects, so after the drain only attempt two's
+  // is left.
+  await drainMicrotasks(300);
+  assert.equal(timers.armed().length, 1, "the second attempt must be bounded, and only it");
+  timers.fireAll();
+  const verdict = await orFail(running, "the retried fetch never gave up");
+
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(
+    verdict.detail,
+    /Failed to fetch/,
+    "the first REAL error must be what the verdict reports",
+  );
+  assert.doesNotMatch(
+    verdict.detail,
+    /did not answer/,
+    "a synthesized timeout must not stand in for a failure the backend actually named",
+  );
+  assert.equal(calls, 2, "an abandoned attempt ends the loop — it is still downloading");
+});
+
+test("#1180: a FALSY throw is still a real error — the flag cannot be read off the value", async () => {
+  // The end-to-end half of "#635: a FALSY thrown value still counts as a failure". `throw
+  // null` and `throw undefined` are failures a backend can really produce, so deriving the
+  // presence flag from the thrown VALUE (`sawRealError = !!err`) forgets them, and the
+  // synthesized "did not answer" then speaks for a failure the backend actually named.
+  //
+  // Structural assertions could not see this: the declaration, the preference and the
+  // message are all still there under that mutation. Only running the ordering shows it.
+  const timers = virtualTimers();
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        if (calls === 1) throw null; // a real failure whose value is falsy
+        return new Promise(() => {}); // …then the connection goes half-open
+      },
+    },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  assert.equal(timers.armed().length, 1, "the second attempt must be bounded");
+  timers.fireAll();
+  const verdict = await orFail(running, "the retried fetch never gave up");
+
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.equal(
+    verdict.detail,
+    undefined,
+    "a null throw carries no detail to report — and must not be replaced by a timeout that did not happen",
+  );
+});
+
+test("#1180: registerNodesFromDefs stays UNBOUNDED, deliberately", () => {
+  // The one await on this path with no time limit, and it must stay that way. `withTimeout`
+  // cannot cancel, so a bound would let the run continue with `defsRegistered = true` for a
+  // registration still in progress and send reapplyDefsToLiveNodes at classes that have not
+  // been minted — a corrupted registry reported as a good one.
+  //
+  // Checked against the frontend build this ComfyUI serves (comfyui-frontend-package
+  // 1.48.7): ComfyUI's own `registerNodes()` awaits this same call during startup, so a
+  // hook that hangs it has already hung the page's own load. There is nothing here for a
+  // bound to rescue.
+  //
+  // Asserted because "add a bound" is the obvious-looking change, and it passes every other
+  // test in this file.
+  assert.match(
+    SRC,
+    /^\s*await a\.registerNodesFromDefs\(defs\);$/m,
+    "the registration call must be awaited bare — see the comment above it before changing this",
+  );
+});
+
+test("#1180: with two real errors before a stall, the LAST one is reported", async () => {
+  // Which of several real errors reaches the user is a genuine degree of freedom, and it was
+  // decided twice differently: `fetchNodeDefsWithRetry` rethrows the LAST error and says so
+  // in its own test name, while the panel used to keep the FIRST. Two rules for one sequence,
+  // neither of them exercised — swapping the panel to first-wins passed the whole suite.
+  //
+  // They agree now, on the module's rule: the most recent thing the backend said is the most
+  // likely to still be true, and a user reading the remedy is acting on it now.
+  const timers = virtualTimers();
+  let calls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError("connection refused");
+        if (calls === 2) throw new TypeError("502 from the proxy");
+        return new Promise(() => {}); // …and then it stops answering entirely
+      },
+    },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(400);
+  assert.equal(timers.armed().length, 1, "the third attempt must be bounded");
+  timers.fireAll();
+  const verdict = await orFail(running, "the retried fetch never gave up");
+
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(verdict.detail, /502 from the proxy/, "the most recent real failure is the one to report");
+  assert.doesNotMatch(verdict.detail, /connection refused/, "…not the one the backend has since moved on from");
+  assert.equal(calls, 3, "both cheap failures were retried; the stall ended the loop");
 });

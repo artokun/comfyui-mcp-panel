@@ -1037,21 +1037,27 @@ async function registerComfyNodeDefs(preloadedDefs) {
       //
       // A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT. `fetchNodeDefsWithRetry` rethrows the
       // LAST error so the caller's verdict reports what actually failed — but with a
-      // timeout now able to be that last error, a genuine backend failure on attempt one
-      // would be buried under "did not answer" from attempt three, and the remedy would
-      // blame the wrong thing. So the first real error is remembered and preferred: a
-      // stall reports as a stall only when nothing better was learned.
-      // A SEPARATE FLAG, because the error's VALUE cannot be the sentinel. This module
-      // already learned that once: `#635: a FALSY thrown value still counts as a failure`
-      // exists because `throw null` and `throw undefined` are real failures a backend can
-      // produce. Testing `firstRealError === null` would forget exactly those and let a
-      // synthesized timeout speak for them.
+      // timeout now able to BE that last error, a genuine backend failure would be buried
+      // under "did not answer" and the remedy would blame the wrong thing. So a real error
+      // is remembered and preferred: a stall reports as a stall only when nothing better
+      // was learned.
+      //
+      // A SEPARATE FLAG, because the error's VALUE cannot answer this. `throw null` and
+      // `throw undefined` are failures a backend can really produce — "#635: a FALSY thrown
+      // value still counts as a failure" exists for exactly that — so testing
+      // `lastRealError === null` would forget them and let a synthesized timeout speak for
+      // a failure the backend had actually named.
       let sawRealError = false;
-      let firstRealError = null;
+      // The LAST real error, which is what `fetchNodeDefsWithRetry` itself rethrows ("#954:
+      // the LAST error wins, not the first"). This used to keep the FIRST one instead, so
+      // the panel and the module it calls disagreed about the same sequence for no stated
+      // reason, and the guard that did it conflated two questions: whether a real error was
+      // seen at all, and which of them to report. Only the first question needs a flag.
+      let lastRealError = null;
       // Whether the attempt that just failed was ABANDONED rather than answered. Tracked
-      // beside the error instead of encoded into it, because the error thrown for a stall
-      // is deliberately the first REAL one when there was one (see above) — so the value
-      // cannot be asked which kind of failure it represents without undoing that.
+      // beside the error rather than encoded into it, because the error thrown for a stall
+      // is deliberately a REAL one when there was one — so the value cannot be asked which
+      // kind of failure it represents without undoing that.
       let lastAttemptTimedOut = false;
       defs = await fetchNodeDefsWithRetry(
         async () => {
@@ -1060,12 +1066,13 @@ async function registerComfyNodeDefs(preloadedDefs) {
           try {
             result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
           } catch (err) {
-            if (!sawRealError) { sawRealError = true; firstRealError = err; }
+            sawRealError = true;
+            lastRealError = err;
             throw err;
           }
           if (result === NODE_DEFS_NO_ANSWER) {
             lastAttemptTimedOut = true;
-            if (sawRealError) throw firstRealError;
+            if (sawRealError) throw lastRealError;
             throw new Error("api.getNodeDefs() did not answer within this refresh's remaining budget");
           }
           return result;
@@ -1101,6 +1108,21 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
     phase = "register";
     if (defs && typeof a.registerNodesFromDefs === "function") {
+      // #1180 — this await stays UNBOUNDED, and that is the decision, not an omission. It is
+      // the last await on this path without a time limit, so it will be asked about again.
+      // Both reasons were checked against the frontend build this ComfyUI actually serves
+      // (comfyui-frontend-package 1.48.7), not inferred:
+      //
+      // A bound could not be applied safely. `withTimeout` does not cancel, so giving up
+      // here would set `defsRegistered = true` for a registration still in progress and send
+      // `reapplyDefsToLiveNodes` at classes that have not been minted yet — a corrupted
+      // registry reported as a good one, which is worse than waiting.
+      //
+      // And there would be nothing left to rescue. ComfyUI's own `registerNodes()` awaits
+      // this same call during startup, so a hook that hangs it has already hung the page's
+      // own load: the panel is not adding a hazard, it is sharing one that already stopped
+      // the app. (`registerNodesFromDefs` awaits `invokeExtensionsAsync("addCustomNodeDefs")`
+      // first, so third-party extension code does run inside this await.)
       await a.registerNodesFromDefs(defs);
       defsRegistered = true;
     }
