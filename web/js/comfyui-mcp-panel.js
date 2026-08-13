@@ -10328,8 +10328,11 @@ const GRAPH_TOOL_EXECUTORS = {
           // doubtful case there is, so it takes that same path. Unbounded, this hung the
           // add on the very path that was about to refuse — the worst place to park,
           // because the user is already being told something went wrong.
-          const fetched = await boundedGetNodeDefs(WIDEN_SOCKET_PROOF_TIMEOUT_MS);
-          const whole = fetched === NODE_DEFS_NO_ANSWER ? null : fetched;
+          // The sentinel needs no unwrapping here: it is a Symbol, so the doubt guard
+          // below rejects it exactly as it rejects every other non-object payload, and
+          // returns null — which is what "keep the proof already in hand" means. Mapping
+          // it first was a second spelling of the same decision.
+          const whole = await boundedGetNodeDefs(WIDEN_SOCKET_PROOF_TIMEOUT_MS);
           // "I did not find out" is not "nothing outputs anything", and the difference
           // matters because the caller REPLACES its proof with whatever comes back.
           // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is

@@ -74,6 +74,12 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
 
+// #1180 — the SHIPPED bounded fetch, extracted rather than re-implemented. A hand-written
+// copy can drift from the real one, and then these tests prove nothing about what ships —
+// the same extraction technique this file already uses for the executor itself.
+const boundedMatch = panelSrc.match(/\nasync function boundedGetNodeDefs\([\s\S]*?\n\}/);
+assert.ok(boundedMatch, "could not locate boundedGetNodeDefs in panel source");
+
 const addNodeMatch = panelSrc.match(
   /\n {2}async graph_add_node\(\{ class_type, pos, title \}\) \{[\s\S]*?\n {2}\},/,
 );
@@ -245,19 +251,18 @@ function realGraphAddNode(comfy, overrides = {}) {
   // Resolved from `deps` at CALL time: tests pass their own `api` through overrides, and a
   // helper closed over the default would call the wrong one.
   if (!("boundedGetNodeDefs" in deps)) {
-    deps.boundedGetNodeDefs = (timeoutMs = 10000) => {
-      const live = deps.api;
-      if (typeof live?.getNodeDefs !== "function") return Promise.resolve(null);
-      return withTimeout(
-        Promise.resolve().then(() => live.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
-        timeoutMs,
-        () => NODE_DEFS_NO_ANSWER,
-      ).then((settled) => {
-        if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
-        if ("err" in settled) throw settled.err;
-        return settled.value;
-      });
-    };
+    // Built from panel source, with this harness's api resolved at CALL time because
+    // tests pass their own through overrides.
+    const build = new Function(
+      "api",
+      "withTimeout",
+      "NODE_DEFS_NO_ANSWER",
+      "NODE_DEFS_FETCH_TIMEOUT_MS",
+      `${boundedMatch[0]}
+       return boundedGetNodeDefs;`,
+    );
+    deps.boundedGetNodeDefs = (timeoutMs) =>
+      build(deps.api, withTimeout, NODE_DEFS_NO_ANSWER, NODE_DEFS_FETCH_TIMEOUT_MS)(timeoutMs);
   }
 
   const names = Object.keys(deps);
