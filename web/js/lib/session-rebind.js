@@ -167,15 +167,19 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       // restarts or duplicates the work it was just asked to do: the exact
       // false-nudge-into-a-live-session harm #1138 exists to prevent.
       //
-      // Closing here is not merely a repair, it is better evidence. `turn:working` is a
-      // frame FROM the orchestrator, so receiving it proves the bridge is carrying
-      // traffic and the orchestrator is alive — which is what the clock was only ever
-      // estimating. It also settles the reconnect re-announce correctly and for the
-      // right reason: an orchestrator that SURVIVED re-announces its live turn, and
-      // that announcement now ends the outage, so no nudge fires for a turn that never
-      // died. One that died has no turn to re-announce, so nothing arrives before the
-      // `ready` ack, the outage stands, and the nudge fires. The panel stops guessing
-      // from elapsed time in the one case where it holds proof.
+      // What this frame actually proves is narrower than "the orchestrator survived",
+      // and the narrow claim is the one that matters: A TURN IS IN FLIGHT RIGHT NOW.
+      // The nudge exists solely to rescue an agent left IDLE — a session resumed with
+      // full context and no pending turn. An agent that is working is not idle, so
+      // there is nothing to rescue, whether the turn is the original one re-announced
+      // by an orchestrator that survived or a brand-new one the user just typed into a
+      // respawned agent. Nudging either is the harm: "continue exactly what you were
+      // doing before the drop" makes a working agent restart or duplicate.
+      //
+      // The converse is what keeps the feature alive: an orchestrator that died has no
+      // turn to announce, so nothing arrives before the `ready` ack, the outage stands
+      // and the nudge fires. Both directions are pinned by tests, so this can never be
+      // satisfied by simply never nudging.
       startedAt = null;
       outageMs = 0;
     },

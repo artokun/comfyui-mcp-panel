@@ -23,13 +23,17 @@ All notable changes to this project are documented here. This project adheres to
   settles the reconnect case for the right reason — an orchestrator that survived
   re-announces its live turn and is left alone, while one that died has no turn to
   re-announce, so its nudge still fires.
-  Separately, the panel's own automatic recovery — reclaiming, respawning or redialling a
-  wedged orchestrator — tore the socket down by a path that never recorded an outage at
-  all. That is a real orchestrator death with the turn already lost, so the resumed
-  session had nothing pending and no nudge was sent: the agent simply stopped, after the
-  panel's own recovery killed its work. All three teardowns now record the outage they
-  cause. Deliberate teardowns (Disconnect, provider switch, reload) are unaffected, as
-  they retire the pending turn on their own paths.
+  Separately, when the panel itself replaces a WEDGED orchestrator — one holding an open
+  socket while answering nothing — no outage was recorded at all. A wedged orchestrator
+  never closes its connection, so the drop that normally starts the clock never happens,
+  and the panel force-kills and respawns it instead. That is a real death with the turn
+  already lost, so the resumed session had nothing pending and no nudge was sent: the
+  agent simply stopped, after the panel's own recovery killed its work. The two
+  recoveries that replace a wedged orchestrator now record it. Deliberate teardowns —
+  Disconnect, provider switch, reload, and any change of bridge address — deliberately do
+  not, since nothing died; they are pinned against it in both directions, because an
+  earlier attempt at this fix recorded an outage for all of them and would have told
+  agents whose orchestrator never died that their connection had dropped.
 
 - **The mid-task resume nudge now measures the outage instead of one backoff step, so a
   ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a

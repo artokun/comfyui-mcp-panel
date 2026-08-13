@@ -359,21 +359,10 @@ test("codex R12: replay only ever writes to a socket that PROVED itself with a h
   const recordAt = markConnected.indexOf("handshakenSock = sock;");
   const replayAt = markConnected.indexOf("replayLostReplies(sock);");
   assert.ok(recordAt !== -1 && replayAt !== -1 && recordAt < replayAt, "record the instance, then replay");
-  // Dropping the socket must forget it too. Asserted through the ONE helper every
-  // teardown now uses (#1163) rather than by counting three copies of the assignment:
-  // the copies were the old shape of "setUrl/stop/destroy all forget it", and a count
-  // stops meaning that the moment they are deduplicated — which is a refactor the
-  // invariant survives, not one it breaks. The claim is now the invariant itself: the
-  // teardown helper forgets the proven socket, and (asserted in session-rebind.test.mjs)
-  // all three teardowns drop the socket through that helper.
-  const dropStart = src.indexOf("function dropSocketForTeardown() {");
-  assert.notEqual(dropStart, -1, "the shared teardown helper must exist");
-  const dropEnd = src.indexOf("\n  }", dropStart);
-  assert.notEqual(dropEnd, -1, "could not locate the end of dropSocketForTeardown");
-  assert.match(
-    src.slice(dropStart, dropEnd),
-    /handshakenSock = null;/,
-    "the teardown helper must forget the proven socket",
+  // Dropping the socket must forget it too.
+  assert.ok(
+    (src.match(/handshakenSock = null;/g) || []).length >= 3,
+    "setUrl/stop/destroy must all forget the proven socket",
   );
 });
 

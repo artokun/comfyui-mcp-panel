@@ -635,24 +635,45 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
     ["the socket close handler must open the outage", "bridgeOutage.noteBridgeClosed();"],
     ["the models handshake must close it", "bridgeOutage.noteHandshake();"],
     ["a turn start must scope the evidence to that turn", "bridgeOutage.noteTurnStarted();"],
-    // #1163 — the FOURTH write site. The socket close listener is guarded by isActive(),
-    // and every panel-driven teardown nulls `sock` first, so the automatic recovery
-    // paths (tryAutoReclaim / tryAutoRespawn / tryHandshakeRedial) reach the tracker
-    // only through here. Without it they respawn the orchestrator with a turn armed and
-    // never nudge — #1145's failure by another route.
-    ["a panel-driven teardown must open the outage", "if (had) bridgeOutage.noteBridgeClosed();"],
   ]) {
     assert.ok(src.includes(snippet), site);
   }
-  // …and each teardown must actually route through that helper rather than dropping the
-  // socket itself. An inlined `sock = null` would bypass the tracker silently.
-  // Counts CALL STATEMENTS only — a line whose whole content is the call — so the
-  // definition and the prose that names it are not mistaken for call sites.
-  assert.equal(
-    (src.match(/^\s*dropSocketForTeardown\(\);/gm) || []).length,
-    3, // stop() + setUrl() + destroy()
-    "stop(), setUrl() and destroy() must all drop the socket through the tracked helper",
-  );
+  // #1163 — a WEDGED orchestrator never closes its socket, so the close listener above
+  // cannot see that death. The two recoveries that REPLACE one must open the outage
+  // themselves, or the fresh handshake measures nothing and the turn the wedge killed is
+  // never resumed. Pinned per-FUNCTION rather than by counting occurrences: a population
+  // count only says "three of these exist somewhere", which stays true if one moves to a
+  // path that must NOT open an outage — the exact mistake the first attempt at #1163 made.
+  for (const [fn, label] of [
+    ["function tryHandshakeRedial(timedOutUrl) {", "the handshake redial"],
+    ["function tryAutoReclaim(timedOutUrl) {", "the force-reclaim"],
+  ]) {
+    const at = src.indexOf(fn);
+    assert.notEqual(at, -1, `could not locate ${label}`);
+    const end = src.indexOf('\n  }', at);
+    assert.notEqual(end, -1, `could not locate the end of ${label}`);
+    assert.match(
+      src.slice(at, end),
+      /bridgeOutage\.noteBridgeClosed\(\);/,
+      `${label} replaces a wedged orchestrator and must open the outage itself`,
+    );
+  }
+  // …and the DELIBERATE teardowns must NOT. stop()/setUrl()/destroy() carry Disconnect,
+  // provider switch, soft reload and every user-driven bridge re-point; opening an outage
+  // there tells an agent whose orchestrator never died that its connection dropped. That
+  // is precisely what the first attempt at #1163 shipped, so it is pinned in both
+  // directions rather than left to the next reviewer.
+  for (const fn of ["    stop() {", "    setUrl(next, opts) {", "    destroy() {"]) {
+    const at = src.indexOf(fn);
+    assert.notEqual(at, -1, `could not locate ${fn.trim()}`);
+    const end = src.indexOf('\n    },', at);
+    assert.notEqual(end, -1, `could not locate the end of ${fn.trim()}`);
+    assert.doesNotMatch(
+      src.slice(at, end),
+      /bridgeOutage\./,
+      `${fn.trim()} is a deliberate teardown and must not record an outage`,
+    );
+  }
 });
 
 // ── #1145: the interval must be the OUTAGE, not one backoff step ─────────────
