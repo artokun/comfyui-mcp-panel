@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+// #1166 adds one structural test over the panel source (where a call sits relative to
+// the restart's I/O), which the rest of this pure-logic file does not need.
+import { readFileSync } from "node:fs";
 
 import {
   adoptRebootRuns,
@@ -906,4 +909,65 @@ test("#585: an unavailable tracker reports every watched run as owed — never n
 test("#585: run ids normalize to strings so a numeric prompt_id survives the sessionStorage round-trip", () => {
   const raw = encodeRebootMarker({ at: 1, runs: [7, "7", null, undefined, 8] });
   assert.deepEqual(decodeRebootMarker(raw).runs, ["7", "8"]);
+});
+
+// ── #1166: a successful restart retires its markers BEFORE it can bail ────────
+//
+// hardRestart's success branch clears the markers that assert a live turn, but the
+// invalidate-failure path returns early — and every clear sat AFTER that return, so a
+// restart that killed the agent and then failed to invalidate left the turn, the
+// soft-reload marker and the restart-resume marker all armed against an agent that no
+// longer existed.
+//
+// The clears belong inside `if (ok)`, NOT at the top of the function. An earlier
+// attempt hoisted them, reasoning that a deliberate restart abandons the turn whatever
+// happens. That is wrong for this pack: `/comfyui_mcp_panel/hard_restart` answers
+// `{"ok": false}` unconditionally ("orchestrator runs out-of-band"), so nothing is ever
+// killed and the old turn keeps running — hoisting cleared a LIVE turn's state on the
+// only path that actually runs.
+//
+// Structural because the claim is structural: WHERE the clears sit relative to the
+// branch and the early return is the whole content of the fix. Statements are matched
+// as statements, never as bare tokens — this function's comments name every one of
+// these calls while explaining the ordering, and an earlier draft of this test matched
+// the prose and asserted the wrong thing.
+test("#1166: a successful restart retires every marker before the invalidate can bail", () => {
+  const src = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  );
+  const start = src.indexOf("async function hardRestart(");
+  assert.notEqual(start, -1, "could not locate hardRestart");
+  const end = src.indexOf("\n  }", start);
+  assert.notEqual(end, -1, "could not locate the end of hardRestart");
+  const body = src.slice(start, end);
+  const at = (re) => body.search(re);
+
+  const okBranchAt = at(/^[ \t]*if \(ok\) \{/m);
+  const invalidateAt = at(/^[ \t]*if \(!await invalidateDurableAgentSession\(\)\) \{/m);
+  assert.notEqual(okBranchAt, -1, "expected the success branch");
+  assert.notEqual(invalidateAt, -1, "expected the invalidate guard");
+
+  // Every marker a restart retires, held to the same rule. Asserted together because
+  // the defect was never one marker — it was retiring SOME of them: three separate
+  // review rounds each found another that had been left behind.
+  for (const [re, what] of [
+    [/^[ \t]*endTurnLocally\(\);/m, "the in-flight turn"],
+    [/^[ \t]*ssSet\(SOFT_RELOAD_KEY, null\);/m, "the soft-reload marker"],
+    [/^[ \t]*ssSet\(REBOOT_KEY, null\);/m, "the restart-resume marker"],
+    [/^[ \t]*stopRebootWatch\(\);/m, "the restart-resume watch"],
+    [/^[ \t]*forgetRebootResumeAttempt\(\);/m, "the in-flight resume attempt"],
+  ]) {
+    const site = at(re);
+    assert.notEqual(site, -1, `a successful restart must retire ${what}`);
+    assert.ok(
+      site > okBranchAt,
+      `${what} must be retired only when the restart SUCCEEDED — this pack's ` +
+        `/hard_restart always answers ok:false, so retiring unconditionally clears a live turn`,
+    );
+    assert.ok(
+      site < invalidateAt,
+      `${what} must be retired BEFORE the invalidate, whose failure path returns early`,
+    );
+  }
 });

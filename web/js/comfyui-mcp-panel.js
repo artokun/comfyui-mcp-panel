@@ -18262,7 +18262,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // `sock` synchronously, so their late close fails the isActive() guard above.
       // #1146 called that harmless on the grounds that every such path clears
       // MID_TASK_KEY, and that is not quite true: connectBackend() clears it only when
-      // `switching`, and hardRestart() only on its success branch (#1166).
+      // `switching`. (hardRestart() had the same hole and no longer does — #1166.)
       //
       // A WEDGED orchestrator is not covered here either: it holds its socket OPEN and
       // answers nothing, so no close ever fires and no outage is recorded for a death
@@ -29480,6 +29480,35 @@ function buildPanel() {
       reloading = false;
     }
     if (ok) {
+      // #1166 — retire everything that asserts a live turn HERE: inside the success
+      // branch, because only a restart that actually happened killed the turn, and
+      // BEFORE the invalidate below, whose failure path returns early and skipped all of
+      // it. That early return was the real defect — not the branch itself.
+      //
+      // Deliberately NOT hoisted to the top of the function. An earlier attempt did
+      // that, on the reasoning that a deliberate restart abandons the turn whatever the
+      // outcome, and it was wrong here: this pack's /hard_restart answers `{ok: false}`
+      // unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so `ok` is
+      // ALWAYS false, nothing is ever killed, and the old orchestrator's turn keeps
+      // running. Retiring at the top therefore cleared the state of a LIVE turn on the
+      // only path this pack takes — the working indicator vanishing while the agent
+      // works, and a follow-up message painting inline instead of queueing. The
+      // reconnect's `turn:working` re-announce normally repairs that, but endTurnLocally()
+      // opens a 300ms straggler window (STALE_WORKING_GUARD_MS) that can swallow it on a
+      // local bridge. The indicator staying up through a restart that did not happen is
+      // not a bug; the turn really is still running.
+      //
+      // All three markers, because retiring only some of them is how this class survives
+      // a fix: the turn itself, the soft-reload marker (a hard restart supersedes a
+      // pending reload), and the restart-resume marker plus its #585 watch (a fresh agent
+      // must not resume the conversation this restart discarded). The Disconnect handler
+      // retires the same set in the same order, minus its USER_DISCONNECTED_KEY latch,
+      // which belongs only to an explicit Disconnect because a restart intends to return.
+      endTurnLocally();
+      ssSet(SOFT_RELOAD_KEY, null);
+      ssSet(REBOOT_KEY, null);
+      stopRebootWatch();
+      forgetRebootResumeAttempt();
       // Start FRESH on reconnect: clear the saved session id so hello sends no
       // resume (resuming would restore the wedged shell). Don't arm the resume
       // nudge. The reconnect spins up a brand-new agent.
@@ -29490,10 +29519,30 @@ function buildPanel() {
             "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
           ),
         );
+        // #1166 — this early return DELIBERATELY skips the client.start() below, and is
+        // left that way. It looks like the #379/#419 "a reload never leaves a bridge
+        // dead" invariant being violated, but reconnecting here would restore the very
+        // session the restart exists to discard, and the pause is disclosed to the user
+        // in the line above rather than silent.
+        //
+        // But a disclosure in the transcript is not enough on its own: the bridge is now
+        // down for good on this path, and until this the chip, dot and buttons still
+        // showed the connected state, so the panel contradicted its own message and left
+        // no affordance to act on it. Paint the real state and restore Connect, so the
+        // "paused" the line above describes is something the user can actually end. This
+        // is the Disconnect handler's UI block, minus its opt-out latch — the pause is
+        // this restart's, not a standing decision to stay disconnected.
+        connectBtn.hidden = false;
+        disconnectBtn.hidden = true;
+        connectBtn.disabled = false;
+        connectBtn.textContent = tr("panel.connect", "Connect");
+        statusText.textContent = tr("panel.status_disconnected", "disconnected");
+        dot.className = "cmcp-dot";
+        settingsBox.hidden = false;
         return;
       }
-      ssSet(SOFT_RELOAD_KEY, null);
-      ssSet(MID_TASK_KEY, null);
+      // Both markers are already retired at the top, on every exit rather than only this
+      // one (#1166).
       appendSystem(
         tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
       );
