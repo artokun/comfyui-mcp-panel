@@ -976,12 +976,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // exactly what the retry loop is for — so a transient stall now costs a retry
       // instead of the whole command, and a genuine outage still rethrows as before.
       //
-      // ABANDONED ATTEMPTS ARE NOT CANCELLED — `withTimeout` deliberately does not, per its
-      // own header. So against a backend that is slow rather than dead, three attempts can
-      // leave three overlapping whole-document downloads in flight, contending for the same
-      // link. That is the cost of retrying at all and it predates this bound; what the bound
-      // changes is that the command now ENDS, instead of waiting on the first one forever.
-      // Worth knowing before raising either the attempt count or the per-attempt bound.
+      // ABANDONED ATTEMPTS ARE NOT CANCELLED, and this bound CREATES that. An earlier version
+      // of this comment claimed the overlap predated it; that was wrong and worth correcting
+      // rather than quietly dropping. Before, an attempt that never settled never returned,
+      // so the loop never advanced and exactly ONE request was ever in flight — the command
+      // hung, but the link stayed clear. Now attempt one is abandoned at the bound and keeps
+      // downloading while attempt two starts, so a slow-but-healthy backend can end up
+      // serving up to three concurrent whole-document responses that contend with each other
+      // and make the next attempt slower still.
+      //
+      // That is a real cost of the fix, not a pre-existing one. It is accepted because the
+      // alternative is the reported bug — a command that never ends — but it is the reason
+      // to be careful about raising the attempt COUNT, which multiplies the overlap, rather
+      // than the per-attempt bound, which reduces it.
       //
       // A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT. `fetchNodeDefsWithRetry` rethrows the
       // LAST error so the caller's verdict reports what actually failed — but with a
@@ -1050,8 +1057,26 @@ async function registerComfyNodeDefs(preloadedDefs) {
     phase = "combo";
     comboApiPresent = typeof a.refreshComboInNodes === "function";
     if (comboApiPresent) {
-      await a.refreshComboInNodes();
-      comboRan = true;
+      // #1180 — BOUNDED, and this was the fifth place the same mistake had to be found.
+      // The fetch phase above is bounded, but `refreshComboInNodes()` issues its own
+      // /object_info request (see the note at the combo-trust check), so a connection that
+      // goes half-open between the two phases parks the run here instead. Worse, the
+      // PAYLOAD-CARRYING path — `graph_add_node`'s `refresh(freshDefs)` — skips the fetch
+      // entirely and reaches this line with the bound never consulted at all.
+      //
+      // A combo refresh that does not answer is reported as one that did not RUN, which is
+      // a verdict `describeNodeDefRefresh` already has words for (`combo_refresh_failed`,
+      // whose remedy says the defs WERE re-registered). That is true here: registration
+      // happened above, so the caller keeps the accurate half of the outcome.
+      const comboSettled = await withTimeout(
+        Promise.resolve().then(() => a.refreshComboInNodes()).then(() => true, () => false),
+        NODE_DEFS_FETCH_TIMEOUT_MS,
+        () => false,
+      );
+      comboRan = comboSettled === true;
+      if (!comboRan) {
+        thrown = thrown ?? new Error(`refreshComboInNodes() did not answer within ${NODE_DEFS_FETCH_TIMEOUT_MS}ms`);
+      }
     }
     phase = "done";
   } catch (e) {

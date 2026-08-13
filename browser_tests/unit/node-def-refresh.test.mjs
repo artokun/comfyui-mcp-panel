@@ -815,3 +815,60 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
   assert.match(await run(["falsy", "timeout", "timeout"]), /THREW: /);
   assert.doesNotMatch(await run(["falsy", "timeout", "timeout"]), /did not answer/);
 });
+
+test("#1180: a combo refresh that never answers is reported, not awaited forever", async () => {
+  // The FIFTH place the same mistake had to be found on this issue. The fetch phase is
+  // bounded, but refreshComboInNodes() issues its own /object_info request, so a connection
+  // that goes half-open between the two phases parks the run here instead — and the
+  // PAYLOAD-CARRYING path (graph_add_node's refresh(freshDefs)) skips the fetch entirely
+  // and reaches this line with the bound never consulted at all.
+  const bounded = (refreshComboInNodes, ms) =>
+    withTimeout(
+      Promise.resolve().then(() => refreshComboInNodes()).then(() => true, () => false),
+      ms,
+      () => false,
+    );
+
+  const started = Date.now();
+  const hung = await Promise.race([
+    bounded(() => new Promise(() => {}), 120),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("the combo refresh parked")), 3000)),
+  ]);
+  assert.equal(hung, false, "a combo refresh that never answers is one that did not RUN");
+  assert.ok(Date.now() - started < 2000, "…and says so on the bound");
+
+  // A healthy one is untouched, and a throwing one still reads as not-run.
+  assert.equal(await bounded(async () => {}, 1000), true);
+  assert.equal(await bounded(async () => { throw new Error("combo exploded"); }, 1000), false);
+
+  // The verdict it produces is one this module already has words for, and they stay true:
+  // registration happened before the combo phase, so the caller keeps the accurate half.
+  const verdict = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: true,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "combo",
+    thrown: new Error("refreshComboInNodes() did not answer within 10000ms"),
+  });
+  assert.equal(verdict.reason, NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED);
+  assert.match(verdict.remedy, /WERE re-registered/);
+
+  // AND THE SHIPPED PHASE MUST ACTUALLY BE BOUNDED. Everything above exercises the shape;
+  // none of it fails if the panel returns to a bare `await a.refreshComboInNodes()` — which
+  // is precisely the re-implemented-harness trap this branch has hit before, and it was
+  // still open here until this assertion was added.
+  const combo = SRC.slice(SRC.indexOf('phase = "combo";'), SRC.indexOf('phase = "done";'));
+  assert.ok(combo.length > 0, "could not locate the combo phase");
+  assert.match(
+    combo,
+    /withTimeout\(\s*[\r\n]?\s*Promise\.resolve\(\)\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
+    "the combo refresh itself must be the bounded promise, not merely nearby",
+  );
+  assert.doesNotMatch(
+    combo,
+    /^\s*await a\.refreshComboInNodes\(\);\s*$/m,
+    "a bare await here parks the run on the payload-carrying path, where no fetch bound applies",
+  );
+});
