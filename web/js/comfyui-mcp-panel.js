@@ -23362,6 +23362,13 @@ function buildPanel() {
   // #1171 — how long the durable-invalidation flush may take before this reports that it
   // could not confirm one. The flush is IndexedDB-backed and can stall; both callers await
   // it while holding something, so an unbounded wait here is a wedge rather than a delay.
+  //
+  // SIZED AGAINST THE STORE'S OWN BOUND, not a guess. `chat-history-store.js` already caps
+  // opening IndexedDB at `IDB_OPEN_TIMEOUT_MS = 2000` and resolves null past it, so the
+  // open half of a flush is bounded there. Twice that leaves the same margin again for the
+  // write itself, and stays far inside the 30s command budget. Anyone changing this should
+  // check that constant first rather than reasoning from a fresh number — sizing a bound
+  // from an unverified figure is what cost #1161 three review rounds.
   const SESSION_INVALIDATE_FLUSH_MS = 4000;
 
   async function invalidateDurableAgentSession() {
@@ -23379,6 +23386,11 @@ function buildPanel() {
     // the fail-closed direction: the risk of proceeding is restoring a session the restart
     // exists to discard. The write itself is not cancelled and may well land; the next call
     // then sees a settled store.
+    // The rejection arm is DEFENSIVE, not load-bearing: `ChatHistoryStore.flush()` catches
+    // its own write failure and resolves a result object, so it does not reject today. It
+    // is handled anyway because this function's callers treat any throw from here as a
+    // failed restart, and a store that starts rejecting should degrade to "not confirmed"
+    // rather than propagate.
     const result = await withTimeout(
       historyStore.flush().then((r) => ({ r }), () => ({ r: false })),
       SESSION_INVALIDATE_FLUSH_MS,
