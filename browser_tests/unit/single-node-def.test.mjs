@@ -153,3 +153,54 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
     "both the fast and full paths must snapshot the backend def before any refresh mutates it",
   );
 });
+
+// ── #1180: the sibling call sites are BOUNDED ────────────────────────────────
+//
+// #1161 bounded the /object_info oracle, which fixed graph_set_widget. These three sites
+// were left unbounded and still hung on the same half-open connection after a ComfyUI
+// restart — the worse shape, because it makes the behaviour hard to report: setting a
+// widget works, adding a node does not.
+//
+// Structural, for the reason #1166's and #1171's tests are: whether a call is bounded is a
+// property of the call site, and these executors are rebuilt in synthetic scopes elsewhere
+// rather than run whole here.
+test("#1180: every getNodeDefs call that can hang a command is bounded", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+
+  // The bound exists, is a real number, and sits inside the bridge's 30s command budget so
+  // the caller sees its own refusal rather than a bare timeout naming nothing.
+  const ms = Number((src.match(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/) || [])[1]);
+  assert.ok(ms > 0, "the bound must be a positive number of milliseconds");
+  assert.ok(ms < 30000, `the bound must stay inside the command budget, got ${ms}`);
+
+  // Bounded through the repo's ONE primitive. A second timeout helper written alongside it
+  // is what bounded-step.js's own header warns produces near-duplicate bugs.
+  assert.match(src, /import \{ withTimeout \} from "\.\/lib\/bounded-step\.js"/);
+  assert.match(src, /async function boundedGetNodeDefs\(/);
+
+  // REIFIED before bounding. withTimeout degrades a rejection through onTimeout exactly as
+  // it does a timeout, so wrapping the call directly collapses "it threw" into "it never
+  // answered" — a first version did that and broke four tests pinning how a getNodeDefs
+  // throw is attributed to the fetch.
+  const helper = src.slice(src.indexOf("async function boundedGetNodeDefs("));
+  const helperBody = helper.slice(0, helper.indexOf("\n}"));
+  assert.match(helperBody, /\(value\) => \(\{ value \}\), \(err\) => \(\{ err \}\)/, "outcome reified");
+  assert.match(helperBody, /if \("err" in settled\) throw settled\.err;/, "a throw keeps its own cause");
+
+  // No UNBOUNDED await of getNodeDefs may remain on a command path. The startup baseline
+  // seed is the one permitted site: nothing awaits it directly and awaitObjectInfoHistorySeed()
+  // already bounds the wait, so it cannot hang a command.
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\/\/.*$/, ""));
+  const bare = code.filter((l) => /await api\.getNodeDefs\(\)/.test(l));
+  assert.equal(
+    bare.length,
+    1,
+    `only the startup seed may await getNodeDefs unbounded; found ${bare.length}: ${bare.join(" | ")}`,
+  );
+  const seedAt = src.indexOf("function seedObjectInfoHistory(");
+  const seedBody = src.slice(seedAt, src.indexOf("\n}", seedAt));
+  assert.match(seedBody, /await api\.getNodeDefs\(\)/, "…and that one site is the seed itself");
+});
