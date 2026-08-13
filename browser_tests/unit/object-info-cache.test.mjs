@@ -13,6 +13,8 @@ import {
   // #1161 — the timeout arm returns the outcome WRAPPER so the refusal can state its
   // cause; the tests assert that shape rather than a bare null.
   CACHE_OUTCOME,
+  // The SHIPPED bound, so a test cannot pass against a value the panel does not use.
+  OBJECT_INFO_READ_WAIT_MS,
   createObjectInfoCache,
 } from "../../web/js/lib/object-info-cache.js";
 
@@ -262,7 +264,7 @@ test("#716: a retired request cannot overwrite a newer value — deterministical
 // Nothing here awaits a promise that may not settle: a test that detects its bug by
 // hanging `node --test` (which has no default timeout) reports a wedged suite instead of
 // naming the broken invariant.
-function boundedCache({ waitMs = 8000, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) {
+function boundedCache({ waitMs = OBJECT_INFO_READ_WAIT_MS, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) {
   const timers = new Set();
   const clock = { t: 1_000_000 };
   const cache = createObjectInfoCache({
@@ -274,7 +276,19 @@ function boundedCache({ waitMs = 8000, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) 
   });
   return { cache, clock, armed: () => timers.size, fireTimers: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }) };
 }
-const gaveUp = (o) => o && typeof o === "object" && o[CACHE_OUTCOME] === true && o.defs === null;
+// The cause is part of the contract, not decoration: without it both call sites compute an
+// empty failure list and the refusal tells the user to hand-check a healthy backend. Review
+// found four of these tests passed with `failures` empty, so the helper asserts it.
+const gaveUp = (o) =>
+  o &&
+  typeof o === "object" &&
+  o[CACHE_OUTCOME] === true &&
+  o.defs === null &&
+  Array.isArray(o.failures) &&
+  o.failures.length > 0 &&
+  // …and short enough to survive the oracle's 200-char per-entry truncation, or the
+  // sentence the user reads ends mid-word.
+  String(o.failures[0]).length <= 200;
 
 // Await a read WITHOUT the ability to hang. `node --test` has no default timeout and waits
 // for the event loop to drain, so a read that never settles wedges the whole suite —
@@ -297,7 +311,8 @@ test("#1161: a fetch that never settles is bounded instead of parking the caller
   assert.ok(gaveUp(outcome), "the read gives up on THIS call rather than hanging");
   // It must say WHY: a bare null makes both call sites compute an empty failure list, so
   // the refusal names no cause and tells the user to hand-check a healthy backend.
-  assert.match(String(outcome.failures?.[0] ?? ""), /did not answer within 8000ms/);
+  assert.match(String(outcome.failures?.[0] ?? ""), new RegExp(`did not answer within ${OBJECT_INFO_READ_WAIT_MS}ms`)); // eslint-disable-line
+  void /x/; // ${OBJECT_INFO_READ_WAIT_MS}ms/);
 });
 
 test("#1161: a JOINER is bounded too — the burst case the bug was reported on", async () => {

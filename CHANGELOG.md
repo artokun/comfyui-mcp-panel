@@ -14,14 +14,13 @@ All notable changes to this project are documented here. This project adheres to
   renaming a node, listing workflows, queueing a run. Setting a widget is the one action
   that checks the backend's node definitions before it writes, and that check could wait
   forever: a restart can leave the browser holding a connection that never answers and
-  never fails.
-  It stayed broken rather than recovering because callers share one in-flight request, so
-  every later attempt waited on the same dead one. The check now gives up after a few
-  seconds and refuses that single call with a retry hint, and the abandoned request is
-  discarded so the next attempt makes a fresh one — which succeeds as soon as the backend
-  is reachable. An answer that arrives after the panel has given up is discarded rather
-  than used, so it cannot overwrite a newer one — the cost is re-asking, never a write
-  authorized against a stale picture of the backend.
+  never fails. It stayed broken rather than recovering because callers share one request,
+  so every later attempt waited on the same dead one.
+  The check now gives up after a few seconds and refuses that one call, saying that the
+  definitions could not be read in time and that the backend itself may be healthy —
+  rather than leaving the call to time out with no explanation. An answer that arrives
+  after the panel stopped waiting is still used, so a slow backend costs one refused call
+  rather than staying broken.
 
 ## [0.14.24] - 2026-08-12
 

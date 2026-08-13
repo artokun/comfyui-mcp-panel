@@ -71,7 +71,7 @@ export const OBJECT_INFO_CACHE_TTL_MS = 1500;
  * #1161 — how long a read will WAIT for a fetch before giving up on THIS call.
  *
  * Unbounded was the P1: after a ComfyUI restart the tab can hold a half-open connection,
- * so `getNodeDefs()` never settles. `graph_set_widget` is the only command that consults
+ * so `getNodeDefs()` never settles. `graph_set_widget` (and `graph_remove_widget`) consult
  * /object_info before writing, so it alone parked forever — every other command on the
  * same tab answered instantly, which is exactly how the report reads.
  *
@@ -123,9 +123,8 @@ export function createObjectInfoCache({
     [CACHE_OUTCOME]: true,
     defs: null,
     failures: [
-      `/object_info did not answer within ${waitMs}ms, so this call gave up waiting. The ` +
-        `request is still running and its answer will be cached if it arrives, so retrying ` +
-        `shortly is the right move; the backend itself may be healthy.`,
+      `/object_info did not answer within ${waitMs}ms, so this call stopped waiting. The ` +
+        `request is still running; retry shortly. The backend may be healthy.`,
     ],
   });
 
