@@ -17,9 +17,12 @@ All notable changes to this project are documented here. This project adheres to
   forever.
   The panel already had a second way to ask — a direct request that keeps working when
   the first route does not — but it was never reached, because nothing gave up on the
-  first one. Each route is now given a few seconds, so a route that stops answering falls
-  through to the one that does and the write simply succeeds. If neither answers, the
-  refusal names both attempts instead of leaving the command to time out silently.
+  first one. The lookup now has an overall time budget, so a route that stops answering falls
+  through to the one that does and the write simply succeeds. The budget is shared across
+  the whole lookup rather than given to each step, so the wait cannot stack, and it is
+  sized against the real payload — several megabytes on a large install — rather than
+  against a fast local reply. If nothing answers, the refusal names every attempt instead
+  of leaving the command to time out silently.
 
 ## [0.14.24] - 2026-08-12
 

@@ -39,6 +39,26 @@
  * broader than the client route, and this comment is where that would need re-checking.
  * The fallback is only ever consulted when the client route returned NOTHING usable, so
  * it can never override a narrower answer the client actually gave.
+ *
+ * #1161 WIDENS THAT LAST SENTENCE, and it is recorded here rather than waved past. The
+ * deadline below treats a client route that does not answer IN TIME as one that answered
+ * nothing — so a client which would have replied with a deliberately narrow schema, and is
+ * merely SLOW rather than broken, now has the raw route consulted over it. Reproduced in
+ * review: a `getNodeDefs` resolving the deny-all `{}` just after the budget expires is
+ * abandoned, and the fallback's full schema is used.
+ *
+ * The alternative is to refuse whenever the client route does not answer, which is exactly
+ * the P1 this exists to remove — three attempts on #1178 established that a bound which can
+ * only choose HOW TO FAIL leaves the reported hang in place under a different name. So the
+ * trade is deliberate: an install whose client route filters AND is slower than the budget
+ * can have a write authorized against a type it meant to withhold.
+ *
+ * The exposure is bounded by the same direction the original note relies on. An INSTALL is
+ * harmless (a type missing from the answer is refused, which fails closed); only a
+ * deliberate NARROWING can be overridden, only while that client is slower than the budget,
+ * and only for a write to a type it withheld. Anyone revisiting this should know it was a
+ * decision and not an oversight, and that the honest fix is a client route which fails fast
+ * rather than one which is merely waited on longer.
  */
 
 import { CACHE_OUTCOME } from "./object-info-cache.js";
@@ -48,7 +68,16 @@ import { withTimeout } from "./bounded-step.js";
 
 /** A payload that can actually answer "does the backend define this type?" */
 function usableDefs(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
+  // #1161 — `Object.keys` INVOKES a Proxy's ownKeys trap, which can throw. This module
+  // promises that "every failure path returns `defs: null`", and a diagnostic that raises
+  // an exception of its own breaks that for callers which (correctly) do not wrap it. A
+  // payload whose own shape cannot be inspected is not usable, which is the same answer
+  // this returns for every other unusable value.
+  try {
+    return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** How much of a thrown value's own words may ride into a refusal message. */
@@ -91,44 +120,52 @@ function describeFailure(label, err, extra = "") {
 }
 
 /**
- * #1161 — how long ONE transport may take before this oracle moves on to the next.
+ * #1161 — the TOTAL time this oracle may spend before it answers with what it has.
  *
  * The P1: after a ComfyUI restart the tab can hold a half-open connection, so
- * `api.getNodeDefs()` never settles — it does not throw, it simply never answers. Both
- * awaits below were unbounded, so the whole oracle parked on the first transport and the
- * second route, added by #982 for exactly this failure, was never asked. Every command
- * that consults it hung until its caller timed out.
+ * `api.getNodeDefs()` never settles — it does not throw, it simply never answers. Every
+ * await here was unbounded, so the oracle parked on the first transport and the second
+ * route, added by #982 for exactly this failure, was never asked. Every command that
+ * consults it hung until its caller timed out.
  *
- * This bound is what makes the fallback REACHABLE. It is not a way to fail faster: the
- * point is that the second route usually answers, so the write succeeds. That is why the
- * bound belongs here and not around the cache — a bound there can only choose how to give
- * up, which is what three attempts on #1178 kept rediscovering.
+ * A DEADLINE, NOT A PER-STEP BOUND. There are three I/O steps (client route, response,
+ * body), and giving each its own budget multiplies: three 6s bounds is an 18s worst case
+ * that nobody chose, stacked on top of the 8s startup seed wait. A single deadline makes
+ * the worst case one number, and lets a fast first step hand its unused time to a slow
+ * second one — which is what actually happens when the client route fails instantly and
+ * the fallback has a 5MB payload to move.
  *
- * PER TRANSPORT, so the worst case is two bounds rather than one. Kept well inside the
- * callers' own budgets (the bridge times a command out at 30s) so trying the second route
- * is still useful, while long enough that a legitimately slow first route is not abandoned
- * while it is still working — /object_info measures ~167ms on a 63-pack install (#767),
- * so seconds of headroom is generous rather than tight.
+ * SIZED FROM THE PAYLOAD, NOT FROM A PING. The first version of this used 6s, justified by
+ * a ~167ms figure — but that measures a fast LAN RESPONSE, while the thing being bounded
+ * is a 5,413,770-byte DOWNLOAD, which this repo measured at ~14.5s (#610). 6s would have
+ * refused an ordinary install, and because the bound does not cancel, it would have paid
+ * for a second full download on the way to refusing. 20s sits above that measurement with
+ * headroom and still inside the bridge's 30s command timeout, so the caller sees this
+ * oracle's own answer rather than a bare timeout.
  */
-export const OBJECT_INFO_TRANSPORT_WAIT_MS = 6000;
+export const OBJECT_INFO_DEADLINE_MS = 20000;
 
 /** Distinguishes "this transport did not answer in time" from any value it could return. */
 const NO_ANSWER = Symbol("object-info-transport-timeout");
 
 /**
- * Run one transport under a bound, preserving the difference between the three outcomes
- * the failure list already distinguishes: it answered, it threw, or it never answered.
+ * Run one I/O step against the SHARED deadline, preserving the difference between the
+ * three outcomes the failure list already distinguishes: it answered, it threw, or it
+ * never answered in time.
  *
  * `withTimeout` NEVER rejects by contract, so a naive wrap would collapse "threw" into
- * "timed out" and the refusal would name the wrong cause — the trap that bit #1178. The
- * outcome is therefore reified before bounding and unwrapped after.
+ * "timed out" and the refusal would name the wrong cause. The outcome is therefore
+ * reified before bounding and unwrapped after.
  */
-async function runTransport(attempt, waitMs, timers) {
+async function runTransport(attempt, remainingMs, timers) {
+  // Out of budget before we even start: report it rather than issuing a request whose
+  // answer we have already decided not to wait for.
+  if (!(remainingMs > 0)) return NO_ANSWER;
   const settled = await withTimeout(
     Promise.resolve()
       .then(attempt)
       .then((value) => ({ value }), (err) => ({ err })),
-    waitMs,
+    remainingMs,
     () => NO_ANSWER,
     timers,
   );
@@ -146,18 +183,22 @@ async function runTransport(attempt, waitMs, timers) {
 export async function fetchWholeObjectInfo({
   getNodeDefs,
   fetchApi,
-  // Injected so a test can drive the bound without waiting on a real clock.
-  waitMs = OBJECT_INFO_TRANSPORT_WAIT_MS,
+  // Injected so a test can drive the deadline without waiting on a real clock.
+  deadlineMs = OBJECT_INFO_DEADLINE_MS,
   timers,
+  now = () => Date.now(),
 } = {}) {
+  // ONE budget for the whole question, spent down by each step (#1161).
+  const startedAt = now();
+  const remaining = () => deadlineMs - (now() - startedAt);
   const failures = [];
 
   if (typeof getNodeDefs === "function") {
-    const outcome = await runTransport(getNodeDefs, waitMs, timers);
+    const outcome = await runTransport(getNodeDefs, remaining(), timers);
     if (outcome === NO_ANSWER) {
       // The #1161 case. Recorded as a failure like any other, and — critically — execution
       // CONTINUES to the second transport, which is what this bound exists to reach.
-      failures.push(`api.getNodeDefs() did not answer within ${waitMs}ms`);
+      failures.push(`api.getNodeDefs() did not answer within the ${deadlineMs}ms budget`);
     } else if ("err" in outcome) {
       failures.push(describeFailure("api.getNodeDefs() threw", outcome.err));
     } else {
@@ -187,23 +228,37 @@ export async function fetchWholeObjectInfo({
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    const outcome = await runTransport(() => fetchApi("/object_info"), waitMs, timers);
+    const outcome = await runTransport(() => fetchApi("/object_info"), remaining(), timers);
     if (outcome === NO_ANSWER) {
-      failures.push(`GET /object_info did not answer within ${waitMs}ms`);
+      failures.push(`GET /object_info did not answer within the ${deadlineMs}ms budget`);
     } else if ("err" in outcome) {
       failures.push(describeFailure("GET /object_info threw", outcome.err));
     } else {
       const res = outcome.value;
-      if (!res || res.ok !== true) {
-        failures.push(describeFailure("GET /object_info was not OK", null, ` (status ${res?.status ?? "unknown"})`));
+      // #1161 — reading `ok`/`status` off the response is itself an operation that can
+      // throw: an extension may monkey-patch fetchApi and hand back a lazily-evaluated or
+      // proxied object. These reads used to sit inside this route's try/catch, and
+      // replacing that with a bound left them exposed — verified against main, where the
+      // same input produced a failures entry and here produced a rejection.
+      let responseOk = false;
+      let responseStatus = "unknown";
+      try {
+        responseOk = !!res && res.ok === true;
+        responseStatus = res?.status ?? "unknown";
+      } catch (err) {
+        failures.push(describeFailure("GET /object_info returned an unreadable response", err));
+        return { [CACHE_OUTCOME]: true, defs: null, failures };
+      }
+      if (!responseOk) {
+        failures.push(describeFailure("GET /object_info was not OK", null, ` (status ${responseStatus})`));
       } else {
         // The BODY is a second I/O step, and it was inside the try/catch this bound
         // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
         // half-open connection can also stall, so it is bounded as well rather than merely
         // re-caught: the response arriving is not the same event as the body arriving.
-        const body = await runTransport(() => res.json(), waitMs, timers);
+        const body = await runTransport(() => res.json(), remaining(), timers);
         if (body === NO_ANSWER) {
-          failures.push(`GET /object_info answered but its body did not arrive within ${waitMs}ms`);
+          failures.push(`GET /object_info answered but its body did not arrive within the ${deadlineMs}ms budget`);
         } else if ("err" in body) {
           // Deliberately the SAME wording as before. A parse failure used to surface
           // through this route's catch, and an existing #982 test pins the sentence a user

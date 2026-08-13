@@ -24,7 +24,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "../../web/js/lib/object-info-oracle.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  // The SHIPPED budget, so a test cannot pass against a value the panel does not use.
+  OBJECT_INFO_DEADLINE_MS,
+} from "../../web/js/lib/object-info-oracle.js";
 
 const SCHEMA = { KSampler: { input: {} }, VAELoader: { input: {} } };
 const okResponse = (body) => ({ ok: true, status: 200, json: async () => body });
@@ -351,14 +356,14 @@ test("#1161: a hung client route falls through to the fallback, which ANSWERS", 
   const out = fetchWholeObjectInfo({
     getNodeDefs: never,
     fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
-    waitMs: 6000,
+    deadlineMs: 6000,
     timers: h.timers,
   });
   await tick();
   h.fire(); // the client route gives up
   const result = await settled(out, "the oracle call");
   assert.deepEqual(result.defs, DEFS_1161, "the fallback answered, so the caller is authorized");
-  assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) did not answer within 6000ms/);
+  assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) did not answer within the 6000ms budget/);
 });
 
 test("#1161: the timeout is reported as a timeout, not as a throw", async () => {
@@ -368,7 +373,7 @@ test("#1161: the timeout is reported as a timeout, not as a throw", async () => 
   const out = fetchWholeObjectInfo({
     getNodeDefs: async () => { throw new Error("client exploded"); },
     fetchApi: never,
-    waitMs: 6000,
+    deadlineMs: 6000,
     timers: h.timers,
   });
   await tick();
@@ -376,12 +381,12 @@ test("#1161: the timeout is reported as a timeout, not as a throw", async () => 
   const result = await settled(out, "the oracle call");
   const note = result.failures.join(" | ");
   assert.match(note, /api\.getNodeDefs\(\) threw: client exploded/, "a throw keeps its own cause");
-  assert.match(note, /GET \/object_info did not answer within 6000ms/, "…and a hang keeps its own");
+  assert.match(note, /GET \/object_info did not answer within the 6000ms budget/, "…and a hang keeps its own");
 });
 
 test("#1161: both transports hanging still returns, and names both", async () => {
   const h = harness();
-  const out = fetchWholeObjectInfo({ getNodeDefs: never, fetchApi: never, waitMs: 6000, timers: h.timers });
+  const out = fetchWholeObjectInfo({ getNodeDefs: never, fetchApi: never, deadlineMs: 6000, timers: h.timers });
   await tick();
   h.fire();
   await tick();
@@ -389,7 +394,7 @@ test("#1161: both transports hanging still returns, and names both", async () =>
   const result = await settled(out, "the oracle call");
   assert.equal(result.defs, null, "nothing answered, so nothing is authorized — still fail-closed");
   assert.equal(result.failures.length, 2, "each route reports for itself");
-  for (const f of result.failures) assert.match(f, /did not answer within 6000ms/);
+  for (const f of result.failures) assert.match(f, /did not answer within the 6000ms budget/);
 });
 
 test("#1161: a hung BODY is bounded too — the response is not the body", async () => {
@@ -399,14 +404,14 @@ test("#1161: a hung BODY is bounded too — the response is not the body", async
   const out = fetchWholeObjectInfo({
     getNodeDefs: async () => null,
     fetchApi: async () => ({ ok: true, json: never }),
-    waitMs: 6000,
+    deadlineMs: 6000,
     timers: h.timers,
   });
   await tick();
   h.fire();
   const result = await settled(out, "the oracle call");
   assert.equal(result.defs, null);
-  assert.match(result.failures.join(" | "), /body did not arrive within 6000ms/);
+  assert.match(result.failures.join(" | "), /body did not arrive within the 6000ms budget/);
 });
 
 test("#1161: a healthy client route is untouched by the bound", async () => {
@@ -414,10 +419,82 @@ test("#1161: a healthy client route is untouched by the bound", async () => {
   const result = await fetchWholeObjectInfo({
     getNodeDefs: async () => DEFS_1161,
     fetchApi: () => { throw new Error("must not be consulted"); },
-    waitMs: 6000,
+    deadlineMs: 6000,
     timers: h.timers,
   });
   assert.deepEqual(result.defs, DEFS_1161);
   assert.deepEqual(result.failures, [], "a route that answers records no failure");
   assert.equal(h.armed(), 0, "and leaves no timer armed");
+});
+
+test("#1161: the SHIPPED budget is a real bound, sized for the payload not a ping", async () => {
+  // Every other #1161 test injects its own budget, so none of them would notice the
+  // shipped constant being set to 0 — which disables the bound entirely by withTimeout's
+  // contract and reinstates the P1 with a green suite. Review caught that gap twice.
+  assert.ok(OBJECT_INFO_DEADLINE_MS > 0, "a non-positive budget disables the bound");
+  // The bounded work is a ~5.4MB download, measured at ~14.5s in this repo (#610) — not
+  // the ~167ms LAN response an earlier version of this bound was mistakenly sized from.
+  assert.ok(
+    OBJECT_INFO_DEADLINE_MS >= 15000,
+    "below the measured payload time this refuses ordinary installs, and pays for a second download doing it",
+  );
+  // …and it must still land inside the bridge's 30s command timeout, so the caller sees
+  // this oracle's own answer rather than a bare timeout with no routes named.
+  assert.ok(OBJECT_INFO_DEADLINE_MS < 30000, "past the command budget the refusal never reaches the caller");
+});
+
+test("#1161: an unreadable response is a failure, never a rejection", async () => {
+  // The contract this module states two screens up: "every failure path returns defs:
+  // null". Replacing the try/catch with a bound re-protected only the awaits, so reading
+  // `ok`/`status` off a proxied or lazily-evaluated response rejected instead. Two callers
+  // await this with no try/catch of their own.
+  const hostile = { get ok() { throw new Error("wrapped api"); } };
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => hostile,
+    deadlineMs: 6000,
+  });
+  assert.equal(result.defs, null);
+  assert.match(result.failures.join(" | "), /unreadable response: wrapped api/);
+});
+
+test("#1161: a payload whose own shape cannot be inspected is a failure, never a rejection", async () => {
+  // Object.keys invokes a Proxy's ownKeys trap, which can throw — same contract, different
+  // entry point, and also proven against main by the review.
+  const trapped = new Proxy({}, { ownKeys() { throw new Error("proxy"); } });
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => trapped,
+    fetchApi: async () => ({ ok: true, json: async () => ({ KSampler: {} }) }),
+    deadlineMs: 6000,
+  });
+  // Nothing rejected — that is the contract this asserts, and the whole point.
+  //
+  // The OUTCOME is `defs: null` rather than the fallback's schema, and that is correct
+  // rather than a shortfall: an uninspectable object still satisfies the "is an object,
+  // is not an array" test, so it takes the deliberate-empty branch and is treated as the
+  // client's own answer. That is the direction this module already chose for an empty
+  // map — the fallback must never widen an answer the client gave — and it fails closed,
+  // which is the safe reading of "I could not tell what it said".
+  assert.equal(result.defs, null);
+});
+
+test("#1161: the budget is shared, so three steps cannot each spend it", async () => {
+  // A per-step bound multiplies: three 6s bounds is an 18s worst case nobody chose,
+  // stacked on the 8s startup seed wait. One budget makes the worst case one number.
+  const h = harness();
+  let clock = 0;
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: never,
+    deadlineMs: 6000,
+    timers: h.timers,
+    now: () => clock,
+  });
+  await tick();
+  clock = 6000; // the first step consumed the whole budget
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  assert.equal(result.defs, null);
+  assert.equal(h.armed(), 0, "with no budget left the second step must not arm a timer at all");
+  assert.equal(result.failures.length, 2, "…and must still report for itself");
 });
