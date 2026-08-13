@@ -184,7 +184,7 @@ import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-lab
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
-import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
+import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
@@ -749,6 +749,27 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
  */
 const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 
+/**
+ * #1180 — the same bound for ONE attempt of a RETRIED fetch, which cannot be the number
+ * above.
+ *
+ * `fetchNodeDefsWithRetry` makes three attempts (two delays) and its own header caps the
+ * added WAITING at 800ms. Reusing the single-call bound would put the worst case at
+ * 3 x 10000 + 800 = 30,800ms — past the bridge's 30s command timeout, so a fully hung
+ * connection would blow the budget and hand the agent a bare timeout naming nothing. That
+ * is precisely the #1161 symptom, reintroduced by the fix for #1180.
+ *
+ * DERIVED, not picked, so the arithmetic cannot drift when the retry schedule changes: the
+ * attempts and their waiting come from the retry module itself, and the whole sequence is
+ * held to half the command budget, leaving the rest for the reply and for everything else
+ * the command does.
+ */
+const NODE_DEFS_RETRY_BUDGET_MS = 15000;
+const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor(
+  (NODE_DEFS_RETRY_BUDGET_MS - OBJECT_INFO_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)) /
+    (OBJECT_INFO_RETRY_DELAYS_MS.length + 1),
+);
+
 /** Sentinel: this call did not answer in time, as distinct from anything it could return. */
 const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
 
@@ -919,9 +940,9 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // exactly what the retry loop is for — so a transient stall now costs a retry
       // instead of the whole command, and a genuine outage still rethrows as before.
       defs = await fetchNodeDefsWithRetry(async () => {
-        const result = await boundedGetNodeDefs();
+        const result = await boundedGetNodeDefs(NODE_DEFS_ATTEMPT_TIMEOUT_MS);
         if (result === NODE_DEFS_NO_ANSWER) {
-          throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_FETCH_TIMEOUT_MS}ms`);
+          throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_ATTEMPT_TIMEOUT_MS}ms`);
         }
         return result;
       });

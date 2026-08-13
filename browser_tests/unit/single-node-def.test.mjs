@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { fetchSingleNodeDef, singleDefConfirms } from "../../web/js/lib/single-node-def.js";
+import { OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -203,4 +204,37 @@ test("#1180: every getNodeDefs call that can hang a command is bounded", () => {
   const seedAt = src.indexOf("function seedObjectInfoHistory(");
   const seedBody = src.slice(seedAt, src.indexOf("\n}", seedAt));
   assert.match(seedBody, /await api\.getNodeDefs\(\)/, "…and that one site is the seed itself");
+});
+
+test("#1180: the RETRIED fetch's worst case stays inside the command budget", () => {
+  // Found by asking what three attempts cost, not by review: fetchNodeDefsWithRetry makes
+  // three attempts (two delays) and caps its own added waiting at 800ms. Reusing the
+  // single-call 10s bound put the worst case at 3 x 10000 + 800 = 30,800ms — PAST the
+  // bridge's 30s command timeout, so a fully hung connection would blow the budget and hand
+  // the agent a bare timeout naming nothing. That is the #1161 symptom, reintroduced by the
+  // fix for #1180.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const single = Number((src.match(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/) || [])[1]);
+  const budget = Number((src.match(/const NODE_DEFS_RETRY_BUDGET_MS = (\d+);/) || [])[1]);
+  assert.ok(budget > 0, "the retry sequence must have its own budget");
+
+  // DERIVED from the retry module, not hardcoded, so the arithmetic cannot drift when the
+  // retry schedule changes.
+  assert.match(
+    src,
+    /OBJECT_INFO_RETRY_DELAYS_MS\.reduce\(/,
+    "the per-attempt bound must be derived from the retry schedule itself",
+  );
+  const attempts = OBJECT_INFO_RETRY_DELAYS_MS.length + 1;
+  const waiting = OBJECT_INFO_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
+  const perAttempt = Math.floor((budget - waiting) / attempts);
+  assert.ok(perAttempt > 0, `each attempt must get a real bound, got ${perAttempt}ms`);
+  assert.ok(
+    perAttempt * attempts + waiting < 30000,
+    `the retried worst case is ${perAttempt * attempts + waiting}ms, past the 30s command budget`,
+  );
+  // …and it must be SMALLER than the single-call bound, which is the whole point.
+  assert.ok(perAttempt < single, "a retried attempt cannot be given the single-call bound");
+  // The refresh site really uses it.
+  assert.match(src, /boundedGetNodeDefs\(NODE_DEFS_ATTEMPT_TIMEOUT_MS\)/, "the refresh uses the derived bound");
 });
