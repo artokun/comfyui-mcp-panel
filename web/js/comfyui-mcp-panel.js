@@ -810,6 +810,17 @@ const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor(
 const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
 
 /**
+ * The combo refresh's three outcomes, kept apart.
+ *
+ * `refreshComboInNodes()` resolves undefined on success, so "it worked" cannot be
+ * expressed as a value it returns — hence a sentinel for success too, rather than a
+ * boolean that a rejection and a timeout would both have to share. The verdict downstream
+ * words those two differently, and the caller's remedy is different for each.
+ */
+const COMBO_OK = Symbol("combo-refreshed");
+const COMBO_NO_ANSWER = Symbol("combo-timeout");
+
+/**
  * `api.getNodeDefs()`, bounded. Resolves the sentinel when the call does not answer, so a
  * caller can tell "never answered" apart from "answered nothing" — the distinction #982
  * was about, and the reason this does not simply resolve null for both.
@@ -1076,21 +1087,38 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // PAYLOAD-CARRYING path — `graph_add_node`'s `refresh(freshDefs)` — skips the fetch
       // entirely and reaches this line with the bound never consulted at all.
       //
-      // A combo refresh that does not answer is reported as one that did not RUN, which is
-      // a verdict `describeNodeDefRefresh` already has words for (`combo_refresh_failed`,
-      // whose remedy says the defs WERE re-registered). That is true here: registration
-      // happened above, so the caller keeps the accurate half of the outcome.
+      // The outcome is REIFIED — a timeout, a throw and a success are three different
+      // things and this has to tell them apart, the way `boundedGetNodeDefs` does.
+      // Collapsing the first two into one `false` did two wrong things at once: it
+      // discarded the real cause of a combo that threw, and then it reported that throw
+      // as a stall by fabricating a "did not answer within 10000ms" message for a failure
+      // that had landed instantly.
       const comboSettled = await withTimeout(
-        Promise.resolve().then(() => a.refreshComboInNodes()).then(() => true, () => false),
+        Promise.resolve()
+          .then(() => a.refreshComboInNodes())
+          .then(() => COMBO_OK, (err) => ({ err })),
         NODE_DEFS_FETCH_TIMEOUT_MS,
-        () => false,
+        () => COMBO_NO_ANSWER,
       );
-      comboRan = comboSettled === true;
+      comboRan = comboSettled === COMBO_OK;
       if (!comboRan) {
-        thrown = thrown ?? new Error(`refreshComboInNodes() did not answer within ${NODE_DEFS_FETCH_TIMEOUT_MS}ms`);
+        // `thrown` is provably null here: a throw inside this try would have jumped to the
+        // catch. The `?? ` that used to guard this assignment could never fire.
+        thrown =
+          comboSettled === COMBO_NO_ANSWER
+            ? new Error(`refreshComboInNodes() did not answer within ${NODE_DEFS_FETCH_TIMEOUT_MS}ms`)
+            : comboSettled.err;
       }
     }
-    phase = "done";
+    // Leave the combo phase ONLY when it produced no failure.
+    //
+    // `describeNodeDefRefresh` reads `phase` to name the cause, and an unconditional
+    // "done" here made a combo failure come out as `register_failed` — whose remedy tells
+    // the user that re-registering the node definitions failed, when registration had in
+    // fact just succeeded a few lines above. The comment that used to sit here asserted
+    // the opposite outcome, `combo_refresh_failed`, which the code has never produced:
+    // `thrown` is set without `didThrow`, and the verdict's `failed` test accepts either.
+    if (!thrown) phase = "done";
   } catch (e) {
     thrown = e;
     didThrow = true;

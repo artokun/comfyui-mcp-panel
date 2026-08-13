@@ -21,6 +21,10 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 // retry loop treats a stalled attempt as a failed one. Both names are module-scope in
 // the real file, so this harness injects them alongside the collaborators it already does.
 const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+// #1180 — the combo refresh resolves undefined on success, so "it worked" needs a sentinel
+// of its own rather than a boolean that a rejection and a timeout would have to share.
+const COMBO_OK = Symbol("combo-refreshed");
+const COMBO_NO_ANSWER = Symbol("combo-timeout");
 const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 // #1180 — the retried path gets a SMALLER per-attempt bound so three attempts plus the
 // retry module's own waiting stay well inside the 30s command budget. Derived here the
@@ -370,7 +374,17 @@ function extractFunction(marker) {
   throw new Error(`unterminated function: ${marker}`);
 }
 
-function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
+// #1180 — ONE builder. Two more copies of this 12-argument factory used to sit inline in
+// the tests below, differing only in the recorder they passed, and adding a collaborator
+// meant remembering all three. It did not get remembered: the combo sentinels landed here
+// and the copies threw ReferenceError.
+function buildRegisterComfyNodeDefs({
+  appValue,
+  apiValue,
+  timers,
+  recordObjectInfoTypes = () => ({}),
+  reapplyDefsToLiveNodes = () => {},
+}) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const factory = new Function(
     "app",
@@ -384,6 +398,8 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "fetchNodeDefsWithRetry",
     "withTimeout",
     "NODE_DEFS_NO_ANSWER",
+    "COMBO_OK",
+    "COMBO_NO_ANSWER",
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -408,13 +424,17 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
   return factory(
     appValue,
     apiValue,
-    () => ({}),
-    () => {},
+    recordObjectInfoTypes,
+    reapplyDefsToLiveNodes,
     describeNodeDefRefresh,
     // No real waiting: the delays are the shipped ones, the sleep is not.
     (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
-    withTimeout,
+    // #1180 — the shipped primitive, told which clock to use, so the combo tests can make
+    // the bound FIRE without the suite waiting ten real seconds for it.
+    timers ? (pr, ms, onT) => withTimeout(pr, ms, onT, timers) : withTimeout,
     NODE_DEFS_NO_ANSWER,
+    COMBO_OK,
+    COMBO_NO_ANSWER,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_ATTEMPT_TIMEOUT_MS,
     NODE_DEFS_RETRY_DELAYS_MS,
@@ -520,65 +540,19 @@ test("#635: a pre-registration throw must not claim registration was attempted (
 
 test("#635: the shipping run attributes a history-recording throw to BEFORE registration", async () => {
   let registerCalls = 0;
-  const body = extractFunction("async function registerComfyNodeDefs(");
-  const factory = new Function(
-    "app",
-    "api",
-    "recordObjectInfoTypes",
-    "reapplyDefsToLiveNodes",
-    "describeNodeDefRefresh",
-    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
-    // a harness that substituted a pass-through would stop proving what this file exists to
-    // prove: that the shipped code produces these verdicts.
-    "fetchNodeDefsWithRetry",
-    "withTimeout",
-    "NODE_DEFS_NO_ANSWER",
-    "NODE_DEFS_FETCH_TIMEOUT_MS",
-    "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
-    "NODE_DEFS_RETRY_DELAYS_MS",
-    "objectInfoCache",
-    `// #1180 — defined HERE, from the api this scope already has, so each factory site
-     // gets its own stub without threading a helper through every call.
-     const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
-       if (typeof api?.getNodeDefs !== "function") return null;
-       const settled = await withTimeout(
-         Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
-         ms,
-         () => NODE_DEFS_NO_ANSWER,
-       );
-       if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
-       if ("err" in settled) throw settled.err;
-       return settled.value;
-     };
-     let nodeDefsRefreshConfirmed = false;
-     ${body}
-     return { registerComfyNodeDefs };`,
-  );
-  const { registerComfyNodeDefs: registerWithThrowingRecorder } = factory(
-    {
+  const { registerComfyNodeDefs: registerWithThrowingRecorder } = buildRegisterComfyNodeDefs({
+    appValue: {
       graph: null,
       registerNodesFromDefs: async () => {
         registerCalls += 1;
       },
       refreshComboInNodes: async () => {},
     },
-    { getNodeDefs: async () => ({ SomeNode: {} }) },
-    () => {
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    recordObjectInfoTypes: () => {
       throw new Error("history exploded");
     },
-    () => {},
-    describeNodeDefRefresh,
-    // No real waiting: the shipped delays, an instant sleep.
-    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
-    withTimeout,
-    NODE_DEFS_NO_ANSWER,
-    NODE_DEFS_FETCH_TIMEOUT_MS,
-    NODE_DEFS_ATTEMPT_TIMEOUT_MS,
-    NODE_DEFS_RETRY_DELAYS_MS,
-    // #716 — the shipping function drops the widget-write burst cache after a successful
-    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
-    cacheSpy,
-  );
+  });
   const verdict = await registerWithThrowingRecorder(undefined);
   assert.equal(verdict.reason, "register_failed");
   assert.match(verdict.remedy, /BEFORE registration was attempted/);
@@ -603,63 +577,13 @@ test("#635: a FALSY thrown value still counts as a failure (codex r5)", () => {
 });
 
 test("#635: the shipping register run treats a falsy throw as a failure everywhere", async () => {
-  const body = extractFunction("async function registerComfyNodeDefs(");
-  const factory = new Function(
-    "app",
-    "api",
-    "recordObjectInfoTypes",
-    "reapplyDefsToLiveNodes",
-    "describeNodeDefRefresh",
-    // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
-    // a harness that substituted a pass-through would stop proving what this file exists to
-    // prove: that the shipped code produces these verdicts.
-    "fetchNodeDefsWithRetry",
-    "withTimeout",
-    "NODE_DEFS_NO_ANSWER",
-    "NODE_DEFS_FETCH_TIMEOUT_MS",
-    "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
-    "NODE_DEFS_RETRY_DELAYS_MS",
-    "objectInfoCache",
-    `// #1180 — defined HERE, from the api this scope already has, so each factory site
-     // gets its own stub without threading a helper through every call.
-     const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
-       if (typeof api?.getNodeDefs !== "function") return null;
-       const settled = await withTimeout(
-         Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
-         ms,
-         () => NODE_DEFS_NO_ANSWER,
-       );
-       if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
-       if ("err" in settled) throw settled.err;
-       return settled.value;
-     };
-     let nodeDefsRefreshConfirmed = false;
-     ${body}
-     return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
-  );
-  const { registerComfyNodeDefs, getConfirmed } = factory(
-    {
-      graph: null,
-      registerNodesFromDefs: async () => {},
-      refreshComboInNodes: async () => {},
-    },
-    { getNodeDefs: async () => ({ SomeNode: {} }) },
-    () => {
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    recordObjectInfoTypes: () => {
       throw null; // a falsy throw — must still read as a failed run
     },
-    () => {},
-    describeNodeDefRefresh,
-    // No real waiting: the shipped delays, an instant sleep.
-    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
-    withTimeout,
-    NODE_DEFS_NO_ANSWER,
-    NODE_DEFS_FETCH_TIMEOUT_MS,
-    NODE_DEFS_ATTEMPT_TIMEOUT_MS,
-    NODE_DEFS_RETRY_DELAYS_MS,
-    // #716 — the shipping function drops the widget-write burst cache after a successful
-    // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
-    cacheSpy,
-  );
+  });
   const verdict = await registerComfyNodeDefs(undefined);
   assert.equal(verdict.refreshed, false);
   assert.equal(verdict.reason, "register_failed");
@@ -825,59 +749,153 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
   assert.doesNotMatch(await run(["falsy", "timeout", "timeout"]), /did not answer/);
 });
 
-test("#1180: a combo refresh that never answers is reported, not awaited forever", async () => {
-  // The FIFTH place the same mistake had to be found on this issue. The fetch phase is
-  // bounded, but refreshComboInNodes() issues its own /object_info request, so a connection
-  // that goes half-open between the two phases parks the run here instead — and the
-  // PAYLOAD-CARRYING path (graph_add_node's refresh(freshDefs)) skips the fetch entirely
-  // and reaches this line with the bound never consulted at all.
-  const bounded = (refreshComboInNodes, ms) =>
-    withTimeout(
-      Promise.resolve().then(() => refreshComboInNodes()).then(() => true, () => false),
-      ms,
-      () => false,
-    );
-
-  const started = Date.now();
-  const hung = await Promise.race([
-    bounded(() => new Promise(() => {}), 120),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("the combo refresh parked")), 3000)),
-  ]);
-  assert.equal(hung, false, "a combo refresh that never answers is one that did not RUN");
-  assert.ok(Date.now() - started < 2000, "…and says so on the bound");
-
-  // A healthy one is untouched, and a throwing one still reads as not-run.
-  assert.equal(await bounded(async () => {}, 1000), true);
-  assert.equal(await bounded(async () => { throw new Error("combo exploded"); }, 1000), false);
-
-  // The verdict it produces is one this module already has words for, and they stay true:
-  // registration happened before the combo phase, so the caller keeps the accurate half.
-  const verdict = describeNodeDefRefresh({
-    appAvailable: true,
-    defsObtained: true,
-    defsRegistered: true,
-    comboApiPresent: true,
-    comboRan: false,
-    phase: "combo",
-    thrown: new Error("refreshComboInNodes() did not answer within 10000ms"),
-  });
-  assert.equal(verdict.reason, NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED);
-  assert.match(verdict.remedy, /WERE re-registered/);
-
-  // AND THE SHIPPED PHASE MUST ACTUALLY BE BOUNDED. Everything above exercises the shape;
-  // none of it fails if the panel returns to a bare `await a.refreshComboInNodes()` — which
-  // is precisely the re-implemented-harness trap this branch has hit before, and it was
-  // still open here until this assertion was added.
-  const combo = SRC.slice(SRC.indexOf('phase = "combo";'), SRC.indexOf('phase = "done";'));
+test("#1180: the shipped combo phase is bounded, and its outcomes stay apart", () => {
+  // STRUCTURE ONLY. What this phase actually DOES under a hung combo is driven end-to-end
+  // in the two tests below; this one pins the shape those tests would silently stop
+  // covering if the bound were removed from the source they rebuild.
+  //
+  // It used to do more, and the more was vacuous: it built a LOCAL copy of the bounded
+  // call and asserted against that, then hand-fed `describeNodeDefRefresh` a
+  // `phase: "combo"` and concluded `combo_refresh_failed`. The shipped code was sending
+  // `phase: "done"`, so the one scenario the test appeared to prove was a state the panel
+  // never reached. A test may not supply the input whose production is the thing in doubt.
+  const combo = SRC.slice(SRC.indexOf('phase = "combo";'), SRC.indexOf('if (!thrown) phase = "done";'));
   assert.ok(combo.length > 0, "could not locate the combo phase");
   assert.match(
     combo,
-    /withTimeout\(\s*[\r\n]?\s*Promise\.resolve\(\)\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
+    /withTimeout\(\s*Promise\.resolve\(\)\s*\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
     "the combo refresh itself must be the bounded promise, not merely nearby",
   );
   assert.doesNotMatch(
     combo,
     /^\s*await a\.refreshComboInNodes\(\);\s*$/m,
     "a bare await here parks the run on the payload-carrying path, where no fetch bound applies",
+  );
+  // The three outcomes must stay distinguishable. Mapping a rejection to the same value as
+  // a timeout is what let an instant combo error be reported as a ten-second stall.
+  assert.match(combo, /=> COMBO_OK, \(err\) => \(\{ err \}\)\)/, "a throw must carry its cause, not become a boolean");
+  assert.match(combo, /\(\) => COMBO_NO_ANSWER,/, "a timeout must be its own outcome");
+  // …and the phase must not advance past `combo` when the combo failed, or the verdict
+  // names the wrong cause entirely.
+  assert.match(
+    SRC,
+    /if \(!thrown\) phase = "done";/,
+    "an unconditional done here reports a combo failure as register_failed",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #1180 — the COMBO phase's own bound.
+//
+// Bounding the FETCH phase first did not remove this stall, it moved it:
+// `refreshComboInNodes()` issues its own /object_info, and the payload-carrying path
+// (`graph_add_node`'s `refresh(freshDefs)`) hands the defs in and reaches the combo
+// phase with the fetch bound never consulted at all.
+//
+// Driven with a `refreshComboInNodes` that NEVER settles, on virtual time, so three
+// things a mutation can break independently are each stated separately:
+//
+//   1. a bound is actually ARMED, with the panel's own constant — passing 0 arms
+//      nothing at all, because `withTimeout` treats a non-positive ms as no bound;
+//   2. giving up is reported as `combo_refresh_failed`, not as a refresh;
+//   3. the shared trust global stays FALSE.
+//
+// (3) is the one with teeth. That global is what lets callers suppress missing-asset
+// candidates using the live combo lists, so a combo refresh that never answered being
+// recorded as a completed one would suppress genuine misses using lists that were
+// never refreshed — an over-report-safe design failing to the unsafe side.
+
+/** Timers whose clock only moves when the test says so. */
+function virtualTimers() {
+  let seq = 0;
+  const pending = new Map();
+  return {
+    setTimer(fn, ms) {
+      const id = (seq += 1);
+      pending.set(id, { fn, ms });
+      return id;
+    },
+    clearTimer(id) {
+      pending.delete(id);
+    },
+    armed: () => [...pending.values()],
+    fireAll() {
+      for (const [id, t] of [...pending]) {
+        pending.delete(id);
+        t.fn();
+      }
+    },
+  };
+}
+
+/** Fail — never hang — when a bound that should exist does not. `node --test` has no
+ *  default per-test timeout, so an unbounded await here would stall the whole run
+ *  instead of reporting the defect it was written to report. */
+function orFail(promise, message, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const t = setTimeout(() => reject(new Error(message)), ms);
+      t.unref?.();
+    }),
+  ]);
+}
+
+/** Let every already-resolved promise on the path settle, leaving only what genuinely
+ *  cannot settle. Microtask turns, not wall-clock: nothing here waits on real time. */
+async function drainMicrotasks(turns = 200) {
+  for (let i = 0; i < turns; i += 1) await Promise.resolve();
+}
+
+test("#1180 the combo phase arms a bound, using the panel's constant", async () => {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: () => new Promise(() => {}), // the half-open case: never settles
+    },
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  const armed = timers.armed();
+  // Exactly one: the fetch phase's bound must already have been CLEARED by its own
+  // answer. Two here would mean a bound leaks per refresh on a long-lived page.
+  assert.equal(armed.length, 1, `the combo phase must leave exactly one bound armed, saw ${armed.length}`);
+  assert.equal(
+    armed[0].ms,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
+    "the combo bound must be the panel's constant — a non-positive ms arms nothing and silently restores the hang",
+  );
+  timers.fireAll();
+  await orFail(running, "the combo phase never gave up: registerComfyNodeDefs is still awaiting refreshComboInNodes");
+});
+
+test("#1180 a combo refresh that never answers is NOT reported as a refresh", async () => {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: () => new Promise(() => {}),
+    },
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  timers.fireAll();
+  const verdict = await orFail(running, "the combo phase never gave up");
+
+  assert.equal(verdict.refreshed, false, "nothing refreshed the combo lists, so the reply must not say refreshed");
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  // The accurate half of the outcome survives: registration DID happen above the combo phase.
+  assert.match(verdict.remedy, /WERE re-registered/);
+  assert.equal(
+    getConfirmed(),
+    false,
+    "a combo refresh that never answered must not license trusting the combo lists to suppress missing assets",
   );
 });
