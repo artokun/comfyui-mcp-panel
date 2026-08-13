@@ -154,6 +154,33 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       startedAt = null;
     },
     noteTurnStarted() {
+      // #1163 — CLOSE the outage, do not merely zero the total.
+      //
+      // Zeroing alone left `startedAt` running across the turn boundary, so an outage
+      // that began before the turn was still measured from before the turn existed.
+      // That is reachable, not theoretical: `sendUserMessage` requires only an OPEN
+      // socket, not a completed handshake, and the socket reopens well before the
+      // `models` frame — up to 45s earlier on a cold backend. A user who types into
+      // that gap gets `turn:working`, then the late handshake measures the pre-turn
+      // drop, and the `ready` ack tells the agent its connection dropped mid-task and
+      // to resume — on top of the message the user sent seconds ago. The agent
+      // restarts or duplicates the work it was just asked to do: the exact
+      // false-nudge-into-a-live-session harm #1138 exists to prevent.
+      //
+      // What this frame actually proves is narrower than "the orchestrator survived",
+      // and the narrow claim is the one that matters: A TURN IS IN FLIGHT RIGHT NOW.
+      // The nudge exists solely to rescue an agent left IDLE — a session resumed with
+      // full context and no pending turn. An agent that is working is not idle, so
+      // there is nothing to rescue, whether the turn is the original one re-announced
+      // by an orchestrator that survived or a brand-new one the user just typed into a
+      // respawned agent. Nudging either is the harm: "continue exactly what you were
+      // doing before the drop" makes a working agent restart or duplicate.
+      //
+      // The converse is what keeps the feature alive: an orchestrator that died has no
+      // turn to announce, so nothing arrives before the `ready` ack, the outage stands
+      // and the nudge fires. Both directions are pinned by tests, so this can never be
+      // satisfied by simply never nudging.
+      startedAt = null;
       outageMs = 0;
     },
     /** The outage the current turn has seen, in ms (0 = none).

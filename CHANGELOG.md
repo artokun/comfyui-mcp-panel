@@ -8,6 +8,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
+  the outage accounting added for #1145, found by review of that change rather than in
+  the wild. A turn beginning while the bridge was still down zeroed the measured outage
+  but left the outage itself running, so it was later measured from before that turn
+  existed. Reachable in ordinary use: sending a message needs only an open socket, not a
+  completed handshake, and the socket comes back well before the model list does — so
+  typing into that gap could draw "your connection dropped mid-task — continue exactly
+  what you were doing" on top of the message just sent, making the agent restart or
+  duplicate the work it was asked to do.
+  A turn start now ENDS the outage rather than only zeroing the total. What that frame
+  proves is narrow but sufficient: a turn is in flight. The nudge exists solely to
+  rescue an agent left IDLE — a session resumed with full context and nothing pending —
+  so once a turn is running there is nothing to rescue, whether it is the original turn
+  re-announced by an orchestrator that survived or a new one just typed into a replaced
+  agent. Nudging either is the harm. The converse still holds and is covered by tests:
+  an orchestrator that died has no turn to announce, so its nudge fires as before.
+
 - **The mid-task resume nudge now measures the outage instead of one backoff step, so a
   ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
   resumed agent its connection dropped mid-task and to continue what it was doing, and it

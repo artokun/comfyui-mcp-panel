@@ -18258,13 +18258,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // clock to the last backoff step. The tracker ignores all but the first; the
       // outage stands until markConnected() ends it.
       //
-      // A panel-DRIVEN teardown never reaches here, and that is deliberate rather than
-      // a gap: stop() nulls `sock` synchronously, so the late close fails the isActive()
-      // guard above and no outage opens. Every such path — Disconnect, provider switch,
-      // soft reload — routes through endTurnLocally() or its own ready-ack branch and
-      // clears MID_TASK_KEY, so there is no mid-task nudge left to decide. Opening an
-      // outage for them would only invent evidence about a drop the user asked for. The
-      // pre-#1145 stamp sat behind this same guard, so this is unchanged behaviour.
+      // A panel-DRIVEN teardown never reaches here — stop()/setUrl()/destroy() null
+      // `sock` synchronously, so their late close fails the isActive() guard above.
+      // #1146 called that harmless on the grounds that every such path clears
+      // MID_TASK_KEY, and that is not quite true: connectBackend() clears it only when
+      // `switching`, and hardRestart() only on its success branch (#1166).
+      //
+      // A WEDGED orchestrator is not covered here either: it holds its socket OPEN and
+      // answers nothing, so no close ever fires and no outage is recorded for a death
+      // the panel then resolves by force-respawning it. Both gaps are real and are
+      // tracked as their own issue rather than patched from here — two attempts to
+      // record those deaths from the teardown side turned a MISSED nudge into a FALSE
+      // one, because the teardown functions cannot distinguish "the orchestrator died"
+      // from "the user changed the bridge URL" or "the agent has not booted yet".
       bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
