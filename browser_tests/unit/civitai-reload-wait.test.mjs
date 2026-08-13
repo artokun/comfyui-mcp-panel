@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   awaitReloadWithin,
+  classifyHighlightOutcome,
   RELOAD_WAIT_BUDGET_MS,
 } from "../../web/js/lib/civitai-reload-wait.js";
 
@@ -100,6 +101,28 @@ test("the budget stays clear of the orchestrator's 20s bridge bound", () => {
     RELOAD_WAIT_BUDGET_MS <= 15000,
     `budget ${RELOAD_WAIT_BUDGET_MS}ms leaves too little headroom under the 20s bridge bound`,
   );
+});
+
+test("a superseded highlight is reported as superseded even when the budget also expired", () => {
+  // The case that matters, and the one the first version of this change got
+  // wrong: BOTH conditions hold. A slow reload outran the budget *and* the grid
+  // moved on underneath it.
+  //
+  // Precedence must be `superseded`, because the two answers ask for different
+  // things. `pending` says "these ids are still good, ask again" — and here they
+  // are not: they belong to the previous search and cannot match. Answering
+  // pending sends the agent back to re-issue ids that are guaranteed to miss,
+  // and hides a bail-out path that predates the bound.
+  assert.equal(
+    classifyHighlightOutcome({ revChanged: true, reloadSettled: false }),
+    "superseded",
+  );
+});
+
+test("each highlight outcome is reachable on its own", () => {
+  assert.equal(classifyHighlightOutcome({ revChanged: true, reloadSettled: true }), "superseded");
+  assert.equal(classifyHighlightOutcome({ revChanged: false, reloadSettled: false }), "pending");
+  assert.equal(classifyHighlightOutcome({ revChanged: false, reloadSettled: true }), "install");
 });
 
 test("BOTH drive methods actually go through the bound", async () => {

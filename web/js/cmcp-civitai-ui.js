@@ -16,7 +16,11 @@ import {
   filtersDirty, bitmask, parseCreatorQuery, levelLabel,
 } from "./cmcp-civitai.js";
 import { summarizeSearchFilters } from "./lib/civitai-search-echo.js";
-import { awaitReloadWithin, RELOAD_WAIT_BUDGET_MS } from "./lib/civitai-reload-wait.js";
+import {
+  awaitReloadWithin,
+  classifyHighlightOutcome,
+  RELOAD_WAIT_BUDGET_MS,
+} from "./lib/civitai-reload-wait.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
@@ -2249,16 +2253,22 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     // before installing, so a retry is idempotent.
     const reloadSettled = await awaitReloadWithin(state.activeReloadPromise, RELOAD_WAIT_BUDGET_MS);
     _assertOpen();
-    if (!reloadSettled) {
-      return { highlighted: 0, missing: list, renderRev: state.renderRev, pending: true };
-    }
-    if (state.renderRev !== rev) {
-      // A reload/tab/filter superseded this highlight while we awaited: these ids
-      // belonged to the OLD search and MUST NOT be installed on the new
-      // generation (they'd glow same-id cards from a different query). Bail
-      // without touching the current set — the agent can re-issue against the
-      // new results (codex finding).
-      return { highlighted: 0, missing: list, renderRev: state.renderRev, superseded: true };
+    // A reload/tab/filter can supersede this highlight while we wait: those ids
+    // belonged to the OLD search and MUST NOT be installed on the new generation
+    // (they'd glow same-id cards from a different query). The bounded wait adds
+    // a second bail-out, and `superseded` takes precedence over `pending` — see
+    // classifyHighlightOutcome, where that precedence is pinned.
+    const outcome = classifyHighlightOutcome({
+      revChanged: state.renderRev !== rev,
+      reloadSettled,
+    });
+    if (outcome !== "install") {
+      return {
+        highlighted: 0,
+        missing: list,
+        renderRev: state.renderRev,
+        [outcome]: true, // superseded | pending — bail without touching the set
+      };
     }
     // Replacement: strip the prior set, install the new one, then paint.
     driveClearHighlight();

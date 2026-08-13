@@ -44,6 +44,33 @@ export const RELOAD_WAIT_BUDGET_MS = 12000;
  * `state.error`. Reporting it as pending would tell an agent to re-read and wait
  * for an answer that has already arrived.
  */
+/**
+ * Which answer `driveHighlight` owes its caller once the bounded wait returns.
+ *
+ * Both conditions can hold at once — the results generation changed while a slow
+ * reload was still in flight — and the PRECEDENCE is load-bearing, because the
+ * two answers ask the agent to do different things:
+ *
+ *   - `superseded`: a reload/tab/filter moved the grid on. The ids belong to the
+ *     old search and can no longer match. Re-read results, then highlight again.
+ *   - `pending`: the ids are still good, we just could not confirm them inside
+ *     the budget. Ask again, unchanged.
+ *   - `install`: current generation, reload settled — do the work.
+ *
+ * `superseded` wins. Reporting `pending` for a superseded request sends the
+ * agent back with ids that cannot match, and buries a bail-out path that
+ * predates the bound. This function exists so that precedence is testable rather
+ * than a statement about line order inside a DOM-heavy module (#1520 review).
+ *
+ * @param {{revChanged: boolean, reloadSettled: boolean}} s
+ * @returns {"superseded"|"pending"|"install"}
+ */
+export function classifyHighlightOutcome({ revChanged, reloadSettled }) {
+  if (revChanged) return "superseded";
+  if (!reloadSettled) return "pending";
+  return "install";
+}
+
 export function awaitReloadWithin(reload, budgetMs, timers) {
   return withTimeout(
     Promise.resolve(reload).then(
