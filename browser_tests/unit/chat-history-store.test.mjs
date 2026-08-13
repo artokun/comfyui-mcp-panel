@@ -2210,9 +2210,46 @@ test('#1171 flush() SETTLES even when IndexedDB never answers, and reports succe
   const elapsed = Date.now() - started
   // Settles on the store's OWN open cap rather than waiting forever.
   assert.ok(elapsed < 10000, `flush() took ${elapsed}ms — it must settle on IDB_OPEN_TIMEOUT_MS, not hang`)
-  // And reports SUCCESS: a capped open yields null from idbMergeWrite, the write chain
-  // passes that null through, and flush() maps a null result to true. This is why a slow
-  // store does NOT drive the panel's "could not be invalidated durably" pause.
-  assert.equal(result, true, 'a capped open must not read as a failed write')
+  // For a SMALL history it also reports success: a capped open yields null from
+  // idbMergeWrite, the write chain passes that null through, and flush() maps null to true.
+  // That is only half the story — see the next test for what a real history does.
+  assert.equal(result, true, 'a capped open must not read as a failed write for a small history')
   store.close?.()
+})
+
+test('#1171 a capped IndexedDB open DOES report failure once history exceeds the local shadow', async () => {
+  // The other half, and the one a first probe missed by testing a five-message thread and
+  // generalising from it. A capped open makes idbMergeWrite yield null, so persist() falls
+  // back to the LOCAL SHADOW's completeness — and the shadow is deliberately partial past
+  // LOCAL_SHADOW_THREADS (20) and LOCAL_SHADOW_MESSAGES (200). So for any user with real
+  // history, a two-second disk hiccup answers ok:false.
+  //
+  // That is not a store fault. It matters because the panel's
+  // invalidateDurableAgentSession() maps this to "could not invalidate durably", and its
+  // callers must treat that as "could not CONFIRM" rather than "the store is broken" —
+  // which the backend-switch caller currently does not (#1184).
+  const hungIndexedDb = {
+    open: () => ({
+      set onsuccess(_) {},
+      set onerror(_) {},
+      set onblocked(_) {},
+      set onupgradeneeded(_) {}
+    })
+  }
+  const cases = [
+    ['400 messages in one thread', [{ id: 't1', ts: 1, title: 'heavy', msgs: Array.from({ length: 400 }, (_, i) => ({ id: 'm' + i, role: 'user', text: 'x' })) }]],
+    ['30 threads', Array.from({ length: 30 }, (_, t) => ({ id: 't' + t, ts: t, title: 't' + t, msgs: [{ id: t + '-0', role: 'user', text: 'x' }] }))]
+  ]
+  for (const [label, threads] of cases) {
+    const store = new ChatHistoryStore({
+      storage: createMemoryStorage(),
+      indexedDb: hungIndexedDb,
+      broadcastFactory: null
+    })
+    store.persist(threads, {}, { maxThreads: 200, maxMessages: 1000 })
+    const result = await store.flush()
+    assert.notEqual(result, true, `${label}: a partial shadow must not claim a durable write`)
+    assert.equal(result?.ok, false, `${label}: and it reports why`)
+    store.close?.()
+  }
 })

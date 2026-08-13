@@ -23375,11 +23375,27 @@ function buildPanel() {
     // modelled path on which this promise simply never settles.
     //
     // MEASURED, against a store whose IndexedDB `open` fires no handler at all — the worst
-    // slow store there is: `flush()` returned `true` after 2017ms, so this reports SUCCESS
-    // rather than hanging or failing. `idbMergeWrite` yields null when the open is capped,
-    // the write chain passes that null through, and `flush()` maps a null result to true.
-    // So a slow store does not reach the two exits below either; that was checked because
-    // review suggested it did.
+    // slow store there is. It SETTLES, on the store's own 2s open cap, which is the property
+    // the widened guard depends on.
+    //
+    // WHAT IT REPORTS DEPENDS ON HOW MUCH HISTORY THERE IS, and an earlier version of this
+    // comment got that wrong in a way worth recording. A capped open makes `idbMergeWrite`
+    // yield null, so `persist()` falls back to the LOCAL SHADOW's completeness — and the
+    // shadow is deliberately partial past `LOCAL_SHADOW_THREADS` (20) and
+    // `LOCAL_SHADOW_MESSAGES` (200). Measured:
+    //
+    //     1 thread /   5 messages   flush() -> true    (this returns true)
+    //     1 thread / 400 messages   flush() -> ok:false (this returns FALSE)
+    //    30 threads                 flush() -> ok:false (this returns FALSE)
+    //
+    // So for any user with real history, a two-second disk hiccup answers false here. That
+    // is not a store fault and there is nothing to fix in this function — but the callers
+    // must treat false as "could not confirm", not as "the store is broken", and the
+    // backend-switch caller currently cannot (see #1184).
+    //
+    // The first probe of this used a single five-message thread and generalised from it,
+    // which is the same class of error as sizing a bound from the wrong measurement. Test
+    // the heavy case: `browser_tests/unit/chat-history-store.test.mjs`.
     //
     // WHAT THE BOUND COST. `flush()` awaits the WHOLE queued chain — including the
     // full-snapshot write `persistThreads()` enqueues one line above — so a timeout meant
@@ -29297,21 +29313,23 @@ function buildPanel() {
       // can observe it. If reconnect fails or the browser closes here, reload
       // still starts fresh instead of restoring a foreign session.
       //
-      // #1171 — SAY SO. This return was silent: the user picked a backend and nothing
-      // happened, with no line in the transcript and the old backend still selected. That
-      // was survivable while only a genuine store failure could reach it; bounding the
-      // flush means a merely SLOW store reaches it too, so the silence had to go with it.
-      // Same wording shape as hardRestart's pause, for the same reason — proceeding would
-      // let a reconnect observe the session this switch exists to drop.
-      if (!await invalidateDurableAgentSession()) {
-        appendSystem(
-          tr(
-            "panel.the_old_session_could_not_be_invalidated",
-            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
-          ),
-        );
-        return;
-      }
+      // #1184 — THIS RETURN IS SILENT, AND SAYING SOMETHING HERE IS NOT THE FIX.
+      //
+      // #1171 briefly added hardRestart's "reconnect is paused" line here. Review showed
+      // that makes it worse rather than better: by this point `seedPrefsForBackendSwitch`,
+      // `selectedBackend`, `localStorage[STORAGE_KEY_BACKEND]`, the chips, `endTurnLocally()`
+      // and `client.armContext(replay)` have ALL committed to the new backend, while the
+      // OLD backend's socket is still open. "Paused" tells the user nothing happened, when
+      // in fact the panel is now half-switched — and the armed replay ships the entire prior
+      // conversation back to the provider that already has it on the next message.
+      //
+      // The exit is also more reachable than a genuine store failure: a capped IndexedDB
+      // open answers ok:false for any history past the local shadow's limits (measured — 400
+      // messages, or 30 threads), so a two-second disk hiccup lands here.
+      //
+      // The fix is to roll the commit back, or not to commit until this succeeds, and that
+      // decision belongs to #1184 rather than to a re-entrancy-guard change.
+      if (!await invalidateDurableAgentSession()) return;
     }
     // Reflect the picked backend in the composer placeholder immediately; onModels
     // reaffirms it authoritatively from the handshake (fix #3).

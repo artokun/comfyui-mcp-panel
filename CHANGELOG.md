@@ -16,11 +16,8 @@ All notable changes to this project are documented here. This project adheres to
   ran straight through the middle of it, tearing down the same state twice.
   The flag is now held until the reconnect, which is what the reload path already did, so
   the two finally agree.
-- **Switching to a different agent backend no longer fails silently (#1171).**
-  If the old provider's session could not be invalidated, the switch stopped with nothing
-  said: no message, and the previously selected backend still showing. It now says the same
-  thing a restart says when it pauses for the same reason. (The panel can still be left
-  showing a backend it did not finish switching to — that is tracked separately in #1184.)
+
+## [0.14.25] - 2026-08-13
 
 ### Fixed
 
