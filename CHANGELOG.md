@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.23] - 2026-08-12
+
 ### Fixed
 
 - **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
@@ -26,6 +28,11 @@ All notable changes to this project are documented here. This project adheres to
   an orchestrator that died has no turn to announce, so its nudge fires as before.
 
 - **The mid-task resume nudge now measures the outage instead of one backoff step, so a
+
+## [0.14.22] - 2026-08-12
+
+### Fixed
+
   ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
   resumed agent its connection dropped mid-task and to continue what it was doing, and it
   fires only for a REAL restart — judged by how long the bridge was gone. But the panel
