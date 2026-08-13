@@ -777,6 +777,18 @@ const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
  * `api.getNodeDefs()`, bounded. Resolves the sentinel when the call does not answer, so a
  * caller can tell "never answered" apart from "answered nothing" — the distinction #982
  * was about, and the reason this does not simply resolve null for both.
+ *
+ * THIS ONE MAY THROW, unlike the `/object_info` oracle next door, and the difference is
+ * deliberate. That oracle documents "every failure path returns `defs: null`" because its
+ * callers await it with no catch. These three call sites are the opposite: each already
+ * sits under handling that attributes a `getNodeDefs` throw to the fetch, with its detail,
+ * and existing tests pin that wording. So this behaves exactly as the bare `await` it
+ * replaced — propagating what that would have propagated — and adds only the bound.
+ *
+ * Probed for hangs rather than assumed: a `getNodeDefs` that returns a never-settling
+ * thenable is bounded (the sentinel, at the bound); one that throws synchronously, returns
+ * a throwing or revoked Proxy, rejects with a Symbol, or is itself a throwing getter all
+ * throw — each exactly as the unbounded original did.
  */
 async function boundedGetNodeDefs(timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) {
   if (typeof api?.getNodeDefs !== "function") return null;
