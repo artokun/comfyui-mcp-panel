@@ -961,3 +961,25 @@ test("#1161: an unreadable elapsed reading charges the FULL grant, never zero", 
     "unmeasurable elapsed must fall back to the whole grant, not to nothing",
   );
 });
+
+test("#1161: a budget beyond the timer's range cannot silently become no bound", async () => {
+  // setTimeout coerces a delay above 2^31-1 to 1ms. An unclamped budget therefore hands
+  // every step a grant whose timer fires almost immediately — the bound inverting into no
+  // bound, which is precisely the hang this module exists to remove, reached by asking for
+  // MORE time rather than less.
+  for (const deadlineMs of [3e9, Number.MAX_SAFE_INTEGER, 2 ** 31]) {
+    const granted = [];
+    let calls = 0;
+    const result = await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs,
+      timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+    });
+    assert.equal(calls, 1, `deadlineMs=${deadlineMs}: the fallback is still issued`);
+    assert.deepEqual(result.defs, DEFS_1161);
+    for (const ms of granted) {
+      assert.ok(ms <= 2 ** 31 - 1, `granted ${ms}ms, which a timer cannot express and fires at 1ms`);
+    }
+  }
+});

@@ -357,7 +357,15 @@ export async function fetchWholeObjectInfo({
   // than the unbounded original gave. NaN and Infinity are not budgets a caller can have
   // meant, so they take the shipped default. A non-positive NUMBER is a real choice and is
   // obeyed — every step is then unattempted, and says so.
-  const budget = Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs) : OBJECT_INFO_DEADLINE_MS;
+  // …and CLAMPED to what a timer can actually express. `setTimeout` coerces a delay above
+  // 2^31-1 to 1ms, so a budget past that would hand every step a grant its timer fires
+  // almost immediately — the bound silently becoming no bound at all, which is the failure
+  // this module exists to remove. Clamping honours a caller asking for "very long" (2^31-1
+  // is ~24.8 days) instead of quietly inverting it.
+  const MAX_EXPRESSIBLE_MS = 2 ** 31 - 1;
+  const budget = Number.isFinite(deadlineMs)
+    ? Math.min(MAX_EXPRESSIBLE_MS, Math.max(0, deadlineMs))
+    : OBJECT_INFO_DEADLINE_MS;
   let consumed = 0;
   /**
    * Run one step CAPPED at `share` of what is LEFT, charging it for what it used — its
