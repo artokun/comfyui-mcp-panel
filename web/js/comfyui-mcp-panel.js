@@ -71,6 +71,9 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
+// #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
+// it is how this repo keeps producing near-duplicate bugs, per that file's own header.
+import { withTimeout } from "./lib/bounded-step.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
@@ -181,7 +184,7 @@ import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-lab
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
-import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
+import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
@@ -722,6 +725,163 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
   recordOpenReceipt(openReceipts, receipt);
   return receipt;
 }
+/**
+ * #1180 — how long any ONE `api.getNodeDefs()` may take before the caller gives up on it.
+ *
+ * #1161 established the failure: after a ComfyUI restart the tab can hold a half-open
+ * connection, so `api.getNodeDefs()` never settles — it does not throw, it simply never
+ * answers. That issue bounded the `/object_info` oracle, which fixed `set_widget`; the
+ * sibling call sites were left unbounded and still hang, which is the worse shape of the
+ * two because it makes the behaviour hard to report: after a restart, setting a widget
+ * works and adding a node does not.
+ *
+ * SIZED FROM THE SAME MEASUREMENT, not a fresh guess. The bounded work is one call for the
+ * whole node-definition document: measured in this repo at 5,413,770 bytes / 167 ms on a
+ * 63-pack install (#767), and live at ~366ms on a 4304-type install while fixing #1161.
+ * 10s is roughly 27x the slowest of those and matches the share #1161's oracle gives its
+ * own client route, so the two paths agree about what "too long" means. It stays well
+ * inside the bridge's 30s command budget, so the caller sees its own refusal rather than a
+ * bare timeout naming nothing.
+ *
+ * Do NOT re-size this from the ~14.5s figure in #610: that measures the forced refresh —
+ * the download plus registerNodesFromDefs plus rebuilding every combo — which is a
+ * different operation. Sizing a bound from it cost #1161 three review rounds.
+ */
+const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
+
+/**
+ * #1180 — ONE budget for a whole `registerComfyNodeDefs` run, shared by its phases.
+ *
+ * PER-PHASE BOUNDS DO NOT COMPOSE, and three review rounds on this issue were spent
+ * relearning that. Each phase was sized on its own and each number looked defensible, but
+ * a run performs them in SEQUENCE: the retried fetch (up to this budget plus the
+ * schedule's waiting) and then the combo refresh, which issues its own /object_info and
+ * had a 10s bound of its own. Roughly 19.8s per run — and `makeRefreshCoalescer`
+ * guarantees a forced `panel_refresh_nodes` pays the in-flight run AND its own, serially,
+ * so about 39.6s before a reply is composed. Past the bridge's 20s READ default and past
+ * the 30s command budget both, which is the #1161 symptom this fix reintroduced twice.
+ *
+ * A run therefore carries a DEADLINE, and each bounded phase gets what is left of it
+ * rather than a private allowance. Two serialized runs then cost 2 x this, and that is the
+ * number sized against the read default — 18,000ms against 20,000ms — because that product
+ * is what the user actually waits through.
+ *
+ * WHAT THE DEADLINE DOES NOT COVER, said plainly so this is not read as a total. Two calls
+ * run INSIDE the window without drawing from it: `registerNodesFromDefs` and
+ * `reapplyDefsToLiveNodes`. Both are deliberately unbounded — see the note at the
+ * registration call — so a run can exceed this budget, and the 18,000ms figure is the cost
+ * of the WAITING this panel controls, not a ceiling on wall-clock. It is the right number
+ * to size against the read default anyway: those two are local work that either completes
+ * in milliseconds or has already hung the page for reasons no bound here can reach.
+ *
+ * On a monotonic clock, like every other elapsed-time measurement in this panel: a
+ * wall-clock jump mid-run must not hand a phase a negative or enormous remainder.
+ *
+ * WHAT IT COSTS, stated rather than left to be discovered. An install whose /object_info
+ * consistently takes longer than the remaining budget gets a worded
+ * `object_info_fetch_failed` where an unbounded panel would eventually have succeeded.
+ * That is a real narrowing and it is the direction this repo has regressed in before. It
+ * is accepted because the alternative is the reported bug — a command that never ends —
+ * and a recoverable, worded refusal beats a hang. Measured on this rig today: /object_info
+ * is 7,440,820 bytes and answers in 532ms (it was 5,413,770 bytes / 167ms when #767
+ * measured it — the document grows with the pack count, which is the reason to keep
+ * measuring rather than to trust the older figure).
+ */
+const NODE_DEFS_RUN_BUDGET_MS = 9000;
+/**
+ * The share of a run's budget the FETCH phase may consume, leaving the rest for the combo
+ * refresh that follows it. Two thirds: the fetch is the phase that must survive a retry
+ * schedule, while the combo phase is a single call.
+ *
+ * A share, not a second constant, so the two cannot be changed into disagreement.
+ */
+const NODE_DEFS_FETCH_SHARE = 2 / 3;
+//
+// #954's SCHEDULE, UNFORKED. An earlier pass here cut it to a single 200ms delay, reasoning
+// that a bound which does not cancel lets three abandoned attempts download the whole
+// document at once and contend with each other. That is true, and the conclusion drawn
+// from it was still wrong: it also cut the window a RESTART-time blip can hide in from
+// 800ms to 200ms, which is the dimension #954 was actually sized on. A backend taking half
+// a second to start accepting connections was bridged before and would not have been after.
+//
+// The two failure modes have opposite economics, so the schedule is the wrong place to
+// separate them:
+//
+//   an attempt that fails INSTANTLY  — connection refused; no bytes moved, so another
+//                                      attempt is free and more of them is strictly better
+//   an attempt abandoned by a TIMEOUT — still downloading; a second attempt races the first
+//                                      and makes the link it is retrying on slower
+//
+// So the SCHEDULE stays #954's and the DECISION moves to the caller: `shouldRetry` below
+// stops the loop the moment an attempt is abandoned, rather than sleeping and stacking a
+// second download on top of it. Instant failures keep all three attempts across 800ms.
+const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
+
+/**
+ * What is left of a run's budget, for the phase about to start.
+ *
+ * Never returns a non-positive number: `withTimeout` treats those as NO BOUND, so an
+ * exhausted budget expressed literally would silently remove the bound at exactly the
+ * moment the run is already too slow — the failure this whole issue is about, arriving
+ * through the mechanism meant to prevent it. A spent budget yields 1ms, which times out
+ * immediately and truthfully.
+ */
+function nodeDefsBudgetLeft(deadline, share = 1) {
+  const left = deadline - monotonicNow();
+  return Math.max(1, Math.floor(left * share));
+}
+
+/** Sentinel: this call did not answer in time, as distinct from anything it could return. */
+const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+
+/**
+ * The combo refresh's three outcomes, kept apart.
+ *
+ * `refreshComboInNodes()` resolves undefined on success, so "it worked" cannot be
+ * expressed as a value it returns — hence a sentinel for success too, rather than a
+ * boolean that a rejection and a timeout would both have to share. The verdict downstream
+ * words those two differently, and the caller's remedy is different for each.
+ */
+const COMBO_OK = Symbol("combo-refreshed");
+const COMBO_NO_ANSWER = Symbol("combo-timeout");
+
+/**
+ * `api.getNodeDefs()`, bounded. Resolves the sentinel when the call does not answer, so a
+ * caller can tell "never answered" apart from "answered nothing" — the distinction #982
+ * was about, and the reason this does not simply resolve null for both.
+ *
+ * THIS ONE MAY THROW, unlike the `/object_info` oracle next door, and the difference is
+ * deliberate. That oracle documents "every failure path returns `defs: null`" because its
+ * callers await it with no catch. These three call sites are the opposite: each already
+ * sits under handling that attributes a `getNodeDefs` throw to the fetch, with its detail,
+ * and existing tests pin that wording. So this behaves exactly as the bare `await` it
+ * replaced — propagating what that would have propagated — and adds only the bound.
+ *
+ * Probed for hangs rather than assumed: a `getNodeDefs` that returns a never-settling
+ * thenable is bounded (the sentinel, at the bound); one that throws synchronously, returns
+ * a throwing or revoked Proxy, rejects with a Symbol, or is itself a throwing getter all
+ * throw — each exactly as the unbounded original did.
+ */
+async function boundedGetNodeDefs(timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) {
+  if (typeof api?.getNodeDefs !== "function") return null;
+  // REIFY BEFORE BOUNDING. `withTimeout` never rejects by contract — it degrades a
+  // rejection through `onTimeout()` exactly as it does a timeout — so wrapping the call
+  // directly would collapse "it threw" into "it never answered" and lose the error. The
+  // refresh path attributes a getNodeDefs throw to the fetch, with its detail, and existing
+  // tests pin that wording; a first version of this swallowed it with `.catch(() => null)`
+  // and broke four of them. Same shape #1161's oracle uses, for the same reason.
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(() => api.getNodeDefs())
+      .then((value) => ({ value }), (err) => ({ err })),
+    timeoutMs,
+    () => NODE_DEFS_NO_ANSWER,
+  );
+  if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+  if ("err" in settled) throw settled.err;
+  return settled.value;
+}
+
 // Monotonic "now" — performance.now() when available (never runs backwards),
 // falling back to Date.now() only if the environment lacks it.
 function monotonicNow() {
@@ -823,7 +983,15 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let defsRegistered = false;
   let comboApiPresent = false;
   let comboRan = false;
+  // Whether the combo phase FAILED, tracked apart from the value it failed with — see the
+  // note at the assignment. A falsy rejection is still a failure.
+  let comboFailed = false;
   let phase = "fetch";
+  // #1180 — ONE deadline for this whole run. Every bounded phase below draws from what is
+  // left of it, so the run's cost is this budget rather than the sum of numbers that each
+  // looked reasonable alone. Taken here, before any phase starts, so a slow fetch is paid
+  // for by the combo phase rather than added to it.
+  let runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -856,7 +1024,89 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // and fatal to a tool call. Bounded (~800ms worst case) because this blocks the call,
       // and the LAST error is rethrown so a genuine outage still reports what it always did.
       // (~800ms is the added WAITING; the three requests themselves are unbounded — codex.)
-      defs = await fetchNodeDefsWithRetry(() => api.getNodeDefs());
+      // #1180 — each ATTEMPT is bounded, not just the waiting between them. The comment
+      // above is explicit that the ~800ms is added waiting and "the three requests
+      // themselves are unbounded", so one half-open connection parked `panel_refresh_nodes`
+      // indefinitely: the retry loop only advances once an attempt SETTLES, and this one
+      // never did. A bounded attempt that does not answer is a failed attempt, so a
+      // transient stall now costs ONE attempt instead of the whole command, and a genuine
+      // outage still rethrows as before.
+      //
+      // ONE attempt, not a retried one, and that is deliberate — see `shouldRetry` below.
+      // This sentence used to say a stall "costs a retry", which was true of an earlier
+      // version of this fix and stopped being true when the retry decision moved to the
+      // caller. A stalled attempt is still downloading, so retrying it races the retry
+      // against its own predecessor; the loop stops instead. Only failures that cost
+      // nothing — a connection refused while the backend restarts — get all three.
+      //
+      // ABANDONED ATTEMPTS ARE NOT CANCELLED, and this bound CREATES that. An earlier version
+      // of this comment claimed the overlap predated it; that was wrong and worth correcting
+      // rather than quietly dropping. Before, an attempt that never settled never returned,
+      // so the loop never advanced and exactly ONE request was ever in flight — the command
+      // hung, but the link stayed clear. Now attempt one is abandoned at the bound and keeps
+      // downloading while attempt two starts, so a slow-but-healthy backend can end up
+      // serving up to three concurrent whole-document responses that contend with each other
+      // and make the next attempt slower still.
+      //
+      // That is a real cost of the fix, not a pre-existing one. It is accepted because the
+      // alternative is the reported bug — a command that never ends — but it is the reason
+      // to be careful about raising the attempt COUNT, which multiplies the overlap, rather
+      // than the per-attempt bound, which reduces it.
+      //
+      // A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT. `fetchNodeDefsWithRetry` rethrows the
+      // LAST error so the caller's verdict reports what actually failed — but with a
+      // timeout now able to BE that last error, a genuine backend failure would be buried
+      // under "did not answer" and the remedy would blame the wrong thing. So a real error
+      // is remembered and preferred: a stall reports as a stall only when nothing better
+      // was learned.
+      //
+      // A SEPARATE FLAG, because the error's VALUE cannot answer this. `throw null` and
+      // `throw undefined` are failures a backend can really produce — "#635: a FALSY thrown
+      // value still counts as a failure" exists for exactly that — so testing
+      // `lastRealError === null` would forget them and let a synthesized timeout speak for
+      // a failure the backend had actually named.
+      let sawRealError = false;
+      // The LAST real error, which is what `fetchNodeDefsWithRetry` itself rethrows ("#954:
+      // the LAST error wins, not the first"). This used to keep the FIRST one instead, so
+      // the panel and the module it calls disagreed about the same sequence for no stated
+      // reason, and the guard that did it conflated two questions: whether a real error was
+      // seen at all, and which of them to report. Only the first question needs a flag.
+      let lastRealError = null;
+      // Whether the attempt that just failed was ABANDONED rather than answered. Tracked
+      // beside the error rather than encoded into it, because the error thrown for a stall
+      // is deliberately a REAL one when there was one — so the value cannot be asked which
+      // kind of failure it represents without undoing that.
+      let lastAttemptTimedOut = false;
+      defs = await fetchNodeDefsWithRetry(
+        async () => {
+          // Unreachable as written — `shouldRetry` ends the loop on the first timeout, so
+          // this can never be observed true on entry. Kept because it is the invariant that
+          // makes the flag safe, not a consequence of it: a future `shouldRetry` that
+          // permits one retry after a stall would, without this line, mark every later
+          // attempt as timed out and stop the loop for a reason that had already passed.
+          lastAttemptTimedOut = false;
+          let result;
+          try {
+            result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
+          } catch (err) {
+            sawRealError = true;
+            lastRealError = err;
+            throw err;
+          }
+          if (result === NODE_DEFS_NO_ANSWER) {
+            lastAttemptTimedOut = true;
+            if (sawRealError) throw lastRealError;
+            throw new Error("api.getNodeDefs() did not answer within this refresh's remaining budget");
+          }
+          return result;
+        },
+        {
+          delays: NODE_DEFS_RETRY_DELAYS_MS,
+          // An abandoned attempt is still downloading the whole document. Retrying it races
+          // the retry against its own predecessor; an instantly-refused one costs nothing.
+          shouldRetry: () => !lastAttemptTimedOut,
+        },
+      );
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -874,6 +1124,30 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // (A throw here is attributed to "record": the fetch itself already succeeded,
     // and registration has not been attempted yet — the verdict must not claim it.)
     phase = "record";
+    // The budget measures WAITING THIS PANEL CONTROLS, and everything from here to the combo
+    // phase is neither waiting nor controllable — so the clock stops across it and the
+    // deadline is pushed out by exactly what it took.
+    //
+    // From HERE, not from the registration call: `recordObjectInfoTypes` walks every type in
+    // the payload (4304 of them on this rig), which is local CPU work of exactly the kind
+    // this rule exists to exclude. Starting the exclusion at the next phase would have left
+    // one arbitrary slice of local work still spending the waiting budget, and an arbitrary
+    // rule is one nobody can apply correctly later.
+    //
+    // Without this the deliberately-unbounded registration SPENT the run's deadline instead
+    // of merely escaping it, which starved the phase after it. On the install #610 measured
+    // — where the whole refresh is about 14.5s, most of it registration and the combo
+    // rebuild — the deadline was already gone by the combo phase, `nodeDefsBudgetLeft` fell
+    // to its 1ms floor, and a HEALTHY `refreshComboInNodes()` was abandoned before it could
+    // start. Every panel_refresh_nodes on that machine then reported combo_refresh_failed
+    // and told the user to reload the tab, for a refresh that had in fact succeeded; worse,
+    // `nodeDefsRefreshConfirmed` stayed false, which is what reopens #610's false "model
+    // still missing".
+    //
+    // The 1ms floor is right for a budget spent WAITING — it fails immediately and
+    // truthfully. It is wrong for one spent computing, and telling those apart is the whole
+    // reason the deadline moves here rather than the floor being softened.
+    const localWorkStartedAt = monotonicNow();
     recordObjectInfoTypes(defs);
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
@@ -881,6 +1155,21 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
     phase = "register";
     if (defs && typeof a.registerNodesFromDefs === "function") {
+      // #1180 — this await stays UNBOUNDED, and that is the decision, not an omission. It is
+      // the last await on this path without a time limit, so it will be asked about again.
+      // Both reasons were checked against the frontend build this ComfyUI actually serves
+      // (comfyui-frontend-package 1.48.7), not inferred:
+      //
+      // A bound could not be applied safely. `withTimeout` does not cancel, so giving up
+      // here would set `defsRegistered = true` for a registration still in progress and send
+      // `reapplyDefsToLiveNodes` at classes that have not been minted yet — a corrupted
+      // registry reported as a good one, which is worse than waiting.
+      //
+      // And there would be nothing left to rescue. ComfyUI's own `registerNodes()` awaits
+      // this same call during startup, so a hook that hangs it has already hung the page's
+      // own load: the panel is not adding a hazard, it is sharing one that already stopped
+      // the app. (`registerNodesFromDefs` awaits `invokeExtensionsAsync("addCustomNodeDefs")`
+      // first, so third-party extension code does run inside this await.)
       await a.registerNodesFromDefs(defs);
       defsRegistered = true;
     }
@@ -892,15 +1181,83 @@ async function registerComfyNodeDefs(preloadedDefs) {
       const rootGraph = a.graph ?? a.canvas?.graph;
       if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
     }
+    // Hand back the time the unbounded local work took. After this, what remains of the
+    // deadline is what remains of the WAITING allowance, which is what the phase below
+    // draws on.
+    runDeadline += monotonicNow() - localWorkStartedAt;
     // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
     // models resolve and stale entries clear (#185/#181/#223).
     phase = "combo";
     comboApiPresent = typeof a.refreshComboInNodes === "function";
     if (comboApiPresent) {
-      await a.refreshComboInNodes();
-      comboRan = true;
+      // #1180 — BOUNDED, and this was the fifth place the same mistake had to be found.
+      // The fetch phase above is bounded, but `refreshComboInNodes()` issues its own
+      // /object_info request (see the note at the combo-trust check), so a connection that
+      // goes half-open between the two phases parks the run here instead. Worse, the
+      // PAYLOAD-CARRYING path — `graph_add_node`'s `refresh(freshDefs)` — skips the fetch
+      // entirely and reaches this line with the bound never consulted at all.
+      //
+      // The outcome is REIFIED — a timeout, a throw and a success are three different
+      // things and this has to tell them apart, the way `boundedGetNodeDefs` does.
+      // Collapsing the first two into one `false` did two wrong things at once: it
+      // discarded the real cause of a combo that threw, and then it reported that throw
+      // as a stall by fabricating a "did not answer within 10000ms" message for a failure
+      // that had landed instantly.
+      //
+      // ABANDONING THIS ONE IS NOT LIKE ABANDONING A FETCH, and that is the cost of the
+      // bound rather than an argument against it. Read from the frontend build this ComfyUI
+      // serves: `refreshComboInNodes` -> `reloadNodeDefs`, whose only long await is its own
+      // `getNodeDefs()`. Everything after that — `registerNodeDef` for every id, then a
+      // walk of the whole graph rewriting each combo widget's options — runs whenever that
+      // fetch finally resolves. So a combo phase given up on does not stop: it mutates the
+      // graph later, after this run has already reported that combos are stale, and it does
+      // so outside `makeRefreshCoalescer`, which only serialises runs the panel starts.
+      //
+      // Accepted, because the alternative is the reported bug. The mutation it eventually
+      // performs is the CORRECT one — fresher defs than the verdict claimed — so the run's
+      // report is pessimistic rather than wrong, and `nodeDefsRefreshConfirmed` staying
+      // false keeps the caller in over-report-safe mode either way. The unbounded version
+      // did the same mutation at the same moment; the only thing the bound changes is that
+      // the panel stops waiting for it.
+      const comboSettled = await withTimeout(
+        Promise.resolve()
+          .then(() => a.refreshComboInNodes())
+          .then(() => COMBO_OK, (err) => ({ err })),
+        nodeDefsBudgetLeft(runDeadline),
+        () => COMBO_NO_ANSWER,
+      );
+      comboRan = comboSettled === COMBO_OK;
+      if (!comboRan) {
+        // A SEPARATE FLAG, for the third time on this path and the same reason each time:
+        // `throw null` and `throw undefined` are failures a backend can really produce, so
+        // a falsy `thrown` cannot mean "nothing failed". Reading the phase guard below off
+        // `thrown` alone put #635's hole back at this new site — a combo that rejected with
+        // a falsy value advanced the phase to "done" and vanished from the verdict's
+        // `failed` test. The `!comboRan` backstop still names the right reason, which is
+        // exactly why this was invisible.
+        comboFailed = true;
+        // `thrown` is provably null here: a throw inside this try would have jumped to the
+        // catch. The `?? ` that used to guard this assignment could never fire.
+        thrown =
+          comboSettled === COMBO_NO_ANSWER
+            ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget")
+            : comboSettled.err;
+        // WARN HERE, because reifying the outcome took this failure off the throwing path
+        // and the catch below is the only place that logged one. The browser console was
+        // the sole record of a failed combo refresh for anyone not reading a tool reply,
+        // and it went silent when the throw stopped happening.
+        console.warn("[comfyui-mcp-panel] combo refresh did not complete:", thrown);
+      }
     }
-    phase = "done";
+    // Leave the combo phase ONLY when it produced no failure.
+    //
+    // `describeNodeDefRefresh` reads `phase` to name the cause, and an unconditional
+    // "done" here made a combo failure come out as `register_failed` — whose remedy tells
+    // the user that re-registering the node definitions failed, when registration had in
+    // fact just succeeded a few lines above. The comment that used to sit here asserted
+    // the opposite outcome, `combo_refresh_failed`, which the code has never produced:
+    // `thrown` is set without `didThrow`, and the verdict's `failed` test accepts either.
+    if (!comboFailed) phase = "done";
   } catch (e) {
     thrown = e;
     didThrow = true;
@@ -8509,6 +8866,47 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
+/**
+ * #1180 — the widen runs INSIDE the registration wait above, so its bound has to fit
+ * there. The generic 10s node-defs bound is TWICE this function's whole 5s deadline: a
+ * timed-out widen would consume the entire wait and leave the poll loop nothing, so the
+ * add would report unmaterialized widgets having never actually looked for them.
+ *
+ * Half the registration deadline, derived from it rather than picked, so the two cannot
+ * drift apart.
+ *
+ * The widen runs BEFORE the polling loop and inside its deadline, so every millisecond it
+ * spends is one #580's wait does not get — which is why it takes a fraction and not the
+ * generic node-defs bound, and why it cannot simply be raised. The add path already
+ * composes to roughly 26.5s of bounds against the bridge's 30s command budget.
+ *
+ * WHAT THAT COSTS, stated because the earlier note here quietly implied it could not
+ * happen. This is one whole-document fetch. Measured on this rig, ComfyUI 0.32.0 with 4304
+ * types, and the three numbers disagree enough to be worth separating:
+ *
+ *     transfer alone (curl)                    7,440,820 bytes    532 ms
+ *     api.getNodeDefs() in the page, warm       median of 5       354 ms  (max seen 767)
+ *     api.getNodeDefs() in the page, COLD       first call       1062 ms
+ *
+ * The cold figure is the relevant one and it is the one nobody measured before: this runs
+ * during an add, which is typically the first whole-schema read after a page load or a
+ * backend restart. Against it, 2500ms is about 2.4x — not the 4.7x the transfer number
+ * suggests, and nowhere near the "order of magnitude" this comment used to claim from
+ * #767's 167ms and a ~366ms reading. The document also grows with the installed pack count
+ * (it was 5,413,770 bytes when #767 measured it), and the panel supports a ComfyUI reached
+ * over a configured bridge URL rather than localhost.
+ *
+ * Where the whole schema takes longer than this bound, the widen is abandoned, the caller
+ * keeps its single-class proof, and #821's case comes back: a class is refused for a link
+ * datatype that a SIBLING node on the canvas already outputs.
+ *
+ * That is a real narrowing and it is accepted for the same reason as the rest of this
+ * issue — the refusal is worded and clears on a retry, where the hang it replaced was
+ * neither. What it is NOT is headroom, and the number to revisit when the add path's total
+ * has room is this one.
+ */
+const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 2);
+
 async function awaitRequiredCustomWidgetRegistration(
   nodeData,
   comfyApp,
@@ -8518,7 +8916,12 @@ async function awaitRequiredCustomWidgetRegistration(
   widenSocketProof,
   liveNodeOfClass,
 ) {
-  const startedAt = Date.now();
+  // MONOTONIC, like every other elapsed-time measurement in this panel. On the wall clock
+  // an NTP correction, a DST change or a VM resume between these two reads either ends the
+  // wait instantly — reporting widgets unmaterialised without having polled for them — or
+  // extends it far past the command budget. This deadline gates #580's protection, so it
+  // is the wrong one to measure on a clock that can move.
+  const startedAt = monotonicNow();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   let socketTypes = knownSocketTypes;
   const check = () =>
@@ -8543,7 +8946,7 @@ async function awaitRequiredCustomWidgetRegistration(
       unavailable = check();
     }
   }
-  while (Date.now() < deadline) {
+  while (monotonicNow() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
     unavailable = check();
@@ -8578,7 +8981,7 @@ async function awaitRequiredCustomWidgetRegistration(
   // a message that says which input is stuck and which of the two causes it is, instead of
   // asserting the single cause that sent #695's reporter to the wrong place.
   throw new Error(
-    unavailableRequiredWidgetMessage(unavailable, classType, Date.now() - startedAt),
+    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt),
   );
 }
 
@@ -10097,7 +10500,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // falls through to the identical full fetch below, so no refusal, removal
         // verdict or history check is decided on anything new.
         if (isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
-          const one = await fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route));
+          // #1180 — THE FAST PATH IS BOUNDED TOO, and it has to be: it runs FIRST, so a
+          // half-open connection hangs here before the bounded fallback below is ever
+          // reached. Bounding only the fallback left `graph_add_node` hanging on exactly
+          // the connection this issue is about. `fetchSingleNodeDef` awaits both the
+          // response and its body, so the whole call is wrapped rather than the request
+          // alone. A timeout resolves null, which is the same answer it already gives for
+          // every other doubt and which sends the add to the full fetch — no new branch.
+          const one = await withTimeout(
+            fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route)),
+            NODE_DEFS_FETCH_TIMEOUT_MS,
+            () => null,
+          );
           if (one) {
             freshDefs = recordObjectInfoTypes(one);
             freshDefsAreSingleClass = true;
@@ -10105,9 +10519,14 @@ const GRAPH_TOOL_EXECUTORS = {
             return freshDefs;
           }
         }
-        freshDefs = recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-        );
+        // #1180 — BOUNDED. Unbounded, a half-open connection after a ComfyUI restart hung
+        // `graph_add_node` here until the caller's own 30s timeout, which is the #1161
+        // failure this command was left out of. A call that does not answer is treated as
+        // one that answered nothing: `recordObjectInfoTypes(null)` yields no defs, and the
+        // add then fails closed on the same path an empty payload already takes, rather
+        // than parking.
+        const whole = await boundedGetNodeDefs();
+        freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
@@ -10161,7 +10580,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // and #780's 1,667x saving is kept for every add that does not need it.
     const widenSocketProof = freshDefsAreSingleClass
       ? async () => {
-          const whole = typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null;
+          // #1180 — BOUNDED, and the timeout lands on the SAFE side by construction. This
+          // helper already answers null for every doubtful payload, and the caller keeps
+          // the proof it holds when it gets null; a call that never answers is the most
+          // doubtful case there is, so it takes that same path. Unbounded, this hung the
+          // add on the very path that was about to refuse — the worst place to park,
+          // because the user is already being told something went wrong.
+          // The sentinel needs no unwrapping here: it is a Symbol, so the doubt guard
+          // below rejects it exactly as it rejects every other non-object payload, and
+          // returns null — which is what "keep the proof already in hand" means. Mapping
+          // it first was a second spelling of the same decision.
+          const whole = await boundedGetNodeDefs(WIDEN_SOCKET_PROOF_TIMEOUT_MS);
           // "I did not find out" is not "nothing outputs anything", and the difference
           // matters because the caller REPLACES its proof with whatever comes back.
           // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is

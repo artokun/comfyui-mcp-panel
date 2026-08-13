@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Adding a node no longer waits forever on a ComfyUI that stopped answering (#1180) (#1186).**
+  When the connection to ComfyUI goes half-open — the socket is up, the server never
+  replies — a request does not fail, it simply never returns. Five requests for the node
+  schema on the add-a-node and refresh-nodes paths had no time limit, so the panel parked
+  on the first one it reached and the add landed minutes later, after the reply it belonged
+  to had already been given up on. Each now gives up on its own and falls through to the
+  handling that was already written for a schema it could not read. The log read that runs
+  while *explaining* one of those failures is bounded too; it was inheriting the very stall
+  it was called to describe.
+  **No change on a healthy ComfyUI**, where these all answer in well under a second.
+
 ## [0.14.27] - 2026-08-13
 
 ### Fixed
