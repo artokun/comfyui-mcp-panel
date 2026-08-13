@@ -971,3 +971,76 @@ test("#1166: a successful restart retires every marker before the invalidate can
     );
   }
 });
+
+// ── #1171: the reload guard must span the work it protects ───────────────────
+//
+// `reloading` is the mutual-exclusion flag between softReload() and hardRestart().
+// hardRestart set it, then released it in a `finally` that closed right after the POST —
+// while the function kept going: retiring the turn and three markers, invalidating the
+// durable session, then reconnecting. From the moment the POST settled the flag was open,
+// so a second restart, or a soft reload sharing the flag, could interleave with that tail
+// and tear down the same session state twice.
+//
+// Structural for the same reason #1166's test is: WHERE the release sits relative to the
+// tail and the reconnect is the entire content of the fix.
+test("#1171: the reload guard is held across hardRestart's tail and released before the reconnect", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("async function hardRestart(");
+  assert.notEqual(start, -1, "could not locate hardRestart");
+  const end = src.indexOf("\n  }", start);
+  const body = src.slice(start, end);
+  const at = (re) => body.search(re);
+
+  const release = at(/^[ \t]*reloading = false;/m);
+  const invalidate = at(/^[ \t]*if \(!await invalidateDurableAgentSession\(\)\) \{/m);
+  const endTurn = at(/^[ \t]*endTurnLocally\(\);/m);
+  const reconnect = at(/^[ \t]*client\.start\(\);/m);
+
+  assert.notEqual(release, -1, "the guard must still be released");
+  assert.notEqual(reconnect, -1, "expected the reconnect");
+  assert.ok(
+    release > endTurn,
+    "the guard must still be held while the turn and its markers are retired — releasing " +
+      "first is what let a second restart interleave with this teardown",
+  );
+  assert.ok(
+    release > invalidate,
+    "the guard must still be held across the durable invalidation, the tail's one await",
+  );
+  assert.ok(
+    release < reconnect,
+    "…and released BEFORE the reconnect, as softReload's beforeStart hook does: holding it " +
+      "across a connect that may never settle would block every later restart",
+  );
+  // Exactly one release site. Two would mean the early `finally` came back alongside the
+  // new one, which is the defect wearing the fix as a hat.
+  assert.equal(
+    (body.match(/^[ \t]*reloading = false;/gm) || []).length,
+    1,
+    "the guard must be released in exactly one place",
+  );
+});
+
+test("#1171: the durable invalidation is BOUNDED, so the widened guard cannot wedge", () => {
+  // Widening the guard without this trades a race for a wedge. The tail awaits
+  // invalidateDurableAgentSession(), which awaits historyStore.flush() — IndexedDB-backed
+  // and able to stall. One hung flush would latch `reloading` for the rest of the session:
+  // no further restart, no soft reload, and no affordance to clear it. This issue's own
+  // history warns about exactly that shape — two prior attempts at the sibling bug each
+  // introduced a worse bug.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("async function invalidateDurableAgentSession(");
+  assert.notEqual(start, -1, "could not locate invalidateDurableAgentSession");
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  assert.match(body, /withTimeout\(/, "the flush must be bounded by the repo's one bounded-step primitive");
+  assert.match(body, /historyStore\.flush\(\)/, "…and it is the flush that is bounded");
+  assert.match(
+    body,
+    /timedOut\b[\s\S]*return false/,
+    "a flush that did not finish cannot confirm invalidation, so it must report NOT confirmed",
+  );
+  // The bound is a real one, and lives where a reader can find it.
+  assert.match(src, /const SESSION_INVALIDATE_FLUSH_MS = \d+;/, "the bound is a named constant");
+  const ms = Number((src.match(/const SESSION_INVALIDATE_FLUSH_MS = (\d+);/) || [])[1]);
+  assert.ok(ms > 0 && ms < 30000, `the flush bound must be positive and inside the command budget, got ${ms}`);
+});

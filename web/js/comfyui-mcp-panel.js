@@ -71,6 +71,9 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
+// #1171 — the repo's one bounded-step primitive. A second timeout helper written
+// alongside it is how this repo keeps producing near-duplicate bugs, per its own header.
+import { withTimeout } from "./lib/bounded-step.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
@@ -23356,12 +23359,34 @@ function buildPanel() {
     });
   }
 
+  // #1171 — how long the durable-invalidation flush may take before this reports that it
+  // could not confirm one. The flush is IndexedDB-backed and can stall; both callers await
+  // it while holding something, so an unbounded wait here is a wedge rather than a delay.
+  const SESSION_INVALIDATE_FLUSH_MS = 4000;
+
   async function invalidateDurableAgentSession() {
     ssSet(SESSION_KEY, null);
     if (thread) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
-    const result = await historyStore.flush();
-    return result === true || result?.ok === true;
+    // BOUNDED, because both callers block on it. `hardRestart` holds the reload
+    // re-entrancy guard across this call (#1171), so a stalled flush would latch that guard
+    // for the rest of the session — no further restart or soft reload, and no affordance to
+    // clear it. The backend switch above awaits it too and simply never proceeds.
+    //
+    // A TIMEOUT IS REPORTED AS "NOT CONFIRMED", not as success. This function answers one
+    // question — is the old session durably invalid? — and a flush that did not finish
+    // cannot answer it. Both callers already handle false by pausing and saying so, which is
+    // the fail-closed direction: the risk of proceeding is restoring a session the restart
+    // exists to discard. The write itself is not cancelled and may well land; the next call
+    // then sees a settled store.
+    const result = await withTimeout(
+      historyStore.flush().then((r) => ({ r }), () => ({ r: false })),
+      SESSION_INVALIDATE_FLUSH_MS,
+      () => ({ timedOut: true }),
+    );
+    if (result?.timedOut) return false;
+    const r = result?.r;
+    return r === true || r?.ok === true;
   }
 
   const panelAliasMutationSink = (path, value) => {
@@ -29456,30 +29481,41 @@ function buildPanel() {
     reloading = true;
     appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
     let ok = false;
+    // #1171 — THE GUARD MUST SPAN THE WORK IT PROTECTS. This `try` used to close right
+    // after the POST, with `reloading = false` in its `finally`, while the function kept
+    // going: retiring the turn and three markers, invalidating the durable session, then
+    // reconnecting. From the moment the POST settled the flag was open, so a second restart
+    // — or a soft reload, which shares the flag — could run against that tail and interleave
+    // two teardowns of the same session state.
+    //
+    // Released just before the reconnect, which is `softReload`'s existing shape (its
+    // `beforeStart` hook does the same thing for the same reason), with the `finally` as the
+    // backstop for a throw. The tail's one unbounded await is the durable invalidation, and
+    // that is bounded now — otherwise widening this guard would trade a race for a wedge,
+    // which is the failure two earlier attempts at the sibling bug produced.
     try {
-      client.stop(); // drop the bridge so the old orchestrator can release the port
-      const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
-      const data = await res.json().catch(() => ({}));
-      if (data?.ok) {
-        ok = true;
-      } else {
-        // `data.message` is the pack's own text and arrives already-worded; only our own
-        // fallback is ours to translate.
+      try {
+        client.stop(); // drop the bridge so the old orchestrator can release the port
+        const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (data?.ok) {
+          ok = true;
+        } else {
+          // `data.message` is the pack's own text and arrives already-worded; only our own
+          // fallback is ours to translate.
+          appendSystem(
+            data?.message ||
+              tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
+          );
+        }
+      } catch (err) {
         appendSystem(
-          data?.message ||
-            tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
+          tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
+            error: coerceMessageText(err?.message ?? err),
+          }),
         );
       }
-    } catch (err) {
-      appendSystem(
-        tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
-          error: coerceMessageText(err?.message ?? err),
-        }),
-      );
-    } finally {
-      reloading = false;
-    }
-    if (ok) {
+      if (ok) {
       // #1166 — retire everything that asserts a live turn HERE: inside the success
       // branch, because only a restart that actually happened killed the turn, and
       // BEFORE the invalidate below, whose failure path returns early and skipped all of
@@ -29546,6 +29582,13 @@ function buildPanel() {
       appendSystem(
         tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
       );
+      }
+    } finally {
+      // #1171 — released here, once, covering every exit from the tail above including
+      // the invalidate-failure early return. `softReload` clears the same flag at the same
+      // point for the same reason: the reconnect is the handover, and holding the guard
+      // across it would block the next restart on a connect that may never settle.
+      reloading = false;
     }
     // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
     // restore the bridge we dropped (the old backend may still be intact).
