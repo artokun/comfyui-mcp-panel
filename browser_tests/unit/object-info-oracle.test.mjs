@@ -653,3 +653,40 @@ test("#1161: a refusal quotes the budget the step ACTUALLY got, not the whole de
   assert.match(client, /within its 3000ms share of the 6000ms budget/, "half the deadline, said plainly");
   assert.doesNotMatch(client, /within the 6000ms budget/, "the un-spent whole must not be quoted as the wait");
 });
+
+test("#1161: a timer that fires LATE cannot starve the fallback", async () => {
+  // Chrome clamps hidden-tab timers to ~1/min after five minutes backgrounded; laptop
+  // sleep/resume and an NTP forward jump do the same. `spent()` clamps a BACKWARD jump but
+  // must not clamp a forward one — that would be lying about elapsed time — so the timer
+  // can fire long after its bound and leave the deadline already overrun.
+  //
+  // Under a subtracted reserve that produced fetchApi call count 0: the P1 exactly, in a
+  // tab that was merely in the background. The floor is what makes it survivable, because
+  // the fallback's budget stops depending on when the first step finished.
+  for (const lateBy of [0, 10_000, 60_000, 600_000]) {
+    const pending = [];
+    let clock = 0;
+    const timers = {
+      setTimer: (fn, ms) => { const t = { fn, ms }; pending.push(t); return t; },
+      clearTimer: (t) => { const i = pending.indexOf(t); if (i >= 0) pending.splice(i, 1); },
+    };
+    let calls = 0;
+    const out = fetchWholeObjectInfo({
+      getNodeDefs: never,
+      fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs: OBJECT_INFO_DEADLINE_MS,
+      timers,
+      now: () => clock,
+    });
+    for (let i = 0; i < 8 && pending.length; i++) {
+      await tick();
+      const t = pending.shift();
+      if (!t) break;
+      clock += t.ms + lateBy; // the timer fires late, and the clock says so
+      t.fn();
+    }
+    const result = await settled(out, `the oracle call (lateBy=${lateBy})`);
+    assert.equal(calls, 1, `lateBy=${lateBy}: the fallback must still be issued`);
+    assert.deepEqual(result.defs, DEFS_1161, `lateBy=${lateBy}: and its answer used`);
+  }
+});
