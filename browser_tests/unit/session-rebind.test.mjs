@@ -1038,6 +1038,27 @@ test("#1096 wiring: the re-advertise is debounced and does not disturb the sessi
   // A hello runs the orchestrator's panel sync, so it must not fire per WS blip.
   assert.match(block, /RECONNECT_REHELLO_MIN_GAP_MS/, "the re-advertise must be debounced");
   assert.match(block, /lastReconnectRehelloAt = now/, "…and the window must be armed when it fires");
+  // …but armed only once the hello PROVABLY reached the wire. Stamping before the send
+  // is the "recorded before it happened" defect the panel already names at the #607
+  // re-hello, with this same 5s constant: a hello refused for want of a route identity,
+  // or dropped on a superseded socket, would spend the window without re-advertising
+  // anything, leaving the tab mapping this exists to repair dropped for the full gap.
+  //
+  // Asserted as an ORDERING, because the token alone cannot see it — the stamp reads
+  // identically whether it sits before the send or inside its resolution, which is
+  // exactly how the first version of this test passed against the wrong shape.
+  const sendAt = block.search(/client\?\.rehello\?\.\(\)/);
+  const stampAt = block.search(/lastReconnectRehelloAt = now/);
+  assert.notEqual(sendAt, -1, "the re-advertise must still be sent");
+  assert.ok(
+    stampAt > sendAt,
+    "the debounce window must be armed AFTER the send, not before it",
+  );
+  assert.match(
+    block,
+    /\.then\(\(landed\) => \{\s*\n\s*if \(landed\) lastReconnectRehelloAt = now;/,
+    "…and only when the hello actually landed, so a refused one leaves the window open",
+  );
   // A hello with no session spawns a clean agent, so the session input must be WIRED,
   // not left to its default.
   const callAt = src.indexOf("shouldRehelloAfterComfyReconnect({", 0);

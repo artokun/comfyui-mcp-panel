@@ -30187,12 +30187,30 @@ function buildPanel() {
       ) {
         const now = monotonicNow();
         if (now - lastReconnectRehelloAt >= RECONNECT_REHELLO_MIN_GAP_MS) {
-          lastReconnectRehelloAt = now;
           try {
-            client?.rehello?.();
+            // The window is armed only once the hello PROVABLY reached the wire, never
+            // before the send. Stamping first is the recurring "recorded before it
+            // happened" defect this file already names at the #607 re-hello — the same
+            // 5s constant, one screen up: a hello that is refused (no route identity
+            // yet) or dropped (socket superseded mid-send) would spend the window
+            // without re-advertising anything, and the tab mapping this exists to
+            // repair would stay dropped for the full gap.
+            //
+            // Not stamping on failure cannot storm: this branch requires a live bridge,
+            // and a hello that failed to land means the socket is gone or superseded —
+            // in which case the predicate declines until it is back, and the reconnect
+            // path's own open-hello re-registers the tab anyway.
+            void Promise.resolve(client?.rehello?.())
+              .then((landed) => {
+                if (landed) lastReconnectRehelloAt = now;
+              })
+              .catch(() => {
+                /* the reconnect path retries the hello; a failed re-advertise is not
+                   fatal here because the mapping is already dropped — this can only
+                   improve it, and the window stays open so the next event may retry */
+              });
           } catch {
-            /* the reconnect path retries the hello; a failed re-advertise is not fatal
-               here because the mapping is already dropped — this can only improve it */
+            /* a throwing rehello is the same non-fatal case as a rejected one */
           }
         }
       }
