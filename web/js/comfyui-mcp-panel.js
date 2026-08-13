@@ -29791,21 +29791,19 @@ function buildPanel() {
         if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
         void connectAgent({ fromChip: true });
       },
-      // REASON-AWARE, because the two aborts are not the same event and one shared message
-      // would be false for one of them.
+      // REASON-AWARE, and there is only one reason left that warrants saying anything.
       //
-      // INVALIDATE_FAILED is the #1184 case: nothing committed, still on the old backend,
-      // and the switch genuinely did not happen. hardRestart's existing line says exactly
-      // that, and it is honest HERE only because nothing has been committed by the time it
-      // runs — which was the objection that withdrew it from this site last time.
+      // INVALIDATE_FAILED is the #1184 case: no backend state committed, still on the old
+      // provider, and the switch genuinely did not happen. hardRestart's existing line says
+      // that, and it is honest at this site only because the reorder means nothing has been
+      // committed by the time it runs. It is narrower than it looks, though: the SESSION is
+      // already invalid regardless (the invalidate destroys it before reporting), so this
+      // speaks for the switch and not for the session — #1198 tracks the rest.
       //
-      // SUPERSEDED says nothing, deliberately. A handshake landed while we were awaiting,
-      // which means the panel is CONNECTED and coherent: `onModels` has already written
-      // `connectedBackend`, `localStorage` and repainted the chips authoritatively, so the
-      // user can see which backend they are on. Printing the invalidate line there would be
-      // flatly wrong — the session WAS invalidated and nothing is paused. Saying something
-      // accurate instead would need a new catalog key, and English is frozen (#1135), so
-      // this defers to the chips rather than mint one.
+      // There used to be a second, SUPERSEDED, for a handshake landing mid-await. That path
+      // no longer aborts — dropping the user's explicit pick was worse than the race — so
+      // there is nothing left to disclose there. The guard on the reason stays, because a
+      // future outcome must opt IN to borrowing this string rather than inherit it.
       disclose: (reason) => {
         if (reason !== BACKEND_SWITCH.INVALIDATE_FAILED) return;
         appendSystem(

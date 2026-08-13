@@ -32,8 +32,6 @@ export const BACKEND_SWITCH = Object.freeze({
   CONNECTED: "connected",
   /** The old provider's session could not be durably invalidated; nothing was committed. */
   INVALIDATE_FAILED: "invalidate_failed",
-  /** A handshake changed the live backend while we were awaiting the invalidate. */
-  SUPERSEDED: "superseded",
 });
 
 /**
@@ -78,6 +76,9 @@ export async function runBackendSwitch(id, effects) {
   // only at its declaration and by the `onModels` handshake. That is what makes deciding
   // this before committing anything equivalent to deciding it after.
   const switching = startedOn !== null && startedOn !== id;
+  // Which backend is live once the await (if any) is done. Same as `startedOn` unless a
+  // handshake landed underneath us.
+  let landedOn = startedOn;
 
   if (switching) {
     // THE ONLY AWAIT BEFORE A COMMIT, and the non-switching path must never reach it: a
@@ -108,16 +109,27 @@ export async function runBackendSwitch(id, effects) {
       disclose(BACKEND_SWITCH.INVALIDATE_FAILED);
       return { switched: false, reason: BACKEND_SWITCH.INVALIDATE_FAILED };
     }
-    // RE-READ, because awaiting opened a window this function did not have before. A
-    // handshake landing during the invalidate writes `connectedBackend` (and the chips, and
-    // localStorage) underneath us. Under the old order those writes overwrote our commits;
-    // under this one ours would land last and silently win against a backend the user did
-    // not pick from the state we decided on.
-    if (liveBackend() !== startedOn) {
-      disclose(BACKEND_SWITCH.SUPERSEDED);
-      return { switched: false, reason: BACKEND_SWITCH.SUPERSEDED };
-    }
+    // RE-READ, because awaiting opened a window this function did not have before: a
+    // handshake landing during the invalidate writes `connectedBackend` underneath us.
+    //
+    // PROCEED, DO NOT ABORT — the first version of this guard returned here, and that was
+    // worse than the race it was guarding. By this point the session has already been
+    // invalidated, so aborting left the user with a destroyed session, no connect, and their
+    // explicit pick silently dropped. An explicit click must not lose to a handshake that
+    // happened to land during it.
+    //
+    // What the re-read is actually FOR is `switching`, which was decided against a backend
+    // that may no longer be live. If the handshake landed on the very backend being asked
+    // for, this is no longer a switch: the replay must not be armed (the new provider
+    // already has the conversation) and the turn was already ended above. Recomputing is
+    // what keeps those two decisions honest; the commits below run either way.
+    landedOn = liveBackend();
   }
+  // `switching` governs only the REPLAY now — the turn ended above, and every commit below
+  // is unconditional. False here means "the live backend is already the one asked for", so
+  // arming a fresh-session preamble against it would replay the conversation to the provider
+  // that is already holding it.
+  const stillSwitching = switching && landedOn !== id;
 
   // From here everything commits, in the panel's original order.
   //
@@ -131,15 +143,15 @@ export async function runBackendSwitch(id, effects) {
   if (id !== prevBackend) seedPrefs(id);
   commitSelection(id);
 
-  if (switching) {
+  if (stillSwitching) {
     // The turn was already ended above, as soon as the invalidate had run — see the note
-    // there. Only the replay belongs here: it is the one step that must NOT happen on an
-    // abort, because arming context against a provider we are not switching to is what
-    // shipped the whole prior transcript back to the backend that already had it.
+    // there. Only the replay belongs here, and only when this is really still a switch:
+    // arming a fresh-session preamble against a provider that already holds the
+    // conversation is what shipped the whole transcript back to the backend that had it.
     const replay = buildReplay();
     if (replay) armContext(replay);
   }
 
   teardownAndConnect(id);
-  return { switched: switching, reason: switching ? BACKEND_SWITCH.SWITCHED : BACKEND_SWITCH.CONNECTED };
+  return { switched: stillSwitching, reason: stillSwitching ? BACKEND_SWITCH.SWITCHED : BACKEND_SWITCH.CONNECTED };
 }

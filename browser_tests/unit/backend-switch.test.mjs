@@ -123,26 +123,44 @@ test("#1184 a NON-switch never consults the history store", async () => {
   }
 });
 
-test("#1184 a handshake landing during the invalidate supersedes the switch", async () => {
-  // Awaiting before committing opens a window the old order did not have: a handshake can
-  // write `connectedBackend` underneath us. Under the old order those writes overwrote our
-  // commits; under this one ours would land last and win against a backend the user did not
-  // pick from the state we decided on.
+test("#1184 a handshake landing during the invalidate does NOT discard the user's pick", async () => {
+  // The first version of this guard ABORTED here, and that was worse than the race it
+  // guarded. By this point the invalidate has run, so the session is already destroyed —
+  // aborting left the user with a dead session, no connect, and their explicit click
+  // silently dropped. A handshake that merely happened to land during the await must not
+  // beat an explicit pick.
   const rec = recorder({ live: "claude" });
   rec.effects.invalidate = async () => {
     rec.log.push("invalidate");
-    rec.setLive("gemini"); // a handshake completes mid-await
+    rec.setLive("gemini"); // an unrelated handshake completes mid-await
     return true;
   };
   const result = await runBackendSwitch("codex", rec.effects);
 
-  assert.deepEqual(result, { switched: false, reason: BACKEND_SWITCH.SUPERSEDED });
-  for (const effect of COMMITS) {
-    assert.ok(!ran(rec.log, effect), `${effect} ran against a backend state that had already moved`);
-  }
-  // …but the turn IS ended, for the same reason as the failed-invalidate path: the session
-  // pointer is gone by the time we know the switch will not proceed.
-  assert.ok(ran(rec.log, "endTurn"), "a destroyed session leaves no resumable turn, whichever abort we take");
+  assert.deepEqual(result, { switched: true, reason: BACKEND_SWITCH.SWITCHED });
+  assert.ok(ran(rec.log, "commitSelection:codex"), "the pick the user made must still be committed");
+  assert.ok(ran(rec.log, "teardownAndConnect"), "…and it must actually connect, not strand the panel");
+  assert.ok(ran(rec.log, "endTurn"), "the destroyed session leaves no resumable turn");
+});
+
+test("#1184 a handshake that landed on the TARGET stops it being a switch", async () => {
+  // The case the re-read actually exists for. If the handshake landed on the very backend
+  // being asked for, the new provider already holds the conversation — arming the
+  // "continued in a fresh AI session" preamble against it would replay the whole transcript
+  // to the session that is already carrying it, which is the #1184 leak by another route.
+  const rec = recorder({ live: "claude", replay: "User: hi" });
+  rec.effects.invalidate = async () => {
+    rec.log.push("invalidate");
+    rec.setLive("codex"); // the handshake landed on the target
+    return true;
+  };
+  const result = await runBackendSwitch("codex", rec.effects);
+
+  assert.equal(result.switched, false, "already on codex — this is no longer a switch");
+  assert.equal(result.reason, BACKEND_SWITCH.CONNECTED);
+  assert.ok(!ran(rec.log, "armContext"), "the target already has the conversation");
+  assert.ok(ran(rec.log, "commitSelection:codex"), "the pick is still recorded");
+  assert.ok(ran(rec.log, "teardownAndConnect"), "and the connect still runs");
 });
 
 test("#1184 the reseed predicate is preserved: reseed iff the target differs", async () => {
@@ -263,23 +281,4 @@ test("#1184 the two aborts are disclosed differently — one message cannot be t
     /disclose: \(reason\) => \{[\s\S]{0,200}?if \(reason !== BACKEND_SWITCH\.INVALIDATE_FAILED\) return;/,
     "the disclosure must branch on the reason, not print the invalidate line for every abort",
   );
-});
-
-test("#1184 a superseded switch reports its own reason, distinct from a failed invalidate", async () => {
-  // The module's half of the same property: the caller cannot tell the two apart unless
-  // these are distinct values.
-  assert.notEqual(BACKEND_SWITCH.SUPERSEDED, BACKEND_SWITCH.INVALIDATE_FAILED);
-
-  const rec = recorder({ live: "claude" });
-  rec.effects.invalidate = async () => {
-    rec.log.push("invalidate");
-    rec.setLive("gemini");
-    return true;
-  };
-  await runBackendSwitch("codex", rec.effects);
-  assert.ok(
-    rec.log.includes(`disclose:${BACKEND_SWITCH.SUPERSEDED}`),
-    "a supersede must disclose as a supersede, so the panel can choose to stay quiet",
-  );
-  assert.ok(!rec.log.includes(`disclose:${BACKEND_SWITCH.INVALIDATE_FAILED}`));
 });
