@@ -322,15 +322,33 @@ test("#982 (codex r4) blank entries: the slice-first order is documented, not ac
 //
 // Timers are injected and fired by hand, so nothing here waits on a real clock and a
 // regression fails with a named assertion rather than wedging `node --test`.
+//
+// THE CLOCK ADVANCES WHEN A TIMER FIRES, and that is not a detail. The first version of
+// this harness fired the injected timer while leaving `now()` at 0, so every test ran with
+// the full budget still unspent — a state production CANNOT reach, since a timer armed for
+// `ms` only fires once `ms` has passed. Under that harness the flagship test below passed
+// while the shipped code never issued the fallback at all (`fetchApi` call count 0). The
+// clock is therefore owned here and moved by `fire()`, so a test cannot assert an outcome
+// the real clock would not produce.
 function harness() {
   const timers = new Set();
+  const armedMs = [];
+  let clock = 0;
   return {
     timers: {
-      setTimer: (fn, ms) => { const t = { fn, ms }; timers.add(t); return t; },
+      setTimer: (fn, ms) => { const t = { fn, ms }; timers.add(t); armedMs.push(ms); return t; },
       clearTimer: (t) => timers.delete(t),
     },
+    now: () => clock,
     armed: () => timers.size,
-    fire: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }),
+    armedMs: () => armedMs.slice(),
+    at: () => clock,
+    fire: () => {
+      const due = [...timers];
+      // Firing a timer means its full duration elapsed — the longest one pins the clock.
+      clock += due.reduce((max, t) => Math.max(max, t.ms), 0);
+      due.forEach((t) => { timers.delete(t); t.fn(); });
+    },
   };
 }
 const DEFS_1161 = { KSampler: {} };
@@ -353,17 +371,49 @@ const never = () => new Promise(() => {});
 test("#1161: a hung client route falls through to the fallback, which ANSWERS", async () => {
   // The whole point: not a faster refusal — a successful write.
   const h = harness();
+  let fetchCalls = 0;
   const out = fetchWholeObjectInfo({
     getNodeDefs: never,
-    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    fetchApi: async () => { fetchCalls += 1; return { ok: true, json: async () => DEFS_1161 }; },
     deadlineMs: 6000,
     timers: h.timers,
+    now: h.now,
   });
   await tick();
-  h.fire(); // the client route gives up
+  h.fire(); // the client route gives up, and the clock moves to when it did
   const result = await settled(out, "the oracle call");
+  // ASSERT THE REQUEST WAS ACTUALLY SENT, not merely that the outcome looks right. This is
+  // the fact the earlier version of this branch got wrong while its suite stayed green: the
+  // client route consumed the entire shared budget, so the fallback was skipped unsent
+  // (call count 0) and the refusal then named a route nothing had contacted. An outcome
+  // assertion alone cannot see that; a call count can.
+  assert.equal(fetchCalls, 1, "the fallback must be ISSUED — a reserved floor is what guarantees it");
   assert.deepEqual(result.defs, DEFS_1161, "the fallback answered, so the caller is authorized");
   assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) did not answer within the 6000ms budget/);
+});
+
+test("#1161: no route is ever REPORTED as timing out when it was never sent", async () => {
+  // #982's original defect was a refusal naming a cause it had not established. A step
+  // reached with no budget left must say so in its own words rather than borrow the
+  // timeout's, or the fix reintroduces the bug it was written to remove.
+  const h = harness();
+  let fetchCalls = 0;
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => { fetchCalls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+    deadlineMs: 6000,
+    timers: h.timers,
+    // A clock that has ALREADY overrun the deadline when the fallback is reached — the
+    // state the unreserved version of this code put every hung client route into.
+    now: () => (fetchCalls === 0 && h.at() >= 3000 ? 99999 : h.at()),
+  });
+  await tick();
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  const note = result.failures.join(" | ");
+  assert.equal(fetchCalls, 0, "this test only means something if the route really was skipped");
+  assert.doesNotMatch(note, /GET \/object_info did not answer/, "an unsent request cannot have failed to answer");
+  assert.match(note, /GET \/object_info was not attempted/, "…it reports what actually happened instead");
 });
 
 test("#1161: the timeout is reported as a timeout, not as a throw", async () => {
@@ -375,6 +425,7 @@ test("#1161: the timeout is reported as a timeout, not as a throw", async () => 
     fetchApi: never,
     deadlineMs: 6000,
     timers: h.timers,
+    now: h.now,
   });
   await tick();
   h.fire();
@@ -386,7 +437,7 @@ test("#1161: the timeout is reported as a timeout, not as a throw", async () => 
 
 test("#1161: both transports hanging still returns, and names both", async () => {
   const h = harness();
-  const out = fetchWholeObjectInfo({ getNodeDefs: never, fetchApi: never, deadlineMs: 6000, timers: h.timers });
+  const out = fetchWholeObjectInfo({ getNodeDefs: never, fetchApi: never, deadlineMs: 6000, timers: h.timers, now: h.now });
   await tick();
   h.fire();
   await tick();
@@ -406,6 +457,7 @@ test("#1161: a hung BODY is bounded too — the response is not the body", async
     fetchApi: async () => ({ ok: true, json: never }),
     deadlineMs: 6000,
     timers: h.timers,
+    now: h.now,
   });
   await tick();
   h.fire();
@@ -421,6 +473,7 @@ test("#1161: a healthy client route is untouched by the bound", async () => {
     fetchApi: () => { throw new Error("must not be consulted"); },
     deadlineMs: 6000,
     timers: h.timers,
+    now: h.now,
   });
   assert.deepEqual(result.defs, DEFS_1161);
   assert.deepEqual(result.failures, [], "a route that answers records no failure");
@@ -481,20 +534,75 @@ test("#1161: a payload whose own shape cannot be inspected is a failure, never a
 test("#1161: the budget is shared, so three steps cannot each spend it", async () => {
   // A per-step bound multiplies: three 6s bounds is an 18s worst case nobody chose,
   // stacked on the 8s startup seed wait. One budget makes the worst case one number.
+  //
+  // But SHARING ALONE IS NOT ENOUGH, which is the correction this test now carries. A
+  // purely first-come budget lets step one take all of it, and then the fallback — the
+  // entire reason this oracle exists — is skipped rather than merely hurried. So the
+  // invariant has two halves: the total never exceeds the deadline, AND no single step can
+  // reduce a later one to nothing.
   const h = harness();
-  let clock = 0;
   const out = fetchWholeObjectInfo({
     getNodeDefs: never,
     fetchApi: never,
     deadlineMs: 6000,
     timers: h.timers,
-    now: () => clock,
+    now: h.now,
   });
   await tick();
-  clock = 6000; // the first step consumed the whole budget
+  h.fire(); // the client route hangs for everything it was given
+  await tick();
+  const budgets = h.armedMs();
+  assert.ok(budgets.length >= 2, "both transports were bounded");
+  assert.ok(budgets[0] <= 3000, "the first step may not take more than its share");
+  assert.ok(budgets[1] > 0, "the fallback is left a real budget — a zero here is the P1 back");
   h.fire();
   const result = await settled(out, "the oracle call");
   assert.equal(result.defs, null);
-  assert.equal(h.armed(), 0, "with no budget left the second step must not arm a timer at all");
-  assert.equal(result.failures.length, 2, "…and must still report for itself");
+  assert.equal(result.failures.length, 2, "each route reports for itself");
+  assert.ok(h.at() <= 6000, "and the whole question still costs no more than the one deadline");
+});
+
+test("#1161: the reserve holds when the client route hangs for its FULL share", async () => {
+  // The production shape of the P1, at the shipped constant rather than a test one: a
+  // half-open socket that never settles. The fallback must still be sent.
+  const h = harness();
+  let fetchCalls = 0;
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => { fetchCalls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+    deadlineMs: OBJECT_INFO_DEADLINE_MS,
+    timers: h.timers,
+    now: h.now,
+  });
+  await tick();
+  h.fire();
+  const result = await settled(out, "the oracle call");
+  assert.equal(fetchCalls, 1, "the shipped budget must reserve room for the fallback too");
+  assert.deepEqual(result.defs, DEFS_1161);
+});
+
+test("#1161: a status that cannot be STRINGIFIED is a failure, never a rejection", async () => {
+  // Guarding the property READ was not enough: `${responseStatus}` interpolates it below
+  // the try, and `Object.create(null)` has no toString to convert with. Proven by running
+  // this input against the previous commit, which rejected with a TypeError where two
+  // callers have no catch of their own.
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => ({ ok: false, status: Object.create(null) }),
+  });
+  assert.equal(result.defs, null);
+  assert.match(result.failures.join(" | "), /GET \/object_info was not OK/);
+});
+
+test("#1161: a thrown value that cannot be stringified is a failure, never a rejection", async () => {
+  // describeFailure called String(err) OUTSIDE every guard, so a rejection value with a
+  // throwing toString escaped the module — the same contract break by a third entry point.
+  // The sanitizer already handled this; the defect was stringifying before reaching it.
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => { throw { toString() { throw new Error("unprintable"); } }; },
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+  });
+  // And because it is only a FAILURE, the fallback still runs and the write is authorized.
+  assert.deepEqual(result.defs, DEFS_1161, "a hostile error value must not cost the user their answer");
+  assert.match(result.failures.join(" | "), /api\.getNodeDefs\(\) threw: \(an unprintable value\)/);
 });

@@ -113,7 +113,17 @@ function sanitizeDetail(value) {
 }
 
 function describeFailure(label, err, extra = "") {
-  const raw = err instanceof Error ? err.message : err == null ? "" : String(err);
+  // #1161 — `String(err)` HERE was outside every guard, so a rejection value with a
+  // throwing toString escaped as a rejection from a module that documents the opposite two
+  // screens up. `sanitizeDetail` already handles exactly this; the bug was stringifying
+  // before reaching it. Reading `.message` off an Error is safe (own data property), but a
+  // getter-backed subclass is not, so that read is guarded too.
+  let raw = "";
+  try {
+    raw = err instanceof Error ? err.message : err == null ? "" : err;
+  } catch {
+    raw = "(an unprintable value)";
+  }
   const detail = sanitizeDetail(raw);
   const suffix = detail ? `: ${detail}` : "";
   return `${label}${extra}${suffix}`;
@@ -147,6 +157,8 @@ export const OBJECT_INFO_DEADLINE_MS = 20000;
 
 /** Distinguishes "this transport did not answer in time" from any value it could return. */
 const NO_ANSWER = Symbol("object-info-transport-timeout");
+/** Distinguishes "the budget was gone before this route was contacted" from a timeout. */
+const NOT_TRIED = Symbol("object-info-transport-not-tried");
 
 /**
  * Run one I/O step against the SHARED deadline, preserving the difference between the
@@ -158,9 +170,10 @@ const NO_ANSWER = Symbol("object-info-transport-timeout");
  * reified before bounding and unwrapped after.
  */
 async function runTransport(attempt, remainingMs, timers) {
-  // Out of budget before we even start: report it rather than issuing a request whose
-  // answer we have already decided not to wait for.
-  if (!(remainingMs > 0)) return NO_ANSWER;
+  // Out of budget before we even start. Reported as its OWN outcome, never as a timeout:
+  // saying a route "did not answer" when it was never contacted is the #982 defect of
+  // asserting a cause that was never established.
+  if (!(remainingMs > 0)) return NOT_TRIED;
   const settled = await withTimeout(
     Promise.resolve()
       .then(attempt)
@@ -190,12 +203,40 @@ export async function fetchWholeObjectInfo({
 } = {}) {
   // ONE budget for the whole question, spent down by each step (#1161).
   const startedAt = now();
-  const remaining = () => deadlineMs - (now() - startedAt);
+  const spent = () => {
+    // A non-monotonic clock (Date.now is the default, and it can jump) must not be able to
+    // hand a step a NEGATIVE elapsed time and so a larger budget than the deadline.
+    const elapsed = now() - startedAt;
+    return Number.isFinite(elapsed) && elapsed > 0 ? elapsed : 0;
+  };
+  // RESERVE A FLOOR FOR THE ROUTE THAT HAS NOT BEEN TRIED YET.
+  //
+  // The first version of this shared budget did not, and it broke the very thing the whole
+  // change exists to do: the client route's bound can only fire AT the deadline, so by the
+  // time the fallback was reached `remaining()` was already <= 0 and the raw GET was never
+  // issued at all — verified by execution, fetchApi call count 0. A hung client route
+  // turned a 30s hang into a 20s refusal, with the #982 fallback still unreachable, and
+  // the refusal then named a route that was never contacted.
+  //
+  // So each step may spend at most what is left MINUS a reserve for the steps after it.
+  // The fallback is the point of this oracle; it must be guaranteed a chance to answer.
+  const stepBudget = (reserve) => {
+    const left = deadlineMs - spent() - reserve;
+    return left > 0 ? left : 0;
+  };
+  // The client route may use at most half, so the fallback and its body always have the
+  // other half — enough for the ~14.5s payload measurement to be attempted on its own.
+  const CLIENT_ROUTE_RESERVE = Math.floor(deadlineMs / 2);
   const failures = [];
 
   if (typeof getNodeDefs === "function") {
-    const outcome = await runTransport(getNodeDefs, remaining(), timers);
-    if (outcome === NO_ANSWER) {
+    const outcome = await runTransport(getNodeDefs, stepBudget(CLIENT_ROUTE_RESERVE), timers);
+    if (outcome === NOT_TRIED) {
+      // Cannot happen while this is the FIRST step (it holds the full budget minus its
+      // own reserve), but it is stated rather than assumed: `"err" in outcome` on a
+      // Symbol throws, so every outcome branch must be exhaustive.
+      failures.push("api.getNodeDefs() was not attempted — the budget was already spent");
+    } else if (outcome === NO_ANSWER) {
       // The #1161 case. Recorded as a failure like any other, and — critically — execution
       // CONTINUES to the second transport, which is what this bound exists to reach.
       failures.push(`api.getNodeDefs() did not answer within the ${deadlineMs}ms budget`);
@@ -228,8 +269,13 @@ export async function fetchWholeObjectInfo({
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    const outcome = await runTransport(() => fetchApi("/object_info"), remaining(), timers);
-    if (outcome === NO_ANSWER) {
+    const outcome = await runTransport(() => fetchApi("/object_info"), stepBudget(0), timers);
+    if (outcome === NOT_TRIED) {
+      // TRUTHFUL ABOUT WHAT WAS NOT DONE. Saying this route "did not answer" when no
+      // request was ever sent is #982's original defect — a refusal asserting a cause it
+      // never established. The reserve above exists so this stays unreachable in practice.
+      failures.push("GET /object_info was not attempted — the budget was spent before it was reached");
+    } else if (outcome === NO_ANSWER) {
       failures.push(`GET /object_info did not answer within the ${deadlineMs}ms budget`);
     } else if ("err" in outcome) {
       failures.push(describeFailure("GET /object_info threw", outcome.err));
@@ -244,7 +290,11 @@ export async function fetchWholeObjectInfo({
       let responseStatus = "unknown";
       try {
         responseOk = !!res && res.ok === true;
-        responseStatus = res?.status ?? "unknown";
+        // SANITIZE INSIDE THE GUARD. Reading `.status` is not the only operation that can
+        // throw — INTERPOLATING it does too (`Object.create(null)` cannot convert to a
+        // primitive), and that interpolation sits below this try. Verified against main,
+        // which returned a failures entry where this rejected.
+        responseStatus = sanitizeDetail(res?.status ?? "unknown") || "unknown";
       } catch (err) {
         failures.push(describeFailure("GET /object_info returned an unreadable response", err));
         return { [CACHE_OUTCOME]: true, defs: null, failures };
@@ -256,8 +306,10 @@ export async function fetchWholeObjectInfo({
         // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
         // half-open connection can also stall, so it is bounded as well rather than merely
         // re-caught: the response arriving is not the same event as the body arriving.
-        const body = await runTransport(() => res.json(), remaining(), timers);
-        if (body === NO_ANSWER) {
+        const body = await runTransport(() => res.json(), stepBudget(0), timers);
+        if (body === NOT_TRIED) {
+          failures.push("GET /object_info answered but its body was not read — the budget was spent");
+        } else if (body === NO_ANSWER) {
           failures.push(`GET /object_info answered but its body did not arrive within the ${deadlineMs}ms budget`);
         } else if ("err" in body) {
           // Deliberately the SAME wording as before. A parse failure used to surface
