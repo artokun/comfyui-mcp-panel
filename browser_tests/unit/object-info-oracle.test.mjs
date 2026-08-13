@@ -959,8 +959,22 @@ test("#1161: the DEFAULT clock is the monotonic one — the property everything 
   // A source guard, in the idiom this suite already uses for the #982 refusal wording,
   // because the choice is a default the tests otherwise always override.
   const src = readFileSync(new URL("../../web/js/lib/object-info-oracle.js", import.meta.url), "utf8");
-  assert.match(src, /performance\.now\(\)/, "the default reading must be the monotonic clock");
-  const dateNowUses = src.split("\n").filter((l) => /Date\.now\(\)/.test(l) && !/^\s*(\/\/|\*)/.test(l));
+  // Pin the ARM, not merely the appearance of the identifier. "performance.now" also occurs
+  // in the rationale comment and in the capability check just above the selection, so the
+  // first version of this guard — a bare match on that identifier — stayed true for the
+  // exact mutation its own comment names, and was vacuous.
+  assert.match(src, /\?\s*\(\)\s*=>\s*performance\.now\(\)/, "the default arm must BE the monotonic clock");
+  // Strip comments before counting Date.now uses: the first filter only skipped lines
+  // STARTING with a marker, so a trailing same-line comment counted as a use.
+  //
+  // SPLIT ON /\r?\n/. This file is CRLF, so a line ends "…\r" — and `//.*$` never matches
+  // there, because `.` excludes the carriage return and `$` sits after it. The strip
+  // silently did nothing and the assertion failed on unmutated source.
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\/\/.*$/, ""));
+  const dateNowUses = code.filter((l) => /Date\.now\(\)/.test(l));
   assert.equal(dateNowUses.length, 1, `Date.now may appear only as the last-resort fallback, found: ${dateNowUses.join(" | ")}`);
   assert.match(dateNowUses[0], /=>\s*Date\.now\(\)/, "and only as the fallback arm of the clock selection");
 });
@@ -996,5 +1010,91 @@ test("#1161: a budget beyond the timer's range cannot silently become no bound",
     for (const ms of granted) {
       assert.ok(ms <= 2 ** 31 - 1, `granted ${ms}ms, which a timer cannot express and fires at 1ms`);
     }
+    // PIN THE BOUNDARY ITSELF. Grants alone cannot see it: at a budget of exactly 2**31 the
+    // largest grant still lands a millisecond or two under the ceiling, so setting the cap
+    // to 2**31 survived every grant assertion. The refusal quotes the budget in force, so
+    // it is the one observable that distinguishes the two.
+    const refused = await fetchWholeObjectInfo({
+      getNodeDefs: () => new Promise(() => {}),
+      fetchApi: () => new Promise(() => {}),
+      deadlineMs,
+      timers: { setTimer: (fn) => { fn(); return {}; }, clearTimer: () => {} },
+    });
+    assert.match(
+      refused.failures.join(" | "),
+      /share of the 2147483647ms budget/,
+      "the budget in force must be exactly the largest a timer can express",
+    );
+  }
+});
+
+test("#1161: a hung step really is charged, so it cannot leave the next one the whole budget", async () => {
+  // Deleting the timeout charge entirely left the whole suite green — including the test
+  // rewritten specifically to see that overrun. The observable consequence is simple: if a
+  // hung client route costs nothing, the fallback draws the FULL budget rather than what is
+  // left, and the total is no longer bounded by anything.
+  const granted = [];
+  const armed = [];
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    deadlineMs: 20000,
+    timers: {
+      setTimer: (fn, ms) => { granted.push(ms); const t = { fn, ms }; armed.push(t); return t; },
+      clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
+    },
+    now: () => 0, // a clock that reveals nothing: only the timeout charge can bound this
+  });
+  await tick();
+  armed.shift().fn();
+  await settled(out, "the oracle call");
+  assert.equal(granted[0], 10000, "the client route's share");
+  assert.ok(
+    granted[1] <= 10000,
+    `the fallback was granted ${granted[1]}ms — a hung step that costs nothing leaves the budget unspent`,
+  );
+});
+
+test("#1161: BOTH fallback shares are pinned, not just the body's", async () => {
+  // BODY_SHARE was re-pinned after it survived a mutation; FALLBACK_RESPONSE_SHARE was left
+  // free, and 0.5 -> 0.9 survived the suite. Pin the response's share the same way, on the
+  // path where the client route has already spent its half so the arithmetic is unambiguous.
+  const granted = [];
+  const armed = [];
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    deadlineMs: 20000,
+    timers: {
+      setTimer: (fn, ms) => { granted.push(ms); const t = { fn, ms }; armed.push(t); return t; },
+      clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
+    },
+    now: () => 0,
+  });
+  await tick();
+  armed.shift().fn(); // the client route burns its 10s
+  await settled(out, "the oracle call");
+  assert.equal(granted[1], 5000, "the response takes half of what the client route left, not more");
+});
+
+test("#1161: a Number-coercible clock keeps the reclaim, it does not silently disable it", async () => {
+  // Demanding `typeof === "number"` rejected every clock the subtraction itself would have
+  // accepted — a Date, or a numeric string — so those charged the full grant and the
+  // reclaim vanished, restoring the 10000/5000/5000 shape that round 8 proved refuses
+  // payloads main serves. The guard must coerce exactly as the arithmetic would.
+  for (const make of [
+    () => { let t = 0; return () => new Date((t += 100)); },
+    () => { let t = 0; return () => String((t += 100)); },
+    () => { let t = 0; return () => (t += 100); },
+  ]) {
+    const granted = [];
+    await fetchWholeObjectInfo({
+      getNodeDefs: async () => null,
+      fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+      deadlineMs: 20000,
+      now: make(),
+      timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+    });
+    assert.ok(granted[2] > 15000, `the body kept ${granted[2]}ms — the reclaim must survive this clock`);
   }
 });

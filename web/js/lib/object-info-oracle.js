@@ -292,19 +292,24 @@ export async function fetchWholeObjectInfo({
   // two callers that await it with no catch. An unreadable clock yields NaN, which the
   // accounting below already treats as "unmeasurable" and charges in full.
   const readClock = () => {
-    let reading;
+    // COERCE, don't just typecheck. Guarding the CALL is not enough — the ARITHMETIC below
+    // is its own operation, and `readClock() - startedStep` throws for a Symbol ("Cannot
+    // convert a Symbol value to a number") and for a null-prototype object. That was the
+    // third time in this issue a guarded READ was undone by an unguarded USE of the same
+    // value, after `${responseStatus}` and `String(err)`.
+    //
+    // But the first fix for it demanded `typeof === "number"`, which REJECTED every clock
+    // the subtraction would have accepted — a `now` returning a Date, or a numeric string,
+    // reads as unmeasurable, charges the full grant, and so silently disables the reclaim:
+    // measured grants fell back to 10000/5000/5000, which is the round-8 regression shape
+    // reintroduced by a fix for something else. Coercing exactly as the subtraction would,
+    // inside the guard, accepts what worked before and rejects only what actually throws.
     try {
-      reading = clockSource();
+      const value = Number(clockSource());
+      return Number.isFinite(value) ? value : NaN;
     } catch {
       return NaN;
     }
-    // A NUMBER, or nothing. Guarding the CALL is not enough — the ARITHMETIC below is its
-    // own operation, and `readClock() - startedStep` throws for a Symbol ("Cannot convert a
-    // Symbol value to a number") and for a null-prototype object. That is the third time in
-    // this issue a guarded READ was undone by an unguarded USE of the same value, after
-    // `${responseStatus}` and `String(err)`, so the value is normalised here at the source
-    // rather than at each of its uses.
-    return typeof reading === "number" && Number.isFinite(reading) ? reading : NaN;
   };
   // ONE budget for the whole question, DIVIDED IN ADVANCE, with each step CAPPED at a share
   // of what is left and charged only for what it actually used. Five designs were tried to
@@ -385,11 +390,12 @@ export async function fetchWholeObjectInfo({
     // call count 0), the exact signature this change exists to remove, reproduced by the
     // arithmetic meant to prevent it.
     //
-    // It does NOT rescue deadlineMs=1, and saying so matters: one millisecond cannot be
-    // divided across three steps that each need at least one. The client route takes it and
-    // the fallback is not reached. That is arithmetic rather than a bug, but an earlier
-    // revision of this comment claimed the floor made every budget reachable, which is the
-    // kind of overclaim that later gets cited as established.
+    // Two earlier revisions of this comment got the tiny-budget case wrong in opposite
+    // directions — first claiming the floor made every budget reachable, then claiming it
+    // could not rescue deadlineMs=1. Measured: at deadlineMs of 1 and 2 the fallback IS
+    // issued and DOES answer, because a client route that returns instantly hands its grant
+    // back and the next step draws from what is left. Neither claim was checked before it
+    // was written, which is how a comment becomes the thing a later reader trusts.
     // `share` is never above 1 for any step here, so `floor(left * share) <= left` already;
     // the min() is a guard for a future share, not something that binds today.
     const grant = left > 0 ? Math.max(1, Math.min(left, Math.floor(left * share))) : 0;
