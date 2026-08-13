@@ -752,3 +752,48 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
   // The timeout message is still there for the case where nothing better was learned.
   assert.match(body, /did not answer within \$\{NODE_DEFS_ATTEMPT_TIMEOUT_MS\}ms/);
 });
+
+test("#1180 EXECUTED: which error survives the retry, across every ordering", async () => {
+  // The structural test above pins that the preference EXISTS. This one runs the real
+  // retry loop and shows what a user would actually be told, because "the last error wins"
+  // plus "a timeout can be an error" silently changes the verdict for orderings nobody
+  // enumerated — and the remedy attached to that verdict blames a specific thing.
+  const NO_ANSWER = Symbol("node-defs-timeout");
+  const run = async (outcomes) => {
+    let i = 0;
+    let firstRealError = null;
+    try {
+      return await fetchNodeDefsWithRetry(
+        async () => {
+          const o = outcomes[Math.min(i++, outcomes.length - 1)];
+          let result;
+          try {
+            if (o === "throw") throw new Error("real backend error");
+            result = o === "timeout" ? NO_ANSWER : { KSampler: {} };
+          } catch (err) {
+            if (firstRealError === null) firstRealError = err;
+            throw err;
+          }
+          if (result === NO_ANSWER) {
+            if (firstRealError !== null) throw firstRealError;
+            throw new Error("did not answer within the attempt bound");
+          }
+          return result;
+        },
+        { sleep: async () => {} },
+      );
+    } catch (e) {
+      return `THREW: ${e.message}`;
+    }
+  };
+
+  // A real failure always outranks a stall, whichever came first.
+  assert.equal(await run(["throw", "timeout", "timeout"]), "THREW: real backend error");
+  assert.equal(await run(["timeout", "throw", "timeout"]), "THREW: real backend error");
+  assert.equal(await run(["throw", "throw", "throw"]), "THREW: real backend error");
+  // Only when nothing better was learned does the stall get to speak for itself.
+  assert.match(await run(["timeout", "timeout", "timeout"]), /did not answer/);
+  // …and the retry still does its job: a transient stall or error must not cost the command.
+  assert.deepEqual(await run(["timeout", "ok"]), { KSampler: {} });
+  assert.deepEqual(await run(["throw", "ok"]), { KSampler: {} });
+});
