@@ -750,61 +750,78 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
 const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 
 /**
- * #1180 — the same bound for ONE attempt of a RETRIED fetch, which cannot be the number
- * above.
+ * #1180 — ONE budget for a whole `registerComfyNodeDefs` run, shared by its phases.
  *
- * `fetchNodeDefsWithRetry` makes three attempts (two delays) and its own header caps the
- * added WAITING at 800ms. Reusing the single-call bound would put the worst case at
- * 3 x 10000 + 800 = 30,800ms — past the bridge's 30s command timeout, so a fully hung
- * connection would blow the budget and hand the agent a bare timeout naming nothing. That
- * is precisely the #1161 symptom, reintroduced by the fix for #1180.
+ * PER-PHASE BOUNDS DO NOT COMPOSE, and three review rounds on this issue were spent
+ * relearning that. Each phase was sized on its own and each number looked defensible, but
+ * a run performs them in SEQUENCE: the retried fetch (up to this budget plus the
+ * schedule's waiting) and then the combo refresh, which issues its own /object_info and
+ * had a 10s bound of its own. Roughly 19.8s per run — and `makeRefreshCoalescer`
+ * guarantees a forced `panel_refresh_nodes` pays the in-flight run AND its own, serially,
+ * so about 39.6s before a reply is composed. Past the bridge's 20s READ default and past
+ * the 30s command budget both, which is the #1161 symptom this fix reintroduced twice.
  *
- * DERIVED, not picked, so the arithmetic cannot drift when the retry schedule changes: the
- * attempts and their waiting come from the retry module itself.
+ * A run therefore carries a DEADLINE, and each bounded phase gets what is left of it
+ * rather than a private allowance. Two serialized runs then cost 2 x this, and that is the
+ * number sized against the read default — 18,000ms against 20,000ms — because that product
+ * is what the user actually waits through.
  *
- * SIZED FOR TWO RUNS, NOT ONE, which is the part a first version got wrong. A forced
- * `panel_refresh_nodes` goes through `makeRefreshCoalescer`, whose documented contract is
- * that a forced call's fetch begins AFTER the in-flight run settles — so a refresh issued
- * just after a reconnect costs the reconnect's run PLUS its own, serially. At a 15s budget
- * that measured 29.5s: past the bridge's 20s READ default, and inside half a second of the
- * 30s command budget, before the command had even composed its reply. The user would get
- * a bare "tab did not reply" instead of the worded verdict this bound exists to preserve.
+ * On a monotonic clock, like every other elapsed-time measurement in this panel: a
+ * wall-clock jump mid-run must not hand a phase a negative or enormous remainder.
  *
- * So the budget is halved against the READ default rather than the command budget: two
- * serialized runs must fit inside it with margin, and one run has to be worth making.
- *
- * WHAT THIS COSTS, stated rather than left for someone to discover. 2733ms per attempt is
- * 16x the 167ms measured on a 63-pack install (#767) and 7.5x the ~366ms measured live on
- * 4304 types — but an install whose /object_info consistently takes LONGER than that fails
- * all three attempts and gets `object_info_fetch_failed`, where an unbounded main would
- * eventually have succeeded. That is a real narrowing, and it is the direction this repo
- * has regressed in before: refusing something main serves.
- *
- * It is accepted here because the alternative is the reported bug — a command that never
- * ends — and because the refusal is recoverable and worded, where the hang is neither. The
- * number to revisit is this budget, not the per-attempt bound: two serialized runs must
- * still fit the read default, so raising it is bounded at about 9800ms (3000ms per
- * attempt), which is not much. A genuinely slow install needs the attempts to ESCALATE
- * rather than the budget to grow, and that is a bigger change than this issue.
+ * WHAT IT COSTS, stated rather than left to be discovered. An install whose /object_info
+ * consistently takes longer than the remaining budget gets a worded
+ * `object_info_fetch_failed` where an unbounded panel would eventually have succeeded.
+ * That is a real narrowing and it is the direction this repo has regressed in before. It
+ * is accepted because the alternative is the reported bug — a command that never ends —
+ * and a recoverable, worded refusal beats a hang. Measured on this rig today: /object_info
+ * is 7,440,820 bytes and answers in 532ms (it was 5,413,770 bytes / 167ms when #767
+ * measured it — the document grows with the pack count, which is the reason to keep
+ * measuring rather than to trust the older figure).
  */
-const BRIDGE_READ_DEFAULT_MS = 20000;
-const NODE_DEFS_RETRY_BUDGET_MS = 9000;
+const NODE_DEFS_RUN_BUDGET_MS = 9000;
+/**
+ * The share of a run's budget the FETCH phase may consume, leaving the rest for the combo
+ * refresh that follows it. Two thirds: the fetch is the phase that must survive a retry
+ * schedule, while the combo phase is a single call.
+ *
+ * A share, not a second constant, so the two cannot be changed into disagreement.
+ */
+const NODE_DEFS_FETCH_SHARE = 2 / 3;
 //
-// FEWER ATTEMPTS, EACH GIVEN MORE TIME. The shipped schedule is three attempts, and with
-// a bound that does not cancel that means up to THREE concurrent whole-document downloads
-// contending on a link that is merely slow — each one making the next attempt slower, so
-// the retry actively works against itself in exactly the case it exists to survive.
+// #954's SCHEDULE, UNFORKED. An earlier pass here cut it to a single 200ms delay, reasoning
+// that a bound which does not cancel lets three abandoned attempts download the whole
+// document at once and contend with each other. That is true, and the conclusion drawn
+// from it was still wrong: it also cut the window a RESTART-time blip can hide in from
+// 800ms to 200ms, which is the dimension #954 was actually sized on. A backend taking half
+// a second to start accepting connections was bridged before and would not have been after.
 //
-// Dropping to two attempts improves both numbers at once: at most two downloads overlap,
-// and each attempt gets 4400ms instead of 2733ms — 61% more time on a link the first
-// attempt has already shown to be slow. The retry keeps its purpose (#954's transient
-// blip during a reconnect window still gets a second chance) and the whole run still
-// fits: two runs at 9000ms each is 18,000ms against the 20,000ms read default.
-const NODE_DEFS_RETRY_DELAYS_MS = [OBJECT_INFO_RETRY_DELAYS_MS[0] ?? 200];
-const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor(
-  (NODE_DEFS_RETRY_BUDGET_MS - NODE_DEFS_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)) /
-    (NODE_DEFS_RETRY_DELAYS_MS.length + 1),
-);
+// The two failure modes have opposite economics, so the schedule is the wrong place to
+// separate them:
+//
+//   an attempt that fails INSTANTLY  — connection refused; no bytes moved, so another
+//                                      attempt is free and more of them is strictly better
+//   an attempt abandoned by a TIMEOUT — still downloading; a second attempt races the first
+//                                      and makes the link it is retrying on slower
+//
+// So the SCHEDULE stays #954's and the DECISION moves to the caller: `shouldRetry` below
+// stops the loop the moment an attempt is abandoned, rather than sleeping and stacking a
+// second download on top of it. Instant failures keep all three attempts across 800ms.
+const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
+
+/**
+ * What is left of a run's budget, for the phase about to start.
+ *
+ * Never returns a non-positive number: `withTimeout` treats those as NO BOUND, so an
+ * exhausted budget expressed literally would silently remove the bound at exactly the
+ * moment the run is already too slow — the failure this whole issue is about, arriving
+ * through the mechanism meant to prevent it. A spent budget yields 1ms, which times out
+ * immediately and truthfully.
+ */
+function nodeDefsBudgetLeft(deadline, share = 1) {
+  const left = deadline - monotonicNow();
+  return Math.max(1, Math.floor(left * share));
+}
 
 /** Sentinel: this call did not answer in time, as distinct from anything it could return. */
 const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
@@ -959,6 +976,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let comboApiPresent = false;
   let comboRan = false;
   let phase = "fetch";
+  // #1180 — ONE deadline for this whole run. Every bounded phase below draws from what is
+  // left of it, so the run's cost is this budget rather than the sum of numbers that each
+  // looked reasonable alone. Taken here, before any phase starts, so a slow fetch is paid
+  // for by the combo phase rather than added to it.
+  const runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -1026,20 +1048,35 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // synthesized timeout speak for them.
       let sawRealError = false;
       let firstRealError = null;
-      defs = await fetchNodeDefsWithRetry(async () => {
-        let result;
-        try {
-          result = await boundedGetNodeDefs(NODE_DEFS_ATTEMPT_TIMEOUT_MS);
-        } catch (err) {
-          if (!sawRealError) { sawRealError = true; firstRealError = err; }
-          throw err;
-        }
-        if (result === NODE_DEFS_NO_ANSWER) {
-          if (sawRealError) throw firstRealError;
-          throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_ATTEMPT_TIMEOUT_MS}ms`);
-        }
-        return result;
-      }, { delays: NODE_DEFS_RETRY_DELAYS_MS });
+      // Whether the attempt that just failed was ABANDONED rather than answered. Tracked
+      // beside the error instead of encoded into it, because the error thrown for a stall
+      // is deliberately the first REAL one when there was one (see above) — so the value
+      // cannot be asked which kind of failure it represents without undoing that.
+      let lastAttemptTimedOut = false;
+      defs = await fetchNodeDefsWithRetry(
+        async () => {
+          lastAttemptTimedOut = false;
+          let result;
+          try {
+            result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
+          } catch (err) {
+            if (!sawRealError) { sawRealError = true; firstRealError = err; }
+            throw err;
+          }
+          if (result === NODE_DEFS_NO_ANSWER) {
+            lastAttemptTimedOut = true;
+            if (sawRealError) throw firstRealError;
+            throw new Error("api.getNodeDefs() did not answer within this refresh's remaining budget");
+          }
+          return result;
+        },
+        {
+          delays: NODE_DEFS_RETRY_DELAYS_MS,
+          // An abandoned attempt is still downloading the whole document. Retrying it races
+          // the retry against its own predecessor; an instantly-refused one costs nothing.
+          shouldRetry: () => !lastAttemptTimedOut,
+        },
+      );
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -1097,7 +1134,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
         Promise.resolve()
           .then(() => a.refreshComboInNodes())
           .then(() => COMBO_OK, (err) => ({ err })),
-        NODE_DEFS_FETCH_TIMEOUT_MS,
+        nodeDefsBudgetLeft(runDeadline),
         () => COMBO_NO_ANSWER,
       );
       comboRan = comboSettled === COMBO_OK;
@@ -1106,7 +1143,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
         // catch. The `?? ` that used to guard this assignment could never fire.
         thrown =
           comboSettled === COMBO_NO_ANSWER
-            ? new Error(`refreshComboInNodes() did not answer within ${NODE_DEFS_FETCH_TIMEOUT_MS}ms`)
+            ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget")
             : comboSettled.err;
       }
     }

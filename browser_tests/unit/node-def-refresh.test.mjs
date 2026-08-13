@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { fetchNodeDefsWithRetry } from "../../web/js/lib/object-info-retry.js";
+import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
 // #1180 — the panel bounds each getNodeDefs attempt and throws on the sentinel so the
@@ -25,14 +25,32 @@ const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
 // of its own rather than a boolean that a rejection and a timeout would have to share.
 const COMBO_OK = Symbol("combo-refreshed");
 const COMBO_NO_ANSWER = Symbol("combo-timeout");
-const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
-// #1180 — the retried path gets a SMALLER per-attempt bound so three attempts plus the
-// retry module's own waiting stay well inside the 30s command budget. Derived here the
-// same way the panel derives it, so the harness cannot drift from the shipped number.
-// #1180 — the refresh uses its OWN schedule: fewer attempts, each given more time,
-// because abandoned attempts keep downloading and three of them contend.
-const NODE_DEFS_RETRY_DELAYS_MS = [200];
-const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor((9000 - 200) / 2);
+// READ from the source, not restated here. A harness that hardcodes the panel's numbers
+// stops failing when the panel's numbers change, which is the one thing these tests exist
+// to notice — the same trap the widen divisor was fixed for. `[200]` sat here as a literal
+// while the panel had already moved back to #954's shared schedule.
+const PANEL_SRC_FOR_CONSTS = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"), "utf8");
+const panelConst = (name) => {
+  const m = PANEL_SRC_FOR_CONSTS.match(new RegExp(`const ${name} = (\\d+);`));
+  if (!m) throw new Error(`the panel no longer defines ${name} as a literal — update this harness`);
+  return Number(m[1]);
+};
+const NODE_DEFS_FETCH_TIMEOUT_MS = panelConst("NODE_DEFS_FETCH_TIMEOUT_MS");
+// #1180 — the refresh shares #954's schedule rather than forking it; a timeout is declined
+// by `shouldRetry` instead of by shortening the schedule for everyone.
+const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
+// #1180 — one budget for a whole run, shared by its phases, because per-phase bounds do
+// not compose: the run performs them in sequence.
+const NODE_DEFS_RUN_BUDGET_MS = panelConst("NODE_DEFS_RUN_BUDGET_MS");
+const NODE_DEFS_FETCH_SHARE = (() => {
+  const m = PANEL_SRC_FOR_CONSTS.match(/const NODE_DEFS_FETCH_SHARE = (\d+) \/ (\d+);/);
+  if (!m) throw new Error("the panel no longer states NODE_DEFS_FETCH_SHARE as a ratio");
+  return Number(m[1]) / Number(m[2]);
+})();
+function nodeDefsBudgetLeft(deadline, share = 1) {
+  return Math.max(1, Math.floor((deadline - monotonicNow()) * share));
+}
+const monotonicNow = () => performance.now();
 const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) =>
   typeof apiValue?.getNodeDefs !== "function"
     ? Promise.resolve(null)
@@ -401,7 +419,10 @@ function buildRegisterComfyNodeDefs({
     "COMBO_OK",
     "COMBO_NO_ANSWER",
     "NODE_DEFS_FETCH_TIMEOUT_MS",
-    "NODE_DEFS_ATTEMPT_TIMEOUT_MS",
+    "NODE_DEFS_RUN_BUDGET_MS",
+    "NODE_DEFS_FETCH_SHARE",
+    "nodeDefsBudgetLeft",
+    "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
@@ -428,7 +449,10 @@ function buildRegisterComfyNodeDefs({
     reapplyDefsToLiveNodes,
     describeNodeDefRefresh,
     // No real waiting: the delays are the shipped ones, the sleep is not.
-    (getDefs) => fetchNodeDefsWithRetry(getDefs, { sleep: async () => {} }),
+    // #1180 — the SHIPPED options, not just the shipped helper. Omitting `delays` let the
+    // helper fall back to its own default, so every test here ran a schedule the refresh
+    // path does not use: the harness proved a retry that production never performs.
+    (getDefs, opts) => fetchNodeDefsWithRetry(getDefs, { ...opts, sleep: async () => {} }),
     // #1180 — the shipped primitive, told which clock to use, so the combo tests can make
     // the bound FIRE without the suite waiting ten real seconds for it.
     timers ? (pr, ms, onT) => withTimeout(pr, ms, onT, timers) : withTimeout,
@@ -436,7 +460,10 @@ function buildRegisterComfyNodeDefs({
     COMBO_OK,
     COMBO_NO_ANSWER,
     NODE_DEFS_FETCH_TIMEOUT_MS,
-    NODE_DEFS_ATTEMPT_TIMEOUT_MS,
+    NODE_DEFS_RUN_BUDGET_MS,
+    NODE_DEFS_FETCH_SHARE,
+    nodeDefsBudgetLeft,
+    monotonicNow,
     NODE_DEFS_RETRY_DELAYS_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
@@ -690,7 +717,7 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
   // falsy throw is forgotten -- which this file already has a test about (codex r5).
   assert.match(body, /let sawRealError = false;/, "presence must not be inferred from the value");
   // The timeout message is still there for the case where nothing better was learned.
-  assert.match(body, /did not answer within \$\{NODE_DEFS_ATTEMPT_TIMEOUT_MS\}ms/);
+  assert.match(body, /did not answer within this refresh's remaining budget/);
 });
 
 test("#1180 EXECUTED: which error survives the retry, across every ordering", async () => {
@@ -864,10 +891,14 @@ test("#1180 the combo phase arms a bound, using the panel's constant", async () 
   // Exactly one: the fetch phase's bound must already have been CLEARED by its own
   // answer. Two here would mean a bound leaks per refresh on a long-lived page.
   assert.equal(armed.length, 1, `the combo phase must leave exactly one bound armed, saw ${armed.length}`);
-  assert.equal(
-    armed[0].ms,
-    NODE_DEFS_FETCH_TIMEOUT_MS,
-    "the combo bound must be the panel's constant — a non-positive ms arms nothing and silently restores the hang",
+  // The bound is what is LEFT of the run's budget, not a private allowance: the fetch
+  // phase ran first and its cost comes out of the same total. So the assertion is a band,
+  // and both edges matter — 0 or less arms nothing at all (withTimeout's non-positive
+  // contract, which silently restores the hang), and anything above the run budget means
+  // the phase is spending time the run has not got.
+  assert.ok(
+    armed[0].ms > 0 && armed[0].ms <= NODE_DEFS_RUN_BUDGET_MS,
+    `the combo bound must be the run's REMAINING budget, saw ${armed[0].ms}ms against a ${NODE_DEFS_RUN_BUDGET_MS}ms run`,
   );
   timers.fireAll();
   await orFail(running, "the combo phase never gave up: registerComfyNodeDefs is still awaiting refreshComboInNodes");

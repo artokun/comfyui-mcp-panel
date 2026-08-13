@@ -238,60 +238,89 @@ test("#1180: every getNodeDefs call that can hang a command is bounded", () => {
   assert.match(seedBody, /await api\.getNodeDefs\(\)/, "…and that one site is the seed itself");
 });
 
-test("#1180: the RETRIED fetch's worst case stays inside the command budget", () => {
-  // Found by asking what three attempts cost, not by review: fetchNodeDefsWithRetry makes
-  // three attempts (two delays) and caps its own added waiting at 800ms. Reusing the
-  // single-call 10s bound put the worst case at 3 x 10000 + 800 = 30,800ms — PAST the
-  // bridge's 30s command timeout, so a fully hung connection would blow the budget and hand
-  // the agent a bare timeout naming nothing. That is the #1161 symptom, reintroduced by the
-  // fix for #1180.
+test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () => {
+  // Per-phase bounds do not compose, and this test used to help hide that. It checked the
+  // fetch phase's arithmetic in isolation while the same branch gave the combo phase a
+  // separate 10s bound, so a run cost roughly 19.8s and a forced refresh — which
+  // makeRefreshCoalescer guarantees pays the in-flight run AND its own, serially — cost
+  // about 39.6s. Past the 20s read default and the 30s command budget both, with every
+  // assertion here green.
+  //
+  // It also computed its own `const attempts = 2` rather than reading the shipped
+  // schedule, so restoring three attempts changed nothing it asserted. A test that
+  // recomputes a value cannot see that value change.
   const src = readFileSync(PANEL_JS, "utf8");
-  const single = Number((src.match(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/) || [])[1]);
-  const budget = Number((src.match(/const NODE_DEFS_RETRY_BUDGET_MS = (\d+);/) || [])[1]);
-  assert.ok(budget > 0, "the retry sequence must have its own budget");
+  const num = (re, what) => {
+    const m = src.match(re);
+    assert.ok(m, `${what} must be findable in the panel source`);
+    return Number(m[1]);
+  };
+  const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/, "the single-call bound");
+  const run = num(/const NODE_DEFS_RUN_BUDGET_MS = (\d+);/, "the run budget");
 
-  // TWO runs, not one — the part a first version got wrong. A forced panel_refresh_nodes
-  // waits for the in-flight run and then starts its own; makeRefreshCoalescer guarantees
-  // exactly that ("a forced call GUARANTEES a fresh registration whose fetch begins AFTER
-  // the current run settles"). So a refresh issued just after a reconnect pays both,
-  // serially. At a 15s budget that measured 29.5s — past the bridge READ default, and
-  // within half a second of the command budget before the reply was even composed, so the
-  // user got a bare "tab did not reply" instead of the worded verdict this bound preserves.
-  const read = Number((src.match(/const BRIDGE_READ_DEFAULT_MS = (\d+);/) || [])[1]);
-  assert.ok(read > 0, "the bridge read default must be stated, not assumed");
+  // TWO runs, not one. A forced panel_refresh_nodes waits for the in-flight run and then
+  // starts its own, so a refresh issued just after a reconnect pays both, serially.
+  // 20000 is the orchestrator's ui-bridge read default. It is NOT read from this repo:
+  // the panel used to carry a BRIDGE_READ_DEFAULT_MS copy of it that nothing consumed, so
+  // this assertion compared the panel against the panel and could never have caught the
+  // drift it appeared to guard. The real value lives in comfyui-mcp; if it changes there,
+  // nothing in this repo will notice, and saying so is more honest than a local mirror.
+  const READ_DEFAULT_MS = 20000;
   assert.ok(
-    budget * 2 < read,
-    `two serialized refresh runs cost ${budget * 2}ms against a ${read}ms read default`,
+    run * 2 < READ_DEFAULT_MS,
+    `two serialized refresh runs cost ${run * 2}ms against a ${READ_DEFAULT_MS}ms read default`,
   );
 
-  // DERIVED from a schedule, not hardcoded, so the arithmetic cannot drift.
+  // Every bounded phase must draw from that ONE deadline rather than carry its own number.
   assert.match(
     src,
-    /NODE_DEFS_RETRY_DELAYS_MS\.reduce\(/,
-    "the per-attempt bound must be derived from the schedule it actually uses",
+    /const runDeadline = monotonicNow\(\) \+ NODE_DEFS_RUN_BUDGET_MS;/,
+    "the run must take a deadline once, before any phase starts",
   );
-  // FEWER ATTEMPTS THAN THE DEFAULT SCHEDULE, each given more time. A bound that does not
-  // cancel makes abandoned attempts keep downloading, so three attempts put up to three
-  // concurrent whole-document responses on a link that is merely slow — each making the
-  // next attempt slower, so the retry works against the very case it exists to survive.
-  const shipped = src.match(/const NODE_DEFS_RETRY_DELAYS_MS = \[([^\]]*)\]/);
-  assert.ok(shipped, "the refresh must state its own retry schedule");
-  const attempts = 2;
-  const waiting = OBJECT_INFO_RETRY_DELAYS_MS[0];
+  assert.match(
+    src,
+    /boundedGetNodeDefs\(nodeDefsBudgetLeft\(runDeadline, NODE_DEFS_FETCH_SHARE\)\)/,
+    "the fetch phase must draw its bound from the run deadline",
+  );
+  assert.match(
+    src,
+    /nodeDefsBudgetLeft\(runDeadline\),\s*\(\) => COMBO_NO_ANSWER/,
+    "the combo phase must draw from what the fetch phase left, not from a constant",
+  );
+  // A monotonic clock, like every other elapsed measurement in this panel: a wall-clock
+  // jump mid-run must not hand a phase a negative or enormous remainder.
+  // Positive, and scoped to the one function. An earlier version of this assertion swept
+  // from here to registerComfyNodeDefs and tripped over monotonicNow's OWN definition,
+  // which names Date.now() as its documented fallback — a test failing on the correct code
+  // because the window it read was wider than the claim it was making.
+  const budgetFn = src.slice(
+    src.indexOf("function nodeDefsBudgetLeft("),
+    src.indexOf("\n}", src.indexOf("function nodeDefsBudgetLeft(")),
+  );
+  assert.match(budgetFn, /deadline - monotonicNow\(\)/, "the budget must be measured on the monotonic clock");
+  assert.match(budgetFn, /Math\.max\(1,/, "a spent budget must yield 1ms, never a non-positive ms that arms no bound");
+
+  // The SHARE is a real fraction: a fetch phase allowed the whole run leaves the combo
+  // phase the 1ms floor, which is the hang arriving through the mechanism meant to stop it.
+  const share = (() => {
+    const m = src.match(/const NODE_DEFS_FETCH_SHARE = (\d+) \/ (\d+);/);
+    assert.ok(m, "the fetch share must be stated as a ratio");
+    return Number(m[1]) / Number(m[2]);
+  })();
+  assert.ok(share > 0 && share < 1, `the fetch phase must get a FRACTION of the run, saw ${share}`);
+
+  // #954's SCHEDULE, SHARED not forked — read from the retry module, never restated.
+  assert.match(
+    src,
+    /const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;/,
+    "forking the schedule is what cut #954's bridging window from 800ms to 200ms",
+  );
+  // …and a timeout is declined by the CALLER, which is what makes sharing it safe.
+  assert.match(src, /shouldRetry: \(\) => !lastAttemptTimedOut/, "an abandoned attempt must not be retried");
   assert.ok(
-    attempts < OBJECT_INFO_RETRY_DELAYS_MS.length + 1,
-    "the refresh must retry FEWER times than the default schedule, not the same or more",
+    run <= single,
+    `a whole run cannot be given more than the single-call bound (${run}ms vs ${single}ms)`,
   );
-  const perAttempt = Math.floor((budget - waiting) / attempts);
-  assert.ok(perAttempt > 0, `each attempt must get a real bound, got ${perAttempt}ms`);
-  assert.ok(
-    perAttempt * attempts + waiting < 30000,
-    `the retried worst case is ${perAttempt * attempts + waiting}ms, past the 30s command budget`,
-  );
-  // …and it must be SMALLER than the single-call bound, which is the whole point.
-  assert.ok(perAttempt < single, "a retried attempt cannot be given the single-call bound");
-  // The refresh site really uses it.
-  assert.match(src, /boundedGetNodeDefs\(NODE_DEFS_ATTEMPT_TIMEOUT_MS\)/, "the refresh uses the derived bound");
 });
 
 test("#1180: the widen's bound fits INSIDE the registration deadline it runs under", () => {
