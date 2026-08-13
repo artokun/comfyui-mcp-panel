@@ -1124,15 +1124,15 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // (A throw here is attributed to "record": the fetch itself already succeeded,
     // and registration has not been attempted yet — the verdict must not claim it.)
     phase = "record";
-    recordObjectInfoTypes(defs);
-    // Re-register node definitions so newly installed/updated classes and their
-    // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
-    // is set ONLY when the registration call actually ran — a frontend without
-    // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
-    phase = "register";
-    // The budget measures WAITING THIS PANEL CONTROLS, and the two phases below are neither
-    // waiting nor controllable — so the clock stops across them and the deadline is pushed
-    // out by exactly what they took.
+    // The budget measures WAITING THIS PANEL CONTROLS, and everything from here to the combo
+    // phase is neither waiting nor controllable — so the clock stops across it and the
+    // deadline is pushed out by exactly what it took.
+    //
+    // From HERE, not from the registration call: `recordObjectInfoTypes` walks every type in
+    // the payload (4304 of them on this rig), which is local CPU work of exactly the kind
+    // this rule exists to exclude. Starting the exclusion at the next phase would have left
+    // one arbitrary slice of local work still spending the waiting budget, and an arbitrary
+    // rule is one nobody can apply correctly later.
     //
     // Without this the deliberately-unbounded registration SPENT the run's deadline instead
     // of merely escaping it, which starved the phase after it. On the install #610 measured
@@ -1148,6 +1148,12 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // truthfully. It is wrong for one spent computing, and telling those apart is the whole
     // reason the deadline moves here rather than the floor being softened.
     const localWorkStartedAt = monotonicNow();
+    recordObjectInfoTypes(defs);
+    // Re-register node definitions so newly installed/updated classes and their
+    // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
+    // is set ONLY when the registration call actually ran — a frontend without
+    // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
+    phase = "register";
     if (defs && typeof a.registerNodesFromDefs === "function") {
       // #1180 — this await stays UNBOUNDED, and that is the decision, not an omission. It is
       // the last await on this path without a time limit, so it will be asked about again.

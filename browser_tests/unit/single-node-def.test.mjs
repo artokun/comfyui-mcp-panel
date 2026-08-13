@@ -291,7 +291,19 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
   );
   const localStart = src.indexOf("const localWorkStartedAt = monotonicNow();");
   const giveBack = src.indexOf("runDeadline += monotonicNow() - localWorkStartedAt;");
-  assert.ok(localStart > 0 && giveBack > localStart, "the clock must stop before the register phase and restart after it");
+  assert.ok(localStart > 0 && giveBack > localStart, "the clock must stop before the local work and restart after it");
+  // The window must cover ALL the local work, not an arbitrary slice of it.
+  // `recordObjectInfoTypes` walks every type in the payload (4304 on this rig) — CPU work
+  // of exactly the kind the give-back exists to exclude. It sat OUTSIDE the window in the
+  // first version of this fix, so one arbitrary slice of computing still spent the waiting
+  // budget, which is the rule this test exists to keep unambiguous.
+  const record = src.indexOf("recordObjectInfoTypes(defs);", localStart - 2000);
+  assert.ok(
+    record > localStart && record < giveBack,
+    "the payload walk is local work and must be inside the excluded window",
+  );
+  const reapply = src.indexOf("reapplyDefsToLiveNodes(rootGraph, defs)", localStart);
+  assert.ok(reapply > localStart && reapply < giveBack, "…and so is the live-node reapply");
   assert.ok(
     giveBack < src.indexOf('phase = "combo";', localStart),
     "…and be handed back BEFORE the combo phase reads what is left",
