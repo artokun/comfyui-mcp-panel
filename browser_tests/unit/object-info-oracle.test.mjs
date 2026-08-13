@@ -690,3 +690,79 @@ test("#1161: a timer that fires LATE cannot starve the fallback", async () => {
     assert.deepEqual(result.defs, DEFS_1161, `lateBy=${lateBy}: and its answer used`);
   }
 });
+
+test("#1161: no clock behaviour can make the granted total exceed the deadline", async () => {
+  // Date.now is this module's default clock and it steps backwards for ordinary reasons:
+  // an NTP correction, a manual or DST change, a VM suspend/resume. The first attempt at
+  // this clamped each negative READING to zero, which silently refunded everything already
+  // spent — measured at -60s against a 20000ms deadline, one call ran to wall t=49900ms,
+  // past the bridge's 30s command timeout, which is the symptom this oracle replaces.
+  //
+  // A high-water ratchet was tried next and is ALSO not enough: it only samples at step
+  // boundaries, so a jump between two samples still refunds, and a test for it passes with
+  // or without the ratchet — which is how the second attempt was caught.
+  //
+  // So the property under test is not about the clock at all. A step cannot outlast the
+  // grant its TIMER enforces, so bounding the SUM OF GRANTS bounds the call in real time
+  // whatever now() reports. That is what this asserts, under a clock behaving as badly as
+  // it can: backwards, stalled, and jumping forward.
+  for (const clocks of [
+    [0, -60_000, -120_000, -180_000],
+    [0, 0, 0, 0],
+    [0, 5_000_000, -5_000_000, 0],
+    [0, NaN, 1000, NaN],
+  ]) {
+    const armed = [];
+    // REAL time, not granted time: a step that HANGS costs exactly the grant its timer
+    // enforces, and a step that answers early costs nothing. Summing grants instead would
+    // charge for time a fast step handed back, and pass or fail for the wrong reason.
+    let elapsedReal = 0;
+    const timers = {
+      setTimer: (fn, ms) => { const t = { fn, ms }; armed.push(t); return t; },
+      clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
+    };
+    let step = 0;
+    const out = fetchWholeObjectInfo({
+      getNodeDefs: never,
+      fetchApi: async () => ({ ok: true, json: never }),
+      deadlineMs: 6000,
+      timers,
+      now: () => clocks[Math.min(step, clocks.length - 1)],
+    });
+    for (let i = 0; i < 8; i++) {
+      await tick();
+      const t = armed.shift();
+      if (!t) continue; // the step answered on its own; its timer was cleared
+      step += 1;
+      elapsedReal += t.ms; // it hung for exactly as long as it was allowed to
+      t.fn();
+    }
+    const result = await settled(out, `the oracle call (${clocks.join(",")})`);
+    assert.equal(result.defs, null, "nothing answered, so nothing is authorized");
+    assert.ok(
+      elapsedReal <= 6000,
+      `ran ${elapsedReal}ms against a 6000ms deadline under clock ${clocks.join(",")} — the budget was refunded`,
+    );
+  }
+});
+
+test("#1161: the BODY's not-attempted branch is real, and reports rather than throwing", async () => {
+  // The one NOT_TRIED branch no test reached: a response that lands exactly as the
+  // fallback's end time arrives leaves the body with nothing. Deleting this branch left
+  // the whole suite green, and without it the Symbol reaches the `in` test and rejects out
+  // of a module two callers await with no catch of their own.
+  let clock = 0;
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    // Answering consumes the whole fallback window, so the body step has none left.
+    fetchApi: async () => { clock = 6000; return { ok: true, json: async () => DEFS_1161 }; },
+    deadlineMs: 6000,
+    now: () => clock,
+  });
+  assert.equal(result.defs, null, "no budget to read the body means no authorization — fail closed");
+  assert.match(
+    result.failures.join(" | "),
+    /GET \/object_info answered but its body was not read/,
+    "and it says the body was not read, rather than claiming the route did not answer",
+  );
+});

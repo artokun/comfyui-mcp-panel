@@ -55,10 +55,18 @@
  *
  * The exposure is bounded by the same direction the original note relies on. An INSTALL is
  * harmless (a type missing from the answer is refused, which fails closed); only a
- * deliberate NARROWING can be overridden, only while that client is slower than the budget,
- * and only for a write to a type it withheld. Anyone revisiting this should know it was a
- * decision and not an oversight, and that the honest fix is a client route which fails fast
- * rather than one which is merely waited on longer.
+ * deliberate NARROWING can be overridden, and only for a write to a type it withheld.
+ *
+ * HOW SLOW IS "TOO SLOW" — stated exactly, because the window is WIDER than this note first
+ * claimed. It is not the whole deadline. The client route is granted at most
+ * `deadline - FALLBACK_FLOOR`, which is HALF the deadline (10s of the shipped 20s), so a
+ * filtering client is overridden once it takes longer than that — twice as readily as
+ * "slower than the budget" implied. The floor is what makes the fallback reachable at all,
+ * so the two properties are in direct tension and this is the side that was chosen.
+ *
+ * Anyone revisiting this should know it was a decision and not an oversight, that the
+ * number to check is the client route's SHARE rather than the deadline, and that the honest
+ * fix is a client route which fails fast rather than one which is merely waited on longer.
  */
 
 import { CACHE_OUTCOME } from "./object-info-cache.js";
@@ -173,6 +181,25 @@ const NO_ANSWER = Symbol("object-info-transport-timeout");
 const NOT_TRIED = Symbol("object-info-transport-not-tried");
 
 /**
+ * Name which of the four things a transport outcome IS, in ONE place.
+ *
+ * The sentinels are Symbols, so `"err" in outcome` is a TypeError rather than a false —
+ * the branch order is load-bearing, not stylistic. Hand-writing that order at each of the
+ * three call sites shipped exactly that bug once already during this issue: a patch
+ * replaced the NO_ANSWER branch instead of adding beside it, and every fallback timeout
+ * began throwing out of a module which documents that it always resolves.
+ *
+ * Callers switch on the returned tag, so each keeps its own control flow — two of the
+ * three return early from the whole function on a usable payload — while the one
+ * dangerous test lives here.
+ */
+function outcomeKind(outcome) {
+  if (outcome === NOT_TRIED) return "not-tried";
+  if (outcome === NO_ANSWER) return "no-answer";
+  return "err" in outcome ? "threw" : "value";
+}
+
+/**
  * Run one I/O step against the SHARED deadline, preserving the difference between the
  * three outcomes the failure list already distinguishes: it answered, it threw, or it
  * never answered in time.
@@ -214,12 +241,57 @@ export async function fetchWholeObjectInfo({
   now = () => Date.now(),
 } = {}) {
   // ONE budget for the whole question, spent down by each step (#1161).
-  const startedAt = now();
-  const spent = () => {
-    // A non-monotonic clock (Date.now is the default, and it can jump) must not be able to
-    // hand a step a NEGATIVE elapsed time and so a larger budget than the deadline.
-    const elapsed = now() - startedAt;
-    return Number.isFinite(elapsed) && elapsed > 0 ? elapsed : 0;
+  // A RATCHET, because clamping each reading was not enough. `Date.now()` is this module's
+  // default clock and it can step BACKWARDS — an NTP correction, a manual or DST change, a
+  // VM suspend/resume. Clamping a single negative reading to 0 stopped one step from
+  // getting an over-large budget, but it also silently REFUNDED everything already spent:
+  // measured with a -60s jump at t=10s against a 20000ms deadline, the fallback redrew a
+  // full budget and the body redrew another, and the call returned at wall t=49900ms.
+  //
+  // That is worse than the bug it was meant to prevent. `graph_set_widget` waits on the
+  // history seed (8s cap) before this even runs, so a 50s oracle overruns the bridge's 30s
+  // per-command timeout and the agent gets a bare timeout naming no routes — precisely the
+  // #1161 symptom this oracle exists to replace with an answer of its own.
+  //
+  // Elapsed time therefore only ever moves FORWARD here. A backwards jump stops the clock
+  // rather than rewinding it, so the total is bounded by the deadline no matter what the
+  // wall clock does.
+  // ACCOUNT BY WHAT WAS GRANTED, NOT BY WHAT THE CLOCK SAYS. A high-water ratchet was tried
+  // first and is not enough: it only samples at step boundaries, so a jump BETWEEN two
+  // samples still refunds everything spent, and a test for it passes either way.
+  //
+  // The safety property cannot depend on `now()` at all. Each step is handed a grant, and a
+  // step cannot outlast its grant because the TIMER enforces that in real time — whatever
+  // `now()` believes. So if the grants sum to at most the deadline, the call takes at most
+  // the deadline, and no clock behaviour can change it.
+  //
+  // The clock is then used only to hand BACK time a fast step did not use, which is an
+  // optimisation. A reading that is negative or non-finite gives back nothing, so a broken
+  // clock costs efficiency and never correctness.
+  let consumed = 0;
+  const runStep = async (attempt, want) => {
+    const grant = Math.max(0, Math.min(want, deadlineMs - consumed));
+    const startedStep = now();
+    const outcome = await runTransport(attempt, grant, timers);
+    if (outcome === NO_ANSWER) {
+      // A TIMEOUT IS ITSELF A REAL-TIME MEASUREMENT, and the only one here that cannot lie.
+      // The timer fired, so the full grant elapsed in wall time no matter what `now()`
+      // believes — and `now()` can believe anything, including that no time passed at all.
+      // A clock stalled at a constant (a coarse timer resolution, a frozen VM clock, a test
+      // stub) reported 0ms for a step that really hung, so nothing was charged and each
+      // later step drew a fresh full grant: three hung steps ran 9000ms against a 6000ms
+      // deadline. Charging the grant on timeout closes that without trusting the clock.
+      consumed += grant;
+    } else {
+      const elapsed = now() - startedStep;
+      // For a step that ANSWERED, the clock is the only estimate available. Zero is
+      // measurable — a step answering inside the same millisecond really used no time, and
+      // charging it the full grant made a fast client route plus a fast fallback exhaust
+      // the budget between them and leave the body unread. Anything unmeasurable
+      // (backwards, NaN) is charged in full, the conservative direction.
+      consumed += Number.isFinite(elapsed) && elapsed >= 0 ? Math.min(elapsed, grant) : grant;
+    }
+    return { outcome, grant };
   };
   // RESERVE A FLOOR FOR THE ROUTE THAT HAS NOT BEEN TRIED YET.
   //
@@ -236,41 +308,25 @@ export async function fetchWholeObjectInfo({
   // fallback is reached. Half of the shipped budget is 10s against a 167ms measured
   // download (#767) and a ~450ms live measurement — see the header for why the ~14.5s
   // figure that once sat here measures a different operation entirely.
-  const FALLBACK_FLOOR = Number.isFinite(deadlineMs) && deadlineMs > 0 ? Math.floor(deadlineMs / 2) : 0;
-  const clientRouteBudget = () => {
-    const left = deadlineMs - spent() - FALLBACK_FLOOR;
-    return left > 0 ? left : 0;
-  };
-  // A FLOOR, NOT MERELY WHAT IS LEFT OVER. Subtracting a reserve makes the fallback's
-  // budget depend on the first step finishing on time, and it does not always: measured at
-  // small deadlines the per-step overhead alone overran the subtraction and the fallback
-  // was skipped again (fetchApi call count 0), which is the exact defect this is fixing.
-  // Taking the MAX makes the guarantee structural — the fallback cannot be starved by
-  // anything the client route does, including overrunning its own bound.
   //
-  // The worst case is still ONE deadline rather than one-and-a-half: the client route is
-  // itself capped at deadline - floor, so reaching the fallback with the floor intact means
-  // roughly half the budget was spent, and the max() and the subtraction agree there. The
-  // response and the body then share ONE end time rather than each drawing a fresh floor,
-  // so a stalled body cannot restart the clock.
-  let fallbackEndsAt = null;
-  const fallbackBudget = () => {
-    const now_ = spent();
-    if (fallbackEndsAt === null) fallbackEndsAt = now_ + Math.max(deadlineMs - now_, FALLBACK_FLOOR);
-    const left = fallbackEndsAt - now_;
-    return left > 0 ? left : 0;
-  };
+  // AND THE FLOOR NOW HOLDS BY CONSTRUCTION rather than by a `max()` that has to argue with
+  // the clock. The client route is granted at most `deadline - consumed - FLOOR`, and
+  // `consumed` grows by at most that grant, so when the fallback is reached
+  // `deadline - consumed >= FLOOR` is arithmetic, not a hope. No clock jump, throttled
+  // timer or overrun can starve the route this oracle exists to reach.
+  const FALLBACK_FLOOR = Number.isFinite(deadlineMs) && deadlineMs > 0 ? Math.floor(deadlineMs / 2) : 0;
+  const clientRouteWant = () => deadlineMs - consumed - FALLBACK_FLOOR;
+  const fallbackWant = () => deadlineMs - consumed;
   const failures = [];
 
   if (typeof getNodeDefs === "function") {
-    const clientMs = clientRouteBudget();
-    const outcome = await runTransport(getNodeDefs, clientMs, timers);
-    if (outcome === NOT_TRIED) {
-      // Cannot happen while this is the FIRST step (it holds the full budget minus its
-      // own reserve), but it is stated rather than assumed: `"err" in outcome` on a
-      // Symbol throws, so every outcome branch must be exhaustive.
+    const { outcome, grant: clientMs } = await runStep(getNodeDefs, clientRouteWant());
+    const kind = outcomeKind(outcome);
+    if (kind === "not-tried") {
+      // Cannot happen while this is the FIRST step (it holds the full budget minus the
+      // fallback's floor), but it is stated rather than assumed.
       failures.push("api.getNodeDefs() was not attempted — the budget was already spent");
-    } else if (outcome === NO_ANSWER) {
+    } else if (kind === "no-answer") {
       // The #1161 case. Recorded as a failure like any other, and — critically — execution
       // CONTINUES to the second transport, which is what this bound exists to reach.
       // THE STEP'S OWN BUDGET, not the whole deadline. Browser-verified against a live
@@ -279,7 +335,7 @@ export async function fetchWholeObjectInfo({
       // number that was never spent is the same defect as #982's "unreachable or the
       // fetch failed" — a refusal asserting something it did not establish.
       failures.push(`api.getNodeDefs() did not answer within its ${Math.round(clientMs)}ms share of the ${deadlineMs}ms budget`);
-    } else if ("err" in outcome) {
+    } else if (kind === "threw") {
       failures.push(describeFailure("api.getNodeDefs() threw", outcome.err));
     } else {
       const defs = outcome.value;
@@ -308,16 +364,16 @@ export async function fetchWholeObjectInfo({
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    const fallbackMs = fallbackBudget();
-    const outcome = await runTransport(() => fetchApi("/object_info"), fallbackMs, timers);
-    if (outcome === NOT_TRIED) {
+    const { outcome, grant: fallbackMs } = await runStep(() => fetchApi("/object_info"), fallbackWant());
+    const kind = outcomeKind(outcome);
+    if (kind === "not-tried") {
       // TRUTHFUL ABOUT WHAT WAS NOT DONE. Saying this route "did not answer" when no
       // request was ever sent is #982's original defect — a refusal asserting a cause it
       // never established. The reserve above exists so this stays unreachable in practice.
       failures.push("GET /object_info was not attempted — the budget was spent before it was reached");
-    } else if (outcome === NO_ANSWER) {
+    } else if (kind === "no-answer") {
       failures.push(`GET /object_info did not answer within its ${Math.round(fallbackMs)}ms share of the ${deadlineMs}ms budget`);
-    } else if ("err" in outcome) {
+    } else if (kind === "threw") {
       failures.push(describeFailure("GET /object_info threw", outcome.err));
     } else {
       const res = outcome.value;
@@ -346,13 +402,13 @@ export async function fetchWholeObjectInfo({
         // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
         // half-open connection can also stall, so it is bounded as well rather than merely
         // re-caught: the response arriving is not the same event as the body arriving.
-        const bodyMs = fallbackBudget();
-        const body = await runTransport(() => res.json(), bodyMs, timers);
-        if (body === NOT_TRIED) {
+        const { outcome: body, grant: bodyMs } = await runStep(() => res.json(), fallbackWant());
+        const bodyKind = outcomeKind(body);
+        if (bodyKind === "not-tried") {
           failures.push("GET /object_info answered but its body was not read — the budget was spent");
-        } else if (body === NO_ANSWER) {
+        } else if (bodyKind === "no-answer") {
           failures.push(`GET /object_info answered but its body did not arrive within its ${Math.round(bodyMs)}ms share of the ${deadlineMs}ms budget`);
-        } else if ("err" in body) {
+        } else if (bodyKind === "threw") {
           // Deliberately the SAME wording as before. A parse failure used to surface
           // through this route's catch, and an existing #982 test pins the sentence a user
           // reads. This change is about bounding the waits, not about rewording refusals —
