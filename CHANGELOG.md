@@ -6,7 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.14.25] - 2026-08-13
+### Fixed
+
+- **Restarting the agent can no longer overlap with a second restart or a reload (#1171).**
+  The panel keeps one flag so that restarting the agent and reloading it cannot run at the
+  same time — but the restart released that flag as soon as the request came back, while it
+  was still finishing: ending the current turn, clearing the markers that say a turn is in
+  flight, invalidating the old session, and reconnecting. Anything started in that window
+  ran straight through the middle of it, tearing down the same state twice.
+  The flag is now held until the reconnect, which is what the reload path already did, so
+  the two finally agree.
+- **Switching to a different agent backend no longer fails silently (#1171).**
+  If the old provider's session could not be invalidated, the switch stopped with nothing
+  said: no message, and the previously selected backend still showing. It now says the same
+  thing a restart says when it pauses for the same reason. (The panel can still be left
+  showing a backend it did not finish switching to — that is tracked separately in #1184.)
 
 ### Fixed
 
