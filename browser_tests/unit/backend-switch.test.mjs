@@ -1,0 +1,183 @@
+// #1184 — a backend switch must not commit anything until the switch is legal.
+//
+// `connectBackend()` committed the new backend to memory, to localStorage and to the UI and
+// only then checked whether the old provider's session could be durably invalidated. When
+// that check failed it returned, leaving the panel claiming a backend it never connected to
+// — and `STORAGE_KEY_BACKEND` outlives the tab, so a reload adopted the aborted choice for
+// good.
+//
+// THESE TESTS ASSERT ORDER, NOT JUST OUTCOME. That distinction is the whole point: the
+// buggy version reached the same final state on every successful switch, so any test that
+// only checks the end state passes against it. What it got wrong was WHEN each write
+// happened relative to the guard.
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { BACKEND_SWITCH, runBackendSwitch } from "../../web/js/lib/backend-switch.js";
+
+const PANEL_SRC = readFileSync(
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  "utf8",
+);
+
+/**
+ * Effects that record the ORDER they were called in.
+ *
+ * Every commit the panel performs is represented, because each is a distinct piece of
+ * leaked state and asserting on a sampled subset is how five of six leaks stay invisible.
+ */
+function recorder({ live = "claude", picked = "claude", invalidate = async () => true, replay = "prior chat" } = {}) {
+  const log = [];
+  let liveBackend = live;
+  const effects = {
+    liveBackend: () => liveBackend,
+    pickedBackend: () => picked,
+    invalidate: async () => {
+      log.push("invalidate");
+      return invalidate();
+    },
+    seedPrefs: () => log.push("seedPrefs"),
+    commitSelection: () => log.push("commitSelection"),
+    endTurn: () => log.push("endTurn"),
+    buildReplay: () => {
+      log.push("buildReplay");
+      return replay;
+    },
+    armContext: () => log.push("armContext"),
+    teardownAndConnect: () => log.push("teardownAndConnect"),
+    disclose: (reason) => log.push(`disclose:${reason}`),
+  };
+  return { log, effects, setLive: (b) => { liveBackend = b; } };
+}
+
+/** Every effect that COMMITS to the new backend. None may run before the switch is legal. */
+const COMMITS = ["seedPrefs", "commitSelection", "endTurn", "buildReplay", "armContext", "teardownAndConnect"];
+
+test("#1184 a failed invalidate commits NOTHING — asserted on every effect, not a sample", async () => {
+  const { log, effects } = recorder({ live: "claude", invalidate: async () => false });
+  const result = await runBackendSwitch("codex", effects);
+
+  assert.deepEqual(result, { switched: false, reason: BACKEND_SWITCH.INVALIDATE_FAILED });
+  // The exact sequence: ask, then say so. Nothing else.
+  assert.deepEqual(log, ["invalidate", `disclose:${BACKEND_SWITCH.INVALIDATE_FAILED}`]);
+  // …and stated per effect, so a failure names the leak rather than a diff of two arrays.
+  for (const effect of COMMITS) {
+    assert.ok(!log.includes(effect), `${effect} ran despite the switch being illegal`);
+  }
+});
+
+test("#1184 the invalidate happens BEFORE every commit, not after them", async () => {
+  // The regression test proper. The old order produced this same final state, so only the
+  // relative positions distinguish the fix from the bug.
+  const { log, effects } = recorder({ live: "claude" });
+  const result = await runBackendSwitch("codex", effects);
+
+  assert.deepEqual(result, { switched: true, reason: BACKEND_SWITCH.SWITCHED });
+  assert.equal(log[0], "invalidate", "the legality check must come first");
+  for (const effect of COMMITS) {
+    const at = log.indexOf(effect);
+    assert.ok(at > 0, `${effect} must run on a successful switch`);
+    assert.ok(at > log.indexOf("invalidate"), `${effect} committed BEFORE the invalidate — this is the defect`);
+  }
+  assert.equal(log[log.length - 1], "teardownAndConnect", "the connect must be last");
+});
+
+test("#1184 a NON-switch never consults the history store", async () => {
+  // A first connect and a re-pick of the live backend are not switches, and gating them on
+  // the history store would make an unrelated IndexedDB hiccup block connecting at all.
+  for (const [label, live] of [["first connect", null], ["re-pick of the live backend", "codex"]]) {
+    const { log, effects } = recorder({ live, invalidate: async () => false });
+    const result = await runBackendSwitch("codex", effects);
+
+    assert.equal(result.switched, false, `${label}: not a switch`);
+    assert.equal(result.reason, BACKEND_SWITCH.CONNECTED, `${label}: but it DID connect`);
+    assert.ok(!log.includes("invalidate"), `${label}: must not invalidate`);
+    assert.ok(log.includes("commitSelection"), `${label}: must still commit the selection`);
+    assert.ok(log.includes("teardownAndConnect"), `${label}: must still connect`);
+    // Session-scoped work belongs to a switch only.
+    assert.ok(!log.includes("endTurn"), `${label}: no turn to end`);
+    assert.ok(!log.includes("armContext"), `${label}: nothing to replay`);
+  }
+});
+
+test("#1184 a handshake landing during the invalidate supersedes the switch", async () => {
+  // Awaiting before committing opens a window the old order did not have: a handshake can
+  // write `connectedBackend` underneath us. Under the old order those writes overwrote our
+  // commits; under this one ours would land last and win against a backend the user did not
+  // pick from the state we decided on.
+  const rec = recorder({ live: "claude" });
+  rec.effects.invalidate = async () => {
+    rec.log.push("invalidate");
+    rec.setLive("gemini"); // a handshake completes mid-await
+    return true;
+  };
+  const result = await runBackendSwitch("codex", rec.effects);
+
+  assert.deepEqual(result, { switched: false, reason: BACKEND_SWITCH.SUPERSEDED });
+  for (const effect of COMMITS) {
+    assert.ok(!rec.log.includes(effect), `${effect} ran against a backend state that had already moved`);
+  }
+});
+
+test("#1184 the reseed predicate is preserved: reseed iff the target differs", async () => {
+  // Seeding from the new backend's group is what stops the post-handshake push carrying the
+  // previous backend's model/effort. A re-pick must NOT reseed — that would clobber a
+  // user's in-session model choice.
+  const differs = recorder({ live: null, picked: "claude" });
+  await runBackendSwitch("codex", differs.effects);
+  assert.ok(differs.log.includes("seedPrefs"), "a different target reseeds");
+
+  const same = recorder({ live: null, picked: "codex" });
+  await runBackendSwitch("codex", same.effects);
+  assert.ok(!same.log.includes("seedPrefs"), "a re-pick of the same backend must not reseed");
+});
+
+test("#1184 the replay is built AFTER the turn ends, and only armed when non-empty", async () => {
+  const withReplay = recorder({ live: "claude", replay: "User: hi" });
+  await runBackendSwitch("codex", withReplay.effects);
+  assert.ok(
+    withReplay.log.indexOf("buildReplay") > withReplay.log.indexOf("endTurn"),
+    "the transcript is captured after the turn is closed out",
+  );
+  assert.ok(withReplay.log.includes("armContext"));
+
+  const empty = recorder({ live: "claude", replay: "" });
+  await runBackendSwitch("codex", empty.effects);
+  assert.ok(empty.log.includes("buildReplay"), "it still asks");
+  assert.ok(!empty.log.includes("armContext"), "…but arming an empty preamble would send a header with no chat");
+});
+
+test("#1184 WIRING: the panel delegates, and keeps no commit above the guard", () => {
+  // Without this the module can be correct and dead. The panel is 1.7MB of IIFE, so this is
+  // a source assertion by necessity — but it is the specific one that matters: no write to
+  // the committed state may remain textually inside connectBackend.
+  const at = PANEL_SRC.indexOf("async function connectBackend(id) {");
+  assert.ok(at > 0, "connectBackend must be findable");
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf("\n  }", at));
+
+  assert.match(body, /runBackendSwitch\(id, \{/, "connectBackend must delegate the ordering to the module");
+  // The commits may only appear as INJECTED effects, i.e. inside a callback the module
+  // calls after the guard — never as statements the function runs on its own.
+  assert.match(body, /commitSelection: \(next\) => \{/, "the selection writes must be an injected effect");
+  assert.match(body, /invalidate: \(\) => invalidateDurableAgentSession\(\)/, "the guard must be injected too");
+  // The old shape, stated exactly so a revert is caught by name.
+  assert.doesNotMatch(
+    body,
+    /if \(!await invalidateDurableAgentSession\(\)\) return;/,
+    "the bare guarded return is the #1184 defect — the module decides the order now",
+  );
+});
+
+test("#1184 the disclosure is honest only because nothing was committed", () => {
+  // #1171 briefly added this same line at the old call site and it was withdrawn, correctly:
+  // saying "reconnect is paused" while the panel had already half-switched was a lie. The
+  // ordering fix is what makes the existing key true, which is why no new catalog string is
+  // minted here — the English catalog is frozen (#1135) and one new key means a pass over
+  // eleven locale files.
+  const at = PANEL_SRC.indexOf("async function connectBackend(id) {");
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf("\n  }", at));
+  assert.match(body, /panel\.the_old_session_could_not_be_invalidated/, "the abort must be disclosed, not silent");
+});
