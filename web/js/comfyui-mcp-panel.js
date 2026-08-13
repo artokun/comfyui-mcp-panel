@@ -8610,6 +8610,18 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
+/**
+ * #1180 — the widen runs INSIDE the registration wait above, so its bound has to fit
+ * there. The generic 10s node-defs bound is TWICE this function's whole 5s deadline: a
+ * timed-out widen would consume the entire wait and leave the poll loop nothing, so the
+ * add would report unmaterialized widgets having never actually looked for them.
+ *
+ * Half the registration deadline, derived from it rather than picked, so the two cannot
+ * drift apart. The widen is one whole-document fetch, measured at 167ms (#767) and ~366ms
+ * live, so half of 5s is still an order of magnitude of headroom.
+ */
+const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 2);
+
 async function awaitRequiredCustomWidgetRegistration(
   nodeData,
   comfyApp,
@@ -10198,7 +10210,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // falls through to the identical full fetch below, so no refusal, removal
         // verdict or history check is decided on anything new.
         if (isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
-          const one = await fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route));
+          // #1180 — THE FAST PATH IS BOUNDED TOO, and it has to be: it runs FIRST, so a
+          // half-open connection hangs here before the bounded fallback below is ever
+          // reached. Bounding only the fallback left `graph_add_node` hanging on exactly
+          // the connection this issue is about. `fetchSingleNodeDef` awaits both the
+          // response and its body, so the whole call is wrapped rather than the request
+          // alone. A timeout resolves null, which is the same answer it already gives for
+          // every other doubt and which sends the add to the full fetch — no new branch.
+          const one = await withTimeout(
+            fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route)),
+            NODE_DEFS_FETCH_TIMEOUT_MS,
+            () => null,
+          );
           if (one) {
             freshDefs = recordObjectInfoTypes(one);
             freshDefsAreSingleClass = true;
@@ -10273,7 +10296,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // doubtful case there is, so it takes that same path. Unbounded, this hung the
           // add on the very path that was about to refuse — the worst place to park,
           // because the user is already being told something went wrong.
-          const fetched = await boundedGetNodeDefs();
+          const fetched = await boundedGetNodeDefs(WIDEN_SOCKET_PROOF_TIMEOUT_MS);
           const whole = fetched === NODE_DEFS_NO_ANSWER ? null : fetched;
           // "I did not find out" is not "nothing outputs anything", and the difference
           // matters because the caller REPLACES its proof with whatever comes back.

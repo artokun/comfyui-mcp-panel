@@ -66,6 +66,10 @@ import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
 // #1180 — mirrors the panel's module-scope sentinel so the rebuilt executor compares
 // against the same value the bounded fetch resolves.
 const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+// #1180 — the widen runs inside the 5s custom-widget registration wait, so its bound is
+// half that rather than the generic node-defs bound, which would consume the whole wait.
+const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(5000 / 2);
+const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -233,6 +237,9 @@ function realGraphAddNode(comfy, overrides = {}) {
     // real file; this harness rebuilds the executor in a synthetic scope, so they are
     // injected. Real withTimeout, so the bound is exercised rather than stubbed away.
     NODE_DEFS_NO_ANSWER,
+    WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
+    withTimeout,
     ...overrides,
   };
   // Resolved from `deps` at CALL time: tests pass their own `api` through overrides, and a

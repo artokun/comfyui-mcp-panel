@@ -131,9 +131,23 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   const src = readFileSync(PANEL_JS, "utf8");
   const i = src.indexOf("getFreshObjectInfo: async () => {");
   assert.ok(i > 0, "the fresh-oracle callback must be findable");
-  const body = src.slice(i, i + 2600);
+  // BOTH ENDS ANCHORED STRUCTURALLY. This used to slice a fixed 2,600 characters, so
+  // adding a comment inside the callback pushed the second snapshotBackendDef out of the
+  // window and failed the count below — a test breaking on prose rather than on behaviour.
+  // The callback ends where the next key of the same object literal begins.
+  const end = src.indexOf("refresh: (defs) =>", i);
+  assert.ok(end > i, "the fresh-oracle callback must be followed by the refresh key");
+  const body = src.slice(i, end);
   const guard = body.indexOf("isRegisteredNodeType(LG?.registered_node_types");
+  // #1180 bounded this call too — it runs FIRST, so an unbounded fast path hung the add
+  // before the bounded fallback was ever reached. The gate assertion is about WHERE the
+  // single-class fetch sits, which the wrapping does not change.
   const call = body.indexOf("fetchSingleNodeDef(class_type");
+  assert.match(
+    body,
+    /withTimeout\(\s*[\r\n]?\s*fetchSingleNodeDef\(class_type/,
+    "the fast path must be bounded: it runs before the fallback and hangs the add on its own",
+  );
   assert.ok(guard > 0, "the registered-type gate must be present");
   assert.ok(call > guard, "…and the single-class fetch must sit INSIDE it");
   // The full fetch must still be there as the fallback. #1180 bounded it — a half-open
@@ -237,4 +251,33 @@ test("#1180: the RETRIED fetch's worst case stays inside the command budget", ()
   assert.ok(perAttempt < single, "a retried attempt cannot be given the single-call bound");
   // The refresh site really uses it.
   assert.match(src, /boundedGetNodeDefs\(NODE_DEFS_ATTEMPT_TIMEOUT_MS\)/, "the refresh uses the derived bound");
+});
+
+test("#1180: the widen's bound fits INSIDE the registration deadline it runs under", () => {
+  // `widenSocketProof` is awaited from inside `awaitRequiredCustomWidgetRegistration`,
+  // whose deadline is `startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS`. Given the
+  // generic 10s node-defs bound — twice that — a timed-out widen consumes the ENTIRE
+  // registration wait, and the add then reports unmaterialized widgets having never
+  // actually polled for them. So the widen needs its own, smaller bound.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const registration = Number(
+    (src.match(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/) || [])[1],
+  );
+  assert.ok(registration > 0, "the registration deadline must be findable");
+
+  // DERIVED from that deadline, not picked, so the two cannot drift apart.
+  assert.match(
+    src,
+    /const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ \d+\)/,
+    "the widen's bound must be derived from the registration deadline",
+  );
+  const widen = Math.floor(registration / 2);
+  assert.ok(widen > 0 && widen < registration, `the widen bound must fit inside ${registration}ms, got ${widen}`);
+
+  // …and the widen must actually use it rather than the generic node-defs bound.
+  assert.match(
+    src,
+    /boundedGetNodeDefs\(WIDEN_SOCKET_PROOF_TIMEOUT_MS\)/,
+    "the widen must use its own bound, not the 10s single-call one",
+  );
 });
