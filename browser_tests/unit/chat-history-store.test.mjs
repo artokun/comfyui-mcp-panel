@@ -2183,12 +2183,11 @@ test('a canonical commit cannot hide failure to save a legacyShadow only-copy tr
   store.close()
 })
 
-test('#1171 flush() SETTLES even when IndexedDB never answers, and reports success', async () => {
+test('#1171 flush() SETTLES even when IndexedDB never answers', async () => {
   // Relied on by the panel: hardRestart holds the reload re-entrancy guard across
   // `invalidateDurableAgentSession()`, which awaits this. If flush() could hang, that guard
-  // would latch for the rest of the session — no further restart, no soft reload, and no
-  // affordance to clear it. A bound was added in the panel for that fear and removed again
-  // once this property was established, so the property belongs here, tested behaviourally.
+  // would latch for the rest of the session. A bound was added in the panel for that fear
+  // and removed again once this property was established, so it is pinned here.
   //
   // The worst slow store there is: an `open` request that fires NO handler at all.
   const hungIndexedDb = {
@@ -2208,26 +2207,30 @@ test('#1171 flush() SETTLES even when IndexedDB never answers, and reports succe
   const started = Date.now()
   const result = await store.flush()
   const elapsed = Date.now() - started
-  // Settles on the store's OWN open cap rather than waiting forever.
-  assert.ok(elapsed < 10000, `flush() took ${elapsed}ms — it must settle on IDB_OPEN_TIMEOUT_MS, not hang`)
-  // For a SMALL history it also reports success: a capped open yields null from
-  // idbMergeWrite, the write chain passes that null through, and flush() maps null to true.
-  // That is only half the story — see the next test for what a real history does.
+  // Settles on the store's OWN open cap (IDB_OPEN_TIMEOUT_MS, 2000) rather than waiting
+  // forever. The slack is for CI scheduling, not for a second cap hiding behind this one.
+  assert.ok(elapsed < 4000, `flush() took ${elapsed}ms — it must settle on the open cap, not hang`)
+  // For a history INSIDE the local shadow's limits it also reports success — and via
+  // `result.ok === true`, because the shadow write is complete. (An earlier comment here
+  // claimed flush() got there by mapping a null result to true; that is a different branch
+  // and not the one this case takes.)
   assert.equal(result, true, 'a capped open must not read as a failed write for a small history')
   store.close?.()
 })
 
-test('#1171 a capped IndexedDB open DOES report failure once history exceeds the local shadow', async () => {
+test('#1171 a capped open reports failure exactly past the local shadow boundary', async () => {
   // The other half, and the one a first probe missed by testing a five-message thread and
-  // generalising from it. A capped open makes idbMergeWrite yield null, so persist() falls
-  // back to the LOCAL SHADOW's completeness — and the shadow is deliberately partial past
-  // LOCAL_SHADOW_THREADS (20) and LOCAL_SHADOW_MESSAGES (200). So for any user with real
-  // history, a two-second disk hiccup answers ok:false.
+  // generalising. A capped open makes idbMergeWrite yield null, so persist() falls back to
+  // the LOCAL SHADOW's completeness — and the shadow is deliberately partial past
+  // LOCAL_SHADOW_THREADS (20) and LOCAL_SHADOW_MESSAGES (200).
   //
-  // That is not a store fault. It matters because the panel's
-  // invalidateDurableAgentSession() maps this to "could not invalidate durably", and its
-  // callers must treat that as "could not CONFIRM" rather than "the store is broken" —
-  // which the backend-switch caller currently does not (#1184).
+  // Pinned AT the boundary rather than at some comfortably-past size, so this test says
+  // where the behaviour actually changes instead of merely that it changes somewhere.
+  //
+  // Why the panel cares: invalidateDurableAgentSession() maps a non-true flush to "could
+  // not invalidate durably", so for any user past these limits a two-second disk hiccup
+  // answers false — which its callers must treat as "could not CONFIRM" rather than "the
+  // store is broken" (#1184).
   const hungIndexedDb = {
     open: () => ({
       set onsuccess(_) {},
@@ -2236,20 +2239,27 @@ test('#1171 a capped IndexedDB open DOES report failure once history exceeds the
       set onupgradeneeded(_) {}
     })
   }
+  const thread = (id, n) => ({ id, ts: 1, title: id, msgs: Array.from({ length: n }, (_, i) => ({ id: id + i, role: 'user', text: 'x' })) })
   const cases = [
-    ['400 messages in one thread', [{ id: 't1', ts: 1, title: 'heavy', msgs: Array.from({ length: 400 }, (_, i) => ({ id: 'm' + i, role: 'user', text: 'x' })) }]],
-    ['30 threads', Array.from({ length: 30 }, (_, t) => ({ id: 't' + t, ts: t, title: 't' + t, msgs: [{ id: t + '-0', role: 'user', text: 'x' }] }))]
+    ['200 messages — at the limit', [thread('t', 200)], true],
+    ['201 messages — one past it', [thread('t', 201)], false],
+    ['20 threads — at the limit', Array.from({ length: 20 }, (_, t) => thread('t' + t, 1)), true],
+    ['21 threads — one past it', Array.from({ length: 21 }, (_, t) => thread('t' + t, 1)), false]
   ]
-  for (const [label, threads] of cases) {
+  for (const [label, threads, expectOk] of cases) {
     const store = new ChatHistoryStore({
       storage: createMemoryStorage(),
       indexedDb: hungIndexedDb,
       broadcastFactory: null
     })
-    store.persist(threads, {}, { maxThreads: 200, maxMessages: 1000 })
+    store.persist(threads, {}, { maxThreads: 500, maxMessages: 1000 })
     const result = await store.flush()
-    assert.notEqual(result, true, `${label}: a partial shadow must not claim a durable write`)
-    assert.equal(result?.ok, false, `${label}: and it reports why`)
+    if (expectOk) {
+      assert.equal(result, true, `${label}: a complete shadow still confirms`)
+    } else {
+      assert.notEqual(result, true, `${label}: a partial shadow must not claim a durable write`)
+      assert.equal(result?.ok, false, `${label}: and it reports why`)
+    }
     store.close?.()
   }
 })

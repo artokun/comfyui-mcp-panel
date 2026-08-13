@@ -1000,6 +1000,20 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   const prologue = body.match(/if \((\w+)\) return;\s*[\r\n]+\s*\1 = true;/);
   assert.ok(prologue, "hardRestart must open with a re-entrancy guard: `if (X) return; X = true;`");
   const guard = prologue[1];
+
+  // …AND IT MUST BE THE FLAG softReload SHARES. Deriving the name from hardRestart alone is
+  // blind to the one change that silently removes the mutual exclusion entirely: giving
+  // hardRestart its own private flag. Every assertion below would still hold, while a soft
+  // reload and a hard restart could once again run at the same time — which is the whole
+  // point of the flag.
+  const softStart = src.indexOf("async function softReload(");
+  assert.notEqual(softStart, -1, "could not locate softReload");
+  const softBody = src.slice(softStart, src.indexOf("\n  }", softStart));
+  assert.match(
+    softBody,
+    new RegExp(`if \\(${guard}\\) return;`),
+    `softReload must gate on the SAME flag hardRestart holds (\`${guard}\`) — a private flag is no exclusion`,
+  );
   const releaseRe = new RegExp(`^[ \\t]*${guard} = false;`, "m");
 
   const release = at(releaseRe);
@@ -1047,8 +1061,11 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   );
   // Exactly one release site. Two would mean the early `finally` came back alongside the
   // new one, which is the defect wearing the fix as a hat.
+  //
+  // NOT line-anchored: an inline re-release (`stopRebootWatch(); reloading = false;`) slips
+  // past an anchored count while reinstating exactly that defect.
   assert.equal(
-    (body.match(new RegExp(`^[ \\t]*${guard} = false;`, "gm")) || []).length,
+    (body.match(new RegExp(`\\b${guard} = false;`, "g")) || []).length,
     1,
     "the guard must be released in exactly one place",
   );
@@ -1067,8 +1084,9 @@ test("#1171: the durable invalidation is deliberately UNBOUNDED, and settles on 
   // the guard cannot latch here, and bounding merely gave the function a new way to answer
   // false for a HEALTHY store — landing on two exits that cannot absorb it.
   // The store's side of this contract is tested BEHAVIOURALLY, in
-  // chat-history-store.test.mjs ("#1171 flush() SETTLES even when IndexedDB never
-  // answers"): a hung open settles on the store's own cap and reports success. An earlier
+  // chat-history-store.test.mjs: a hung open SETTLES on the store's own cap. What it then
+  // REPORTS depends on how much history there is — success inside the local shadow's limits,
+  // ok:false past them — which is pinned there at the boundary. An earlier
   // version of this test asserted that file's SOURCE TEXT instead — matching `tx.oncomplete`
   // and friends — which coupled a restart test to another module's internals and would
   // break on a harmless refactor while proving nothing about behaviour.
