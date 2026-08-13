@@ -951,9 +951,31 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // never did. A bounded attempt that does not answer is a failed attempt, which is
       // exactly what the retry loop is for — so a transient stall now costs a retry
       // instead of the whole command, and a genuine outage still rethrows as before.
+      //
+      // ABANDONED ATTEMPTS ARE NOT CANCELLED — `withTimeout` deliberately does not, per its
+      // own header. So against a backend that is slow rather than dead, three attempts can
+      // leave three overlapping whole-document downloads in flight, contending for the same
+      // link. That is the cost of retrying at all and it predates this bound; what the bound
+      // changes is that the command now ENDS, instead of waiting on the first one forever.
+      // Worth knowing before raising either the attempt count or the per-attempt bound.
+      //
+      // A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT. `fetchNodeDefsWithRetry` rethrows the
+      // LAST error so the caller's verdict reports what actually failed — but with a
+      // timeout now able to be that last error, a genuine backend failure on attempt one
+      // would be buried under "did not answer" from attempt three, and the remedy would
+      // blame the wrong thing. So the first real error is remembered and preferred: a
+      // stall reports as a stall only when nothing better was learned.
+      let firstRealError = null;
       defs = await fetchNodeDefsWithRetry(async () => {
-        const result = await boundedGetNodeDefs(NODE_DEFS_ATTEMPT_TIMEOUT_MS);
+        let result;
+        try {
+          result = await boundedGetNodeDefs(NODE_DEFS_ATTEMPT_TIMEOUT_MS);
+        } catch (err) {
+          if (firstRealError === null) firstRealError = err;
+          throw err;
+        }
         if (result === NODE_DEFS_NO_ANSWER) {
+          if (firstRealError !== null) throw firstRealError;
           throw new Error(`api.getNodeDefs() did not answer within ${NODE_DEFS_ATTEMPT_TIMEOUT_MS}ms`);
         }
         return result;

@@ -731,3 +731,24 @@ test("#716: a FAILED refresh still drops the burst cache", async () => {
   assert.equal(verdict.reason, "object_info_fetch_failed");
   assert.equal(cacheInvalidations, before + 1, "a failed refresh must not leave a usable entry");
 });
+
+test("#1180: a real backend error outranks a synthesized timeout in the verdict", async () => {
+  // fetchNodeDefsWithRetry rethrows the LAST error, so the caller's verdict names what
+  // actually failed. Once a timeout can BE that last error, a genuine failure on attempt
+  // one gets buried under "did not answer" from attempt three — and describeNodeDefRefresh's
+  // remedy then blames the wrong thing, which is this codebase's own false-cause defect.
+  //
+  // First real error wins; a stall reports as a stall only when nothing better was learned.
+  const src = SRC;
+  const start = src.indexOf("defs = await fetchNodeDefsWithRetry(");
+  assert.notEqual(start, -1, "could not locate the retried fetch");
+  const body = src.slice(start, start + 900);
+  assert.match(body, /firstRealError/, "the first real error must be remembered");
+  assert.match(
+    body,
+    /if \(firstRealError !== null\) throw firstRealError;/,
+    "…and preferred over the synthesized timeout",
+  );
+  // The timeout message is still there for the case where nothing better was learned.
+  assert.match(body, /did not answer within \$\{NODE_DEFS_ATTEMPT_TIMEOUT_MS\}ms/);
+});
