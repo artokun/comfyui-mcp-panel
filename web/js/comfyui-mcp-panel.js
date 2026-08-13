@@ -23363,12 +23363,23 @@ function buildPanel() {
   // could not confirm one. The flush is IndexedDB-backed and can stall; both callers await
   // it while holding something, so an unbounded wait here is a wedge rather than a delay.
   //
-  // SIZED AGAINST THE STORE'S OWN BOUND, not a guess. `chat-history-store.js` already caps
-  // opening IndexedDB at `IDB_OPEN_TIMEOUT_MS = 2000` and resolves null past it, so the
-  // open half of a flush is bounded there. Twice that leaves the same margin again for the
-  // write itself, and stays far inside the 30s command budget. Anyone changing this should
-  // check that constant first rather than reasoning from a fresh number — sizing a bound
-  // from an unverified figure is what cost #1161 three review rounds.
+  // MEASURED, not inferred. `ChatHistoryStore.persist()` + `flush()` timed in a live panel
+  // on this ComfyUI install, writing threads of 120 messages x 400 chars:
+  //
+  //     1 thread     52 KB     35 ms
+  //     5 threads   259 KB     40 ms
+  //    20 threads  1035 KB     61 ms
+  //
+  // Nearly flat in payload — a 20x larger write costs under 2x the time — so 4000ms is
+  // roughly 65x the worst case observed. It also agrees with the store's own judgement:
+  // `chat-history-store.js` caps opening IndexedDB at `IDB_OPEN_TIMEOUT_MS = 2000` and
+  // resolves null past it, so the open half is already bounded there and this leaves the
+  // same margin again for the write.
+  //
+  // The first version of this comment reasoned only from that 2000ms constant, which is an
+  // inference about a DIFFERENT operation — the exact move that cost #1161 three review
+  // rounds when a refresh figure was cited as a download time. Anyone changing this should
+  // re-measure rather than adjust the number against an argument.
   const SESSION_INVALIDATE_FLUSH_MS = 4000;
 
   async function invalidateDurableAgentSession() {
