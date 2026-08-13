@@ -988,6 +988,7 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   const start = src.indexOf("async function hardRestart(");
   assert.notEqual(start, -1, "could not locate hardRestart");
   const end = src.indexOf("\n  }", start);
+  assert.notEqual(end, -1, "could not locate the end of hardRestart");
   const body = src.slice(start, end);
   const at = (re) => body.search(re);
 
@@ -998,6 +999,24 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
 
   assert.notEqual(release, -1, "the guard must still be released");
   assert.notEqual(reconnect, -1, "expected the reconnect");
+
+  // IN A `finally`, not merely before the reconnect. A plain assignment sitting between the
+  // tail and client.start() satisfies every positional check below while LATCHING the flag
+  // on the invalidate-failure early return and on any throw — the defect wearing the fix as
+  // a hat. That mutation passed this test until these three assertions were added.
+  const finallyAt = at(/^[ \t]*\} finally \{/m);
+  assert.notEqual(finallyAt, -1, "the release must sit in a `finally`, so every exit path takes it");
+  assert.equal(
+    (body.match(/^[ \t]*\} finally \{/gm) || []).length,
+    1,
+    "exactly one finally, so there is no doubt which one releases the guard",
+  );
+  assert.ok(release > finallyAt, "the release must be INSIDE that finally, not before it");
+  assert.ok(
+    endTurn < finallyAt,
+    "…and the tail must sit inside the guarded try — a finally opening before it guards nothing",
+  );
+
   assert.ok(
     release > endTurn,
     "the guard must still be held while the turn and its markers are retired — releasing " +
@@ -1031,9 +1050,18 @@ test("#1171: the durable invalidation is BOUNDED, so the widened guard cannot we
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const start = src.indexOf("async function invalidateDurableAgentSession(");
   assert.notEqual(start, -1, "could not locate invalidateDurableAgentSession");
-  const body = src.slice(start, src.indexOf("\n  }", start));
-  assert.match(body, /withTimeout\(/, "the flush must be bounded by the repo's one bounded-step primitive");
-  assert.match(body, /historyStore\.flush\(\)/, "…and it is the flush that is bounded");
+  const end = src.indexOf("\n  }", start);
+  assert.notEqual(end, -1, "could not locate the end of invalidateDurableAgentSession");
+  const body = src.slice(start, end);
+  // THE FLUSH MUST BE THE BOUNDED THING. Asserting that `withTimeout(` and
+  // `historyStore.flush()` each appear somewhere in the body is satisfied by a body that
+  // bounds something else entirely and awaits the flush unbounded beside it — that mutation
+  // passed this test until the two were required to be the same call.
+  assert.match(
+    body,
+    /withTimeout\(\s*[\r\n]?\s*historyStore\.flush\(\)/,
+    "the flush itself must be the promise handed to withTimeout, not merely nearby",
+  );
   assert.match(
     body,
     /timedOut\b[\s\S]*return false/,
