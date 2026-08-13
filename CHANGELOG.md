@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A backend switch that cannot complete no longer leaves the panel claiming the new one (#1184) (#1196).**
+  Picking a different provider committed the choice — in memory, to the chips, and to the
+  stored runtime pick — before checking whether the old provider's session could be safely
+  ended. When that check failed the switch stopped there, and because the stored pick
+  outlives the tab, a reload adopted a backend the panel had never actually connected to.
+  The conversation replay armed for the new provider was left armed too, so the next
+  message shipped the whole prior transcript back to the provider that already had it.
+  Nothing is committed now until the switch is known to be possible, and a switch that
+  stops says so instead of failing silently.
+
 ## [0.14.28] - 2026-08-13
 
 ### Fixed
