@@ -29532,6 +29532,15 @@ function buildPanel() {
     // see the note there. Widening a guard over an await that could hang would trade a race
     // for a wedge, which is what two earlier attempts at the sibling bug produced, so that
     // await settling is a precondition of this shape rather than an incidental detail.
+    //
+    // WHAT THIS DOES AND DOES NOT CHANGE HERE. The whole guarded tail lives inside
+    // `if (ok)`, and this pack's `/comfyui_mcp_panel/hard_restart` answers `{"ok": false}`
+    // with a 503 unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so on
+    // THIS distribution `ok` is always false, the tail is skipped, and the two shapes
+    // execute identically. The change is therefore preparatory here: it is correct for a
+    // deployment whose restart route really restarts the agent, and it stops the window
+    // existing before one of those meets it. Anyone measuring for a behaviour change on a
+    // stock install will find none, and that is expected rather than a broken fix.
     try {
       try {
         client.stop(); // drop the bridge so the old orchestrator can release the port

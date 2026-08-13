@@ -6,16 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- **Restarting the agent can no longer overlap with a second restart or a reload (#1171).**
+- **Restarting the agent holds its exclusion flag until the reconnect (#1171).**
   The panel keeps one flag so that restarting the agent and reloading it cannot run at the
-  same time — but the restart released that flag as soon as the request came back, while it
-  was still finishing: ending the current turn, clearing the markers that say a turn is in
-  flight, invalidating the old session, and reconnecting. Anything started in that window
-  ran straight through the middle of it, tearing down the same state twice.
-  The flag is now held until the reconnect, which is what the reload path already did, so
-  the two finally agree.
+  same time, but the restart released it as soon as the request came back — while it was
+  still ending the current turn, clearing the markers that say a turn is in flight,
+  invalidating the old session, and reconnecting. The flag is now held until the reconnect,
+  which is what the reload path already did, so the two agree.
+  **No visible change when the panel manages ComfyUI's agent the usual way**: this
+  distribution's restart route always answers "not restarted" (the orchestrator runs
+  out-of-band), so the work this now protects is skipped anyway. It matters for setups
+  whose restart route really does restart the agent, and it removes the window before one
+  of those hits it.
 
 ## [0.14.25] - 2026-08-13
 
