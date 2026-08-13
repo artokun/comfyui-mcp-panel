@@ -2182,3 +2182,37 @@ test('a canonical commit cannot hide failure to save a legacyShadow only-copy tr
   )
   store.close()
 })
+
+test('#1171 flush() SETTLES even when IndexedDB never answers, and reports success', async () => {
+  // Relied on by the panel: hardRestart holds the reload re-entrancy guard across
+  // `invalidateDurableAgentSession()`, which awaits this. If flush() could hang, that guard
+  // would latch for the rest of the session — no further restart, no soft reload, and no
+  // affordance to clear it. A bound was added in the panel for that fear and removed again
+  // once this property was established, so the property belongs here, tested behaviourally.
+  //
+  // The worst slow store there is: an `open` request that fires NO handler at all.
+  const hungIndexedDb = {
+    open: () => ({
+      set onsuccess(_) {},
+      set onerror(_) {},
+      set onblocked(_) {},
+      set onupgradeneeded(_) {}
+    })
+  }
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: hungIndexedDb,
+    broadcastFactory: null
+  })
+  store.persist([{ id: 't1', ts: 1, title: 'hung', msgs: [] }], {}, { maxThreads: 10, maxMessages: 10 })
+  const started = Date.now()
+  const result = await store.flush()
+  const elapsed = Date.now() - started
+  // Settles on the store's OWN open cap rather than waiting forever.
+  assert.ok(elapsed < 10000, `flush() took ${elapsed}ms — it must settle on IDB_OPEN_TIMEOUT_MS, not hang`)
+  // And reports SUCCESS: a capped open yields null from idbMergeWrite, the write chain
+  // passes that null through, and flush() maps a null result to true. This is why a slow
+  // store does NOT drive the panel's "could not be invalidated durably" pause.
+  assert.equal(result, true, 'a capped open must not read as a failed write')
+  store.close?.()
+})

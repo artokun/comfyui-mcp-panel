@@ -1052,11 +1052,12 @@ test("#1171: the durable invalidation is deliberately UNBOUNDED, and settles on 
   // all three terminal transaction events; `openDb` is capped and resolves null past it. So
   // the guard cannot latch here, and bounding merely gave the function a new way to answer
   // false for a HEALTHY store — landing on two exits that cannot absorb it.
-  const store = readFileSync(new URL("../../web/js/lib/chat-history-store.js", import.meta.url), "utf8");
-  for (const handler of [/tx\.oncomplete = \(\) =>/, /tx\.onerror = \(\) =>/, /tx\.onabort = \(\) =>/]) {
-    assert.match(store, handler, `the write transaction must settle on ${handler.source} — the reason no bound is needed`);
-  }
-  assert.match(store, /IDB_OPEN_TIMEOUT_MS/, "and opening the database is itself capped");
+  // The store's side of this contract is tested BEHAVIOURALLY, in
+  // chat-history-store.test.mjs ("#1171 flush() SETTLES even when IndexedDB never
+  // answers"): a hung open settles on the store's own cap and reports success. An earlier
+  // version of this test asserted that file's SOURCE TEXT instead — matching `tx.oncomplete`
+  // and friends — which coupled a restart test to another module's internals and would
+  // break on a harmless refactor while proving nothing about behaviour.
 
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const start = src.indexOf("async function invalidateDurableAgentSession(");
