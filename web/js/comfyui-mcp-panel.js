@@ -183,10 +183,10 @@ import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
-import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
+import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
-import { runBackendSwitch } from "./lib/backend-switch.js";
+import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
@@ -29791,9 +29791,23 @@ function buildPanel() {
         if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
         void connectAgent({ fromChip: true });
       },
-      // The same line hardRestart uses. It is honest HERE only because nothing has been
-      // committed by the time it runs — which was the objection that withdrew it last time.
-      disclose: () => {
+      // REASON-AWARE, because the two aborts are not the same event and one shared message
+      // would be false for one of them.
+      //
+      // INVALIDATE_FAILED is the #1184 case: nothing committed, still on the old backend,
+      // and the switch genuinely did not happen. hardRestart's existing line says exactly
+      // that, and it is honest HERE only because nothing has been committed by the time it
+      // runs — which was the objection that withdrew it from this site last time.
+      //
+      // SUPERSEDED says nothing, deliberately. A handshake landed while we were awaiting,
+      // which means the panel is CONNECTED and coherent: `onModels` has already written
+      // `connectedBackend`, `localStorage` and repainted the chips authoritatively, so the
+      // user can see which backend they are on. Printing the invalidate line there would be
+      // flatly wrong — the session WAS invalidated and nothing is paused. Saying something
+      // accurate instead would need a new catalog key, and English is frozen (#1135), so
+      // this defers to the chips rather than mint one.
+      disclose: (reason) => {
+        if (reason !== BACKEND_SWITCH.INVALIDATE_FAILED) return;
         appendSystem(
           tr(
             "panel.the_old_session_could_not_be_invalidated",

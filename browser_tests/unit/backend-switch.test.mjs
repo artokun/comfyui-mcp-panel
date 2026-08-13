@@ -181,3 +181,41 @@ test("#1184 the disclosure is honest only because nothing was committed", () => 
   const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf("\n  }", at));
   assert.match(body, /panel\.the_old_session_could_not_be_invalidated/, "the abort must be disclosed, not silent");
 });
+
+test("#1184 the two aborts are disclosed differently — one message cannot be true for both", () => {
+  // A shared message would be false for one of them. INVALIDATE_FAILED means nothing
+  // committed and the switch did not happen, which is what hardRestart's line says.
+  // SUPERSEDED means a handshake landed mid-await, so the panel IS connected and coherent —
+  // `onModels` has already written connectedBackend, localStorage and repainted the chips.
+  // Printing "reconnect is paused" there would be flatly wrong: the session WAS invalidated
+  // and nothing is paused.
+  //
+  // Caught by reading rather than by a test, which is why it is pinned now: the module
+  // passes a reason and the first wiring ignored it.
+  const at = PANEL_SRC.indexOf("async function connectBackend(id) {");
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf("\n  }", at));
+  assert.match(
+    body,
+    /disclose: \(reason\) => \{[\s\S]{0,200}?if \(reason !== BACKEND_SWITCH\.INVALIDATE_FAILED\) return;/,
+    "the disclosure must branch on the reason, not print the invalidate line for every abort",
+  );
+});
+
+test("#1184 a superseded switch reports its own reason, distinct from a failed invalidate", async () => {
+  // The module's half of the same property: the caller cannot tell the two apart unless
+  // these are distinct values.
+  assert.notEqual(BACKEND_SWITCH.SUPERSEDED, BACKEND_SWITCH.INVALIDATE_FAILED);
+
+  const rec = recorder({ live: "claude" });
+  rec.effects.invalidate = async () => {
+    rec.log.push("invalidate");
+    rec.setLive("gemini");
+    return true;
+  };
+  await runBackendSwitch("codex", rec.effects);
+  assert.ok(
+    rec.log.includes(`disclose:${BACKEND_SWITCH.SUPERSEDED}`),
+    "a supersede must disclose as a supersede, so the panel can choose to stay quiet",
+  );
+  assert.ok(!rec.log.includes(`disclose:${BACKEND_SWITCH.INVALIDATE_FAILED}`));
+});
