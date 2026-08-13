@@ -29305,7 +29305,22 @@ function buildPanel() {
       // The old provider's session must be durably invalid before any reconnect
       // can observe it. If reconnect fails or the browser closes here, reload
       // still starts fresh instead of restoring a foreign session.
-      if (!await invalidateDurableAgentSession()) return;
+      //
+      // #1171 — SAY SO. This return was silent: the user picked a backend and nothing
+      // happened, with no line in the transcript and the old backend still selected. That
+      // was survivable while only a genuine store failure could reach it; bounding the
+      // flush means a merely SLOW store reaches it too, so the silence had to go with it.
+      // Same wording shape as hardRestart's pause, for the same reason — proceeding would
+      // let a reconnect observe the session this switch exists to drop.
+      if (!await invalidateDurableAgentSession()) {
+        appendSystem(
+          tr(
+            "panel.the_old_session_could_not_be_invalidated",
+            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+          ),
+        );
+        return;
+      }
     }
     // Reflect the picked backend in the composer placeholder immediately; onModels
     // reaffirms it authoritatively from the handshake (fix #3).
