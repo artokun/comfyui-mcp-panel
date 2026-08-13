@@ -1040,35 +1040,36 @@ test("#1171: the reload guard is held across hardRestart's tail and released bef
   );
 });
 
-test("#1171: the durable invalidation is BOUNDED, so the widened guard cannot wedge", () => {
-  // Widening the guard without this trades a race for a wedge. The tail awaits
-  // invalidateDurableAgentSession(), which awaits historyStore.flush() — IndexedDB-backed
-  // and able to stall. One hung flush would latch `reloading` for the rest of the session:
-  // no further restart, no soft reload, and no affordance to clear it. This issue's own
-  // history warns about exactly that shape — two prior attempts at the sibling bug each
-  // introduced a worse bug.
+test("#1171: the durable invalidation is deliberately UNBOUNDED, and settles on its own", () => {
+  // A bound was added here and removed again, and the reversal is the interesting part.
+  //
+  // The argument for one: hardRestart now holds the reload guard across this call, so an
+  // await that never settled would latch the guard for the session. That shape is real —
+  // two earlier attempts at the sibling bug produced it — but it is not reachable through
+  // this store, and the bound cost more than the hazard.
+  //
+  // `flush()` awaits the serial `_writePromise`, and every write in that chain resolves on
+  // all three terminal transaction events; `openDb` is capped and resolves null past it. So
+  // the guard cannot latch here, and bounding merely gave the function a new way to answer
+  // false for a HEALTHY store — landing on two exits that cannot absorb it.
+  const store = readFileSync(new URL("../../web/js/lib/chat-history-store.js", import.meta.url), "utf8");
+  for (const handler of [/tx\.oncomplete = \(\) =>/, /tx\.onerror = \(\) =>/, /tx\.onabort = \(\) =>/]) {
+    assert.match(store, handler, `the write transaction must settle on ${handler.source} — the reason no bound is needed`);
+  }
+  assert.match(store, /IDB_OPEN_TIMEOUT_MS/, "and opening the database is itself capped");
+
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const start = src.indexOf("async function invalidateDurableAgentSession(");
   assert.notEqual(start, -1, "could not locate invalidateDurableAgentSession");
   const end = src.indexOf("\n  }", start);
   assert.notEqual(end, -1, "could not locate the end of invalidateDurableAgentSession");
   const body = src.slice(start, end);
-  // THE FLUSH MUST BE THE BOUNDED THING. Asserting that `withTimeout(` and
-  // `historyStore.flush()` each appear somewhere in the body is satisfied by a body that
-  // bounds something else entirely and awaits the flush unbounded beside it — that mutation
-  // passed this test until the two were required to be the same call.
-  assert.match(
+  // If a bound is ever reinstated, it must come with a reason that survives the two
+  // problems that retired this one, so the removal is asserted rather than merely narrated.
+  assert.doesNotMatch(
     body,
-    /withTimeout\(\s*[\r\n]?\s*historyStore\.flush\(\)/,
-    "the flush itself must be the promise handed to withTimeout, not merely nearby",
+    /withTimeout\(/,
+    "bounding flush() bounds the whole queued write chain, so a busy queue reads as a broken store",
   );
-  assert.match(
-    body,
-    /timedOut\b[\s\S]*return false/,
-    "a flush that did not finish cannot confirm invalidation, so it must report NOT confirmed",
-  );
-  // The bound is a real one, and lives where a reader can find it.
-  assert.match(src, /const SESSION_INVALIDATE_FLUSH_MS = \d+;/, "the bound is a named constant");
-  const ms = Number((src.match(/const SESSION_INVALIDATE_FLUSH_MS = (\d+);/) || [])[1]);
-  assert.ok(ms > 0 && ms < 30000, `the flush bound must be positive and inside the command budget, got ${ms}`);
+  assert.match(body, /await historyStore\.flush\(\)/, "the flush is awaited directly");
 });

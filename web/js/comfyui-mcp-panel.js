@@ -71,9 +71,6 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
-// #1171 — the repo's one bounded-step primitive. A second timeout helper written
-// alongside it is how this repo keeps producing near-duplicate bugs, per its own header.
-import { withTimeout } from "./lib/bounded-step.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
@@ -23363,67 +23360,33 @@ function buildPanel() {
   // could not confirm one. The flush is IndexedDB-backed and can stall; both callers await
   // it while holding something, so an unbounded wait here is a wedge rather than a delay.
   //
-  // MEASURED, not inferred. `ChatHistoryStore.persist()` + `flush()` timed in a live panel
-  // on this ComfyUI install, writing threads of 120 messages x 400 chars:
-  //
-  //     1 thread     52 KB     35 ms
-  //     5 threads   259 KB     40 ms
-  //    20 threads  1035 KB     61 ms
-  //
-  // Nearly flat in payload — a 20x larger write costs under 2x the time — so 4000ms is
-  // roughly 65x the worst case observed. It also agrees with the store's own judgement:
-  // `chat-history-store.js` caps opening IndexedDB at `IDB_OPEN_TIMEOUT_MS = 2000` and
-  // resolves null past it, so the open half is already bounded there and this leaves the
-  // same margin again for the write.
-  //
-  // The first version of this comment reasoned only from that 2000ms constant, which is an
-  // inference about a DIFFERENT operation — the exact move that cost #1161 three review
-  // rounds when a refresh figure was cited as a download time. Anyone changing this should
-  // re-measure rather than adjust the number against an argument.
-  const SESSION_INVALIDATE_FLUSH_MS = 4000;
-
   async function invalidateDurableAgentSession() {
     ssSet(SESSION_KEY, null);
     if (thread) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
-    // BOUNDED, because both callers block on it. `hardRestart` holds the reload
-    // re-entrancy guard across this call (#1171), so a stalled flush would latch that guard
-    // for the rest of the session — no further restart or soft reload, and no affordance to
-    // clear it. The backend switch above awaits it too and simply never proceeds.
+    // #1171 — DELIBERATELY UNBOUNDED, after a bound was added here and removed again.
     //
-    // A TIMEOUT IS REPORTED AS "NOT CONFIRMED", not as success. This function answers one
-    // question — is the old session durably invalid? — and a flush that did not finish
-    // cannot answer it. Both callers already handle false by pausing and saying so, which is
-    // the fail-closed direction: the risk of proceeding is restoring a session the restart
-    // exists to discard. The write itself is not cancelled and may well land; the next call
-    // then sees a settled store.
-    // The rejection arm is DEFENSIVE, not load-bearing: `ChatHistoryStore.flush()` catches
-    // its own write failure and resolves a result object, so it does not reject today. It
-    // is handled anyway because this function's callers treat any throw from here as a
-    // failed restart, and a store that starts rejecting should degrade to "not confirmed"
-    // rather than propagate.
-    const result = await withTimeout(
-      historyStore.flush().then((r) => ({ r }), () => ({ r: false })),
-      SESSION_INVALIDATE_FLUSH_MS,
-      () => ({ timedOut: true }),
-    );
-    if (result?.timedOut) {
-      // BOTH CALLERS SEE THE SAME `false`, and that is correct — either way this cannot
-      // confirm the durable write, and either way the safe move is to pause. But the two
-      // causes call for different action from a HUMAN: a store that reported failure is a
-      // real fault, while a store that merely did not finish inside the bound will usually
-      // succeed on a retry. The transcript line is the same for both (the English catalog
-      // is frozen, #1135); the distinction is recorded here, where whoever is debugging a
-      // stranded panel will look.
-      console.warn(
-        `[comfyui-mcp-panel] durable session invalidation did not confirm within ` +
-          `${SESSION_INVALIDATE_FLUSH_MS}ms — the write was not cancelled and may still land; ` +
-          `retrying usually succeeds. Session id and thread binding are already cleared in memory.`,
-      );
-      return false;
-    }
-    const r = result?.r;
-    return r === true || r?.ok === true;
+    // The reasoning for adding one: hardRestart now holds the reload re-entrancy guard
+    // across this call, so an await that never settles would latch that guard for the rest
+    // of the session. That is a real shape — it is what two earlier attempts at the sibling
+    // bug produced — but it is not reachable through this store, and the bound cost more
+    // than the hazard it removed.
+    //
+    // WHY IT SETTLES. `flush()` awaits the store's serial `_writePromise`. Every write in
+    // that chain resolves on all three terminal transaction events (`oncomplete`,
+    // `onerror`, `onabort`), `db.transaction(...)` is itself wrapped in try/catch, and
+    // `openDb` is capped by `IDB_OPEN_TIMEOUT_MS` and resolves null past it. There is no
+    // modelled path on which this promise simply never settles.
+    //
+    // WHAT THE BOUND COST. `flush()` awaits the WHOLE queued chain — including the
+    // full-snapshot write `persistThreads()` enqueues one line above — so a timeout meant
+    // "the queue was busy", not "the store is broken". It gave this function a new way to
+    // answer false for a healthy store, and that answer lands on two exits that cannot
+    // absorb it: connectBackend abandons a switch whose chips, prefs and armed replay have
+    // already committed to the new backend, and hardRestart skips `client.start()` and
+    // strands the bridge for a write that then lands a moment later.
+    const result = await historyStore.flush();
+    return result === true || result?.ok === true;
   }
 
   const panelAliasMutationSink = (path, value) => {
