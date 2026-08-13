@@ -274,8 +274,27 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
   // Every bounded phase must draw from that ONE deadline rather than carry its own number.
   assert.match(
     src,
-    /const runDeadline = monotonicNow\(\) \+ NODE_DEFS_RUN_BUDGET_MS;/,
+    /let runDeadline = monotonicNow\(\) \+ NODE_DEFS_RUN_BUDGET_MS;/,
     "the run must take a deadline once, before any phase starts",
+  );
+  // …and give back what the UNBOUNDED local work took, or that work spends the deadline
+  // rather than merely escaping it. Without this, a slow install (#610 measured the whole
+  // refresh at ~14.5s, mostly registration) reaches the combo phase with the budget gone,
+  // falls to the 1ms floor, and abandons a HEALTHY combo refresh — reporting
+  // combo_refresh_failed on every panel_refresh_nodes and leaving
+  // nodeDefsRefreshConfirmed false, which is what reopens #610's false 'model still
+  // missing'. The budget is an allowance for WAITING, not for computing.
+  assert.match(
+    src,
+    /runDeadline \+= monotonicNow\(\) - localWorkStartedAt;/,
+    "the unbounded register/reapply phases must not spend the waiting budget",
+  );
+  const localStart = src.indexOf("const localWorkStartedAt = monotonicNow();");
+  const giveBack = src.indexOf("runDeadline += monotonicNow() - localWorkStartedAt;");
+  assert.ok(localStart > 0 && giveBack > localStart, "the clock must stop before the register phase and restart after it");
+  assert.ok(
+    giveBack < src.indexOf('phase = "combo";', localStart),
+    "…and be handed back BEFORE the combo phase reads what is left",
   );
   assert.match(
     src,

@@ -988,7 +988,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // left of it, so the run's cost is this budget rather than the sum of numbers that each
   // looked reasonable alone. Taken here, before any phase starts, so a slow fetch is paid
   // for by the combo phase rather than added to it.
-  const runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
+  let runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -1069,6 +1069,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
       let lastAttemptTimedOut = false;
       defs = await fetchNodeDefsWithRetry(
         async () => {
+          // Unreachable as written — `shouldRetry` ends the loop on the first timeout, so
+          // this can never be observed true on entry. Kept because it is the invariant that
+          // makes the flag safe, not a consequence of it: a future `shouldRetry` that
+          // permits one retry after a stall would, without this line, mark every later
+          // attempt as timed out and stop the loop for a reason that had already passed.
           lastAttemptTimedOut = false;
           let result;
           try {
@@ -1115,6 +1120,24 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // is set ONLY when the registration call actually ran — a frontend without
     // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
     phase = "register";
+    // The budget measures WAITING THIS PANEL CONTROLS, and the two phases below are neither
+    // waiting nor controllable — so the clock stops across them and the deadline is pushed
+    // out by exactly what they took.
+    //
+    // Without this the deliberately-unbounded registration SPENT the run's deadline instead
+    // of merely escaping it, which starved the phase after it. On the install #610 measured
+    // — where the whole refresh is about 14.5s, most of it registration and the combo
+    // rebuild — the deadline was already gone by the combo phase, `nodeDefsBudgetLeft` fell
+    // to its 1ms floor, and a HEALTHY `refreshComboInNodes()` was abandoned before it could
+    // start. Every panel_refresh_nodes on that machine then reported combo_refresh_failed
+    // and told the user to reload the tab, for a refresh that had in fact succeeded; worse,
+    // `nodeDefsRefreshConfirmed` stayed false, which is what reopens #610's false "model
+    // still missing".
+    //
+    // The 1ms floor is right for a budget spent WAITING — it fails immediately and
+    // truthfully. It is wrong for one spent computing, and telling those apart is the whole
+    // reason the deadline moves here rather than the floor being softened.
+    const localWorkStartedAt = monotonicNow();
     if (defs && typeof a.registerNodesFromDefs === "function") {
       // #1180 — this await stays UNBOUNDED, and that is the decision, not an omission. It is
       // the last await on this path without a time limit, so it will be asked about again.
@@ -1142,6 +1165,10 @@ async function registerComfyNodeDefs(preloadedDefs) {
       const rootGraph = a.graph ?? a.canvas?.graph;
       if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
     }
+    // Hand back the time the unbounded local work took. After this, what remains of the
+    // deadline is what remains of the WAITING allowance, which is what the phase below
+    // draws on.
+    runDeadline += monotonicNow() - localWorkStartedAt;
     // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
     // models resolve and stale entries clear (#185/#181/#223).
     phase = "combo";

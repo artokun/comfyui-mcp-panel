@@ -17,40 +17,21 @@ import { dirname, join } from "node:path";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
-// #1180 — the panel bounds each getNodeDefs attempt and throws on the sentinel so the
-// retry loop treats a stalled attempt as a failed one. Both names are module-scope in
-// the real file, so this harness injects them alongside the collaborators it already does.
-const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
-// #1180 — the combo refresh resolves undefined on success, so "it worked" needs a sentinel
-// of its own rather than a boolean that a rejection and a timeout would have to share.
-const COMBO_OK = Symbol("combo-refreshed");
-const COMBO_NO_ANSWER = Symbol("combo-timeout");
-// READ from the source, not restated here. A harness that hardcodes the panel's numbers
-// stops failing when the panel's numbers change, which is the one thing these tests exist
-// to notice — the same trap the widen divisor was fixed for. `[200]` sat here as a literal
-// while the panel had already moved back to #954's shared schedule.
-const PANEL_SRC_FOR_CONSTS = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"), "utf8");
-const panelConst = (name) => {
-  const m = PANEL_SRC_FOR_CONSTS.match(new RegExp(`const ${name} = (\\d+);`));
-  if (!m) throw new Error(`the panel no longer defines ${name} as a literal — update this harness`);
-  return Number(m[1]);
-};
-const NODE_DEFS_FETCH_TIMEOUT_MS = panelConst("NODE_DEFS_FETCH_TIMEOUT_MS");
-// #1180 — the refresh shares #954's schedule rather than forking it; a timeout is declined
-// by `shouldRetry` instead of by shortening the schedule for everyone.
+// #1180 — READ from the panel, never restated. Shared with the other harnesses that
+// rebuild shipped functions, so one copy of a constant cannot drift from another.
+import {
+  COMBO_NO_ANSWER,
+  COMBO_OK,
+  NODE_DEFS_FETCH_SHARE,
+  NODE_DEFS_FETCH_TIMEOUT_MS,
+  NODE_DEFS_NO_ANSWER,
+  NODE_DEFS_RUN_BUDGET_MS,
+  monotonicNow,
+  nodeDefsBudgetLeft,
+} from "./_panel-constants.mjs";
+// The refresh shares #954's schedule rather than forking it; a timeout is declined by
+// `shouldRetry` instead of by shortening the schedule for everyone.
 const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
-// #1180 — one budget for a whole run, shared by its phases, because per-phase bounds do
-// not compose: the run performs them in sequence.
-const NODE_DEFS_RUN_BUDGET_MS = panelConst("NODE_DEFS_RUN_BUDGET_MS");
-const NODE_DEFS_FETCH_SHARE = (() => {
-  const m = PANEL_SRC_FOR_CONSTS.match(/const NODE_DEFS_FETCH_SHARE = (\d+) \/ (\d+);/);
-  if (!m) throw new Error("the panel no longer states NODE_DEFS_FETCH_SHARE as a ratio");
-  return Number(m[1]) / Number(m[2]);
-})();
-function nodeDefsBudgetLeft(deadline, share = 1) {
-  return Math.max(1, Math.floor((deadline - monotonicNow()) * share));
-}
-const monotonicNow = () => performance.now();
 const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) =>
   typeof apiValue?.getNodeDefs !== "function"
     ? Promise.resolve(null)
