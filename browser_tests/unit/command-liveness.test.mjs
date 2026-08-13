@@ -17,6 +17,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+// #1095 needs a REAL parser: the invariant is that no path exits between marking a
+// command in flight and replying, which is a reachability property a token count cannot
+// express — as review proved by running the counting version against the leaking code.
+import ts from "typescript";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -594,6 +598,69 @@ test("#1095: the in-flight command count is paired, and read before a re-target"
   const decs = (src.match(/^\s*if \(commandsInFlight > 0\) commandsInFlight--;/gm) || []).length;
   assert.equal(incs, 2, "both command paths that deliver a reply must mark it in flight");
   assert.equal(decs, 1, "the count is released in exactly one place — deliverReply");
+
+  // COUNTING THOSE IS NOT ENOUGH, and this test shipped believing it was. Review proved
+  // it by execution: at the revision where the increment sat ABOVE the #517 dedupe region
+  // — with five paths returning before any reply, leaking the count permanently — this
+  // file was byte-identical and still passed. Two increments and one decrement is true of
+  // both the broken and the fixed arrangement, so the assertions above cannot tell them
+  // apart. What actually matters is a REACHABILITY property, so it has to be read off the
+  // syntax tree rather than off a token count.
+  //
+  // The real invariant: between the increment and the reply there is no exit. Returns and
+  // throws inside a try are excluded — the executor's throws are caught below and turned
+  // into a reply, which is the whole point of that catch.
+  const sf = ts.createSourceFile(PANEL_JS, src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
+  let branch = null;
+  (function findBranch(n) {
+    if (
+      ts.isIfStatement(n) &&
+      n.expression.getText(sf) === "isCommandFrame" &&
+      n.getEnd() - n.getStart(sf) > 5000 // the executing branch, not the refusal stub
+    ) branch = n;
+    ts.forEachChild(n, findBranch);
+  })(sf);
+  assert.ok(branch, "could not locate the executing command branch");
+
+  let incPos = -1;
+  let replyPos = -1;
+  (function locate(n) {
+    if (ts.isPostfixUnaryExpression(n) && n.operand.getText(sf) === "commandsInFlight") {
+      incPos = n.getStart(sf);
+    }
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "deliverReply") {
+      replyPos = n.getStart(sf);
+    }
+    ts.forEachChild(n, locate);
+  })(branch);
+  assert.ok(incPos !== -1 && replyPos !== -1, "the branch must mark in flight and deliver a reply");
+  assert.ok(incPos < replyPos, "the mark must precede the reply that releases it");
+
+  const escapes = [];
+  (function scan(n) {
+    if (ts.isFunctionLike(n) && n !== branch) return; // nested callbacks have their own exits
+    if (ts.isTryStatement(n)) {
+      // A throw inside `try` is caught and answered; only the handlers can truly exit.
+      if (n.catchClause) ts.forEachChild(n.catchClause, scan);
+      if (n.finallyBlock) ts.forEachChild(n.finallyBlock, scan);
+      return;
+    }
+    if (
+      (ts.isReturnStatement(n) || ts.isThrowStatement(n)) &&
+      n.getStart(sf) > incPos &&
+      n.getStart(sf) < replyPos
+    ) {
+      escapes.push(sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1);
+    }
+    ts.forEachChild(n, scan);
+  })(branch);
+  assert.deepEqual(
+    escapes,
+    [],
+    `every exit between marking a command in flight and replying leaks the count — ` +
+      `a leaked count never returns to 0, so every later workflow switch pays the full ` +
+      `deferral budget. Leaking exits at line(s): ${escapes.join(", ")}`,
+  );
 
   // The decrement must live INSIDE deliverReply, which every command path reaches once.
   const dStart = src.indexOf("const deliverReply = (reply, cmd, superseded) => {");
