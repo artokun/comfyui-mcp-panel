@@ -184,6 +184,9 @@ import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-lab
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
+// #1184 — the ORDER a backend switch commits in. A module because the defect is an
+// ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
+import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
@@ -22442,10 +22445,20 @@ function buildPanel() {
     // #43: the LAST RUNTIME pick (STORAGE_KEY_BACKEND, already in selectedBackend)
     // must survive a panel REMOUNT — navigating away and back was silently swapping
     // an active Codex session to the durable default (Claude) and dropping the
-    // conversation. A Settings-dialog change to the default already writes
-    // STORAGE_KEY_BACKEND (via applyBackend→connectBackend), so the two only diverge
-    // after a session-only chip pick — and then the runtime pick wins. Fall back to
-    // the durable default ONLY when there's no runtime pick yet (first-ever load).
+    // conversation. A Settings-dialog change to the default USUALLY writes
+    // STORAGE_KEY_BACKEND too (via applyBackend→connectBackend), so the two normally
+    // diverge only after a session-only chip pick — and then the runtime pick wins. Fall
+    // back to the durable default ONLY when there's no runtime pick yet (first-ever load).
+    //
+    // #1184 — "usually", not "always", and the exception is deliberate. A switch whose
+    // session invalidation fails now commits NOTHING, including this key, so the runtime
+    // pick keeps naming the backend the panel is actually connected to. The Settings value
+    // and the runtime pick then disagree, and this resolves in favour of the runtime pick,
+    // which is the correct half: it is the one backed by a live connection. Before that
+    // fix the key was written first and the divergence resolved the other way — a reload
+    // adopting a backend the panel had never reached, which is the bug #1184 reports.
+    // (ComfyUI persists the Settings value before notifying us at all, so the dialog will
+    // still show the un-taken choice; that half is #1198.)
     let runtimePick = null;
     try {
       runtimePick = window.localStorage.getItem(STORAGE_KEY_BACKEND);
@@ -29712,98 +29725,106 @@ function buildPanel() {
   }
 
   async function connectBackend(id) {
-    // CENTRALIZED per-backend seeding: every switch path routes through here — the
-    // backend chips, the model-popover provider row, AND the Settings backend combo
-    // (panelHooks.applyBackend). When the target backend differs from the one prefs
-    // currently reflect (connectedBackend if connected, else the last-picked
-    // selectedBackend), seed prefs from the NEW backend's group BEFORE connecting, so
-    // the post-handshake push uses the new backend's model/effort — never the
-    // previous backend's stale values. A re-pick of the same backend doesn't reseed.
-    const prevBackend = connectedBackend || selectedBackend;
-    if (id !== prevBackend) seedPrefsForBackendSwitch(id);
-    selectedBackend = id;
-    try {
-      window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
-    } catch {
-      // localStorage unavailable — selection just won't persist.
-    }
-    // FIX 1 — do NOT write SETTING_BACKEND here. A live composer/chip backend switch
-    // is TEMPORARY/session-only and must NOT change the saved Settings default. The
-    // old setSetting(SETTING_BACKEND, id) re-entered through SETTING_BACKEND.onChange →
-    // applyBackend → connectBackend → setSetting → … (ComfyUI fires onChange async,
-    // AFTER setSetting's suppressSettingOnChange has already reset), so each switch
-    // overlapped multiple connects and the bridge's close-old-on-new-hello looped
-    // (the 9181 "ready"/"waiting" storm). The Settings "Default agent backend" now
-    // changes ONLY when the user edits it in the Settings dialog. Runtime selection
-    // still persists in STORAGE_KEY_BACKEND above (drives backendNow()'s timings).
-    renderBackendChips(
-      Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
-        backend: el.dataset.backend,
-        running: el.dataset.running === "1",
-      })),
-    );
-    // Switching to a DIFFERENT backend than we're connected to: agent sessions are
-    // NOT shareable across providers, so start FRESH for the new one (fix #2).
-    // Sending the saved (foreign) session id on hello makes the new orchestrator
-    // try to resume a session it doesn't own (stuck awaiting handshake +
-    // a spurious re-send). Mirror newChat()'s session-clear so getResume() → null;
-    // the visible chat log stays, only the agent session resets.
-    const switching = connectedBackend !== null && connectedBackend !== id;
-    if (switching) {
-      // Switching providers abandons the old agent session (not portable across
-      // backends). End the turn locally — like the Disconnect handler — so the
-      // working indicator doesn't outlive the session we're dropping (the client
-      // .stop() below sets closed=true, suppressing the onStatus that would hide).
-      endTurnLocally();
-      // Replay the visible transcript to the NEW provider as one-shot context so
-      // its fresh session has the conversation (session/thinking aren't portable
-      // across providers). Consumed by the next user message, then auto-cleared.
-      const replay = buildReplayTranscript();
-      if (replay) client.armContext(replay);
-      // The old provider's session must be durably invalid before any reconnect
-      // can observe it. If reconnect fails or the browser closes here, reload
-      // still starts fresh instead of restoring a foreign session.
+    // #1184 — the ORDER lives in lib/backend-switch.js, and it is an order rather than a
+    // repair. This function used to commit the new backend — prefs, `selectedBackend`,
+    // `localStorage`, the chips, `endTurnLocally()`, the armed replay — and only THEN check
+    // whether the old provider's session could be durably invalidated, returning silently
+    // when it could not. The panel was left claiming a backend it had never connected to,
+    // and `STORAGE_KEY_BACKEND` outlives the tab, so a reload adopted that choice for good.
+    //
+    // Committing later rather than rolling back: an undo would have to restore six pieces
+    // of state, and `armContext` has no disarm affordance at all.
+    const { switched } = await runBackendSwitch(id, {
+      liveBackend: () => connectedBackend,
+      pickedBackend: () => selectedBackend,
+      // The old provider's session must be durably invalid before any reconnect can observe
+      // it. If the reconnect fails or the browser closes, a reload must start fresh rather
+      // than restore a foreign session.
+      invalidate: () => invalidateDurableAgentSession(),
+      // CENTRALIZED per-backend seeding: every switch path routes through here — the backend
+      // chips, the model-popover provider row, AND the Settings backend combo
+      // (panelHooks.applyBackend). Seeding from the NEW backend's group before connecting is
+      // what stops the post-handshake push carrying the previous backend's stale
+      // model/effort. A re-pick of the same backend does not reseed; the caller decides.
+      seedPrefs: (next) => seedPrefsForBackendSwitch(next),
+      // ONE STEP, deliberately. `renderBackendChips` highlights on `selectedBackend` and
+      // `connectAgent` POSTs it, so these three writes have to land together and before the
+      // connect; splitting them silently connects to the previous backend.
+      commitSelection: (next) => {
+        selectedBackend = next;
+        try {
+          window.localStorage.setItem(STORAGE_KEY_BACKEND, next);
+        } catch {
+          // localStorage unavailable — the selection just won't persist.
+        }
+        // FIX 1 — do NOT write SETTING_BACKEND here. A live composer/chip switch is
+        // TEMPORARY/session-only and must not change the saved Settings default. The old
+        // setSetting(SETTING_BACKEND, id) re-entered through SETTING_BACKEND.onChange →
+        // applyBackend → connectBackend → setSetting → … (ComfyUI fires onChange async,
+        // AFTER suppressSettingOnChange has reset), so each switch overlapped multiple
+        // connects and the bridge's close-old-on-new-hello looped (the 9181
+        // "ready"/"waiting" storm). Runtime selection persists in STORAGE_KEY_BACKEND above.
+        renderBackendChips(
+          Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
+            backend: el.dataset.backend,
+            running: el.dataset.running === "1",
+          })),
+        );
+      },
+      // Like the Disconnect handler: the working indicator must not outlive the session
+      // being dropped (the client .stop() below sets closed=true, suppressing the onStatus
+      // that would hide it).
+      endTurn: () => endTurnLocally(),
+      // Agent sessions are NOT shareable across providers, so the new one starts fresh and
+      // the visible transcript is replayed to it as one-shot context (session/thinking are
+      // not portable). Consumed by the next user message, then auto-cleared.
+      buildReplay: () => buildReplayTranscript(),
+      armContext: (replay) => client.armContext(replay),
+      teardownAndConnect: (next) => {
+        // Reflect the picked backend in the composer placeholder immediately; onModels
+        // reaffirms it authoritatively from the handshake (fix #3).
+        setAskPlaceholder(next);
+        // CLEAN TEARDOWN before the (re)connect (fix #1). The old fromChip path bypassed the
+        // in-flight guard, so a chip pick could OVERLAP a sticky-reconnect already in flight
+        // — re-delivering the prior pending message (a visible duplicate) and starting a
+        // reconnect storm that trips the orchestrator's bounded-restart give-up. Tearing the
+        // bridge down and clearing the guard first means EXACTLY ONE connect runs.
+        client.stop();
+        connecting = false;
+        // FIX 2 — refresh the bridge URL (and the Advanced URL field) before reconnecting.
+        // Single-port now, so this is normally the same 9180 URL for every backend; it still
+        // matters when a custom Bridge URL override is set. /connect's returned bridge_url
+        // still applies on top. The client is stopped, so setUrl only updates its `url`
+        // here; connectAgent's client.start() opens it.
+        const nextUrl = configuredBridgeUrlFor(next);
+        urlInput.value = nextUrl;
+        if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
+        void connectAgent({ fromChip: true });
+      },
+      // REASON-AWARE, and there is only one reason left that warrants saying anything.
       //
-      // #1184 — THIS RETURN IS SILENT, AND SAYING SOMETHING HERE IS NOT THE FIX.
+      // INVALIDATE_FAILED is the #1184 case: no backend state committed, still on the old
+      // provider, and the switch genuinely did not happen. hardRestart's existing line says
+      // that, and it is honest at this site only because the reorder means nothing has been
+      // committed by the time it runs. It is narrower than it looks, though: the SESSION is
+      // already invalid regardless (the invalidate destroys it before reporting), so this
+      // speaks for the switch and not for the session — #1198 tracks the rest.
       //
-      // #1171 briefly added hardRestart's "reconnect is paused" line here. Review showed
-      // that makes it worse rather than better: by this point `seedPrefsForBackendSwitch`,
-      // `selectedBackend`, `localStorage[STORAGE_KEY_BACKEND]`, the chips, `endTurnLocally()`
-      // and `client.armContext(replay)` have ALL committed to the new backend, while the
-      // OLD backend's socket is still open. "Paused" tells the user nothing happened, when
-      // in fact the panel is now half-switched — and the armed replay ships the entire prior
-      // conversation back to the provider that already has it on the next message.
-      //
-      // The exit is also more reachable than a genuine store failure: a capped IndexedDB
-      // open answers ok:false for any history past the local shadow's limits (measured — 400
-      // messages, or 30 threads), so a two-second disk hiccup lands here.
-      //
-      // The fix is to roll the commit back, or not to commit until this succeeds, and that
-      // decision belongs to #1184 rather than to a re-entrancy-guard change.
-      if (!await invalidateDurableAgentSession()) return;
-    }
-    // Reflect the picked backend in the composer placeholder immediately; onModels
-    // reaffirms it authoritatively from the handshake (fix #3).
-    setAskPlaceholder(id);
-    // CLEAN TEARDOWN before the (re)connect (fix #1). The old fromChip path bypassed
-    // the in-flight guard, so a chip pick could OVERLAP a sticky-reconnect already
-    // in flight — re-delivering the prior pending message (a visible duplicate) and
-    // starting a reconnect storm that trips the orchestrator's bounded-restart
-    // give-up ("the agent session keeps dropping"). Tearing the bridge down and
-    // clearing the guard first means EXACTLY ONE connect runs for the new backend.
-    client.stop();
-    connecting = false;
-    // FIX 2 — refresh the bridge URL (and the Advanced URL field) before
-    // reconnecting. Single-port now, so this is normally the same 9180 URL for
-    // every backend — it still matters when a custom Bridge URL override is set.
-    // /connect's returned bridge_url still applies on top. The client is stopped, so
-    // setUrl only updates its `url` here (its connect() no-ops while closed);
-    // connectAgent's client.start() opens it. urlInput has no settings onChange wired,
-    // so updating it can't re-enter the storm.
-    const nextUrl = configuredBridgeUrlFor(id);
-    urlInput.value = nextUrl;
-    if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
-    void connectAgent({ fromChip: true });
+      // There used to be a second, SUPERSEDED, for a handshake landing mid-await. That path
+      // no longer aborts — dropping the user's explicit pick was worse than the race — so
+      // there is nothing left to disclose there. The guard on the reason stays, because a
+      // future outcome must opt IN to borrowing this string rather than inherit it.
+      disclose: (reason) => {
+        if (reason !== BACKEND_SWITCH.INVALIDATE_FAILED) return;
+        appendSystem(
+          tr(
+            "panel.the_old_session_could_not_be_invalidated",
+            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+          ),
+        );
+      },
+    });
+    return switched;
   }
 
   // Soft reload: pick up new code WITHOUT restarting ComfyUI, keeping this
