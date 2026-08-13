@@ -56,8 +56,16 @@ function recorder({ live = "claude", picked = "claude", invalidate = async () =>
   return { log, effects, setLive: (b) => { liveBackend = b; } };
 }
 
-/** Every effect that COMMITS to the new backend. None may run before the switch is legal. */
-const COMMITS = ["seedPrefs", "commitSelection", "endTurn", "buildReplay", "armContext", "teardownAndConnect"];
+/**
+ * Every effect that COMMITS to the NEW backend. None may run before the switch is legal.
+ *
+ * `endTurn` is deliberately NOT here. It is not a commit to the new backend — it retires a
+ * turn on the OLD one, and it has to run on the abort paths too, because
+ * `invalidateDurableAgentSession` destroys the session pointer BEFORE it reports whether it
+ * succeeded. A turn whose session id is already gone cannot resume, so leaving MID_TASK_KEY
+ * armed would make the mid-task nudge fire into a fresh empty session claiming full context.
+ */
+const COMMITS = ["seedPrefs", "commitSelection", "buildReplay", "armContext", "teardownAndConnect"];
 /** Effects are logged as `name` or `name:arg`; match on the name half. */
 const at = (log, name) => log.findIndex((e) => e === name || e.startsWith(`${name}:`));
 const ran = (log, name) => at(log, name) !== -1;
@@ -68,7 +76,9 @@ test("#1184 a failed invalidate commits NOTHING — asserted on every effect, no
 
   assert.deepEqual(result, { switched: false, reason: BACKEND_SWITCH.INVALIDATE_FAILED });
   // The exact sequence: ask, then say so. Nothing else.
-  assert.deepEqual(log, ["invalidate", `disclose:${BACKEND_SWITCH.INVALIDATE_FAILED}`]);
+  // endTurn between them, and that is the point: the invalidate already destroyed the
+  // session pointer, so the turn is unresumable whatever the boolean said.
+  assert.deepEqual(log, ["invalidate", "endTurn", `disclose:${BACKEND_SWITCH.INVALIDATE_FAILED}`]);
   // …and stated per effect, so a failure names the leak rather than a diff of two arrays.
   for (const effect of COMMITS) {
     assert.ok(!ran(log, effect), `${effect} ran despite the switch being illegal`);
@@ -130,6 +140,9 @@ test("#1184 a handshake landing during the invalidate supersedes the switch", as
   for (const effect of COMMITS) {
     assert.ok(!ran(rec.log, effect), `${effect} ran against a backend state that had already moved`);
   }
+  // …but the turn IS ended, for the same reason as the failed-invalidate path: the session
+  // pointer is gone by the time we know the switch will not proceed.
+  assert.ok(ran(rec.log, "endTurn"), "a destroyed session leaves no resumable turn, whichever abort we take");
 });
 
 test("#1184 the reseed predicate is preserved: reseed iff the target differs", async () => {
@@ -182,6 +195,34 @@ test("#1184 WIRING: the panel delegates, and keeps no commit above the guard", (
   const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf("\n  }", at));
 
   assert.match(body, /runBackendSwitch\(id, \{/, "connectBackend must delegate the ordering to the module");
+
+  // THE REGION THAT MATTERS: everything BEFORE the delegation. Asserting only that the
+  // module is called proved nothing — the #1184 leak could be reinstated verbatim above the
+  // call (write `selectedBackend`, persist STORAGE_KEY_BACKEND, then delegate) and all ten
+  // tests stayed green. Verified by doing exactly that.
+  // CODE ONLY. The comment above the delegation NAMES these calls while explaining what the
+  // old order got wrong, so a raw text scan matched the prose and failed on correct code —
+  // the same trap that has bitten several assertions in this repo.
+  const preamble = body
+    .slice(0, body.indexOf("runBackendSwitch(id, {"))
+    .split(String.fromCharCode(10))
+    .filter((l) => !l.trim().startsWith("//"))
+    .join(String.fromCharCode(10));
+  const LEAKS = [
+    [/selectedBackend\s*=/, "the in-memory pick"],
+    [/localStorage\.setItem/, "the persisted pick — this one outlives the tab"],
+    [/renderBackendChips\(/, "the chip paint"],
+    [/endTurnLocally\(/, "the working indicator and MID_TASK_KEY"],
+    [/armContext\(/, "the one-shot replay, which client.stop() does NOT disarm"],
+    [/seedPrefsForBackendSwitch\(/, "the prefs reseed"],
+  ];
+  for (const [re, what] of LEAKS) {
+    assert.doesNotMatch(
+      preamble,
+      re,
+      `${what} is committed BEFORE the switch is known to be legal — that is #1184, reinstated`,
+    );
+  }
   // The commits may only appear as INJECTED effects, i.e. inside a callback the module
   // calls after the guard — never as statements the function runs on its own.
   assert.match(body, /commitSelection: \(next\) => \{/, "the selection writes must be an injected effect");

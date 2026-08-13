@@ -83,11 +83,28 @@ export async function runBackendSwitch(id, effects) {
     // THE ONLY AWAIT BEFORE A COMMIT, and the non-switching path must never reach it: a
     // first connect and a re-pick of the live backend stay fully synchronous, so neither is
     // ever gated on the history store's health.
-    if (!(await invalidate())) {
-      // Nothing has been committed, so "nothing happened" is now TRUE. That matters: an
-      // earlier attempt at disclosure here was withdrawn on the grounds that telling the
-      // user the switch was paused was a lie while the panel was already half-switched.
-      // Ordering the invalidate first is what makes the honest message available.
+    const invalidated = await invalidate();
+
+    // THE INVALIDATE IS DESTRUCTIVE BEFORE IT REPORTS, and an earlier version of this file
+    // claimed the opposite. `invalidateDurableAgentSession` clears the session key, nulls
+    // `thread.sessionId` and persists — and only THEN consults `flush()` for the boolean it
+    // returns. So "it failed, therefore nothing happened" was never true: by the time we
+    // learn the answer the old session's resume pointer is already gone, whatever it says.
+    //
+    // That is why the turn is ended HERE rather than with the commits below. The old order
+    // ended it before the invalidate, so a failure left the two consistent. Ending it only
+    // on success left MID_TASK_KEY armed against a session pointer that no longer exists,
+    // and the mid-task nudge would later fire into a brand-new empty session telling the
+    // agent it "resumed with full context" — the exact false-reassurance class this repo
+    // keeps fixing. A turn whose session id has been destroyed cannot resume, so it ends,
+    // and both abort paths below inherit that.
+    endTurn();
+
+    if (!invalidated) {
+      // Honest now in a narrower sense than the first draft of this comment claimed: no
+      // BACKEND state has been committed, so the panel is still on the old provider and
+      // "reconnect is paused" is true of the switch. It is not true of the session, which
+      // is already invalid — see #1198 for the part this ordering cannot fix.
       disclose(BACKEND_SWITCH.INVALIDATE_FAILED);
       return { switched: false, reason: BACKEND_SWITCH.INVALIDATE_FAILED };
     }
@@ -115,10 +132,10 @@ export async function runBackendSwitch(id, effects) {
   commitSelection(id);
 
   if (switching) {
-    // Switching providers abandons the old agent session — not portable across backends.
-    // End the turn locally so the working indicator does not outlive the session being
-    // dropped, then replay the visible transcript to the NEW provider as one-shot context.
-    endTurn();
+    // The turn was already ended above, as soon as the invalidate had run — see the note
+    // there. Only the replay belongs here: it is the one step that must NOT happen on an
+    // abort, because arming context against a provider we are not switching to is what
+    // shipped the whole prior transcript back to the backend that already had it.
     const replay = buildReplay();
     if (replay) armContext(replay);
   }
