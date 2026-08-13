@@ -42,13 +42,23 @@ export async function readComfyLogText(api, { timeoutMs = COMFY_LOG_READ_TIMEOUT
   try {
     const route = "/internal/logs/raw";
     const url = typeof api?.fileURL === "function" ? api.fileURL(route) : route;
-    const res = await withTimeout(
-      Promise.resolve().then(() => fetch(url, { cache: "no-store" })).catch(() => null),
+    // ONE bound over the WHOLE read — headers AND body.
+    //
+    // Bounding `fetch` alone did not bound this call. `fetch` resolves as soon as the
+    // response HEAD arrives; the bytes stream afterwards, inside `res.json()`. So a server
+    // that sent headers and then stopped — the half-open case this whole issue is about —
+    // parked on the body read exactly as it did before there was any bound here, and the
+    // constant above claimed to cover a read it covered a fraction of.
+    const body = await withTimeout(
+      Promise.resolve()
+        .then(async () => {
+          const res = await fetch(url, { cache: "no-store" });
+          return res?.ok ? await res.json() : null;
+        })
+        .catch(() => null),
       timeoutMs,
       () => null,
     );
-    if (!res || !res.ok) return "";
-    const body = await res.json().catch(() => null);
     const entries = Array.isArray(body) ? body : Array.isArray(body?.entries) ? body.entries : null;
     if (entries) {
       return entries.map((e) => (typeof e === "string" ? e : (e?.m ?? ""))).join("\n");
