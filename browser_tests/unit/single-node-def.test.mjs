@@ -308,6 +308,16 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
     return Number(m[1]) / Number(m[2]);
   })();
   assert.ok(share > 0 && share < 1, `the fetch phase must get a FRACTION of the run, saw ${share}`);
+  // …and a USABLE remainder, not merely a nonzero one. `share < 1` alone passed 999/1000,
+  // which leaves the combo phase 9ms of a 9000ms run — arithmetically a fraction, and in
+  // practice the 1ms floor and an instant timeout on every call. The combo phase is one
+  // request against the same backend the fetch just used, so it needs the same order of
+  // time, not a rounding error.
+  const comboLeft = run * (1 - share);
+  assert.ok(
+    comboLeft >= 1000,
+    `the combo phase is left ${Math.round(comboLeft)}ms of a ${run}ms run — too little to answer in`,
+  );
 
   // #954's SCHEDULE, SHARED not forked — read from the retry module, never restated.
   assert.match(

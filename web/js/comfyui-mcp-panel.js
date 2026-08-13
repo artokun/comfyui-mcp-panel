@@ -766,6 +766,14 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * number sized against the read default — 18,000ms against 20,000ms — because that product
  * is what the user actually waits through.
  *
+ * WHAT THE DEADLINE DOES NOT COVER, said plainly so this is not read as a total. Two calls
+ * run INSIDE the window without drawing from it: `registerNodesFromDefs` and
+ * `reapplyDefsToLiveNodes`. Both are deliberately unbounded — see the note at the
+ * registration call — so a run can exceed this budget, and the 18,000ms figure is the cost
+ * of the WAITING this panel controls, not a ceiling on wall-clock. It is the right number
+ * to size against the read default anyway: those two are local work that either completes
+ * in milliseconds or has already hung the page for reasons no bound here can reach.
+ *
  * On a monotonic clock, like every other elapsed-time measurement in this panel: a
  * wall-clock jump mid-run must not hand a phase a negative or enormous remainder.
  *
@@ -1152,6 +1160,22 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // discarded the real cause of a combo that threw, and then it reported that throw
       // as a stall by fabricating a "did not answer within 10000ms" message for a failure
       // that had landed instantly.
+      //
+      // ABANDONING THIS ONE IS NOT LIKE ABANDONING A FETCH, and that is the cost of the
+      // bound rather than an argument against it. Read from the frontend build this ComfyUI
+      // serves: `refreshComboInNodes` -> `reloadNodeDefs`, whose only long await is its own
+      // `getNodeDefs()`. Everything after that — `registerNodeDef` for every id, then a
+      // walk of the whole graph rewriting each combo widget's options — runs whenever that
+      // fetch finally resolves. So a combo phase given up on does not stop: it mutates the
+      // graph later, after this run has already reported that combos are stale, and it does
+      // so outside `makeRefreshCoalescer`, which only serialises runs the panel starts.
+      //
+      // Accepted, because the alternative is the reported bug. The mutation it eventually
+      // performs is the CORRECT one — fresher defs than the verdict claimed — so the run's
+      // report is pessimistic rather than wrong, and `nodeDefsRefreshConfirmed` staying
+      // false keeps the caller in over-report-safe mode either way. The unbounded version
+      // did the same mutation at the same moment; the only thing the bound changes is that
+      // the panel stops waiting for it.
       const comboSettled = await withTimeout(
         Promise.resolve()
           .then(() => a.refreshComboInNodes())
@@ -1167,6 +1191,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
           comboSettled === COMBO_NO_ANSWER
             ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget")
             : comboSettled.err;
+        // WARN HERE, because reifying the outcome took this failure off the throwing path
+        // and the catch below is the only place that logged one. The browser console was
+        // the sole record of a failed combo refresh for anyone not reading a tool reply,
+        // and it went silent when the throw stopped happening.
+        console.warn("[comfyui-mcp-panel] combo refresh did not complete:", thrown);
       }
     }
     // Leave the combo phase ONLY when it produced no failure.

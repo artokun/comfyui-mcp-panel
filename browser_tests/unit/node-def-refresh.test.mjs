@@ -808,6 +808,14 @@ test("#1180: the shipped combo phase is bounded, and its outcomes stay apart", (
   // a timeout is what let an instant combo error be reported as a ten-second stall.
   assert.match(combo, /=> COMBO_OK, \(err\) => \(\{ err \}\)\)/, "a throw must carry its cause, not become a boolean");
   assert.match(combo, /\(\) => COMBO_NO_ANSWER,/, "a timeout must be its own outcome");
+  // …and a failure must still reach the browser console. Reifying the outcome took this
+  // off the throwing path, and the catch below was the ONLY place that logged one — so the
+  // sole record of a failed combo refresh for anyone not reading a tool reply went silent.
+  assert.match(
+    combo,
+    /console\.warn\(/,
+    "a combo failure that no longer throws must be logged where the throw used to be",
+  );
   // …and the phase must not advance past `combo` when the combo failed, or the verdict
   // names the wrong cause entirely.
   assert.match(
