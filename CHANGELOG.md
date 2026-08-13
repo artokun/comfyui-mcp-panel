@@ -43,42 +43,10 @@ All notable changes to this project are documented here. This project adheres to
   of those hits it.
 
 ### Added
-- Brazilian Portuguese (pt-BR) panel catalog — 1107 keys + 52 settings (#1156)
-- Russian (ru) panel catalog — 1161 keys, all four plural forms (#1155)
-- complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
-- Spanish (es) panel catalog (#1152)
-- add the Arabic (ar) panel catalog (#1143)
-- add the Traditional Chinese (zh-TW) panel catalog (#1153)
-- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
-- add the Turkish (tr) panel catalog (#1148)
-- add the Persian (fa) panel catalog (#1147)
-- complete the Japanese panel translation (999 keys) (#1140)
-
 ### Fixed
 - hold the reload guard across hardRestart's tail (#1183)
-- bound each /object_info transport so a hung route falls through to the one that works (#1179)
-- a successful restart retires every marker before the invalidate can bail (#1170)
-- a turn start closes the outage; a panel-driven respawn opens one (#1164)
-- let a truncated provider hint be read on hover (#1165)
-- translate the "why can't I use this provider" hints in all 11 languages (#1162)
-- stamp the outage once, not every failed retry (#1146)
-- translate the 22 strings that answer "why can't I use this provider" (#1160)
-- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
-- a definitions difference that is only link renumbering is not a content change (#1125)
-- the status pill froze because onStatus threw on every status frame (#1154)
-- name every uninstalled node type before queueing, not one rejection at a time (#1129)
-- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
-
 ### Changed
 - 0.14.25 (#1182)
-- 0.14.24 (#1173)
-- 0.14.23 (#1169)
-- 0.14.22 (#1167)
-- 0.14.21 (#1159)
-- 0.14.20 (#1157)
-- 0.14.19 (#1149)
-
-
 ## [0.14.25] - 2026-08-13
 
 ### Fixed
@@ -105,17 +73,6 @@ All notable changes to this project are documented here. This project adheres to
   long each one was actually given, rather than quoting a wait it never spent.
 
 ### Added
-- Brazilian Portuguese (pt-BR) panel catalog — 1107 keys + 52 settings (#1156)
-- Russian (ru) panel catalog — 1161 keys, all four plural forms (#1155)
-- complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
-- Spanish (es) panel catalog (#1152)
-- add the Arabic (ar) panel catalog (#1143)
-- add the Traditional Chinese (zh-TW) panel catalog (#1153)
-- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
-- add the Turkish (tr) panel catalog (#1148)
-- add the Persian (fa) panel catalog (#1147)
-- complete the Japanese panel translation (999 keys) (#1140)
-
 ### Fixed
 - bound each /object_info transport so a hung route falls through to the one that works (#1179)
 - a successful restart retires every marker before the invalidate can bail (#1170)
@@ -124,21 +81,11 @@ All notable changes to this project are documented here. This project adheres to
 - translate the "why can't I use this provider" hints in all 11 languages (#1162)
 - stamp the outage once, not every failed retry (#1146)
 - translate the 22 strings that answer "why can't I use this provider" (#1160)
-- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
-- a definitions difference that is only link renumbering is not a content change (#1125)
-- the status pill froze because onStatus threw on every status frame (#1154)
-- name every uninstalled node type before queueing, not one rejection at a time (#1129)
-- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
-
 ### Changed
 - 0.14.24 (#1173)
 - 0.14.23 (#1169)
 - 0.14.22 (#1167)
 - 0.14.21 (#1159)
-- 0.14.20 (#1157)
-- 0.14.19 (#1149)
-
-
 ## [0.14.24] - 2026-08-12
 
 ### Fixed
@@ -185,7 +132,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
-  ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
+- **A ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
   resumed agent its connection dropped mid-task and to continue what it was doing, and it
   fires only for a REAL restart — judged by how long the bridge was gone. But the panel
   assigns its socket before the connection resolves, so a REFUSED reconnect attempt is
@@ -224,24 +171,10 @@ All notable changes to this project are documented here. This project adheres to
 - complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
 - Spanish (es) panel catalog (#1152)
 - add the Arabic (ar) panel catalog (#1143)
-- add the Traditional Chinese (zh-TW) panel catalog (#1153)
-- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
-- add the Turkish (tr) panel catalog (#1148)
-- add the Persian (fa) panel catalog (#1147)
-- complete the Japanese panel translation (999 keys) (#1140)
-
 ### Fixed
 - an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
-- a definitions difference that is only link renumbering is not a content change (#1125)
-- the status pill froze because onStatus threw on every status frame (#1154)
-- name every uninstalled node type before queueing, not one rejection at a time (#1129)
-- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
-
 ### Changed
 - 0.14.20 (#1157)
-- 0.14.19 (#1149)
-
-
 ## [0.14.20] - 2026-08-12
 
 ### Added
@@ -249,14 +182,9 @@ All notable changes to this project are documented here. This project adheres to
 - add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
 - add the Turkish (tr) panel catalog (#1148)
 - add the Persian (fa) panel catalog (#1147)
-- complete the Japanese panel translation (999 keys) (#1140)
-
 ### Fixed
 - a definitions difference that is only link renumbering is not a content change (#1125)
 - the status pill froze because onStatus threw on every status frame (#1154)
-- name every uninstalled node type before queueing, not one rejection at a time (#1129)
-- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
-
 ### Changed
 - 0.14.19 (#1149)
 
