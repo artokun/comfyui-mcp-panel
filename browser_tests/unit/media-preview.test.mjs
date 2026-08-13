@@ -1419,3 +1419,27 @@ test("a late fulfilment after the bound fired does not overwrite the fallback", 
   settle("too late");
   assert.equal(await p, "fallback");
 });
+
+test("#1161 withTimeout: a `timers` object that cannot be READ is treated as absent, never a rejection", async () => {
+  // bounded-step.js's own header argues that every injected guard is an operation that can
+  // fail, and wraps `onTimeout` and `clearTimer` accordingly — but READING the injected
+  // object was itself unguarded. A throwing getter, or a Proxy whose get trap throws, threw
+  // synchronously before the returned promise existed, so withTimeout REJECTED out of a
+  // function documented three lines above its signature as never rejecting. The
+  // /object_info oracle passes this object straight through, and two panel commands await
+  // that oracle with no catch of their own.
+  const hostile = [
+    { get setTimer() { throw new Error("hostile getter"); } },
+    new Proxy({}, { get() { throw new Error("proxy trap"); } }),
+    { setTimer: 5, clearTimer: "no" }, // present, but not callable
+  ];
+  for (const timers of hostile) {
+    const value = await withTimeout(Promise.resolve("answered"), 1000, () => "timed out", timers);
+    assert.equal(value, "answered", "an unreadable timers object must fall back to the real timer");
+  }
+  // …and the bound must still WORK through that fallback, not merely avoid throwing.
+  const timedOut = await withTimeout(new Promise(() => {}), 1, () => "timed out", {
+    get setTimer() { throw new Error("hostile getter"); },
+  });
+  assert.equal(timedOut, "timed out", "the real timer still bounds the step");
+});

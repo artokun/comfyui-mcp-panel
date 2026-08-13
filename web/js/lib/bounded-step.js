@@ -48,8 +48,26 @@
  * @returns {Promise<any>} never rejects
  */
 export function withTimeout(promise, ms, onTimeout, timers = {}) {
-  const setTimer = timers.setTimer ?? ((fn, delay) => setTimeout(fn, delay));
-  const clearTimer = timers.clearTimer ?? ((t) => clearTimeout(t));
+  // #1161 — READING the injected object is itself an operation that can fail, which is the
+  // one case the note above missed while making exactly that argument about `onTimeout` and
+  // `clearTimer`. A `timers` whose `setTimer` is a throwing getter, or a Proxy whose get
+  // trap throws, threw HERE — synchronously, before the returned promise exists — so
+  // `withTimeout` rejected out of a function whose contract three lines up says it never
+  // does. Two panel commands await the oracle that calls this with no catch of their own.
+  //
+  // A `timers` that cannot be read is treated as one that was not supplied: the real timer
+  // is used, which is the same answer as the default and always safe.
+  let setTimer;
+  let clearTimer;
+  try {
+    setTimer = timers?.setTimer;
+    clearTimer = timers?.clearTimer;
+  } catch {
+    setTimer = undefined;
+    clearTimer = undefined;
+  }
+  if (typeof setTimer !== "function") setTimer = (fn, delay) => setTimeout(fn, delay);
+  if (typeof clearTimer !== "function") clearTimer = (t) => clearTimeout(t);
   if (!(ms > 0)) return promise;
   return new Promise((resolve) => {
     let settled = false;
