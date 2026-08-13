@@ -782,10 +782,28 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * `object_info_fetch_failed` where an unbounded panel would eventually have succeeded.
  * That is a real narrowing and it is the direction this repo has regressed in before. It
  * is accepted because the alternative is the reported bug — a command that never ends —
- * and a recoverable, worded refusal beats a hang. Measured on this rig today: /object_info
- * is 7,440,820 bytes and answers in 532ms (it was 5,413,770 bytes / 167ms when #767
- * measured it — the document grows with the pack count, which is the reason to keep
- * measuring rather than to trust the older figure).
+ * and a recoverable, worded refusal beats a hang.
+ *
+ * MEASURED, in the page, on this rig — ComfyUI 0.32.0, frontend 1.48.7, 4320 node types.
+ * These are the phase costs this budget is actually spent on, and they are recorded here
+ * because every previous number in this area was a guess that later reviews quoted back as
+ * a measurement:
+ *
+ *     api.getNodeDefs()          456 ms warm, 1062 ms COLD (the first read after a load
+ *                                or a restart — which is the one a refresh usually pays)
+ *     registerNodesFromDefs()   3972 ms   unbounded local work, EXCLUDED from this budget
+ *     refreshComboInNodes()     4846 ms   its own /object_info, then a walk of every node
+ *                                rewriting each combo widget's options
+ *
+ * Two things follow. First, the exclusion of local work is not a nicety: without it the
+ * combo phase here would be left 4572 ms for a 4846 ms job and would be abandoned on a
+ * COMPLETELY HEALTHY machine, reporting `combo_refresh_failed` on every refresh. That was
+ * measured, not reasoned about — the unit suite passed either way.
+ *
+ * Second, the margin that remains is thinner than this number suggests. The fetch may use
+ * its full 6000 ms share and still succeed, which would leave the combo phase 3000 ms
+ * against a measured 4846 ms need. That case is #1193; it needs the combo phase to have a
+ * floor rather than only a remainder, and that is a design change rather than a constant.
  */
 const NODE_DEFS_RUN_BUDGET_MS = 9000;
 /**
