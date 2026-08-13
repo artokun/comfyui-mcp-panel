@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.27] - 2026-08-13
+
+### Fixed
+- bound the two drive waits on the CivitAI fetch, so a slow CivitAI no longer makes a healthy panel look dead (#1189)
+
 ## [0.14.26] - 2026-08-13
 
 ### Changed
