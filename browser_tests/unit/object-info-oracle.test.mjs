@@ -693,7 +693,7 @@ test("#1161: a timer that fires LATE cannot starve the fallback", async () => {
   }
 });
 
-test("#1161: the budget is divided WITHOUT consulting a clock at all", async () => {
+test("#1161: an injected clock that THROWS cannot reject out of this module", async () => {
   // The structural version of an invariant that three previous designs asserted in prose
   // and none actually held. Each of those tried to make an untrustworthy `Date.now()` safe:
   // clamping negative readings refunded everything spent (one call ran ~50s against a 20s
@@ -719,23 +719,81 @@ test("#1161: the budget is divided WITHOUT consulting a clock at all", async () 
   );
 });
 
-test("#1161: every step is reserved a real share, so none can be starved", async () => {
-  // The property that REPLACED the starvation branch. Reserving for the fallback but not
-  // for its BODY was the same defect one level down: a response that used everything left
-  // the body unreadable, and a body that cannot be read authorizes nothing.
+test("#1161: a hung route is CAPPED at its share; a fast one hands the rest back", async () => {
+  // BOTH halves matter, and each was broken on its own during this issue.
+  //
+  // The CAP stops a hung client route consuming the budget and starving the fallback — the
+  // original P1, fetchApi call count 0. The RECLAIM stops a client route that answers
+  // instantly from spending 10s it never used: charging the full grant there was a shipped
+  // regression that refused a 5.4MB payload at 5.5s which both the parent and main
+  // delivered at 7.5s.
   const granted = [];
-  const result = await fetchWholeObjectInfo({
+  const armed = [];
+  const timers = {
+    setTimer: (fn, ms) => { granted.push(ms); const t = { fn, ms }; armed.push(t); return t; },
+    clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
+  };
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
+    deadlineMs: OBJECT_INFO_DEADLINE_MS,
+    timers,
+  });
+  await tick();
+  armed.shift().fn(); // only the CLIENT route hangs; the fallback answers normally
+  const result = await settled(out, "the oracle call");
+  assert.deepEqual(result.defs, DEFS_1161, "the fallback still answers after the cap fires");
+  assert.equal(granted[0], 10000, "the client route is capped at its half — this is the P1 fix");
+  assert.ok(granted[1] <= 10000, `the fallback got ${granted[1]}ms, which cannot exceed what was left`);
+  assert.ok(granted[1] > 0, "and it is a real budget, not a token one");
+
+  // Now the reclaim: a client route that answers immediately must cost almost nothing.
+  const fast = [];
+  await fetchWholeObjectInfo({
     getNodeDefs: async () => null,
     fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
-    deadlineMs: 20000,
-    timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
+    deadlineMs: OBJECT_INFO_DEADLINE_MS,
+    timers: { setTimer: (fn, ms) => { fast.push(ms); return { fn, ms }; }, clearTimer: () => {} },
   });
-  assert.deepEqual(result.defs, DEFS_1161);
-  assert.equal(granted.length, 3, "client route, response and body are each bounded");
-  for (const [i, ms] of granted.entries()) {
-    assert.ok(ms > 0, `step ${i} was granted ${ms}ms — a zero grant is a starved step`);
+  assert.equal(fast.length, 3, "client route, response and body are each bounded");
+  assert.equal(fast[0], 10000, "the cap on the client route is unchanged");
+  assert.ok(fast[1] > 9000, `the response kept ${fast[1]}ms the client route did not use`);
+  assert.ok(fast[2] > 9000, `and the body kept ${fast[2]}ms — main gave it ~19.5s, not 5s`);
+  for (const [i, ms] of fast.entries()) assert.ok(ms > 0, `step ${i} was granted ${ms}ms`);
+});
+
+test("#1161: REAL elapsed stays inside the budget however the steps behave", async () => {
+  // The invariant is about real time, NOT about the sum of grants — a step that answers
+  // early hands its remainder back, so later grants can legitimately exceed what is
+  // nominally "left". What must never happen is the CALL outlasting its budget, which is
+  // what overran to 49,998ms while a clock was being trusted to say otherwise.
+  const armed = [];
+  let elapsedReal = 0;
+  const timers = {
+    setTimer: (fn, ms) => { const t = { fn, ms }; armed.push(t); return t; },
+    clearTimer: (t) => { const i = armed.indexOf(t); if (i >= 0) armed.splice(i, 1); },
+  };
+  const out = fetchWholeObjectInfo({
+    getNodeDefs: never,
+    fetchApi: async () => ({ ok: true, json: never }),
+    deadlineMs: OBJECT_INFO_DEADLINE_MS,
+    timers,
+    // A clock frozen at a constant — the reading that broke the previous two designs.
+    now: () => 0,
+  });
+  for (let i = 0; i < 8; i++) {
+    await tick();
+    const t = armed.shift();
+    if (!t) continue;
+    elapsedReal += t.ms; // a step that hangs costs exactly the grant its timer enforces
+    t.fn();
   }
-  assert.ok(granted.reduce((a, b) => a + b, 0) <= 20000, "and the shares sum to one budget");
+  const result = await settled(out, "the oracle call");
+  assert.equal(result.defs, null, "nothing answered, so nothing is authorized");
+  assert.ok(
+    elapsedReal <= OBJECT_INFO_DEADLINE_MS,
+    `ran ${elapsedReal}ms against a ${OBJECT_INFO_DEADLINE_MS}ms budget on a frozen clock`,
+  );
 });
 
 test("#1161: a non-finite budget cannot poison the arithmetic", async () => {
@@ -789,21 +847,6 @@ test("#1161: outcomeKind names all four outcomes, including both Symbols", () =>
   }
 });
 
-test("#1161: the shares are the ones documented — 10s / 5s / 5s on the shipped budget", async () => {
-  // Review found BODY_SHARE 1 -> 0.5 and FALLBACK_RESPONSE_SHARE 0.5 -> 0.4 both left the
-  // suite green: the split the module documents in three places was asserted nowhere, so
-  // the numbers a reader checks could drift from the numbers that run.
-  const granted = [];
-  await fetchWholeObjectInfo({
-    getNodeDefs: async () => null,
-    fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
-    deadlineMs: OBJECT_INFO_DEADLINE_MS,
-    timers: { setTimer: (fn, ms) => { granted.push(ms); return { fn, ms }; }, clearTimer: () => {} },
-  });
-  assert.deepEqual(granted, [10000, 5000, 5000], "client route, then the response and body of the fallback");
-  assert.equal(granted.reduce((a, b) => a + b, 0), OBJECT_INFO_DEADLINE_MS, "and they are exactly the budget");
-});
-
 test("#1161: a refusal quotes the budget in force, not the argument it was given", async () => {
   // Reverting the three failure strings from `${budget}` to `${deadlineMs}` survived the
   // whole suite. It matters because the two now DIFFER: a value that cannot be a budget is
@@ -849,5 +892,25 @@ test("#1161: an explicitly NULL timers object is not a rejection", async () => {
     fetchApi: async () => ({ ok: true, json: async () => DEFS_1161 }),
     timers: null,
   });
+  assert.deepEqual(result.defs, DEFS_1161);
+});
+
+test("#1161: a forward clock jump during a step cannot starve the steps after it", async () => {
+  // The reclaim charges what a step actually used, which means a clock that leaps FORWARD
+  // mid-step reports a spend far larger than the grant that step was even allowed. Without
+  // clamping to the grant, that overcharge exhausts the budget and the fallback is skipped
+  // — the fetchApi-call-count-0 signature again, arriving through the reclaim rather than
+  // through the cap. `performance.now()` should never do this, but `now` is injectable and
+  // the Date.now fallback exists, so the clamp is what makes the direction safe.
+  let calls = 0;
+  let reading = 0;
+  const result = await fetchWholeObjectInfo({
+    // Answers immediately, but the clock leaps a billion ms while it does.
+    getNodeDefs: async () => { reading = 1e9; return null; },
+    fetchApi: async () => { calls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+    deadlineMs: 20000,
+    now: () => reading,
+  });
+  assert.equal(calls, 1, "the fallback must still be issued — a step cannot spend more than it was granted");
   assert.deepEqual(result.defs, DEFS_1161);
 });

@@ -258,7 +258,46 @@ export async function fetchWholeObjectInfo({
   // Injected so a test can drive the deadline without waiting on a real clock.
   deadlineMs = OBJECT_INFO_DEADLINE_MS,
   timers,
+  // MONOTONIC BY DEFAULT, and that is the whole reason a clock is admissible here again.
+  now,
 } = {}) {
+  // WHY THIS READS `performance.now()` AND NOT `Date.now()`.
+  //
+  // Three earlier designs were broken by a clock, and every scenario that broke them —
+  // an NTP step correction, a DST or manual change, a VM suspend/resume, a frozen reading
+  // — is a WALL-CLOCK hazard. `Date.now()` was the default, so all of them landed:
+  // measured at 49,998ms and 46,091ms against a 20,000ms deadline.
+  //
+  // `performance.now()` is monotonic by specification. It does not step backwards and is
+  // not repointed by the system clock, which is why this repo already measures its other
+  // elapsed-time windows on it — see `monotonicNow()` in the panel, `session-rebind.js`
+  // and `reconnect-staleness.js`, all of which say so in as many words.
+  //
+  // The reaction to those three rounds was to stop measuring entirely and charge every
+  // step its full grant. That bounded the total, but it stranded the unused time and
+  // REFUSED payloads both the parent and main delivered. The defect was never measurement;
+  // it was measuring with the one clock in the platform that is allowed to lie.
+  //
+  // A reading that is still somehow unusable (negative, non-finite — reachable only on the
+  // `Date.now` fallback where `performance` is absent) charges the FULL grant, so the
+  // budget can only ever be over-spent in the conservative direction.
+  const clockSource =
+    typeof now === "function"
+      ? now
+      : typeof performance !== "undefined" && typeof performance.now === "function"
+        ? () => performance.now()
+        : () => Date.now();
+  // READING THE CLOCK MUST NOT BE ABLE TO THROW OUT OF THIS MODULE. `now` is an injected
+  // option, and this module's header promises every failure path returns `defs: null` to
+  // two callers that await it with no catch. An unreadable clock yields NaN, which the
+  // accounting below already treats as "unmeasurable" and charges in full.
+  const readClock = () => {
+    try {
+      return clockSource();
+    } catch {
+      return NaN;
+    }
+  };
   // ONE budget for the whole question, DIVIDED IN ADVANCE — and no clock is consulted to
   // do it. That is the whole point, and it was arrived at the hard way.
   //
@@ -320,12 +359,26 @@ export async function fetchWholeObjectInfo({
     // step never being attempted. Verified: at deadlineMs of 1 or 2 the fallback was never
     // issued (fetchApi call count 0), which is the exact signature this whole change exists
     // to remove, reproduced by the arithmetic meant to prevent it.
-    const grant = left > 0 ? Math.max(1, Math.floor(left * share)) : 0;
-    consumed += grant;
+    const grant = left > 0 ? Math.max(1, Math.min(left, Math.floor(left * share))) : 0;
+    const startedStep = readClock();
     // `timers: null` is not `timers: undefined`, and only the latter reaches `withTimeout`'s
     // own default — an explicit null read `.setTimer` off null and REJECTED out of a module
     // that documents it always resolves, which two callers await with no catch of their own.
     const outcome = await runTransport(attempt, grant, timers ?? undefined);
+    if (outcome === NO_ANSWER) {
+      // It ran out its whole grant — that much is certain without measuring anything.
+      consumed += grant;
+    } else {
+      // IT ANSWERED EARLY, so the time it did not use goes back. Charging the full grant
+      // here was a real shipped regression, reproduced against both the parent and main: a
+      // client route that answers `null` in 200ms was still charged 10s, leaving the
+      // fallback 5s + 5s instead of ~19.8s, so a 5.4MB payload over a tunnel that BOTH
+      // other trees delivered at 7.5s was refused at 5.5s with most of the budget never
+      // granted to anything. The fallback is the entire reason this oracle exists; starving
+      // it to satisfy a bound is the wrong trade.
+      const spent = readClock() - startedStep;
+      consumed += Number.isFinite(spent) && spent >= 0 ? Math.min(spent, grant) : grant;
+    }
     return { outcome, grant };
   };
   // On the shipped 20s budget: 10s for the client route, 5s for the response, 5s for the
