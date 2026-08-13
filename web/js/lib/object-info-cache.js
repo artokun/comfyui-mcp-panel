@@ -60,6 +60,8 @@
  * single definition would become the cached schema. A Symbol cannot appear in JSON, so
  * only a producer that deliberately tagged its result can be mistaken for one.
  */
+import { withTimeout } from "./bounded-step.js";
+
 export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
 
 /** How long a fetched payload may be reused. */
@@ -113,85 +115,67 @@ export function createObjectInfoCache({
   // rather than merely forgetting the value it will produce.
   let generation = 0;
 
-  // #1161 — the sentinel is module-scoped, not allocated per read: a fresh Symbol per call
-  // is behaviourally identical and only makes garbage on the hot path.
-  const TIMED_OUT = Symbol("object-info-read-timeout");
+  // #1161 — the timeout note, built once. It is the whole reason the bound returns the
+  // #982 wrapper rather than a bare null: without a stated cause both call sites compute
+  // an empty failure list, and the refusal tells the user to hand-check a backend that
+  // answers /object_info perfectly well.
+  const timedOutOutcome = () => ({
+    [CACHE_OUTCOME]: true,
+    defs: null,
+    failures: [
+      `/object_info did not answer within ${waitMs}ms, so this call gave up waiting. The ` +
+        `request is still running and its answer will be cached if it arrives, so retrying ` +
+        `shortly is the right move; the backend itself may be healthy.`,
+    ],
+  });
 
   /**
    * Hand a caller the in-flight request, but never let it wait forever.
    *
    * Applied to EVERY caller — issuer and joiner alike — because the bound belongs where a
-   * promise is handed out, not where it is created. Bounding only the issuer left every
-   * concurrent reader on the raw promise, which is how the first attempt at this fix
-   * failed to fix the burst case the bug was reported on.
+   * promise is handed out, not where it is created. The first attempt at #1161 bounded
+   * only the issuer, so every concurrent reader still parked on the raw promise, and the
+   * burst case the bug was actually reported on was unfixed.
    *
-   * @param {Promise<any>} request the in-flight fetch
-   * @param {number} requestId its identity, so only its OWN waiter retires it
+   * Uses the repo's ONE bounded-step primitive rather than a second timeout helper, whose
+   * header says exactly why: "A second timeout helper written alongside the first is how
+   * this repo keeps producing near-duplicate bugs." Two hand-rolled attempts here proved
+   * it. Its at-most-once contract is what stops a joiner receiving a payload this call
+   * already gave up on, and it never rejects, so a throwing timer cannot reinstate the
+   * unbounded wait it exists to remove.
+   *
+   * IT ONLY STOPS THE CALLER WAITING. It does not retire the request, and that is the
+   * whole correction: an earlier version cleared the inflight slot and advanced the
+   * generation, which discarded the fetch's own late payload and converted a merely SLOW
+   * backend — a remote or tunnelled ComfyUI, a 5MB /object_info still loading custom
+   * nodes — into a permanent refusal, measurably worse than the bug. Leaving the request
+   * alone keeps every existing invariant: one fetch per burst, the late payload cached for
+   * the next call, and staleness still governed by invalidate()'s generation bump.
    */
-  async function boundRead(request, requestId) {
-    if (!(waitMs > 0)) return request;
-    let timer = null;
-    let outcome;
-    try {
-      outcome = await Promise.race([
-        // A rejection must reach the caller unchanged, so the request arm is not wrapped;
-        // only the timeout arm needs a sentinel.
-        request,
-        new Promise((resolve) => {
-          // Armed OUTSIDE the executor's throw path would be cleaner still, but the
-          // executor is where `resolve` lives. A throwing setTimer must not reject the
-          // read and discard a fetch that already succeeded, so it degrades to "no bound"
-          // rather than to a failure.
-          try {
-            timer = setTimer(() => resolve(TIMED_OUT), waitMs);
-          } catch {
-            /* no timer — this arm simply never resolves, and the request arm decides */
-          }
-        }),
-      ]);
-    } finally {
-      if (timer !== null) {
-        try {
-          clearTimer(timer);
-        } catch {
-          /* a throwing clear must not turn a successful read into a failure */
-        }
-      }
-    }
-    if (outcome !== TIMED_OUT) return outcome;
-    // Abandoned. Keep the rejection observed, or a fetch that fails after the bound becomes
-    // an unhandled rejection this file did nothing about.
-    request.catch(() => {});
-    // A payload may have landed WHILE we waited — an invalidation plus a successful
-    // refetch on another path. Refusing then would tell the user to reconnect ComfyUI at
-    // the exact moment the panel holds a fresh authoritative schema.
-    if (value !== null && now() - at < ttlMs) return value;
-    if (inflightId === requestId) {
-      inflight = null;
-      inflightGeneration = -1;
-      inflightId = 0;
-      // ADVANCE THE GENERATION, which the first attempt did not. Releasing the slot alone
-      // left the abandoned request still matching `issuedAt === generation`, so a late
-      // pre-restart payload could overwrite a NEWER schema and re-stamp its TTL — the
-      // fabricated-success hole #458 exists to close. Two requests were never live in one
-      // generation before this bound existed; retiring by generation is how this file
-      // already retires a request it no longer trusts.
-      generation++;
-    }
-    // The #982 outcome wrapper, not a bare null: the refusal must say WHY. Without it both
-    // call sites compute an empty failure list, and the user is told to hand-check a
-    // backend that answers /object_info perfectly well, against a route list that is
-    // absent — a hung read misdiagnosed as an unreachable one.
-    return {
-      [CACHE_OUTCOME]: true,
-      defs: null,
-      failures: [
-        `/object_info did not answer within ${waitMs}ms — the request was abandoned for this ` +
-          `call and a fresh one will be issued on the next. This is what a half-open ` +
-          `connection after a ComfyUI restart looks like; the backend itself may be healthy.`,
-      ],
-    };
-  }
+  // NOT a bare `withTimeout(request, …)`. That helper NEVER rejects by contract — a
+  // rejected promise degrades through `onTimeout()` exactly as a timeout does — and this
+  // cache must keep propagating a failed fetch. Three #716 tests pin that, and they caught
+  // the regression: without this, a network error that fails instantly would be reported
+  // to the user as "/object_info did not answer within 8000ms", which is simply false.
+  //
+  // So the outcome is REIFIED before it is bounded and unwrapped after: the helper still
+  // provides the settle-at-most-once and never-hang guarantees, while rejection stays a
+  // rejection and only a real timeout produces the timeout outcome.
+  const REJECTED = Symbol("object-info-read-rejected");
+  const boundRead = (request) =>
+    withTimeout(
+      request.then(
+        (v) => ({ v }),
+        (e) => ({ [REJECTED]: e }),
+      ),
+      waitMs,
+      () => ({ timedOut: true }),
+      { setTimer, clearTimer },
+    ).then((r) => {
+      if (r && r.timedOut) return timedOutOutcome();
+      if (r && REJECTED in r) throw r[REJECTED];
+      return r.v;
+    });
 
   return {
     /**
@@ -212,7 +196,7 @@ export function createObjectInfoCache({
       // restart the issuing call gave up at the bound while every overlapping call parked
       // until the orchestrator's 30s timeout. The bound belongs where a promise is handed
       // to a caller, not where it is created.
-      if (inflight && inflightGeneration === generation) return boundRead(inflight, inflightId);
+      if (inflight && inflightGeneration === generation) return boundRead(inflight);
       const issuedAt = generation;
       // An id captured BEFORE the promise exists, because `finally` must not name the
       // binding it is being assigned to: a fetchDefs() that throws SYNCHRONOUSLY runs the
@@ -273,7 +257,7 @@ export function createObjectInfoCache({
       inflight = request;
       inflightGeneration = issuedAt;
       inflightId = requestId;
-      return boundRead(request, requestId);
+      return boundRead(request);
     },
 
     /**

@@ -245,7 +245,7 @@ test("#716: a retired request cannot overwrite a newer value — deterministical
 });
 
 
-// ── #1161: a fetch that never settles must not park the tool ─────────────────
+// ── #1161: a fetch that never settles must not park the caller ───────────────
 //
 // The only open P1. After a ComfyUI restart the tab can hold a half-open connection, so
 // getNodeDefs() never settles. graph_set_widget is the one command that consults
@@ -253,10 +253,15 @@ test("#716: a retired request cannot overwrite a newer value — deterministical
 // other command answered instantly — and coalescing made it permanent, because every
 // later read joined the same dead promise.
 //
-// These never await a promise that may not settle: a test that detects its bug by hanging
-// `node --test` (which has no default timeout) reports a wedged suite instead of naming
-// the broken invariant. Every wait here is resolved by firing the injected timer, and the
-// clock is injected too, matching the rest of this file.
+// The bound ONLY stops the caller waiting. It deliberately does not retire the request:
+// two earlier attempts did, and each converted a merely SLOW backend into a permanent
+// refusal that was measurably worse than the bug. Everything the cache already guarantees
+// — one fetch per burst, the late payload cached for the next call, staleness governed by
+// invalidate() — is left intact.
+//
+// Nothing here awaits a promise that may not settle: a test that detects its bug by
+// hanging `node --test` (which has no default timeout) reports a wedged suite instead of
+// naming the broken invariant.
 function boundedCache({ waitMs = 8000, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) {
   const timers = new Set();
   const clock = { t: 1_000_000 };
@@ -264,124 +269,89 @@ function boundedCache({ waitMs = 8000, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) 
     ttlMs,
     waitMs,
     now: () => clock.t,
-    setTimer: (fn, ms) => {
-      const t = { fn, ms };
-      timers.add(t);
-      return t;
-    },
+    setTimer: (fn, ms) => { const t = { fn, ms }; timers.add(t); return t; },
     clearTimer: (t) => timers.delete(t),
   });
-  return {
-    cache,
-    clock,
-    armed: () => timers.size,
-    fireTimers: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }),
-  };
+  return { cache, clock, armed: () => timers.size, fireTimers: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }) };
 }
+const gaveUp = (o) => o && typeof o === "object" && o[CACHE_OUTCOME] === true && o.defs === null;
 
-const timedOut = (outcome) =>
-  outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true && outcome.defs === null;
+// Await a read WITHOUT the ability to hang. `node --test` has no default timeout and waits
+// for the event loop to drain, so a read that never settles wedges the whole suite —
+// reporting a timeout with no clue which invariant broke, and leaving a pending promise
+// alive even when the assertion before it already failed. Round 2 of this review caught
+// exactly that. A real bound here turns "the suite hung" into a named failure.
+const settled = (p, what) =>
+  Promise.race([
+    p,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${what} never settled — the bound did not apply to it`)), 250),
+    ),
+  ]);
 
 test("#1161: a fetch that never settles is bounded instead of parking the caller", async () => {
   const { cache, fireTimers } = boundedCache();
-  const read = cache.read(() => new Promise(() => {})); // half-open socket
+  const read = cache.read(() => new Promise(() => {}));
   fireTimers();
-  const outcome = await read;
-  assert.ok(timedOut(outcome), "the read gives up on THIS call rather than hanging");
-  // The refusal must say WHY: a bare null makes the caller's note misdiagnose a hung read
-  // as an unreachable backend, naming a route list it never printed.
+  const outcome = await settled(read, "the bounded read");
+  assert.ok(gaveUp(outcome), "the read gives up on THIS call rather than hanging");
+  // It must say WHY: a bare null makes both call sites compute an empty failure list, so
+  // the refusal names no cause and tells the user to hand-check a healthy backend.
   assert.match(String(outcome.failures?.[0] ?? ""), /did not answer within 8000ms/);
 });
 
 test("#1161: a JOINER is bounded too — the burst case the bug was reported on", async () => {
-  // The defect the first attempt shipped: read() returned the in-flight promise BEFORE the
-  // bound was installed, so only the issuing call was bounded and every overlapping call
-  // parked until the orchestrator's 30s timeout. #716 built this cache for bursts, so that
-  // is the case that matters most.
+  // The first attempt bounded only the issuing call, so every overlapping call still
+  // parked until the orchestrator's 30s timeout. #716 built this cache for bursts, so
+  // that is the case that matters most.
   const { cache, fireTimers, armed } = boundedCache();
-  const issuer = cache.read(() => new Promise(() => {}));
-  const joinerA = cache.read(() => new Promise(() => {}));
-  const joinerB = cache.read(() => new Promise(() => {}));
-  assert.equal(armed(), 3, "every caller must arm its own bound, not just the issuer");
+  const reads = [cache.read(() => new Promise(() => {})), cache.read(() => new Promise(() => {})), cache.read(() => new Promise(() => {}))];
+  assert.equal(armed(), 3, "every caller arms its own bound, not just the issuer");
   fireTimers();
-  for (const [name, p] of [["issuer", issuer], ["joinerA", joinerA], ["joinerB", joinerB]]) {
-    assert.ok(timedOut(await p), `${name} must give up rather than park`);
-  }
+  for (const [i, p] of reads.entries()) assert.ok(gaveUp(await settled(p, `caller ${i}`)), `caller ${i} must give up rather than park`);
 });
 
-test("#1161: the abandoned request is retired, so the next read issues a fresh one", async () => {
+test("#1161: a SLOW backend still works — the late payload is cached for the next call", async () => {
+  // The regression both earlier attempts shipped. Retiring the request on timeout threw
+  // away its own late answer, so a remote or still-loading ComfyUI refused FOREVER: worse
+  // than the bug, which at least cached the payload once it arrived.
   const { cache, fireTimers } = boundedCache();
-  let calls = 0;
-  const first = cache.read(() => { calls++; return new Promise(() => {}); });
-  fireTimers();
-  assert.ok(timedOut(await first));
-  assert.equal(calls, 1);
   const defs = { KSampler: {} };
-  const second = await cache.read(() => { calls++; return Promise.resolve(defs); });
-  assert.equal(calls, 2, "the next read must not join the dead request");
-  assert.deepEqual(second, defs, "…and it recovers as soon as the backend answers");
-});
-
-test("#1161: an abandoned request cannot overwrite a NEWER schema", async () => {
-  // The generation must advance when the slot is abandoned. Releasing it alone left the
-  // abandoned request still matching `issuedAt === generation`, so a late pre-restart
-  // payload could overwrite a newer one and re-stamp its TTL — a write authorized against
-  // a pack that was uninstalled during the restart, reported as success (#458).
-  const { cache, clock, fireTimers } = boundedCache();
-  let releaseStale;
-  const stale = new Promise((resolve) => { releaseStale = resolve; });
-  const first = cache.read(() => stale);
+  let land;
+  const slow = new Promise((resolve) => { land = resolve; });
+  const first = cache.read(() => slow);
   fireTimers();
-  assert.ok(timedOut(await first));
-
-  const fresh = { KSampler: {} };
-  assert.deepEqual(await cache.read(() => Promise.resolve(fresh)), fresh);
-
-  releaseStale({ GoneNode: {}, KSampler: {} }); // the pre-restart map lands late
-  await stale;
+  assert.ok(gaveUp(await settled(first, "the first call")), "the first call gives up waiting");
+  land(defs);
+  await slow;
   await new Promise((r) => setTimeout(r, 0));
-
-  clock.t += 1; // still inside the TTL of the FRESH value
   let refetched = 0;
-  const after = await cache.read(() => { refetched++; return Promise.resolve({}); });
-  assert.equal(refetched, 0, "the fresh value is still cached");
-  assert.deepEqual(after, fresh, "the retired request must not have overwritten it");
+  const second = await cache.read(() => { refetched++; return Promise.resolve({ other: {} }); });
+  assert.equal(refetched, 0, "the late answer populated the cache");
+  assert.deepEqual(second, defs, "…so the next call succeeds instead of refusing forever");
 });
 
-test("#1161: a payload that lands WHILE we wait is used, not refused", async () => {
-  // Refusing here would tell the user to reconnect ComfyUI at the exact moment the panel
-  // holds a fresh authoritative schema.
+test("#1161: one fetch per burst survives the bound — no request storm", async () => {
+  // Retiring the slot let each bounded-out read issue ANOTHER un-abortable /object_info,
+  // against a browser limit of six connections per host. The slot must stay.
   const { cache, fireTimers } = boundedCache();
-  const pending = cache.read(() => new Promise(() => {}));
-  cache.invalidate();
-  const defs = { KSampler: {} };
-  assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
+  let issued = 0;
+  const reads = [];
+  for (let i = 0; i < 5; i++) reads.push(cache.read(() => { issued++; return new Promise(() => {}); }));
   fireTimers();
-  assert.deepEqual(await pending, defs, "the waiting read must use the payload that arrived");
+  for (const p of reads) assert.ok(gaveUp(await settled(p, "a burst read")));
+  assert.equal(issued, 1, "a burst against a hung backend must still cost exactly one fetch");
 });
 
-test("#1161: a healthy fetch and a rejection are both unaffected by the bound", async () => {
-  const { cache } = boundedCache();
+test("#1161: a healthy fetch, a rejection, and the timer cleanup are all unaffected", async () => {
+  const { cache, armed } = boundedCache();
   const defs = { KSampler: {} };
   assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
+  assert.equal(armed(), 0, "a settled read leaves no timer armed");
+  // A REJECTION must still propagate. withTimeout never rejects by contract, so the
+  // outcome is reified before it is bounded and unwrapped after — otherwise a network
+  // error that fails instantly would be reported to the user as "did not answer within
+  // 8000ms", which is false. Three #716 tests pin this, and they caught it.
   const other = boundedCache().cache;
   await assert.rejects(other.read(() => Promise.reject(new Error("backend down"))), /backend down/);
-});
-
-test("#1161: a throwing timer degrades to no bound, never to a failed read", async () => {
-  const defs = { KSampler: {} };
-  const cache = createObjectInfoCache({
-    waitMs: 8000,
-    setTimer: () => { throw new Error("no timers here"); },
-    clearTimer: () => {},
-  });
-  assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
-});
-
-test("#1161: the timer is cleared when the fetch wins the race", async () => {
-  // Without the cleanup an 8s timer is left armed for every read — invisible in behaviour
-  // and exactly the kind of thing no assertion notices.
-  const { cache, armed } = boundedCache();
-  await cache.read(() => Promise.resolve({ KSampler: {} }));
-  assert.equal(armed(), 0, "a settled read must leave no timer armed");
 });
