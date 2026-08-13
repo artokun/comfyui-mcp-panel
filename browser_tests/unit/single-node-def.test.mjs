@@ -242,6 +242,20 @@ test("#1180: the RETRIED fetch's worst case stays inside the command budget", ()
   const budget = Number((src.match(/const NODE_DEFS_RETRY_BUDGET_MS = (\d+);/) || [])[1]);
   assert.ok(budget > 0, "the retry sequence must have its own budget");
 
+  // TWO runs, not one — the part a first version got wrong. A forced panel_refresh_nodes
+  // waits for the in-flight run and then starts its own; makeRefreshCoalescer guarantees
+  // exactly that ("a forced call GUARANTEES a fresh registration whose fetch begins AFTER
+  // the current run settles"). So a refresh issued just after a reconnect pays both,
+  // serially. At a 15s budget that measured 29.5s — past the bridge READ default, and
+  // within half a second of the command budget before the reply was even composed, so the
+  // user got a bare "tab did not reply" instead of the worded verdict this bound preserves.
+  const read = Number((src.match(/const BRIDGE_READ_DEFAULT_MS = (\d+);/) || [])[1]);
+  assert.ok(read > 0, "the bridge read default must be stated, not assumed");
+  assert.ok(
+    budget * 2 < read,
+    `two serialized refresh runs cost ${budget * 2}ms against a ${read}ms read default`,
+  );
+
   // DERIVED from the retry module, not hardcoded, so the arithmetic cannot drift when the
   // retry schedule changes.
   assert.match(

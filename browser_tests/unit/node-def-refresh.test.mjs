@@ -25,7 +25,7 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 // #1180 — the retried path gets a SMALLER per-attempt bound so three attempts plus the
 // retry module's own waiting stay well inside the 30s command budget. Derived here the
 // same way the panel derives it, so the harness cannot drift from the shipped number.
-const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor((15000 - 800) / 3);
+const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor((9000 - 800) / 3);
 const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) =>
   typeof apiValue?.getNodeDefs !== "function"
     ? Promise.resolve(null)

@@ -760,11 +760,21 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * is precisely the #1161 symptom, reintroduced by the fix for #1180.
  *
  * DERIVED, not picked, so the arithmetic cannot drift when the retry schedule changes: the
- * attempts and their waiting come from the retry module itself, and the whole sequence is
- * held to half the command budget, leaving the rest for the reply and for everything else
- * the command does.
+ * attempts and their waiting come from the retry module itself.
+ *
+ * SIZED FOR TWO RUNS, NOT ONE, which is the part a first version got wrong. A forced
+ * `panel_refresh_nodes` goes through `makeRefreshCoalescer`, whose documented contract is
+ * that a forced call's fetch begins AFTER the in-flight run settles — so a refresh issued
+ * just after a reconnect costs the reconnect's run PLUS its own, serially. At a 15s budget
+ * that measured 29.5s: past the bridge's 20s READ default, and inside half a second of the
+ * 30s command budget, before the command had even composed its reply. The user would get
+ * a bare "tab did not reply" instead of the worded verdict this bound exists to preserve.
+ *
+ * So the budget is halved against the READ default rather than the command budget: two
+ * serialized runs must fit inside it with margin, and one run has to be worth making.
  */
-const NODE_DEFS_RETRY_BUDGET_MS = 15000;
+const BRIDGE_READ_DEFAULT_MS = 20000;
+const NODE_DEFS_RETRY_BUDGET_MS = 9000;
 const NODE_DEFS_ATTEMPT_TIMEOUT_MS = Math.floor(
   (NODE_DEFS_RETRY_BUDGET_MS - OBJECT_INFO_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)) /
     (OBJECT_INFO_RETRY_DELAYS_MS.length + 1),
