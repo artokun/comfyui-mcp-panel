@@ -1024,8 +1024,10 @@ test("#1096 wiring: the re-advertise is debounced and does not disturb the sessi
   // across lines and a future one would break a stricter locator for no reason.
   const at = src.indexOf("shouldRehelloAfterComfyReconnect({");
   assert.notEqual(at, -1, "the reconnect handler must consult the predicate");
+  // The predicate's ARGUMENTS, sliced once and reused by both argument assertions below.
+  const callArgs = src.slice(at, src.indexOf("})", at));
   assert.match(
-    src.slice(at, src.indexOf("})", at)),
+    callArgs,
     /bridgeConnected: client\.isConnected\(\)/,
     "the live bridge state must come from the client, not a cached flag",
   );
@@ -1060,10 +1062,11 @@ test("#1096 wiring: the re-advertise is debounced and does not disturb the sessi
     "…and only when the hello actually landed, so a refused one leaves the window open",
   );
   // A hello with no session spawns a clean agent, so the session input must be WIRED,
-  // not left to its default.
-  const callAt = src.indexOf("shouldRehelloAfterComfyReconnect({", 0);
-  const callBlock = src.slice(callAt, src.indexOf("})", callAt));
-  assert.match(callBlock, /hasResumableSession/, "the session input must be passed at the call site");
+  // not left to its default. Asserted against the argument slice computed ONCE above:
+  // this used to recompute `src.indexOf(needle, 0)`, which is the same call as
+  // `src.indexOf(needle)`, so it re-derived a byte-identical slice under a second name
+  // and read as a broader check than it was.
+  assert.match(callArgs, /hasResumableSession/, "the session input must be passed at the call site");
   // MONOTONIC: a wall-clock adjustment must not be able to make the gap look negative.
   assert.match(block, /monotonicNow\(\)/);
   // It re-advertises and nothing more — no connect, no session frame. Bouncing a live
