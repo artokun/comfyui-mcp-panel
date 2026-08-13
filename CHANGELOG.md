@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.24] - 2026-08-12
+
 ### Fixed
 
 - **A successful agent restart no longer leaves the old turn's state armed against a
