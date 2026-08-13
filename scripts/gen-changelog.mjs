@@ -49,8 +49,19 @@ const git = (args) => execSync(`git ${args}`, { cwd: ROOT, encoding: "utf-8", st
 
 /** The ref to diff against = the previous release. Prefer the most recent
  *  version tag (mcp); fall back to the most recent release commit (the panel
- *  has no per-release tags); else the first commit. */
+ *  has no per-release tags); else the first commit.
+ *
+ *  MEMOIZED. Five call sites ask for this in one run, and the answer cannot change
+ *  between them — but each call re-ran `describe`, a full `git log`, and a `merge-base`.
+ *  #1191 made that visible rather than merely wasteful: the range warning below printed
+ *  once per call, and a diagnostic that repeats itself reads like several problems. */
+let prevTagMemo;
 function prevTag() {
+  if (prevTagMemo !== undefined) return prevTagMemo;
+  prevTagMemo = computePrevTag();
+  return prevTagMemo;
+}
+function computePrevTag() {
   try {
     // --match, because bare `describe --tags` accepts the nearest reachable tag of ANY
     // name — a `backup`, a CI marker, anything — and would silently make it the release
