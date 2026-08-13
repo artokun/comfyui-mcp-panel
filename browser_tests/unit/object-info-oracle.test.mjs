@@ -396,24 +396,38 @@ test("#1161: no route is ever REPORTED as timing out when it was never sent", as
   // #982's original defect was a refusal naming a cause it had not established. A step
   // reached with no budget left must say so in its own words rather than borrow the
   // timeout's, or the fix reintroduces the bug it was written to remove.
-  const h = harness();
+  // A zero budget is the one input that still reaches this branch, now that the floor
+  // makes a hung client route unable to starve the fallback. It is a REAL path — the
+  // caller injects the budget — and it pins the wording for whatever else reaches it.
   let fetchCalls = 0;
-  const out = fetchWholeObjectInfo({
+  const result = await fetchWholeObjectInfo({
     getNodeDefs: never,
     fetchApi: async () => { fetchCalls += 1; return { ok: true, json: async () => DEFS_1161 }; },
-    deadlineMs: 6000,
-    timers: h.timers,
-    // A clock that has ALREADY overrun the deadline when the fallback is reached — the
-    // state the unreserved version of this code put every hung client route into.
-    now: () => (fetchCalls === 0 && h.at() >= 3000 ? 99999 : h.at()),
+    deadlineMs: 0,
   });
-  await tick();
-  h.fire();
-  const result = await settled(out, "the oracle call");
   const note = result.failures.join(" | ");
   assert.equal(fetchCalls, 0, "this test only means something if the route really was skipped");
-  assert.doesNotMatch(note, /GET \/object_info did not answer/, "an unsent request cannot have failed to answer");
+  assert.equal(result.defs, null, "and nothing unasked-for is authorized");
+  assert.doesNotMatch(note, /did not answer within/, "an unsent request cannot have failed to answer");
   assert.match(note, /GET \/object_info was not attempted/, "…it reports what actually happened instead");
+  assert.match(note, /api\.getNodeDefs\(\) was not attempted/, "both routes speak for themselves");
+});
+
+test("#1161: the fallback's budget is a FLOOR, not merely what the first step left over", async () => {
+  // Subtracting a reserve makes the fallback depend on the client route finishing on time.
+  // Measured: at small deadlines the per-step overhead alone overran the subtraction and
+  // the fallback was skipped again — the exact defect being fixed, back by another door.
+  // Taking the max() instead makes the guarantee independent of the first step entirely.
+  for (const deadlineMs of [5, 10, 50, 200]) {
+    let fetchCalls = 0;
+    const result = await fetchWholeObjectInfo({
+      getNodeDefs: never,
+      fetchApi: async () => { fetchCalls += 1; return { ok: true, json: async () => DEFS_1161 }; },
+      deadlineMs,
+    });
+    assert.equal(fetchCalls, 1, `deadlineMs=${deadlineMs}: the fallback must still be issued`);
+    assert.deepEqual(result.defs, DEFS_1161, `deadlineMs=${deadlineMs}: and its answer used`);
+  }
 });
 
 test("#1161: the timeout is reported as a timeout, not as a throw", async () => {

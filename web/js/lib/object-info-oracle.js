@@ -220,17 +220,36 @@ export async function fetchWholeObjectInfo({
   //
   // So each step may spend at most what is left MINUS a reserve for the steps after it.
   // The fallback is the point of this oracle; it must be guaranteed a chance to answer.
-  const stepBudget = (reserve) => {
-    const left = deadlineMs - spent() - reserve;
+  // The client route may use at most half, so the other half is still there when the
+  // fallback is reached — enough for the ~14.5s payload measurement to be attempted.
+  const FALLBACK_FLOOR = Number.isFinite(deadlineMs) && deadlineMs > 0 ? Math.floor(deadlineMs / 2) : 0;
+  const clientRouteBudget = () => {
+    const left = deadlineMs - spent() - FALLBACK_FLOOR;
     return left > 0 ? left : 0;
   };
-  // The client route may use at most half, so the fallback and its body always have the
-  // other half — enough for the ~14.5s payload measurement to be attempted on its own.
-  const CLIENT_ROUTE_RESERVE = Math.floor(deadlineMs / 2);
+  // A FLOOR, NOT MERELY WHAT IS LEFT OVER. Subtracting a reserve makes the fallback's
+  // budget depend on the first step finishing on time, and it does not always: measured at
+  // small deadlines the per-step overhead alone overran the subtraction and the fallback
+  // was skipped again (fetchApi call count 0), which is the exact defect this is fixing.
+  // Taking the MAX makes the guarantee structural — the fallback cannot be starved by
+  // anything the client route does, including overrunning its own bound.
+  //
+  // The worst case is still ONE deadline rather than one-and-a-half: the client route is
+  // itself capped at deadline - floor, so reaching the fallback with the floor intact means
+  // roughly half the budget was spent, and the max() and the subtraction agree there. The
+  // response and the body then share ONE end time rather than each drawing a fresh floor,
+  // so a stalled body cannot restart the clock.
+  let fallbackEndsAt = null;
+  const fallbackBudget = () => {
+    const now_ = spent();
+    if (fallbackEndsAt === null) fallbackEndsAt = now_ + Math.max(deadlineMs - now_, FALLBACK_FLOOR);
+    const left = fallbackEndsAt - now_;
+    return left > 0 ? left : 0;
+  };
   const failures = [];
 
   if (typeof getNodeDefs === "function") {
-    const outcome = await runTransport(getNodeDefs, stepBudget(CLIENT_ROUTE_RESERVE), timers);
+    const outcome = await runTransport(getNodeDefs, clientRouteBudget(), timers);
     if (outcome === NOT_TRIED) {
       // Cannot happen while this is the FIRST step (it holds the full budget minus its
       // own reserve), but it is stated rather than assumed: `"err" in outcome` on a
@@ -269,7 +288,7 @@ export async function fetchWholeObjectInfo({
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    const outcome = await runTransport(() => fetchApi("/object_info"), stepBudget(0), timers);
+    const outcome = await runTransport(() => fetchApi("/object_info"), fallbackBudget(), timers);
     if (outcome === NOT_TRIED) {
       // TRUTHFUL ABOUT WHAT WAS NOT DONE. Saying this route "did not answer" when no
       // request was ever sent is #982's original defect — a refusal asserting a cause it
@@ -306,7 +325,7 @@ export async function fetchWholeObjectInfo({
         // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
         // half-open connection can also stall, so it is bounded as well rather than merely
         // re-caught: the response arriving is not the same event as the body arriving.
-        const body = await runTransport(() => res.json(), stepBudget(0), timers);
+        const body = await runTransport(() => res.json(), fallbackBudget(), timers);
         if (body === NOT_TRIED) {
           failures.push("GET /object_info answered but its body was not read — the budget was spent");
         } else if (body === NO_ANSWER) {
