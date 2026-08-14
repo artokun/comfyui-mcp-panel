@@ -2166,6 +2166,17 @@ export function resolveGraphBindingVerdict({
   // refusal has to say when it does fire: without it a shape refusal cannot tell
   // "a different graph" from "this graph, drifted, with no identity stamp", and
   // the old message resolved that ambiguity by asserting the worse one.
+  //
+  // #1187 — BEFORE YOU RELAX THE `structureMatches` CONJUNCT BELOW, read
+  // docs/design/graph-binding-tag-vs-tracker.md. A structural hand edit makes
+  // `structureMatches` false by definition, so a matching tag cannot rescue the read,
+  // and that refusal is a real reported bug. Two fixes for it were built, reviewed and
+  // REJECTED P0 — dropping the conjunct (a stale tag then permits writes to a canvas
+  // this workflow does not own, see the seal's closed-duplicate gap above), and
+  // settling the tracker first (the capture flips `isModified`, which SUPPRESSES
+  // `graphRootMismatchesActiveWorkflow`'s comparison rather than satisfying it — that
+  // function returns false outright on a dirty tab). Both passed the full unit
+  // suite; one was mutation-verified. The suite does not cover either hazard.
   const contentDiffers = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
   const structureMatches =
     contentDiffers && graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
