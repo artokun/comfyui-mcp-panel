@@ -274,6 +274,9 @@ import {
   unrunnableNodeIds,
   describeUnrunnable,
   missingNodeRunRefusal,
+  graphToPromptUnusable,
+  unserializableGraphRefusal,
+  unresolvedNodeTypes,
 } from "./lib/missing-node-preflight.js";
 import {
   classifyWorkflowRefresh,
@@ -12668,6 +12671,33 @@ const GRAPH_TOOL_EXECUTORS = {
       // None of that applies here: no network, no cap, and the bytes inspected are
       // the bytes that would have been POSTed.
       const built = await app.graphToPrompt();
+      // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
+      // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
+      // result that does not exist has no unrunnable entries in it — and the check below
+      // reads `[]` as "the graph is fine". The undefined then reaches ComfyUI's own
+      // queuePrompt, which dereferences `.workflow` on it, and the caller gets
+      // "Cannot read properties of undefined (reading 'workflow')": a message that names
+      // nothing, reads like a panel crash, and gave the reporter no reason to suspect
+      // their graph. The run-to-node path has always refused this properly (#556); the
+      // full-graph path did not.
+      if (graphToPromptUnusable(built)) {
+        // Name what the FRONTEND could not resolve, from the ROOT graph — serialization is
+        // root-scoped, so scanning the currently VIEWED graph would miss a missing pack that
+        // lives in a subgraph, or lives at the root while the user is inside one (review).
+        // Types only, and only unregistered ones: a graph that failed to serialize for some
+        // other reason reports no cause rather than a wrong one.
+        throw new Error(
+          unserializableGraphRefusal(
+            // `LG` is a local in other functions, NOT in scope here — the panel-scope gate
+            // caught it as a live ReferenceError on CI. Read LiteGraph the same way those
+            // locals are initialised.
+            unresolvedNodeTypes(
+              rootGraph ?? graph,
+              (window.LiteGraph ?? globalThis.LiteGraph)?.registered_node_types ?? {},
+            ),
+          ),
+        );
+      }
       const badIds = unrunnableNodeIds(built);
       if (badIds.length) {
         const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];

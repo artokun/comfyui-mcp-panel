@@ -122,7 +122,13 @@ test("#1460 WIRING: the preflight reads the SERIALIZED prompt, not the canvas", 
   assert.match(src, /import \{[\s\S]*?unrunnableNodeIds,[\s\S]*?\} from "\.\/lib\/missing-node-preflight\.js";/);
   const at = src.indexOf("const built = await app.graphToPrompt();");
   assert.ok(at > 0, "the preflight must serialize the prompt itself");
-  const block = src.slice(at, at + 600);
+  // Bounded by the pre-flight's OWN catch rather than a byte count. A fixed 600 excluded
+  // `unrunnableNodeIds(built)` as soon as #1582 added a guard above it — reporting missing
+  // wiring while the wiring was fine. The window exists to keep this assertion scoped to
+  // the pre-flight block, and that block ends at its catch.
+  const endOfTry = src.indexOf("} catch (err) {", at);
+  assert.ok(endOfTry > at, "the pre-flight's try block must still be recognisable");
+  const block = src.slice(at, endOfTry);
   assert.match(block, /unrunnableNodeIds\(built\)/);
   // The refuted approach must be gone entirely.
   assert.equal((src.match(/findUnregisteredTypes/g) ?? []).length, 0);

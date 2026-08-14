@@ -57,6 +57,97 @@ export function unrunnableNodeIds(prompt) {
 }
 
 /**
+ * #1582 — did `graphToPrompt()` fail to produce anything we can reason about?
+ *
+ * A DIFFERENT question from `unrunnableNodeIds`, and the whole defect is that the two were
+ * conflated. That one asks "which entries in this prompt are unrunnable?" and answers `[]`
+ * for a result that does not exist — correctly, because a thing that is not there has no
+ * unrunnable entries. The pre-flight then read `[]` as "the graph is fine" and handed an
+ * undefined result to ComfyUI's `queuePrompt`, which dereferences `.workflow` on it and
+ * throws `Cannot read properties of undefined (reading 'workflow')`.
+ *
+ * Absence of evidence, read as evidence of absence.
+ *
+ * A usable result must carry an `output` OBJECT. An empty one is fine — an empty graph
+ * serializes to no nodes and is not this failure.
+ */
+export function graphToPromptUnusable(built) {
+  if (!built || typeof built !== "object" || Array.isArray(built)) return true;
+  const output = built.output;
+  return !output || typeof output !== "object" || Array.isArray(output);
+}
+
+/**
+ * #1582 — every node type in the workflow the frontend cannot resolve, ROOT-SCOPED.
+ *
+ * Serialization is root-scoped: `graphToPrompt` walks the whole workflow, including every
+ * nested subgraph, whichever one the user happens to be looking at. Naming the offenders
+ * from the CURRENTLY VIEWED graph therefore misses them whenever the missing pack lives in
+ * a subgraph — or lives at the root while the user is inside one — leaving the generic
+ * refusal on exactly the large workflows this matters most for (review). The reported graph
+ * has 317 nodes.
+ *
+ * Bounded and cycle-safe: a `seen` set over graph objects, so a subgraph that references an
+ * ancestor cannot spin, and a depth cap in case something exotic slips past that.
+ */
+export function unresolvedNodeTypes(rootGraph, registry) {
+  const reg = registry && typeof registry === "object" ? registry : {};
+  const out = new Set();
+  const seen = new Set();
+  const walk = (g, depth) => {
+    if (!g || typeof g !== "object" || depth > 12 || seen.has(g)) return;
+    seen.add(g);
+    // Read each accessor ONCE. `_nodes` can be a getter, and testing it with isArray and
+    // then reading it again invokes that getter twice — harmless here, but it makes "how
+    // many times was this graph visited?" unanswerable, which is the property the cycle
+    // guard is judged on.
+    const own = g._nodes;
+    const alt = own === undefined ? g.nodes : undefined;
+    const nodes = Array.isArray(own) ? own : Array.isArray(alt) ? alt : [];
+    for (const n of nodes) {
+      const type = typeof n?.type === "string" ? n.type : null;
+      if (type && !Object.prototype.hasOwnProperty.call(reg, type)) out.add(type);
+      // A SubgraphNode carries its definition; both shapes appear across frontend versions.
+      walk(n?.subgraph, depth + 1);
+    }
+    for (const sub of Array.isArray(g.subgraphs) ? g.subgraphs : []) walk(sub, depth + 1);
+  };
+  walk(rootGraph, 0);
+  return [...out];
+}
+
+/**
+ * The refusal for a graph that could not be serialized at all.
+ *
+ * Mirrors what the run-to-node path has always said (#556) so the two paths stop giving
+ * wildly different answers to the same failure — the reporter learned the real cause only
+ * because they happened to retry with `to_node_id`.
+ *
+ * `types` is the node types the frontend could not resolve, when we know them. When we do
+ * NOT, this says so and stops: serialization can fail for reasons that have nothing to do
+ * with missing packs, and naming one anyway sends the user to install something they
+ * already have.
+ */
+export function unserializableGraphRefusal(types) {
+  const list = [...new Set((Array.isArray(types) ? types : []).filter((t) => typeof t === "string" && t))];
+  const shown = list.slice(0, 10);
+  const more = list.length > shown.length ? `, and ${list.length - shown.length} more` : "";
+  const cause = list.length
+    ? `The frontend could not resolve these node types, which is the usual cause: ` +
+      `${shown.join(", ")}${more}. Install the pack that provides them ` +
+      `(list_packs / install_custom_node) and restart ComfyUI so the frontend registers ` +
+      `them, or delete/bypass those nodes. `
+    : `The panel could not identify which nodes are responsible, so this does not ` +
+      `establish that a pack is missing — serialization can fail for other reasons. `;
+  return (
+    `NOT queued: this workflow could not be serialized into a prompt (graphToPrompt failed), ` +
+    `so there was nothing to send. ${cause}` +
+    `Nothing was queued and the queue is untouched. ` +
+    `panel_get_errors lists the node types this ComfyUI does not recognise.`
+  );
+}
+
+/**
  * Name the offending nodes using the live graph, which still knows their types.
  *
  * The serialized entry has lost the type — that is precisely why it is unrunnable — so
