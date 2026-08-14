@@ -271,9 +271,22 @@ function autoBody(commits, coveredPRs) {
   return lines.join("\n").trimEnd();
 }
 
+/**
+ * The release date, in UTC — ONE source, deliberately.
+ *
+ * This used to read local calendar fields (`getFullYear`/`getMonth`/`getDate`) while release
+ * notes written by hand carried the UTC date. That is how 0.14.31, 0.14.32 and 0.14.33 each
+ * ended up with two headings a day apart: the release commits were authored around
+ * 23:00-0600, so the generator stamped the 13th while the hand-written half stamped the 14th.
+ * The split made the duplication obvious, which was lucky — identical dates would have hidden
+ * it for longer.
+ *
+ * UTC rather than local, because a changelog is read by people in other timezones and by
+ * `changelog-delta`, and "the day it shipped" has to mean one thing. `toISOString` is used
+ * rather than assembling UTC fields by hand so there is no second way to get this wrong.
+ */
 function today() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return new Date().toISOString().slice(0, 10);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -292,6 +305,18 @@ const writeChangelog = (s) => writeFileSync(CHANGELOG, EOL === "\r\n" ? s.replac
 /** Build a dated entry string for `ver` from commits in `range`, folding in any
  *  hand-written highlights (deduped by PR). */
 function buildEntry(ver, range, highlights = "") {
+  // BARE `#N` ONLY, deliberately — this set is compared against PANEL PR numbers.
+  //
+  // A first attempt at #1219 widened this to `/\((?:[\w.-]+)?#(\d+)\)/g` so it would also see
+  // `(comfyui-mcp#1478)`, on the theory that upstream-first descriptions were failing to
+  // suppress their commits. That is wrong twice over. The two ids are different numbers in
+  // different namespaces — panel PR #1211 and mcp issue #1478 name the same change — so
+  // capturing the upstream number cannot match anything here. And it would be actively
+  // dangerous: an upstream issue number that happens to equal an unrelated panel PR number
+  // would suppress that PR's commit from the auto body, silently dropping shipped work.
+  //
+  // Cross-namespace dedupe is not solvable by number. The duplication it was reaching for is
+  // prevented by the post-write assertion at the bottom of this file instead.
   const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
   const commits = parseCommits(range);
   const auto = autoBody(commits, covered);
@@ -373,12 +398,40 @@ if (!version) {
 }
 
 if (md.includes(`## [${version}]`)) {
-  console.error(`CHANGELOG already has a [${version}] section — nothing to do.`);
+  // Exit 0 is deliberate: re-running the generator for an already-released version is a
+  // benign no-op and must not fail a release. But #1219 showed this message can also mean
+  // something is genuinely wrong — release notes hand-written under a pre-numbered
+  // `## [version]` heading instead of under Unreleased — and in that case the notes ship
+  // WITHOUT the auto-generated commit body, because this returns before writing it. Say both,
+  // so the operator can tell which one they are looking at.
+  console.error(
+    `CHANGELOG already has a [${version}] section — nothing to do.\n` +
+    `  If this is a re-run, that is expected.\n` +
+    `  If you just wrote the release notes yourself, they are in the WRONG PLACE: put them under\n` +
+    `  "${unrelHeader}" instead. This script promotes whatever is there VERBATIM into the one\n` +
+    `  dated section it writes, and appends the commits those notes did not mention. A\n` +
+    `  pre-numbered heading skips all of that — and leaves a SECOND heading once this script is\n` +
+    `  run again, which is how 0.14.31, 0.14.32 and 0.14.33 each ended up duplicated.`,
+  );
   process.exit(0);
 }
 
 const { text: entry, commits } = buildEntry(version, `${prevTag()}..HEAD`, highlights);
 const next = md.replace(UNREL, `${unrelHeader}\n\n${entry}\n\n`);
+
+// #1219 — NO POST-WRITE ASSERTION HERE, and the reason is worth stating so it is not added.
+//
+// A first attempt at #1219 put a duplicate-heading check right here, after building `next`.
+// It cannot fire. In the ordering that actually produced 0.14.31/32/33, the hand-written
+// numbered section was added AFTER this script had already run and exited — so at write time
+// there was exactly one heading and the check would have passed. In the opposite ordering the
+// pre-write check above returns first, so this point is never reached with a duplicate either.
+// Dead code shaped like a guard is worse than no guard: it reads as coverage.
+//
+// This script cannot defend against an edit made after it exits. The check that DOES catch it
+// is `browser_tests/unit/changelog-integrity.test.mjs`, which asserts the shape of the
+// committed file and therefore runs on the release PR no matter which step introduced the
+// second heading.
 writeChangelog(next);
 
 const nComp = new Set(commits.map((c) => componentOf(c.scope))).size;
