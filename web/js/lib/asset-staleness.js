@@ -854,14 +854,18 @@ export function emptyComboListsOnGraph(rootGraph, defsByType) {
 /**
  * #1172 — what to tell the agent when the backend's own list came back empty.
  *
- * Points at the BACKEND, deliberately. The panel did refresh, it did re-read
- * `/object_info`, and the server answered with no values — so another `panel_refresh_nodes`
- * changes nothing. Naming the refresh as the remedy is the wrong-remedy failure this repo
- * keeps removing; the remedy is the server's model paths, or a ComfyUI restart.
+ * WHAT THIS DELIBERATELY DOES NOT DO: name a cause, or predict what another command will do.
+ * The same rule `describeUploadFailure` states for #756, and a first version of this note
+ * broke it twice. It said "the backend is not finding it: check that server's model paths,
+ * then restart ComfyUI" — an INFERENCE. An empty list is equally a node whose combo the
+ * CLIENT populates, a pack that publishes an empty enum deliberately, or a server with
+ * genuinely zero of that asset. And it said "setting one of these widgets will be refused",
+ * which is simply FALSE: `set-widget.js` treats an authoritative empty list as unknowable
+ * and PERFORMS the write, reporting `empty_option_list: true` (#507/#1133). That sentence
+ * would have talked an agent out of a write that succeeds.
  *
- * Claims ONLY what was observed: that the list arrived empty. Not that the model is missing
- * (it may be present but unindexed), not that the node is broken, and not that a run will
- * fail — a widget the user never sets can be empty forever without consequence.
+ * So it reports the observation and the one thing that genuinely follows from it — that a
+ * second refresh returns the same payload, because the refresh is not what is empty.
  */
 export function emptyComboNote(empties) {
   if (!Array.isArray(empties) || !empties.length) return "";
@@ -871,9 +875,11 @@ export function emptyComboNote(empties) {
     `${empties.length} combo widget${empties.length === 1 ? "" : "s"} on this graph ` +
     `${empties.length === 1 ? "has" : "have"} an EMPTY list of valid values in the definitions ` +
     `the backend just published: ${shown}${more}. The refresh itself succeeded — this is what ` +
-    `/object_info returned, so refreshing again will return the same thing. If a value is ` +
-    `expected there, the backend is not finding it: check that server's model paths, then ` +
-    `restart ComfyUI. Setting one of these widgets will be refused until the backend lists it.`
+    `/object_info returned, so refreshing again returns the same thing. Why the list is empty ` +
+    `is NOT established here: it may be an asset the server has none of, a combo this node ` +
+    `populates client-side, or a pack that publishes an empty list deliberately. A write to ` +
+    `one of these is still permitted and reports empty_option_list, but nothing can verify ` +
+    `the value against a list the backend did not provide.`
   );
 }
 
@@ -881,7 +887,11 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
   let repaired = 0;
   if (!defsByType) return repaired;
   try {
-    // #1193 — one merged input map per TYPE for the whole sweep, not one per node.
+    // #1193 — one merged input map per TYPE for the whole sweep, not one per node. This
+    // removes the per-node spread; it does NOT make the sweep free. Rebuilding still walks
+    // every widget and copies each authoritative array, which is work the sweep did not do
+    // before. Stated rather than claimed safe: it has not been measured against #1193's
+    // 3.97s register/reapply figure.
     const mergedCache = new Map();
     for (const graph of collectAllGraphs(rootGraph)) {
       for (const node of graph._nodes ?? []) {

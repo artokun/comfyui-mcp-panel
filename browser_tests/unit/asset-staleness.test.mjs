@@ -1283,11 +1283,26 @@ test("#1172 the note points at the BACKEND, never at another refresh", () => {
   // command that just answered. The refresh worked; the server's answer is what is empty.
   const note = emptyComboNote([{ type: "CheckpointLoaderSimple", widget: "ckpt_name" }]);
   assert.match(note, /CheckpointLoaderSimple\.ckpt_name/);
-  assert.match(note, /refresh(ing)? again will return the same thing/i);
-  assert.match(note, /model paths/);
+  assert.match(note, /refresh(ing)? again returns the same thing/i);
   assert.doesNotMatch(note, /panel_refresh_nodes|try refreshing|refresh the nodes again/i);
   assert.equal(emptyComboNote([]), "");
   assert.equal(emptyComboNote(null), "");
+});
+
+test("#1172 the note NAMES NO CAUSE and does not predict another command's outcome", () => {
+  // #756's rule, applied to this note. A first version broke it twice: it inferred "the
+  // backend is not finding it — check model paths, then restart", and it asserted "setting
+  // one of these widgets will be refused". The second is FALSE — set-widget.js treats an
+  // authoritative empty list as unknowable and PERFORMS the write with empty_option_list
+  // (#507/#1133) — and would have talked an agent out of a write that succeeds.
+  const note = emptyComboNote([{ type: "CheckpointLoaderSimple", widget: "ckpt_name" }]);
+  assert.doesNotMatch(note, /model path|restart ComfyUI|not finding|missing/i, "no inferred cause");
+  assert.doesNotMatch(note, /will be refused|cannot be set|must not be set/i, "no false refusal claim");
+  // …and it must say the true thing about writes, so the agent is not left guessing.
+  assert.match(note, /still permitted/i);
+  assert.match(note, /empty_option_list/);
+  // The one inference that IS supportable: the refresh is not what is empty.
+  assert.match(note, /NOT established here/);
 });
 
 test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's hole)", () => {
@@ -1303,6 +1318,10 @@ test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's
     /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos \};/,
     "…and the refreshed:true branch must forward it",
   );
+  // The spread alone is not enough: `emptyCombos` could still be built without the list
+  // itself, forwarding only the note. Pin BOTH fields of the mapping.
+  assert.match(code, /empty_combo_lists: verdict\.empty_combo_lists,/, "the list must be mapped");
+  assert.match(code, /empty_combo_lists_note: verdict\.empty_combo_lists_note,/, "…and the note");
   // #1133: an empty list must never flip the verdict to failed — that would re-refuse via the
   // verdict what #1133 deliberately permits via the write path.
   assert.doesNotMatch(code, /empty_combo_lists[\s\S]{0,200}?refreshed = false/, "disclosure, not failure");
