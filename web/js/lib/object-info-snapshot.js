@@ -194,6 +194,11 @@ export function createObjectInfoSnapshot() {
       const detached = Object.create(null);
       for (const key of keys) detached[key] = EMPTY_DEF;
       defs = Object.freeze(detached);
+      // `currentEpoch` and `observedAtEpoch` are provably equal here — the guard above
+      // returned false otherwise — so writing either is the same store. Mutation testing
+      // reports the swap as a SURVIVOR for exactly that reason; it is an equivalent mutant,
+      // not a hole in the suite, and it is recorded here so the next run does not re-chase
+      // it. `currentEpoch` is written because it is the one `authorize` compares against.
       epoch = currentEpoch;
       return true;
     },
