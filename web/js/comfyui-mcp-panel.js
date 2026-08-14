@@ -12488,7 +12488,13 @@ const GRAPH_TOOL_EXECUTORS = {
         // other reason reports no cause rather than a wrong one.
         throw new Error(
           unserializableGraphRefusal(
-            unresolvedNodeTypes(rootGraph ?? graph, LG?.registered_node_types ?? {}),
+            // `LG` is a local in other functions, NOT in scope here — the panel-scope gate
+            // caught it as a live ReferenceError on CI. Read LiteGraph the same way those
+            // locals are initialised.
+            unresolvedNodeTypes(
+              rootGraph ?? graph,
+              (window.LiteGraph ?? globalThis.LiteGraph)?.registered_node_types ?? {},
+            ),
           ),
         );
       }
