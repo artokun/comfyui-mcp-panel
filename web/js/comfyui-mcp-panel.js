@@ -6170,6 +6170,30 @@ function awaitMediaEvent(el, name, timeoutMs) {
  * Same-origin /view means the canvas is NOT tainted, so toBlob works. Returns a
  * PNG Blob, or null if the video can't be decoded/sampled. Never throws.
  */
+/**
+ * A storyboard attempt that failed, and WHY (comfyui-mcp#1493).
+ *
+ * The builder used to answer every failure with a bare `null`: an undecodable
+ * codec, a canvas it could not get, frames that never painted, and a sheet that
+ * would not encode all looked identical to the caller. The reply then had to say
+ * "the panel is not told which" — which was honest, and useless, because the
+ * builder knew exactly and threw it away.
+ *
+ * THIS IS TRUTHY, so a caller must test `.reason` BEFORE treating the result as
+ * a sheet — `if (!sheet)` alone would sail past it and try to upload a plain
+ * object. `produceSheet` is the only consumer and does exactly that. Said
+ * plainly because the tempting summary — "existing checks keep working" — is
+ * false, and a wrong reassurance in a comment outlives the person who wrote it.
+ *
+ * What it DOES preserve is the meaning of `null`: a builder that returns nothing
+ * still reports nothing, so a test double of `async () => null` keeps meaning
+ * what it means today. That is why the existing "NO invented cause" test stays
+ * valid instead of being rewritten to accommodate this change.
+ */
+function storyboardFailure(reason) {
+  return { reason };
+}
+
 async function buildVideoStoryboard(url) {
   const video = document.createElement("video");
   video.muted = true;
@@ -6197,7 +6221,16 @@ async function buildVideoStoryboard(url) {
     const duration = Number(video.duration);
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    if (!isFinite(duration) || duration <= 0 || !vw || !vh) return null;
+    if (!isFinite(duration) || duration <= 0 || !vw || !vh) {
+      // #1493 — say WHICH. A caller that only sees `null` cannot tell a codec
+      // the browser will not decode from a frame it could not paint, and the
+      // two need different advice.
+      return storyboardFailure(
+        !isFinite(duration) || duration <= 0
+          ? "the browser reported no usable duration for it (its codec may not be decodable here — VP9/AV1 .webm is the usual case)"
+          : "the browser reported zero video dimensions for it (its codec may not be decodable here)",
+      );
+    }
 
     const n = storyboardFrameCount();
     const cellW = STORYBOARD.CELL_W;
@@ -6211,7 +6244,7 @@ async function buildVideoStoryboard(url) {
     canvas.width = pad * 2 + cols * cellW + (cols - 1) * gap;
     canvas.height = pad * 2 + rows * cellH + (rows - 1) * gap;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
+    if (!ctx) return storyboardFailure("this browser refused a 2D canvas context, so no sheet could be drawn");
     ctx.fillStyle = "#111114";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -6248,10 +6281,10 @@ async function buildVideoStoryboard(url) {
         ctx.fillText(String(i + 1).padStart(2, "0"), x + 4, y + 4);
       }
     }
-    if (!painted) return null;
+    if (!painted) return storyboardFailure("its metadata loaded but not one of the sampled frames could be painted (seeking never produced an image)");
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-    if (!blob) return null;
+    if (!blob) return storyboardFailure("the contact sheet was drawn but the canvas would not encode it to PNG (a cross-origin frame taints the canvas)");
     // #648 — the grid has COLS*ROWS CELLS, but a video with unseekable frames
     // paints fewer and leaves the rest blank. storyboardFrameCount() reports the
     // capacity, not the sample count, so a caller reading only that would tell
@@ -6266,7 +6299,12 @@ async function buildVideoStoryboard(url) {
     }
     return blob;
   } catch {
-    return null; // decode/seek/metadata failure → caller falls back to video-only
+    // The metadata wait itself timed out, or decode/seek threw.
+    return storyboardFailure(
+      "the browser never delivered its metadata within " +
+        Math.round(STORYBOARD.META_TIMEOUT_MS / 1000) +
+        "s, or decoding threw (its codec may not be decodable here)",
+    );
   } finally {
     cleanup();
   }

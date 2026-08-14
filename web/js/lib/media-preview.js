@@ -872,19 +872,40 @@ async function buildSampledPreview(job, deps) {
 async function produceSheet(job, deps) {
   const { buildVideoStoryboard, uploadBlobToInput, storyboardFrameCount, warn } = deps;
   try {
-    const blob = await buildVideoStoryboard(job.url);
+    const produced = await buildVideoStoryboard(job.url);
+    // #1493 — the builder may hand back `{reason}` instead of a sheet. That is
+    // TRUTHY, so it has to be recognised before the `!blob` check below, or an
+    // explanation would be uploaded to ComfyUI as if it were a PNG.
+    // Recognise SUCCESS positively; treat everything else as a failure.
+    //
+    // Two earlier versions inferred failure instead, and both were wrong in the
+    // direction that uploads garbage: keying on the reason's TYPE let a
+    // malformed `{reason:{…}}` through as a sheet, and keying on the PRESENCE of
+    // `reason` still uploaded any other truthy value — `[]`, `{}`, a string
+    // (review finding). A sheet is the thing with a numeric `size`, which is
+    // what a Blob has and what every test double models; nothing else may reach
+    // `uploadBlobToInput`.
+    //
+    // A hypothetical Blob carrying its own string `reason` is therefore read as
+    // a failure. That is a shape the builder never produces, and preferring the
+    // explanation over a silent upload is the safe way to be wrong about it.
+    const asObject = produced != null && typeof produced === "object" ? produced : null;
+    const named = asObject && typeof asObject.reason === "string" ? asObject.reason : null;
+    const looksLikeSheet = asObject != null && typeof asObject.size === "number";
+    const blob = looksLikeSheet && !named ? produced : null;
     if (!blob) {
       warn("[cmcp] show_media: could not sample frames from", job.name);
       return {
         ref: null,
         frames: null,
         cells: null,
-        // Deliberately non-diagnostic. The builder returns nothing when the
-        // metadata never arrives, when the dimensions are unusable, when no
-        // frame could be captured, AND when the finished sheet fails to encode
-        // — and it does not report which. Naming one of them would hand the
-        // agent a cause nothing observed.
-        why: "the sampler returned no contact sheet (its metadata, its frames or the sheet's own encoding failed — the panel is not told which)",
+        // Name the cause ONLY when the builder supplied one. A sampler that
+        // returns a bare `null` still reports nothing, and inventing a diagnosis
+        // for it would hand the agent a cause nothing observed — the rule the
+        // "NO invented cause" test exists to hold, and which still holds.
+        why: named
+          ? `the sampler could not build a contact sheet: ${named}`
+          : "the sampler returned no contact sheet (its metadata, its frames or the sheet's own encoding failed — the panel is not told which)",
       };
     }
     const base = job.name.replace(/\.[^.]+$/, "") || "video";
