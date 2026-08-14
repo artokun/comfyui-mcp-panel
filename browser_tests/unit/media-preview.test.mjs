@@ -1203,8 +1203,22 @@ const panelSource = () =>
  *
  * Not a JS parser, and it does not need to be — but a brace counter that reads
  * braces inside STRINGS and COMMENTS can mis-bound and then validate the wrong
- * region entirely (also a review finding), which is worse than no check. So mask
- * those first, preserving length so offsets still line up with the original.
+ * region entirely, which is worse than no check. So mask those first, preserving
+ * length so offsets still line up with the original.
+ *
+ * STRINGS ARE MASKED BEFORE COMMENTS, and the order is load-bearing: a `//` or
+ * `/*` inside a string literal would otherwise start a comment that runs to the
+ * end of the line (or to the next close) and blank out real code, moving the
+ * bound (review, round 3). Masking strings first removes those characters before
+ * anything can read them as a comment opener.
+ *
+ * ACCEPTED LIMITS, stated rather than implied: regex literals are NOT masked, so
+ * a regex containing an unbalanced brace inside this function would mis-bound
+ * it, and nested template literals are matched only to their first unescaped
+ * backtick. Both are absent from the function this is used on, and the
+ * assertions here fail loudly rather than silently passing if the bound moves —
+ * a body that no longer contains `storyboardFailure(` trips the >= 5 check. Buy
+ * a real parser if this helper ever gets pointed at arbitrary code.
  */
 function functionBody(signature) {
   const src = panelSource();
@@ -1213,11 +1227,11 @@ function functionBody(signature) {
 
   const blank = (m) => m.replace(/[^\n]/g, " "); // keep newlines, drop content
   const masked = src
+    .replace(/"(?:\\.|[^"\\\n])*"/g, blank) // "…"  ─┐ strings FIRST, so a `//`
+    .replace(/'(?:\\.|[^'\\\n])*'/g, blank) // '…'   │ inside one cannot open a
+    .replace(/`(?:\\.|[^`\\])*`/g, blank) //  `…`   ─┘ comment that eats real code
     .replace(/\/\*[\s\S]*?\*\//g, blank) // block comments
-    .replace(/\/\/[^\n]*/g, blank) // line comments
-    .replace(/"(?:\\.|[^"\\\n])*"/g, blank) // "…"
-    .replace(/'(?:\\.|[^'\\\n])*'/g, blank) // '…'
-    .replace(/`(?:\\.|[^`\\])*`/g, blank); // `…` (may span lines)
+    .replace(/\/\/[^\n]*/g, blank); // line comments
 
   const open = masked.indexOf("{", start);
   assert.ok(open > start, `could not find the opening brace of ${signature}`);
