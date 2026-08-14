@@ -49,17 +49,12 @@ const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOU
 let cacheInvalidations = 0;
 const cacheSpy = { invalidate: () => { cacheInvalidations += 1; }, read: async (f) => f() };
 
-/**
- * #1223 — the last-observed-schema snapshot the refresh run also clears and re-records.
- * A spy for the same reason cacheSpy is one: the run's contract is that a suspicion of
- * change RETIRES it and only a successful fetch puts one back, and that is assertable only
- * if the harness can see both calls.
- */
+/** #1223 — the last-observed-schema snapshot the refresh run also clears and re-records. */
 let snapshotClears = 0;
 const snapshotRecords = [];
 const snapshotSpy = {
   clear: () => { snapshotClears += 1; },
-  record: (defs, epoch) => { snapshotRecords.push({ defs, epoch }); return true; },
+  record: (defs, opts) => { snapshotRecords.push({ defs, opts }); return true; },
 };
 
 import {
@@ -419,10 +414,9 @@ function buildRegisterComfyNodeDefs({
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
-    // #1223 — the snapshot the run retires and re-records, and the connection epoch it
-    // stamps a recording with. Both are module state in the panel, so the extracted body
-    // throws ReferenceError without them (the exact failure #1180's note above predicted
-    // for the next collaborator added to this function).
+    // #1223 — the snapshot the run retires and re-records, and the connection epoch a
+    // recording is stamped with. Both are module state in the panel, so the extracted
+    // body throws ReferenceError without them.
     "objectInfoSnapshot",
     "backendReconnectEpoch",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
@@ -468,12 +462,9 @@ function buildRegisterComfyNodeDefs({
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,
-    // #1223 — same reasoning as cacheSpy: a spy, so a test can prove the run retires the
-    // last-observed schema and re-records only what it actually fetched.
+    // #1223 — a spy, so a test can prove the run retires the last-observed schema and
+    // re-records only a payload it fetched itself.
     snapshotSpy,
-    // The connection epoch a recording is stamped with. A fixed value here; the epoch's
-    // real job (refusing a snapshot from a replaced backend) is proved in
-    // object-info-snapshot.test.mjs, where it can be moved.
     7,
   );
 }
@@ -728,11 +719,11 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
 });
 
 test("#1180 EXECUTED: which error survives the retry, across every ordering", async () => {
-  // MIRRORS the panel's loop rather than driving it, which is worth being plain about:
-  // its value is enumerating many orderings cheaply, and the structural test above is what
-  // ties the mirror to the source. The ordering that drives the SHIPPED executor is "a REAL
-  // error survives a later stall" at the end of this file, on virtual timers.
-  //
+  // MIRRORS the panel's loop rather than driving it, which is worth being plain about:
+  // its value is enumerating many orderings cheaply, and the structural test above is what
+  // ties the mirror to the source. The ordering that drives the SHIPPED executor is "a REAL
+  // error survives a later stall" at the end of this file, on virtual timers.
+  //
   // This one runs the real
   // retry loop and shows what a user would actually be told, because "the last error wins"
   // plus "a timeout can be an error" silently changes the verdict for orderings nobody
@@ -754,7 +745,7 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
             if (o === "falsy") throw null; // a real failure whose VALUE is falsy
             result = o === "timeout" ? NO_ANSWER : { KSampler: {} };
           } catch (err) {
-            sawRealError = true;
+            sawRealError = true;
             lastRealError = err;
             throw err;
           }

@@ -5,8 +5,14 @@
  * the graph, so a render blocks the schema fetch: a BUSY backend, not an absent one.
  *
  * The fix authorizes from the last WHOLE schema observed on the CURRENT backend connection,
- * under four conditions that all fail closed. These tests exist to keep each condition
- * load-bearing — every one of them is the difference between this and re-opening #458.
+ * under four conditions that all fail closed. These tests keep each condition load-bearing —
+ * every one is the difference between this and re-opening #458.
+ *
+ * SEVERAL OF THESE EXIST BECAUSE THE FIRST VERSION SHIPPED THE BUG THEY NOW PIN. Review
+ * found that the snapshot was never populated on a normal startup (so the reported case was
+ * still refused), that the epoch was read AFTER the fetch (so a pre-restart schema could be
+ * filed under post-restart provenance), and that the clear it relied on never ran because
+ * the reconnect's refresh is coalesced away. Those three have named tests below.
  *
  * The last block drives the SHIPPED `getFreshObjectInfo` body extracted from the panel, not
  * a re-implementation of it. A test that reasons about a copy of the wiring proves the copy.
@@ -17,25 +23,31 @@ import { readFileSync } from "node:fs";
 
 import {
   createObjectInfoSnapshot,
-  transportsWereSilent,
+  noBackendAnswerEstablished,
   snapshotAuthorizationNote,
 } from "../../web/js/lib/object-info-snapshot.js";
-import { TRANSPORT_OUTCOME, fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
+import {
+  TRANSPORT_OUTCOME,
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+} from "../../web/js/lib/object-info-oracle.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
-import { objectInfoOracleFailureNote } from "../../web/js/lib/object-info-oracle.js";
 
 const SCHEMA = { KSampler: { input: {} }, H3Keyframes: { input: {} } };
 const silence = [
   { route: "client", kind: TRANSPORT_OUTCOME.NO_ANSWER },
   { route: "http", kind: TRANSPORT_OUTCOME.NO_ANSWER },
 ];
+/** The v2 record contract: an epoch captured before the fetch, unchanged since, and a claim. */
+const stored = (snap, defs = SCHEMA, epoch = 3) =>
+  snap.record(defs, { observedAtEpoch: epoch, currentEpoch: epoch, whole: true });
 
 // ---------------------------------------------------------------------------
-// Condition 4: SILENCE, not merely failure
+// Condition 4: the backend never ANSWERED
 // ---------------------------------------------------------------------------
 
 test("#1223 both probes timing out is the silence this licenses", () => {
-  assert.equal(transportsWereSilent(silence), true);
+  assert.equal(noBackendAnswerEstablished(silence), true);
 });
 
 test("#1223 a route that THREW disqualifies — a refused connection is a process that is gone", () => {
@@ -43,7 +55,7 @@ test("#1223 a route that THREW disqualifies — a refused connection is a proces
   // signature of a backend that is DOWN, and a down backend may be restarting — the one
   // event that can change the type set. Silence is the signature of one that is busy.
   assert.equal(
-    transportsWereSilent([
+    noBackendAnswerEstablished([
       { route: "client", kind: TRANSPORT_OUTCOME.NO_ANSWER },
       { route: "http", kind: TRANSPORT_OUTCOME.THREW },
     ]),
@@ -52,10 +64,8 @@ test("#1223 a route that THREW disqualifies — a refused connection is a proces
 });
 
 test("#1223 a route that ANSWERED something unusable disqualifies", () => {
-  // A non-OK status, an empty schema, a body that stalled after its headers arrived. All
-  // are a backend saying something, which is a different fault from the reported one.
   assert.equal(
-    transportsWereSilent([
+    noBackendAnswerEstablished([
       { route: "client", kind: TRANSPORT_OUTCOME.NO_ANSWER },
       { route: "http", kind: TRANSPORT_OUTCOME.ANSWERED_UNUSABLE },
     ]),
@@ -63,71 +73,57 @@ test("#1223 a route that ANSWERED something unusable disqualifies", () => {
   );
 });
 
+test("#1223 a client that returned NOTHING leaves the question unanswered, and licenses", () => {
+  // Review finding: tagging this ANSWERED_UNUSABLE contradicted the oracle's own stated
+  // semantics ("Only a client that returned NOTHING (null/undefined/non-object) or threw
+  // leaves the question unanswered") and made the whole fix inert on any frontend whose
+  // getNodeDefs swallows its failure and resolves undefined. It failed closed, so it was
+  // not dangerous — it just never fired.
+  assert.equal(
+    noBackendAnswerEstablished([
+      { route: "client", kind: TRANSPORT_OUTCOME.NOTHING_RETURNED },
+      { route: "http", kind: TRANSPORT_OUTCOME.NO_ANSWER },
+    ]),
+    true,
+  );
+  assert.equal(
+    noBackendAnswerEstablished([{ route: "client", kind: TRANSPORT_OUTCOME.NOTHING_RETURNED }]),
+    true,
+    "and on its own, when no fallback transport is wired",
+  );
+});
+
 test("#1223 never-contacted routes are neutral, but cannot license on their own", () => {
   assert.equal(
-    transportsWereSilent([
+    noBackendAnswerEstablished([
       { route: "client", kind: TRANSPORT_OUTCOME.NOT_ATTEMPTED },
       { route: "http", kind: TRANSPORT_OUTCOME.NO_ANSWER },
     ]),
     true,
-    "one route silent, the other never asked — still the reported condition",
   );
   assert.equal(
-    transportsWereSilent([
+    noBackendAnswerEstablished([
       { route: "client", kind: TRANSPORT_OUTCOME.NOT_ATTEMPTED },
       { route: "http", kind: TRANSPORT_OUTCOME.NOT_ATTEMPTED },
     ]),
     false,
-    "nothing was ever asked, so nothing was observed to be silent",
+    "nothing was ever asked, so nothing was observed",
   );
 });
 
 test("#1223 an absent, empty, or unrecognised outcome list licenses nothing", () => {
-  // "We recorded nothing" is not evidence of silence. A caller that lost the outcomes — or
-  // one handing in a shape this module never produced — must get the refusal.
-  assert.equal(transportsWereSilent(undefined), false);
-  assert.equal(transportsWereSilent([]), false);
-  assert.equal(transportsWereSilent("no-answer"), false);
-  assert.equal(transportsWereSilent([{ route: "client", kind: "invented" }]), false);
-  assert.equal(transportsWereSilent([null, { kind: TRANSPORT_OUTCOME.NO_ANSWER }]), false);
-  assert.equal(transportsWereSilent(["no-answer", "no-answer"]), false, "bare strings are not outcomes");
-});
-
-test("#1223 the oracle's real tags drive it — not a list hand-written in this test", async () => {
-  // The tags and the prose must describe the SAME attempt. Pinning only hand-made lists
-  // would let the oracle stop emitting them, or emit the wrong one, with the suite green.
-  const timedOut = await fetchWholeObjectInfo({
-    getNodeDefs: () => new Promise(() => {}),
-    fetchApi: () => new Promise(() => {}),
-    deadlineMs: 20,
-  });
-  assert.equal(timedOut.defs, null);
-  assert.equal(transportsWereSilent(timedOut.outcomes), true, "two hung transports read as silence");
-  assert.equal(timedOut.outcomes.length, timedOut.failures.length, "one tag per recorded attempt");
-
-  const refused = await fetchWholeObjectInfo({
-    getNodeDefs: async () => {
-      throw new TypeError("Failed to fetch");
-    },
-    fetchApi: async () => {
-      throw new TypeError("Failed to fetch");
-    },
-  });
-  assert.equal(refused.defs, null);
-  assert.equal(transportsWereSilent(refused.outcomes), false, "a refused connection is not silence");
-
-  const notOk = await fetchWholeObjectInfo({
-    getNodeDefs: async () => null,
-    fetchApi: async () => ({ ok: false, status: 503 }),
-  });
-  assert.equal(transportsWereSilent(notOk.outcomes), false, "a 503 is an answer");
+  assert.equal(noBackendAnswerEstablished(undefined), false);
+  assert.equal(noBackendAnswerEstablished([]), false);
+  assert.equal(noBackendAnswerEstablished("no-answer"), false);
+  assert.equal(noBackendAnswerEstablished([{ route: "client", kind: "invented" }]), false);
+  assert.equal(noBackendAnswerEstablished([null, { kind: TRANSPORT_OUTCOME.NO_ANSWER }]), false);
+  assert.equal(noBackendAnswerEstablished(["no-answer", "no-answer"]), false, "bare strings are not outcomes");
 });
 
 test("#1223 EACH route's tag is pinned on its own, not through the aggregate", async () => {
-  // Mutation-driven. Asserting only `transportsWereSilent(...) === false` over a TWO-route
-  // failure lets one correct tag mask a wrong one: mistagging the client's THREW as
-  // silence survived, because the http route's own THREW still carried the verdict. The
-  // tag is the thing the fallback reads, so the tag is what has to be pinned.
+  // Mutation-driven. Asserting only the aggregate over a TWO-route failure lets one correct
+  // tag mask a wrong one: mistagging the client's THREW as silence survived, because the
+  // http route's own THREW still carried the verdict.
   const kinds = async (opts) => (await fetchWholeObjectInfo({ deadlineMs: 40, ...opts })).outcomes.map((o) => o.kind);
 
   assert.deepEqual(
@@ -142,9 +138,9 @@ test("#1223 EACH route's tag is pinned on its own, not through the aggregate", a
   );
 
   assert.deepEqual(
-    await kinds({ getNodeDefs: null, fetchApi: async () => ({ ok: false, status: 503 }) }),
+    await kinds({ getNodeDefs: null, fetchApi: async () => ({ ok: false, status: 500 }) }),
     [TRANSPORT_OUTCOME.NOT_ATTEMPTED, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
-    "a non-OK status is an answer; an unwired client is a route nobody asked",
+    "a 500 is ComfyUI answering; an unwired client is a route nobody asked",
   );
 
   assert.deepEqual(
@@ -153,7 +149,7 @@ test("#1223 EACH route's tag is pinned on its own, not through the aggregate", a
       fetchApi: async () => ({ ok: true, status: 200, json: () => new Promise(() => {}) }),
     }),
     [TRANSPORT_OUTCOME.NOT_ATTEMPTED, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
-    "headers arrived, so the backend answered — a stalled BODY is not the silence this licenses",
+    "headers arrived, so the backend answered — a stalled BODY is not silence",
   );
 
   assert.deepEqual(
@@ -163,36 +159,118 @@ test("#1223 EACH route's tag is pinned on its own, not through the aggregate", a
   );
 
   assert.deepEqual(
+    await kinds({ getNodeDefs: async () => undefined, fetchApi: null }),
+    [TRANSPORT_OUTCOME.NOTHING_RETURNED, TRANSPORT_OUTCOME.NOT_ATTEMPTED],
+    "resolving undefined is NOT an answer — it is the question left unanswered",
+  );
+
+  assert.deepEqual(
     await kinds({ getNodeDefs: () => new Promise(() => {}), fetchApi: null }),
     [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.NOT_ATTEMPTED],
-    "and a hung client with no fallback wired is the one shape that licenses",
+    "and a hung client with no fallback wired is the canonical shape",
   );
 });
 
-test("#1223 a usable answer still returns its outcomes alongside the schema", async () => {
-  const { defs, outcomes } = await fetchWholeObjectInfo({
-    getNodeDefs: async () => SCHEMA,
-    fetchApi: null,
+test("#1223 a PROXY gateway error is the backend not answering, not the backend answering", async () => {
+  // ComfyUI behind nginx/Caddy is the standard remote and RunPod shape. The proxy answers a
+  // hung upstream with 502/504 after its own read timeout — the same event as a bare
+  // timeout, arriving over HTTP. Counting it as an answer disabled the fix for every
+  // proxied install AND blamed the backend for a message it never sent.
+  const kinds = async (status) =>
+    (
+      await fetchWholeObjectInfo({
+        deadlineMs: 40,
+        getNodeDefs: () => new Promise(() => {}),
+        fetchApi: async () => ({ ok: false, status }),
+      })
+    ).outcomes.map((o) => o.kind);
+
+  for (const status of [502, 504]) {
+    assert.deepEqual(
+      await kinds(status),
+      [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.NO_ANSWER],
+      `status ${status} is the proxy reporting silence`,
+    );
+  }
+  // 503 is deliberately NOT in the set: ComfyUI itself can serve it, so it is not
+  // unambiguously the proxy and this must not guess.
+  assert.deepEqual(
+    await kinds(503),
+    [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
+    "503 stays an answer — it is not unambiguously a proxy",
+  );
+});
+
+test("#1223 the gateway refusal SAYS it was a proxy, not the backend", async () => {
+  const { failures } = await fetchWholeObjectInfo({
+    deadlineMs: 40,
+    getNodeDefs: null,
+    fetchApi: async () => ({ ok: false, status: 504 }),
   });
+  assert.match(failures.join(" "), /proxy in front of ComfyUI/i);
+});
+
+test("#1223 a usable answer still returns its outcomes alongside the schema", async () => {
+  const { defs, outcomes } = await fetchWholeObjectInfo({ getNodeDefs: async () => SCHEMA, fetchApi: null });
   assert.equal(defs, SCHEMA);
   assert.deepEqual(outcomes, [], "the route that answered is not a failure, so nothing is tagged");
 });
 
 // ---------------------------------------------------------------------------
-// Conditions 1–3: a snapshot, an unbroken connection, the same process
+// Conditions 1-3: a vouched-for whole map, an unbroken connection, the same process
 // ---------------------------------------------------------------------------
 
 test("#1223 the reported case: silent probes on an unbroken connection authorize", () => {
   const snap = createObjectInfoSnapshot();
-  assert.equal(snap.record(SCHEMA, 3), true);
+  assert.equal(stored(snap), true);
   const { defs, reason } = snap.authorize({ epoch: 3, socketDown: false, outcomes: silence });
-  assert.equal(defs, SCHEMA, "the edit the reporter was refused is authorized");
   assert.equal(reason, "");
+  assert.ok(defs, "the edit the reporter was refused is authorized");
+  assert.ok(Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "and the reported node type is in it");
+});
+
+test("#1223 what is stored is DETACHED — registration hooks mutate defs in place", () => {
+  // `registerNodesFromDefs` runs `beforeRegisterNodeDef` hooks that mutate the definitions
+  // in place (Comfy's own upload hook adds an input the backend never declared). Retaining
+  // the payload by reference would hand frontend-mutated data back as backend evidence.
+  const live = { KSampler: { input: {} } };
+  const snap = createObjectInfoSnapshot();
+  stored(snap, live);
+  live.KSampler.input.image = ["IMAGE", { image_upload: true }];
+  live.InjectedByAnExtension = { input: {} };
+  const { defs } = snap.authorize({ epoch: 3, socketDown: false, outcomes: silence });
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(defs, "InjectedByAnExtension"),
+    false,
+    "a type added after the observation is not in the snapshot",
+  );
+  assert.deepEqual(defs.KSampler, {}, "and the def's own shape is not carried at all");
+});
+
+test("#1223 the stored map answers MEMBERSHIP only, so it cannot supply stale combo lists", () => {
+  // The values being empty is what stops `refreshComboOptionsFromDefs` rewriting a live
+  // dropdown backwards to an older option list (it does `w.options.values = first.slice()`),
+  // and what makes `uploadInputConfig` / `serverDeclaresEmptyComboOptions` answer
+  // conservatively.
+  const snap = createObjectInfoSnapshot();
+  stored(snap, { CheckpointLoaderSimple: { input: { required: { ckpt_name: [["old.safetensors"], {}] } } } });
+  const { defs } = snap.authorize({ epoch: 3, socketDown: false, outcomes: silence });
+  assert.deepEqual(defs.CheckpointLoaderSimple, {}, "no option list survives into the snapshot");
+});
+
+test("#1223 a type named __proto__ cannot reach Object.prototype", () => {
+  // On a plain object `detached["__proto__"] = x` sets the prototype instead of creating an
+  // own property — losing the type AND poisoning every object in the page.
+  const snap = createObjectInfoSnapshot();
+  stored(snap, { __proto__: { input: {} }, KSampler: {} });
+  const { defs } = snap.authorize({ epoch: 3, socketDown: false, outcomes: silence });
+  assert.equal({}.polluted, undefined, "nothing was written to Object.prototype");
+  assert.ok(defs, "and the snapshot is still usable");
 });
 
 test("#1223 a DOWN socket refuses — a restarting backend is the one thing that moves the type set", () => {
   const snap = createObjectInfoSnapshot();
-  snap.record(SCHEMA, 3);
+  stored(snap);
   const { defs, reason } = snap.authorize({ epoch: 3, socketDown: true, outcomes: silence });
   assert.equal(defs, null);
   assert.match(reason, /socket is down/i);
@@ -200,37 +278,54 @@ test("#1223 a DOWN socket refuses — a restarting backend is the one thing that
 
 test("#1223 a RECONNECT since the observation refuses — it describes a replaced process", () => {
   const snap = createObjectInfoSnapshot();
-  snap.record(SCHEMA, 3);
+  stored(snap);
   const { defs, reason } = snap.authorize({ epoch: 4, socketDown: false, outcomes: silence });
   assert.equal(defs, null);
   assert.match(reason, /reconnected/i);
-  // Provenance, not freshness: the snapshot is refused outright rather than aged out, so
-  // there is no time bound here to get wrong.
-  assert.equal(
+  assert.ok(
     snap.authorize({ epoch: 3, socketDown: false, outcomes: silence }).defs,
-    SCHEMA,
     "and the SAME epoch still authorizes — age alone was never the question",
   );
 });
 
-test("#1223 an unreadable epoch refuses — a snapshot that cannot prove provenance is worse than none", () => {
+test("#1223 a reconnect DURING the fetch is refused at record time", () => {
+  // THE DEFECT THIS EXISTS FOR. The first version read the epoch at RECORD time, so a
+  // schema fetched before a ComfyUI restart was filed under post-restart provenance and
+  // would authorize a write to a type the new process no longer defines. The epoch must be
+  // captured before the request goes out and re-checked when the answer lands.
   const snap = createObjectInfoSnapshot();
-  snap.record(SCHEMA, 3);
-  for (const epoch of [undefined, null, NaN, Infinity, "3"]) {
-    assert.equal(snap.authorize({ epoch, socketDown: false, outcomes: silence }).defs, null, `epoch ${String(epoch)}`);
-  }
+  assert.equal(
+    snap.record(SCHEMA, { observedAtEpoch: 3, currentEpoch: 4, whole: true }),
+    false,
+    "the connection was replaced while this payload was in flight",
+  );
+  assert.equal(snap.peek().held, false);
+  assert.equal(snap.authorize({ epoch: 4, socketDown: false, outcomes: silence }).defs, null);
 });
 
-test("#1223 an epoch that cannot be compared later is never stored", () => {
+test("#1223 a payload nobody vouched for as WHOLE is refused", () => {
+  // A per-class /object_info/<Type> payload reaching the snapshot would make every other
+  // type read as absent and the ever-seen gate diagnose the whole install as removed packs.
+  // `record` cannot judge wholeness from the value, so it requires the claim.
   const snap = createObjectInfoSnapshot();
-  assert.equal(snap.record(SCHEMA, undefined), false);
-  assert.equal(snap.record(SCHEMA, NaN), false);
-  assert.equal(snap.record(SCHEMA, "3"), false);
+  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1 }), false);
+  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1, whole: false }), false);
+  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1, whole: "yes" }), false);
   assert.equal(snap.peek().held, false);
 });
 
+test("#1223 an unreadable epoch refuses, at record time and at authorize time", () => {
+  const snap = createObjectInfoSnapshot();
+  for (const bad of [undefined, null, NaN, Infinity, "3"]) {
+    assert.equal(snap.record(SCHEMA, { observedAtEpoch: bad, currentEpoch: bad, whole: true }), false, `record ${String(bad)}`);
+  }
+  stored(snap);
+  for (const bad of [undefined, null, NaN, Infinity, "3"]) {
+    assert.equal(snap.authorize({ epoch: bad, socketDown: false, outcomes: silence }).defs, null, `authorize ${String(bad)}`);
+  }
+});
+
 test("#1223 nothing observed yet refuses, and SAYS that rather than blaming a reconnect", () => {
-  // #982's lesson: a caller told the wrong cause goes looking in the wrong place.
   const snap = createObjectInfoSnapshot();
   const { defs, reason } = snap.authorize({ epoch: 1, socketDown: false, outcomes: silence });
   assert.equal(defs, null);
@@ -239,7 +334,7 @@ test("#1223 nothing observed yet refuses, and SAYS that rather than blaming a re
 
 test("#1223 a backend that ANSWERED is told apart from an empty snapshot in the reason", () => {
   const snap = createObjectInfoSnapshot();
-  snap.record(SCHEMA, 1);
+  stored(snap, SCHEMA, 1);
   const { defs, reason } = snap.authorize({
     epoch: 1,
     socketDown: false,
@@ -251,15 +346,19 @@ test("#1223 a backend that ANSWERED is told apart from an empty snapshot in the 
 
 test("#1223 only a payload that could authorize anything is stored", () => {
   const snap = createObjectInfoSnapshot();
+  // Called directly, NOT through `stored`: that helper defaults its payload, so passing
+  // `undefined` silently tested the good schema and the case passed for the wrong reason.
   for (const bad of [null, undefined, {}, [], "schema", 7, [SCHEMA]]) {
-    assert.equal(snap.record(bad, 1), false, `${JSON.stringify(bad) ?? String(bad)} is not a schema`);
+    assert.equal(
+      snap.record(bad, { observedAtEpoch: 3, currentEpoch: 3, whole: true }),
+      false,
+      `${String(bad)} is not a schema`,
+    );
   }
   assert.equal(snap.peek().held, false, "a failed fetch never displaces a good snapshot with nothing");
 });
 
 test("#1223 a payload whose own shape cannot be inspected is not stored", () => {
-  // `Object.keys` invokes a Proxy's ownKeys trap, which can throw — the same hazard the
-  // oracle's `usableDefs` guards. A diagnostic path must not raise an exception of its own.
   const hostile = new Proxy(
     {},
     {
@@ -269,29 +368,27 @@ test("#1223 a payload whose own shape cannot be inspected is not stored", () => 
     },
   );
   const snap = createObjectInfoSnapshot();
-  assert.doesNotThrow(() => snap.record(hostile, 1));
-  assert.equal(snap.record(hostile, 1), false);
+  assert.doesNotThrow(() => stored(snap, hostile));
+  assert.equal(stored(snap, hostile), false);
 });
 
 test("#1223 a good snapshot is not displaced by a later failed fetch", () => {
   const snap = createObjectInfoSnapshot();
-  snap.record(SCHEMA, 2);
-  snap.record(null, 2);
-  snap.record({}, 2);
-  assert.equal(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs, SCHEMA);
+  stored(snap, SCHEMA, 2);
+  stored(snap, null, 2);
+  stored(snap, {}, 2);
+  assert.ok(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs);
 });
 
 test("#1223 clear() retires it — a suspicion of change outranks a stored schema", () => {
   const snap = createObjectInfoSnapshot();
-  snap.record(SCHEMA, 2);
+  stored(snap, SCHEMA, 2);
   snap.clear();
   assert.equal(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs, null);
   assert.equal(snap.peek().held, false);
 });
 
 test("#1223 a successful write authorized this way DISCLOSES it", () => {
-  // A write reported as SUCCEEDED and VERIFIED, verified against a schema nobody could
-  // re-fetch, is indistinguishable from a fully live authorization unless it says so.
   const note = snapshotAuthorizationNote(" Tried 2 routes: a; b.");
   assert.match(note, /SUCCEEDED/);
   assert.match(note, /last whole \/object_info observed/);
@@ -340,46 +437,60 @@ function extractSetWidgetOracle() {
 /**
  * Build the SHIPPED oracle body with doubles for the module state it closes over, so these
  * cases run the production code path rather than a description of it.
+ *
+ * `epochDuringFetch` lets a test move the connection epoch WHILE the read is in flight —
+ * the reconnect-mid-fetch hazard, which cannot be exercised any other way.
  */
-function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot }) {
+function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epochDuringFetch = null }) {
   const body = extractSetWidgetOracle();
   const factory = new Function(
     "api",
     "objectInfoCache",
-    "fetchWholeObjectInfo",
+    "realFetchWholeObjectInfo",
     "CACHE_OUTCOME",
     "objectInfoSnapshot",
-    "backendReconnectEpoch",
+    "initialEpoch",
+    "epochDuringFetch",
     "comfyBackendSocketDown",
-    "recordObjectInfoTypes",
     "objectInfoOracleFailureNote",
-    `let oracleFailures = [];
+    // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
+    // extracted body, because the panel's is module state the body re-reads. An earlier
+    // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
+    // read the same number by construction — the reconnect-mid-fetch case could not fail,
+    // and the test passed while proving nothing.
+    `let backendReconnectEpoch = initialEpoch;
+     let oracleFailures = [];
+     let snapshotIneligibility = "";
      let setWidgetSchemaFromSnapshot = null;
      const historyRecorded = [];
+     const recordObjectInfoTypes = (defs) => { historyRecorded.push(defs); return defs; };
+     // Declared HERE so it closes over the mutable epoch above and can move it the moment
+     // the read is issued — the panel's real hazard is a reconnect landing mid-fetch.
+     const fetchWholeObjectInfo = (opts) => {
+       const pending = realFetchWholeObjectInfo({ ...opts, deadlineMs: 20 });
+       if (epochDuringFetch !== null) backendReconnectEpoch = epochDuringFetch;
+       return pending;
+     };
      const getFreshObjectInfo = async () => ${body};
      return {
        getFreshObjectInfo,
+       readNote: () => setWidgetSchemaFromSnapshot,
+       readIneligibility: () => snapshotIneligibility,
        readFailures: () => oracleFailures,
-       readSnapshotNote: () => setWidgetSchemaFromSnapshot,
        readHistory: () => historyRecorded,
-       recordHistory: (defs) => { historyRecorded.push(defs); return defs; },
      };`,
   );
-  const built = factory(
+  return factory(
     api,
     createObjectInfoCache(),
-    // The SHIPPED oracle, on a budget a test can wait for. Only `deadlineMs` is
-    // substituted, so the tags these cases read are the ones production produces — the
-    // suite must not spend 20 real seconds per hung-transport case to learn that.
-    (opts) => fetchWholeObjectInfo({ ...opts, deadlineMs: 20 }),
+    fetchWholeObjectInfo,
     CACHE_OUTCOME,
     snapshot,
     epoch,
+    epochDuringFetch,
     socketDown,
-    (defs) => built.recordHistory(defs),
     objectInfoOracleFailureNote,
   );
-  return built;
 }
 
 const hungApi = { getNodeDefs: () => new Promise(() => {}), fetchApi: () => new Promise(() => {}) };
@@ -389,25 +500,39 @@ test("#1223 SHIPPED: a live answer is returned and snapshotted", async () => {
   const o = buildShippedOracle({ api: { getNodeDefs: async () => SCHEMA }, snapshot, epoch: 5 });
   assert.equal(await o.getFreshObjectInfo(), SCHEMA);
   assert.deepEqual(snapshot.peek(), { held: true, epoch: 5 }, "stamped with the connection it was read on");
-  assert.equal(o.readSnapshotNote(), null, "a live authorization discloses nothing, because there is nothing to disclose");
+  assert.equal(o.readNote(), null, "a live authorization discloses nothing, because there is nothing to disclose");
   assert.deepEqual(o.readHistory(), [SCHEMA], "and it IS a real observation, so the ever-seen history takes it");
+});
+
+test("#1223 SHIPPED: a reconnect DURING the read means the answer is not snapshotted", async () => {
+  // The burst cache deliberately returns a result to its waiter even after an invalidation
+  // has retired it from storage. Without the issuance-epoch check, that retired answer is
+  // promoted into a store with NO TTL, stamped with whatever epoch is current when it lands.
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: { getNodeDefs: async () => SCHEMA },
+    snapshot,
+    epoch: 5,
+    epochDuringFetch: 6,
+  });
+  assert.equal(await o.getFreshObjectInfo(), SCHEMA, "the caller still gets its answer");
+  assert.equal(snapshot.peek().held, false, "but it is NOT filed as evidence about the new connection");
 });
 
 test("#1223 SHIPPED: the reported case — hung probes fall back and disclose", async () => {
   const snapshot = createObjectInfoSnapshot();
-  snapshot.record(SCHEMA, 5);
+  stored(snapshot, SCHEMA, 5);
   const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5, socketDown: false });
-  assert.equal(await o.getFreshObjectInfo(), SCHEMA, "the H3Keyframes edit is no longer refused");
-  const note = o.readSnapshotNote();
-  assert.equal(typeof note, "string");
-  assert.match(note, /did not answer/, "and the reply can say which routes went silent");
+  const defs = await o.getFreshObjectInfo();
+  assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the edit is no longer refused");
+  assert.match(o.readNote(), /did not answer/, "and the reply can say which routes went silent");
 });
 
 test("#1223 SHIPPED: a snapshot re-read is NOT recorded as a new backend observation", async () => {
   // Recording it would let a snapshot keep its own types "ever seen" after the backend
   // stopped defining them — the #458 trust root feeding itself.
   const snapshot = createObjectInfoSnapshot();
-  snapshot.record(SCHEMA, 5);
+  stored(snapshot, SCHEMA, 5);
   const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5 });
   await o.getFreshObjectInfo();
   assert.deepEqual(o.readHistory(), [], "nothing new was observed, so nothing is recorded");
@@ -415,30 +540,30 @@ test("#1223 SHIPPED: a snapshot re-read is NOT recorded as a new backend observa
 
 test("#1223 SHIPPED: a DOWN socket still refuses, and the refusal says why", async () => {
   const snapshot = createObjectInfoSnapshot();
-  snapshot.record(SCHEMA, 5);
+  stored(snapshot, SCHEMA, 5);
   const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5, socketDown: true });
   assert.equal(await o.getFreshObjectInfo(), null, "fails closed exactly as before the fix");
-  assert.equal(o.readSnapshotNote(), null);
-  assert.match(objectInfoOracleFailureNote(o.readFailures()), /socket is down/i);
+  assert.equal(o.readNote(), null);
+  assert.match(o.readIneligibility(), /socket is down/i);
 });
 
 test("#1223 SHIPPED: a reconnect since the observation still refuses", async () => {
   const snapshot = createObjectInfoSnapshot();
-  snapshot.record(SCHEMA, 4);
+  stored(snapshot, SCHEMA, 4);
   const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5 });
   assert.equal(await o.getFreshObjectInfo(), null);
-  assert.match(objectInfoOracleFailureNote(o.readFailures()), /reconnected/i);
+  assert.match(o.readIneligibility(), /reconnected/i);
 });
 
 test("#1223 SHIPPED: a backend that ANSWERED badly still refuses — #458 is untouched", async () => {
   const snapshot = createObjectInfoSnapshot();
-  snapshot.record(SCHEMA, 5);
+  stored(snapshot, SCHEMA, 5);
   const o = buildShippedOracle({
     api: {
       getNodeDefs: async () => {
         throw new TypeError("Failed to fetch");
       },
-      fetchApi: async () => ({ ok: false, status: 503 }),
+      fetchApi: async () => ({ ok: false, status: 500 }),
     },
     snapshot,
     epoch: 5,
@@ -446,56 +571,66 @@ test("#1223 SHIPPED: a backend that ANSWERED badly still refuses — #458 is unt
   assert.equal(await o.getFreshObjectInfo(), null, "a down/erroring backend authorizes nothing");
 });
 
-test("#1223 SHIPPED: with no snapshot at all, the pre-fix refusal is unchanged", async () => {
+test("#1223 SHIPPED: the ineligibility reason is NOT counted as a transport route", async () => {
+  // objectInfoOracleFailureNote renders "Tried N routes:" from failures.length. Splicing a
+  // non-route entry in made a two-transport failure report THREE routes tried — #982's own
+  // defect (a refusal asserting something that did not happen).
   const o = buildShippedOracle({ api: hungApi, snapshot: createObjectInfoSnapshot(), epoch: 5 });
   assert.equal(await o.getFreshObjectInfo(), null);
-  const note = objectInfoOracleFailureNote(o.readFailures());
-  assert.match(note, /did not answer/, "the routes it tried are still named (#982)");
-  assert.match(note, /no whole \/object_info has been observed/i);
+  assert.equal(o.readFailures().length, 2, "two transports were tried");
+  assert.match(objectInfoOracleFailureNote(o.readFailures()), /Tried 2 routes/);
+  assert.match(o.readIneligibility(), /no whole \/object_info has been observed/i);
 });
 
 // ---------------------------------------------------------------------------
-// The whole-schema-only contract, which `record` cannot enforce from the value
+// The panel wiring, pinned at the source level
 // ---------------------------------------------------------------------------
 
-test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched", () => {
-  // A per-class `/object_info/<Type>` payload reaching the snapshot would make every other
-  // type read as absent, and the #458 ever-seen gate would diagnose the whole install as
-  // removed packs. `recordObjectInfoTypes` legitimately receives such payloads (the
-  // add_node single-def path); the snapshot must not.
-  const sites = PANEL_SRC.match(/objectInfoSnapshot\.record\(/g) ?? [];
-  assert.equal(sites.length, 2, "exactly two whole-schema call sites — add one and justify it here");
+test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and vouched for", () => {
+  // Each CALL SITE is checked for its own claim. Counting `whole: true` across the file
+  // instead counted the comment that documents the rule, which is not a call site.
+  const sites = [...PANEL_SRC.matchAll(/objectInfoSnapshot\.record\(/g)];
+  assert.equal(sites.length, 3, "startup seed, refresh run, set_widget oracle — add one and justify it here");
+  for (const site of sites) {
+    const call = PANEL_SRC.slice(site.index, site.index + 260);
+    assert.match(call, /whole: true/, `the record site at index ${site.index} states the wholeness claim`);
+    assert.match(call, /observedAtEpoch/, `the record site at index ${site.index} stamps the issuance epoch`);
+  }
   assert.match(
     PANEL_SRC,
-    /recordObjectInfoTypes\(defs\);[\s\S]{0,600}?objectInfoSnapshot\.record\(defs, backendReconnectEpoch\);/,
-    "the refresh run records the whole map it just fetched",
-  );
-  assert.match(
-    PANEL_SRC,
-    /objectInfoSnapshot\.record\(defs, backendReconnectEpoch\);\s*\n\s*return recordObjectInfoTypes\(defs\);/,
-    "and so does the set_widget oracle, on the whole-payload route",
-  );
-  assert.ok(
-    !/objectInfoSnapshot\.record\(\s*one\b/.test(PANEL_SRC),
-    "the single-def add_node payload never reaches the snapshot",
+    /if \(!preloadedDefs\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    "the refresh run records only a payload it fetched itself — a caller-supplied one is not provably whole",
   );
 });
 
-test("#1223 a suspicion of schema change retires the snapshot with the burst cache", () => {
-  // The refresh run drops the #716 cache at its START because a refresh that FAILS is when
-  // the schema is most likely to have moved. A snapshot that survived that suspicion would
-  // authorize writes the cache has already been told not to.
+test("#1223 the STARTUP read is snapshotted — otherwise the reported case is still refused", () => {
+  // On a normal startup, seedObjectInfoHistory performs the ONLY whole /object_info read;
+  // registerComfyNodeDefs does not run. Without recording there, a first widget edit during
+  // a render found no snapshot and was refused exactly as before the fix.
+  const seed = PANEL_SRC.slice(PANEL_SRC.indexOf("function seedObjectInfoHistory("));
+  const body = seed.slice(0, seed.indexOf("\nasync function "));
+  assert.match(body, /const observedAtEpoch = backendReconnectEpoch;/, "the epoch is captured before the fetch");
+  assert.match(body, /objectInfoSnapshot\.record\(defs, \{/, "and the startup payload is recorded");
+});
+
+test("#1223 the socket handlers clear the snapshot DIRECTLY, not by way of a refresh", () => {
+  // The `reconnected` handler's refreshComfyNodeDefs() carries no payload and no force,
+  // which makeRefreshCoalescer resolves by joining an in-flight run and returning — so
+  // registerComfyNodeDefs, and the clear inside it, may never run for that reconnect.
+  for (const evt of ["reconnecting", "reconnected"]) {
+    const at = PANEL_SRC.indexOf(`api.addEventListener("${evt}"`);
+    assert.notEqual(at, -1, `${evt} handler not found`);
+    const handler = PANEL_SRC.slice(at, at + 1200);
+    assert.match(handler, /objectInfoSnapshot\.clear\(\);/, `${evt} retires the snapshot itself`);
+  }
   assert.match(
     PANEL_SRC,
-    /objectInfoCache\.invalidate\(\);[\s\S]{0,600}?objectInfoSnapshot\.clear\(\);/,
-    "cleared on the same event, for the same reason",
+    /objectInfoCache\.invalidate\(\);[\s\S]{0,700}?objectInfoSnapshot\.clear\(\);/,
+    "and the refresh run still clears it too, on the same suspicion that drops the burst cache",
   );
 });
 
 test("#1223 the disclosure rides on its OWN field, never on `warning`", () => {
-  // `warning` is single-slot and priority-ordered (link-driven outranks
-  // control_after_generate). Appending here would silently displace a warning about what
-  // the write actually DOES — strictly worse than a separate field.
   assert.match(PANEL_SRC, /schema_source: "last-observed", schema_note: snapshotAuthorizationNote\(/);
   const setWidget = PANEL_SRC.slice(PANEL_SRC.indexOf("async graph_set_widget("));
   const body = setWidget.slice(0, setWidget.indexOf("async graph_remove_widget("));
@@ -503,4 +638,13 @@ test("#1223 the disclosure rides on its OWN field, never on `warning`", () => {
     !/warning:[^\n]*snapshotAuthorizationNote/.test(body),
     "the provenance note never competes for the warning slot",
   );
+});
+
+test("#1223 no comment cites a symbol that does not exist", () => {
+  // A backticked identifier reads as a real export; the next reader greps for it and
+  // concludes the guard was deleted. `recordsWholeSchemaOnly` was exactly that.
+  const snapshotSrc = readFileSync(new URL("../../web/js/lib/object-info-snapshot.js", import.meta.url), "utf8");
+  for (const [name, src] of [["panel", PANEL_SRC], ["snapshot module", snapshotSrc]]) {
+    assert.ok(!/recordsWholeSchemaOnly/.test(src), `${name} still cites a phantom symbol`);
+  }
 });

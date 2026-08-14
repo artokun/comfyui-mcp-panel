@@ -264,11 +264,38 @@ export const TRANSPORT_OUTCOME = Object.freeze({
   NO_ANSWER: "no-answer",
   /** Never contacted — the budget was gone, or no transport was wired. */
   NOT_ATTEMPTED: "not-attempted",
+  /**
+   * It settled with nothing — resolved null/undefined/a non-object.
+   *
+   * SEPARATE FROM ANSWERED_UNUSABLE, and the distinction is this file's own, stated five
+   * screens down: "Only a client that returned NOTHING (null/undefined/non-object) or threw
+   * LEAVES THE QUESTION UNANSWERED". Tagging it as an answer contradicted that and made the
+   * #1223 fallback dead on any frontend whose `getNodeDefs` swallows its own failure and
+   * resolves `undefined` — it fails closed, so it was not dangerous, merely inert.
+   *
+   * Note this is NOT the empty-`{}` case, which IS an answer (a client expressing deny-all)
+   * and keeps ANSWERED_UNUSABLE.
+   */
+  NOTHING_RETURNED: "nothing-returned",
   /** It threw. Something answered, or the connection was actively refused. */
   THREW: "threw",
   /** It answered, and the answer could not authorize anything (non-OK, empty, unusable). */
   ANSWERED_UNUSABLE: "answered-unusable",
 });
+
+/**
+ * Statuses that are the PROXY speaking, not ComfyUI.
+ *
+ * #1223 — ComfyUI behind nginx/Caddy is the standard remote and RunPod shape, and a proxy
+ * answers a hung upstream with a synthetic gateway error after its own read timeout. That
+ * is the SAME event as a bare timeout — the backend never answered — but it arrives as an
+ * HTTP response, so tagging it ANSWERED_UNUSABLE both disabled the fallback for every
+ * proxied install and blamed the backend for a message it never sent (#982's exact defect).
+ *
+ * 502 and 504 only. 503 is deliberately excluded: ComfyUI itself can serve it, so it is not
+ * unambiguously the proxy, and this must not guess.
+ */
+const GATEWAY_STATUSES = Object.freeze([502, 504]);
 
 /**
  * Fetch the whole `/object_info` schema, trying the frontend client first and the raw
@@ -533,7 +560,9 @@ export async function fetchWholeObjectInfo({
       }
       record(
         "client",
-        TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+        // NOTHING_RETURNED, not ANSWERED_UNUSABLE — this branch IS the "returned NOTHING"
+        // case the note above reserves, so it leaves the question unanswered (#1223).
+        TRANSPORT_OUTCOME.NOTHING_RETURNED,
         describeFailure(
           "api.getNodeDefs() returned no usable schema",
           null,
@@ -579,8 +608,13 @@ export async function fetchWholeObjectInfo({
       // same input produced a failures entry and here produced a rejection.
       let responseOk = false;
       let responseStatus = "unknown";
+      // The NUMERIC status, kept apart from the sanitized display string: the gateway test
+      // is a decision and must not be made by pattern-matching a string built for a human.
+      let statusCode = null;
       try {
         responseOk = !!res && res.ok === true;
+        const raw = res?.status;
+        statusCode = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
         // SANITIZE INSIDE THE GUARD. Reading `.status` is not the only operation that can
         // throw — INTERPOLATING it does too (`Object.create(null)` cannot convert to a
         // primitive), and that interpolation sits below this try. Verified against main,
@@ -595,10 +629,19 @@ export async function fetchWholeObjectInfo({
         return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
       }
       if (!responseOk) {
+        const gateway = statusCode !== null && GATEWAY_STATUSES.includes(statusCode);
         record(
           "http",
-          TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
-          describeFailure("GET /object_info was not OK", null, ` (status ${responseStatus})`),
+          // A gateway error is the PROXY reporting that ComfyUI did not answer it — the
+          // same event as a bare timeout, arriving over HTTP (#1223).
+          gateway ? TRANSPORT_OUTCOME.NO_ANSWER : TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+          describeFailure(
+            gateway
+              ? "GET /object_info got a GATEWAY error — a proxy in front of ComfyUI reporting the backend did not answer it"
+              : "GET /object_info was not OK",
+            null,
+            ` (status ${responseStatus})`,
+          ),
         );
       } else {
         // The BODY is a second I/O step, and it was inside the try/catch this bound

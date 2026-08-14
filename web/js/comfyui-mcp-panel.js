@@ -961,11 +961,12 @@ const objectInfoCache = createObjectInfoCache();
 // busy rendering. Consulted only AFTER the oracle has failed, and only under the four
 // fail-closed conditions in lib/object-info-snapshot.js.
 //
-// RECORDS WHOLE SCHEMAS ONLY (`recordsWholeSchemaOnly`, pinned by a test). Every call site
-// below hands it a full /object_info map. A per-class `/object_info/<Type>` payload — which
-// `recordObjectInfoTypes` legitimately also receives, from the add_node single-def path —
-// must NEVER reach it: one type present would make all 4300 others read as absent, and the
-// #458 ever-seen gate would then diagnose the whole install as removed packs.
+// RECORDS WHOLE SCHEMAS ONLY, and every call site must say `whole: true` to claim it. A
+// per-class /object_info/<Type> payload — which recordObjectInfoTypes legitimately also
+// receives, from the add_node single-def path — must NEVER reach it: one type present would
+// make all ~4300 others read as absent, and the #458 ever-seen gate would then diagnose the
+// whole install as removed packs. The three sites below are the startup seed, the refresh
+// run's own fetch, and the set_widget whole-payload route.
 const objectInfoSnapshot = createObjectInfoSnapshot();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
@@ -979,9 +980,23 @@ function seedObjectInfoHistory() {
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         if (typeof api?.getNodeDefs === "function") {
+          // #1223 — the epoch BEFORE the request goes out. On a normal startup this is the
+          // ONLY whole /object_info read that happens: registerComfyNodeDefs does not run
+          // unless something triggers a refresh. Without recording here, the reported case
+          // — the first widget edit lands while ComfyUI is rendering and both probes time
+          // out — found no snapshot and was refused exactly as before the fix.
+          const observedAtEpoch = backendReconnectEpoch;
           const defs = await api.getNodeDefs();
           if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
             recordObjectInfoTypes(defs);
+            // A whole payload, and this is the only reader of it — nothing registers these
+            // defs, so no beforeRegisterNodeDef hook can have mutated them yet. `record`
+            // still copies out the type names rather than trusting that.
+            objectInfoSnapshot.record(defs, {
+              observedAtEpoch,
+              currentEpoch: backendReconnectEpoch,
+              whole: true,
+            });
             markObjectInfoHistorySeeded();
             return;
           }
@@ -1061,6 +1076,10 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // not to. Re-recorded below if this run's fetch succeeds, so the cost of being wrong here
   // is one refused write during an outage, not a stale authorization.
   objectInfoSnapshot.clear();
+  // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
+  // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
+  // can never be filed under post-restart provenance.
+  const runStartedAtEpoch = backendReconnectEpoch;
   let thrown = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
@@ -1210,11 +1229,23 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // reason the deadline moves here rather than the floor being softened.
     const localWorkStartedAt = monotonicNow();
     recordObjectInfoTypes(defs);
-    // #1223 — a WHOLE map, freshly fetched, stamped with the connection it was read on.
-    // This is the payload a later widget write falls back to when the backend goes silent
-    // mid-render. `record` rejects an empty/non-object payload itself, so a failed fetch
-    // leaves the snapshot cleared above rather than replacing it with nothing usable.
-    objectInfoSnapshot.record(defs, backendReconnectEpoch);
+    // #1223 — the payload a later widget write falls back to when the backend goes silent
+    // mid-render. Recorded BEFORE registerNodesFromDefs runs below, and `record` copies out
+    // the type names, so a beforeRegisterNodeDef hook mutating these definitions in place
+    // (Comfy's upload hook adds an input the backend never declared) cannot reach it.
+    //
+    // ONLY WHEN THIS RUN FETCHED THE PAYLOAD ITSELF. A caller-supplied `preloadedDefs` is
+    // not provably whole: assertAddNodeResolvableRefreshing re-reads the registry across an
+    // await and can pass its SINGLE-CLASS defs to refresh(), and a one-type map recorded
+    // here would make every other type read as absent — the ever-seen gate would then
+    // report the entire install as removed packs.
+    if (!preloadedDefs) {
+      objectInfoSnapshot.record(defs, {
+        observedAtEpoch: runStartedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
     // is set ONLY when the registration call actually ran — a frontend without
@@ -1437,12 +1468,14 @@ function setupListeners() {
     api.addEventListener("reconnecting", () => {
       nodeDefsRefreshConfirmed = false;
       comfyBackendSocketDown = true;
+      objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
     });
     api.addEventListener("status", (ev) => {
       // A null status payload is ComfyUI's "backend connection lost" signal.
       if (ev?.detail == null) {
         nodeDefsRefreshConfirmed = false;
         comfyBackendSocketDown = true;
+        objectInfoSnapshot.clear(); // #1223 — same reasoning as `reconnecting`.
       }
     });
     // ComfyUI's own socket to its backend re-establishing is the reliable
@@ -1450,6 +1483,7 @@ function setupListeners() {
     // stale node registry + combos then (#221/#171/#185/#181).
     api.addEventListener("reconnected", () => {
       comfyBackendSocketDown = false;
+      objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
       // #433: the frontend may now restore a stale/wrong active tab — bump the
       // epoch and arm the monotonic possibly-stale window. Bumping the epoch
       // invalidates any EARLIER resync so a pre-reconnect open can't clear this
@@ -11487,6 +11521,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // reason `oracleFailures` is: a concurrent write must not make THIS reply claim a
     // provenance it did not have.
     let setWidgetSchemaFromSnapshot = null;
+    // #1223 — why the snapshot could not stand in, kept OFF the route list so the route
+    // count stays honest. Per-request for the same reason the other two are.
+    let snapshotIneligibility = "";
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -11566,6 +11603,11 @@ const GRAPH_TOOL_EXECUTORS = {
       // after a restart-without-reload. Mirrors graph_add_node.
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () => {
+        // #1223 — the epoch BEFORE the read is issued. The burst cache deliberately
+        // RETURNS a result to its waiter even after an invalidation has retired it from
+        // storage, so without this the retired answer could be promoted into a store with
+        // no TTL at all, stamped with whatever epoch happened to be current when it landed.
+        const observedAtEpoch = backendReconnectEpoch;
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
@@ -11592,8 +11634,13 @@ const GRAPH_TOOL_EXECUTORS = {
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
         if (defs) {
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
-          // above), so it is the payload #1223's fallback is allowed to hold.
-          objectInfoSnapshot.record(defs, backendReconnectEpoch);
+          // above), so it is one #1223's fallback may hold. Refused if a reconnect landed
+          // while the read was in flight.
+          objectInfoSnapshot.record(defs, {
+            observedAtEpoch,
+            currentEpoch: backendReconnectEpoch,
+            whole: true,
+          });
           return recordObjectInfoTypes(defs);
         }
         // #1223 — the probe produced nothing. If it went SILENT (rather than answering
@@ -11618,12 +11665,20 @@ const GRAPH_TOOL_EXECUTORS = {
           // keep its own types "ever seen" after the backend stopped defining them.
           return fallback.defs;
         }
-        oracleFailures = [...oracleFailures, `the last-observed schema was not usable either — ${fallback.reason}`];
+        // NOT appended to `oracleFailures`. That array is the list of TRANSPORT ROUTES, and
+        // objectInfoOracleFailureNote renders "Tried N routes:" from its length — splicing
+        // a non-route entry in made a two-transport failure report three routes tried, which
+        // is #982's own defect (a refusal asserting something that did not happen) committed
+        // by the code written to avoid it.
+        snapshotIneligibility = fallback.reason;
         return recordObjectInfoTypes(defs);
       },
       // What the last oracle attempt observed, so a refusal can say which routes were
-      // tried and what each one did instead of asserting an unreachable backend.
-      describeObjectInfoFailure: () => objectInfoOracleFailureNote(oracleFailures),
+      // tried and what each one did instead of asserting an unreachable backend — then,
+      // separately, why the last-observed schema could not stand in for them either.
+      describeObjectInfoFailure: () =>
+        objectInfoOracleFailureNote(oracleFailures) +
+        (snapshotIneligibility ? ` The last-observed schema was not usable either — ${snapshotIneligibility}.` : ""),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
       // node — refuse (non-forgeable; client shape/name/provenance can't prove this).
