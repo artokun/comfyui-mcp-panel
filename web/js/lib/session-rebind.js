@@ -253,10 +253,23 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
 // no agent for a graph tool to route to, so a dropped tab mapping harms nobody until the
 // next connect, which hellos on its own.
 //
-// (A hello also bumps `agentSessionEpoch`, which is how the panel tells a straggler
-// command from the outgoing agent apart from evidence about the new one. That affects the
-// canvas-tool DISCLOSURE inference, not whether a command executes — worth knowing, and
-// the reason this stays debounced and conditional rather than fired freely.)
+// UNRESOLVED, and recorded here rather than reassured away, because the review that
+// found them ruled they are not this predicate's to fix:
+//
+//   1. A landed hello bumps `agentSessionEpoch`, which invalidates
+//      `canvasToolsProvenEpoch`, so a session that had already PROVEN its canvas tools
+//      is re-asked and the user's next message is silently prefixed with the disclosure
+//      paragraph. Once per re-advertise.
+//   2. The orchestrator answers a hello with a `ready` ack even on a live socket, and
+//      the panel's ready handler consumes MID_TASK_KEY BEFORE it decides whether to
+//      nudge. A re-advertise therefore disarms the mid-task resume nudge (#1138/#1145/
+//      #1163) with `outageMs: 0`, so a LATER real restart finds no marker.
+//
+// Both live inside the hello path, not in the decision to re-advertise, and both are
+// already reachable on main through #310's post-`free_vram` re-advertise. The remedy the
+// review named is a re-advertise that does not carry the hello's session semantics (no
+// `ready` ack, no epoch bump) — its own change, gating this one. Do NOT read the debounce
+// below as a mitigation for either: it bounds how OFTEN they happen, never whether.
 export function shouldRehelloAfterComfyReconnect({
   bridgeConnected = false,
   hasResumableSession = false,
@@ -265,6 +278,76 @@ export function shouldRehelloAfterComfyReconnect({
   // bridge, and an unreadable session state is not a session worth re-advertising for.
   if (bridgeConnected !== true) return false;
   return hasResumableSession === true;
+}
+
+// #1096 — the re-advertise's RATE LIMIT and its send ordering, as a unit that can be
+// tested by behaviour.
+//
+// This existed inline at the call site, where the only available test was a source scan
+// over the panel — and mutation testing proved that scan stays green when the debounce is
+// inverted or the send relocated, which is the one regression that matters. The same
+// lesson `shouldNudgeAfterMidTaskReconnect` records one screen up: a decision a pure test
+// cannot reach is a decision nothing checks. So the gate owns three claims outright, each
+// asserted against observed behaviour rather than a token:
+//
+//  - it never sends unless `shouldRehelloAfterComfyReconnect` says so (socket observed
+//    up, session observed present);
+//  - it arms its window only when the send RESOLVES TRUE — a hello refused for want of a
+//    route identity, or dropped on a superseded socket, re-advertised nothing and must
+//    not spend the window (the "recorded before it happened" defect this cluster keeps
+//    hitting);
+//  - only one send is in flight at a time, so a burst of `reconnected` events cannot
+//    stack orchestrator panel syncs behind each other while the first is unresolved.
+//
+// `now` is injected and the panel passes the MONOTONIC clock: a wall-clock adjustment
+// must not be able to make the gap look negative and re-arm the window early.
+export function createReconnectRehelloGate({
+  now = () => Date.now(),
+  minGapMs = 5000,
+} = {}) {
+  // null = nothing has landed yet, which is NOT the same as "landed infinitely long ago"
+  // arithmetically — but it must behave that way, so it is branched on explicitly rather
+  // than seeded with a sentinel the subtraction could misread (the 0-stamp mistake #1138
+  // recorded).
+  let lastLandedAt = null;
+  let inFlight = false;
+  const readClock = () => {
+    const t = now();
+    return typeof t === "number" && Number.isFinite(t) ? t : null;
+  };
+  return {
+    /** Re-advertise if this is the uncovered case and the window is open.
+     *  `send` must resolve truthy ONLY when the hello reached the wire.
+     *  Resolves to whether a hello actually landed. */
+    async attempt({ bridgeConnected = false, hasResumableSession = false } = {}, send) {
+      if (!shouldRehelloAfterComfyReconnect({ bridgeConnected, hasResumableSession })) return false;
+      if (typeof send !== "function") return false;
+      // One at a time. Without this the debounce is no protection during the window that
+      // matters most: the first hello is still awaiting its identity resolve (which can
+      // outlast the gap on a busy install) and every further `reconnected` would queue
+      // another orchestrator panel sync behind it.
+      if (inFlight) return false;
+      const t = readClock();
+      // An unreadable clock decides nothing. Declining is the safe direction: the mapping
+      // is repaired by the next reconnect event or the next connect's own hello, whereas
+      // sending on an untimeable clock would leave the window unarmed and unbounded.
+      if (t === null) return false;
+      if (lastLandedAt !== null && t - lastLandedAt < minGapMs) return false;
+      inFlight = true;
+      let landed = false;
+      try {
+        landed = (await send()) === true;
+      } catch {
+        // A throwing or rejecting re-advertise is the same non-fatal case as a refused
+        // one: nothing landed, so nothing is recorded and the window stays open.
+        landed = false;
+      } finally {
+        inFlight = false;
+      }
+      if (landed) lastLandedAt = t;
+      return landed;
+    },
+  };
 }
 
 // #332 — During the post-restart reconnect window a Manager-backed fetch (e.g.

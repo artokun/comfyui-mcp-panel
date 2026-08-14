@@ -504,7 +504,7 @@ import {
   shouldRehelloAfterCommand,
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
-  shouldRehelloAfterComfyReconnect,
+  createReconnectRehelloGate,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -945,14 +945,15 @@ function monotonicNow() {
     ? performance.now()
     : Date.now();
 }
-// #1096 — debounce for the re-advertise on a bridge-survived ComfyUI reconnect. A hello
-// is not free: the orchestrator runs its panel sync on each one (~1s measured, and the
-// step that blocks on the panel operation lock), and `reconnected` can fire repeatedly
-// while ComfyUI's socket flaps. One re-advertise per window is enough to repair a dropped
-// tab mapping; MONOTONIC so a wall-clock adjustment cannot make the gap look negative and
-// re-arm it early. Read/written only from the reconnect handler.
-const RECONNECT_REHELLO_MIN_GAP_MS = 5000;
-let lastReconnectRehelloAt = -Infinity;
+// #1096 — the rate limit for the re-advertise on a bridge-survived ComfyUI reconnect. A
+// hello is not free: the orchestrator runs its panel sync on each one (~1s measured, and
+// the step that blocks on the panel operation lock), and `reconnected` can fire repeatedly
+// while ComfyUI's socket flaps. The gate itself lives in session-rebind.js so its debounce
+// and its arm-only-when-landed ordering are covered by BEHAVIOURAL tests — a source scan
+// over this file stayed green when either was mutated. What is decided HERE, and only
+// here, is the clock: MONOTONIC, so a wall-clock adjustment cannot make the gap look
+// negative and re-arm the window early.
+const reconnectRehelloGate = createReconnectRehelloGate({ now: monotonicNow });
 // The actual (idempotent) node-def registration; the coalescer owns the in-flight
 // slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
 // payload when present (graph_add_node passes the fresh defs it just validated
@@ -30171,49 +30172,28 @@ function buildPanel() {
       // A rehello re-targets the EXISTING socket and the orchestrator carries the routing
       // state across it (#884), so this repairs the mapping without touching the session.
       //
-      // DEBOUNCED, because a hello is not free: the orchestrator runs its panel sync on
-      // each one (~1s measured, and the step that blocks on the panel operation lock — a
-      // stale lock made it 60s per hello). `reconnected` can fire repeatedly during a
+      // RATE LIMITED, because a hello is not free: the orchestrator runs its panel sync
+      // on each one (~1s measured, and the step that blocks on the panel operation lock —
+      // a stale lock made it 60s per hello). `reconnected` can fire repeatedly during a
       // flapping window, and re-advertising per blip would queue that work behind itself.
-      // `hasResumableSession` is REQUIRED, not decorative: a hello with the session key
-      // cleared spawns a clean agent (see sendHello), which would turn a ComfyUI blip
-      // into a spurious agent start. With a session present it rebinds, which is the
-      // whole intent. Reuses the value computed above for the resume decision.
-      if (
-        shouldRehelloAfterComfyReconnect({
+      // The gate owns the window, the in-flight latch and the arm-only-when-the-hello-
+      // LANDED ordering; all three are pinned by behavioural tests in session-rebind.
+      //
+      // The session input is read from SESSION_KEY — the SAME source the frame will
+      // actually carry (`getResume`) — and deliberately NOT from `hasResumableSession`
+      // above, which is derived from the active thread RECORD. The two can disagree: a
+      // thread record can hold a session id while SESSION_KEY is empty, and then the
+      // guard would pass while the hello goes out with `resume: null`, which by
+      // sendHello's own contract SPAWNS A CLEAN AGENT. That is the spurious agent start
+      // this input exists to prevent, arriving because the guard asked a different
+      // question than the frame does. Ask the frame's question.
+      void reconnectRehelloGate.attempt(
+        {
           bridgeConnected: client.isConnected(),
-          hasResumableSession,
-        })
-      ) {
-        const now = monotonicNow();
-        if (now - lastReconnectRehelloAt >= RECONNECT_REHELLO_MIN_GAP_MS) {
-          try {
-            // The window is armed only once the hello PROVABLY reached the wire, never
-            // before the send. Stamping first is the recurring "recorded before it
-            // happened" defect this file already names at the #607 re-hello — the same
-            // 5s constant, one screen up: a hello that is refused (no route identity
-            // yet) or dropped (socket superseded mid-send) would spend the window
-            // without re-advertising anything, and the tab mapping this exists to
-            // repair would stay dropped for the full gap.
-            //
-            // Not stamping on failure cannot storm: this branch requires a live bridge,
-            // and a hello that failed to land means the socket is gone or superseded —
-            // in which case the predicate declines until it is back, and the reconnect
-            // path's own open-hello re-registers the tab anyway.
-            void Promise.resolve(client?.rehello?.())
-              .then((landed) => {
-                if (landed) lastReconnectRehelloAt = now;
-              })
-              .catch(() => {
-                /* the reconnect path retries the hello; a failed re-advertise is not
-                   fatal here because the mapping is already dropped — this can only
-                   improve it, and the window stays open so the next event may retry */
-              });
-          } catch {
-            /* a throwing rehello is the same non-fatal case as a rejected one */
-          }
-        }
-      }
+          hasResumableSession: Boolean(ssGet(SESSION_KEY)),
+        },
+        () => client?.rehello?.(),
+      );
       return;
     }
     appendSystem(tr("panel.comfyui_is_back_reconnecting_the_agent", "ComfyUI is back — reconnecting the agent…"));

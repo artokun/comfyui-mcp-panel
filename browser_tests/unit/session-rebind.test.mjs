@@ -12,6 +12,7 @@ import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
   shouldRehelloAfterComfyReconnect,
+  createReconnectRehelloGate,
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
   planSoftReloadRecovery,
@@ -1015,64 +1016,244 @@ test("#1096: the two reconnect paths never both act, and never both decline with
   );
 });
 
-test("#1096 wiring: the re-advertise is debounced and does not disturb the session", () => {
+// ---- #1096 the re-advertise GATE, tested by behaviour --------------------------
+//
+// The debounce and the send ordering used to live inline in the panel, where the only
+// available test was a source scan — and mutation testing proved that scan stayed green
+// with the debounce inverted and the send relocated. These exercise the real unit, so an
+// inverted window or a stamp moved ahead of the send fails an assertion instead.
+
+/** A gate on a hand-cranked clock, plus a send recorder. */
+function gateHarness({ minGapMs = 5000, clock = { t: 0 } } = {}) {
+  const sends = [];
+  const gate = createReconnectRehelloGate({ now: () => clock.t, minGapMs });
+  const send = (outcome) => () => {
+    sends.push(clock.t);
+    if (typeof outcome === "function") return outcome();
+    return outcome;
+  };
+  return { gate, sends, send, clock };
+}
+
+test("#1096 gate: a socket that is not up is never announced to", async () => {
+  // THE NEGATIVE CASE. The whole failure class here is announcing a tab the route cannot
+  // serve, so "bridge down ⇒ no frame left the panel" is the assertion that matters, and
+  // it is asserted on the SEND being absent, not on a returned boolean.
+  const h = gateHarness();
+  assert.equal(
+    await h.gate.attempt({ bridgeConnected: false, hasResumableSession: true }, h.send(true)),
+    false,
+  );
+  assert.deepEqual(h.sends, [], "a down bridge must not put a hello on the wire");
+  // …and an unreadable connection state is not an up one.
+  for (const stray of [1, "true", {}, [], null, undefined]) {
+    assert.equal(
+      await h.gate.attempt({ bridgeConnected: stray, hasResumableSession: true }, h.send(true)),
+      false,
+    );
+  }
+  assert.deepEqual(h.sends, [], "only an observed-true socket may be announced to");
+});
+
+test("#1096 gate: no session means no re-advertise", async () => {
+  // A hello with the session key cleared spawns a clean agent (sendHello's own contract),
+  // so this is the second half of the negative case, on the other input.
+  const h = gateHarness();
+  assert.equal(
+    await h.gate.attempt({ bridgeConnected: true, hasResumableSession: false }, h.send(true)),
+    false,
+  );
+  assert.equal(await h.gate.attempt({ bridgeConnected: true }, h.send(true)), false);
+  assert.equal(await h.gate.attempt({}, h.send(true)), false);
+  assert.equal(await h.gate.attempt(undefined, h.send(true)), false);
+  assert.deepEqual(h.sends, [], "no session ⇒ nothing announced");
+});
+
+test("#1096 gate: the uncovered case DOES re-advertise, exactly once per window", async () => {
+  const h = gateHarness({ minGapMs: 5000 });
+  const live = { bridgeConnected: true, hasResumableSession: true };
+  assert.equal(await h.gate.attempt(live, h.send(true)), true);
+  assert.deepEqual(h.sends, [0], "the uncovered case must actually re-advertise");
+  // Inside the window: suppressed. A hello runs the orchestrator's panel sync (~1s, and
+  // it blocks on the panel operation lock), so a flapping socket must not queue one per
+  // blip. Asserted on the send list — this is what the source scan could not see.
+  h.clock.t = 4999;
+  assert.equal(await h.gate.attempt(live, h.send(true)), false);
+  assert.deepEqual(h.sends, [0], "a second blip inside the window must not re-advertise");
+  // Window expired: it acts again.
+  h.clock.t = 5000;
+  assert.equal(await h.gate.attempt(live, h.send(true)), true);
+  assert.deepEqual(h.sends, [0, 5000]);
+});
+
+test("#1096 gate: the window is INVERSION-SENSITIVE", async () => {
+  // The two sides must disagree, so a flipped comparison cannot pass: inside the window
+  // suppresses, outside it acts. A token-presence scan sees these as identical.
+  const inside = gateHarness({ minGapMs: 5000 });
+  const outside = gateHarness({ minGapMs: 5000 });
+  const live = { bridgeConnected: true, hasResumableSession: true };
+  for (const h of [inside, outside]) await h.gate.attempt(live, h.send(true));
+  inside.clock.t = 100;
+  outside.clock.t = 60_000;
+  const suppressed = await inside.gate.attempt(live, inside.send(true));
+  const allowed = await outside.gate.attempt(live, outside.send(true));
+  assert.notEqual(
+    suppressed,
+    allowed,
+    "if these ever agree, the window has stopped distinguishing a blip from a real gap",
+  );
+  assert.equal(suppressed, false);
+  assert.equal(allowed, true);
+});
+
+test("#1096 gate: a hello that did NOT land leaves the window open", async () => {
+  // The "recorded before it happened" defect, asserted where it is observable. A hello
+  // refused for want of a route identity, or dropped on a superseded socket, advertised
+  // nothing — so it must not spend the window and leave the mapping this repairs dropped
+  // for the full gap. Arming ahead of the send is exactly how this used to be wrong.
+  const h = gateHarness({ minGapMs: 5000 });
+  const live = { bridgeConnected: true, hasResumableSession: true };
+  assert.equal(await h.gate.attempt(live, h.send(false)), false);
+  assert.deepEqual(h.sends, [0], "it tried");
+  h.clock.t = 1; // still deep inside the window
+  assert.equal(await h.gate.attempt(live, h.send(true)), true, "…so the very next event may retry");
+  assert.deepEqual(h.sends, [0, 1]);
+  // And only NOW is the window armed, by the send that actually landed.
+  h.clock.t = 2;
+  assert.equal(await h.gate.attempt(live, h.send(true)), false);
+  assert.deepEqual(h.sends, [0, 1]);
+});
+
+test("#1096 gate: only a literal true counts as landed", async () => {
+  // sendHello resolves the boolean "did this reach the wire". A truthy stand-in (a frame
+  // object, a 1) is not that proof, and treating it as one would arm the window on a
+  // hello nobody observed arriving.
+  for (const truthy of [1, "sent", {}, []]) {
+    const h = gateHarness({ minGapMs: 5000 });
+    const live = { bridgeConnected: true, hasResumableSession: true };
+    assert.equal(await h.gate.attempt(live, h.send(truthy)), false);
+    h.clock.t = 1;
+    assert.equal(await h.gate.attempt(live, h.send(true)), true, `${JSON.stringify(truthy)}`);
+  }
+});
+
+test("#1096 gate: a throwing or rejecting re-advertise is non-fatal and arms nothing", async () => {
+  const h = gateHarness({ minGapMs: 5000 });
+  const live = { bridgeConnected: true, hasResumableSession: true };
+  assert.equal(
+    await h.gate.attempt(live, h.send(() => { throw new Error("socket gone"); })),
+    false,
+  );
+  assert.equal(
+    await h.gate.attempt(live, h.send(() => Promise.reject(new Error("superseded")))),
+    false,
+  );
+  assert.deepEqual(h.sends, [0, 0]);
+  // Neither armed the window: the next event still gets to try.
+  assert.equal(await h.gate.attempt(live, h.send(true)), true);
+  // A missing client method resolves undefined — the same "nothing landed" case, and it
+  // must not throw out of the gate.
+  const h2 = gateHarness();
+  assert.equal(
+    await h2.gate.attempt(
+      { bridgeConnected: true, hasResumableSession: true },
+      h2.send(undefined),
+    ),
+    false,
+  );
+});
+
+test("#1096 gate: only one re-advertise is in flight at a time", async () => {
+  // The window alone is no protection during the interval that matters most: the first
+  // hello is still awaiting its identity resolve, which can outlast the gap on a busy
+  // install, and every further `reconnected` would stack another panel sync behind it.
+  let release;
+  const blocked = new Promise((r) => { release = r; });
+  const h = gateHarness({ minGapMs: 5000 });
+  const live = { bridgeConnected: true, hasResumableSession: true };
+  const first = h.gate.attempt(live, h.send(() => blocked));
+  h.clock.t = 999_999; // window wide open — only the latch can refuse this
+  assert.equal(await h.gate.attempt(live, h.send(true)), false, "a second send must not overlap");
+  assert.deepEqual(h.sends, [0], "exactly one hello on the wire");
+  release(true);
+  assert.equal(await first, true);
+  // …and the latch releases, so later events are governed by the window alone.
+  h.clock.t = 999_999 + 5000;
+  assert.equal(await h.gate.attempt(live, h.send(true)), true);
+});
+
+test("#1096 gate: an unreadable clock decides nothing", async () => {
+  for (const bad of [NaN, Infinity, -Infinity, "0", null, undefined]) {
+    const sends = [];
+    const gate = createReconnectRehelloGate({ now: () => bad });
+    assert.equal(
+      await gate.attempt(
+        { bridgeConnected: true, hasResumableSession: true },
+        () => { sends.push(1); return true; },
+      ),
+      false,
+      `an untimeable window must not be entered: ${String(bad)}`,
+    );
+    assert.deepEqual(sends, []);
+  }
+});
+
+test("#1096 wiring: the call site consults the gate, in the right polarity", () => {
+  // The gate's behaviour is covered above; this covers the two things a pure test cannot
+  // see — that the panel actually reaches it, and with which inputs. Exact substrings on
+  // purpose: #1096's own review proved by mutation that loose token scans over this file
+  // assert nothing at all.
   const src = readFileSync(
     new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
     "utf8",
   );
-  // Anchored on the call, not on a one-line argument shape — the arguments are formatted
-  // across lines and a future one would break a stricter locator for no reason.
-  const at = src.indexOf("shouldRehelloAfterComfyReconnect({");
-  assert.notEqual(at, -1, "the reconnect handler must consult the predicate");
-  // The predicate's ARGUMENTS, sliced once and reused by both argument assertions below.
-  const callArgs = src.slice(at, src.indexOf("})", at));
-  assert.match(
-    callArgs,
-    /bridgeConnected: client\.isConnected\(\)/,
-    "the live bridge state must come from the client, not a cached flag",
+  const at = src.indexOf("reconnectRehelloGate.attempt(");
+  assert.notEqual(at, -1, "the reconnect handler must reach the gate");
+  // POLARITY. `void gate.attempt(…)` DISPATCHES it; `if (!gate.attempt(…))` or any other
+  // negated wrapper would read as wired while doing the opposite, and that is invisible
+  // to a token scan. Pinned on the bytes IMMEDIATELY BEFORE the call rather than on a
+  // line-shaped substring, so it survives reformatting and CRLF but still fails the
+  // moment a `!` or a condition is put in front of it.
+  assert.equal(
+    src.indexOf("void reconnectRehelloGate.attempt("),
+    at - "void ".length,
+    "the re-advertise must be dispatched, not negated or folded into a condition",
   );
-  // It sits in the branch that used to `return` having done nothing.
+  // It sits in the branch that used to `return` having done nothing…
   const guardAt = src.indexOf("!shouldResumeAfterComfyReconnect({");
   assert.ok(guardAt !== -1 && guardAt < at, "it must be inside the declined-resume branch");
-  // Bounded by the branch's OWN `return`, not by connectAgent(): the resume path that
+  // …bounded by that branch's OWN `return`, not by connectAgent(): the resume path which
   // follows legitimately announces itself, and slicing that far would assert about it.
   const block = src.slice(at, src.indexOf("return;", at));
-  // A hello runs the orchestrator's panel sync, so it must not fire per WS blip.
-  assert.match(block, /RECONNECT_REHELLO_MIN_GAP_MS/, "the re-advertise must be debounced");
-  assert.match(block, /lastReconnectRehelloAt = now/, "…and the window must be armed when it fires");
-  // …but armed only once the hello PROVABLY reached the wire. Stamping before the send
-  // is the "recorded before it happened" defect the panel already names at the #607
-  // re-hello, with this same 5s constant: a hello refused for want of a route identity,
-  // or dropped on a superseded socket, would spend the window without re-advertising
-  // anything, leaving the tab mapping this exists to repair dropped for the full gap.
-  //
-  // Asserted as an ORDERING, because the token alone cannot see it — the stamp reads
-  // identically whether it sits before the send or inside its resolution, which is
-  // exactly how the first version of this test passed against the wrong shape.
-  const sendAt = block.search(/client\?\.rehello\?\.\(\)/);
-  const stampAt = block.search(/lastReconnectRehelloAt = now/);
-  assert.notEqual(sendAt, -1, "the re-advertise must still be sent");
+  // The live bridge state is OBSERVED at the moment of the attempt, never a cached flag —
+  // announcing a tab on a socket that was up a moment ago is the failure this fixes.
   assert.ok(
-    stampAt > sendAt,
-    "the debounce window must be armed AFTER the send, not before it",
+    block.includes("bridgeConnected: client.isConnected(),"),
+    "the live bridge state must be read from the client at the call site",
   );
-  assert.match(
-    block,
-    /\.then\(\(landed\) => \{\s*\n\s*if \(landed\) lastReconnectRehelloAt = now;/,
-    "…and only when the hello actually landed, so a refused one leaves the window open",
+  // The session input must ask the SAME question the frame does. `hasResumableSession`
+  // one screen up is derived from the active thread RECORD; the hello carries `resume`
+  // from SESSION_KEY. Gating on the record lets the guard pass while the frame goes out
+  // with `resume: null`, which spawns a clean agent — the spurious start this input
+  // exists to prevent. Pinned exactly, because "hasResumableSession is mentioned" was
+  // true of the wrong version too.
+  assert.ok(
+    block.includes("hasResumableSession: Boolean(ssGet(SESSION_KEY)),"),
+    "the session input must be read from the source the hello itself will carry",
   );
-  // A hello with no session spawns a clean agent, so the session input must be WIRED,
-  // not left to its default. Asserted against the argument slice computed ONCE above:
-  // this used to recompute `src.indexOf(needle, 0)`, which is the same call as
-  // `src.indexOf(needle)`, so it re-derived a byte-identical slice under a second name
-  // and read as a broader check than it was.
-  assert.match(callArgs, /hasResumableSession/, "the session input must be passed at the call site");
-  // MONOTONIC: a wall-clock adjustment must not be able to make the gap look negative.
-  assert.match(block, /monotonicNow\(\)/);
-  // It re-advertises and nothing more — no connect, no session frame. Bouncing a live
-  // session here is exactly what #278 removed.
-  assert.match(block, /client\?\.rehello\?\.\(\)/);
+  // It re-advertises and nothing more — no connect, no session frame, no chat line.
+  // Bouncing a live session here is exactly what #278 removed.
+  assert.ok(block.includes("() => client?.rehello?.(),"), "the send must be the re-advertise");
   assert.doesNotMatch(block, /connectAgent\(/, "it must not reconnect");
   assert.doesNotMatch(block, /resume_session/, "it must not re-resume the session");
   assert.doesNotMatch(block, /appendSystem\(/, "a silent repair needs no chat line");
+  // MONOTONIC, decided at the construction site and nowhere else — the gate's own default
+  // is Date.now() so it stays usable standalone, exactly as the outage tracker's is. A
+  // wall clock here lets an NTP/DST correction re-arm the window early.
+  assert.ok(
+    src.includes("createReconnectRehelloGate({ now: monotonicNow })"),
+    "the panel's re-advertise gate must measure on the monotonic clock",
+  );
+  // The inline debounce this replaced must not come back: it was unreachable from a test.
+  assert.doesNotMatch(src, /lastReconnectRehelloAt/, "the untestable inline window stays gone");
 });
