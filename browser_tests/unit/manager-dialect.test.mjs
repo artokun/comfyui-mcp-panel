@@ -93,6 +93,10 @@ test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-respo
   const factory = new Function(
     "api",
     "classifyManager404",
+    // #423 — the transports now TAG their no-response throw so the fallback ladder
+    // recognises it without reading the (translated) message. Real implementation,
+    // same as classifyManager404.
+    "markManagerUnreachable",
     `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
 ${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
 return { managerV2, managerCall };`,
@@ -104,6 +108,7 @@ return { managerV2, managerCall };`,
     const { managerV2: mv2, managerCall: mcall } = factory(
       { fetchApi: async () => res },
       classifyManager404,
+      ManagerInstall.markManagerUnreachable,
     );
     for (const call of [mv2, mcall]) {
       const err = await call("manager/queue/status").then(
@@ -116,6 +121,14 @@ return { managerV2, managerCall };`,
         isManagerRouteMissing(err),
         res !== null && res.status === 404,
         `marker only for the proven 404 (res=${JSON.stringify(res)})`,
+      );
+      // #423 — whichever way it failed, the fallback ladder must be able to SEE it
+      // without reading the sentence. The 404 branch carries managerRouteMissing;
+      // the no-response branch is tagged by the transport itself. A translated
+      // message disarmed every rung of the ladder for 11 of 12 shipped locales.
+      assert.ok(
+        isManagerRouteMissing(err) || err.managerTransportUnreachable === true,
+        `structurally recognisable (res=${JSON.stringify(res)})`,
       );
     }
   }
@@ -177,6 +190,7 @@ function buildDialectHarness({ fetchApi, managerCall, managerV2, AbortSignalImpl
     "managerCall",
     "managerV2",
     "isManagerUnreachable",
+    "markManagerUnreachable",
     "dialectRetryTarget",
     "MANAGER_FETCH_TIMEOUT_MS",
     "AbortSignal",
@@ -195,6 +209,7 @@ return { managerGet, getDialectCache: () => managerDialectCache };`,
     managerCall,
     managerV2,
     isManagerUnreachable,
+    ManagerInstall.markManagerUnreachable,
     dialectRetryTarget,
     15000,
     AbortSignalImpl,

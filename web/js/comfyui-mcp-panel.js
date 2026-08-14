@@ -98,6 +98,7 @@ import {
   installedListRoute,
   isManagerRouteMissing,
   isManagerUnreachable,
+  markManagerUnreachable,
   isMethodNotAllowed,
   assertBatchOk,
   legacyUpdateBody,
@@ -5599,7 +5600,11 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
     throw new Error(managerFetchFailureMessage(route, err), { cause: err });
   }
   if (!res) {
-    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    // #423 — TAG it. The fallback ladder must recognise this without reading the
+    // sentence; a translated message silently disarmed every rung of it.
+    throw markManagerUnreachable(
+      new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
+    );
   }
   if (res.status === 404) {
     // A 404 is a PROVEN route-level rejection — no handler ran. Tag it so the
@@ -5648,7 +5653,11 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
     ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
   });
   if (!res) {
-    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    // #423 — TAG it. The fallback ladder must recognise this without reading the
+    // sentence; a translated message silently disarmed every rung of it.
+    throw markManagerUnreachable(
+      new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
+    );
   }
   if (res.status === 404) {
     // See managerV2: a 404 is the PROVEN route-level rejection the #605
@@ -5870,10 +5879,14 @@ async function detectManagerDialect({ signal } = {}) {
     managerDialectCache = "legacy";
     return managerDialectCache;
   }
-  throw new Error(
-    "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
-      "nor /manager/queue/status answered with a queue status). Is the built-in " +
-      "Manager installed and enabled on the connected ComfyUI?",
+  // #423 — TAG it: neither dialect answered, so every dialect-routed GET above
+  // this is entitled to its fallback regardless of the panel's language.
+  throw markManagerUnreachable(
+    new Error(
+      "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
+        "nor /manager/queue/status answered with a queue status). Is the built-in " +
+        "Manager installed and enabled on the connected ComfyUI?",
+    ),
   );
 }
 

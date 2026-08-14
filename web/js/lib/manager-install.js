@@ -399,6 +399,13 @@ export function installedListRoute() {
   return "customnode/installed?mode=default";
 }
 
+/** Tag an error the Manager transport could not get an answer for, so the
+ *  fallback ladder can recognise it WITHOUT reading its wording (#423). */
+export function markManagerUnreachable(err) {
+  if (err && typeof err === "object") err.managerTransportUnreachable = true;
+  return err;
+}
+
 /** #423 — does a Manager error mean "route/prefix not present on this build"
  *  (a 404 / the panel's "not reachable" throw), i.e. we should retry the
  *  absolute (no-/v2) legacy route? A legacy-UI pip build can answer the queue
@@ -406,8 +413,31 @@ export function installedListRoute() {
  *  /v2/customnode/installed 404s while /customnode/installed serves fine.
  *  Broad on purpose: it gates IDEMPOTENT GET fallbacks, where re-issuing the
  *  request after even an ambiguous transport failure is safe. Mutations must
- *  use the stricter isManagerRouteMissing instead (codex P0). */
+ *  use the stricter isManagerRouteMissing instead (codex P0).
+ *
+ *  ## Why this asks the error, not the sentence
+ *
+ *  This used to decide by matching the English words "not reachable". The
+ *  message it reads is composed by `classifyManager404`, which runs it through
+ *  `tr()` — so on all 11 non-English locales the match failed, every rung of the
+ *  ladder rethrew, and the generic error surfaced while the Manager was running
+ *  and answering. The fallbacks existed and were unreachable code for anyone not
+ *  using the panel in English, which is how #423 recurred on 0.14.36 with the
+ *  whole ladder already shipped.
+ *
+ *  The facts were never in the prose: a route-missing 404 is already tagged
+ *  `managerRouteMissing`, and the transports now tag their no-response throw. The
+ *  wording test is kept LAST and only as a bridge for any path that throws a bare
+ *  Error without passing through those — it can only add matches, never remove
+ *  one, so a locale can no longer take a fallback away. */
 export function isManagerUnreachable(err) {
+  // #706, structurally. A security refusal means a handler RAN and declined; it is
+  // not an unreachable route in any language. This used to hold only because that
+  // message happens not to contain "not reachable" — but it embeds up to 300
+  // characters of UPSTREAM body text, so the wording was never ours to rely on.
+  if (err?.managerSecurityRefusal === true) return false;
+  if (isManagerRouteMissing(err)) return true;
+  if (err?.managerTransportUnreachable === true) return true;
   const msg = String(err?.message ?? err ?? "");
   return /not reachable/i.test(msg) || /HTTP\s*404\b/.test(msg);
 }

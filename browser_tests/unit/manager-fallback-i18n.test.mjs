@@ -87,8 +87,10 @@ test("the verdict does not depend on the WORDING at all", () => {
   // The durable form of the above. Even a locale that has not been written yet — or a
   // reworded English message — must not change the answer, because the fact being asked
   // about (the route 404'd) is structural and was known before any text was composed.
+  // NS-stripped, like catalogFor above — `__setCatalogForTest` takes what
+  // `loadCatalog` installs, not the file layout.
   __setCatalogForTest("xx", {
-    comfyuiMcpPanel: { manager_404: { comfyui_manager_not_reachable_is_the_built: "🙈" } },
+    manager_404: { comfyui_manager_not_reachable_is_the_built: "🙈" },
   });
   const err = errorForRouteMissing404();
   assert.equal(err.message, "🙈", "the catalogue is live");
@@ -109,6 +111,52 @@ test("the security refusal is still NOT treated as unreachable, in any locale", 
     err.managerSecurityRefusal = true;
     assert.ok(!isManagerUnreachable(err), `${locale}: a refusal must not authorise a fallback`);
   }
+});
+
+test("a security refusal is refused even when the UPSTREAM body says 'not reachable'", () => {
+  // The sharp version of the test above. `summarizeManagerBody` embeds up to 300
+  // characters of the Manager's own body into the message, so the words in it are
+  // upstream text, not ours. Before this fix the #706 invariant held only because that
+  // text happened never to contain "not reachable" — a guarantee nobody could make.
+  __setCatalogForTest("en", {});
+  const { routeMissing, message } = classifyManager404(
+    "A security error has occurred. The registry endpoint is not reachable from this host. " +
+      "Please check the terminal logs",
+  );
+  assert.equal(routeMissing, false, "still classified as a refusal, not a missing route");
+  const err = new Error(message);
+  err.managerSecurityRefusal = true;
+  assert.match(err.message, /not reachable/i, "the hostile phrase really is in the message");
+  assert.ok(
+    !isManagerUnreachable(err),
+    "a handler ran and declined — the fallback ladder must stay shut whatever the body says",
+  );
+});
+
+test("a security refusal VETOES the tags, not the other way round", () => {
+  // The call sites set exactly one of these today (`if (routeMissing) … else …`), so an
+  // error carrying both is not reachable from current code. The precedence is still a
+  // decision worth stating: "a handler ran and declined" is the fact that must win,
+  // because acting on the other one re-sends work the Manager already processed. Pinning
+  // it means a future path that tags an error it re-throws cannot quietly invert it.
+  __setCatalogForTest("en", {});
+  for (const tag of ["managerRouteMissing", "managerTransportUnreachable"]) {
+    const err = new Error("...");
+    err.managerSecurityRefusal = true;
+    err[tag] = true;
+    assert.ok(!isManagerUnreachable(err), `${tag} must not override a refusal`);
+  }
+});
+
+test("a TAGGED transport failure opens the ladder whatever its message says", () => {
+  // The other direction: the transports' no-response throw is raw English today, but the
+  // i18n gate takes new strings over time. Once tagged, the wording stops mattering — so
+  // translating it later cannot re-introduce this bug.
+  __setCatalogForTest("ja", catalogFor("ja"));
+  const err = new Error("ComfyUI-Manager に接続できません");
+  assert.ok(!isManagerUnreachable(err), "untagged and untranslatable-by-regex: not matched");
+  err.managerTransportUnreachable = true;
+  assert.ok(isManagerUnreachable(err), "tagged: matched");
 });
 
 test("the untranslated transport throws keep working", () => {
