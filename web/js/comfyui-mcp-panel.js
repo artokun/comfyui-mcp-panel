@@ -98,6 +98,7 @@ import {
   installedListRoute,
   isManagerRouteMissing,
   isManagerUnreachable,
+  markManagerUnreachable,
   isMethodNotAllowed,
   assertBatchOk,
   legacyUpdateBody,
@@ -5596,10 +5597,23 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
     // current state before retrying a MUTATING call.
     // An abort is the caller's own doing and must pass through untouched.
     if (err?.name === "AbortError") throw err;
-    throw new Error(managerFetchFailureMessage(route, err), { cause: err });
+    // #423, second blind spot (found in review). This is untagged AND its wording has
+    // never matched the gate's regex, so a transport-level failure has always skipped
+    // the whole fallback ladder — including the /object_info search that exists for
+    // exactly this case. Tagging it is safe in the direction that matters: this flag
+    // gates IDEMPOTENT GETs only. `isManagerRouteMissing`, the one predicate allowed to
+    // re-send a MUTATION, still requires a proven 404 and does not read this — which is
+    // what keeps the paragraph above true.
+    throw markManagerUnreachable(
+      new Error(managerFetchFailureMessage(route, err), { cause: err }),
+    );
   }
   if (!res) {
-    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    // #423 — TAG it. The fallback ladder must recognise this without reading the
+    // sentence; a translated message silently disarmed every rung of it.
+    throw markManagerUnreachable(
+      new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
+    );
   }
   if (res.status === 404) {
     // A 404 is a PROVEN route-level rejection — no handler ran. Tag it so the
@@ -5642,13 +5656,30 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
  *  released 3.x ComfyUI-Manager whose queue lives under /manager/* with
  *  per-operation routes. Same error handling as managerV2. */
 async function managerCall(route, { method = "GET", body, signal } = {}) {
-  const res = await api.fetchApi(`/${route}`, {
-    method,
-    ...(signal ? { signal } : {}),
-    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
-  });
+  let res;
+  try {
+    res = await api.fetchApi(`/${route}`, {
+      method,
+      ...(signal ? { signal } : {}),
+      ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+  } catch (err) {
+    // #423, second blind spot (found in review). The docstring above claims "same error
+    // handling as managerV2" and it was not true: there was no catch here at all, so a
+    // fetch rejection propagated raw ("Failed to fetch") — no route, no tag, and no
+    // match for the gate's regex, which skipped the fallback ladder entirely. This is
+    // the LEGACY transport, i.e. the very rung the ladder falls back TO.
+    if (err?.name === "AbortError") throw err;
+    throw markManagerUnreachable(
+      new Error(managerFetchFailureMessage(route, err), { cause: err }),
+    );
+  }
   if (!res) {
-    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    // #423 — TAG it. The fallback ladder must recognise this without reading the
+    // sentence; a translated message silently disarmed every rung of it.
+    throw markManagerUnreachable(
+      new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
+    );
   }
   if (res.status === 404) {
     // See managerV2: a 404 is the PROVEN route-level rejection the #605
@@ -5870,10 +5901,14 @@ async function detectManagerDialect({ signal } = {}) {
     managerDialectCache = "legacy";
     return managerDialectCache;
   }
-  throw new Error(
-    "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
-      "nor /manager/queue/status answered with a queue status). Is the built-in " +
-      "Manager installed and enabled on the connected ComfyUI?",
+  // #423 — TAG it: neither dialect answered, so every dialect-routed GET above
+  // this is entitled to its fallback regardless of the panel's language.
+  throw markManagerUnreachable(
+    new Error(
+      "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
+        "nor /manager/queue/status answered with a queue status). Is the built-in " +
+        "Manager installed and enabled on the connected ComfyUI?",
+    ),
   );
 }
 
