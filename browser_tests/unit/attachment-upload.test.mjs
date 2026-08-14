@@ -124,10 +124,21 @@ test("#756 WIRING: both upload paths record the status and the exception", () =>
     2,
     "…and both must surface it as the attachment's error",
   );
+  // Window widened from 200 to 500: #1188 added a defensive re-read of the file's
+  // measurements inside each catch, which pushed the assignment further from `catch (err) {`.
+  // The contract is unchanged — the caught exception must still be what gets reported.
   assert.equal(
-    (src.match(/catch \(err\) \{[\s\S]{0,200}?att\.uploadError = describeUploadFailure\(\{ error: err/g) || []).length,
+    (src.match(/catch \(err\) \{[\s\S]{0,500}?att\.uploadError = describeUploadFailure\(\{ error: err/g) || []).length,
     2,
     "both upload paths must record the caught exception",
+  );
+  // #1188 — and neither catch may read `file.size`/`file.type` directly. A throwing getter
+  // there throws a SECOND time while reporting the first failure, escapes the handler, and
+  // rejects `att.ready` — which the send path awaits and cannot handle.
+  assert.equal(
+    (src.match(/catch \(err\) \{[\s\S]{0,500}?describeUploadFailure\(\{ error: err, name, size: file\.size/g) || []).length,
+    0,
+    "the reporting catch must not re-read a property that may be what threw",
   );
   assert.ok(
     !src.includes("/* upload failed — the chip still references it by name as a fallback */"),

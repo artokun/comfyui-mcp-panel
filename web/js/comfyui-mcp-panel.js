@@ -83,6 +83,8 @@ import {
   describeUploadTimeout,
   attachmentSummaryLine,
   boundedUpload,
+  readFileFacts,
+  readErrorBody,
   UPLOAD_NO_ANSWER,
 } from "./lib/attachment-upload.js";
 import {
@@ -30789,6 +30791,11 @@ function buildPanel() {
       try {
         const fd = new FormData();
         fd.append("image", file, name);
+        // #1188 — read the measurements ONCE, before anything can fail on them. A `size` or
+        // `type` that throws would otherwise throw AGAIN inside the catch that reports it,
+        // escape the handler, and REJECT `att.ready` — which the send path awaits and is
+        // not built to have reject.
+        const { size, mediaType } = readFileFacts(file);
         // #1188 — bounded, request AND body. Without this a half-open connection after a
         // ComfyUI restart leaves `att.ready` pending forever. `att.ready` catches
         // everything internally so it never REJECTS — it simply never settles, and the
@@ -30800,21 +30807,23 @@ function buildPanel() {
             if (res.status === 200) return { info: await res.json() };
             // #756 — a non-200 had NO else at all. The status was in hand and thrown
             // away, leaving "upload failed" as the whole of what anyone could learn.
+            // The body gets its OWN shorter bound: a refusal we can already name must not
+            // be downgraded to "no response" just because ComfyUI's explanation stalls.
             return {
               failure: describeUploadFailure({
                 status: res.status,
                 statusText: res.statusText,
-                body: await res.text().catch(() => null),
+                body: await readErrorBody(res, withTimeout),
                 name,
-                size: file.size,
-                mediaType: file.type,
+                size,
+                mediaType,
               }),
             };
           },
-          { size: file?.size, withTimeout },
+          { size, withTimeout },
         );
         if (outcome === UPLOAD_NO_ANSWER) {
-          att.uploadError = describeUploadTimeout({ name, size: file.size, mediaType: file.type });
+          att.uploadError = describeUploadTimeout({ name, size, mediaType });
         } else if (outcome?.failure) {
           att.uploadError = outcome.failure;
         } else {
@@ -30823,8 +30832,11 @@ function buildPanel() {
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
         }
       } catch (err) {
-        // #756 — the bare catch swallowed transport failures identically.
-        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
+        // #756 — the bare catch swallowed transport failures identically. The measurements
+        // are re-read defensively here too: this catch also runs for a throw raised BEFORE
+        // readFileFacts, so it cannot assume those locals exist.
+        const facts = readFileFacts(file);
+        att.uploadError = describeUploadFailure({ error: err, name, size: facts.size, mediaType: facts.mediaType });
       }
     })();
     att.ready.then(renderAttachmentChips, () => {}); // refresh once the thumb loads
@@ -30853,6 +30865,10 @@ function buildPanel() {
         const fd = new FormData();
         // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
         fd.append("image", file, name);
+        // #1188 — read the measurements ONCE. Same reason as the image path above: a
+        // throwing `size`/`type` getter would throw again inside the reporting catch and
+        // reject `att.ready`.
+        const { size, mediaType } = readFileFacts(file);
         // #1188 — bounded, request AND body. This path is the reason the bound is sized by
         // payload rather than flat: it exists specifically for video, so a fixed number
         // would either cut off a legitimate large upload or wait absurdly long for a small
@@ -30864,21 +30880,23 @@ function buildPanel() {
             if (res.status === 200) return { info: await res.json() };
             // #756 — a non-200 had NO else at all. The status was in hand and thrown
             // away, leaving "upload failed" as the whole of what anyone could learn.
+            // The body gets its OWN shorter bound: a refusal we can already name must not
+            // be downgraded to "no response" just because ComfyUI's explanation stalls.
             return {
               failure: describeUploadFailure({
                 status: res.status,
                 statusText: res.statusText,
-                body: await res.text().catch(() => null),
+                body: await readErrorBody(res, withTimeout),
                 name,
-                size: file.size,
-                mediaType: file.type,
+                size,
+                mediaType,
               }),
             };
           },
-          { size: file?.size, withTimeout },
+          { size, withTimeout },
         );
         if (outcome === UPLOAD_NO_ANSWER) {
-          att.uploadError = describeUploadTimeout({ name, size: file.size, mediaType: file.type });
+          att.uploadError = describeUploadTimeout({ name, size, mediaType });
         } else if (outcome?.failure) {
           att.uploadError = outcome.failure;
         } else {
@@ -30887,8 +30905,11 @@ function buildPanel() {
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
         }
       } catch (err) {
-        // #756 — the bare catch swallowed transport failures identically.
-        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
+        // #756 — the bare catch swallowed transport failures identically. The measurements
+        // are re-read defensively here too: this catch also runs for a throw raised BEFORE
+        // readFileFacts, so it cannot assume those locals exist.
+        const facts = readFileFacts(file);
+        att.uploadError = describeUploadFailure({ error: err, name, size: facts.size, mediaType: facts.mediaType });
       }
     })();
   }

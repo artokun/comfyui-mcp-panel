@@ -123,13 +123,28 @@ export const UPLOAD_STALL_FLOOR_MS = 30000;
 export const UPLOAD_MIN_BYTES_PER_MS = 50;
 
 /**
+ * The largest delay `setTimeout` can actually hold.
+ *
+ * Above 2^31-1 ms the delay overflows a 32-bit signed int and is coerced to **1ms** — so an
+ * allowance so generous it should never fire becomes a bound that fires immediately and
+ * refuses every upload. A bound that big is unreachable in practice (it needs a ~107 GB
+ * payload), but the failure direction is the dangerous one: not "waits too long" but
+ * "refuses instantly", and it would arrive through the mechanism meant to prevent refusals.
+ * Clamping also absorbs an `Infinity` reachable through the options object, which no
+ * production caller passes but which the exported signature permits.
+ */
+export const MAX_TIMER_MS = 2147483647;
+
+/**
  * How long an upload of `size` bytes may take before the caller stops waiting.
  *
- * NEVER returns a non-positive number. `withTimeout` treats those as NO BOUND (see
- * `bounded-step.js:20`), so a zero or negative result would silently restore the very hang
- * this exists to prevent — the same trap `nodeDefsBudgetLeft` guards against by clamping to
- * 1ms. An unknown or unusable size yields the floor rather than a fabricated allowance,
- * matching `describeSize`'s rule that an unmeasured value must be absent, not zero.
+ * ALWAYS returns a delay a timer can actually hold: finite, and within [1, MAX_TIMER_MS].
+ * Both ends matter, and they fail in opposite directions. Below 1, `withTimeout` treats the
+ * value as NO BOUND (see `bounded-step.js:20`) and silently restores the very hang this
+ * exists to prevent — the trap `nodeDefsBudgetLeft` guards against the same way. Above
+ * `MAX_TIMER_MS`, `setTimeout` coerces the delay to 1ms and the bound refuses every upload
+ * instantly. An unknown or unusable size yields the floor rather than a fabricated
+ * allowance, matching `describeSize`'s rule that an unmeasured value must be absent, not zero.
  */
 export function uploadBoundMs(size, {
   floorMs = UPLOAD_STALL_FLOOR_MS,
@@ -137,10 +152,67 @@ export function uploadBoundMs(size, {
 } = {}) {
   const floor = Number.isFinite(floorMs) && floorMs > 0 ? Math.ceil(floorMs) : UPLOAD_STALL_FLOOR_MS;
   const rate = Number.isFinite(bytesPerMs) && bytesPerMs > 0 ? bytesPerMs : UPLOAD_MIN_BYTES_PER_MS;
-  if (size === null || size === undefined || size === "") return floor;
+  const clamp = (ms) => Math.min(MAX_TIMER_MS, Math.max(1, ms));
+  if (size === null || size === undefined || size === "") return clamp(floor);
   const n = Number(size);
-  if (!Number.isFinite(n) || n <= 0) return floor;
-  return Math.max(1, floor + Math.ceil(n / rate));
+  if (!Number.isFinite(n) || n <= 0) return clamp(floor);
+  return clamp(floor + Math.ceil(n / rate));
+}
+
+/**
+ * A file's measurements, read ONCE and defensively.
+ *
+ * A `File`/`Blob` whose `size` or `type` is a throwing getter (or a revoked Proxy) makes the
+ * bare reads throw at the top of the upload path — and then throw AGAIN inside the `catch`
+ * that reports the failure, because that catch reads the same properties to describe the
+ * file. The exception escapes the handler entirely and `att.ready` REJECTS, which the send
+ * path is not built for: it awaits `Promise.all(pending.map((a) => a.ready))`, so one
+ * unreadable file would break sending rather than mark that attachment failed.
+ *
+ * The unbounded original had this trap only on the non-200 branch. Passing the size to the
+ * bound would have widened it to EVERY upload, so the read is hoisted here instead. An
+ * unreadable measurement is reported as absent — `describeSize`'s rule — never as zero.
+ */
+export function readFileFacts(file) {
+  const facts = { size: undefined, mediaType: "" };
+  try {
+    facts.size = file?.size;
+  } catch {
+    /* unreadable — stays absent rather than becoming a fabricated 0 */
+  }
+  try {
+    facts.mediaType = file?.type;
+  } catch {
+    /* unreadable — an absent MIME type simply drops out of the description */
+  }
+  return facts;
+}
+
+/** How long ComfyUI's own explanation of a refusal may take to arrive. Short, because the
+ *  status is ALREADY in hand by this point and is worth reporting without it. */
+export const UPLOAD_ERROR_BODY_MS = 5000;
+
+/**
+ * Read a refusal's body without letting it cost us the status.
+ *
+ * #756's whole point was that "the status was in hand and thrown away". A body read that
+ * stalls inside the outer upload bound would do exactly that again by a new route: the
+ * outer bound fires, the sentinel is returned, and a KNOWN `HTTP 413` is reported to the
+ * user as "no response". Bounding the body separately and shorter means a stalled
+ * explanation costs only the explanation — the status still gets reported, with the same
+ * "the server sent no body explaining it" wording a body-less refusal already produces.
+ */
+export async function readErrorBody(res, withTimeout, ms = UPLOAD_ERROR_BODY_MS) {
+  if (typeof withTimeout !== "function") return null;
+  try {
+    return await withTimeout(
+      Promise.resolve().then(() => res.text()).then((t) => t, () => null),
+      ms,
+      () => null,
+    );
+  } catch {
+    return null;
+  }
 }
 
 /** Sentinel: the upload did not answer, as distinct from anything it could return. */

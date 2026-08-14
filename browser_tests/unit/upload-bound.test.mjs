@@ -20,9 +20,12 @@ import {
   uploadBoundMs,
   boundedUpload,
   describeUploadTimeout,
+  readFileFacts,
+  readErrorBody,
   UPLOAD_NO_ANSWER,
   UPLOAD_STALL_FLOOR_MS,
   UPLOAD_MIN_BYTES_PER_MS,
+  MAX_TIMER_MS,
 } from "../../web/js/lib/attachment-upload.js";
 
 const SRC = readFileSync(
@@ -71,6 +74,62 @@ test("#1188 the bound scales with the payload, so video is not cut off", () => {
   // non-positive-adjacent failures that would reach withTimeout and arm setTimeout(fn, NaN),
   // which fires immediately and would refuse every upload.
   assert.ok(Number.isFinite(uploadBoundMs(Number.MAX_SAFE_INTEGER)), "a huge size must stay finite");
+});
+
+test("#1188 the bound stays inside what setTimeout can actually hold", () => {
+  // Above 2^31-1 ms setTimeout overflows a 32-bit signed int and coerces the delay to 1ms,
+  // so an allowance so generous it should never fire becomes a bound that refuses EVERY
+  // upload instantly — the failure arriving through the mechanism meant to prevent it.
+  // Measured directly rather than asserted from the spec: node reports _idleTimeout 1 for
+  // a delay of MAX_SAFE_INTEGER.
+  for (const size of [Number.MAX_SAFE_INTEGER, Number.MAX_VALUE, 1e30]) {
+    const ms = uploadBoundMs(size);
+    assert.ok(ms > 0 && ms <= MAX_TIMER_MS, `uploadBoundMs(${size}) = ${ms} is not a usable delay`);
+  }
+  // The options object is caller-reachable and can otherwise produce Infinity.
+  const viaOptions = uploadBoundMs(Number.MAX_VALUE, { floorMs: Number.MAX_VALUE, bytesPerMs: 1 });
+  assert.ok(Number.isFinite(viaOptions) && viaOptions <= MAX_TIMER_MS, `options produced ${viaOptions}`);
+  assert.ok(Number.isFinite(uploadBoundMs(1, { bytesPerMs: Number.MIN_VALUE })), "a tiny rate must not overflow");
+});
+
+// ── measurements that may themselves fail ───────────────────────────────────────────
+
+test("#1188 readFileFacts survives a File whose getters throw", () => {
+  // The trap this closes: the bare reads throw at the top of the upload path, and then throw
+  // AGAIN inside the catch that reports the failure, because that catch describes the file.
+  // The exception escapes the handler and `att.ready` REJECTS — which the send path awaits
+  // via Promise.all and is not built to handle.
+  const hostile = {
+    get size() { throw new Error("revoked"); },
+    get type() { throw new Error("revoked"); },
+  };
+  const facts = readFileFacts(hostile);
+  assert.equal(facts.size, undefined, "an unreadable size must be ABSENT, not a fabricated 0");
+  assert.equal(facts.mediaType, "");
+  // A half-hostile file still yields the half that reads.
+  const partial = { size: 4096, get type() { throw new Error("revoked"); } };
+  assert.equal(readFileFacts(partial).size, 4096);
+  // …and the absent size flows through to a description that simply omits it, rather than
+  // claiming "0 B" — describeSize's rule.
+  assert.doesNotMatch(describeUploadTimeout({ name: "x.png", ...readFileFacts(hostile) }), /0 B/);
+  for (const bad of [null, undefined, 0, "", false]) {
+    assert.doesNotThrow(() => readFileFacts(bad), `readFileFacts(${String(bad)}) threw`);
+  }
+});
+
+test("#1188 a stalled error body never costs us the status we already have", async () => {
+  // #756's whole point was that "the status was in hand and thrown away". A body read that
+  // stalls inside the OUTER upload bound would do exactly that by a new route: the outer
+  // bound fires and a known HTTP 413 is reported to the user as "no response".
+  const stalled = { text: () => new Promise(() => {}) };
+  assert.equal(await readErrorBody(stalled, withTimeout, 20), null, "a stalled body must give up");
+  // A body that arrives is still read.
+  assert.equal(await readErrorBody({ text: async () => "too large" }, withTimeout, 5000), "too large");
+  // A body that rejects degrades the same way, not into a throw the caller must catch.
+  assert.equal(await readErrorBody({ text: async () => { throw new Error("x"); } }, withTimeout, 5000), null);
+  // A response object that is not one at all must not throw either.
+  assert.equal(await readErrorBody({}, withTimeout, 5000), null);
+  assert.equal(await readErrorBody(null, withTimeout, 5000), null);
 });
 
 // ── the bounded exchange ────────────────────────────────────────────────────────────
@@ -178,8 +237,10 @@ test("#1188 each upload site's body read sits INSIDE the bounded callback", () =
   // Anchored on the options argument rather than on closing-brace indentation: the three
   // sites sit at different nesting depths, and an indentation-coupled window silently
   // matched the wrong span for two of them.
+  // "{ size" matches both the explicit `{ size: blob?.size, … }` and the shorthand
+  // `{ size, … }` the composer sites use after hoisting the read.
   const sites = CODE.split("await boundedUpload(").slice(1).map((chunk) => {
-    const end = chunk.indexOf("{ size:");
+    const end = chunk.indexOf("{ size");
     assert.ok(end > 0, "each bounded call must pass its options object");
     return chunk.slice(0, end);
   });
@@ -199,6 +260,34 @@ test("#1188 uploadBlobToInput still answers null, so no caller learns a new shap
     CODE,
     /return out === UPLOAD_NO_ANSWER \? null : out;/,
     "the sentinel must be collapsed to the existing failure value",
+  );
+});
+
+test("#1188 the composer reads each file's measurements once, defensively", () => {
+  // Passing the size to the bound added a read on the HAPPY path, where the original only
+  // read it on the non-200 branch — widening a throwing-getter trap from rare to universal.
+  const hoisted = (CODE.match(/const \{ size, mediaType \} = readFileFacts\(file\);/g) || []).length;
+  assert.equal(hoisted, 2, `both composer sites must hoist the read, saw ${hoisted}`);
+  // And the bound must be given that hoisted value, not a fresh `file.size` read.
+  assert.equal(
+    (CODE.match(/\{ size, withTimeout \},/g) || []).length,
+    2,
+    "both bounded calls must use the hoisted size",
+  );
+});
+
+test("#1188 a refusal's body is bounded separately from the upload", () => {
+  // Otherwise a stalled explanation drags a KNOWN status into the outer bound and it gets
+  // reported as "no response" — #756's defect, reintroduced by #1188's own fix.
+  assert.equal(
+    (CODE.match(/body: await readErrorBody\(res, withTimeout\),/g) || []).length,
+    2,
+    "both composer sites must bound the error body on its own",
+  );
+  assert.equal(
+    (CODE.match(/body: await res\.text\(\)\.catch\(\(\) => null\),/g) || []).length,
+    0,
+    "no site may read a refusal body under the outer bound alone",
   );
 });
 
