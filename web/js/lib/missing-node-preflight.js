@@ -57,6 +57,58 @@ export function unrunnableNodeIds(prompt) {
 }
 
 /**
+ * #1582 — did `graphToPrompt()` fail to produce anything we can reason about?
+ *
+ * A DIFFERENT question from `unrunnableNodeIds`, and the whole defect is that the two were
+ * conflated. That one asks "which entries in this prompt are unrunnable?" and answers `[]`
+ * for a result that does not exist — correctly, because a thing that is not there has no
+ * unrunnable entries. The pre-flight then read `[]` as "the graph is fine" and handed an
+ * undefined result to ComfyUI's `queuePrompt`, which dereferences `.workflow` on it and
+ * throws `Cannot read properties of undefined (reading 'workflow')`.
+ *
+ * Absence of evidence, read as evidence of absence.
+ *
+ * A usable result must carry an `output` OBJECT. An empty one is fine — an empty graph
+ * serializes to no nodes and is not this failure.
+ */
+export function graphToPromptUnusable(built) {
+  if (!built || typeof built !== "object" || Array.isArray(built)) return true;
+  const output = built.output;
+  return !output || typeof output !== "object" || Array.isArray(output);
+}
+
+/**
+ * The refusal for a graph that could not be serialized at all.
+ *
+ * Mirrors what the run-to-node path has always said (#556) so the two paths stop giving
+ * wildly different answers to the same failure — the reporter learned the real cause only
+ * because they happened to retry with `to_node_id`.
+ *
+ * `types` is the node types the frontend could not resolve, when we know them. When we do
+ * NOT, this says so and stops: serialization can fail for reasons that have nothing to do
+ * with missing packs, and naming one anyway sends the user to install something they
+ * already have.
+ */
+export function unserializableGraphRefusal(types) {
+  const list = [...new Set((Array.isArray(types) ? types : []).filter((t) => typeof t === "string" && t))];
+  const shown = list.slice(0, 10);
+  const more = list.length > shown.length ? `, and ${list.length - shown.length} more` : "";
+  const cause = list.length
+    ? `The frontend could not resolve these node types, which is the usual cause: ` +
+      `${shown.join(", ")}${more}. Install the pack that provides them ` +
+      `(list_packs / install_custom_node) and restart ComfyUI so the frontend registers ` +
+      `them, or delete/bypass those nodes. `
+    : `The panel could not identify which nodes are responsible, so this does not ` +
+      `establish that a pack is missing — serialization can fail for other reasons. `;
+  return (
+    `NOT queued: this workflow could not be serialized into a prompt (graphToPrompt failed), ` +
+    `so there was nothing to send. ${cause}` +
+    `Nothing was queued and the queue is untouched. ` +
+    `panel_get_errors lists the node types this ComfyUI does not recognise.`
+  );
+}
+
+/**
  * Name the offending nodes using the live graph, which still knows their types.
  *
  * The serialized entry has lost the type — that is precisely why it is unrunnable — so

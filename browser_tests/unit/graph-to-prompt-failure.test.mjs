@@ -84,3 +84,128 @@ test("#1582 a long type list is bounded", () => {
   assert.match(msg, /LCNode0/);
   assert.match(msg, /more|…|\.\.\./);
 });
+
+// ── WIRING. The helpers are useless if the run path never consults them, and the guard is
+//    a few lines inside a 30k-line file that a refactor could drop with every unit test
+//    still green.
+
+test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
+  const at = src.indexOf("const built = await app.graphToPrompt();");
+  assert.ok(at > 0, "the pre-flight's graphToPrompt call must still be recognisable");
+  const block = src.slice(at, at + 1800);
+  const guard = block.indexOf("graphToPromptUnusable(built)");
+  const offenders = block.indexOf("unrunnableNodeIds(built)");
+  assert.ok(guard > -1, "the unusable-result guard must exist");
+  assert.ok(offenders > -1, "the offender check must still exist");
+  // ORDER is the fix. Asking for offenders first answers `[]` for an absent result and
+  // lets it through to queuePrompt, which is the reported TypeError.
+  assert.ok(guard < offenders, "the guard must run BEFORE the offender check");
+  assert.match(block, /unserializableGraphRefusal\(/);
+});
+
+test("#1582 the refusal keeps the prefix its own catch requires", async () => {
+  // The pre-flight is wrapped in a try whose catch re-throws ONLY /^NOT queued:/ — anything
+  // else is swallowed so a broken pre-flight cannot become a new failure mode. A refusal
+  // without that prefix would be silently discarded and the run would proceed into the
+  // TypeError, with every helper test still passing.
+  assert.match(unserializableGraphRefusal([]), /^NOT queued:/);
+  assert.match(unserializableGraphRefusal(["LCKreaSampler"]), /^NOT queued:/);
+});
+
+// ── BEHAVIOUR, from the REAL source. The wiring tests above pin that the guard exists and
+//    runs first; they cannot see whether it actually refuses. Extracting the pre-flight
+//    block and driving it against stubs proves the reported call now fails with a reason —
+//    the same real-source extraction pattern manager-dialect.test.mjs uses.
+
+/** Pull the pre-flight try/catch out of the monolith and run it with injected deps. */
+async function buildPreflight({ graphToPrompt, nodes = [], registry = {} }) {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
+  const marker = src.indexOf("      // Inspect the SERIALIZED prompt");
+  assert.ok(marker > 0, "the pre-flight comment must still be recognisable");
+  const start = src.lastIndexOf("try {", marker);
+  const endMark = src.indexOf("if (err instanceof Error && /^NOT queued:/.test(err.message)) throw err;", start);
+  assert.ok(endMark > start, "the pre-flight catch must still be recognisable");
+  const body = src.slice(start, src.indexOf("\n", endMark)) + "\n    }";
+  const mod = await import("../../web/js/lib/missing-node-preflight.js");
+  const factory = new Function(
+    "app",
+    "graph",
+    "LG",
+    "unrunnableNodeIds",
+    "describeUnrunnable",
+    "missingNodeRunRefusal",
+    "graphToPromptUnusable",
+    "unserializableGraphRefusal",
+    `return async function preflight() {\n${body}\n};`,
+  );
+  return factory(
+    { graphToPrompt },
+    { _nodes: nodes },
+    { registered_node_types: registry },
+    mod.unrunnableNodeIds,
+    mod.describeUnrunnable,
+    mod.missingNodeRunRefusal,
+    mod.graphToPromptUnusable,
+    mod.unserializableGraphRefusal,
+  );
+}
+
+const runPreflight = async (opts) => {
+  const preflight = await buildPreflight(opts);
+  try {
+    await preflight();
+    return "__NO_REFUSAL__";
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+};
+
+test("#1582 BEHAVIOUR: an undefined graphToPrompt result refuses, naming the packs", async () => {
+  // The reported call, end to end through the real pre-flight source.
+  const msg = await runPreflight({
+    graphToPrompt: async () => undefined,
+    nodes: [
+      { id: 1, type: "KSampler" },
+      { id: 2, type: "LCKreaSampler" },
+      { id: 3, type: "Florence2Run" },
+    ],
+    registry: { KSampler: {} },
+  });
+  assert.notEqual(msg, "__NO_REFUSAL__", "an unserializable graph must not reach queuePrompt");
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /graphToPrompt/);
+  assert.match(msg, /LCKreaSampler/);
+  assert.match(msg, /Florence2Run/);
+  // Only the UNREGISTERED ones. Naming a type the frontend has would send the user to
+  // reinstall something that is already working.
+  assert.doesNotMatch(msg, /KSampler\b(?!.*could not)/);
+});
+
+test("#1582 BEHAVIOUR: a healthy prompt passes the pre-flight untouched", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => ({
+      output: { 1: { class_type: "KSampler", inputs: {} } },
+      workflow: {},
+    }),
+    nodes: [{ id: 1, type: "KSampler" }],
+    registry: { KSampler: {} },
+  });
+  assert.equal(msg, "__NO_REFUSAL__", "a runnable graph must not be refused");
+});
+
+test("#1582 BEHAVIOUR: the #1460 unrunnable-node refusal still fires", async () => {
+  // The check this guard was inserted above. It must keep working — a serialized prompt
+  // that EXISTS but carries a node with no class_type is a different failure with its own
+  // (more specific) message.
+  const msg = await runPreflight({
+    graphToPrompt: async () => ({ output: { 7: { inputs: {} } }, workflow: {} }),
+    nodes: [{ id: 7, type: "GoneNode" }],
+    registry: {},
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /cannot be executed by the server/);
+  assert.match(msg, /GoneNode/);
+});
