@@ -2169,54 +2169,6 @@ export function resolveGraphBindingVerdict({
   const contentDiffers = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
   const structureMatches =
     contentDiffers && graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
-  // #1187 — a PROVEN root tag outranks the ChangeTracker comparison, structural or not.
-  //
-  // This was `!(structureMatches && tagMatches)`, which consulted the positive tag only as a
-  // CONJUNCT of `structureMatches`. So on a structural difference — which is precisely what
-  // "the user added a node" means — `structureMatches` was false, the whole term was false,
-  // and a matching identity stamp was structurally INCAPABLE of rescuing the read. The tag
-  // could only ever confirm a verdict the structure had already reached.
-  //
-  // The evidence is not symmetric. `extra.comfyui_mcp.workflow_uuid` is IDENTITY, stamped by
-  // `sealProvenRootBinding` on a root proven to be this workflow's. `changeTracker.activeState`
-  // is a lagging SNAPSHOT: ComfyUI captures it on user-input events, so after a hand edit
-  // there is a window where `activeState` still reports the old node count while `_nodes`
-  // reports the new one — and `wf.isModified` has not flipped yet either, so
-  // `graphRootMismatchesActiveWorkflow`'s dirty-tab escape hatch does not fire. During that
-  // window every read AND every mutation refused, telling the user their own canvas "is bound
-  // to a different graph". It cleared itself once the tracker captured, which is why it read
-  // as intermittent rather than as the deterministic race it is.
-  //
-  // THIS WIDENS #349's STRUCTURAL LINE, deliberately. Stated plainly rather than presented as
-  // a pure bug fix: a tagged root that differs STRUCTURALLY from the tracker's snapshot is now
-  // permitted, where before only content drift was. The residual exposure is the already-
-  // accepted `sealProvenRootBinding` stranded-duplicate gap documented above — a root that was
-  // legitimately sealed and then abandoned — now extended from content drift to structural
-  // drift. That is a real widening of a known hole, not a new one.
-  //
-  // What still refuses, because each is ordered AHEAD of this term and is untouched:
-  //   - a FOREIGN tag            → `rootUuidMismatch`
-  //   - an UNTAGGED root         → `rootTagProven` is false, so this term still fires
-  //   - #618's count-short root inside the reconnect window → `midPopulation`
-  //   - a dirty tab mutating without a positive match → `dirtyMutationBindingUnproven`
-  //
-  // `structureMatches` is still computed, and still consumed: when this DOES refuse it is what
-  // lets the message distinguish "a different graph" from "this graph, drifted, unstamped".
-  // #1187 — NOT relaxed. A first attempt made a matching tag sufficient here
-  // (`contentDiffers && !tagMatches`) and it was unsafe: this file already records, at
-  // #565 and #817, that some ComfyUI builds do not reset `graph.extra` in `configure()`,
-  // so a reused `app.graph` carries the PREVIOUS workflow's tag. Tag A can therefore sit on
-  // canvas B, and trusting the tag alone permits reads and writes against the wrong canvas —
-  // the exact #349 hazard this fence exists for. Every stale-tag mitigation above requires
-  // CONTENT proof (equal serialization, or zero nodes on both sides); none trusts the tag by
-  // itself, and neither may this.
-  //
-  // #1187's real cause is not this predicate: it is that `changeTracker.activeState` LAGS a
-  // hand edit, so `contentDiffers` is true and `isModified` has not flipped yet. The panel
-  // fixes it where it lives, by making the snapshot current and asking again — see
-  // `assertGraphBoundToActiveWorkflow`'s capture-and-re-resolve. Once the tracker has
-  // captured, the dirty-tab escape hatch in `graphRootMismatchesActiveWorkflow` handles the
-  // case through the path that already existed, and this predicate needs no change at all.
   const rootShapeMismatch =
     contentDiffers &&
     !(structureMatches && graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
