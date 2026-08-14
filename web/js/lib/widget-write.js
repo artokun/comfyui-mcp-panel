@@ -6,38 +6,6 @@ import { explainNumericNormalization, normalizationNote } from "./widget-normali
 // throw INSIDE the span that attributes the throw to the callback body) and cannot
 // depend on globals a page could later redefine.
 const reflectApply = Reflect.apply;
-
-/**
- * #1569 — does this widget decide for itself what gets QUEUED?
- *
- * `graphToPrompt` does not send `w.value`; it asks the widget for `serializeValue()` when
- * it defines one. A node that keeps its authoritative state elsewhere derives that from
- * the state, so a write can move the canvas and leave the queue untouched — success
- * reported, `panel_query_graph` showing the new strings, and the run using the old ones.
- *
- * This only asks whether such a serializer EXISTS. It deliberately never calls it, and
- * that restraint is the whole design:
- *
- *   - CALLING IT HAS SIDE EFFECTS. Upstream's `RecordAudio` stops an active recording and
- *     kicks off an upload from inside its serializer. Sampling it to satisfy a diagnostic
- *     would stop the user's recording — twice, for a before/after comparison.
- *   - AND IT CANNOT BE COMPARED ANYWAY. That same serializer is `async`, so every call
- *     returns a fresh Promise; two samples are never equal, or (once cloned) always equal.
- *     Either way the verdict is noise.
- *
- * An earlier version of this fix did sample, before and after. Review found both problems
- * with a real upstream node, and a check that can fail a working write — or stop a
- * recording — is worse than the bug it reports.
- *
- * The property LOOKUP itself can throw (a poisoned accessor), which is not an answer.
- */
-function widgetOwnsItsSerialization(w) {
-  try {
-    return typeof w?.serializeValue === "function";
-  } catch {
-    return false;
-  }
-}
 // A module-load capture cannot defend against a `Reflect.apply` that was already
 // replaced BEFORE this module evaluated (codex round 2). Nothing here can: at that
 // point the page owns the intrinsics the whole panel runs on. Written down rather
@@ -1190,8 +1158,6 @@ export function applyWidgetWrite(
       ? JSON.stringify(a) === JSON.stringify(b)
       : Object.is(a, b);
   const previousClone = deepClone(previous);
-
-
   const previousParentClone = parentWidget ? deepClone(previousParent) : undefined;
   // #477: prior values (+ deep clones) of the secondary display proxies, so rollback
   // restores them exactly and a stateful hook mutating a restored object in place is
@@ -1341,40 +1307,10 @@ export function applyWidgetWrite(
   // decide. A throw on a verified write is DISCLOSED on the success result
   // (`write_warning`); only a write that ALSO fails verification fails + rolls
   // back, with the throw named as the likely cause.
-  /**
-   * #1569 — did the value that will be QUEUED fail to move, for a write that really
-   * asked it to?
-   *
-   * Every condition here is a reason to stay silent, because a false positive turns a
-   * working write into a refusal:
-   *   - no clean sample on either side (no serializer, or one that throws) → no evidence;
-   *   - the caller did not actually change the widget → nothing was expected to move;
-   *   - the widget itself did not take the value → the checks above own that failure and
-   *     say something more specific.
-   */
   let failure = null;
   let originalErr = null;
   let driftFailure = false;
   let writeWarning = null;
-  /**
-   * #1569 — the widget took the value; whether the QUEUE will use it is a separate
-   * question this cannot answer without calling the serializer, which it must not do.
-   *
-   * Only for a write that actually CHANGED something (re-writing the current value has
-   * nothing to be stale about) and only when the widget defines its own serializer, so a
-   * core widget — the overwhelming majority — never sees this.
-   */
-  const ownSerializerNote =
-    widgetOwnsItsSerialization(w) && !structurallyEqual(previousClone, expected)
-      ? `the value is on the canvas, but this widget defines its own serializeValue(), so what ` +
-        `ComfyUI queues is whatever the node builds at queue time — which for some custom nodes ` +
-        `(prompt builders especially) comes from internal state a widget write does not reach. ` +
-        `If a run still uses the OLD value, that is why, and setting it again will not help: ` +
-        `drive the input another way (for a prompt builder, wire a CLIPTextEncode into the ` +
-        `sampler's conditioning) or edit the field in the ComfyUI UI so the node's own handler ` +
-        `updates that state (#1569). This is not a report that anything failed — it cannot be ` +
-        `checked from here without invoking the node's serializer, which has side effects.`
-      : null;
   // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
   // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
   // exactly its job (min 1 / step 2 snaps 4096 -> 4097) was reported as "did not
@@ -1786,11 +1722,6 @@ export function applyWidgetWrite(
           ...(threwFromCallback ? { write_warning_source: "widget_callback" } : {}),
         }
       : {}),
-    // #1569 — a SEPARATE field from write_warning, deliberately. write_warning means
-    // something went wrong during this write; this means the write was fine and the node
-    // decides what gets queued. Merging them would make a routine disclosure read as a
-    // problem, and a real problem read as routine.
-    ...(ownSerializerNote ? { queue_value_note: ownSerializerNote } : {}),
     // #805 — the write applied and the node quantized it. Report BOTH values so the
     // caller can carry the stored one forward instead of retrying the request.
     ...(normalization
