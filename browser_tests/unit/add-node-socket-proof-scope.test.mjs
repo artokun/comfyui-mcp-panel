@@ -227,6 +227,11 @@ function realGraphAddNode(comfy, overrides = {}) {
     awaitObjectInfoHistorySeed: async () => {},
     recordObjectInfoTypes: (defs) => defs,
     objectInfoHistory: { wasTypeEverDefined: () => false },
+    // #1223 — the last-observed-schema snapshot the add path files its WHOLE payload into,
+    // and the connection epoch it stamps that with. Both are module scope in the real file,
+    // so this rebuilt scope has to name them or the executor throws ReferenceError.
+    objectInfoSnapshot: { record: () => true, clear: () => {} },
+    backendReconnectEpoch: 0,
     api,
     refreshComfyNodeDefs: async (defs) => app.registerNodesFromDefs(defs ?? backendObjectInfo()),
     summarizeNode: (node) => ({
