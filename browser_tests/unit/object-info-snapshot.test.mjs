@@ -123,6 +123,52 @@ test("#1223 the oracle's real tags drive it — not a list hand-written in this 
   assert.equal(transportsWereSilent(notOk.outcomes), false, "a 503 is an answer");
 });
 
+test("#1223 EACH route's tag is pinned on its own, not through the aggregate", async () => {
+  // Mutation-driven. Asserting only `transportsWereSilent(...) === false` over a TWO-route
+  // failure lets one correct tag mask a wrong one: mistagging the client's THREW as
+  // silence survived, because the http route's own THREW still carried the verdict. The
+  // tag is the thing the fallback reads, so the tag is what has to be pinned.
+  const kinds = async (opts) => (await fetchWholeObjectInfo({ deadlineMs: 40, ...opts })).outcomes.map((o) => o.kind);
+
+  assert.deepEqual(
+    await kinds({
+      getNodeDefs: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+      fetchApi: null,
+    }),
+    [TRANSPORT_OUTCOME.THREW, TRANSPORT_OUTCOME.NOT_ATTEMPTED],
+    "a refused connection on the client route is an ANSWER, never silence",
+  );
+
+  assert.deepEqual(
+    await kinds({ getNodeDefs: null, fetchApi: async () => ({ ok: false, status: 503 }) }),
+    [TRANSPORT_OUTCOME.NOT_ATTEMPTED, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
+    "a non-OK status is an answer; an unwired client is a route nobody asked",
+  );
+
+  assert.deepEqual(
+    await kinds({
+      getNodeDefs: null,
+      fetchApi: async () => ({ ok: true, status: 200, json: () => new Promise(() => {}) }),
+    }),
+    [TRANSPORT_OUTCOME.NOT_ATTEMPTED, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
+    "headers arrived, so the backend answered — a stalled BODY is not the silence this licenses",
+  );
+
+  assert.deepEqual(
+    await kinds({ getNodeDefs: async () => ({}), fetchApi: async () => ({ ok: true, json: async () => SCHEMA }) }),
+    [TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
+    "an EMPTY client schema is its answer (#982), and it short-circuits before the fallback",
+  );
+
+  assert.deepEqual(
+    await kinds({ getNodeDefs: () => new Promise(() => {}), fetchApi: null }),
+    [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.NOT_ATTEMPTED],
+    "and a hung client with no fallback wired is the one shape that licenses",
+  );
+});
+
 test("#1223 a usable answer still returns its outcomes alongside the schema", async () => {
   const { defs, outcomes } = await fetchWholeObjectInfo({
     getNodeDefs: async () => SCHEMA,
