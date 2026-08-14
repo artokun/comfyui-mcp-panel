@@ -239,7 +239,11 @@ test("#1448 WIRING: the caller records the outcome instead of assuming one", () 
   // removes stale entries — measured 109 -> 107 on a live rig — so a snapshot taken
   // before it can offer a workflow that no longer exists as an example.
   assert.match(panel, /const known = knownSelectorSample\(\[\.\.\.\(s\?\.openWorkflows \?\? \[\]\), \.\.\.\(s\?\.workflows \?\? \[\]\)\]\);/);
-  assert.match(panel, /openWorkflowNotFoundMessage\(\{ path, refresh, known \}\)/);
+  // `disk` is required, not optional (#1448 — the half the reporter filed). Omitting
+  // it compiles and reads fine, and silently restores the defect: the refusal goes
+  // back to asserting absence from an in-memory scan that was MEASURED to lag disk in
+  // both directions.
+  assert.match(panel, /openWorkflowNotFoundMessage\(\{ path, refresh, known, disk \}\)/);
   const failSite = panel.slice(panel.indexOf("const known = knownSelectorSample"));
   assert.ok(
     failSite.indexOf("openWorkflowNotFoundMessage") < 400,

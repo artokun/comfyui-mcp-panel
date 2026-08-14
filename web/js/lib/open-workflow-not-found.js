@@ -94,7 +94,29 @@ export function classifyWorkflowRefresh(before, after, opts = {}) {
  * The caller now proves the re-read by watching the store change, and says
  * "unconfirmed" when it cannot.
  */
-export function openWorkflowNotFoundMessage({ path, refresh, known = [] } = {}) {
+export function openWorkflowNotFoundMessage({ path, refresh, known = [], disk } = {}) {
+  // #1448 (the half the reporter actually filed) — the SERVER was asked whether the
+  // file exists, and when it says yes this is a different failure entirely. Handled
+  // first and returned early: none of the list-refresh reasoning below applies once
+  // the file is known to be on disk, and appending it would bury the one fact that
+  // decides what the caller should do next.
+  //
+  // The two cases need OPPOSITE actions — reload the tab vs fix the name — and were
+  // previously the same sentence, which is why the reporter went looking for a file
+  // that was exactly where they left it.
+  if (disk?.onDisk === "yes") {
+    return (
+      `"${path}" IS on disk in the workflows folder (the server lists it as ` +
+      `"${disk.entry}"), but this ComfyUI frontend's workflow list does not contain it. ` +
+      `The file is not missing — the list is stale, and a re-read did not pick it up ` +
+      `(this frontend's sync swallows its own errors, so a silent failure is invisible ` +
+      `from here). RELOAD THE COMFYUI BROWSER TAB and try again; the entry appears once ` +
+      `the frontend re-reads the folder. To open it right now without reloading, use ` +
+      `panel_load_workflow path:<file> — it reads the file directly, though the tab ` +
+      `lands unsaved rather than as a saved library entry.`
+    );
+  }
+
   const refreshClause =
     refresh === "changed"
       ? `A re-read of the workflow list was requested and the list DID change, and it still does ` +
@@ -120,9 +142,21 @@ export function openWorkflowNotFoundMessage({ path, refresh, known = [] } = {}) 
       `same file also answers to its bare name with or without ".json".`
     : "";
 
+  // What the SERVER said, when it could be asked. "no" is the first evidence this
+  // refusal has ever had for the absence it asserts; "unknown" keeps the old,
+  // unevidenced wording rather than inventing a stronger claim (#1448).
+  const diskClause =
+    disk?.onDisk === "no"
+      ? ` The server was also asked directly: the workflows folder on disk does NOT contain ` +
+        `it either, so this is not a stale-list problem.`
+      : disk?.onDisk === "unknown"
+        ? ` The server could not be asked whether the file is on disk (${disk.why ?? "probe failed"}), ` +
+          `so absence from the list is not by itself proof the file is missing.`
+        : "";
+
   return (
-    `no workflow matching "${path}". ${refreshClause}${shape} If the file IS in the workflows ` +
-    `folder, check the name matches exactly (including case and any subfolder); if it is anywhere ` +
-    `else, load it with panel_load_workflow path:<file>, which reads any readable path.`
+    `no workflow matching "${path}". ${refreshClause}${diskClause}${shape} If the file IS in the ` +
+    `workflows folder, check the name matches exactly (including case and any subfolder); if it is ` +
+    `anywhere else, load it with panel_load_workflow path:<file>, which reads any readable path.`
   );
 }

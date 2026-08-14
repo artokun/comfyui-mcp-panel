@@ -278,6 +278,7 @@ import {
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
+import { classifyDiskProbe } from "./lib/workflow-disk-probe.js";
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -13810,8 +13811,35 @@ const GRAPH_TOOL_EXECUTORS = {
       // (codex review). A successful re-read REMOVES stale entries — measured on a
       // live rig, the store went 109 to 107 — so a pre-refresh snapshot can offer a
       // workflow the re-read just deleted as an example of what is addressable.
+      // #1448 — ASK THE SERVER before asserting the file is not there. Everything
+      // above this line is an in-memory scan of the frontend's store, and that store
+      // was MEASURED to lag disk in both directions: a file staged into the
+      // workflows folder out-of-band is on disk and absent from the store until a
+      // sync lands, and a file deleted out-of-band stays in the store after it is
+      // gone. The panel cannot even tell whether the sync succeeded. So this is the
+      // only step in the path that can contradict a stale list with evidence.
+      //
+      // Runs only on the refusal path — never on a successful open — so the extra
+      // round-trip costs nothing in the normal case.
+      let disk;
+      try {
+        const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false");
+        disk = classifyDiskProbe(
+          {
+            ok: reply?.ok === true,
+            status: reply?.status,
+            body: reply?.ok ? await reply.json() : undefined,
+          },
+          path,
+        );
+      } catch (err) {
+        // FAIL OPEN. Every earlier round of this issue shipped a message that claimed
+        // more than it knew; a probe that turned a stale list into a confident "your
+        // file does not exist" would be the same bug with more authority.
+        disk = { onDisk: "unknown", why: err?.message ?? String(err) };
+      }
       const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
-      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known })));
+      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known, disk })));
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
