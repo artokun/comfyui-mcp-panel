@@ -529,7 +529,30 @@ export function moveGroupMembers(members, dx, dy) {
       // is whether the rect ends up LIVE, not whether the delta-write happened: a
       // rect that was already right needs no write and is not stuck.
       refreshNodeArea(n, [px, py]);
-      if (!nodeAreaIsLive(n)) landedExactly = false;
+      // panel#813 — A COLLAPSED MEMBER IS NOT A NODE THAT REFUSED TO MOVE.
+      //
+      // `nodeAreaIsLive` compares the cached rect against `wantedNodeArea`, which for a
+      // collapsed node is the panel's PILL (`w = _collapsed_width || 80`, `h = 0`). The
+      // engine's own `updateArea()` recompute — which `refreshNodeArea` above deliberately
+      // TRUSTS as soon as it sees the origin move — writes the engine's extents instead. On
+      // a collapsed node those two models disagree by construction, so the width comparison
+      // failed for every collapsed member and the group move was refused AFTER their
+      // positions had already been written. That is the report: four `size:[225,0]` nodes
+      // called stuck, on a graph the reporter then repositioned one-by-one without trouble.
+      //
+      // So give the rect ONE MORE CHANCE to be put on the panel's convention before ruling,
+      // using `syncNodeArea` — the very writer this move's own pre-flight
+      // (`syncGraphNodeAreas`) already ran over every node moments earlier. Nothing new is
+      // written that the pre-flight did not already write, and the forced value is the pill,
+      // never the full box, so the #416 area-overstatement guarantee is untouched.
+      //
+      // THE #408 GUARD IS NOT RELAXED. A rect that genuinely cannot be corrected — frozen,
+      // hostile accessor, disposed — makes `syncNodeArea` return false and the node is still
+      // stuck, still refusing the whole move. That is the property #408 needs: membership is
+      // rect-first, so a rect that cannot track its node would report it in a group it has
+      // left. The question changes from "does the rect already agree" to "can the rect be
+      // MADE to agree", which is the one the caller actually needs answered.
+      if (!nodeAreaIsLive(n) && !syncNodeArea(n)) landedExactly = false;
     } catch {
       landedExactly = false;
     }
