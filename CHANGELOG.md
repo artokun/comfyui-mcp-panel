@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.39] - 2026-08-14
+
+### Fixed
+- a widget edit is no longer refused just because the /object_info probe went silent while ComfyUI was busy rendering — it is authorized from the last whole schema observed on the same backend connection, which a restart always invalidates (#1223)
+
 ## [0.14.38] - 2026-08-14
 
 ### Fixed
