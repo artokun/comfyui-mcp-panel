@@ -11081,10 +11081,42 @@ const GRAPH_TOOL_EXECUTORS = {
     } else {
       await app.loadGraphData(...loadArgs);
     }
+    // comfyui-mcp#1478 (defect 1) — REPORT THE IDENTITY THIS LOAD LANDED ON.
+    //
+    // The very next graph command was refused with `workflow instance mismatch`,
+    // deterministically, because a blank-canvas load takes the fresh-mint path above and
+    // the session's fence still names the pre-load instance. The orchestrator could only
+    // respond with a CONDITIONAL note ("a load CAN re-mint the instance…"), because this
+    // reply carried nothing that separated re-minted from reused.
+    //
+    // Read AFTER the load, so it names the workflow that is live now — the in-place path
+    // preserved the instance (`__cmcpKeepInstance`) and will match the fence, while the
+    // fresh-mint path will not. The orchestrator compares and says exactly what happened,
+    // or claims the fence from this value, which is race-proof precisely because it came
+    // from this command's own reply rather than from "whatever is active now": that is
+    // what `refreshFenceFromOwnReply` already does for workflow_new (#762) and
+    // workflow_save (#800).
+    //
+    // SHAPE-GATED (#716's rule): publish only a canonical instance uuid, never a routing
+    // handle or a half-established value. A missing field costs the orchestrator a round
+    // trip through its existing fallback rather than breaking anything, so an unreadable
+    // identity must stay absent instead of shipping something that merely looks like one.
+    let loadedWorkflowUuid;
+    try {
+      const liveAfterLoad = app?.extensionManager?.workflow?.activeWorkflow || null;
+      const uuid = liveAfterLoad
+        ? workflowObjectUuid(liveAfterLoad) || workflowStableUuid(liveAfterLoad)
+        : undefined;
+      if (isCanonicalWorkflowInstanceUuid(uuid)) loadedWorkflowUuid = uuid;
+    } catch {
+      // Reading the identity is itself an operation that can fail. An omitted field is
+      // the fail-closed answer the orchestrator already handles.
+    }
     return {
       loaded: true,
       node_count: clone.nodes.length,
       ...(auxSanitized ? { aux_id_sanitized: auxSanitized } : {}),
+      ...(loadedWorkflowUuid ? { workflow_uuid: loadedWorkflowUuid } : {}),
     };
   },
 
