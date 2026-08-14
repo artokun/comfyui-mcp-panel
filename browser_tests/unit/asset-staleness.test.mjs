@@ -1283,7 +1283,10 @@ test("#1172 the note points at the BACKEND, never at another refresh", () => {
   // command that just answered. The refresh worked; the server's answer is what is empty.
   const note = emptyComboNote([{ type: "CheckpointLoaderSimple", widget: "ckpt_name" }]);
   assert.match(note, /CheckpointLoaderSimple\.ckpt_name/);
-  assert.match(note, /not a step the panel skipped/i);
+  assert.match(note, /this empty list is what \/object_info answered/i);
+  // …and nothing about the PANEL's internals: the disclosure is built from the payload alone,
+  // so a clause about what the panel did or did not skip overstates what it can establish.
+  assert.doesNotMatch(note, /panel (skipped|failed|missed)/i, "no claim about panel internals");
   // …and it must NOT predict what a later refresh will return: a second /object_info read can
   // observe changed server state, so that clause was a prediction dressed as an observation.
   assert.doesNotMatch(note, /refresh(ing)? again (returns|will return)/i, "no prediction about another command");

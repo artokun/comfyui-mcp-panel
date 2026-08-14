@@ -874,8 +874,8 @@ export function emptyComboNote(empties) {
   return (
     `${empties.length} combo widget${empties.length === 1 ? "" : "s"} on this graph ` +
     `${empties.length === 1 ? "has" : "have"} an EMPTY list of valid values in the definitions ` +
-    `the backend just published: ${shown}${more}. The refresh itself succeeded — the empty ` +
-    `list is what /object_info answered, not a step the panel skipped. Why the list is empty ` +
+    `the backend just published: ${shown}${more}. The refresh itself succeeded — this empty ` +
+    `list is what /object_info answered. Why the list is empty ` +
     `is NOT established here: it may be an asset the server has none of, a combo this node ` +
     `populates client-side, or a pack that publishes an empty list deliberately. A write to ` +
     `one of these is still permitted and reports empty_option_list, but nothing can verify ` +
