@@ -56,10 +56,8 @@ All notable changes to this project are documented here. This project adheres to
   whose restart route really does restart the agent, and it removes the window before one
   of those hits it.
 
-### Added
 ### Fixed
 - hold the reload guard across hardRestart's tail (#1183)
-### Changed
 ## [0.14.25] - 2026-08-13
 
 ### Fixed
@@ -85,10 +83,8 @@ All notable changes to this project are documented here. This project adheres to
   sixty-odd node packs. If nothing answers, the refusal names every attempt and says how
   long each one was actually given, rather than quoting a wait it never spent.
 
-### Added
 ### Fixed
 - bound each /object_info transport so a hung route falls through to the one that works (#1179)
-### Changed
 ## [0.14.24] - 2026-08-12
 
 ### Fixed
@@ -180,7 +176,6 @@ All notable changes to this project are documented here. This project adheres to
 - complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
 ### Fixed
 - an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
-### Changed
 ## [0.14.20] - 2026-08-12
 
 ### Added
@@ -193,7 +188,6 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - a definitions difference that is only link renumbering is not a content change (#1125)
 - the status pill froze because onStatus threw on every status frame (#1154)
-### Changed
 ## [0.14.19] - 2026-08-12
 
 ### Added
