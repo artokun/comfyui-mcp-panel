@@ -577,7 +577,13 @@ export function moveGroupMembers(members, dx, dy) {
       try {
         isCollapsed = !!n?.flags?.collapsed;
       } catch {
-        isCollapsed = false; // unreadable flags ⇒ not eligible for the collapsed repair
+        // Unreadable flags ⇒ not eligible for the collapsed repair. Mutation reports
+        // flipping this to `true` as a SURVIVOR, and it is an equivalent mutant rather than
+        // a gap: `syncNodeArea` reads the same `flags` accessor through `wantedNodeArea`,
+        // so it throws, is caught there, and returns false — the node is stuck either way.
+        // Stated here so the next run does not re-chase it; the BEHAVIOUR is pinned by
+        // "a node whose flags accessor THROWS is stuck, not repaired".
+        isCollapsed = false;
       }
       if (!nodeAreaIsLive(n) && !(isCollapsed && syncNodeArea(n) && nodeAreaIsLive(n))) {
         landedExactly = false;

@@ -847,3 +847,26 @@ test("#813 an EXPANDED node's authoritative extents are not overwritten (review 
     "and its authoritative extents survive — never replaced by the 200x130 generic model",
   );
 });
+
+test("#813 a node whose flags accessor THROWS is stuck, not repaired", () => {
+  // The collapsed repair is gated on reading `flags.collapsed`, and that read can throw on
+  // a disposed or hostile node. It must fail CLOSED: an unreadable node is not one this can
+  // show to have moved. (syncNodeArea would also fail on the same accessor, so the two
+  // guards agree — this pins the behaviour rather than the implementation of it.)
+  const n = {
+    id: 32,
+    pos: [100, 100],
+    size: [225, 0],
+    get flags() {
+      throw new TypeError("disposed");
+    },
+    boundingRect: [0, 0, 1, 1], // deliberately wrong, so a repair would have to be attempted
+  };
+
+  let r;
+  assert.doesNotThrow(() => {
+    r = moveGroupMembers([n], 50, 25);
+  }, "a hostile accessor must never escape the mover");
+  assert.deepEqual(r.moved, [], "an unreadable node is not reported moved");
+  assert.deepEqual(r.stuck, [n]);
+});
