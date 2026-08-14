@@ -318,7 +318,13 @@ export function describeTimedOutUpload({ observed, name, size, mediaType, boundM
   // "is it a status": an integer in the range HTTP defines. A real `Response.status` always
   // is, so nothing legitimate is turned away, and every non-status degrades to the truthful
   // timeout wording rather than to an invented refusal.
-  if (isHttpStatus(observed?.status)) {
+  // …and a status is not automatically a REFUSAL. `describeUploadFailure`'s status branch
+  // words its answer as "upload REFUSED by ComfyUI … Nothing was written to input/", which is
+  // a lie about a 2xx. Only a status that actually denotes failure may be reported that way;
+  // anything else falls back to the timeout wording, which is what a 200 whose body never
+  // finished streaming genuinely is. Unreachable from the composers today — they record only
+  // non-200 — but this function is exported and must not depend on its callers' discipline.
+  if (isHttpStatus(observed?.status) && Number(observed.status) >= 400) {
     return describeUploadFailure({
       status: observed.status,
       statusText: observed.statusText,

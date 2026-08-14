@@ -261,13 +261,21 @@ test("#1188 a genuine no-answer still reads as a transport timeout", () => {
     assert.match(msg, /did not COMPLETE/, `status ${String(status)} was treated as real`);
     assert.doesNotMatch(msg, /REFUSED/, `status ${String(status)} produced an invented refusal`);
   }
-  // …while every shape a real Response can present IS honoured.
-  for (const status of [100, 200, 404, 413, 500, 599, "413"]) {
+  // …while a status that genuinely denotes a refusal IS honoured, in either representation.
+  for (const status of [400, 404, 413, 500, 599, "413"]) {
     assert.match(
       describeTimedOutUpload({ observed: { status }, name: "x" }),
       /REFUSED/,
-      `a real status ${String(status)} was thrown away`,
+      `a real refusal status ${String(status)} was thrown away`,
     );
+  }
+  // A 1xx/2xx/3xx is a status but NOT a refusal, and describeUploadFailure's status branch
+  // words itself as "upload REFUSED … Nothing was written to input/" — a lie about a 200.
+  // A 200 whose body never finished streaming is a timeout, and reads as one.
+  for (const status of [100, 200, 201, 204, 302, 399]) {
+    const msg = describeTimedOutUpload({ observed: { status }, name: "x", size: 10 });
+    assert.match(msg, /did not COMPLETE/, `status ${status} should not read as a refusal`);
+    assert.doesNotMatch(msg, /REFUSED|Nothing was written/, `status ${status} fabricated a refusal`);
   }
 });
 
@@ -323,11 +331,22 @@ test("#1188 every uploadBlobToInput caller branches on the null it can now retur
     ["web/js/lib/run-completion-frame.js", /const ref = await uploadBlobToInput\(/],
   ];
   for (const [rel, call] of sites) {
-    const src = readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), "utf8");
-    assert.match(src, call, `${rel} no longer calls uploadBlobToInput — update this list`);
-    // Each site must test the ref before using it. The shapes differ by call site, so this
-    // asserts that SOME null test exists rather than one exact spelling.
-    assert.match(src, /if \(!ref\)|!ref\b|ref \?|ref &&|typeof ref/, `${rel} does not branch on a null ref`);
+    const raw = readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), "utf8");
+    // Measure CODE distance, not text distance. This repo writes long explanatory comments,
+    // and one of them sits between civitai's call and its guard — a raw character window
+    // put the guard out of range and failed a site that is actually correct.
+    const src = raw.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+    const at = src.search(call);
+    assert.ok(at >= 0, `${rel} no longer calls uploadBlobToInput — update this list`);
+    // SCOPED to the 400 code-characters after the call. An unscoped search over the whole
+    // file was vacuous: media-preview.js has unrelated `!ref`/`ref ?` expressions ~340 lines
+    // above its upload, so the assertion passed even with the real guard deleted. A test
+    // that cannot fail is worse than no test, because it reads as coverage.
+    assert.match(
+      src.slice(at, at + 400),
+      /if \(!ref\)|!ref\b|ref \?|ref &&|typeof ref/,
+      `${rel} does not branch on a null ref within 400 code-chars of the call`,
+    );
   }
   // …and the civitai path specifically, because it is the one that was wrong.
   const civitai = readFileSync(fileURLToPath(new URL("../../web/js/cmcp-civitai-ui.js", import.meta.url)), "utf8");
@@ -338,9 +357,10 @@ test("#1188 every uploadBlobToInput caller branches on the null it can now retur
 });
 
 test("#1188 uploadBlobToInput still answers null, so no caller learns a new shape", () => {
-  // Four callers branch on a null ref today (the apps, civitai and training wizards, and the
-  // storyboard pipeline). Returning the sentinel to them instead would make `!ref` false and
-  // send a Symbol into `viewUrl`.
+  // FIVE callers, enumerated and asserted in the test above — this comment said "four" until
+  // a review counted them, which is the same unchecked claim the source comment carried.
+  // Returning the sentinel to them instead would make `!ref` false and send a Symbol into
+  // `viewUrl`.
   assert.match(
     CODE,
     /return out === UPLOAD_NO_ANSWER \? null : out;/,
