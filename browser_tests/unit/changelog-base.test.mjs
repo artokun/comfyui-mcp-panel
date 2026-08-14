@@ -94,3 +94,67 @@ test("#932: no release in history falls back to the caller's first-commit path",
   // Malformed lines must be skipped, not crash a release.
   assert.equal(pickReleaseSha("garbage\nnot-a-sha\x1f0.11.76 — x"), null);
 });
+
+// ---------------------------------------------------------------------------
+// #1191 — and this file's own header is the reason it needed writing.
+//
+// #932 above says both matchers "were written for shapes it has never produced". Its fix
+// then taught the predicate the shape of 2026's releases and left it blind to the shape
+// that replaced them: measured over all 1124 subjects in history, 79 begin
+// `chore(release):` and the shipped predicate matched ZERO of them. Nine consecutive
+// releases re-listed everything back to v0.14.18.
+//
+// The lesson is narrow and worth stating: #932's tests asserted the shapes it was FIXING
+// and never asserted the shapes the repo would go on to produce. So these name the current
+// shape literally, and the negative set names the specific near-misses a looser fix would
+// have let through.
+
+test("#1191: the CURRENT release shape is recognised — `chore(release): …`", () => {
+  for (const s of [
+    "chore(release): 0.14.28 (#1195)",
+    "chore(release): 0.14.26 (#1185)",
+    "chore(release): 0.14.19", // the pre-squash branch tip: no PR number
+    "chore(release): panel 0.4.9 — x",
+    "chore(release): comfyui-agent-panel v0.1.2 — streaming UI",
+  ]) {
+    assert.equal(isReleaseSubject(s), true, JSON.stringify(s));
+  }
+});
+
+test("#1191: the broadening stops well short of `^chore(release)`", () => {
+  // The dangerous direction, and these are not hypothetical shapes — they are the ones a
+  // `(?:\S+\s+)?` wildcard accepts. A false positive here silently truncates the range and
+  // drops real work out of the entry.
+  for (const s of [
+    "chore(release): revert 1.2.3 rollout",
+    "chore(release): fix the script",
+    "chore(release): sync PANEL_VERSION to 0.9.0", // real subject; not a release boundary
+    "chore(release): prepare for 2.0",
+  ]) {
+    assert.equal(isReleaseSubject(s), false, JSON.stringify(s));
+  }
+});
+
+test("#1191: a `chore(release)` commit beats an older `release:` one as the base", () => {
+  // THE ASSERTION THAT FAILED BEFORE THE FIX. The shipped predicate skipped every
+  // `chore(release):` line and returned the ancient `release:` sha, which is precisely what
+  // widened the range: that commit is an ancestor of the newest tag, so prevTag()'s
+  // ancestry check threw and the base fell back to the tag.
+  const sha = pickReleaseSha(
+    [
+      logLine("aaaaaaaa", "fix(1180): bound the sibling getNodeDefs call sites (#1186)"),
+      logLine("bbbbbbbb", "chore(release): 0.14.27 (#1190)"),
+      logLine("cccccccc", "feat: something older"),
+      logLine("dddddddd", "release: panel 0.14.0 — the panel speaks 12 languages"),
+    ].join("\n"),
+  );
+  assert.equal(sha, "bbbbbbbb", "the newest release is the chore(release) commit, not the ancient release: one");
+});
+
+test("#1191: release commits are excluded from the entry they announce", () => {
+  // The second symptom, same predicate. Unskipped, `chore(release):` subjects were parsed
+  // as ordinary commits; `chore` is not a known type but the subject carries a PR, so they
+  // were filed under "Changed" — which is why 0.14.25 and 0.14.26 each shipped a list of
+  // the releases that preceded them.
+  assert.equal(isReleaseSubject("chore(release): 0.14.25 (#1182)"), true, "…so the parser skips it");
+});
