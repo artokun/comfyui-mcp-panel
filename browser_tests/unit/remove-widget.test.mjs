@@ -357,7 +357,13 @@ test("WIRING: the panel command routes through runRemoveWidget and refuses on an
   const src = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8");
   const idx = src.indexOf("async graph_remove_widget(");
   assert.ok(idx > 0, "graph_remove_widget handler is missing");
-  const block = src.slice(idx, idx + 2000);
+  // Bounded at the NEXT handler, not at a fixed width. A `slice(idx, idx + 2000)` silently
+  // stops covering the handler as soon as anything is added above the assertion it looks
+  // for — a comment is enough — so the test starts passing-by-not-looking rather than
+  // failing. That is the same trap a sibling test hit with a fixed slice over the socket
+  // listeners (#1223).
+  const next = src.indexOf("\n  async graph_", idx + 1);
+  const block = src.slice(idx, next === -1 ? src.length : next);
   assert.match(block, /runRemoveWidget\(/);
   // declaredNames must come from the FETCHED defs, not a literal.
   assert.match(block, /declaredNames,/);
