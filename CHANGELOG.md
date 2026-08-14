@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.40] - 2026-08-14
+
+### Fixed
+- a group whose members are COLLAPSED nodes now moves, instead of being refused after those members positions had already been written (#813)
+
 ## [0.14.39] - 2026-08-14
 
 ### Fixed
