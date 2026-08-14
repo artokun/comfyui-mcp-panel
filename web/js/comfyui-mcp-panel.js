@@ -28124,8 +28124,15 @@ function buildPanel() {
       if (type) fd.append("type", type);
       // #1188 — bounded, request AND body. On timeout this resolves the sentinel and falls
       // through to the SAME `null` this function already returns for every other failure,
-      // so no caller learns a new shape: all four (the apps, civitai and training wizards,
-      // and the storyboard pipeline) already branch on a null ref today.
+      // so no caller learns a new shape.
+      //
+      // FIVE call sites, counted rather than remembered: cmcp-apps-ui.js:1697,
+      // cmcp-civitai-ui.js:1196, cmcp-training-ui.js:754, lib/media-preview.js:893 and
+      // lib/run-completion-frame.js:407. An earlier version of this comment said "all four
+      // already branch on a null ref today" and was wrong on both halves — there were five,
+      // and civitai's did not branch at all: muted it announced a save that never happened,
+      // unmuted it dereferenced `ref.filename`. That is fixed at the site. The claim is only
+      // safe to make BECAUSE it was checked, which is the reason it now names each one.
       const out = await boundedUpload(
         async () => {
           const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });

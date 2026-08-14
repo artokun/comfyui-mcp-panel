@@ -270,6 +270,22 @@ export async function boundedUpload(run, { size, withTimeout, boundMs } = {}) {
  * chip through the same untranslated path #756 already established.
  */
 /**
+ * Is this a status a server could actually have answered with?
+ *
+ * Deliberately stricter than "coerces to a number". A status is an integer in the range HTTP
+ * defines; `0`, `false`, `[]` and `""` are not, however cleanly they coerce. Strings are
+ * accepted because a status arriving as `"413"` is the same observation as `413` — but a
+ * string that merely starts with digits is not, which `Number()` handles correctly (it
+ * yields NaN for `"413 Payload Too Large"`, unlike `parseInt`).
+ */
+function isHttpStatus(value) {
+  if (typeof value !== "number" && typeof value !== "string") return false;
+  if (typeof value === "string" && value.trim() === "") return false;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 100 && n <= 599;
+}
+
+/**
  * What to report when the OUTER upload bound fires.
  *
  * Giving the refusal body its own shorter bound was not enough on its own. The inner bound
@@ -289,12 +305,20 @@ export async function boundedUpload(run, { size, withTimeout, boundMs } = {}) {
  * refusal that came without one.
  */
 export function describeTimedOutUpload({ observed, name, size, mediaType, boundMs } = {}) {
-  // ABSENT before COERCED, exactly as `describeSize` insists. `Number(null)` and `Number("")`
-  // are both 0, which is finite — so a coerce-first check turns "no status was ever observed"
-  // into a confident `HTTP null`, fabricating a server answer inside the one function whose
-  // whole job is to distinguish an answer from silence. A first version of this did that.
-  const status = observed?.status;
-  if (status !== null && status !== undefined && status !== "" && Number.isFinite(Number(status))) {
+  // ABSENT before COERCED, exactly as `describeSize` insists — and then narrower still.
+  //
+  // `Number(null)` and `Number("")` are both 0, which is finite, so a coerce-first check
+  // turns "no status was ever observed" into a confident `HTTP null`: a fabricated server
+  // answer produced by the one function whose whole job is to tell an answer from silence.
+  // A first version of this did exactly that.
+  //
+  // Excluding the absent values alone is still not enough. `0`, `false` and `[]` all coerce
+  // to a finite number and would render as `HTTP 0`, `HTTP false` and a blank status. None
+  // is a thing a server can answer, so the test is not "does it look like a number" but
+  // "is it a status": an integer in the range HTTP defines. A real `Response.status` always
+  // is, so nothing legitimate is turned away, and every non-status degrades to the truthful
+  // timeout wording rather than to an invented refusal.
+  if (isHttpStatus(observed?.status)) {
     return describeUploadFailure({
       status: observed.status,
       statusText: observed.statusText,

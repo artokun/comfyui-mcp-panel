@@ -248,9 +248,26 @@ test("#1188 a genuine no-answer still reads as a transport timeout", () => {
   const msg = describeTimedOutUpload({ observed: {}, name: "x.png", size: 10, mediaType: "image/png", boundMs: 30000 });
   assert.match(msg, /did not COMPLETE/);
   assert.doesNotMatch(msg, /HTTP/);
-  // And a malformed record must not be mistaken for a real status.
-  for (const bad of [{ status: undefined }, { status: null }, { status: "nope" }, { status: NaN }]) {
-    assert.match(describeTimedOutUpload({ observed: bad, name: "x" }), /did not COMPLETE/);
+  // And a malformed record must not be mistaken for a real status. The check is "is it a
+  // status", not "does it coerce to a number": 0, false and [] all coerce finitely and were
+  // rendering as `HTTP 0`, `HTTP false` and a blank status — invented server answers from
+  // the function whose job is to tell an answer from silence.
+  const notStatuses = [
+    undefined, null, "", "   ", NaN, Infinity, -1, 0, 99, 600, 1000, 4.5,
+    false, true, [], {}, "nope", "413 Payload Too Large", () => 413,
+  ];
+  for (const status of notStatuses) {
+    const msg = describeTimedOutUpload({ observed: { status }, name: "x", size: 10 });
+    assert.match(msg, /did not COMPLETE/, `status ${String(status)} was treated as real`);
+    assert.doesNotMatch(msg, /REFUSED/, `status ${String(status)} produced an invented refusal`);
+  }
+  // …while every shape a real Response can present IS honoured.
+  for (const status of [100, 200, 404, 413, 500, 599, "413"]) {
+    assert.match(
+      describeTimedOutUpload({ observed: { status }, name: "x" }),
+      /REFUSED/,
+      `a real status ${String(status)} was thrown away`,
+    );
   }
 });
 
