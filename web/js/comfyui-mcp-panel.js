@@ -78,7 +78,13 @@ import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
-import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
+import {
+  describeUploadFailure,
+  describeUploadTimeout,
+  attachmentSummaryLine,
+  boundedUpload,
+  UPLOAD_NO_ANSWER,
+} from "./lib/attachment-upload.js";
 import {
   buildInstallRequest,
   classifyInstallOutcome,
@@ -28113,10 +28119,20 @@ function buildPanel() {
       const fd = new FormData();
       fd.append("image", blob, name);
       if (type) fd.append("type", type);
-      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-      if (res.status !== 200) return null;
-      const info = await res.json();
-      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
+      // #1188 — bounded, request AND body. On timeout this resolves the sentinel and falls
+      // through to the SAME `null` this function already returns for every other failure,
+      // so no caller learns a new shape: all four (the apps, civitai and training wizards,
+      // and the storyboard pipeline) already branch on a null ref today.
+      const out = await boundedUpload(
+        async () => {
+          const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+          if (res.status !== 200) return null;
+          const info = await res.json();
+          return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
+        },
+        { size: blob?.size, withTimeout },
+      );
+      return out === UPLOAD_NO_ANSWER ? null : out;
     } catch {
       return null;
     }
@@ -30773,22 +30789,38 @@ function buildPanel() {
       try {
         const fd = new FormData();
         fd.append("image", file, name);
-        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-        if (res.status === 200) {
-          const info = await res.json();
+        // #1188 — bounded, request AND body. Without this a half-open connection after a
+        // ComfyUI restart leaves `att.ready` pending forever. `att.ready` catches
+        // everything internally so it never REJECTS — it simply never settles, and the
+        // composer awaits `Promise.all(pending.map((a) => a.ready))` before sending. The
+        // user is then unable to send the message at all, with nothing on screen saying why.
+        const outcome = await boundedUpload(
+          async () => {
+            const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+            if (res.status === 200) return { info: await res.json() };
+            // #756 — a non-200 had NO else at all. The status was in hand and thrown
+            // away, leaving "upload failed" as the whole of what anyone could learn.
+            return {
+              failure: describeUploadFailure({
+                status: res.status,
+                statusText: res.statusText,
+                body: await res.text().catch(() => null),
+                name,
+                size: file.size,
+                mediaType: file.type,
+              }),
+            };
+          },
+          { size: file?.size, withTimeout },
+        );
+        if (outcome === UPLOAD_NO_ANSWER) {
+          att.uploadError = describeUploadTimeout({ name, size: file.size, mediaType: file.type });
+        } else if (outcome?.failure) {
+          att.uploadError = outcome.failure;
+        } else {
+          const info = outcome.info;
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
-        } else {
-          // #756 — a non-200 had NO else at all. The status was in hand and thrown
-          // away, leaving "upload failed" as the whole of what anyone could learn.
-          att.uploadError = describeUploadFailure({
-            status: res.status,
-            statusText: res.statusText,
-            body: await res.text().catch(() => null),
-            name,
-            size: file.size,
-            mediaType: file.type,
-          });
         }
       } catch (err) {
         // #756 — the bare catch swallowed transport failures identically.
@@ -30821,22 +30853,38 @@ function buildPanel() {
         const fd = new FormData();
         // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
         fd.append("image", file, name);
-        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-        if (res.status === 200) {
-          const info = await res.json();
+        // #1188 — bounded, request AND body. This path is the reason the bound is sized by
+        // payload rather than flat: it exists specifically for video, so a fixed number
+        // would either cut off a legitimate large upload or wait absurdly long for a small
+        // one. Same wedge as the image path above — a never-settling `att.ready` blocks the
+        // composer's `Promise.all` on send.
+        const outcome = await boundedUpload(
+          async () => {
+            const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+            if (res.status === 200) return { info: await res.json() };
+            // #756 — a non-200 had NO else at all. The status was in hand and thrown
+            // away, leaving "upload failed" as the whole of what anyone could learn.
+            return {
+              failure: describeUploadFailure({
+                status: res.status,
+                statusText: res.statusText,
+                body: await res.text().catch(() => null),
+                name,
+                size: file.size,
+                mediaType: file.type,
+              }),
+            };
+          },
+          { size: file?.size, withTimeout },
+        );
+        if (outcome === UPLOAD_NO_ANSWER) {
+          att.uploadError = describeUploadTimeout({ name, size: file.size, mediaType: file.type });
+        } else if (outcome?.failure) {
+          att.uploadError = outcome.failure;
+        } else {
+          const info = outcome.info;
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
-        } else {
-          // #756 — a non-200 had NO else at all. The status was in hand and thrown
-          // away, leaving "upload failed" as the whole of what anyone could learn.
-          att.uploadError = describeUploadFailure({
-            status: res.status,
-            statusText: res.statusText,
-            body: await res.text().catch(() => null),
-            name,
-            size: file.size,
-            mediaType: file.type,
-          });
         }
       } catch (err) {
         // #756 — the bare catch swallowed transport failures identically.

@@ -110,10 +110,19 @@ test("#756 WIRING: both upload paths record the status and the exception", () =>
   // The helper being right proves nothing if the call sites still discard. Pin the
   // two sites that had the defect, and that neither bare form survives.
   const src = readFileSync(PANEL_JS, "utf8");
+  // #1188 moved the exchange inside a bounded callback, so the non-200 description is now
+  // BUILT there and assigned by the caller. Same contract — the status must still be
+  // captured on both paths — pinned at both ends of the new shape so neither half can be
+  // dropped: a `failure:` nobody reads, or an `att.uploadError` fed by something else.
   assert.equal(
-    (src.match(/att\.uploadError = describeUploadFailure\(\{\s*\r?\n?\s*status: res\.status/g) || []).length,
+    (src.match(/failure: describeUploadFailure\(\{\s*\r?\n?\s*status: res\.status/g) || []).length,
     2,
     "both upload paths must record a non-200 status",
+  );
+  assert.equal(
+    (src.match(/att\.uploadError = outcome\.failure;/g) || []).length,
+    2,
+    "…and both must surface it as the attachment's error",
   );
   assert.equal(
     (src.match(/catch \(err\) \{[\s\S]{0,200}?att\.uploadError = describeUploadFailure\(\{ error: err/g) || []).length,

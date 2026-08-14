@@ -1,0 +1,212 @@
+// #1188 — the three `/upload/image` sites, bounded.
+//
+// Same failure as #1161/#1180: after a ComfyUI restart the tab can hold a half-open
+// connection where a request neither answers nor fails, so there is nothing for the
+// existing `try/catch` to catch. Here it wedges the composer: `att.ready` catches
+// everything internally so it never REJECTS — it simply never settles — and the send path
+// awaits `Promise.all(pending.map((a) => a.ready))`. The user cannot send at all.
+//
+// Unlike the credentials frame (cmcp-secrets-bound.test.mjs), the logic here lives in an
+// importable module, so most of this is BEHAVIOURAL. Source assertions are used only for
+// the three monolith call sites, which cannot be constructed outside the panel IIFE.
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import {
+  uploadBoundMs,
+  boundedUpload,
+  describeUploadTimeout,
+  UPLOAD_NO_ANSWER,
+  UPLOAD_STALL_FLOOR_MS,
+  UPLOAD_MIN_BYTES_PER_MS,
+} from "../../web/js/lib/attachment-upload.js";
+
+const SRC = readFileSync(
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  "utf8",
+);
+
+/** A promise that never settles — the half-open connection, modelled. */
+const NEVER = () => new Promise(() => {});
+
+// ── the bound itself ────────────────────────────────────────────────────────────────
+
+test("#1188 uploadBoundMs never returns a non-positive number", () => {
+  // `withTimeout` treats a non-positive ms as NO BOUND and returns the promise unchanged
+  // (bounded-step.js:71), so any input that drove this to 0 or below would silently restore
+  // the hang while every other assertion here still passed. That exact class of mutation
+  // survived on #1180 until it was asserted for.
+  for (const size of [0, -1, -99999, null, undefined, "", NaN, Infinity, -Infinity, "abc", {}, []]) {
+    const ms = uploadBoundMs(size);
+    assert.ok(Number.isFinite(ms) && ms > 0, `uploadBoundMs(${String(size)}) returned ${ms}`);
+  }
+  // A caller cannot disable the bound through the options object either.
+  assert.ok(uploadBoundMs(1024, { floorMs: 0, bytesPerMs: 0 }) > 0, "a zeroed floor must not disarm it");
+  assert.ok(uploadBoundMs(1024, { floorMs: -5, bytesPerMs: -5 }) > 0, "…nor a negative one");
+});
+
+test("#1188 an unknown size yields the floor rather than a fabricated allowance", () => {
+  // describeSize's rule: an unmeasured value must be ABSENT, not zero. Coercing null to 0
+  // here would produce the floor anyway, but by accident — pin the intent.
+  assert.equal(uploadBoundMs(null), UPLOAD_STALL_FLOOR_MS);
+  assert.equal(uploadBoundMs(undefined), UPLOAD_STALL_FLOOR_MS);
+  assert.equal(uploadBoundMs(""), UPLOAD_STALL_FLOOR_MS);
+});
+
+test("#1188 the bound scales with the payload, so video is not cut off", () => {
+  // The reason this is not a flat number: handleMediaUpload exists specifically for video.
+  // A flat bound either refuses a legitimate large upload or waits absurdly long for a
+  // small one.
+  const small = uploadBoundMs(100 * 1024); // 100 KB
+  const large = uploadBoundMs(500 * 1024 * 1024); // 500 MB
+  assert.ok(large > small, "a larger payload must get a larger allowance");
+  assert.ok(small >= UPLOAD_STALL_FLOOR_MS, "…and nothing may fall below the floor");
+  // The allowance is exactly the floor plus the transfer time at the throughput floor.
+  assert.equal(uploadBoundMs(1000), UPLOAD_STALL_FLOOR_MS + Math.ceil(1000 / UPLOAD_MIN_BYTES_PER_MS));
+  // A pathological size must stay a finite number, not become Infinity/NaN — those are
+  // non-positive-adjacent failures that would reach withTimeout and arm setTimeout(fn, NaN),
+  // which fires immediately and would refuse every upload.
+  assert.ok(Number.isFinite(uploadBoundMs(Number.MAX_SAFE_INTEGER)), "a huge size must stay finite");
+});
+
+// ── the bounded exchange ────────────────────────────────────────────────────────────
+
+test("#1188 a request that never answers resolves the sentinel, not a hang", async () => {
+  const out = await boundedUpload(NEVER, { size: 1, withTimeout, boundMs: 20 });
+  assert.equal(out, UPLOAD_NO_ANSWER);
+});
+
+test("#1188 the bound covers the BODY, not just the response head", async () => {
+  // `fetch` resolves as soon as the head arrives; the bytes stream afterwards inside
+  // `json()`. Bounding the request alone leaves the part that actually waits unbounded —
+  // exactly what shipped in #1180's first attempt at the log read, and it passed review
+  // because the test stalled the HANDSHAKE rather than the body.
+  let headArrived = false;
+  const out = await boundedUpload(
+    async () => {
+      const res = { status: 200, json: NEVER }; // head fine, body never streams
+      headArrived = true;
+      return { info: await res.json() };
+    },
+    { size: 1, withTimeout, boundMs: 20 },
+  );
+  assert.ok(headArrived, "the request half must have completed — otherwise this proves nothing");
+  assert.equal(out, UPLOAD_NO_ANSWER, "a body that never streams must still hit the bound");
+});
+
+test("#1188 a real failure keeps its own cause instead of becoming a timeout", async () => {
+  // REIFY BEFORE BOUNDING. `withTimeout` never rejects by contract — it degrades a rejection
+  // through onTimeout() exactly as it does a timeout — so handing it run() directly would
+  // collapse "it threw" into "it never answered" and lose the error. #756's tests pin the
+  // wording that describeUploadFailure({ error }) produces from that cause.
+  const boom = new TypeError("Failed to fetch");
+  await assert.rejects(
+    () => boundedUpload(async () => { throw boom; }, { size: 1, withTimeout, boundMs: 5000 }),
+    (err) => err === boom,
+  );
+});
+
+test("#1188 a value that resolves in time passes through untouched", async () => {
+  const ref = { filename: "a.png", subfolder: undefined, type: "input" };
+  const out = await boundedUpload(async () => ref, { size: 1, withTimeout, boundMs: 5000 });
+  assert.equal(out, ref, "the happy path must be byte-identical to the unbounded original");
+  // null is a legitimate return here (uploadBlobToInput's non-200 branch) and must NOT be
+  // confused with the sentinel.
+  assert.equal(await boundedUpload(async () => null, { size: 1, withTimeout, boundMs: 5000 }), null);
+});
+
+test("#1188 the sentinel is unforgeable", () => {
+  // A string or plain object could collide with a real upload result. ComfyUI's /upload/image
+  // answers with arbitrary JSON.
+  assert.equal(typeof UPLOAD_NO_ANSWER, "symbol");
+});
+
+test("#1188 a missing withTimeout fails loudly instead of running unbounded", async () => {
+  // Degrading to an unbounded run would be the one outcome this exists to prevent, arriving
+  // through the mechanism meant to prevent it — the failure #1191 recorded as "a guard can
+  // cause what it reports".
+  await assert.rejects(() => boundedUpload(NEVER, { size: 1 }), /requires withTimeout/);
+  await assert.rejects(() => boundedUpload(NEVER, { size: 1, withTimeout: null }), /requires withTimeout/);
+});
+
+test("#1188 the ms handed to withTimeout is positive for every caller shape", async () => {
+  // The bound-zero mutation, caught at the boundary rather than inferred from behaviour.
+  const seen = [];
+  const spy = (p, ms, onTimeout) => { seen.push(ms); return withTimeout(p, ms, onTimeout); };
+  for (const size of [undefined, null, 0, -1, 12, 5 * 1024 * 1024]) {
+    await boundedUpload(async () => "ok", { size, withTimeout: spy });
+  }
+  assert.ok(seen.length === 6, `expected 6 bounded calls, saw ${seen.length}`);
+  for (const ms of seen) assert.ok(Number.isFinite(ms) && ms > 0, `withTimeout received ${ms}`);
+});
+
+test("#1188 a timeout is described as the transport failure it is a species of", () => {
+  const msg = describeUploadTimeout({ name: "clip.mp4", size: 4096, mediaType: "video/mp4", boundMs: 30000 });
+  // Routed through describeUploadFailure's `error` branch so it reads with the same shape as
+  // #756's transport text — including the part that is precisely true here: the bound does
+  // not cancel, so whether bytes reached the server is genuinely unknown.
+  assert.match(msg, /did not COMPLETE/);
+  assert.match(msg, /clip\.mp4/);
+  assert.match(msg, /30s/, "the user must be told how long was waited");
+  assert.match(msg, /Whether any bytes reached the server is unknown/);
+});
+
+// ── the three monolith call sites ───────────────────────────────────────────────────
+
+/** Source with comment lines removed. The comments here NAME the calls they explain, so a
+ *  raw scan matches prose and a mutation that moves real code into a comment slips through.
+ *  One did on #1180: replacing a throw with a return while leaving `// was: throw …` behind
+ *  passed every assertion. */
+const CODE = SRC.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+
+test("#1188 no /upload/image call site bypasses the bound", () => {
+  // The whole fix in one line: if a raw request to that endpoint survives outside a bounded
+  // callback, that site is still unbounded no matter how good the helper is.
+  const calls = CODE.split("\n").filter((l) => /await api\.fetchApi\("\/upload\/image"/.test(l));
+  assert.equal(calls.length, 3, `expected exactly 3 upload sites, saw ${calls.length}`);
+  const bounded = (CODE.match(/await boundedUpload\(/g) || []).length;
+  assert.equal(bounded, 3, `expected all 3 to go through boundedUpload, saw ${bounded}`);
+});
+
+test("#1188 each upload site's body read sits INSIDE the bounded callback", () => {
+  // Same trap as the credentials helper: bounding the request while awaiting res.json()
+  // afterwards leaves the waiting part unbounded and still passes a handshake-stalling test.
+  // Anchored on the options argument rather than on closing-brace indentation: the three
+  // sites sit at different nesting depths, and an indentation-coupled window silently
+  // matched the wrong span for two of them.
+  const sites = CODE.split("await boundedUpload(").slice(1).map((chunk) => {
+    const end = chunk.indexOf("{ size:");
+    assert.ok(end > 0, "each bounded call must pass its options object");
+    return chunk.slice(0, end);
+  });
+  assert.equal(sites.length, 3, `expected 3 bounded callbacks, matched ${sites.length}`);
+  for (const body of sites) {
+    assert.match(body, /async \(\) => \{/, "the exchange must be a callback, not a bare promise");
+    assert.match(body, /await api\.fetchApi\("\/upload\/image"/, "the request must be inside");
+    assert.match(body, /await res\.json\(\)/, "…and so must the body read");
+  }
+});
+
+test("#1188 uploadBlobToInput still answers null, so no caller learns a new shape", () => {
+  // Four callers branch on a null ref today (the apps, civitai and training wizards, and the
+  // storyboard pipeline). Returning the sentinel to them instead would make `!ref` false and
+  // send a Symbol into `viewUrl`.
+  assert.match(
+    CODE,
+    /return out === UPLOAD_NO_ANSWER \? null : out;/,
+    "the sentinel must be collapsed to the existing failure value",
+  );
+});
+
+test("#1188 the composer's two sites report the timeout instead of silently succeeding", () => {
+  // A sentinel falling through to the success branch would set att.inputRef from
+  // `outcome.info` on an undefined `info` and throw a TypeError the user cannot act on.
+  const guards = (CODE.match(/if \(outcome === UPLOAD_NO_ANSWER\) \{/g) || []).length;
+  assert.equal(guards, 2, `both composer sites must branch on the sentinel, saw ${guards}`);
+  const reported = (CODE.match(/att\.uploadError = describeUploadTimeout\(/g) || []).length;
+  assert.equal(reported, 2, `…and both must say so, saw ${reported}`);
+});
