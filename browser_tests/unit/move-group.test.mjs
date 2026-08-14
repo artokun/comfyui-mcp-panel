@@ -2209,3 +2209,34 @@ test("moveReroutePoints skips malformed points and never throws", () => {
   assert.deepEqual(ok.pos, [11, 12]);
   assert.doesNotThrow(() => moveReroutePoints(undefined, 1, 1));
 });
+
+test("#813 the reported move: a group of COLLAPSED members moves, whole, with no partial", () => {
+  // The reporter's group 6 ("Face Detail & Output"): four collapsed size:[225,0] nodes,
+  // moved to [1500,-40]. Every one was called "would not accept a new position" — after its
+  // position had already been written — and the caller was told to press Ctrl+Z, which an
+  // agent driving the panel cannot do.
+  const collapsed = (id) => ({
+    id,
+    pos: [100, 100],
+    size: [225, 0],
+    flags: { collapsed: true },
+    _collapsed_width: 80,
+    boundingRect: [100, 70, 80, 30],
+    updateArea() {
+      // The engine recomputes from size and knows nothing about the panel's pill.
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, this.size[0], this.size[1] + 30];
+    },
+  });
+  const members = [collapsed(24), collapsed(25), collapsed(26), collapsed(28)];
+  const g = group(6, [50, 50, 400, 400], "Face Detail & Output");
+  const graph = makeGraph({ nodes: members, groups: [g] });
+
+  const res = realMoveGroup(graph)({ group_id: 6, pos: [1500, -40] });
+
+  assert.equal(res.moved.nodes, 4, "all four collapsed members moved — no refusal, no partial");
+  for (const n of members) {
+    assert.deepEqual(n.pos, [1550, 10], "each member translated by the box delta");
+  }
+  assert.deepEqual(g._bounding, [1500, -40, 400, 400]);
+  assert.deepEqual(res.group.node_ids, [24, 25, 26, 28], "and all four are still reported as members");
+});

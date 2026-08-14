@@ -49,6 +49,14 @@ const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOU
 let cacheInvalidations = 0;
 const cacheSpy = { invalidate: () => { cacheInvalidations += 1; }, read: async (f) => f() };
 
+/** #1223 — the last-observed-schema snapshot the refresh run also clears and re-records. */
+let snapshotClears = 0;
+const snapshotRecords = [];
+const snapshotSpy = {
+  clear: () => { snapshotClears += 1; },
+  record: (defs, opts) => { snapshotRecords.push({ defs, opts }); return true; },
+};
+
 import {
   describeNodeDefRefresh,
   NODE_DEF_REFRESH_REASONS,
@@ -406,6 +414,11 @@ function buildRegisterComfyNodeDefs({
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
+    // #1223 — the snapshot the run retires and re-records, and the connection epoch a
+    // recording is stamped with. Both are module state in the panel, so the extracted
+    // body throws ReferenceError without them.
+    "objectInfoSnapshot",
+    "backendReconnectEpoch",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
      const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
@@ -449,6 +462,10 @@ function buildRegisterComfyNodeDefs({
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
     cacheSpy,
+    // #1223 — a spy, so a test can prove the run retires the last-observed schema and
+    // re-records only a payload it fetched itself.
+    snapshotSpy,
+    7,
   );
 }
 

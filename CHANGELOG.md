@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.40] - 2026-08-14
+
+### Fixed
+- a group whose members are COLLAPSED nodes now moves, instead of being refused after those members positions had already been written (#813)
+
+## [0.14.39] - 2026-08-14
+
+### Fixed
+- a widget edit is no longer refused just because the /object_info probe went silent while ComfyUI was busy rendering — it is authorized from the last whole schema observed on the same backend connection, which a restart always invalidates (#1223)
+
+## [0.14.38] - 2026-08-14
+
+### Fixed
+- translating the error disarmed every ComfyUI-Manager fallback (#1230)
+
+
+## [0.14.37] - 2026-08-14
+
+### Fixed
+- a run whose outcome could not be confirmed is reported as a neutral event instead of an urgent error, so cancelling a large batch no longer tells the agent every prompt ERRORED (#1226, comfyui-mcp#1489)
+
+
 ## [0.14.36] - 2026-08-14
 
 ### Fixed

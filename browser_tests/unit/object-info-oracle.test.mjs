@@ -153,7 +153,13 @@ test("#982 source guard: the refusal states an observation, and the panel wires 
   );
   const panel = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(panel, /fetchWholeObjectInfo\(\{/, "the panel asks through the two-transport oracle");
-  assert.match(panel, /describeObjectInfoFailure: \(\) => objectInfoOracleFailureNote/, "and can report what failed");
+  // #1223 wrapped this across lines to append the snapshot's ineligibility reason AFTER
+  // the route note — deliberately outside `failures`, so "Tried N routes" stays honest.
+  assert.match(
+    panel,
+    /describeObjectInfoFailure: \(\) =>\s*objectInfoOracleFailureNote\(oracleFailures\)/,
+    "and can report what failed",
+  );
   // The burst cache still wraps it: two transports must not become two fetches per write.
   assert.match(panel, /await objectInfoCache\.read\(async \(\) => \{/, "still read through the #716 cache");
 });
@@ -165,7 +171,7 @@ test("#982 (codex) the fallback is consulted ONLY when the client returned nothi
   const clientBlock = src.slice(src.indexOf("if (typeof getNodeDefs === \"function\")"), src.indexOf("// SECOND TRANSPORT"));
   assert.match(
     clientBlock,
-    /if \(usableDefs\(defs\)\) return \{ \[CACHE_OUTCOME\]: true, defs, failures \};/,
+    /if \(usableDefs\(defs\)\) return \{ \[CACHE_OUTCOME\]: true, defs, failures, outcomes \};/,
     "a usable client answer returns",
   );
   // …and the measured equivalence is recorded rather than assumed.
