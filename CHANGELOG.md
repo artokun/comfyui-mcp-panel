@@ -57,7 +57,6 @@ All notable changes to this project are documented here. This project adheres to
   of those hits it.
 
 ### Fixed
-- hold the reload guard across hardRestart's tail (#1183)
 ## [0.14.25] - 2026-08-13
 
 ### Fixed
@@ -84,12 +83,9 @@ All notable changes to this project are documented here. This project adheres to
   long each one was actually given, rather than quoting a wait it never spent.
 
 ### Fixed
-- bound each /object_info transport so a hung route falls through to the one that works (#1179)
 ## [0.14.24] - 2026-08-12
 
 ### Fixed
-- a successful restart retires every marker before the invalidate can bail (#1170)
-
 - **A successful agent restart no longer leaves the old turn's state armed against a
   fresh agent (#1166).** When a restart genuinely replaces the agent, the panel retires
   the markers that say a turn is in flight. Those clears all sat after a step that can
@@ -108,8 +104,6 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.14.23] - 2026-08-12
 
 ### Fixed
-- a turn start closes the outage; a panel-driven respawn opens one (#1164)
-
 - **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
   the outage accounting added for #1145, found by review of that change rather than in
   the wild. A turn beginning while the bridge was still down zeroed the measured outage
@@ -127,14 +121,11 @@ All notable changes to this project are documented here. This project adheres to
   agent. Nudging either is the harm. The converse still holds and is covered by tests:
   an orchestrator that died has no turn to announce, so its nudge fires as before.
 
-- **The mid-task resume nudge now measures the outage instead of one backoff step, so a
-
 ## [0.14.22] - 2026-08-12
 
 ### Fixed
 - let a truncated provider hint be read on hover (#1165)
 - translate the "why can't I use this provider" hints in all 11 languages (#1162)
-- stamp the outage once, not every failed retry (#1146)
 - translate the 22 strings that answer "why can't I use this provider" (#1160)
 
 - **A ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
