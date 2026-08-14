@@ -6,27 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.14.32] - 2026-08-13
+## [0.14.34] - 2026-08-14
 
 ### Fixed
-- a node-inputs difference that is only the frontend's definition rebuild is not content loss (#1208)
+- every release since 0.14.31 writes two sections for one version (#1219)
+- rebuild combo options during the reapply sweep, and disclose an empty authoritative list (#1218)
 
+
+## [0.14.33] - 2026-08-14
+
+### Fixed
+- panel_get_errors is a READ, so the dirty-tab mutation fence no longer refuses it as "this mutation" (#1211, comfyui-mcp#1478)
+- bound the remaining unbounded network awaits (#1201)
 
 ## [0.14.32] - 2026-08-14
 
 ### Fixed
-- a faithful workflow_open no longer reports CONTENT_UNVERIFIED just because the frontend rebuilt each node's `inputs` from its definition (comfyui-mcp#1467)
-
-## [0.14.31] - 2026-08-13
-
-### Fixed
-- the workflow-list refresh reports what it OBSERVED, not that it was asked for (#1206)
-
+- a faithful workflow_open no longer reports CONTENT_UNVERIFIED just because the frontend rebuilt each node's `inputs` from its definition (#1208, comfyui-mcp#1467)
 
 ## [0.14.31] - 2026-08-14
 
 ### Fixed
-- panel_open_workflow no longer claims the workflow list "WAS re-read from the server" when it cannot know that — the frontend's sync swallows its own errors (comfyui-mcp#1448)
+- panel_open_workflow no longer claims the workflow list "WAS re-read from the server" when it cannot know that — the frontend's sync swallows its own errors (#1206, comfyui-mcp#1448)
 
 ## [0.14.30] - 2026-08-14
 
