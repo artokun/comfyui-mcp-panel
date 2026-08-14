@@ -11103,9 +11103,30 @@ const GRAPH_TOOL_EXECUTORS = {
     // identity must stay absent instead of shipping something that merely looks like one.
     let loadedWorkflowUuid;
     try {
-      const liveAfterLoad = app?.extensionManager?.workflow?.activeWorkflow || null;
-      const uuid = liveAfterLoad
-        ? workflowObjectUuid(liveAfterLoad) || workflowStableUuid(liveAfterLoad)
+      // TIED TO THIS LOAD BY OBJECT IDENTITY, never by "what is active now" (review, P1).
+      //
+      // The first version read the live active workflow after the await. That is the
+      // SAME hazard the orchestrator-side attempt was rejected for, moved one layer down:
+      // load starts for A, the user switches to B while it awaits, the continuation reads
+      // B's uuid, and an orchestrator that CLAIMS the fence from this reply points the
+      // session at B — so the next agent edit lands on the wrong graph. Publishing a uuid
+      // that might name another canvas is worse than publishing none, precisely because
+      // the field is trusted enough to claim from.
+      //
+      // What IS provable: `activeWorkflow` was captured before the load and passed to
+      // loadGraphData as the target, and `__cmcpKeepInstance` preserves its identity. If
+      // that very OBJECT is still the active one, this reply describes the workflow this
+      // command wrote into — an identity comparison, immune to a name or a switch. If it
+      // is not (the user moved, or this was a blank-canvas load that minted something we
+      // hold no reference to), nothing here can prove which workflow is ours, so the field
+      // is omitted and the orchestrator keeps its existing conditional note.
+      const liveNow = app?.extensionManager?.workflow?.activeWorkflow || null;
+      const provablyOurs =
+        !!activeWorkflow &&
+        !!liveNow &&
+        rawWorkflowObject(liveNow) === rawWorkflowObject(activeWorkflow);
+      const uuid = provablyOurs
+        ? workflowObjectUuid(liveNow) || workflowStableUuid(liveNow)
         : undefined;
       if (isCanonicalWorkflowInstanceUuid(uuid)) loadedWorkflowUuid = uuid;
     } catch {

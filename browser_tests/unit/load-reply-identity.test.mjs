@@ -50,26 +50,41 @@ test("#1478 graph_load's reply carries workflow_uuid", () => {
   );
 });
 
-test("#1478 the identity is read AFTER the load, not before it", () => {
-  // Read before, it would name the instance the load replaced — the exact stale value the
-  // fence already holds, which would make the field worse than useless: the orchestrator
-  // would compare two stale values, find them equal, and conclude nothing moved.
+test("#1478 the identity is read AFTER the load, and only when it is PROVABLY ours", () => {
   const body = graphLoadBody();
   const loadAt = body.indexOf("await app.loadGraphData(");
-  const readAt = body.indexOf("const liveAfterLoad");
+  const readAt = body.indexOf("const liveNow");
   assert.ok(loadAt !== -1, "the load call must still be recognisable");
   assert.ok(readAt > loadAt, "the identity is read after loadGraphData has landed");
 
-  // POSITION IS NOT ENOUGH, and mutation testing is what showed it: assigning the
-  // PRE-load `activeWorkflow` const to `liveAfterLoad` sits in the same place and killed
-  // no test. That is the worst version of this field — the orchestrator would compare the
-  // stale fence against an equally stale reply, find them equal, and conclude the instance
-  // did not move on exactly the load where it did.
+  // THE PROPERTY THAT MATTERS, and the one review had to force. Reading "whatever is
+  // active now" after the await is the SAME wrong-graph hazard the orchestrator-side
+  // attempt was rejected for: load starts for A, the user switches to B while it awaits,
+  // the continuation reads B, and an orchestrator that CLAIMS the fence from this reply
+  // points the session at B — the next agent edit lands on the wrong graph.
+  //
+  // So the reply names a workflow only when the live one IS the object this load
+  // targeted. Object identity, not a name: immune to a switch, and unforgeable.
   assert.match(
-    body.slice(readAt, readAt + 200),
-    /const liveAfterLoad = app\?\.extensionManager\?\.workflow\?\.activeWorkflow \|\| null;/,
-    "the identity comes from a FRESH lookup, not the pre-load capture",
+    body.slice(readAt, readAt + 420),
+    /rawWorkflowObject\(liveNow\) === rawWorkflowObject\(activeWorkflow\)/,
+    "the identity is gated on the live workflow being the very object this load targeted",
   );
+  assert.match(
+    body.slice(readAt, readAt + 520),
+    /provablyOurs\s*\?/,
+    "and the uuid is only read on that branch",
+  );
+});
+
+test("#1478 an unprovable load publishes NOTHING rather than a guess", () => {
+  // A blank-canvas load mints a workflow this code holds no reference to, so nothing here
+  // can prove which one is ours. Publishing the active one anyway is worse than publishing
+  // none, precisely because the field is trusted enough to claim a fence from. The
+  // orchestrator keeps its existing conditional note on that path.
+  const body = graphLoadBody();
+  assert.match(body, /!!activeWorkflow &&/, "no pre-load target ⇒ nothing is provable");
+  assert.match(body, /!!liveNow &&/, "no live workflow ⇒ nothing is provable");
 });
 
 test("#1478 the field is SHAPE-GATED — only a canonical instance uuid is published", () => {
@@ -90,7 +105,7 @@ test("#1478 an unreadable identity omits the field instead of throwing", () => {
   // graph has already landed — a throw here would turn a successful load into a failed
   // one, which is strictly worse than the mismatch this is fixing.
   const body = graphLoadBody();
-  const readAt = body.indexOf("const liveAfterLoad");
+  const readAt = body.indexOf("const liveNow");
   const after = body.slice(readAt);
   assert.match(after.slice(0, 700), /\} catch \{/, "the read is guarded");
   assert.doesNotMatch(after.slice(0, 700), /throw /, "and never rethrows");
