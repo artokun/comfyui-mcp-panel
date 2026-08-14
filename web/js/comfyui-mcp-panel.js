@@ -278,6 +278,10 @@ import {
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
+import { classifyDiskProbe } from "./lib/workflow-disk-probe.js";
+/** #1448 — wall-clock bound on the refusal-path /userdata probe. Generous: it only
+ *  ever runs when the open is already failing, and a slow answer still beats none. */
+const WORKFLOW_DISK_PROBE_MS = 4000;
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -13810,8 +13814,64 @@ const GRAPH_TOOL_EXECUTORS = {
       // (codex review). A successful re-read REMOVES stale entries — measured on a
       // live rig, the store went 109 to 107 — so a pre-refresh snapshot can offer a
       // workflow the re-read just deleted as an example of what is addressable.
-      const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
-      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known })));
+      // #1448 — ASK THE SERVER before asserting the file is not there. Everything
+      // above this line is an in-memory scan of the frontend's store, and that store
+      // was MEASURED to lag disk in both directions: a file staged into the
+      // workflows folder out-of-band is on disk and absent from the store until a
+      // sync lands, and a file deleted out-of-band stays in the store after it is
+      // gone. The panel cannot even tell whether the sync succeeded. So this is the
+      // only step in the path that can contradict a stale list with evidence.
+      //
+      // Runs only on the refusal path — never on a successful open — so the extra
+      // round-trip costs nothing in the normal case.
+      //
+      // BOUNDED (codex P1). The refusal path had no deadline: a /userdata that accepts
+      // the request and never answers would hang panel_open_workflow forever, turning a
+      // wrong message into no message at all. withTimeout never rejects, so the timeout
+      // lands in the same fail-open "unknown" as every other failure.
+      // ABORTED, not merely abandoned (review r2). withTimeout stops us WAITING but
+      // cannot cancel the request, so a server that accepts and never answers would
+      // leave one live fetch per failed open, accumulating until the browser's
+      // connection pool is exhausted. Same idiom as fetchImageBytes.
+      const probeCtrl = new AbortController();
+      const probeTimer = setTimeout(() => probeCtrl.abort(), WORKFLOW_DISK_PROBE_MS);
+      const disk = await withTimeout(
+        (async () => {
+          try {
+            const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false", {
+              signal: probeCtrl.signal,
+            });
+            return classifyDiskProbe(
+              {
+                ok: reply?.ok === true,
+                status: reply?.status,
+                body: reply?.ok ? await reply.json() : undefined,
+              },
+              path,
+            );
+          } catch (err) {
+            // FAIL OPEN. Every earlier round of this issue shipped a message that
+            // claimed more than it knew; a probe that turned a stale list into a
+            // confident "your file does not exist" would be that bug with more
+            // authority.
+            return { onDisk: "unknown", why: err?.message ?? String(err) };
+          }
+        })(),
+        WORKFLOW_DISK_PROBE_MS,
+        () => ({ onDisk: "unknown", why: `no answer within ${WORKFLOW_DISK_PROBE_MS}ms` }),
+      );
+      clearTimeout(probeTimer);
+      // The probe added an await to a path that previously had none, which widens the
+      // window for another sync or command to land the target in the store (codex P2).
+      // Re-check once: if it is addressable now, OPEN it rather than refusing with a
+      // verdict that went stale while we were proving it.
+      const late = find();
+      if (late) {
+        target = late;
+      } else {
+        const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
+        throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known, disk })));
+      }
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
