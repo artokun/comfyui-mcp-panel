@@ -13,6 +13,8 @@
 // command at a time, and every mutation must stay outside it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
@@ -94,4 +96,39 @@ test("the two other unlisted reads are deliberately still refused", () => {
   // the evidence to be written down with it.
   assert.equal(graphCommandMayMutateWorkflow("graph_get_object_info"), true);
   assert.equal(graphCommandMayMutateWorkflow("graph_prompt_director_audit"), true);
+});
+
+// ── The claim the classification RESTS ON ───────────────────────────────────
+//
+// Review: the tests above only assert what the allowlist RETURNS. Two further
+// claims are load-bearing, and only one of them is testable here.
+//
+// TESTED below: the dispatcher derives its bar from this list. That is where the
+// reporter's refusal came from, and it is a whole-file search, so it is exact.
+//
+// NOT TESTED, verified by reading: `graph_get_errors`'s executor writes nothing —
+// it calls `assertGraphBoundToActiveWorkflow(graph, rootGraph)` with no options
+// (so it already took the read-shaped defaults; only the DISPATCH bar was wrong)
+// and otherwise only reads `graph._nodes` and builds a report.
+//
+// A source-scanning version of that check was written and REMOVED. Bounding a
+// method body by counting braces needs real tokenization: masking comments first
+// breaks on `//` inside a string, and masking strings first breaks on an
+// apostrophe inside a comment — which is what happened here, mis-bounding the
+// slice so every "must not write" assertion passed against the wrong text. A
+// vacuous test asserting a safety property is worse than an honest note.
+
+const panelSource = () =>
+  readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
+
+test("#1478 the DISPATCH-time bar is derived from this list", () => {
+  // The second claim: a correct classification is useless if the dispatch site
+  // does not use it — and the dispatch site is where the reporter's refusal came
+  // from. Asserted on the call, not on the file merely mentioning it.
+  const src = panelSource();
+  assert.match(
+    src,
+    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, graphCommandBindingBar\(msg\.cmd\)\)/,
+    "the bar must come from graphCommandBindingBar(msg.cmd), not a local guess",
+  );
 });
