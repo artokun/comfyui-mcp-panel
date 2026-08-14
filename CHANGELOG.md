@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.33] - 2026-08-13
+
+### Fixed
+- panel_get_errors is a READ, so the dirty-mutation fence must not refuse it (#1211)
+- bound the remaining unbounded network awaits (#1201)
+
+
+## [0.14.33] - 2026-08-14
+
+### Fixed
+- panel_get_errors is a READ, so the dirty-tab mutation fence no longer refuses it as "this mutation" (comfyui-mcp#1478)
+
 ## [0.14.32] - 2026-08-13
 
 ### Fixed
