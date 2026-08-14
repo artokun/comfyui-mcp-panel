@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.30] - 2026-08-14
+
+### Fixed
+- the video storyboard sampler now names WHICH failure it hit, instead of reporting six different causes as one silent nothing (comfyui-mcp#1493)
+
 ## [0.14.29] - 2026-08-13
 
 ### Fixed
