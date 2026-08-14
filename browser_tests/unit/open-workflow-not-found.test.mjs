@@ -23,10 +23,15 @@ import {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const msg = (o) => openWorkflowNotFoundMessage({ path: "video_minimax_low_vram.json", ...o });
 
-test("#1448 a re-read that HAPPENED is stated as such", () => {
-  const t = msg({ refresh: "ok" });
-  assert.match(t, /list WAS re-read/);
-  assert.match(t, /still does not contain it/);
+test("#1448 r2 a CHANGED list is reported as a change, NOT as a successful read", () => {
+  // The claim this round had to retreat from. "The list changed" is an
+  // observation; "the server read succeeded" is a causal claim the panel cannot
+  // make — another writer can move the store while the sync silently fails.
+  const t = msg({ refresh: "changed" });
+  assert.match(t, /the list DID change/);
+  assert.match(t, /still does not contain a match/);
+  assert.doesNotMatch(t, /WAS re-read from the server/, "no causal claim about the read");
+  assert.match(t, /cannot see whether the server read itself succeeded/i);
 });
 
 test("#1448 r2 the re-read verdict is DECIDED from the store, both directions", () => {
@@ -40,29 +45,47 @@ test("#1448 r2 the re-read verdict is DECIDED from the store, both directions", 
   // Nothing moved: same counts, same array identities → cannot confirm.
   assert.equal(
     classifyWorkflowRefresh(fp("1/1", openA, savedA), fp("1/1", openA, savedA)),
-    "unconfirmed",
+    "unchanged",
   );
   // A count changed (the 109 → 107 case) → proof it ran.
   assert.equal(
     classifyWorkflowRefresh(fp("1/109", openA, savedA), fp("1/107", openA, savedA)),
-    "ok",
+    "changed",
   );
-  // Counts identical but the arrays were REPLACED → also proof it ran. Dropping
+  // Counts identical but the arrays were REPLACED → still a change. Dropping
   // this half is a mutation that survived a count-only comparison.
   assert.equal(
     classifyWorkflowRefresh(fp("1/1", openA, savedA), fp("1/1", [{ path: "a" }], [{ path: "b" }])),
-    "ok",
+    "changed",
+  );
+  // ...but identity is IGNORED when the caller says it carries no information.
+  // A reactive getter handing back a fresh array per access would otherwise
+  // report "changed" on every refresh — the original bug in new wording.
+  assert.equal(
+    classifyWorkflowRefresh(
+      fp("1/1", openA, savedA),
+      fp("1/1", [{ path: "a" }], [{ path: "b" }]),
+      { identityMeaningful: false },
+    ),
+    "unchanged",
+  );
+  // A real count move is still honoured with identity disabled.
+  assert.equal(
+    classifyWorkflowRefresh(fp("1/109", openA, savedA), fp("1/107", openA, savedA), {
+      identityMeaningful: false,
+    }),
+    "changed",
   );
   // A missing sample claims nothing rather than defaulting to confident.
-  assert.equal(classifyWorkflowRefresh(null, fp("1/1", openA, savedA)), "unconfirmed");
-  assert.equal(classifyWorkflowRefresh(fp("1/1", openA, savedA), null), "unconfirmed");
+  assert.equal(classifyWorkflowRefresh(null, fp("1/1", openA, savedA)), "unchanged");
+  assert.equal(classifyWorkflowRefresh(fp("1/1", openA, savedA), null), "unchanged");
 });
 
 test("#1448 r2 an UNCONFIRMED re-read never claims the list was refreshed", () => {
   // The state that did not exist before, and the one that is now almost always
   // right: syncWorkflows resolves whether or not the read succeeded, so unless
   // the store visibly changed we cannot say it happened.
-  const t = msg({ refresh: "unconfirmed" });
+  const t = msg({ refresh: "unchanged" });
   assert.doesNotMatch(t, /WAS re-read/, "it must not assert what it could not observe");
   assert.match(t, /cannot confirm/i);
   // …and it must not let the caller conclude the file is missing.
@@ -71,10 +94,13 @@ test("#1448 r2 an UNCONFIRMED re-read never claims the list was refreshed", () =
   assert.match(t, /swallows its own\s+errors/i);
 });
 
-test("#1448 r2 a CONFIRMED re-read still says so, and says why it is confident", () => {
-  const t = msg({ refresh: "ok" });
-  assert.match(t, /WAS re-read/);
-  assert.match(t, /the list changed/, "the claim now carries the evidence for itself");
+test("#1448 r2 NO refresh state claims the server read succeeded", () => {
+  // The invariant across the whole surface, not one branch of it. Every earlier
+  // version of this fix leaked a causal claim into at least one state.
+  for (const refresh of ["changed", "unchanged", "unavailable", "not-needed"]) {
+    const t = msg({ refresh });
+    assert.doesNotMatch(t, /WAS re-read from the server/, refresh);
+  }
 });
 
 test("#1448 a frontend with no sync method does NOT claim a refresh", () => {
@@ -99,7 +125,7 @@ test("#1448 a FAILED re-read says so, and that it is not evidence of absence", (
 test("#1448 it no longer asserts the file is outside the workflows folder", () => {
   // The remedy that misled the reporter. panel_load_workflow is still offered — it IS
   // the right tool for a path elsewhere — but as a branch, not as a diagnosis.
-  for (const refresh of ["ok", "unavailable", "not-needed", "failed: x"]) {
+  for (const refresh of ["changed", "unchanged", "unavailable", "not-needed", "failed: x"]) {
     const t = msg({ refresh });
     assert.doesNotMatch(t, /For a file outside the workflows folder/, refresh);
     assert.match(t, /If the file IS in the workflows/, refresh);
@@ -110,7 +136,7 @@ test("#1448 it no longer asserts the file is outside the workflows folder", () =
 test("#1448 it shows the selector SHAPES, which are not guessable from outside", () => {
   // Measured on the live rig: `filename` carries no extension while `key` does, and
   // `path` is folder-qualified. A caller cannot infer that, so the sample shows it.
-  const t = msg({ refresh: "ok", known: ["workflows/Anima Wojak Batch.json"] });
+  const t = msg({ refresh: "changed", known: ["workflows/Anima Wojak Batch.json"] });
   assert.match(t, /workflows\/Anima Wojak Batch\.json/);
   assert.match(t, /bare name with or without "\.json"/);
 });
@@ -133,7 +159,7 @@ test("#1448 the sample is only PERSISTED records, and is bounded", () => {
 });
 
 test("#1448 with no known records it still gives a usable message", () => {
-  const t = msg({ refresh: "ok", known: [] });
+  const t = msg({ refresh: "changed", known: [] });
   // Case-insensitive: a control mutation capitalising the leading word killed the
   // strict form. The property is that the refusal names the selector it was given.
   assert.match(t, /no workflow matching "video_minimax_low_vram\.json"/i);
@@ -176,8 +202,16 @@ test("#1448 WIRING: the caller records the outcome instead of assuming one", () 
   assert.match(panel, /const after = fingerprintStore\(\);/, "...and AFTER the re-read");
   assert.match(
     panel,
-    /refresh = classifyWorkflowRefresh\(before, after\);/,
+    /refresh = classifyWorkflowRefresh\(before, after, \{ identityMeaningful \}\);/,
     "the verdict comes from the shared decision, not an inline guess",
+  );
+  // The fresh-getter probe: two samples with NOTHING between them. Without it,
+  // a store that materialises a new array per access reports "changed" every
+  // time and the original bug returns in new wording (review, round 2).
+  assert.match(panel, /const control = fingerprintStore\(\);/, "identity is calibrated first");
+  assert.match(
+    panel,
+    /const identityMeaningful =\s*control\.open === before\.open && control\.saved === before\.saved;/,
   );
   // The sample must be taken AFTER the refresh (codex review). A successful re-read
   // removes stale entries — measured 109 -> 107 on a live rig — so a snapshot taken

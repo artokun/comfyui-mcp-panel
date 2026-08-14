@@ -39,32 +39,40 @@ export function knownSelectorSample(records, limit = 3) {
 }
 
 /**
- * Did a workflow-list re-read demonstrably HAPPEN? (#1448 r2)
+ * What was OBSERVED about the workflow list across a re-read attempt (#1448 r2).
  *
- * `syncWorkflows` is a VueUse `useAsyncState` execute wrapper built without
- * `throwError`, so it resolves whether the read succeeded or failed and the
- * store never exposes the error. "The call returned" is therefore no evidence at
- * all, and treating it as evidence is what made every refusal claim the list had
- * been re-read.
+ * This deliberately says nothing about whether `syncWorkflows()` succeeded, and
+ * that restraint is the whole point. Two rounds of this fix tried to prove the
+ * read happened and both were wrong:
  *
- * What IS evidence is the store changing: a genuine re-read rebuilds the arrays,
- * so entries appear or disappear (measured on a live rig: 109 → 107) or the
- * array identity is replaced. Either proves it ran.
+ *   1. "the call resolved" — worthless. `syncWorkflows` is a VueUse
+ *      `useAsyncState` execute wrapper built without `throwError`, so a failed
+ *      read is caught into a private ref and execute resolves normally.
+ *   2. "the list changed, therefore the read worked" — a CAUSAL claim from a
+ *      CORRELATION (review). Another writer can change the store during the
+ *      await while the sync silently fails, and a reactive getter that
+ *      materialises a fresh array per access makes the identity test fire every
+ *      single time — which would restore the original bug wearing new wording.
  *
- * Seeing NEITHER proves nothing — an unchanged directory re-reads to an
- * identical list — hence "unconfirmed" rather than "failed". Lives here, out of
- * the DOM-bound panel module, so the decision is testable on its own; mutation
- * showed the message tests could not see it at all.
+ * So the verdict describes the LIST, which is the thing actually observed:
+ * "changed" or "unchanged". The caller's message must not upgrade either into a
+ * statement about the server read.
  *
- * @param {{counts: string, open: unknown, saved: unknown}} before
- * @param {{counts: string, open: unknown, saved: unknown}} after
- * @returns {"ok"|"unconfirmed"}
+ * `identityMeaningful` is false when the store hands back a fresh array on every
+ * access — the caller detects that by sampling twice with nothing in between —
+ * in which case array identity carries no information and only counts are used.
+ *
+ * @param {{counts: string, open: unknown, saved: unknown}|null} before
+ * @param {{counts: string, open: unknown, saved: unknown}|null} after
+ * @param {{identityMeaningful?: boolean}} [opts]
+ * @returns {"changed"|"unchanged"}
  */
-export function classifyWorkflowRefresh(before, after) {
-  if (!before || !after) return "unconfirmed"; // nothing to compare — claim nothing
-  const countsMoved = before.counts !== after.counts;
-  const arraysReplaced = before.open !== after.open || before.saved !== after.saved;
-  return countsMoved || arraysReplaced ? "ok" : "unconfirmed";
+export function classifyWorkflowRefresh(before, after, opts = {}) {
+  if (!before || !after) return "unchanged"; // nothing to compare — claim nothing
+  if (before.counts !== after.counts) return "changed";
+  const identityMeaningful = opts.identityMeaningful !== false;
+  if (!identityMeaningful) return "unchanged";
+  return before.open !== after.open || before.saved !== after.saved ? "changed" : "unchanged";
 }
 
 /**
@@ -85,10 +93,11 @@ export function classifyWorkflowRefresh(before, after) {
  */
 export function openWorkflowNotFoundMessage({ path, refresh, known = [] } = {}) {
   const refreshClause =
-    refresh === "ok"
-      ? `The workflow list WAS re-read from the server first (the list changed), and it still does ` +
-        `not contain it.`
-      : refresh === "unconfirmed"
+    refresh === "changed"
+      ? `A re-read of the workflow list was requested and the list DID change, and it still does ` +
+        `not contain a match. (The panel cannot see whether the server read itself succeeded — ` +
+        `this frontend's sync swallows its own errors — so this reports the list, not the read.)`
+      : refresh === "unchanged"
         ? `A re-read of the workflow list was requested and returned, but NOTHING in the list ` +
           `changed — so this panel cannot confirm the list was actually refreshed, and cannot ` +
           `treat the absence as proof the file is missing. (This frontend's sync swallows its own ` +

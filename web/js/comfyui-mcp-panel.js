@@ -13676,11 +13676,20 @@ const GRAPH_TOOL_EXECUTORS = {
           // when the contents happen to match. classifyWorkflowRefresh decides.
           return { counts: `${open.length}/${saved.length}`, open, saved };
         };
+        // Is array IDENTITY informative on this frontend? A reactive getter that
+        // materialises a fresh array per access would make the identity test
+        // fire on every refresh, reporting "changed" unconditionally and putting
+        // the original bug back in new wording (review). Two reads with nothing
+        // between them answer it: if identity already differs, it carries no
+        // information and only counts are compared.
+        const control = fingerprintStore();
         const before = fingerprintStore();
+        const identityMeaningful =
+          control.open === before.open && control.saved === before.saved;
         try {
           await s.syncWorkflows();
           const after = fingerprintStore();
-          refresh = classifyWorkflowRefresh(before, after);
+          refresh = classifyWorkflowRefresh(before, after, { identityMeaningful });
         } catch (err) {
           // Kept for a frontend that DOES set throwError, and for a store that
           // throws synchronously before ever reaching useAsyncState.
