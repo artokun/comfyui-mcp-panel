@@ -1838,6 +1838,28 @@ const READ_ONLY_GRAPH_COMMANDS = new Set([
   "graph_get_subgraph",
   "graph_list_subgraphs",
   "graph_screenshot",
+  // #1478 — `graph_get_errors` reads the error surface and writes nothing. It was
+  // missing here, so `graphCommandMayMutateWorkflow` called it a MUTATION and a
+  // dirty tab refused it as `dirty-mutation-binding-unproven` — a message that
+  // calls a read "this mutation" and prescribes reloading the tab or re-opening
+  // the workflow, neither of which a read should ever cost.
+  //
+  // It is also the worst possible moment to refuse it: the reporter had just
+  // loaded a pack whose nodes were already red, which is exactly when this tool
+  // is the one to call. They fell back to filesystem globs.
+  //
+  // WHY THIS LIST IS THE FIX AND NOT THE GUARD. Membership here lowers the bar
+  // for a command, so it is an enumeration that must stay conservative: a read
+  // aimed at the wrong canvas returns wrong DATA, while a mutation aimed there
+  // corrupts a graph, and that asymmetry is the whole reason reads have a lower
+  // bar at all. So this grows one verified command at a time, never by pattern.
+  //
+  // `graph_get_object_info` and `graph_prompt_director_audit` are also absent and
+  // also look like reads, but "looks like" is not the standard for weakening a
+  // guard — they stay out until someone establishes it the way this one was
+  // (the orchestrator's own tool description says "Read-only", and its executor
+  // touches no graph state).
+  "graph_get_errors",
 ]);
 
 export function graphCommandMayMutateWorkflow(command) {
