@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.32] - 2026-08-13
+
+### Fixed
+- a node-inputs difference that is only the frontend's definition rebuild is not content loss (#1208)
+
+
+## [0.14.32] - 2026-08-14
+
+### Fixed
+- a faithful workflow_open no longer reports CONTENT_UNVERIFIED just because the frontend rebuilt each node's `inputs` from its definition (comfyui-mcp#1467)
+
 ## [0.14.31] - 2026-08-13
 
 ### Fixed
