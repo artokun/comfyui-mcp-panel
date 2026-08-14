@@ -804,11 +804,24 @@ test("#696: the relaxation needs POSITIVE identity — an untagged root is still
   assert.equal(driftVerdict(fixture)?.reason, "root-shape-mismatch");
 });
 
-test("#696: a STRUCTURAL difference on a tagged root is still a refusal, in every surface", () => {
-  // The direction that must NOT be softened. Each of these is a real wrong-canvas
-  // signature; the identity tag is present in all of them, so only the structural
-  // comparison can hold the line.
-  const cases = {
+// #1187 REPLACES the boundary this block used to assert. It previously required that a
+// structural difference refuse EVEN on a tagged root, because the tag was consulted only as a
+// conjunct of `structureMatches`. That is exactly the defect: a hand-edited canvas differs
+// structurally by definition, so the workflow's own identity stamp could never rescue it, and
+// every read and write was refused while ChangeTracker's snapshot lagged.
+//
+// The boundary now runs through IDENTITY, not shape. These same seven signatures must be
+// refused when the tag is ABSENT or FOREIGN, and permitted when it MATCHES. Written as one
+// table over all three tag states so the widening cannot be mistaken for a blanket relaxation
+// — deleting the guard would turn the middle and bottom sections green too.
+const STRUCTURAL_SIGNATURES = () => ({
+  // THE REPORTED CASE, and the one the old table was missing: a node ADDED by hand, so the
+  // live canvas runs AHEAD of the tracker (the issue's 98 vs 99). Deliberately distinct from
+  // "a node was removed" below — #618's `midPopulation` absorbs the count-SHORT direction
+  // inside the reconnect window, so only the count-LONG direction reaches the shape term.
+  "a node was added by hand": (nodes, state) => {
+    state.nodes = [...nodes, { id: 4, type: "SaveImage", widgets_values: [] }];
+  },
     "a node type changed": (nodes) => {
       nodes[0].type = "UNETLoader";
     },
@@ -830,15 +843,60 @@ test("#696: a STRUCTURAL difference on a tagged root is still a refusal, in ever
     "a top-level subgraph appeared": (nodes, state) => {
       state.subgraphs = [{ id: "s1", nodes: [{ id: 7, type: "SaveImage" }] }];
     },
-  };
-  for (const [label, drift] of Object.entries(cases)) {
+  });
+
+test("#1187: a STRUCTURAL difference on a PROVEN root is permitted — it is the user's own edit", () => {
+  // The case the issue reports. The user adds a node by hand; ChangeTracker has not captured
+  // yet, so `isModified` is still false and `activeState` still reports the old count. Before
+  // #1187 this refused every read AND every mutation, telling the user their own canvas was
+  // "bound to a different graph", and cleared itself once the tracker caught up — which is
+  // why it read as intermittent rather than as the deterministic race it is.
+  for (const [label, drift] of Object.entries(STRUCTURAL_SIGNATURES())) {
     const fixture = driftFixture({ drift });
+    // NOT vacuous: the raw comparator must still report the difference. A fixture with
+    // `isModified: true` would make `graphRootMismatchesActiveWorkflow` bail, leaving
+    // `contentDiffers` false and the verdict null for a reason that has nothing to do with
+    // this fix — passing while proving nothing.
+    assert.equal(
+      graphRootMismatchesActiveWorkflow({ rootGraph: fixture.rootGraph, activeWorkflow: fixture.activeWorkflow }),
+      true,
+      `${label}: the comparator must still see it, or this case proves nothing`,
+    );
     assert.equal(
       graphRootContentDriftOnBoundCanvas(fixture),
       false,
-      `${label} is STRUCTURAL — it must never be waved through as content drift`,
+      `${label} is STRUCTURAL — it must never be waved through as CONTENT drift`,
     );
-    assert.ok(driftVerdict(fixture), `${label} must still be refused`);
+    // …and yet the verdict permits it, because the tag is identity and the tracker is a
+    // lagging snapshot. This is the widening of #349's structural line, asserted explicitly.
+    assert.equal(driftVerdict(fixture), null, `${label} on a proven root must be permitted (#1187)`);
+  }
+});
+
+test("#1187: the same signatures are still REFUSED on an untagged root", () => {
+  // Absence of the tag is absence of proof. Without it, byte-identical structure cannot tell
+  // the active tab's canvas from a duplicate tab's — so the whole relaxation has nothing to
+  // stand on and the guard must hold. Deleting the fix would make the test ABOVE go red;
+  // deleting the guard would make THIS one go red. Both directions are pinned.
+  for (const [label, drift] of Object.entries(STRUCTURAL_SIGNATURES())) {
+    const fixture = driftFixture({ drift, rootUuid: null });
+    assert.equal(
+      driftVerdict(fixture)?.reason,
+      "root-shape-mismatch",
+      `${label} on an UNTAGGED root must still be refused`,
+    );
+  }
+});
+
+test("#1187: the same signatures are still REFUSED on a foreign tag", () => {
+  // #349's wrong-canvas case, ordered ahead of the shape term and untouched by the widening.
+  for (const [label, drift] of Object.entries(STRUCTURAL_SIGNATURES())) {
+    const fixture = driftFixture({ drift, rootUuid: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb" });
+    assert.equal(
+      driftVerdict(fixture, { rootUuidMismatch: true })?.reason,
+      "root-workflow-uuid-mismatch",
+      `${label} on a FOREIGN tag must still be refused`,
+    );
   }
 });
 
