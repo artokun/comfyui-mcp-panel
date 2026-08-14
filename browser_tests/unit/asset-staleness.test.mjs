@@ -8,6 +8,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+/** #1172 — the wiring assertion reads the shipped monolith, so the disclosure cannot be
+ *  added to the verdict while the forwarding whitelist silently drops it. */
+const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 
 import {
   findNodeByScopedId,
@@ -22,6 +27,8 @@ import {
   reconcileUnknownWidgetNames,
   collectAllGraphs,
   reapplyDefsToLiveNodes,
+  emptyComboListsOnGraph,
+  emptyComboNote,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
@@ -1206,4 +1213,97 @@ test("resolveMissingModelDirectory: NON-ultralytics directories never regress", 
   assert.equal(resolveMissingModelDirectory("loras", "bbox/x.pt"), "loras");
   assert.equal(resolveMissingModelDirectory("ultralytics_extra", "segm/x.pt"), "ultralytics_extra");
   assert.equal(resolveMissingModelDirectory(null, "segm/x.pt"), null);
+});
+
+// ── #1172: the reapply sweep must REBUILD combo options, and empty lists must be disclosed ──
+
+const CKPT_DEF = (values) => ({ input: { required: { ckpt_name: [values, {}] } } });
+
+test("#1172 the reapply sweep repopulates a combo whose option list is empty", () => {
+  // The reported bug. panel_add_node builds the widget from the REGISTERED nodeData, so a
+  // newly added CheckpointLoaderSimple starts with `values: []`. The sweep stamped nodeData
+  // and reconciled UNKNOWN names but never touched options.values, leaving the node unusable
+  // while refresh_nodes answered `refreshed: true`.
+  const node = {
+    id: 1,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", value: "", options: { values: [] } }],
+    constructor: {},
+  };
+  reapplyDefsToLiveNodes(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF(["anime.safetensors", "sd15.ckpt"]) });
+  assert.deepEqual(node.widgets[0].options.values, ["anime.safetensors", "sd15.ckpt"]);
+});
+
+test("#1172 the rebuild reaches nodes inside SUBGRAPHS", () => {
+  // collectAllGraphs already walks them; the rebuild rides the same sweep, so a promoted
+  // inner node must be repaired too rather than silently skipped.
+  const inner = { id: 2, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", options: { values: [] } }], constructor: {} };
+  const root = graphOf([{ id: 1, type: "Host", subgraph: { _nodes: [inner] } }]);
+  reapplyDefsToLiveNodes(root, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) });
+  assert.deepEqual(inner.widgets[0].options.values, ["a.safetensors"]);
+});
+
+test("#1172 a DYNAMIC (function) option source is never clobbered", () => {
+  // #507/#1133 hazard: a client-populated combo derives its own list. Overwriting it with the
+  // backend's array would break exactly the nodes #1133 is making writable.
+  const dynamic = () => ["computed"];
+  const node = { id: 3, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", options: { values: dynamic } }], constructor: {} };
+  reapplyDefsToLiveNodes(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) });
+  assert.equal(node.widgets[0].options.values, dynamic, "a function source must survive the sweep");
+});
+
+test("#1172 emptyComboListsOnGraph reports only EMPTY lists, and only for types on the graph", () => {
+  const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [], constructor: {} };
+  const defs = {
+    CheckpointLoaderSimple: CKPT_DEF([]),
+    // present in the payload but NOT on the graph — the backend may publish dozens of empty
+    // combos for packs the user is not using, and reporting those buries the one that matters.
+    SomeOtherLoader: { input: { required: { other_name: [[], {}] } } },
+  };
+  assert.deepEqual(emptyComboListsOnGraph(graphOf([node]), defs), [
+    { type: "CheckpointLoaderSimple", widget: "ckpt_name" },
+  ]);
+});
+
+test("#1172 FALSE-POSITIVE FLOOR: a populated list discloses nothing", () => {
+  // If this ever goes red the disclosure fires on every refresh and is worthless.
+  const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [], constructor: {} };
+  assert.deepEqual(emptyComboListsOnGraph(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }), []);
+  // A non-combo input (a type string, not an option array) is not an empty combo either.
+  assert.deepEqual(
+    emptyComboListsOnGraph(graphOf([node]), { CheckpointLoaderSimple: { input: { required: { steps: ["INT", { default: 20 }] } } } }),
+    [],
+  );
+  assert.deepEqual(emptyComboListsOnGraph(graphOf([node]), null), []);
+  assert.deepEqual(emptyComboListsOnGraph(null, { CheckpointLoaderSimple: CKPT_DEF([]) }), []);
+});
+
+test("#1172 the note points at the BACKEND, never at another refresh", () => {
+  // The wrong-remedy failure this repo keeps removing: telling the agent to re-run the very
+  // command that just answered. The refresh worked; the server's answer is what is empty.
+  const note = emptyComboNote([{ type: "CheckpointLoaderSimple", widget: "ckpt_name" }]);
+  assert.match(note, /CheckpointLoaderSimple\.ckpt_name/);
+  assert.match(note, /refresh(ing)? again will return the same thing/i);
+  assert.match(note, /model paths/);
+  assert.doesNotMatch(note, /panel_refresh_nodes|try refreshing|refresh the nodes again/i);
+  assert.equal(emptyComboNote([]), "");
+  assert.equal(emptyComboNote(null), "");
+});
+
+test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's hole)", () => {
+  // That branch returns a FIXED object literal, so a field the verdict carries but the
+  // whitelist does not name is dropped on exactly the successful path where it matters.
+  // #981 fell into this hole at this same line; a verdict-only change would look correct in
+  // every unit test and report nothing to the agent.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const code = src.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.match(code, /verdict\.empty_combo_lists = empties;/, "the verdict must carry the field");
+  assert.match(
+    code,
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos \};/,
+    "…and the refreshed:true branch must forward it",
+  );
+  // #1133: an empty list must never flip the verdict to failed — that would re-refuse via the
+  // verdict what #1133 deliberately permits via the write path.
+  assert.doesNotMatch(code, /empty_combo_lists[\s\S]{0,200}?refreshed = false/, "disclosure, not failure");
 });

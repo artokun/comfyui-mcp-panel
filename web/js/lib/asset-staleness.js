@@ -761,14 +761,18 @@ export function collectAllGraphs(rootGraph) {
  * map supplies the concrete-def key to look its options up under (#458×#366). Widgets
  * not in the map fall back to their own name.
  */
-export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap) {
+export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap, mergedInputs) {
   let refreshed = 0;
   if (!node || !defsByType) return refreshed;
   try {
     const type = defTypeKey ?? node.type ?? node.comfyClass;
     const def = type ? defsByType[type] : null;
     if (!def) return refreshed;
-    const inputs = { ...(def.input?.required ?? {}), ...(def.input?.optional ?? {}) };
+    // #1193 — the merged map may be supplied by a caller sweeping MANY nodes, so a graph of
+    // N nodes of the same type spreads its inputs once rather than N times. This function is
+    // O(inputs) per call and #1193 measured the register/reapply phase at 3.97s of a 9s run;
+    // rebuilding combos there must not add a fresh spread per node.
+    const inputs = mergedInputs ?? { ...(def.input?.required ?? {}), ...(def.input?.optional ?? {}) };
     for (const w of node.widgets ?? []) {
       if (w?.name == null) continue;
       const defKey = (widgetNameMap && widgetNameMap[w.name]) ?? w.name;
@@ -790,15 +794,116 @@ export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widget
   return refreshed;
 }
 
-export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
-  let repaired = 0;
-  if (!defsByType) return repaired;
+/** Merged `{...required, ...optional}` per TYPE, built at most once per sweep (#1193). */
+function mergedInputsFor(def, cache, type) {
+  if (cache.has(type)) return cache.get(type);
+  const merged = { ...(def.input?.required ?? {}), ...(def.input?.optional ?? {}) };
+  cache.set(type, merged);
+  return merged;
+}
+
+/**
+ * Is this input spec a combo whose authoritative option list came back EMPTY?
+ *
+ * A combo's spec is `[[opt, ...], config?]`. An empty first element is the backend saying
+ * "this widget has no valid values" — which is a real answer (#507/#1133: a server with zero
+ * checkpoints), not a panel failure. It is worth DISCLOSING and never worth refusing over.
+ */
+function isEmptyComboSpec(spec) {
+  const first = Array.isArray(spec) ? spec[0] : undefined;
+  return Array.isArray(first) && first.length === 0;
+}
+
+/**
+ * #1172 — the combos whose AUTHORITATIVE list is empty, for the types actually on the graph.
+ *
+ * Computed from the `/object_info` payload the caller already holds, deliberately NOT by
+ * re-reading widgets after `app.refreshComboInNodes()` resolves. #1193 wants to stop waiting
+ * on that call; a disclosure that depended on it would tie this answer to the one await it is
+ * trying to drop, and would report nothing at all if the call were ever abandoned mid-flight.
+ *
+ * Scoped to types PRESENT on the graph. The backend may publish dozens of empty combos for
+ * packs the user is not using, and reporting those would bury the one node that matters —
+ * the same "say only what was observed to matter" rule `describeUploadFailure` follows.
+ *
+ * @returns {Array<{type: string, widget: string}>} sorted, de-duplicated
+ */
+export function emptyComboListsOnGraph(rootGraph, defsByType) {
+  const found = new Map();
+  if (!defsByType) return [];
   try {
+    const cache = new Map();
     for (const graph of collectAllGraphs(rootGraph)) {
       for (const node of graph._nodes ?? []) {
         const type = node?.type ?? node?.comfyClass;
         const def = type ? defsByType[type] : null;
         if (!def) continue;
+        const inputs = mergedInputsFor(def, cache, type);
+        for (const [widget, spec] of Object.entries(inputs)) {
+          if (!isEmptyComboSpec(spec)) continue;
+          found.set(`${type}::${widget}`, { type, widget });
+        }
+      }
+    }
+  } catch {
+    /* best-effort — a malformed def means we disclose less, never that we refuse */
+  }
+  return [...found.values()].sort((a, b) => a.type.localeCompare(b.type) || a.widget.localeCompare(b.widget));
+}
+
+/**
+ * #1172 — what to tell the agent when the backend's own list came back empty.
+ *
+ * Points at the BACKEND, deliberately. The panel did refresh, it did re-read
+ * `/object_info`, and the server answered with no values — so another `panel_refresh_nodes`
+ * changes nothing. Naming the refresh as the remedy is the wrong-remedy failure this repo
+ * keeps removing; the remedy is the server's model paths, or a ComfyUI restart.
+ *
+ * Claims ONLY what was observed: that the list arrived empty. Not that the model is missing
+ * (it may be present but unindexed), not that the node is broken, and not that a run will
+ * fail — a widget the user never sets can be empty forever without consequence.
+ */
+export function emptyComboNote(empties) {
+  if (!Array.isArray(empties) || !empties.length) return "";
+  const shown = empties.slice(0, 6).map((e) => `${e.type}.${e.widget}`).join(", ");
+  const more = empties.length > 6 ? `, and ${empties.length - 6} more` : "";
+  return (
+    `${empties.length} combo widget${empties.length === 1 ? "" : "s"} on this graph ` +
+    `${empties.length === 1 ? "has" : "have"} an EMPTY list of valid values in the definitions ` +
+    `the backend just published: ${shown}${more}. The refresh itself succeeded — this is what ` +
+    `/object_info returned, so refreshing again will return the same thing. If a value is ` +
+    `expected there, the backend is not finding it: check that server's model paths, then ` +
+    `restart ComfyUI. Setting one of these widgets will be refused until the backend lists it.`
+  );
+}
+
+export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
+  let repaired = 0;
+  if (!defsByType) return repaired;
+  try {
+    // #1193 — one merged input map per TYPE for the whole sweep, not one per node.
+    const mergedCache = new Map();
+    for (const graph of collectAllGraphs(rootGraph)) {
+      for (const node of graph._nodes ?? []) {
+        const type = node?.type ?? node?.comfyClass;
+        const def = type ? defsByType[type] : null;
+        if (!def) continue;
+        // #1172 — REBUILD THE COMBO OPTION ARRAYS HERE.
+        //
+        // This sweep stamped `ctor.nodeData` and reconciled UNKNOWN widget names but never
+        // touched `options.values`, even though `refreshComboOptionsFromDefs` — which does
+        // exactly that — sits thirty lines above and was called only from the set_widget
+        // path. Rebuilding was delegated entirely to `app.refreshComboInNodes()`, whose
+        // per-node effect the panel never observes and never verifies, so a newly added
+        // CheckpointLoaderSimple kept an empty `ckpt_name` list while `refresh_nodes`
+        // answered `refreshed: true`. Doing it here also makes the panel's combo state
+        // correct independently of whether that frontend call is waited on at all, which is
+        // a partial answer to #1193.
+        //
+        // It is safe to run alongside the frontend call: `refreshComboOptionsFromDefs`
+        // skips a dynamic (function) option source and writes the same values
+        // `/object_info` just published.
+        refreshComboOptionsFromDefs(node, defsByType, type, undefined, mergedInputsFor(def, mergedCache, type));
         // Stamp only onto a TYPE-SPECIFIC constructor (already carries nodeData
         // for this type) — never onto a shared generic/unknown fallback class,
         // which would corrupt every other unknown node.
