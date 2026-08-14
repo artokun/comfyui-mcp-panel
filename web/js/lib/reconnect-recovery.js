@@ -109,25 +109,76 @@ export async function watchPostReconnectSettle({
  *
  * Both refusals are retryable and state that nothing was applied — true
  * because the gate runs BEFORE the executor.
+ *
+ * ## Why this returns STRUCTURE, not a sentence (#1529)
+ *
+ * That last paragraph is the fact an automatic retry depends on, and until now it
+ * existed only in prose. The orchestrator half of #1529 was first written to
+ * regex-match this text to decide a retry was safe, and was reverted as a P0:
+ * the property being asserted — "the executor did not run" — is not derivable
+ * from a string the executor itself could have produced. Acknowledged panel
+ * errors travel as arbitrary `msg.error` text, so any sentence written here, a
+ * genuine mid-write failure can also contain. Being wrong does not print a bad
+ * message; it DOUBLE-APPLIES a graph mutation.
+ *
+ * So the trusted side states it structurally and the reader keys on that. This
+ * is the same shape as the bridge's other provenance channels (`markReplyTimeout`,
+ * `tabIncarnation`, the #514 open receipt): a fact the panel KNOWS, published as
+ * a field rather than inferred from wording.
+ *
+ * `applied: false` is a claim this gate is entitled to make and callers are not:
+ * it is true precisely because the gate runs before the executor, which is why
+ * both call sites must keep invoking it there.
+ *
+ * @returns {{code: string, message: string, applied: false, stage: "pre-executor",
+ *   retryable: true}|null}
  */
 export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSettleWindow = false } = {}) {
   const name = typeof cmd === "string" && cmd ? `"${cmd}"` : "this graph command";
+  /** Every refusal from this gate shares these — see the docblock. */
+  const base = { applied: false, stage: "pre-executor", retryable: true };
   if (backendDown) {
-    return (
-      `[backend-reconnecting] ComfyUI's backend connection is down right now (a restart or ` +
-      `reconnect is in progress), so ${name} was NOT applied — nothing changed. A graph mutation ` +
-      `dispatched in this window can land on a canvas the reconnect is about to rebuild. Retry ` +
-      `once the tab has reconnected (usually seconds); if it never reconnects, reload the ComfyUI page.`
-    );
+    return {
+      ...base,
+      code: "backend-reconnecting",
+      message:
+        `[backend-reconnecting] ComfyUI's backend connection is down right now (a restart or ` +
+        `reconnect is in progress), so ${name} was NOT applied — nothing changed. A graph mutation ` +
+        `dispatched in this window can land on a canvas the reconnect is about to rebuild. Retry ` +
+        `once the tab has reconnected (usually seconds); if it never reconnects, reload the ComfyUI page.`,
+    };
   }
   if (bindingSettleWindow) {
-    return (
-      `[post-reconnect-settling] ComfyUI reconnected moments ago and the panel has not yet ` +
-      `re-proven that the canvas is bound to the active workflow, so ${name} was NOT applied — ` +
-      `nothing changed. The panel re-proves the binding automatically (usually within a few ` +
-      `seconds); retry in a moment. If this persists past ~30 seconds, re-open the active ` +
-      `workflow tab (panel_open_workflow) or reload the panel (panel_reload scope:frontend), then retry.`
-    );
+    return {
+      ...base,
+      code: "post-reconnect-settling",
+      message:
+        `[post-reconnect-settling] ComfyUI reconnected moments ago and the panel has not yet ` +
+        `re-proven that the canvas is bound to the active workflow, so ${name} was NOT applied — ` +
+        `nothing changed. The panel re-proves the binding automatically (usually within a few ` +
+        `seconds); retry in a moment. If this persists past ~30 seconds, re-open the active ` +
+        `workflow tab (panel_open_workflow) or reload the panel (panel_reload scope:frontend), then retry.`,
+    };
   }
   return null;
+}
+
+/**
+ * Throwable form: an Error whose message is unchanged from before, carrying the
+ * structured refusal on a named property so the reply builder can publish it.
+ *
+ * A dedicated property rather than spreading fields onto the Error: `code` and
+ * `message` on an Error are conventional and already mean other things to other
+ * readers, and a refusal that quietly changed what `err.code` means for every
+ * catch in the file is the kind of collision that surfaces months later.
+ */
+export function reconnectRefusalError(refusal) {
+  const err = new Error(refusal.message);
+  err.cmcpRefusal = {
+    code: refusal.code,
+    applied: refusal.applied,
+    stage: refusal.stage,
+    retryable: refusal.retryable,
+  };
+  return err;
 }

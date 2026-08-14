@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 import {
   watchPostReconnectSettle,
   graphMutationReconnectGate,
+  reconnectRefusalError,
 } from "../../web/js/lib/reconnect-recovery.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -161,7 +162,7 @@ test("#646: no instability signal → no gate", () => {
 });
 
 test("#646: backend down refuses with a retryable, nothing-applied message naming the command", () => {
-  const msg = graphMutationReconnectGate({ cmd: "graph_set_widget", backendDown: true });
+  const { message: msg } = graphMutationReconnectGate({ cmd: "graph_set_widget", backendDown: true });
   assert.match(msg, /\[backend-reconnecting\]/);
   assert.match(msg, /"graph_set_widget"/, "the refusal names the command it refused");
   assert.match(msg, /NOT applied — nothing changed/, "the refusal is honest that nothing ran");
@@ -169,15 +170,139 @@ test("#646: backend down refuses with a retryable, nothing-applied message namin
 });
 
 test("#646: the unproven-binding window refuses and names the escalate-after-30s remedy", () => {
-  const msg = graphMutationReconnectGate({ cmd: "graph_add_node", bindingSettleWindow: true });
+  const { message: msg } = graphMutationReconnectGate({ cmd: "graph_add_node", bindingSettleWindow: true });
   assert.match(msg, /\[post-reconnect-settling\]/);
   assert.match(msg, /NOT applied — nothing changed/);
   assert.match(msg, /panel_open_workflow/, "the persistent case names the proven-rebind remedy");
 });
 
 test("#646: backend-down takes precedence over the settle window (both true)", () => {
-  const msg = graphMutationReconnectGate({ cmd: "graph_run", backendDown: true, bindingSettleWindow: true });
+  const { message: msg, code } = graphMutationReconnectGate({
+    cmd: "graph_run",
+    backendDown: true,
+    bindingSettleWindow: true,
+  });
   assert.match(msg, /\[backend-reconnecting\]/);
+  assert.equal(code, "backend-reconnecting", "the CODE agrees with the message, not just the prose");
+});
+
+// ── #1529: the refusal is STRUCTURE, not a sentence ─────────────────────────
+//
+// The property a retry depends on — "the executor did not run" — was previously
+// only stated in prose. A reader that matched the text to decide a retry was safe
+// was reverted as a P0: acknowledged panel errors travel as arbitrary text, so a
+// genuine MID-WRITE failure can contain the same words, and being wrong there
+// double-applies a graph mutation. These tests fence the field, not the wording.
+
+test("#1529: every refusal carries applied:false / pre-executor / retryable", () => {
+  for (const args of [
+    { cmd: "graph_set_widget", backendDown: true },
+    { cmd: "graph_add_node", bindingSettleWindow: true },
+    { cmd: "graph_run", backendDown: true, bindingSettleWindow: true },
+  ]) {
+    const refusal = graphMutationReconnectGate(args);
+    assert.equal(refusal.applied, false, JSON.stringify(args));
+    assert.equal(refusal.stage, "pre-executor", JSON.stringify(args));
+    assert.equal(refusal.retryable, true, JSON.stringify(args));
+    assert.equal(typeof refusal.code, "string");
+    assert.ok(refusal.code.length > 0, "a refusal without a code is not machine-readable");
+  }
+});
+
+test("#1529: the two codes are DISTINCT — a reader can tell the cases apart", () => {
+  // They differ in remedy (wait for the socket vs re-prove the binding), so a
+  // reader that collapsed them would retry the wrong one forever.
+  assert.notEqual(
+    graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }).code,
+    graphMutationReconnectGate({ cmd: "graph_run", bindingSettleWindow: true }).code,
+  );
+});
+
+test("#1529: NO refusal still means null — the gate did not become truthy-always", () => {
+  // The direction that would be catastrophic: an object is truthy, so if the
+  // clean path started returning one, EVERY graph mutation would refuse.
+  assert.equal(graphMutationReconnectGate({ cmd: "graph_run" }), null);
+  assert.equal(graphMutationReconnectGate({ cmd: "graph_run", backendDown: false }), null);
+  assert.equal(graphMutationReconnectGate(), null);
+});
+
+test("#1529: reconnectRefusalError keeps the message and attaches the structure", () => {
+  const refusal = graphMutationReconnectGate({ cmd: "graph_set_widget", backendDown: true });
+  const err = reconnectRefusalError(refusal);
+  assert.ok(err instanceof Error, "it must still be throwable/catchable as an Error");
+  assert.equal(err.message, refusal.message, "the human-readable text is UNCHANGED from before");
+  assert.deepEqual(err.cmcpRefusal, {
+    code: "backend-reconnecting",
+    applied: false,
+    stage: "pre-executor",
+    retryable: true,
+  });
+});
+
+test("#1529: the structure does not collide with Error's own fields", () => {
+  // Deliberately a namespaced property: `code` and `message` on an Error already
+  // mean other things to other catch blocks in the panel, and quietly changing
+  // what `err.code` means is the collision that surfaces months later.
+  const err = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }));
+  assert.equal(err.code, undefined, "Error.code is left alone");
+  assert.equal(err.applied, undefined);
+  assert.equal(err.retryable, undefined);
+});
+
+// ── The wiring: the field only helps if it REACHES the reply ────────────────
+//
+// TESTED below: both call sites throw the structured error, and the wire-reply
+// builder publishes it.
+//
+// NOT TESTED, MEASURED by reading — the throw survives the trip. A catch between
+// a call site and the reply that rebuilt the Error would strip `cmcpRefusal`
+// silently, leaving `error` intact and the field simply absent: a no-op that
+// looks exactly like success. The file has 211 `throw new Error(`, of which four
+// rebuild from a caught error — lines ~5570 (manager fetch), ~10933 (graph JSON
+// parse), ~14653 (rename), ~16288 (canvas draw) — and none is on a path from
+// either gate. The one rethrow that IS on a command path (~13479, workflow_new)
+// is `throw err instanceof Error ? err : new Error(…)`, which preserves identity
+// and therefore the property.
+//
+// A brace-counting "is there an enclosing catch" scan was written and REMOVED:
+// its function-boundary heuristic silently bound the wrong slice and reported a
+// clean answer for a function 1500 lines away. Same lesson as #1478 — a wiring
+// scan that mis-bounds is worse than a note, because it reports PASS.
+
+test("#1529 wiring: both gate call sites throw the STRUCTURED error", () => {
+  // A call site left on `new Error(gate)` would stringify the object to
+  // "[object Object]" — the gate's own message lost AND no field published.
+  assert.equal(
+    (SRC.match(/if \(reconnectGate\) throw reconnectRefusalError\(reconnectGate\);/g) ?? []).length,
+    2,
+    "both graph-mutation entry points throw the structured refusal",
+  );
+  assert.doesNotMatch(
+    SRC,
+    /throw new Error\(reconnectGate\)/,
+    "no call site may still throw the bare gate value",
+  );
+});
+
+test("#1529 wiring: the reply builder publishes `refusal` and leaves `error` alone", () => {
+  // Anchored on the WIRE-REPLY builder specifically. `coerceMessageText(err…)`
+  // appears at 14 sites in this file — journal entries (noteOpenAttempt) and UI
+  // toasts among them — and the first occurrence is a workflow_new journal write,
+  // not this. An anchor that matched the wrong one passed its assertions against
+  // unrelated text, which is how a wiring test goes vacuous.
+  const start = SRC.indexOf("reply = {\n            rid: msg.rid,\n            ok: false,");
+  assert.notEqual(start, -1, "the acknowledged-error WIRE reply builder is still recognisable");
+  const block = SRC.slice(start, start + 900);
+  assert.match(block, /error: coerceMessageText\(err\?\.message \?\? err\),/, "the text reply is intact");
+  assert.match(
+    block,
+    /\.\.\.\(err\?\.cmcpRefusal \? \{ refusal: err\.cmcpRefusal \} : \{\}\)/,
+    "the structured refusal rides along on the reply",
+  );
+  // Additive: the spread is CONDITIONAL, so an ordinary error's reply has no
+  // `refusal` key at all — a reader keying on presence cannot be fooled by an
+  // unrelated failure.
+  assert.match(block, /err\?\.cmcpRefusal \?/, "absent on every error that is not this gate's");
 });
 
 // ---------------------------------------------------------------------------
