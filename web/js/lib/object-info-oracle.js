@@ -625,13 +625,21 @@ export async function fetchWholeObjectInfo({
       let statusCode = null;
       try {
         responseOk = !!res && res.ok === true;
+        // READ THE STATUS EXACTLY ONCE, and derive BOTH the decision and the display text
+        // from that one value (#1223). This code deliberately supports a monkey-patched
+        // fetchApi returning a proxied or getter-backed response — the two screens above
+        // say so — and such a response can answer differently on each read. Two reads let a
+        // first value of 504 classify the route as silence while the second, 502, is what
+        // the message reports: the fallback would then be licensed by a status that exists
+        // only in the classification, against a reply that names the status meant to
+        // disqualify it.
         const raw = res?.status;
         statusCode = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
         // SANITIZE INSIDE THE GUARD. Reading `.status` is not the only operation that can
         // throw — INTERPOLATING it does too (`Object.create(null)` cannot convert to a
         // primitive), and that interpolation sits below this try. Verified against main,
         // which returned a failures entry where this rejected.
-        responseStatus = sanitizeDetail(res?.status ?? "unknown") || "unknown";
+        responseStatus = sanitizeDetail(raw ?? "unknown") || "unknown";
       } catch (err) {
         record(
           "http",

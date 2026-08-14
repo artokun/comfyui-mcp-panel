@@ -219,6 +219,34 @@ test("#1223 a 502 cannot license the fallback even when every other route went q
   );
 });
 
+test("#1223 an UNSTABLE status cannot classify as silence while reporting a disqualifying code", async () => {
+  // This module deliberately supports a monkey-patched fetchApi returning a proxied or
+  // getter-backed response — its own comments say so — and such a response can answer
+  // differently on each read. Two reads let a first value of 504 license the fallback while
+  // the second, 502, is what the reply names: the decision and the disclosure would then
+  // describe different responses, and the licensing one is invisible to the reader.
+  let reads = 0;
+  const flipflop = {
+    ok: false,
+    get status() {
+      reads += 1;
+      return reads === 1 ? 504 : 502;
+    },
+  };
+  const { outcomes, failures } = await fetchWholeObjectInfo({
+    deadlineMs: 40,
+    getNodeDefs: null,
+    fetchApi: async () => flipflop,
+  });
+  const reported = /status (\d+)/.exec(failures.join(" "))?.[1];
+  const silent = outcomes.at(-1).kind === TRANSPORT_OUTCOME.NO_ANSWER;
+  assert.equal(
+    silent,
+    reported === "504",
+    `classification and disclosure must describe the SAME response (reported ${reported}, silent=${silent})`,
+  );
+});
+
 test("#1223 the gateway refusal SAYS it was a proxy, not the backend", async () => {
   const { failures } = await fetchWholeObjectInfo({
     deadlineMs: 40,
@@ -631,7 +659,19 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   // Each CALL SITE is checked for its own claim. Counting `whole: true` across the file
   // instead counted the comment that documents the rule, which is not a call site.
   const sites = [...PANEL_SRC.matchAll(/objectInfoSnapshot\.record\(/g)];
-  assert.equal(sites.length, 3, "startup seed, refresh run, set_widget oracle — add one and justify it here");
+  assert.equal(
+    sites.length,
+    4,
+    "startup seed, refresh run, set_widget oracle, add_node resolver — add one and justify it here",
+  );
+  // The add_node site is gated on the panel's own record of WHICH question it asked. A
+  // single-class /object_info/<Type> payload reaching the snapshot would make every other
+  // type read as absent and the ever-seen gate diagnose the install as removed packs.
+  assert.match(
+    PANEL_SRC,
+    /if \(freshDefs && !freshDefsAreSingleClass\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    "add_node files its payload only when it fetched the WHOLE schema",
+  );
   for (const site of sites) {
     const call = PANEL_SRC.slice(site.index, site.index + 260);
     assert.match(call, /whole: true/, `the record site at index ${site.index} states the wholeness claim`);

@@ -10735,6 +10735,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // schema — a sibling class is where a custom link datatype is produced. Remember
     // which payload we got, because a single-class map is not evidence about siblings.
     let freshDefsAreSingleClass = false;
+    // #1223 — the epoch before ANY fetch inside the resolver goes out, so a whole map it
+    // obtains can be filed with honest provenance below.
+    const addNodeObservedAtEpoch = backendReconnectEpoch;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
         // #767 — ask about ONE type instead of re-downloading the whole schema.
@@ -10795,6 +10798,26 @@ const GRAPH_TOOL_EXECUTORS = {
       // pack that is not installed, and the refusal used to name only the latter.
       readImportFailures: () => readPackImportFailures(api),
     });
+    // #1223 — file the WHOLE map this resolver fetched, when it fetched one.
+    //
+    // AFTER the resolver, not inside it: when a type needs registering the resolver calls
+    // `refresh`, and `registerComfyNodeDefs` CLEARS the snapshot at the start of its run.
+    // Recording earlier would simply be wiped. Skipping it altogether — which the earlier
+    // `!preloadedDefs` rule did, since the resolver hands its payload in as `preloadedDefs`
+    // — left an add that registers a new type with NO snapshot at all, so the very next
+    // render-induced probe timeout reproduced the refusal this issue exists to remove.
+    //
+    // `freshDefsAreSingleClass` is the panel's OWN record of which question it asked, so it
+    // is the honest wholeness claim; the single-class fast path is only taken for an
+    // already-registered type, and it sets that flag. Mutation by a beforeRegisterNodeDef
+    // hook (#700) is irrelevant here because `record` copies out only the type NAMES.
+    if (freshDefs && !freshDefsAreSingleClass) {
+      objectInfoSnapshot.record(freshDefs, {
+        observedAtEpoch: addNodeObservedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY
     // registered class; the resolver only refreshes absent classes, so
