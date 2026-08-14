@@ -58,21 +58,24 @@ export function knownSelectorSample(records, limit = 3) {
  * "changed" or "unchanged". The caller's message must not upgrade either into a
  * statement about the server read.
  *
- * `identityMeaningful` is false when the store hands back a fresh array on every
- * access — the caller detects that by sampling twice with nothing in between —
- * in which case array identity carries no information and only counts are used.
+ * Identity is calibrated PER LIST, and separately, because the two need not
+ * behave alike: the store can expose one as a plain array and the other as a
+ * reactive getter that materialises a fresh array per access. A single
+ * all-or-nothing flag would disable identity for both the moment either one is
+ * fresh, throwing away a real signal from the stable list (review, round 2). The
+ * caller detects each by sampling twice with nothing in between.
  *
  * @param {{counts: string, open: unknown, saved: unknown}|null} before
  * @param {{counts: string, open: unknown, saved: unknown}|null} after
- * @param {{identityMeaningful?: boolean}} [opts]
+ * @param {{openIdentityMeaningful?: boolean, savedIdentityMeaningful?: boolean}} [opts]
  * @returns {"changed"|"unchanged"}
  */
 export function classifyWorkflowRefresh(before, after, opts = {}) {
   if (!before || !after) return "unchanged"; // nothing to compare — claim nothing
   if (before.counts !== after.counts) return "changed";
-  const identityMeaningful = opts.identityMeaningful !== false;
-  if (!identityMeaningful) return "unchanged";
-  return before.open !== after.open || before.saved !== after.saved ? "changed" : "unchanged";
+  const openMoved = opts.openIdentityMeaningful !== false && before.open !== after.open;
+  const savedMoved = opts.savedIdentityMeaningful !== false && before.saved !== after.saved;
+  return openMoved || savedMoved ? "changed" : "unchanged";
 }
 
 /**

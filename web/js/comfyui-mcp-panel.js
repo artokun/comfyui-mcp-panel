@@ -13682,14 +13682,20 @@ const GRAPH_TOOL_EXECUTORS = {
         // the original bug back in new wording (review). Two reads with nothing
         // between them answer it: if identity already differs, it carries no
         // information and only counts are compared.
+        // Calibrated PER LIST: the store may expose one as a plain array and the
+        // other as a reactive getter, and a single flag would disable identity
+        // for both the moment either is fresh (review, round 2).
         const control = fingerprintStore();
         const before = fingerprintStore();
-        const identityMeaningful =
-          control.open === before.open && control.saved === before.saved;
+        const openIdentityMeaningful = control.open === before.open;
+        const savedIdentityMeaningful = control.saved === before.saved;
         try {
           await s.syncWorkflows();
           const after = fingerprintStore();
-          refresh = classifyWorkflowRefresh(before, after, { identityMeaningful });
+          refresh = classifyWorkflowRefresh(before, after, {
+            openIdentityMeaningful,
+            savedIdentityMeaningful,
+          });
         } catch (err) {
           // Kept for a frontend that DOES set throwError, and for a store that
           // throws synchronously before ever reaching useAsyncState.

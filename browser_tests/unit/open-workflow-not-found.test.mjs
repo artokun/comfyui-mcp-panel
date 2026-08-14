@@ -65,17 +65,39 @@ test("#1448 r2 the re-read verdict is DECIDED from the store, both directions", 
     classifyWorkflowRefresh(
       fp("1/1", openA, savedA),
       fp("1/1", [{ path: "a" }], [{ path: "b" }]),
-      { identityMeaningful: false },
+      { openIdentityMeaningful: false, savedIdentityMeaningful: false },
     ),
     "unchanged",
   );
   // A real count move is still honoured with identity disabled.
   assert.equal(
     classifyWorkflowRefresh(fp("1/109", openA, savedA), fp("1/107", openA, savedA), {
-      identityMeaningful: false,
+      openIdentityMeaningful: false,
+      savedIdentityMeaningful: false,
     }),
     "changed",
   );
+  // PER-LIST calibration: one fresh getter must not blind us to the other list.
+  // A single all-or-nothing flag threw away the stable list's signal (round 3).
+  assert.equal(
+    classifyWorkflowRefresh(
+      fp("1/1", openA, savedA),
+      fp("1/1", [{ path: "a" }], [{ path: "b" }]),
+      { openIdentityMeaningful: false, savedIdentityMeaningful: true },
+    ),
+    "changed",
+    "saved-list identity still counts when only the open list is fresh",
+  );
+  assert.equal(
+    classifyWorkflowRefresh(
+      fp("1/1", openA, savedA),
+      fp("1/1", [{ path: "a" }], savedA),
+      { openIdentityMeaningful: false, savedIdentityMeaningful: true },
+    ),
+    "unchanged",
+    "and the fresh list alone still proves nothing",
+  );
+
   // A missing sample claims nothing rather than defaulting to confident.
   assert.equal(classifyWorkflowRefresh(null, fp("1/1", openA, savedA)), "unchanged");
   assert.equal(classifyWorkflowRefresh(fp("1/1", openA, savedA), null), "unchanged");
@@ -202,17 +224,17 @@ test("#1448 WIRING: the caller records the outcome instead of assuming one", () 
   assert.match(panel, /const after = fingerprintStore\(\);/, "...and AFTER the re-read");
   assert.match(
     panel,
-    /refresh = classifyWorkflowRefresh\(before, after, \{ identityMeaningful \}\);/,
+    /refresh = classifyWorkflowRefresh\(before, after, \{\s*openIdentityMeaningful,\s*savedIdentityMeaningful,\s*\}\);/,
     "the verdict comes from the shared decision, not an inline guess",
   );
   // The fresh-getter probe: two samples with NOTHING between them. Without it,
   // a store that materialises a new array per access reports "changed" every
   // time and the original bug returns in new wording (review, round 2).
   assert.match(panel, /const control = fingerprintStore\(\);/, "identity is calibrated first");
-  assert.match(
-    panel,
-    /const identityMeaningful =\s*control\.open === before\.open && control\.saved === before\.saved;/,
-  );
+  // PER LIST — a single flag would disable identity for both the moment either
+  // getter is fresh, discarding a real signal from the stable one (round 3).
+  assert.match(panel, /const openIdentityMeaningful = control\.open === before\.open;/);
+  assert.match(panel, /const savedIdentityMeaningful = control\.saved === before\.saved;/);
   // The sample must be taken AFTER the refresh (codex review). A successful re-read
   // removes stale entries — measured 109 -> 107 on a live rig — so a snapshot taken
   // before it can offer a workflow that no longer exists as an example.
