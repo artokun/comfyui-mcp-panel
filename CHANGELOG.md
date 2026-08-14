@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.34] - 2026-08-14
+
+### Fixed
+- every release since 0.14.31 writes two sections for one version (#1219)
+- rebuild combo options during the reapply sweep, and disclose an empty authoritative list (#1218)
+
+
 ## [0.14.33] - 2026-08-14
 
 ### Fixed
