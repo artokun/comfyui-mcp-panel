@@ -190,7 +190,7 @@ const PANEL = readFileSync(
 test("#1448 wiring: the refusal path actually ASKS the server", () => {
   assert.match(
     PANEL,
-    /api\.fetchApi\("\/userdata\?dir=workflows&recurse=true&split=false"\)/,
+    /api\.fetchApi\("\/userdata\?dir=workflows&recurse=true&split=false",/,
     "the probe must call the listing endpoint — a fail-open probe that never runs is invisible",
   );
   assert.match(PANEL, /classifyDiskProbe\(/, "and classify its answer");
@@ -201,9 +201,24 @@ test("#1448 wiring: the probe is BOUNDED, so a hung /userdata cannot eat the ref
   // and never answers would hang panel_open_workflow forever — a wrong message
   // replaced by no message.
   const site = PANEL.slice(PANEL.indexOf("ASK THE SERVER before asserting"));
-  assert.match(site.slice(0, 1800), /withTimeout\(/, "the probe runs under a wall-clock bound");
+  assert.match(site.slice(0, 2400), /withTimeout\(/, "the probe runs under a wall-clock bound");
   assert.match(PANEL, /const WORKFLOW_DISK_PROBE_MS = \d+;/, "with a named bound");
-  assert.match(site.slice(0, 2400), /onDisk: "unknown", why: `no answer within/, "timeout fails OPEN");
+  assert.match(site.slice(0, 3000), /onDisk: "unknown", why: `no answer within/, "timeout fails OPEN");
+});
+
+test("#1448 wiring: the timed-out request is ABORTED, not merely abandoned", () => {
+  // Review r2: withTimeout stops us WAITING but cannot cancel the request. A server
+  // that accepts and never answers would leave one live fetch per failed open, which
+  // accumulates until the browser's connection pool is exhausted.
+  //
+  // These two assertions were written once and SILENTLY DID NOT LAND — a scripted
+  // edit no-op'd, and both abort mutations then survived, which is the only reason
+  // the gap was visible at all. Re-added deliberately.
+  const site = PANEL.slice(PANEL.indexOf("ASK THE SERVER before asserting"), PANEL.length);
+  assert.match(site.slice(0, 2400), /probeCtrl\.abort\(\)/, "the pending request is cancelled");
+  assert.match(site.slice(0, 2400), /signal: probeCtrl\.signal/, "and the fetch honours the signal");
+  // The timer must be cleared on the happy path, or every refusal leaks one.
+  assert.match(site.slice(0, 3200), /clearTimeout\(probeTimer\)/, "the abort timer is cleared");
 });
 
 test("#1448 wiring: a target that appears WHILE the probe runs is opened, not refused", () => {
@@ -211,6 +226,6 @@ test("#1448 wiring: a target that appears WHILE the probe runs is opened, not re
   // for another sync to land the target in the store. Refusing after that would be a
   // verdict that went stale while it was being proven.
   const site = PANEL.slice(PANEL.indexOf("ASK THE SERVER before asserting"));
-  assert.match(site.slice(0, 2600), /const late = find\(\);/);
-  assert.match(site.slice(0, 2700), /if \(late\) \{\s*\n\s*target = late;/);
+  assert.match(site.slice(0, 3400), /const late = find\(\);/);
+  assert.match(site.slice(0, 3400), /if \(late\) \{\s*\n\s*target = late;/);
 });

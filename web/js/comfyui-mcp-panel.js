@@ -13829,10 +13829,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // the request and never answers would hang panel_open_workflow forever, turning a
       // wrong message into no message at all. withTimeout never rejects, so the timeout
       // lands in the same fail-open "unknown" as every other failure.
+      // ABORTED, not merely abandoned (review r2). withTimeout stops us WAITING but
+      // cannot cancel the request, so a server that accepts and never answers would
+      // leave one live fetch per failed open, accumulating until the browser's
+      // connection pool is exhausted. Same idiom as fetchImageBytes.
+      const probeCtrl = new AbortController();
+      const probeTimer = setTimeout(() => probeCtrl.abort(), WORKFLOW_DISK_PROBE_MS);
       const disk = await withTimeout(
         (async () => {
           try {
-            const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false");
+            const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false", {
+              signal: probeCtrl.signal,
+            });
             return classifyDiskProbe(
               {
                 ok: reply?.ok === true,
@@ -13852,6 +13860,7 @@ const GRAPH_TOOL_EXECUTORS = {
         WORKFLOW_DISK_PROBE_MS,
         () => ({ onDisk: "unknown", why: `no answer within ${WORKFLOW_DISK_PROBE_MS}ms` }),
       );
+      clearTimeout(probeTimer);
       // The probe added an await to a path that previously had none, which widens the
       // window for another sync or command to land the target in the store (codex P2).
       // Re-check once: if it is addressable now, OPEN it rather than refusing with a
