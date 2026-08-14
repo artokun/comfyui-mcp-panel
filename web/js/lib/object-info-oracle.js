@@ -245,12 +245,39 @@ async function runTransport(attempt, remainingMs, timers) {
 }
 
 /**
+ * #1223 — the MACHINE-READABLE half of `failures`, and the reason it exists.
+ *
+ * `failures` is prose, written to be read by a person in a refusal. A caller that needs to
+ * DECIDE something from what the transports did cannot parse those sentences (they are
+ * rewritten whenever the wording improves — twice already in #982 and #1161), so each
+ * attempt is also recorded as a tag here.
+ *
+ * The distinction the tags exist to carry: SILENCE is not the same evidence as an ANSWER.
+ * A route that times out establishes only that nothing came back in time; a route that
+ * THREW, returned a non-OK status, or handed back an unusable body establishes that
+ * something on the other end responded. `object-info-snapshot.js` licenses its fallback on
+ * exactly that difference, so the tags must stay a faithful record of the outcome rather
+ * than a summary of it. One tag per attempted route, in order, mirroring `failures`.
+ */
+export const TRANSPORT_OUTCOME = Object.freeze({
+  /** Ran out its whole grant without settling. Nothing was established. */
+  NO_ANSWER: "no-answer",
+  /** Never contacted — the budget was gone, or no transport was wired. */
+  NOT_ATTEMPTED: "not-attempted",
+  /** It threw. Something answered, or the connection was actively refused. */
+  THREW: "threw",
+  /** It answered, and the answer could not authorize anything (non-OK, empty, unusable). */
+  ANSWERED_UNUSABLE: "answered-unusable",
+});
+
+/**
  * Fetch the whole `/object_info` schema, trying the frontend client first and the raw
  * HTTP route second.
  *
- * Returns `{ defs, failures }` — `defs` is null unless one route returned a usable
- * payload, and `failures` names every route that did not, in order. An empty `failures`
- * with a null `defs` cannot happen: a route that answers nothing is itself a failure.
+ * Returns `{ defs, failures, outcomes }` — `defs` is null unless one route returned a
+ * usable payload, `failures` names every route that did not, in order, and `outcomes`
+ * carries the same list as TRANSPORT_OUTCOME tags (#1223). An empty `failures` with a null
+ * `defs` cannot happen: a route that answers nothing is itself a failure.
  */
 export async function fetchWholeObjectInfo({
   getNodeDefs,
@@ -447,6 +474,18 @@ export async function fetchWholeObjectInfo({
   const FALLBACK_RESPONSE_SHARE = 0.5;
   const BODY_SHARE = 1;
   const failures = [];
+  // #1223 — kept in lockstep with `failures` by pushing through ONE helper. Two arrays
+  // appended at eleven call sites drift the first time a branch is added to one of them,
+  // and a tag list that silently omits an attempt would license the snapshot fallback on
+  // evidence that route never gave.
+  const outcomes = [];
+  // The route is passed, never DERIVED FROM THE SENTENCE. Sniffing the prose for a prefix
+  // is the very coupling the tags exist to remove — it would re-break the moment a message
+  // is reworded, which is a thing this file's history shows happening.
+  const record = (route, kind, sentence) => {
+    failures.push(sentence);
+    outcomes.push({ route, kind });
+  };
 
   if (typeof getNodeDefs === "function") {
     const { outcome, grant: clientMs } = await runStep(getNodeDefs, CLIENT_ROUTE_SHARE);
@@ -456,7 +495,11 @@ export async function fetchWholeObjectInfo({
       // a false cause here: on a degenerate budget nothing had been drawn when this ran.
       // Naming a cause that did not happen is #982's original defect, and it is no more
       // acceptable in a branch that is hard to reach than in one that is not.
-      failures.push(`api.getNodeDefs() was not attempted — the ${budget}ms budget leaves it no time`);
+      record(
+        "client",
+        TRANSPORT_OUTCOME.NOT_ATTEMPTED,
+        `api.getNodeDefs() was not attempted — the ${budget}ms budget leaves it no time`,
+      );
     } else if (kind === "no-answer") {
       // The #1161 case. Recorded as a failure like any other, and — critically — execution
       // CONTINUES to the second transport, which is what this bound exists to reach.
@@ -465,22 +508,32 @@ export async function fetchWholeObjectInfo({
       // here told the reader it had waited 20000ms when it had waited 10000ms. Naming a
       // number that was never spent is the same defect as #982's "unreachable or the
       // fetch failed" — a refusal asserting something it did not establish.
-      failures.push(`api.getNodeDefs() did not answer within its ${Math.round(clientMs)}ms share of the ${budget}ms budget`);
+      record(
+        "client",
+        TRANSPORT_OUTCOME.NO_ANSWER,
+        `api.getNodeDefs() did not answer within its ${Math.round(clientMs)}ms share of the ${budget}ms budget`,
+      );
     } else if (kind === "threw") {
-      failures.push(describeFailure("api.getNodeDefs() threw", outcome.err));
+      record("client", TRANSPORT_OUTCOME.THREW, describeFailure("api.getNodeDefs() threw", outcome.err));
     } else {
       const defs = outcome.value;
-      if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
+      if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures, outcomes };
       // AN EMPTY MAP IS AN ANSWER, NOT AN ABSENCE (codex). A client that deliberately
       // filters could express deny-all as `{}`, and consulting the raw route would then
       // overrule it with a broader schema — the one direction this fallback must never
       // move. Only a client that returned NOTHING (null/undefined/non-object) or threw
       // leaves the question unanswered, and only that may be asked again elsewhere.
       if (defs && typeof defs === "object" && !Array.isArray(defs)) {
-        failures.push("api.getNodeDefs() returned an EMPTY schema — treated as its answer, not as an absence");
-        return { [CACHE_OUTCOME]: true, defs: null, failures };
+        record(
+          "client",
+          TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+          "api.getNodeDefs() returned an EMPTY schema — treated as its answer, not as an absence",
+        );
+        return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
       }
-      failures.push(
+      record(
+        "client",
+        TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
         describeFailure(
           "api.getNodeDefs() returned no usable schema",
           null,
@@ -489,7 +542,10 @@ export async function fetchWholeObjectInfo({
       );
     }
   } else {
-    failures.push("api.getNodeDefs is not a function on this frontend");
+    // NOT_ATTEMPTED, not ANSWERED_UNUSABLE: a transport this frontend does not have is a
+    // route that was never asked. Tagging an absent client as though it had answered would
+    // make "no transport is wired" read as evidence the backend responded (#1223).
+    record("client", TRANSPORT_OUTCOME.NOT_ATTEMPTED, "api.getNodeDefs is not a function on this frontend");
   }
 
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
@@ -501,11 +557,19 @@ export async function fetchWholeObjectInfo({
       // TRUTHFUL ABOUT WHAT WAS NOT DONE. Saying this route "did not answer" when no
       // request was ever sent is #982's original defect — a refusal asserting a cause it
       // never established. The reserve above exists so this stays unreachable in practice.
-      failures.push("GET /object_info was not attempted — the budget was spent before it was reached");
+      record(
+        "http",
+        TRANSPORT_OUTCOME.NOT_ATTEMPTED,
+        "GET /object_info was not attempted — the budget was spent before it was reached",
+      );
     } else if (kind === "no-answer") {
-      failures.push(`GET /object_info did not answer within its ${Math.round(fallbackMs)}ms share of the ${budget}ms budget`);
+      record(
+        "http",
+        TRANSPORT_OUTCOME.NO_ANSWER,
+        `GET /object_info did not answer within its ${Math.round(fallbackMs)}ms share of the ${budget}ms budget`,
+      );
     } else if (kind === "threw") {
-      failures.push(describeFailure("GET /object_info threw", outcome.err));
+      record("http", TRANSPORT_OUTCOME.THREW, describeFailure("GET /object_info threw", outcome.err));
     } else {
       const res = outcome.value;
       // #1161 — reading `ok`/`status` off the response is itself an operation that can
@@ -523,11 +587,19 @@ export async function fetchWholeObjectInfo({
         // which returned a failures entry where this rejected.
         responseStatus = sanitizeDetail(res?.status ?? "unknown") || "unknown";
       } catch (err) {
-        failures.push(describeFailure("GET /object_info returned an unreadable response", err));
-        return { [CACHE_OUTCOME]: true, defs: null, failures };
+        record(
+          "http",
+          TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+          describeFailure("GET /object_info returned an unreadable response", err),
+        );
+        return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
       }
       if (!responseOk) {
-        failures.push(describeFailure("GET /object_info was not OK", null, ` (status ${responseStatus})`));
+        record(
+          "http",
+          TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+          describeFailure("GET /object_info was not OK", null, ` (status ${responseStatus})`),
+        );
       } else {
         // The BODY is a second I/O step, and it was inside the try/catch this bound
         // replaced — an existing #982 test caught the escape. Reading a 5MB schema over a
@@ -536,27 +608,44 @@ export async function fetchWholeObjectInfo({
         const { outcome: body, grant: bodyMs } = await runStep(() => res.json(), BODY_SHARE);
         const bodyKind = outcomeKind(body);
         if (bodyKind === "not-tried") {
-          failures.push("GET /object_info answered but its body was not read — the budget was spent");
+          // ANSWERED_UNUSABLE, not NOT_ATTEMPTED: the RESPONSE arrived — the backend
+          // demonstrably answered — and only the body read was skipped. The tag records
+          // what the backend did, not which of our own steps ran (#1223).
+          record(
+            "http",
+            TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+            "GET /object_info answered but its body was not read — the budget was spent",
+          );
         } else if (bodyKind === "no-answer") {
-          failures.push(`GET /object_info answered but its body did not arrive within its ${Math.round(bodyMs)}ms share of the ${budget}ms budget`);
+          // Same reasoning: the response headers came back, so something is alive on the
+          // other end. A stalled BODY is not the silence the snapshot fallback licenses on.
+          record(
+            "http",
+            TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+            `GET /object_info answered but its body did not arrive within its ${Math.round(bodyMs)}ms share of the ${budget}ms budget`,
+          );
         } else if (bodyKind === "threw") {
           // Deliberately the SAME wording as before. A parse failure used to surface
           // through this route's catch, and an existing #982 test pins the sentence a user
           // reads. This change is about bounding the waits, not about rewording refusals —
           // improving the phrasing here would be a separate, reviewable decision.
-          failures.push(describeFailure("GET /object_info threw", body.err));
+          record("http", TRANSPORT_OUTCOME.THREW, describeFailure("GET /object_info threw", body.err));
         } else {
           const defs = body.value;
-          if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures };
-          failures.push("GET /object_info returned no usable schema (an empty or non-object body)");
+          if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures, outcomes };
+          record(
+            "http",
+            TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+            "GET /object_info returned no usable schema (an empty or non-object body)",
+          );
         }
       }
     }
   } else {
-    failures.push("no fetchApi is wired for the fallback route");
+    record("http", TRANSPORT_OUTCOME.NOT_ATTEMPTED, "no fetchApi is wired for the fallback route");
   }
 
-  return { [CACHE_OUTCOME]: true, defs: null, failures };
+  return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
 }
 
 /**

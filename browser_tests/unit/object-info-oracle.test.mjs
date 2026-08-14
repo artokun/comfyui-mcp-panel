@@ -165,7 +165,7 @@ test("#982 (codex) the fallback is consulted ONLY when the client returned nothi
   const clientBlock = src.slice(src.indexOf("if (typeof getNodeDefs === \"function\")"), src.indexOf("// SECOND TRANSPORT"));
   assert.match(
     clientBlock,
-    /if \(usableDefs\(defs\)\) return \{ \[CACHE_OUTCOME\]: true, defs, failures \};/,
+    /if \(usableDefs\(defs\)\) return \{ \[CACHE_OUTCOME\]: true, defs, failures, outcomes \};/,
     "a usable client answer returns",
   );
   // …and the measured equivalence is recorded rather than assumed.

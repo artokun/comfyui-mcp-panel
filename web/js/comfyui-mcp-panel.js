@@ -202,6 +202,7 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
@@ -955,6 +956,17 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // #716 — one /object_info per BURST of widget writes, instead of one per write.
 const objectInfoCache = createObjectInfoCache();
+// #1223 — the last WHOLE /object_info observed on the CURRENT backend connection, so a
+// widget edit is not refused merely because the schema probe went silent while ComfyUI was
+// busy rendering. Consulted only AFTER the oracle has failed, and only under the four
+// fail-closed conditions in lib/object-info-snapshot.js.
+//
+// RECORDS WHOLE SCHEMAS ONLY (`recordsWholeSchemaOnly`, pinned by a test). Every call site
+// below hands it a full /object_info map. A per-class `/object_info/<Type>` payload — which
+// `recordObjectInfoTypes` legitimately also receives, from the add_node single-def path —
+// must NEVER reach it: one type present would make all 4300 others read as absent, and the
+// #458 ever-seen gate would then diagnose the whole install as removed packs.
+const objectInfoSnapshot = createObjectInfoSnapshot();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -1043,6 +1055,12 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
   // be wrong in the dangerous direction.
   objectInfoCache.invalidate();
+  // #1223 — retire the last-observed snapshot on the SAME event and for the SAME reason.
+  // This function runs exactly when something suspects the schema moved, and a snapshot
+  // that survived a suspicion would authorize writes the burst cache has already been told
+  // not to. Re-recorded below if this run's fetch succeeds, so the cost of being wrong here
+  // is one refused write during an outage, not a stale authorization.
+  objectInfoSnapshot.clear();
   let thrown = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
@@ -1192,6 +1210,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // reason the deadline moves here rather than the floor being softened.
     const localWorkStartedAt = monotonicNow();
     recordObjectInfoTypes(defs);
+    // #1223 — a WHOLE map, freshly fetched, stamped with the connection it was read on.
+    // This is the payload a later widget write falls back to when the backend goes silent
+    // mid-render. `record` rejects an empty/non-object payload itself, so a failed fetch
+    // leaves the snapshot cleared above rather than replacing it with nothing usable.
+    objectInfoSnapshot.record(defs, backendReconnectEpoch);
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
     // is set ONLY when the registration call actually ran — a frontend without
@@ -11459,6 +11482,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // its refusal, so the message would name routes another call tried. Declared in the
     // handler's own scope, so each invocation reports what IT observed.
     let oracleFailures = [];
+    // #1223 — null while the authorization came from a LIVE probe; the oracle's failure
+    // note once it came from the last-observed snapshot instead. Per-request for the same
+    // reason `oracleFailures` is: a concurrent write must not make THIS reply claim a
+    // provenance it did not have.
+    let setWidgetSchemaFromSnapshot = null;
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -11562,6 +11590,35 @@ const GRAPH_TOOL_EXECUTORS = {
         });
         const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
+        if (defs) {
+          // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
+          // above), so it is the payload #1223's fallback is allowed to hold.
+          objectInfoSnapshot.record(defs, backendReconnectEpoch);
+          return recordObjectInfoTypes(defs);
+        }
+        // #1223 — the probe produced nothing. If it went SILENT (rather than answering
+        // something unusable) and this backend connection has not been interrupted since a
+        // whole schema was last read, authorize from that snapshot instead of refusing a
+        // write the backend would accept. Every other cause still falls through to the
+        // unchanged #458 refusal below, which now also explains why the snapshot was not
+        // eligible — a caller told "no schema" when the real cause was a reconnect goes
+        // looking in the wrong place (#982).
+        const fallback = objectInfoSnapshot.authorize({
+          epoch: backendReconnectEpoch,
+          socketDown: comfyBackendSocketDown,
+          outcomes: outcome?.outcomes,
+        });
+        if (fallback.defs) {
+          // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
+          // and it was verified against a schema nobody could re-fetch — an agent that is
+          // not told that cannot tell this apart from a fully live authorization.
+          setWidgetSchemaFromSnapshot = objectInfoOracleFailureNote(oracleFailures);
+          // NOT recorded into the ever-seen history: it is not a new observation of the
+          // backend, it is the old one being re-read. Recording it would let a snapshot
+          // keep its own types "ever seen" after the backend stopped defining them.
+          return fallback.defs;
+        }
+        oracleFailures = [...oracleFailures, `the last-observed schema was not usable either — ${fallback.reason}`];
         return recordObjectInfoTypes(defs);
       },
       // What the last oracle attempt observed, so a refusal can say which routes were
@@ -11670,6 +11727,13 @@ const GRAPH_TOOL_EXECUTORS = {
       if (stillActive) clearStaleRedFlag(node, { app, graph, rootGraph });
     } catch {
       /* best-effort visual cleanup — never fail the write over it */
+    }
+    // #1223 — DISCLOSE the provenance of the authorization, on a field of its own rather
+    // than in `warning`. That channel is single-slot and priority-ordered (link-driven
+    // outranks control_after_generate), so appending here would silently displace a warning
+    // about what the write actually DOES — a strictly worse trade than a separate field.
+    if (setWidgetSchemaFromSnapshot !== null && result && typeof result === "object") {
+      return { ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) };
     }
     return result;
   },
