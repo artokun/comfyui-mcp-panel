@@ -309,6 +309,34 @@ test("#1188 each upload site's body read sits INSIDE the bounded callback", () =
   }
 });
 
+test("#1188 every uploadBlobToInput caller branches on the null it can now return", () => {
+  // The claim "all callers already branch on a null ref" was made in a comment before it was
+  // checked, and it was false on both halves: there are FIVE sites, not four, and civitai's
+  // did not branch at all. Muted, it announced "Saved {name} to ComfyUI inputs." for an
+  // upload that wrote nothing; unmuted, it dereferenced `ref.filename`. Counted here so the
+  // claim cannot rot back into a guess.
+  const sites = [
+    ["web/js/cmcp-apps-ui.js", /const ref = await uploadBlobToInput\(/],
+    ["web/js/cmcp-civitai-ui.js", /const ref = await ctx\.uploadBlobToInput\(/],
+    ["web/js/cmcp-training-ui.js", /ctx\.uploadBlobToInput\(/],
+    ["web/js/lib/media-preview.js", /const ref = await uploadBlobToInput\(/],
+    ["web/js/lib/run-completion-frame.js", /const ref = await uploadBlobToInput\(/],
+  ];
+  for (const [rel, call] of sites) {
+    const src = readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), "utf8");
+    assert.match(src, call, `${rel} no longer calls uploadBlobToInput — update this list`);
+    // Each site must test the ref before using it. The shapes differ by call site, so this
+    // asserts that SOME null test exists rather than one exact spelling.
+    assert.match(src, /if \(!ref\)|!ref\b|ref \?|ref &&|typeof ref/, `${rel} does not branch on a null ref`);
+  }
+  // …and the civitai path specifically, because it is the one that was wrong.
+  const civitai = readFileSync(fileURLToPath(new URL("../../web/js/cmcp-civitai-ui.js", import.meta.url)), "utf8");
+  const at = civitai.indexOf("const ref = await ctx.uploadBlobToInput(");
+  const guard = civitai.indexOf("if (!ref)", at);
+  const muted = civitai.indexOf("ctx.isMuted()", at);
+  assert.ok(guard > at && guard < muted, "civitai must refuse a null ref BEFORE announcing a save");
+});
+
 test("#1188 uploadBlobToInput still answers null, so no caller learns a new shape", () => {
   // Four callers branch on a null ref today (the apps, civitai and training wizards, and the
   // storyboard pipeline). Returning the sentinel to them instead would make `!ref` false and
