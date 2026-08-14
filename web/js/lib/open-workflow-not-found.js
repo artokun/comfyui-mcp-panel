@@ -117,6 +117,18 @@ export function openWorkflowNotFoundMessage({ path, refresh, known = [], disk } 
     );
   }
 
+  // Several files on disk answer to that bare name. Naming one and telling the caller
+  // to reload would send them to a file they may not have meant (review, P1), so the
+  // refusal reports the fan-out and the action that resolves it.
+  if (disk?.onDisk === "ambiguous") {
+    const list = (disk.candidates ?? []).map((c) => `"${c}"`).join(", ");
+    return (
+      `"${path}" is ambiguous: the workflows folder on disk holds more than one file with ` +
+      `that name — ${list}. Qualify it with the subfolder (e.g. panel_open_workflow ` +
+      `path:"<subfolder>/<name>.json") so this opens the one you mean.`
+    );
+  }
+
   const refreshClause =
     refresh === "changed"
       ? `A re-read of the workflow list was requested and the list DID change, and it still does ` +

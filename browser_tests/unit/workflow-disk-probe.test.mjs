@@ -57,17 +57,36 @@ test("#1448 a bare name finds a file in a SUBFOLDER", () => {
   assert.equal(diskListingEntryFor(LISTING, "Nested Thing"), "sub/Nested Thing.json");
 });
 
-test("#1448 an AMBIGUOUS bare name is not resolved to a guess", () => {
-  // Two subfolders holding the same filename: picking one arbitrarily could send the
-  // caller to the wrong workflow, which is worse than the refusal being improved.
-  // First match wins only because the caller never acts on it — it is a hint in a
-  // message, and the message names the entry it found.
+test("#1448 an AMBIGUOUS bare name is REPORTED, never resolved to a guess", () => {
+  // Review, P1 — and this test previously blessed the defect. Returning the first
+  // base-name hit made the refusal say the requested file "IS on disk" while naming a
+  // file the caller may not have meant, and prescribing a reload that would not help.
+  // The comment claimed it was "deliberately not resolved to a guess" while the code
+  // did exactly that.
   const ambiguous = ["a/Same.json", "b/Same.json"];
-  const hit = diskListingEntryFor(ambiguous, "Same");
-  assert.ok(hit === "a/Same.json" || hit === "b/Same.json");
-  // A FULLY-QUALIFIED selector is exact and must not fall back to the other folder.
+  assert.equal(diskListingEntryFor(ambiguous, "Same"), null, "no single answer exists");
+  const verdict = classifyDiskProbe({ ok: true, body: ambiguous }, "Same");
+  assert.equal(verdict.onDisk, "ambiguous");
+  assert.deepEqual(verdict.candidates, ["a/Same.json", "b/Same.json"]);
+
+  // A FULLY-QUALIFIED selector names one file even when the bare name fans out.
   assert.equal(diskListingEntryFor(ambiguous, "b/Same.json"), "b/Same.json");
+  assert.equal(classifyDiskProbe({ ok: true, body: ambiguous }, "b/Same.json").onDisk, "yes");
   assert.equal(diskListingEntryFor(ambiguous, "c/Same.json"), null);
+  assert.equal(classifyDiskProbe({ ok: true, body: ambiguous }, "c/Same.json").onDisk, "no");
+});
+
+test("#1448 the ambiguous refusal lists the candidates and how to disambiguate", () => {
+  const t = openWorkflowNotFoundMessage({
+    path: "Same",
+    refresh: "changed",
+    disk: { onDisk: "ambiguous", candidates: ["a/Same.json", "b/Same.json"] },
+  });
+  assert.match(t, /is ambiguous/);
+  assert.match(t, /"a\/Same\.json", "b\/Same\.json"/);
+  assert.match(t, /Qualify it with the subfolder/);
+  // It must not tell them to reload — the list is not the problem here.
+  assert.doesNotMatch(t, /RELOAD THE COMFYUI BROWSER TAB/);
 });
 
 test("#1448 a file genuinely absent answers null", () => {
@@ -153,4 +172,45 @@ test("#1448 with NO probe result the message is exactly what it was before", () 
   const before = openWorkflowNotFoundMessage({ path: "x.json", refresh: "changed" });
   assert.doesNotMatch(before, /on disk/i);
   assert.match(before, /no workflow matching "x\.json"/);
+});
+
+// ── WIRING. The lib can be perfect and never called (mutation found exactly that:
+//    replacing the fetch with `undefined` killed nothing, because every failure mode
+//    fails open to the same "unknown" the absent call produces).
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const PANEL = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+  "utf8",
+).replace(/\r\n/g, "\n");
+
+test("#1448 wiring: the refusal path actually ASKS the server", () => {
+  assert.match(
+    PANEL,
+    /api\.fetchApi\("\/userdata\?dir=workflows&recurse=true&split=false"\)/,
+    "the probe must call the listing endpoint — a fail-open probe that never runs is invisible",
+  );
+  assert.match(PANEL, /classifyDiskProbe\(/, "and classify its answer");
+});
+
+test("#1448 wiring: the probe is BOUNDED, so a hung /userdata cannot eat the refusal", () => {
+  // Review, P1: fetchApi + .json() had no deadline. A server that accepts the request
+  // and never answers would hang panel_open_workflow forever — a wrong message
+  // replaced by no message.
+  const site = PANEL.slice(PANEL.indexOf("ASK THE SERVER before asserting"));
+  assert.match(site.slice(0, 1800), /withTimeout\(/, "the probe runs under a wall-clock bound");
+  assert.match(PANEL, /const WORKFLOW_DISK_PROBE_MS = \d+;/, "with a named bound");
+  assert.match(site.slice(0, 2400), /onDisk: "unknown", why: `no answer within/, "timeout fails OPEN");
+});
+
+test("#1448 wiring: a target that appears WHILE the probe runs is opened, not refused", () => {
+  // Review, P2: the probe added an await to a path that had none, widening the window
+  // for another sync to land the target in the store. Refusing after that would be a
+  // verdict that went stale while it was being proven.
+  const site = PANEL.slice(PANEL.indexOf("ASK THE SERVER before asserting"));
+  assert.match(site.slice(0, 2600), /const late = find\(\);/);
+  assert.match(site.slice(0, 2700), /if \(late\) \{\s*\n\s*target = late;/);
 });

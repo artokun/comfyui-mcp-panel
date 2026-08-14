@@ -279,6 +279,9 @@ import {
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
 import { classifyDiskProbe } from "./lib/workflow-disk-probe.js";
+/** #1448 — wall-clock bound on the refusal-path /userdata probe. Generous: it only
+ *  ever runs when the open is already failing, and a slow answer still beats none. */
+const WORKFLOW_DISK_PROBE_MS = 4000;
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -13821,25 +13824,45 @@ const GRAPH_TOOL_EXECUTORS = {
       //
       // Runs only on the refusal path — never on a successful open — so the extra
       // round-trip costs nothing in the normal case.
-      let disk;
-      try {
-        const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false");
-        disk = classifyDiskProbe(
-          {
-            ok: reply?.ok === true,
-            status: reply?.status,
-            body: reply?.ok ? await reply.json() : undefined,
-          },
-          path,
-        );
-      } catch (err) {
-        // FAIL OPEN. Every earlier round of this issue shipped a message that claimed
-        // more than it knew; a probe that turned a stale list into a confident "your
-        // file does not exist" would be the same bug with more authority.
-        disk = { onDisk: "unknown", why: err?.message ?? String(err) };
+      //
+      // BOUNDED (codex P1). The refusal path had no deadline: a /userdata that accepts
+      // the request and never answers would hang panel_open_workflow forever, turning a
+      // wrong message into no message at all. withTimeout never rejects, so the timeout
+      // lands in the same fail-open "unknown" as every other failure.
+      const disk = await withTimeout(
+        (async () => {
+          try {
+            const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false");
+            return classifyDiskProbe(
+              {
+                ok: reply?.ok === true,
+                status: reply?.status,
+                body: reply?.ok ? await reply.json() : undefined,
+              },
+              path,
+            );
+          } catch (err) {
+            // FAIL OPEN. Every earlier round of this issue shipped a message that
+            // claimed more than it knew; a probe that turned a stale list into a
+            // confident "your file does not exist" would be that bug with more
+            // authority.
+            return { onDisk: "unknown", why: err?.message ?? String(err) };
+          }
+        })(),
+        WORKFLOW_DISK_PROBE_MS,
+        () => ({ onDisk: "unknown", why: `no answer within ${WORKFLOW_DISK_PROBE_MS}ms` }),
+      );
+      // The probe added an await to a path that previously had none, which widens the
+      // window for another sync or command to land the target in the store (codex P2).
+      // Re-check once: if it is addressable now, OPEN it rather than refusing with a
+      // verdict that went stale while we were proving it.
+      const late = find();
+      if (late) {
+        target = late;
+      } else {
+        const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
+        throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known, disk })));
       }
-      const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
-      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known, disk })));
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas

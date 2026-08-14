@@ -79,25 +79,43 @@ function withoutJson(p) {
  * @returns {string|null} the listing entry that matched, or null.
  */
 export function diskListingEntryFor(listing, selector) {
-  if (!Array.isArray(listing)) return null;
+  const found = matchDiskListing(listing, selector);
+  return found.matches.length === 1 ? found.matches[0] : null;
+}
+
+/**
+ * The full result: every entry the selector could name.
+ *
+ * AMBIGUITY IS REPORTED, NOT RESOLVED (review, P1). An earlier version returned the
+ * first base-name hit and the refusal then said the requested file "IS on disk",
+ * naming a file the caller may not have meant and prescribing a reload that would not
+ * help. Worse, the comment claimed it was "deliberately not resolved to a guess"
+ * while the code did exactly that — the reassurance was the tell.
+ *
+ * An EXACT path match is unambiguous by construction and wins outright: `b/Same.json`
+ * names one file even when `a/Same.json` exists. Only a BARE name can fan out, and
+ * when it does the caller is told which folders hold it rather than being sent to one
+ * of them.
+ *
+ * @returns {{matches: string[], exact: boolean}}
+ */
+export function matchDiskListing(listing, selector) {
+  const none = { matches: [], exact: false };
+  if (!Array.isArray(listing)) return none;
   const want = canonicalWorkflowPath(selector);
-  if (!want) return null;
+  if (!want) return none;
   const wantNoExt = withoutJson(want).toLowerCase();
   const wantBase = wantNoExt.split("/").pop();
+  const qualified = wantNoExt.includes("/");
+  const byBase = [];
   for (const raw of listing) {
     const entry = canonicalWorkflowPath(typeof raw === "string" ? raw : raw?.[0]);
     if (!entry) continue;
     const entryNoExt = withoutJson(entry).toLowerCase();
-    if (entryNoExt === wantNoExt) return entry;
-    // A BARE name may address a file in a subfolder — but only when it is
-    // unambiguous. Deliberately not resolved here: two subfolders holding the same
-    // filename would make this pick one arbitrarily, and picking the wrong workflow
-    // is worse than the refusal this is trying to improve. Exact-path matches above
-    // are the only positive answer; the base-name case only ever DOWNGRADES to a
-    // hint, below.
-    if (entryNoExt.split("/").pop() === wantBase && !wantNoExt.includes("/")) return entry;
+    if (entryNoExt === wantNoExt) return { matches: [entry], exact: true };
+    if (!qualified && entryNoExt.split("/").pop() === wantBase) byBase.push(entry);
   }
-  return null;
+  return { matches: byBase, exact: false };
 }
 
 /**
@@ -119,6 +137,12 @@ export function classifyDiskProbe(response, selector) {
     return { onDisk: "unknown", why: response?.status ? `HTTP ${response.status}` : "no response" };
   }
   if (!Array.isArray(response.body)) return { onDisk: "unknown", why: "unrecognised listing shape" };
-  const entry = diskListingEntryFor(response.body, selector);
-  return entry ? { onDisk: "yes", entry } : { onDisk: "no" };
+  const { matches } = matchDiskListing(response.body, selector);
+  if (matches.length === 1) return { onDisk: "yes", entry: matches[0] };
+  // Several files share that bare name. Saying "yes" here would name one of them and
+  // tell the caller to reload for a file they may not have meant (review, P1); saying
+  // "no" would be false. The honest answer is that the name is under-specified, and
+  // the caller can act on it — qualify the folder.
+  if (matches.length > 1) return { onDisk: "ambiguous", candidates: matches };
+  return { onDisk: "no" };
 }
