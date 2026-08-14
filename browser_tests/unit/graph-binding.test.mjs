@@ -3638,3 +3638,112 @@ test("#618: activeWorkflowCurrentNodeCount reads ONLY the current state — the 
   );
   assert.equal(activeWorkflowCurrentNodeCount({}), null, "no current state → no evidence");
 });
+
+// ── #1187: the settle wrapper itself, executed rather than described ────────────────────
+//
+// The tests above model what a landed capture DOES to the evidence. These run the real
+// `resolveGraphBindingVerdictAfterSettlingTracker` out of the panel source, with its three
+// dependencies injected, because two mutations survived a suite that only described it:
+// dropping the tag precondition, and discarding the re-resolve result. Source-text
+// assertions could not catch either — only calling it can.
+const settleSource = () => {
+  const src = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  return panelFunctionSource(src, "resolveGraphBindingVerdictAfterSettlingTracker", "stampGraphRootWorkflowUuid");
+};
+
+/** Build the REAL wrapper with controllable deps. `resolve` is called once per invocation and
+ *  answers from the queue, so "refuse then permit" models a capture that fixed the evidence. */
+function buildSettle({ verdicts, tagMatches = true, capture = { verdict: "captured" }, isModified = false }) {
+  const calls = { resolve: 0, capture: 0 };
+  const fn = new Function(
+    "resolveGraphBindingVerdict",
+    "graphRootWorkflowUuidMatches",
+    "captureCanvasIntoTracker",
+    `${settleSource()}\nreturn resolveGraphBindingVerdictAfterSettlingTracker;`,
+  )(
+    () => verdicts[Math.min(calls.resolve++, verdicts.length - 1)],
+    () => { if (typeof tagMatches === "function") return tagMatches(); return tagMatches; },
+    () => { calls.capture++; if (typeof capture === "function") return capture(); return capture; },
+  );
+  return { fn, calls, evidence: { rootGraph: {}, activeWorkflow: { isModified }, activeWorkflowUuid: "u" } };
+}
+
+const SHAPE = { reason: "root-shape-mismatch" };
+
+test("#1187 settle: a landed capture that clears the evidence permits", () => {
+  const { fn, calls, evidence } = buildSettle({ verdicts: [SHAPE, null] });
+  assert.equal(fn(evidence), null, "the re-resolve's answer must be the one returned");
+  assert.equal(calls.capture, 1, "exactly one capture — this must not loop");
+  assert.equal(calls.resolve, 2, "…and the resolver must actually be asked again");
+});
+
+test("#1187 settle: the FRESH verdict is returned, not the stale one", () => {
+  // The mutation this exists for: `const settled = verdict` discards the re-resolve, so the
+  // fix silently stops working while every source assertion still passes.
+  const fresh = { reason: "root-mid-population" };
+  const { fn, evidence } = buildSettle({ verdicts: [SHAPE, fresh] });
+  assert.equal(fn(evidence), fresh, "a still-refusing settle must report CURRENT evidence");
+});
+
+test("#1187 settle: an untagged root is never captured", () => {
+  // The other surviving mutation. Without the tag precondition the wrapper would disturb the
+  // undo stack of a root it cannot help — a capture pushes an undo entry and clears redo.
+  const { fn, calls, evidence } = buildSettle({ verdicts: [SHAPE, null], tagMatches: false });
+  assert.equal(fn(evidence)?.reason, "root-shape-mismatch", "an untagged root keeps its refusal");
+  assert.equal(calls.capture, 0, "and its undo stack is left alone");
+});
+
+test("#1187 settle: only root-shape-mismatch is settled", () => {
+  for (const reason of ["root-workflow-uuid-mismatch", "root-mid-population", "dirty-mutation-binding-unproven"]) {
+    const { fn, calls, evidence } = buildSettle({ verdicts: [{ reason }, null] });
+    assert.equal(fn(evidence)?.reason, reason, `${reason} must be returned untouched`);
+    assert.equal(calls.capture, 0, `${reason} must not trigger a capture`);
+  }
+  const { fn, calls, evidence } = buildSettle({ verdicts: [null] });
+  assert.equal(fn(evidence), null, "a permitted read needs no settling");
+  assert.equal(calls.capture, 0);
+});
+
+test("#1187 settle: an already-dirty tab is not settled — the lag is not what refused", () => {
+  const { fn, calls, evidence } = buildSettle({ verdicts: [SHAPE, null], isModified: true });
+  assert.equal(fn(evidence)?.reason, "root-shape-mismatch");
+  assert.equal(calls.capture, 0);
+});
+
+test("#1187 settle: every capture outcome short of PROVEN keeps the original refusal", () => {
+  // A helper meant to stop a false refusal must never become a way to skip a true one.
+  // "pending" is the subtle one: the capture may yet land, but not before this synchronous
+  // fence has to answer, so it is refused on what is known now.
+  for (const verdict of ["pending", "failed", "unavailable", "unverified", "inactive", undefined]) {
+    const { fn, evidence } = buildSettle({ verdicts: [SHAPE, null], capture: { verdict } });
+    assert.equal(
+      fn(evidence)?.reason,
+      "root-shape-mismatch",
+      `a "${verdict}" capture must not permit`,
+    );
+  }
+  const nullish = buildSettle({ verdicts: [SHAPE, null], capture: null });
+  assert.equal(nullish.fn(nullish.evidence)?.reason, "root-shape-mismatch", "a null capture result must not permit");
+});
+
+test("#1187 settle: a dependency that THROWS leaves the refusal exactly as it was", () => {
+  // Every guard is itself an operation that can fail.
+  const thrower = () => { throw new Error("revoked"); };
+  for (const over of [{ tagMatches: thrower }, { capture: thrower }]) {
+    const { fn, evidence } = buildSettle({ verdicts: [SHAPE, null], ...over });
+    assert.equal(fn(evidence)?.reason, "root-shape-mismatch", "a throwing dependency must fail closed");
+  }
+  // …including the re-resolve itself.
+  const boom = new Function(
+    "resolveGraphBindingVerdict",
+    "graphRootWorkflowUuidMatches",
+    "captureCanvasIntoTracker",
+    `${settleSource()}\nreturn resolveGraphBindingVerdictAfterSettlingTracker;`,
+  )(
+    (() => { let n = 0; return () => { if (n++ === 0) return SHAPE; throw new Error("revoked"); }; })(),
+    () => true,
+    () => ({ verdict: "captured" }),
+  );
+  assert.equal(boom({ rootGraph: {}, activeWorkflow: { isModified: false }, activeWorkflowUuid: "u" })?.reason,
+    "root-shape-mismatch", "a throwing re-resolve must fail closed");
+});
