@@ -83,7 +83,27 @@ function canonical(value) {
     return `#${value}`;
   }
   if (typeof value !== "object") return `${typeof value}:${String(value)}`;
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (Array.isArray(value)) {
+    // Indexed explicitly, with holes distinguished from present values: `.map`
+    // SKIPS holes and `.join` renders them empty, so `[,,]` and `["",""]` and a
+    // shorter array could all encode alike (review). A hole is not a value.
+    const parts = [];
+    for (let i = 0; i < value.length; i++) {
+      parts.push(hasOwn(value, i) ? canonical(value[i]) : "h");
+    }
+    return `[${parts.join(",")}]`;
+  }
+  // EXOTIC OBJECTS FAIL CLOSED. A Date, Map or Set has no enumerable own string
+  // keys, so the key-walk below would encode every one of them as `{}` — making
+  // `new Date(0)` and `new Date(1)`, or two differently-populated Maps, compare
+  // EQUAL and be admitted as rebuild-only (review). Nothing in a serialized
+  // workflow should be one of these; if one appears, the honest answer is that
+  // this comparison cannot read it. Throwing lands in the caller's catch, which
+  // answers false.
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new TypeError("unreadable value in node inputs");
+  }
   // Key-sorted, so property order is not mistaken for a difference.
   return `{${Object.keys(value)
     .sort()

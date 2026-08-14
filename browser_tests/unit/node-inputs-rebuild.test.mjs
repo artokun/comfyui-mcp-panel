@@ -221,3 +221,44 @@ test("WIRING: a LOST slot still refuses through the real gate", () => {
   const live = graphOf([node(1, [slot("image")])]);
   assert.equal(graphRootReproducesStateContent({ rootGraph: live, state: saved }).proven, false);
 });
+
+test("EXOTIC values fail closed rather than compare equal", () => {
+  // Date/Map/Set have no enumerable own string keys, so a naive key-walk encodes
+  // every one of them as `{}` — making two different Dates, or two differently
+  // populated Maps, compare EQUAL and be admitted as rebuild-only (review r2).
+  const pairs = [
+    [new Date(0), new Date(1)],
+    [new Map([["a", 1]]), new Map([["b", 2]])],
+    [new Set([1]), new Set([2])],
+  ];
+  for (const [a, b] of pairs) {
+    assert.equal(
+      inputsDifferOnlyByDefinitionRebuild([slot("x", { v: a })], [slot("x", { v: b })]),
+      false,
+      String(a),
+    );
+  }
+});
+
+test("a HOLE in an array is not a value", () => {
+  // `.map` skips holes and `.join` renders them empty, so a sparse array could
+  // encode identically to a shorter one or to empty strings.
+  const sparse = [];
+  sparse.length = 2;
+  assert.equal(
+    inputsDifferOnlyByDefinitionRebuild([slot("x", { v: sparse })], [slot("x", { v: ["", ""] })]),
+    false,
+  );
+  assert.equal(
+    inputsDifferOnlyByDefinitionRebuild([slot("x", { v: sparse })], [slot("x", { v: [] })]),
+    false,
+  );
+  // THE discriminating case: a hole is not an explicit undefined. Encoding a
+  // hole by reading value[i] yields undefined for both, so these two collide and
+  // an array that LOST an entry reads as unchanged. The pairs above refuse
+  // either way, which is why mutation caught this and they did not.
+  assert.equal(
+    inputsDifferOnlyByDefinitionRebuild([slot("x", { v: sparse })], [slot("x", { v: [undefined, undefined] })]),
+    false,
+  );
+});
