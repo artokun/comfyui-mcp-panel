@@ -765,6 +765,23 @@ test("#1095: EVERY re-advertise goes through the gate — no caller can bypass i
   // waking, a manual change) and an elapsed-time window built on it either expires
   // instantly or never — the same rule as monotonicNow()'s other consumers.
   assert.match(gateCall.getText(sf), /now:\s*monotonicNow/, "the budget is elapsed time, so it needs a monotonic clock");
+
+  // A parked hello belongs to the connection it was queued for. Every teardown path must
+  // drop it: setUrl (pointing at a DIFFERENT bridge — firing there would register this tab
+  // somewhere nobody asked for, the corruption class #508 refuses to risk), stop, and
+  // destroy (a timer firing from a closure nothing owns any more). Three paths, three
+  // cancels — the same "setUrl/stop/destroy must all forget it" rule already asserted for
+  // `handshakenSock` above.
+  assert.equal(
+    (src.match(/^\s*rehelloGate\.cancel\(\);/gm) || []).length,
+    3,
+    "setUrl, stop and destroy must each drop a parked re-advertise",
+  );
+  assert.equal(
+    (src.match(/^\s*advertisedSock = null;/gm) || []).length,
+    3,
+    "…and each must forget the socket that had a mapping, so the next hello is a first one",
+  );
 });
 
 test("#1095: the workflow poll commits its state INLINE — it no longer gates anything", () => {
