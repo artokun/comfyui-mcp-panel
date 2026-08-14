@@ -282,27 +282,7 @@ test("EVERY failure exit in the builder names itself — no bare `return null` s
   // the honest instrument for "this function contains no unnamed exit" is the
   // source itself — bounded to the function body, not a fixed-size window that
   // silently stops covering what it checks.
-  const src = panelSource();
-  const start = src.indexOf("async function buildVideoStoryboard(");
-  assert.ok(start > 0, "could not locate buildVideoStoryboard");
-  // Walk braces from the function's opening `{` to its matching close.
-  const open = src.indexOf("{", start);
-  let depth = 0;
-  let end = open;
-  for (let i = open; i < src.length; i++) {
-    const c = src[i];
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
-    }
-  }
-  assert.ok(end > open, "could not bound the function body");
-  const body = src.slice(open, end);
-
+  const body = functionBody("async function buildVideoStoryboard(");
   const bare = body.match(/return null\s*;/g) ?? [];
   assert.deepEqual(
     bare,
@@ -353,6 +333,47 @@ test("a builder that returns a bare null STILL invents no cause", async () => {
   assert.match(reply.note, /the panel is not told which/);
   assert.doesNotMatch(reply.note, /could not be seeked/);
   assert.doesNotMatch(reply.note, /VP9/);
+});
+
+test("nothing that is not sheet-shaped is ever uploaded", async () => {
+  // Success is recognised POSITIVELY (a numeric `size`, which is what a Blob has
+  // and what the doubles model). Two earlier versions inferred FAILURE instead
+  // and both leaked: keying on the reason's type uploaded `{reason:{…}}`, and
+  // keying on its presence uploaded every other truthy value (review finding).
+  for (const shape of [[], {}, "a string", 42, true, { paintedFrames: 3 }]) {
+    const h = harness({ buildVideoStoryboard: async () => shape });
+    const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+    assert.equal(
+      h.calls.uploads.length,
+      0,
+      `a ${JSON.stringify(shape)} must not reach uploadBlobToInput`,
+    );
+    assert.equal(reply.previews.length, 0);
+    assert.match(reply.note, /no sampled preview could be built/);
+  }
+});
+
+test("a sheet-shaped result that ALSO carries a reason is read as the failure", async () => {
+  // The ambiguous shape the code comments call out. It is not one the builder
+  // produces, so the question is only which way to be wrong: preferring the
+  // explanation over silently uploading something that announced its own
+  // failure. Documented behaviour deserves a test — mutation showed that
+  // dropping the guard changed nothing observable without one.
+  const h = harness({
+    buildVideoStoryboard: async () => ({ size: 4096, reason: "no usable duration" }),
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(h.calls.uploads.length, 0);
+  assert.match(reply.note, /no usable duration/);
+});
+
+test("a sheet-shaped result is still uploaded — the positive check did not break success", async () => {
+  // The other direction, and the one a stricter check is most likely to break.
+  const h = harness({ buildVideoStoryboard: async () => ({ size: 4096, paintedFrames: 20 }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(h.calls.uploads.length, 1);
+  assert.equal(reply.previews.length, 1);
 });
 
 test("a non-string reason is ignored rather than interpolated", async () => {
@@ -1172,6 +1193,44 @@ test("a mixed batch reports each kind's outcome separately (#710)", async () => 
 const panelSource = () =>
   readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
 
+/**
+ * The body of a named function, bounded by its OWN braces.
+ *
+ * Replaces the fixed-size `slice(i, i + N)` these source tests used to take. A
+ * fixed window has a cliff: #1493 grew the storyboard builder past 4000 chars
+ * and the assertion below silently stopped covering the line it checked. Raising
+ * the number only moves the cliff (review finding), so bound the real thing.
+ *
+ * Not a JS parser, and it does not need to be — but a brace counter that reads
+ * braces inside STRINGS and COMMENTS can mis-bound and then validate the wrong
+ * region entirely (also a review finding), which is worse than no check. So mask
+ * those first, preserving length so offsets still line up with the original.
+ */
+function functionBody(signature) {
+  const src = panelSource();
+  const start = src.indexOf(signature);
+  assert.ok(start > 0, `could not locate ${signature}`);
+
+  const blank = (m) => m.replace(/[^\n]/g, " "); // keep newlines, drop content
+  const masked = src
+    .replace(/\/\*[\s\S]*?\*\//g, blank) // block comments
+    .replace(/\/\/[^\n]*/g, blank) // line comments
+    .replace(/"(?:\\.|[^"\\\n])*"/g, blank) // "…"
+    .replace(/'(?:\\.|[^'\\\n])*'/g, blank) // '…'
+    .replace(/`(?:\\.|[^`\\])*`/g, blank); // `…` (may span lines)
+
+  const open = masked.indexOf("{", start);
+  assert.ok(open > start, `could not find the opening brace of ${signature}`);
+  let depth = 0;
+  for (let i = open; i < masked.length; i++) {
+    if (masked[i] === "{") depth++;
+    else if (masked[i] === "}" && --depth === 0) {
+      return src.slice(open, i); // the ORIGINAL text, precisely bounded
+    }
+  }
+  assert.fail(`could not bound the body of ${signature}`);
+}
+
 test("the show_media dispatcher answers with the handler's reply, not a fixed acknowledgement", () => {
   const src = panelSource();
   assert.match(
@@ -1221,14 +1280,10 @@ test("the panel's storyboard builder carries the count it ACTUALLY drew", () => 
   // Without this, media-preview has only the grid capacity to go on and every
   // partially-sampled sheet is described as a full one — 19 blank cells
   // presented to the agent as 19 observations.
-  const src = panelSource();
-  const i = src.indexOf("async function buildVideoStoryboard(");
-  assert.ok(i > 0, "could not locate buildVideoStoryboard");
-  // 6000, not 4000: #1493 gave each failure branch a named reason and the body
-  // outgrew the old window, which made this assert on text it could no longer
-  // see. A window that silently stops covering what it checks is the failure
-  // mode of every source-scanning test.
-  const fn = src.slice(i, i + 6000);
+  // Brace-bounded, not a fixed window. #1493 grew this function past the old
+  // 4000-char slice and the assertion below stopped covering the line it
+  // checks; bumping the number would only move that cliff.
+  const fn = functionBody("async function buildVideoStoryboard(");
   assert.match(fn, /blob\.paintedFrames = painted;/);
   // A sheet that will not encode must still not be reported as a sheet. This
   // used to pin the literal `if (!blob) return null;`; comfyui-mcp#1493 replaced

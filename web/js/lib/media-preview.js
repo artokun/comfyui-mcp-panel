@@ -876,15 +876,23 @@ async function produceSheet(job, deps) {
     // #1493 — the builder may hand back `{reason}` instead of a sheet. That is
     // TRUTHY, so it has to be recognised before the `!blob` check below, or an
     // explanation would be uploaded to ComfyUI as if it were a PNG.
-    // Detect the FAILURE SHAPE by the presence of `reason`, and interpolate only
-    // when it is a string. Keying "is this a failure?" on the reason's TYPE was
-    // wrong in the dangerous direction: a malformed `{reason: {...}}` is truthy,
-    // failed the string test, and was then treated as a Blob — uploaded to
-    // ComfyUI, and announced as a sheet the panel could not count. Caught by the
-    // malformed-reason test below, which is why it exists.
-    const isFailure = produced != null && typeof produced === "object" && "reason" in produced;
-    const named = isFailure && typeof produced.reason === "string" ? produced.reason : null;
-    const blob = isFailure ? null : produced;
+    // Recognise SUCCESS positively; treat everything else as a failure.
+    //
+    // Two earlier versions inferred failure instead, and both were wrong in the
+    // direction that uploads garbage: keying on the reason's TYPE let a
+    // malformed `{reason:{…}}` through as a sheet, and keying on the PRESENCE of
+    // `reason` still uploaded any other truthy value — `[]`, `{}`, a string
+    // (review finding). A sheet is the thing with a numeric `size`, which is
+    // what a Blob has and what every test double models; nothing else may reach
+    // `uploadBlobToInput`.
+    //
+    // A hypothetical Blob carrying its own string `reason` is therefore read as
+    // a failure. That is a shape the builder never produces, and preferring the
+    // explanation over a silent upload is the safe way to be wrong about it.
+    const asObject = produced != null && typeof produced === "object" ? produced : null;
+    const named = asObject && typeof asObject.reason === "string" ? asObject.reason : null;
+    const looksLikeSheet = asObject != null && typeof asObject.size === "number";
+    const blob = looksLikeSheet && !named ? produced : null;
     if (!blob) {
       warn("[cmcp] show_media: could not sample frames from", job.name);
       return {
