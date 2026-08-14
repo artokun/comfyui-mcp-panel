@@ -157,7 +157,7 @@ function computePrevTag() {
     `changelog: WARNING — no version tag AND no recognisable release commit; bounding at the FIRST commit ${root.slice(0, 8)}.`,
   );
   console.error(
-    "changelog: unless this is a brand-new repository, the entry below will regenerate the entire history —" +
+    "changelog: unless this is a brand-new repository, the entry below will re-list the entire history —" +
       " check scripts/lib/changelog-match.mjs still matches this repo's release subjects.",
   );
   return root;
