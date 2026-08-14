@@ -644,14 +644,96 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   );
 });
 
-test("#1223 the STARTUP read is snapshotted — otherwise the reported case is still refused", () => {
-  // On a normal startup, seedObjectInfoHistory performs the ONLY whole /object_info read;
-  // registerComfyNodeDefs does not run. Without recording there, a first widget edit during
-  // a render found no snapshot and was refused exactly as before the fix.
-  const seed = PANEL_SRC.slice(PANEL_SRC.indexOf("function seedObjectInfoHistory("));
-  const body = seed.slice(0, seed.indexOf("\nasync function "));
-  assert.match(body, /const observedAtEpoch = backendReconnectEpoch;/, "the epoch is captured before the fetch");
-  assert.match(body, /objectInfoSnapshot\.record\(defs, \{/, "and the startup payload is recorded");
+/**
+ * The SHIPPED `seedObjectInfoHistory`, extracted and driven.
+ *
+ * A source-regex test was tried first and is not good enough: `if (false) record(...)` still
+ * MATCHES the pattern, so disabling the startup snapshot left the assertion green. Mutation
+ * caught that. A test for whether code RUNS has to run it.
+ */
+function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null }) {
+  const start = PANEL_SRC.indexOf("function seedObjectInfoHistory()");
+  assert.notEqual(start, -1, "seedObjectInfoHistory not found");
+  const open = PANEL_SRC.indexOf("{", start);
+  let depth = 0;
+  let body = null;
+  for (let i = open; i < PANEL_SRC.length; i += 1) {
+    const ch = PANEL_SRC[i];
+    if (ch === "/" && PANEL_SRC[i + 1] === "/") {
+      i = PANEL_SRC.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) {
+      body = PANEL_SRC.slice(start, i + 1);
+      break;
+    }
+  }
+  assert.ok(body, "unterminated seedObjectInfoHistory");
+
+  const factory = new Function(
+    "api",
+    "objectInfoSnapshot",
+    "initialEpoch",
+    "epochDuringFetch",
+    "objectInfoHistory",
+    `let backendReconnectEpoch = initialEpoch;
+     let objectInfoHistorySeed = null;
+     const recorded = [];
+     let seeded = false;
+     const recordObjectInfoTypes = (defs) => { recorded.push(defs); return defs; };
+     const markObjectInfoHistorySeeded = () => { seeded = true; return true; };
+     ${body}
+     return {
+       run: () => seedObjectInfoHistory(),
+       readRecorded: () => recorded,
+       wasSeeded: () => seeded,
+       setEpoch: (n) => { backendReconnectEpoch = n; },
+     };`,
+  );
+  const built = factory(
+    {
+      getNodeDefs: async () => {
+        // Move the epoch WHILE the request is outstanding — the reconnect-mid-fetch hazard.
+        if (epochDuringFetch !== null) built.setEpoch(epochDuringFetch);
+        return api.defs;
+      },
+    },
+    snapshot,
+    epoch,
+    null,
+    { loseBaseline: () => {} },
+  );
+  return built;
+}
+
+test("#1223 SHIPPED STARTUP: the seed's whole read IS snapshotted", async () => {
+  // On a normal startup this is the ONLY whole /object_info read that happens —
+  // registerComfyNodeDefs does not run unless something triggers a refresh. Without this,
+  // the reported case (first widget edit during a render, both probes silent) finds no
+  // snapshot and is refused exactly as before the fix. That was the shipped v1 behaviour.
+  const snapshot = createObjectInfoSnapshot();
+  const seed = buildShippedSeed({ api: { defs: SCHEMA }, epoch: 2, snapshot });
+  await seed.run();
+  assert.equal(seed.wasSeeded(), true, "the history baseline still lands");
+  assert.deepEqual(seed.readRecorded(), [SCHEMA], "and the ever-seen history still takes it");
+  assert.deepEqual(snapshot.peek(), { held: true, epoch: 2 }, "and the snapshot is filed at the startup epoch");
+});
+
+test("#1223 SHIPPED STARTUP: a failed seed leaves no snapshot", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const seed = buildShippedSeed({ api: { defs: null }, epoch: 2, snapshot });
+  await seed.run();
+  assert.equal(snapshot.peek().held, false, "nothing observed, nothing filed");
+});
+
+test("#1223 SHIPPED STARTUP: a reconnect during the seed's fetch is not filed", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const seed = buildShippedSeed({ api: { defs: SCHEMA }, epoch: 2, snapshot, epochDuringFetch: 3 });
+  await seed.run();
+  assert.equal(seed.wasSeeded(), true, "the history is still seeded — that trust root is separate");
+  assert.equal(snapshot.peek().held, false, "but the payload describes the connection that was replaced");
 });
 
 test("#1223 the socket handlers clear the snapshot DIRECTLY, not by way of a refresh", () => {
