@@ -144,7 +144,23 @@ function computePrevTag() {
   } catch {
     /* no release commit */
   }
-  return git("rev-list --max-parents=0 HEAD").split(/\s+/)[0]; // first commit
+  // #1191 — THE SAME WARNING, on the branch that had none. The tag path above announces a
+  // fallback; this one reached the FIRST COMMIT in silence, which is the worse outcome of
+  // the two: bounding at a stale tag re-lists one release, bounding at the root re-lists
+  // every commit in history. A first pass added the warning to the tag branch only, so the
+  // untagged repo — which is what this project actually is — kept the original failure.
+  //
+  // Not a hard failure: a genuinely fresh repository has no release commit and this IS its
+  // correct answer. The point is that it should never be reached without saying so.
+  const root = git("rev-list --max-parents=0 HEAD").split(/\s+/)[0];
+  console.error(
+    `changelog: WARNING — no version tag AND no recognisable release commit; bounding at the FIRST commit ${root.slice(0, 8)}.`,
+  );
+  console.error(
+    "changelog: unless this is a brand-new repository, the entry below will re-list the entire history —" +
+      " check scripts/lib/changelog-match.mjs still matches this repo's release subjects.",
+  );
+  return root;
 }
 
 // The release-subject rules live in ./lib/changelog-match.mjs so the tests can import the
