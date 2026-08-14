@@ -11648,6 +11648,13 @@ const GRAPH_TOOL_EXECUTORS = {
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
           // above), so it is one #1223's fallback may hold — but ONLY when this call issued
           // the fetch itself, and only if no reconnect landed while it was in flight.
+          //
+          // This guard is DEFENCE IN DEPTH, and mutation testing reports removing it as a
+          // surviving mutant for that reason: `record` independently rejects a non-finite
+          // `observedAtEpoch`, which is exactly what a cache hit leaves here. It is kept
+          // because it states the rule at the point of decision — "only the caller that
+          // asked may file the answer" — rather than leaving it to be inferred from a
+          // validation two files away.
           if (observedAtEpoch !== null) {
             objectInfoSnapshot.record(defs, {
               observedAtEpoch,
