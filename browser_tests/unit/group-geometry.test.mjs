@@ -793,3 +793,57 @@ test("#813 an EXPANDED member is unaffected — its two models already agree", (
   assert.deepEqual(r.stuck, []);
   assert.deepEqual([...n.boundingRect], [110, 80, 200, 130]);
 });
+
+test("#813 a rect exposed by a COPYING getter is not reported moved (review P2)", () => {
+  // `boundingRect` backed by a getter that hands out a fresh array each read. syncNodeArea
+  // mutates and verifies the throwaway copy, so its own verdict is true while the node's
+  // real rect never changed. Trusting that would report the node moved and then let the
+  // next rect-first membership read drop it from the group it was just moved into. This
+  // file already documents the same accessor shape for `pos` in writePoint.
+  const real = [100, 70, 80, 30];
+  const n = {
+    id: 30,
+    pos: [100, 100],
+    size: [225, 0],
+    flags: { collapsed: true },
+    _collapsed_width: 80,
+    get boundingRect() {
+      return [...real]; // a COPY: writes to it are dropped
+    },
+    updateArea() {
+      /* engine cannot move a rect it is handed by copy either */
+    },
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "a rect whose writes cannot be observed is not 'moved'");
+  assert.deepEqual(r.stuck, [n]);
+  assert.deepEqual(real, [100, 70, 80, 30], "and the underlying rect really was never updated");
+});
+
+test("#813 an EXPANDED node's authoritative extents are not overwritten (review P2)", () => {
+  // A custom node whose updateArea() computes visible bounds reaching past `size` — a
+  // legitimate engine answer that differs from the panel's generic footprint model. The
+  // collapsed repair must not fire here: overwriting the engine's rect and reporting
+  // success would make later rect-first membership wrong.
+  const n = {
+    id: 31,
+    pos: [100, 100],
+    size: [200, 100],
+    // Deliberately WIDER than size — the node draws outside its box.
+    boundingRect: [100, 70, 400, 300],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, 400, 300];
+    },
+  };
+
+  const r = moveGroupMembers([n], 10, 10);
+
+  assert.deepEqual(r.stuck, [n], "an expanded node with a non-generic rect is still stuck");
+  assert.deepEqual(
+    [...n.boundingRect],
+    [110, 80, 400, 300],
+    "and its authoritative extents survive — never replaced by the 200x130 generic model",
+  );
+});

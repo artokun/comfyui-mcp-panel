@@ -552,7 +552,36 @@ export function moveGroupMembers(members, dx, dy) {
       // rect-first, so a rect that cannot track its node would report it in a group it has
       // left. The question changes from "does the rect already agree" to "can the rect be
       // MADE to agree", which is the one the caller actually needs answered.
-      if (!nodeAreaIsLive(n) && !syncNodeArea(n)) landedExactly = false;
+      //
+      // TWO THINGS THE CORRECTION IS DELIBERATELY NOT (both found in review):
+      //
+      // 1. IT IS NOT UNGATED. Only a COLLAPSED node gets it. An expanded node's
+      //    `updateArea()` may authoritatively compute extents that legitimately differ from
+      //    the generic `[x, y-30, size0, size1+30]` model — visible bounds that reach past
+      //    `size`, on a custom node that draws outside its box. Forcing the generic
+      //    footprint there would overwrite the engine's own answer and then report success,
+      //    and rect-first membership would be wrong afterwards. The reported defect is
+      //    specifically the collapsed-PILL disagreement, so that is all this repairs; an
+      //    expanded node with an uncorrectable rect is still stuck, exactly as before.
+      //    A `flags` accessor that THROWS reads as not-collapsed, so it fails closed.
+      //
+      // 2. IT DOES NOT TRUST `syncNodeArea`'s OWN VERDICT ALONE. `boundingRect` can be an
+      //    accessor whose getter returns a FRESH array on every read — a shape this file
+      //    already documents for `pos` in `writePoint` ("a getter that returns a COPY, where
+      //    an in-place write is silently dropped"). Against such a node `syncNodeArea`
+      //    mutates and then verifies the throwaway copy it was handed, returns true, and the
+      //    node's real rect never changed: the move would report the node moved while the
+      //    next membership read still saw the old rect and dropped it from the group. So the
+      //    verdict is re-read through `nodeAreaIsLive`, which fetches the property again.
+      let isCollapsed = false;
+      try {
+        isCollapsed = !!n?.flags?.collapsed;
+      } catch {
+        isCollapsed = false; // unreadable flags ⇒ not eligible for the collapsed repair
+      }
+      if (!nodeAreaIsLive(n) && !(isCollapsed && syncNodeArea(n) && nodeAreaIsLive(n))) {
+        landedExactly = false;
+      }
     } catch {
       landedExactly = false;
     }
