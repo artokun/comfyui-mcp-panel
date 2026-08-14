@@ -483,7 +483,13 @@ test("#1529 audit: NO shipped module touches the raw property outside a comment"
       const text = readFileSync(full, "utf8");
       text.split("\n").forEach((line, i) => {
         if (!line.includes("cmcpRefusal")) return;
-        if (/^\s*(\/\/|\*|\/\*)/.test(line)) return; // a comment may name it
+        // A comment may name it — but only a line that is ENTIRELY comment.
+        // `/* compat */ reply.refusal = err.cmcpRefusal;` starts with a block
+        // opener and is executable code (review r3), so a leading-token test
+        // alone would wave it through.
+        const isWholeLineComment =
+          /^\s*(\/\/|\*)/.test(line) || (/^\s*\/\*/.test(line) && !/\*\/\s*\S/.test(line));
+        if (isWholeLineComment) return;
         offenders.push(`${entry.name}:${i + 1}: ${line.trim()}`);
       });
     }
@@ -505,9 +511,26 @@ test("#1529 audit: the mint has exactly the two known, PRE-EXECUTOR call sites",
   //
   // The two that exist: revalidateGraphMutationContext's preflight (before
   // getGraphCtx, before any write) and the dispatch gate (before the executor).
-  const sites = [...SRC.matchAll(/reconnectRefusalError\(/g)].length;
-  assert.equal(sites, 2, "a new mint call site must be reviewed for 'is this before the executor?'");
+  // Counts every REFERENCE to the identifier, not `name(` — `(reconnectRefusalError)(gate)`,
+  // `const mint = reconnectRefusalError`, or a re-export all read as zero call
+  // sites to a `name\(` regex while adding one (review r3). Three references:
+  // the import binding, and the two throws.
+  const refs = [...SRC.matchAll(/\breconnectRefusalError\b/g)].length;
+  assert.equal(refs, 3, "a new mint reference must be reviewed for 'is this before the executor?'");
+  // …and the two that exist are still the throws, not something else.
+  assert.equal([...SRC.matchAll(/throw reconnectRefusalError\(reconnectGate\);/g)].length, 2);
 });
+
+// NOT PROVABLE HERE, and stated rather than implied: none of the above shows
+// that either call site is still PRE-EXECUTOR. Moving an existing mint below a
+// graph write keeps every count in this file unchanged (review r3), and no
+// source scan decides it — "has this dispatch written yet" is runtime state.
+//
+// What the counts buy is that the set cannot GROW silently, which is the way a
+// post-write mint would realistically arrive. The two sites carry the argument
+// at the call itself: revalidateGraphMutationContext's gate runs before
+// getGraphCtx and before any write, and the dispatch gate runs before the
+// executor. Both comments say so, and both are load-bearing for `applied:false`.
 
 test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list", () => {
   // The reviewer's P2: a send boundary that rebuilt the frame as {rid, ok, error}
