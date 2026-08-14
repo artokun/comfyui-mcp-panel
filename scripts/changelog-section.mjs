@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 /**
- * Print ONE version's section from CHANGELOG.md — used as the Comfy Registry
- * `changelog` field on publish (the Registry's "Updates" section for this pack)
- * and as a GitHub Release body.
+ * Print ONE version's section from CHANGELOG.md.
+ *
+ * ONE call site in this repo: `.github/workflows/publish_action.yml`, which
+ * feeds the output to `comfy node publish --changelog-file` so it lands in the
+ * Registry's "Updates" section for this pack. (The sibling script of the same
+ * name in comfyui-mcp additionally writes GitHub Release bodies; this repo does
+ * not generate those, so do not assume that integration exists here.)
  *
  * Why this exists: every publish to the Registry has shipped with a BLANK
  * changelog. `comfy node publish` accepts `--changelog-file <path>`, but the
@@ -15,9 +19,10 @@
  * same defect on that repo's GitHub Release bodies — see mcp#1138.)
  *
  * Usage:  node scripts/changelog-section.mjs 0.11.45 [--file CHANGELOG.md]
- * Exits non-zero (and prints nothing to stdout) when the section is absent, so
- * a caller can fall back — e.g. publish with no changelog — rather than fail
- * the whole release over missing notes.
+ * Exits non-zero (and prints nothing to stdout) when the section is absent or
+ * empty. That is a supported outcome, not an error to escalate: the workflow
+ * treats it as "no notes for this version" and publishes without them rather
+ * than failing the release over missing prose.
  */
 import { readFileSync } from "node:fs";
 
