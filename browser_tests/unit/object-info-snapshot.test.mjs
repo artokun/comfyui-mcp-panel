@@ -617,10 +617,14 @@ test("#1223 the socket handlers clear the snapshot DIRECTLY, not by way of a ref
   // The `reconnected` handler's refreshComfyNodeDefs() carries no payload and no force,
   // which makeRefreshCoalescer resolves by joining an in-flight run and returning — so
   // registerComfyNodeDefs, and the clear inside it, may never run for that reconnect.
-  for (const evt of ["reconnecting", "reconnected"]) {
+  // Each handler is bounded at the NEXT listener registration. A fixed-width slice ran past
+  // the end of `reconnecting` into `status` — which also clears — so deleting the clear from
+  // `reconnecting` left this test green. Found by mutation, not by reading.
+  for (const evt of ["reconnecting", "status", "reconnected"]) {
     const at = PANEL_SRC.indexOf(`api.addEventListener("${evt}"`);
     assert.notEqual(at, -1, `${evt} handler not found`);
-    const handler = PANEL_SRC.slice(at, at + 1200);
+    const next = PANEL_SRC.indexOf("api.addEventListener(", at + 1);
+    const handler = PANEL_SRC.slice(at, next === -1 ? PANEL_SRC.length : next);
     assert.match(handler, /objectInfoSnapshot\.clear\(\);/, `${evt} retires the snapshot itself`);
   }
   assert.match(
