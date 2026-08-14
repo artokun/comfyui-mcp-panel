@@ -204,6 +204,8 @@ function realGraphAddNode(comfy, overrides = {}) {
   const { app, LG, graph } = comfy;
   const context = { app, LG, graph, rootGraph: graph, workflow: { uuid: "wf" } };
   const calls = { single: [], whole: 0 };
+  // #1223 — what the add filed into the last-observed-schema snapshot, and with what epoch.
+  const snapshotFilings = [];
 
   const api = {
     // The whole-schema route. Counting it is how these tests prove #780's saving survives.
@@ -230,7 +232,11 @@ function realGraphAddNode(comfy, overrides = {}) {
     // #1223 — the last-observed-schema snapshot the add path files its WHOLE payload into,
     // and the connection epoch it stamps that with. Both are module scope in the real file,
     // so this rebuilt scope has to name them or the executor throws ReferenceError.
-    objectInfoSnapshot: { record: () => true, clear: () => {} },
+    //
+    // A RECORDING spy, not a stub: the add is one of the readers that must feed the
+    // fallback, and the epoch it stamps has to be the one at the WHOLE request — not the
+    // one before the optional per-class probe that may precede it.
+    objectInfoSnapshot: { record: (defs, opts) => (snapshotFilings.push({ defs, opts }), true), clear: () => {} },
     backendReconnectEpoch: 0,
     api,
     refreshComfyNodeDefs: async (defs) => app.registerNodesFromDefs(defs ?? backendObjectInfo()),
@@ -294,7 +300,7 @@ function realGraphAddNode(comfy, overrides = {}) {
      const executors = {${addNodeMatch[0]}};
      return executors.graph_add_node;`,
   );
-  return { graph_add_node: factory(...names.map((n) => deps[n])), calls };
+  return { graph_add_node: factory(...names.map((n) => deps[n])), calls, snapshotFilings };
 }
 
 // ---------------------------------------------------------------------------
@@ -681,4 +687,38 @@ test("#1180: the registration wait measures itself on the monotonic clock", () =
   assert.match(fn, /const startedAt = monotonicNow\(\);/, "the deadline must be taken on the monotonic clock");
   assert.match(fn, /while \(monotonicNow\(\) < deadline\)/, "…and the poll must read the SAME clock it was set on");
   assert.doesNotMatch(fn, /Date\.now\(\)/, "no wall-clock reading may survive in this function");
+});
+
+test("#1223: the add files a WHOLE schema, and never a single-class payload", async () => {
+  // graph_add_node is one of the readers that must feed the last-observed-schema fallback:
+  // an add that registers a new type is often the last thing to have read a whole map, and
+  // dropping it leaves the next render-time widget edit refused for want of it.
+  //
+  // UNREGISTERED type ⇒ the #780 fast path is skipped and the WHOLE schema is fetched.
+  const comfy = makeComfy();
+  delete comfy.LG.registered_node_types.SeedVR2VideoUpscaler;
+  const { graph_add_node, snapshotFilings } = realGraphAddNode(comfy);
+  await graph_add_node({ class_type: 'SeedVR2VideoUpscaler', workflow_uuid: 'wf' });
+
+  assert.equal(snapshotFilings.length, 1, 'one whole schema was fetched, so one is filed');
+  const [{ defs, opts }] = snapshotFilings;
+  assert.ok(Object.keys(defs).length > 1, 'the WHOLE map, not a single-class payload');
+  assert.equal(opts.whole, true, 'and the wholeness claim is stated');
+  assert.equal(
+    opts.observedAtEpoch,
+    opts.currentEpoch,
+    'the epoch must be read where the WHOLE request goes out — a reconnect during the ' +
+      'optional per-class probe before it would leave this stale and the record rejected',
+  );
+});
+
+test("#1223: an add that takes the single-class fast path files NOTHING", async () => {
+  // A one-entry /object_info/<Type> payload reaching the snapshot would make every other
+  // type read as absent, and the #458 ever-seen gate would diagnose the whole install as
+  // removed packs. The fast path only runs for an ALREADY-REGISTERED type.
+  const comfy = makeComfy();
+  const { graph_add_node, snapshotFilings, calls } = realGraphAddNode(comfy);
+  await graph_add_node({ class_type: 'SeedVR2VideoUpscaler', workflow_uuid: 'wf' });
+  assert.ok(calls.single.length > 0, 'the fast path ran');
+  assert.deepEqual(snapshotFilings, [], 'and nothing was filed from it');
 });

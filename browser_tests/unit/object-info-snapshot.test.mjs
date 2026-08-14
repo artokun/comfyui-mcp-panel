@@ -652,8 +652,157 @@ test("#1223 SHIPPED: the ineligibility reason is NOT counted as a transport rout
 });
 
 // ---------------------------------------------------------------------------
-// The panel wiring, pinned at the source level
+// The OTHER whole-schema readers, extracted and driven
+//
+// A source-count assertion cannot pin these: wrapping a record site in `if (false)` leaves
+// the call text — and therefore the count — untouched. Mutation caught exactly that, in a
+// test written after learning the same lesson about the startup seed.
 // ---------------------------------------------------------------------------
+
+/** Balanced-brace extraction of a `async <name>(...) { ... }` executor from the panel. */
+function extractExecutor(name) {
+  const start = PANEL_SRC.indexOf(`async ${name}(`);
+  assert.notEqual(start, -1, `${name} not found`);
+  // Skip the PARAMETER LIST before looking for the body. These executors destructure their
+  // argument — `async graph_get_object_info({ if_none_match } = {})` — so the first `{` in
+  // the text is the parameter pattern, and a scanner that starts there closes on its own
+  // `}` and "extracts" 45 characters of signature.
+  const paren = PANEL_SRC.indexOf("(", start);
+  let parenDepth = 0;
+  let afterParams = -1;
+  for (let i = paren; i < PANEL_SRC.length; i += 1) {
+    if (PANEL_SRC[i] === "(") parenDepth += 1;
+    if (PANEL_SRC[i] === ")" && --parenDepth === 0) {
+      afterParams = i;
+      break;
+    }
+  }
+  assert.notEqual(afterParams, -1, `${name} parameter list is unterminated`);
+  const open = PANEL_SRC.indexOf("{", afterParams);
+  let depth = 0;
+  for (let i = open; i < PANEL_SRC.length; i += 1) {
+    const ch = PANEL_SRC[i];
+    if (ch === "/" && PANEL_SRC[i + 1] === "/") {
+      i = PANEL_SRC.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < PANEL_SRC.length; i += 1) {
+        if (PANEL_SRC[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (PANEL_SRC[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return PANEL_SRC.slice(start, i + 1);
+  }
+  throw new Error(`unterminated ${name}`);
+}
+
+function buildExecutor(name, deps) {
+  const names = Object.keys(deps);
+  const factory = new Function(...names, `const executors = { ${extractExecutor(name)} };\nreturn executors.${name};`);
+  return factory(...names.map((n) => deps[n]));
+}
+
+test("#1223 SHIPPED get_object_info: a successful whole read IS filed", async () => {
+  // After a failed startup seed, or a reconnect that cleared the snapshot, this command can
+  // be the only thing that has successfully read a whole schema. Dropping it left the next
+  // render-time widget edit refused for want of the very map it had just read.
+  const snapshot = createObjectInfoSnapshot();
+  const get = buildExecutor("graph_get_object_info", {
+    fetchWholeObjectInfo: async () => ({ defs: SCHEMA, failures: [], outcomes: [] }),
+    objectInfoSnapshot: snapshot,
+    backendReconnectEpoch: 9,
+    api: { getNodeDefs: async () => SCHEMA },
+    pageComfyOrigin: () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote: () => "",
+    objectInfoFingerprint: () => "fp",
+    objectInfoUnchanged: (etag) => etag === "fp",
+  });
+
+  const res = await get({});
+  assert.equal(res.ok, true);
+  assert.deepEqual(snapshot.peek(), { held: true, epoch: 9 }, "filed at the epoch it was read on");
+
+  // ...and the if_none_match early-return still keeps it fed, which is why the record sits
+  // above that branch: a caller polling with a fingerprint would otherwise never file one.
+  const snapshot2 = createObjectInfoSnapshot();
+  const get2 = buildExecutor("graph_get_object_info", {
+    fetchWholeObjectInfo: async () => ({ defs: SCHEMA, failures: [], outcomes: [] }),
+    objectInfoSnapshot: snapshot2,
+    backendReconnectEpoch: 9,
+    api: { getNodeDefs: async () => SCHEMA },
+    pageComfyOrigin: () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote: () => "",
+    objectInfoFingerprint: () => "fp",
+    objectInfoUnchanged: (etag) => etag === "fp",
+  });
+  const unchanged = await get2({ if_none_match: "fp" });
+  assert.equal(unchanged.unchanged, true, "the early return still happens");
+  assert.equal(snapshot2.peek().held, true, "and the snapshot was still fed on the way there");
+});
+
+test("#1223 SHIPPED get_object_info: a FAILED read files nothing", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const get = buildExecutor("graph_get_object_info", {
+    fetchWholeObjectInfo: async () => ({ defs: null, failures: ["nope"], outcomes: [] }),
+    objectInfoSnapshot: snapshot,
+    backendReconnectEpoch: 9,
+    api: {},
+    pageComfyOrigin: () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote: () => "",
+    objectInfoFingerprint: () => "fp",
+    objectInfoUnchanged: () => false,
+  });
+  const res = await get({});
+  assert.equal(res.ok, false);
+  assert.equal(snapshot.peek().held, false);
+});
+
+function buildRemoveWidget({ snapshot, epoch = 4, cache, defs = SCHEMA }) {
+  const node = { id: 3, type: "KSampler", comfyClass: "KSampler", widgets: [{ name: "seed" }] };
+  return buildExecutor("graph_remove_widget", {
+    getGraphCtx: () => ({ graph: {} }),
+    resolveNode: () => node,
+    objectInfoCache: cache,
+    fetchWholeObjectInfo: async () => ({ defs, failures: [], outcomes: [] }),
+    CACHE_OUTCOME,
+    objectInfoSnapshot: snapshot,
+    backendReconnectEpoch: epoch,
+    api: {},
+    recordObjectInfoTypes: (d) => d,
+    declaredInputNames: () => new Set(["seed"]),
+    objectInfoOracleFailureNote: () => "",
+    assertActiveWorkflowCommandTarget: () => {},
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    runRemoveWidget: async () => ({ ok: true }),
+  });
+}
+
+test("#1223 SHIPPED remove_widget: the whole schema it paid for IS filed", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const remove = buildRemoveWidget({ snapshot, epoch: 4, cache: createObjectInfoCache() });
+  await remove({ node_id: 3, widget: "seed" });
+  assert.deepEqual(snapshot.peek(), { held: true, epoch: 4 });
+});
+
+test("#1223 SHIPPED remove_widget: a CACHE HIT is not filed", async () => {
+  // Same rule as set_widget: a cached payload may predate a reconnect, and this call cannot
+  // vouch for when it was issued.
+  const snapshot = createObjectInfoSnapshot();
+  const cache = createObjectInfoCache();
+  const remove = buildRemoveWidget({ snapshot, epoch: 4, cache });
+  await remove({ node_id: 3, widget: "seed" });
+  snapshot.clear();
+  await remove({ node_id: 3, widget: "seed" }); // within the TTL ⇒ served from store
+  assert.equal(snapshot.peek().held, false, "the second call never issued a request of its own");
+});
 
 test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and vouched for", () => {
   // Each CALL SITE is checked for its own claim. Counting `whole: true` across the file
