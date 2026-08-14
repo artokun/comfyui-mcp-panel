@@ -215,6 +215,7 @@ import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/objec
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
+import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
@@ -12050,6 +12051,36 @@ const GRAPH_TOOL_EXECUTORS = {
     // seed keeps running, so a late response still establishes the baseline and the next
     // call authorizes normally — ordinary latency must never burn the session.
     await awaitObjectInfoHistorySeed();
+    // #757 — MINT an rgthree Power Lora Loader row when the write targets one that does not
+    // exist yet. Those rows are created only by the node's own "➕ Add Lora" button, a
+    // DOM-only control an agent cannot click, so every write to `lora_1` on a fresh node was
+    // refused for a widget no tool could bring into existence. Writing an EXISTING row
+    // already worked; this is the creation half.
+    //
+    // AFTER the history seed and BEFORE runSetWidget, deliberately. The seed is what makes
+    // the #458 authorization meaningful, and creating a row is a mutation — it must not
+    // happen on a call that authorization is about to refuse. runSetWidget then resolves the
+    // now-present widget through the ordinary path, so the composite merge and the #240
+    // verify are unchanged.
+    //
+    // The classifier is keyed on node TYPE + the `lora_<n>` name shape + a lora-slot-shaped
+    // VALUE, all three. That is what keeps it away from the deliberate refusal to auto-press
+    // a control on an ordinary typo — see lib/rgthree-lora-row.js.
+    let createdLoraRow = null;
+    if (isRgthreeLoraRowCreation(node, widget, value)) {
+      // The uuid fence brackets the mutation, as graph_remove_widget does: the user can
+      // switch workflows during the awaits above, and a row must never be grown on a canvas
+      // the caller did not address (#570/#718).
+      assertActiveWorkflowCommandTarget({
+        cmd: "graph_set_widget",
+        [WORKFLOW_UUID_FIELD]: workflow_uuid,
+      });
+      createdLoraRow = createRgthreeLoraRow(node, widget, {
+        beforeChange: () => graph.beforeChange(),
+        afterChange: () => graph.afterChange(),
+        setDirty: () => graph.setDirtyCanvas(true, true),
+      }).created;
+    }
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
@@ -12310,10 +12341,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // than in `warning`. That channel is single-slot and priority-ordered (link-driven
     // outranks control_after_generate), so appending here would silently displace a warning
     // about what the write actually DOES — a strictly worse trade than a separate field.
+    // #757 — DISCLOSE that the row did not exist and was minted. The caller asked to set a
+    // widget and the panel also GREW the node, which is a structural change to the graph;
+    // reporting only the value write would hide it. Its own field, for the same reason the
+    // #1223 provenance note has one: `warning` is single-slot and priority-ordered.
+    const withCreation = (r) =>
+      createdLoraRow !== null && r && typeof r === "object"
+        ? { ...r, created_widget: createdLoraRow }
+        : r;
     if (setWidgetSchemaFromSnapshot !== null && result && typeof result === "object") {
-      return { ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) };
+      return withCreation({ ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) });
     }
-    return result;
+    return withCreation(result);
   },
 
   // artokun/comfyui-mcp#938: remove ONE dynamic widget row (rgthree Power Lora Loader

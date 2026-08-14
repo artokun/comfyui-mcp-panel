@@ -268,7 +268,11 @@ const RGTHREE_LORA_SLOT_SCHEMA = {
 // the row is repaired-forward — never fall back to inferring a type from a corrupt value,
 // which would accept a further wrong-type write and deepen the corruption.
 const RGTHREE_LORA_SLOT_KEYS = new Set(["on", "lora", "strength", "strengthTwo"]);
-function isLoraSlotObject(obj) {
+// EXPORTED for #757's creation route (`rgthree-lora-row.js`), which must decide whether an
+// incoming value is a lora row before it will mint a slot for it. Exported rather than
+// re-implemented there: two copies of a shape test drift, and the drift would show up as a
+// slot created for a value the writer then refuses.
+export function isLoraSlotObject(obj) {
   if (obj == null || typeof obj !== "object" || Array.isArray(obj)) return false;
   const keys = Object.keys(obj);
   if (keys.length === 0) return false;
