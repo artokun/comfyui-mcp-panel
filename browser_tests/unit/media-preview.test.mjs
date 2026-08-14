@@ -271,6 +271,101 @@ test("a sampler that returns nothing degrades with a remedy and NO invented caus
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
 });
 
+// comfyui-mcp#1493 — the builder knew which of its six failures it hit and threw
+// that away, so the reply had to say "the panel is not told which". It can now
+// hand back `{reason}`, and only then may the reply name a cause.
+test("EVERY failure exit in the builder names itself — no bare `return null` survives", () => {
+  // The consumer tests below all STUB buildVideoStoryboard, so none of them can
+  // see the builder's own branches: mutation showed the duration branch could be
+  // reverted to a bare `null` with the whole suite still green. The real builder
+  // needs a DOM (video + canvas + seeking) that these node tests do not have, so
+  // the honest instrument for "this function contains no unnamed exit" is the
+  // source itself — bounded to the function body, not a fixed-size window that
+  // silently stops covering what it checks.
+  const src = panelSource();
+  const start = src.indexOf("async function buildVideoStoryboard(");
+  assert.ok(start > 0, "could not locate buildVideoStoryboard");
+  // Walk braces from the function's opening `{` to its matching close.
+  const open = src.indexOf("{", start);
+  let depth = 0;
+  let end = open;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  assert.ok(end > open, "could not bound the function body");
+  const body = src.slice(open, end);
+
+  const bare = body.match(/return null\s*;/g) ?? [];
+  assert.deepEqual(
+    bare,
+    [],
+    `every failure exit must name its cause; found ${bare.length} bare \`return null\``,
+  );
+  // …and the named exits are actually there (a body that returns nothing at all
+  // would trivially satisfy the assertion above).
+  const named = body.match(/return storyboardFailure\(/g) ?? [];
+  assert.ok(named.length >= 5, `expected the 5 failure branches to be named, saw ${named.length}`);
+});
+
+test("a NAMED sampler failure is passed through, not flattened to the generic note", async () => {
+  const h = harness({
+    buildVideoStoryboard: async () => ({
+      reason: "the browser reported no usable duration for it (its codec may not be decodable here — VP9/AV1 .webm is the usual case)",
+    }),
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(reply.previews.length, 0);
+  assert.match(reply.note, /no usable duration/);
+  assert.match(reply.note, /VP9\/AV1/);
+  // The generic "not told which" line must be GONE — we were told which.
+  assert.doesNotMatch(reply.note, /the panel is not told which/);
+  // Still actionable, and the user still got the player.
+  assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+  assert.equal(h.calls.paintedVideos.length, 1);
+});
+
+test("a named failure is never uploaded as if it were a sheet", async () => {
+  // `{reason}` is TRUTHY. A consumer that only checked `if (!blob)` would sail
+  // past it and hand the explanation to uploadBlobToInput as a PNG.
+  const h = harness({ buildVideoStoryboard: async () => ({ reason: "no usable duration" }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(h.calls.uploads.length, 0, "an explanation must never be uploaded");
+  assert.equal(reply.previews.length, 0);
+});
+
+test("a builder that returns a bare null STILL invents no cause", async () => {
+  // The rule the pre-existing test holds, restated against the new code path: a
+  // sampler that reports nothing tells us nothing, and naming a cause for it
+  // would be a diagnosis nothing made. Only a SUPPLIED reason is repeated.
+  const h = harness({ buildVideoStoryboard: async () => null });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.match(reply.note, /the panel is not told which/);
+  assert.doesNotMatch(reply.note, /could not be seeked/);
+  assert.doesNotMatch(reply.note, /VP9/);
+});
+
+test("a non-string reason is ignored rather than interpolated", async () => {
+  // A malformed object must degrade to the generic note, not print
+  // "[object Object]" at the agent — the serialization failure this repo keeps
+  // rediscovering.
+  const h = harness({ buildVideoStoryboard: async () => ({ reason: { nested: true } }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.doesNotMatch(reply.note, /\[object Object\]/);
+  assert.match(reply.note, /the panel is not told which/);
+});
+
 test("the 'ask the user' remedy is withheld when the user cannot see it either", async () => {
   // Telling the caller to ask a person who was never shown the video sends it
   // somewhere that does not work from where it is.
@@ -1129,9 +1224,18 @@ test("the panel's storyboard builder carries the count it ACTUALLY drew", () => 
   const src = panelSource();
   const i = src.indexOf("async function buildVideoStoryboard(");
   assert.ok(i > 0, "could not locate buildVideoStoryboard");
-  const fn = src.slice(i, i + 4000);
+  // 6000, not 4000: #1493 gave each failure branch a named reason and the body
+  // outgrew the old window, which made this assert on text it could no longer
+  // see. A window that silently stops covering what it checks is the failure
+  // mode of every source-scanning test.
+  const fn = src.slice(i, i + 6000);
   assert.match(fn, /blob\.paintedFrames = painted;/);
-  assert.match(fn, /if \(!blob\) return null;/);
+  // A sheet that will not encode must still not be reported as a sheet. This
+  // used to pin the literal `if (!blob) return null;`; comfyui-mcp#1493 replaced
+  // the bare null with a NAMED failure, so pin the property that matters — the
+  // encode branch does not fall through — rather than the exact wording, which
+  // was only ever incidental to this test's point.
+  assert.match(fn, /if \(!blob\) return storyboardFailure\(/);
 });
 
 test("onShowMedia routes through composeShowMediaReply with the storyboard pipeline wired", () => {

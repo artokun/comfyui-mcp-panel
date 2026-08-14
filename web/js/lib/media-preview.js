@@ -872,19 +872,32 @@ async function buildSampledPreview(job, deps) {
 async function produceSheet(job, deps) {
   const { buildVideoStoryboard, uploadBlobToInput, storyboardFrameCount, warn } = deps;
   try {
-    const blob = await buildVideoStoryboard(job.url);
+    const produced = await buildVideoStoryboard(job.url);
+    // #1493 — the builder may hand back `{reason}` instead of a sheet. That is
+    // TRUTHY, so it has to be recognised before the `!blob` check below, or an
+    // explanation would be uploaded to ComfyUI as if it were a PNG.
+    // Detect the FAILURE SHAPE by the presence of `reason`, and interpolate only
+    // when it is a string. Keying "is this a failure?" on the reason's TYPE was
+    // wrong in the dangerous direction: a malformed `{reason: {...}}` is truthy,
+    // failed the string test, and was then treated as a Blob — uploaded to
+    // ComfyUI, and announced as a sheet the panel could not count. Caught by the
+    // malformed-reason test below, which is why it exists.
+    const isFailure = produced != null && typeof produced === "object" && "reason" in produced;
+    const named = isFailure && typeof produced.reason === "string" ? produced.reason : null;
+    const blob = isFailure ? null : produced;
     if (!blob) {
       warn("[cmcp] show_media: could not sample frames from", job.name);
       return {
         ref: null,
         frames: null,
         cells: null,
-        // Deliberately non-diagnostic. The builder returns nothing when the
-        // metadata never arrives, when the dimensions are unusable, when no
-        // frame could be captured, AND when the finished sheet fails to encode
-        // — and it does not report which. Naming one of them would hand the
-        // agent a cause nothing observed.
-        why: "the sampler returned no contact sheet (its metadata, its frames or the sheet's own encoding failed — the panel is not told which)",
+        // Name the cause ONLY when the builder supplied one. A sampler that
+        // returns a bare `null` still reports nothing, and inventing a diagnosis
+        // for it would hand the agent a cause nothing observed — the rule the
+        // "NO invented cause" test exists to hold, and which still holds.
+        why: named
+          ? `the sampler could not build a contact sheet: ${named}`
+          : "the sampler returned no contact sheet (its metadata, its frames or the sheet's own encoding failed — the panel is not told which)",
       };
     }
     const base = job.name.replace(/\.[^.]+$/, "") || "video";
