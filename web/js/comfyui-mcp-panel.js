@@ -7052,7 +7052,7 @@ function assertGraphBoundToActiveWorkflow(
   // available response was a blind reload/re-open retry loop. Every caller runs
   // this BEFORE doing any work, which is what makes its "was NOT applied" claim
   // true rather than a fabrication.
-  const verdict = resolveGraphBindingVerdict({
+  const evidence = {
     graph,
     rootGraph,
     activeWorkflow,
@@ -7064,8 +7064,72 @@ function assertGraphBoundToActiveWorkflow(
     requireDirtyMutationBinding,
     postReconnectWindow: postReconnectSettleWindow(),
     graphLoading,
-  });
+  };
+  const verdict = resolveGraphBindingVerdictAfterSettlingTracker(evidence);
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
+}
+
+/**
+ * #1187 — resolve the verdict, and if it refuses only because ChangeTracker LAGS, make the
+ * snapshot current and ask once more.
+ *
+ * THE BUG. ComfyUI captures `changeTracker.activeState` on user-input events, so immediately
+ * after a hand edit there is a window where `activeState` still reports the old node count
+ * while `rootGraph._nodes` reports the new one — and `wf.isModified` has not flipped either,
+ * so `graphRootMismatchesActiveWorkflow`'s dirty-tab escape hatch does not fire. In that
+ * window `root-shape-mismatch` refuses every read AND every mutation, telling the user their
+ * own canvas "is bound to a different graph". It self-clears once the tracker captures, which
+ * is why it presents as intermittent rather than as the deterministic race it is.
+ *
+ * WHY NOT RELAX THE PREDICATE. The obvious fix — let a matching root tag outrank the content
+ * comparison — was tried and is UNSAFE. `lib/graph-binding.js` records at #565 and #817 that
+ * some ComfyUI builds do not reset `graph.extra` in `configure()`, so a reused `app.graph`
+ * carries the PREVIOUS workflow's tag: tag A can sit on canvas B, and trusting the tag alone
+ * would permit reads and writes against the wrong canvas. Every stale-tag mitigation in that
+ * file demands CONTENT proof; none trusts the tag by itself.
+ *
+ * So this does not move the line. It removes the LAG, then re-asks the unchanged predicates.
+ * Once the tracker has captured, `isModified` flips and the existing dirty-tab path answers —
+ * no guard is widened, and a canvas that genuinely differs still refuses, now on current
+ * evidence rather than stale evidence.
+ *
+ * EVERY GUARD IS ITSELF AN OPERATION THAT CAN FAIL. The capture can be unavailable on an
+ * older frontend, be swallowed by a no-op window, resolve asynchronously, or throw. In every
+ * one of those cases this returns the ORIGINAL refusal — today's behaviour, unchanged. The
+ * only path that reaches a different answer is a capture that PROVABLY landed. A helper meant
+ * to stop a false refusal must never become a way to skip a true one.
+ *
+ * THE SIDE EFFECT, STATED. A capture that sees a change pushes an undo entry and clears the
+ * redo queue. That is not free — but it is a capture ComfyUI itself would have taken on the
+ * next user-input event, for an edit the user really made. This accelerates it; it does not
+ * invent it. The trigger is deliberately narrow so it cannot fire as a matter of course:
+ * only on `root-shape-mismatch`, only on a root already carrying THIS workflow's tag, and
+ * only while the tab still reads clean.
+ */
+function resolveGraphBindingVerdictAfterSettlingTracker(evidence) {
+  const verdict = resolveGraphBindingVerdict(evidence);
+  if (verdict?.reason !== "root-shape-mismatch") return verdict;
+  const { rootGraph, activeWorkflow, activeWorkflowUuid } = evidence;
+  try {
+    // A tagless or foreign root is refused for a reason a capture cannot change, and its undo
+    // stack is not ours to disturb. Requiring the tag ALSO keeps the wrong-canvas case out:
+    // a stale tag still has to survive the re-resolve on current content.
+    if (!graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return verdict;
+    // Already dirty means the lag is not what refused, so there is nothing to settle.
+    if (activeWorkflow?.isModified === true) return verdict;
+    const captured = captureCanvasIntoTracker(activeWorkflow);
+    // "pending" is an ASYNC capture: it may land, but not before this synchronous fence has
+    // to answer. Refuse on what is known now rather than on what might be true shortly.
+    if (captured?.verdict !== "captured") return verdict;
+    const settled = resolveGraphBindingVerdict(evidence);
+    // Report the FRESH verdict when it still refuses: it was computed on the current snapshot,
+    // so its reason and its numbers are the ones the user can act on.
+    return settled;
+  } catch {
+    // The settle path is best-effort by construction. Anything it cannot do leaves the
+    // original refusal exactly as it was.
+    return verdict;
+  }
 }
 
 /**

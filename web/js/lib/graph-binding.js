@@ -2202,8 +2202,24 @@ export function resolveGraphBindingVerdict({
   //
   // `structureMatches` is still computed, and still consumed: when this DOES refuse it is what
   // lets the message distinguish "a different graph" from "this graph, drifted, unstamped".
-  const rootTagProven = graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
-  const rootShapeMismatch = contentDiffers && !rootTagProven;
+  // #1187 — NOT relaxed. A first attempt made a matching tag sufficient here
+  // (`contentDiffers && !tagMatches`) and it was unsafe: this file already records, at
+  // #565 and #817, that some ComfyUI builds do not reset `graph.extra` in `configure()`,
+  // so a reused `app.graph` carries the PREVIOUS workflow's tag. Tag A can therefore sit on
+  // canvas B, and trusting the tag alone permits reads and writes against the wrong canvas —
+  // the exact #349 hazard this fence exists for. Every stale-tag mitigation above requires
+  // CONTENT proof (equal serialization, or zero nodes on both sides); none trusts the tag by
+  // itself, and neither may this.
+  //
+  // #1187's real cause is not this predicate: it is that `changeTracker.activeState` LAGS a
+  // hand edit, so `contentDiffers` is true and `isModified` has not flipped yet. The panel
+  // fixes it where it lives, by making the snapshot current and asking again — see
+  // `assertGraphBoundToActiveWorkflow`'s capture-and-re-resolve. Once the tracker has
+  // captured, the dirty-tab escape hatch in `graphRootMismatchesActiveWorkflow` handles the
+  // case through the path that already existed, and this predicate needs no change at all.
+  const rootShapeMismatch =
+    contentDiffers &&
+    !(structureMatches && graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   const baselineReadDesync =
     currentStateTrustworthy &&
