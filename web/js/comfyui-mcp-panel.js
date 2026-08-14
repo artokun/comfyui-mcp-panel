@@ -205,6 +205,7 @@ import {
   watchPostReconnectSettle,
   graphMutationReconnectGate,
   reconnectRefusalError,
+  readReconnectRefusal,
 } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
@@ -18615,6 +18616,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
           reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
+          const reconnectRefusal = readReconnectRefusal(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -18627,7 +18629,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // reader is unaffected; a reader that wants to retry safely keys on
             // this instead of matching the sentence, which a genuine mid-write
             // failure could also contain.
-            ...(err?.cmcpRefusal ? { refusal: err.cmcpRefusal } : {}),
+            //
+            // Via readReconnectRefusal, never `err.cmcpRefusal` directly: the
+            // raw property is inherited and settable, so an error thrown AFTER a
+            // write could carry it and be retried into a duplicate node. The
+            // reader answers the stronger question — did the gate mint this,
+            // pre-executor? — and returns a freshly built object.
+            ...(reconnectRefusal ? { refusal: reconnectRefusal } : {}),
           };
         }
         // Settle the rid ledger BEFORE the dead-socket drop below (#517): even

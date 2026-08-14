@@ -163,6 +163,27 @@ export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSe
   return null;
 }
 
+/** The codes this gate is allowed to publish. An enumerated list, not a shape
+ *  test: a reader keys its retry on the code, so an unrecognised one must not
+ *  reach it (the #1478 lesson — enumerate, do not pattern-match). */
+const REFUSAL_CODES = new Set(["backend-reconnecting", "post-reconnect-settling"]);
+
+/**
+ * The errors THIS MODULE minted. A WeakSet, not a marker property:
+ *
+ *   - a property is inherited. `err?.cmcpRefusal` walks the prototype chain, so
+ *     anything that lands `cmcpRefusal` on `Error.prototype` — a polyfill, a
+ *     careless extension, a bad merge — makes EVERY error in the page read as a
+ *     pre-executor refusal, including one thrown after a node was already added.
+ *   - a property is also settable. Membership here is not.
+ *
+ * The set holds the errors themselves and is unreachable from outside this
+ * module, so it answers the only question the reader actually has: did the gate
+ * produce this, before the executor ran? Entries are weak, so a caught-and-
+ * discarded error is still collectable.
+ */
+const MINTED_REFUSALS = new WeakSet();
+
 /**
  * Throwable form: an Error whose message is unchanged from before, carrying the
  * structured refusal on a named property so the reply builder can publish it.
@@ -174,11 +195,67 @@ export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSe
  */
 export function reconnectRefusalError(refusal) {
   const err = new Error(refusal.message);
-  err.cmcpRefusal = {
-    code: refusal.code,
-    applied: refusal.applied,
-    stage: refusal.stage,
-    retryable: refusal.retryable,
-  };
+  // defineProperty, not assignment. `err.cmcpRefusal = …` is an assignment, and
+  // an assignment to a property that exists on the PROTOTYPE as non-writable
+  // THROWS in strict mode — which ES modules are. So a polluted Error.prototype
+  // would not merely confuse the reader: it would make this function throw a
+  // TypeError from inside the gate's call site, replacing a clear refusal with
+  // an unrelated crash. (Found by the pollution test below, which was written
+  // for the reader and caught this instead.) defineProperty creates the OWN
+  // property regardless of what the prototype says.
+  Object.defineProperty(err, "cmcpRefusal", {
+    value: {
+      code: refusal.code,
+      applied: refusal.applied,
+      stage: refusal.stage,
+      retryable: refusal.retryable,
+    },
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  MINTED_REFUSALS.add(err);
   return err;
+}
+
+/**
+ * The reader's side: the refusal to publish for a caught error, or null.
+ *
+ * Every caller must go through this rather than reading `err.cmcpRefusal`
+ * directly, because the property alone answers a WEAKER question than the one a
+ * retry depends on. The field says "something set this"; the retry needs "the
+ * gate set this, before the executor ran". Those differ exactly in the case that
+ * costs a graph: an error thrown AFTER a write, carrying the property by
+ * inheritance or by an unrelated assignment, would be published as
+ * applied:false and retried into a duplicate node (review, P0).
+ *
+ * Three independent conditions, all required:
+ *
+ *   1. this module minted the error (unforgeable, and immune to a polluted
+ *      prototype);
+ *   2. the payload is an OWN property — not one inherited after minting;
+ *   3. every field still holds the exact value the gate is entitled to claim.
+ *
+ * (3) matters because the payload is a mutable object on a mutable error: being
+ * minted at throw time does not prove it was unmodified at catch time. The
+ * literals are re-asserted rather than copied, and the returned object is built
+ * FRESH — so nothing that was attached to the caught payload rides along onto
+ * the wire.
+ *
+ * @returns {{code: string, applied: false, stage: "pre-executor", retryable: true}|null}
+ */
+export function readReconnectRefusal(err) {
+  if (!err || typeof err !== "object") return null;
+  if (!MINTED_REFUSALS.has(err)) return null;
+  if (!Object.prototype.hasOwnProperty.call(err, "cmcpRefusal")) return null;
+  const payload = err.cmcpRefusal;
+  if (!payload || typeof payload !== "object") return null;
+  if (!REFUSAL_CODES.has(payload.code)) return null;
+  // The three claims, re-checked. Anything else is not this gate's refusal, and
+  // "unrecognised" must read as no refusal at all — the direction that merely
+  // loses an automatic retry, rather than the one that double-applies a write.
+  if (payload.applied !== false) return null;
+  if (payload.stage !== "pre-executor") return null;
+  if (payload.retryable !== true) return null;
+  return { code: payload.code, applied: false, stage: "pre-executor", retryable: true };
 }

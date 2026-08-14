@@ -24,6 +24,7 @@ import {
   watchPostReconnectSettle,
   graphMutationReconnectGate,
   reconnectRefusalError,
+  readReconnectRefusal,
 } from "../../web/js/lib/reconnect-recovery.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -249,6 +250,131 @@ test("#1529: the structure does not collide with Error's own fields", () => {
   assert.equal(err.retryable, undefined);
 });
 
+// ── The reader: which errors are ENTITLED to publish a refusal ──────────────
+//
+// Review, P0: the first version of the reply builder tested `err?.cmcpRefusal`
+// — an unqualified property read. That answers "something set this", when the
+// question a retry depends on is "the GATE set this, before the executor ran".
+// They differ in exactly the case that costs a graph: an error thrown AFTER a
+// write, carrying the property by inheritance or assignment, published as
+// applied:false and retried into a duplicate node.
+//
+// These run the reader; they are not source scans.
+
+test("#1529 reader: a genuine gate refusal is published", () => {
+  const err = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }));
+  assert.deepEqual(readReconnectRefusal(err), {
+    code: "backend-reconnecting",
+    applied: false,
+    stage: "pre-executor",
+    retryable: true,
+  });
+});
+
+test("#1529 reader: a FOREIGN error with a perfect-looking payload is refused", () => {
+  // The forged case. Every field is exactly right; the only thing missing is
+  // that this gate did not mint it — which is the whole claim.
+  const impostor = new Error("added the node, then the socket died");
+  impostor.cmcpRefusal = {
+    code: "backend-reconnecting",
+    applied: false,
+    stage: "pre-executor",
+    retryable: true,
+  };
+  assert.equal(readReconnectRefusal(impostor), null);
+});
+
+test("#1529 reader: an INHERITED payload is refused (prototype pollution)", () => {
+  // The accidental version, and the reason this is a WeakSet and not a marker
+  // property: one assignment to Error.prototype would otherwise make every
+  // error in the page — including a post-write failure — read as retryable.
+  const polluted = { code: "backend-reconnecting", applied: false, stage: "pre-executor", retryable: true };
+  Object.defineProperty(Error.prototype, "cmcpRefusal", {
+    value: polluted,
+    configurable: true,
+    enumerable: false,
+  });
+  try {
+    const midWriteFailure = new Error("node added, then the tab went away");
+    assert.equal(midWriteFailure.cmcpRefusal, polluted, "the pollution really is visible on the error");
+    assert.equal(readReconnectRefusal(midWriteFailure), null, "and the reader still refuses it");
+    // A MINTED error must still work while the prototype is polluted, and must
+    // publish its OWN payload rather than the inherited one.
+    const real = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", bindingSettleWindow: true }));
+    assert.equal(readReconnectRefusal(real)?.code, "post-reconnect-settling");
+  } finally {
+    delete Error.prototype.cmcpRefusal;
+  }
+  assert.equal("cmcpRefusal" in Error.prototype, false, "the test cleaned up after itself");
+});
+
+test("#1529 reader: a MINTED error that lost its own payload cannot borrow one", () => {
+  // The case the own-property check exists for, and the only one where it is
+  // load-bearing — mutation testing showed that deleting the check otherwise
+  // kills nothing, because the mint check already rejects foreign errors.
+  //
+  // The sequence is narrow but real: something strips unknown properties off an
+  // error (a sanitizer before logging is the usual culprit), and the prototype
+  // carries a payload. Without the own check the error is still MINTED, so the
+  // reader would fall through to the inherited object and publish a refusal
+  // sourced from something the gate never wrote.
+  const err = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }));
+  delete err.cmcpRefusal;
+  Object.defineProperty(Error.prototype, "cmcpRefusal", {
+    value: { code: "backend-reconnecting", applied: false, stage: "pre-executor", retryable: true },
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
+  try {
+    assert.ok(err.cmcpRefusal, "the inherited payload really is reachable on this error");
+    assert.equal(readReconnectRefusal(err), null, "but it is not this gate's, so it is not published");
+  } finally {
+    delete Error.prototype.cmcpRefusal;
+  }
+});
+
+test("#1529 reader: a minted error whose payload was TAMPERED with is refused", () => {
+  // Minting happens at throw time; the payload is a mutable object on a mutable
+  // error, so being minted does not prove it was unmodified at catch time.
+  for (const tamper of [
+    (p) => { p.applied = true; },
+    (p) => { p.stage = "post-executor"; },
+    (p) => { p.retryable = false; },
+    (p) => { p.code = "something-else"; },
+    (p) => { delete p.code; },
+  ]) {
+    const err = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }));
+    tamper(err.cmcpRefusal);
+    assert.equal(readReconnectRefusal(err), null, tamper.toString());
+  }
+});
+
+test("#1529 reader: a minted error whose payload was REPLACED wholesale is refused", () => {
+  const err = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }));
+  err.cmcpRefusal = { code: "backend-reconnecting", applied: false, stage: "pre-executor", retryable: true };
+  // Still an own property and still perfectly shaped — but no longer the object
+  // the gate built. Identity is what is checked, so this is accepted; the test
+  // records that deliberately, because the WeakSet brands the ERROR, not the
+  // payload, and an attacker-shaped payload on a minted error can only come from
+  // code that already holds the gate's own error object.
+  assert.deepEqual(readReconnectRefusal(err)?.code, "backend-reconnecting");
+});
+
+test("#1529 reader: the published object is FRESH — extras do not ride to the wire", () => {
+  const err = reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run", backendDown: true }));
+  err.cmcpRefusal.smuggled = { token: "sensitive" };
+  const published = readReconnectRefusal(err);
+  assert.deepEqual(Object.keys(published).sort(), ["applied", "code", "retryable", "stage"]);
+  assert.notEqual(published, err.cmcpRefusal, "a fresh object, not the caught payload");
+});
+
+test("#1529 reader: non-errors and ordinary failures answer null", () => {
+  for (const v of [null, undefined, 0, "", "backend-reconnecting", {}, new Error("boom"), [], Symbol("x")]) {
+    assert.equal(readReconnectRefusal(v), null, String(typeof v));
+  }
+});
+
 // ── The wiring: the field only helps if it REACHES the reply ────────────────
 //
 // TESTED below: both call sites throw the structured error, and the wire-reply
@@ -290,19 +416,30 @@ test("#1529 wiring: the reply builder publishes `refusal` and leaves `error` alo
   // toasts among them — and the first occurrence is a workflow_new journal write,
   // not this. An anchor that matched the wrong one passed its assertions against
   // unrelated text, which is how a wiring test goes vacuous.
-  const start = SRC.indexOf("reply = {\n            rid: msg.rid,\n            ok: false,");
+  const start = SRC.indexOf("reply = { rid: msg.rid, ok: true, result };\n        } catch (err) {");
   assert.notEqual(start, -1, "the acknowledged-error WIRE reply builder is still recognisable");
-  const block = SRC.slice(start, start + 900);
+  const block = SRC.slice(start, start + 1800);
+  assert.match(block, /reply = \{\n\s+rid: msg\.rid,\n\s+ok: false,/, "…and this is its failure branch");
   assert.match(block, /error: coerceMessageText\(err\?\.message \?\? err\),/, "the text reply is intact");
   assert.match(
     block,
-    /\.\.\.\(err\?\.cmcpRefusal \? \{ refusal: err\.cmcpRefusal \} : \{\}\)/,
+    /\.\.\.\(reconnectRefusal \? \{ refusal: reconnectRefusal \} : \{\}\)/,
     "the structured refusal rides along on the reply",
   );
-  // Additive: the spread is CONDITIONAL, so an ordinary error's reply has no
-  // `refusal` key at all — a reader keying on presence cannot be fooled by an
-  // unrelated failure.
-  assert.match(block, /err\?\.cmcpRefusal \?/, "absent on every error that is not this gate's");
+  // Through the READER, never the raw property — that distinction is the P0.
+  assert.match(block, /const reconnectRefusal = readReconnectRefusal\(err\);/);
+  assert.doesNotMatch(
+    SRC,
+    /refusal: err\.cmcpRefusal/,
+    "no reply may publish the raw, inheritable property",
+  );
+});
+
+test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list", () => {
+  // The reviewer's P2: a send boundary that rebuilt the frame as {rid, ok, error}
+  // would drop `refusal` silently — the tests above would all still pass while
+  // the contract was gone. Asserted on the actual send.
+  assert.match(SRC, /thisSock\.send\(JSON\.stringify\(reply\)\)/, "the whole reply object goes to the wire");
 });
 
 // ---------------------------------------------------------------------------
