@@ -480,11 +480,16 @@ test("the README does not promise parity it cannot guarantee — anywhere in the
   assert.match(readme, /identical \*\*as served\*\*/);
 });
 
-/** The whole body of the bridge client's sendHello(). */
+/** The whole body of the bridge client's hello PAYLOAD builder.
+ *
+ *  #1095 — `advertiseHello`, not `sendHello`. `sendHello` is now the gated entry point in
+ *  front of it (a re-advertise waits for in-flight commands to reply), so slicing from
+ *  `sendHello` would return a five-line wrapper containing none of what this file asserts —
+ *  and `assert.equal(count, 1)` style checks would keep passing on an empty window. */
 function sendHelloBody(source) {
-  const start = source.indexOf("  function sendHello() {");
+  const start = source.indexOf("  function advertiseHello() {");
   const end = source.indexOf("  // When the workflow title changes", start);
-  assert.ok(start >= 0 && end > start, "could not locate sendHello");
+  assert.ok(start >= 0 && end > start, "could not locate advertiseHello");
   return source.slice(start, end);
 }
 

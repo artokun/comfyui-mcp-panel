@@ -645,17 +645,24 @@ test("#607 an unreadable live identity re-hellos nothing (unknown is not new evi
   assert.equal(hellos, 0, "an unknown identity must not be treated as a changed one");
 });
 
-test("#607 sendHello reports whether the hello reached the wire, and publishes only then", () => {
-  // The hook's budget is only meaningful if `sendHello()` answers truthfully: a
+test("#607 the hello reports whether it reached the wire, and publishes only then", () => {
+  // The hook's budget is only meaningful if the hello answers truthfully: a
   // closed socket must resolve false rather than an ignored undefined, and the
   // advertised identity must be published on the success path, never at payload
   // time — publishing early would credit a hello that did not happen.
-  const src = balancedFrom(SRC, "function sendHello()");
+  //
+  // #1095 — this reads `advertiseHello`, the payload builder, which is what these
+  // assertions have always been about. `sendHello` is now the GATED entry point in front
+  // of it (it holds a re-advertise until in-flight commands have replied), so pointing
+  // this at `sendHello` would silently slice a five-line wrapper and pass on the absence
+  // of everything it checks — the same "a passing assertion stops meaning what it checks"
+  // trap this suite has corrected three times for character-window slices.
+  const src = balancedFrom(SRC, "function advertiseHello()");
   assert.match(src, /readyState !== WebSocket\.OPEN\) return Promise\.resolve\(false\)/);
   assert.match(src, /return sendBridgeHello\(/);
   assert.match(src, /return sent === true;/);
   const publishAt = src.indexOf("lastAdvertisedWorkflowUuid = advertisedWorkflowUuid;");
-  assert.notEqual(publishAt, -1, "sendHello must publish what it advertised");
+  assert.notEqual(publishAt, -1, "the hello must publish what it advertised");
   const successAt = src.indexOf("if (sent) {");
   assert.ok(successAt !== -1 && publishAt > successAt, "…only inside the success branch");
   const payloadAt = src.indexOf("(advertisedWorkflowUuid = workflowStableUuid())");

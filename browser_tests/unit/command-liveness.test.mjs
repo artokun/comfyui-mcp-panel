@@ -278,13 +278,17 @@ test("codex R11 / #694: summaries obey the SAME cross-bridge/session/age rule as
   // #694 — the hello fires at socket-open, BEFORE the models handshake stamps the
   // socket's epoch: a summary computed there is filtered with an UNKNOWN epoch and can
   // contradict the epoch-filtered replay. The hello must therefore carry NO summaries…
-  const helloStart = src.indexOf("function sendHello() {");
-  assert.notEqual(helloStart, -1);
+  // #1095 — `advertiseHello` is the payload builder; `sendHello` in front of it is the
+  // gate. Slicing the gate would prove nothing, because a five-line wrapper trivially
+  // contains no `lostReplies` — the assertion would pass on an empty window instead of on
+  // the code it is about.
+  const helloStart = src.indexOf("function advertiseHello() {");
+  assert.notEqual(helloStart, -1, "could not locate the hello payload builder");
   const helloBody = src.slice(helloStart, src.indexOf("\n  }", helloStart));
   assert.equal(
     /lostReplies|lost_replies/.test(helloBody.replace(/\/\/[^\n]*/g, "")),
     false,
-    "sendHello must not advertise lost-reply summaries computed before the epoch is known",
+    "the hello must not advertise lost-reply summaries computed before the epoch is known",
   );
   // …they ride the post-handshake `lost_replies` frame, sent from INSIDE the replay with
   // the SAME targetUrl/targetEpoch locals the replay loop uses — agreement by construction.
@@ -474,7 +478,15 @@ test("#508 codex R3: a command arriving on an ALREADY-superseded socket is refus
   // frame outright — neither executed, nor replied to, nor journaled — which is the very
   // "registered tab that never acknowledges anything" wedge this change exists to remove.
   const listenerAt = src.indexOf('thisSock.addEventListener("message"');
-  const listener = src.slice(listenerAt, listenerAt + 3000);
+  assert.notEqual(listenerAt, -1, "could not locate the message listener");
+  // Searched from the listener's start over the WHOLE source, not over a fixed 3000-char
+  // window. The window was the same stand-in for "inside this listener" that this test
+  // already corrects one line below, and it failed for the same reason on the very next
+  // comment added to the guard (#1095's second pass): the block moved past character 3000
+  // and `guardEnd` came back -1 from a slice that had been truncated mid-block, not from
+  // any change to what is being asserted. The two `indexOf`s below are ordered relative to
+  // each other, which is the actual claim, and both are asserted to have been found.
+  const listener = src.slice(listenerAt);
   const parseAt = listener.indexOf("msg = JSON.parse(");
   const guardAt = listener.indexOf("if (!isActive()) {");
   assert.ok(parseAt !== -1 && guardAt !== -1, "the listener must parse before the instance guard");
@@ -574,7 +586,7 @@ test("#508 wiring: self-heal re-registers via sendHello ONLY — it can never pi
   assert.match(body, /reRegisterExhaustedHint\(\)/, "an exhausted budget must surface a user action");
 });
 
-// ── #1095: a workflow re-target must not withdraw a route mid-command ─────────
+// ── #1095: a re-advertise must not withdraw a route mid-command ───────────────
 //
 // rehelloForWorkflow's own note says the backend DROPS the socket's prior tab mapping
 // when the panel re-advertises. That is correct — it stops a background workflow's output
@@ -584,30 +596,31 @@ test("#508 wiring: self-heal re-registers via sendHello ONLY — it can never pi
 // Creating a workflow and immediately applying a batch of mutations is exactly that
 // window, since the workflow poll ticks every 600ms — between two commands.
 //
-// Structural, because the claim is about WHERE the counter moves relative to the command
-// branch and the reply. Statements are matched as statements: this region's comments name
-// every one of these calls while explaining the ordering.
-test("#1095: the in-flight command count is paired, and read before a re-target", () => {
+// THE GATE'S BEHAVIOUR IS DRIVEN IN rehello-gate.test.mjs. What is left here is wiring
+// that only the panel source can answer: whether the mark/release pair is exactly paired
+// across the command branch, and whether EVERY re-advertise actually reaches the gate.
+// Both are structural claims about the source, which is why they are read off the syntax
+// tree; neither is a claim that some code runs, which a source pattern cannot make.
+test("#1095: the in-flight mark is paired across the command branch", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  const at = (re) => src.search(re);
 
-  // Every increment must be paired with the single decrement in deliverReply, or the
-  // count drifts: too high strands the tab on the old route until the budget runs out,
-  // too low reopens the race. Both command paths that reach deliverReply increment.
-  const incs = (src.match(/^\s*commandsInFlight\+\+;/gm) || []).length;
-  const decs = (src.match(/^\s*if \(commandsInFlight > 0\) commandsInFlight--;/gm) || []).length;
-  assert.equal(incs, 2, "both command paths that deliver a reply must mark it in flight");
-  assert.equal(decs, 1, "the count is released in exactly one place — deliverReply");
+  // Every mark must be paired with the single release in deliverReply, or the count
+  // drifts: too high delays a re-advertise until the budget runs out, too low reopens the
+  // race. Both command paths that reach deliverReply mark.
+  const marks = (src.match(/^\s*rehelloGate\.began\(/gm) || []).length;
+  const releases = (src.match(/^\s*rehelloGate\.ended\(\);/gm) || []).length;
+  assert.equal(marks, 2, "both command paths that deliver a reply must mark it in flight");
+  assert.equal(releases, 1, "the mark is released in exactly one place — deliverReply");
 
   // COUNTING THOSE IS NOT ENOUGH, and this test shipped believing it was. Review proved
-  // it by execution: at the revision where the increment sat ABOVE the #517 dedupe region
-  // — with five paths returning before any reply, leaking the count permanently — this
-  // file was byte-identical and still passed. Two increments and one decrement is true of
-  // both the broken and the fixed arrangement, so the assertions above cannot tell them
-  // apart. What actually matters is a REACHABILITY property, so it has to be read off the
-  // syntax tree rather than off a token count.
+  // it by execution: at the revision where the mark sat ABOVE the #517 dedupe region —
+  // with five paths returning before any reply, leaking it permanently — this file was
+  // byte-identical and still passed. Two marks and one release is true of both the broken
+  // and the fixed arrangement, so the assertions above cannot tell them apart. What
+  // actually matters is a REACHABILITY property, so it has to be read off the syntax tree
+  // rather than off a token count.
   //
-  // The real invariant: between the increment and the reply there is no exit. Returns and
+  // The real invariant: between the mark and the reply there is no exit. Returns and
   // throws inside a try are excluded — the executor's throws are caught below and turned
   // into a reply, which is the whole point of that catch.
   const sf = ts.createSourceFile(PANEL_JS, src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
@@ -625,7 +638,7 @@ test("#1095: the in-flight command count is paired, and read before a re-target"
   let incPos = -1;
   let replyPos = -1;
   (function locate(n) {
-    if (ts.isPostfixUnaryExpression(n) && n.operand.getText(sf) === "commandsInFlight") {
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "rehelloGate.began") {
       incPos = n.getStart(sf);
     }
     if (ts.isCallExpression(n) && n.expression.getText(sf) === "deliverReply") {
@@ -657,24 +670,24 @@ test("#1095: the in-flight command count is paired, and read before a re-target"
   assert.deepEqual(
     escapes,
     [],
-    `every exit between marking a command in flight and replying leaks the count — ` +
-      `a leaked count never returns to 0, so every later workflow switch pays the full ` +
-      `deferral budget. Leaking exits at line(s): ${escapes.join(", ")}`,
+    `every exit between marking a command in flight and replying leaks the mark — ` +
+      `a leaked mark never returns the count to 0, so every later re-advertise pays the ` +
+      `full budget. Leaking exits at line(s): ${escapes.join(", ")}`,
   );
 
-  // The decrement must live INSIDE deliverReply, which every command path reaches once.
+  // The release must live INSIDE deliverReply, which every command path reaches once.
   const dStart = src.indexOf("const deliverReply = (reply, cmd, superseded) => {");
   assert.notEqual(dStart, -1, "could not locate deliverReply");
   const dEnd = src.indexOf("\n    };", dStart);
   assert.notEqual(dEnd, -1, "could not locate the end of deliverReply");
   assert.match(
     src.slice(dStart, dEnd),
-    /if \(commandsInFlight > 0\) commandsInFlight--;/,
+    /rehelloGate\.ended\(\);/,
     "the command is finished when its reply is handed over, whatever happens to it after",
   );
 
   // The superseded-socket refusal replies too, so it must balance the pair. The count is
-  // CLIENT-scoped while that branch runs on a RETIRED socket, so an unpaired decrement
+  // CLIENT-scoped while that branch runs on a RETIRED socket, so an unpaired release
   // there would discount a command still running on the live socket — reintroducing the
   // race through the bookkeeping meant to close it.
   const gStart = src.indexOf("if (!isActive()) {");
@@ -682,32 +695,93 @@ test("#1095: the in-flight command count is paired, and read before a re-target"
   assert.ok(gStart !== -1 && gEnd !== -1, "could not bound the superseded guard");
   assert.match(
     src.slice(gStart, gEnd),
-    /commandsInFlight\+\+;/,
-    "the superseded refusal must balance the decrement its deliverReply performs",
+    /rehelloGate\.began\(\);/,
+    "the superseded refusal must balance the release its deliverReply performs",
+  );
+});
+
+test("#1095: EVERY re-advertise goes through the gate — no caller can bypass it", () => {
+  // This is the finding that sent the first cut back. The deferral was implemented at ONE
+  // caller (the workflow poll), while `rehelloForWorkflow`, the #607/#570 fence via
+  // noteWorkflowInstanceMismatch, the #310 free_vram re-advertise and the #508 self-heal
+  // re-registration all call the hello directly and stayed ungated — and gating the poll
+  // made the fence trip MORE often, routing more traffic through an ungated re-hello.
+  //
+  // A guard at one caller cannot be completed by patching callers, because the next caller
+  // added is ungated again. So the property asserted is a CLOSURE one: the only code that
+  // may reach the raw send is the gate itself and the gated entry point.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const sf = ts.createSourceFile(PANEL_JS, src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
+
+  let gateCall = null;
+  let sendHelloFn = null;
+  let advertiseFn = null;
+  const rawCalls = [];
+  (function walk(n) {
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "createRehelloGate") gateCall = n;
+    if (ts.isFunctionDeclaration(n) && n.name?.getText(sf) === "sendHello") sendHelloFn = n;
+    if (ts.isFunctionDeclaration(n) && n.name?.getText(sf) === "advertiseHello") advertiseFn = n;
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "advertiseHello") rawCalls.push(n);
+    ts.forEachChild(n, walk);
+  })(sf);
+
+  assert.ok(gateCall, "the client must construct the re-advertise gate");
+  assert.ok(sendHelloFn, "sendHello must remain the entry point every caller already uses");
+  assert.ok(advertiseFn, "the raw hello send must exist as its own function");
+  assert.ok(rawCalls.length >= 2, "the gate and the entry point must both be able to send");
+
+  const inside = (node, host) => node.getStart(sf) >= host.getStart(sf) && node.getEnd() <= host.getEnd();
+  const strays = rawCalls
+    .filter((c) => !inside(c, gateCall) && !inside(c, sendHelloFn))
+    .map((c) => sf.getLineAndCharacterOfPosition(c.getStart(sf)).line + 1);
+  assert.deepEqual(
+    strays,
+    [],
+    `advertiseHello() may only be reached from the gate or from sendHello. A direct call ` +
+      `elsewhere is an ungated re-advertise, which is the defect this change exists to ` +
+      `close. Stray call(s) at line(s): ${strays.join(", ")}`,
   );
 
-  // The poll must consult the count BEFORE it commits the new workflow id. Advancing the
-  // id and deferring only the hello would swallow the change forever, because the next
-  // tick's `wfid === currentWorkflowId` early return would treat it as handled.
+  // …and sendHello must actually consult the gate rather than merely sitting in front of
+  // it. The bypass it DOES have is the first hello on a socket: that creates the mapping
+  // instead of replacing one, so it can strand nothing, and deferring it would leave the
+  // tab unregistered — strictly worse than the race.
+  const entry = sendHelloFn.getText(sf);
+  assert.match(entry, /rehelloGate\.request\(\)/, "a re-advertise must be routed through the gate");
+  assert.match(
+    entry,
+    /sock !== advertisedSock/,
+    "…and only the first hello on a socket may bypass it, keyed on the socket that has one",
+  );
+  // `advertisedSock` must be recorded on the SEND-LANDED path only. Arming the gate off a
+  // hello that never left the tab would defer the retry that could actually register it —
+  // the "recorded before it happened" defect this file names in three other places.
+  const advBody = advertiseFn.getText(sf);
+  const sentAt = advBody.indexOf("if (sent) {");
+  const armAt = advBody.indexOf("advertisedSock = target;");
+  assert.ok(sentAt !== -1 && armAt !== -1 && armAt > sentAt, "the gate arms only once a hello LANDED");
+
+  // The clock must be the monotonic one. A wall clock can step backwards (NTP, a laptop
+  // waking, a manual change) and an elapsed-time window built on it either expires
+  // instantly or never — the same rule as monotonicNow()'s other consumers.
+  assert.match(gateCall.getText(sf), /now:\s*monotonicNow/, "the budget is elapsed time, so it needs a monotonic clock");
+});
+
+test("#1095: the workflow poll commits its state INLINE — it no longer gates anything", () => {
+  // Review's third finding on the first cut. `panelHooks.applyChatScope` nulls
+  // `currentWorkflowId`, calls this, and then repaints the context ring and announces the
+  // scope change — it expects the re-bind to have happened. A deferred early return
+  // announced a re-bind that had not, leaving the panel internally inconsistent until a
+  // later tick repaired it. With the wait inside sendHello, only the wire send is delayed.
+  const src = readFileSync(PANEL_JS, "utf8");
   const wStart = src.indexOf("function onWorkflowMaybeChanged() {");
   const wEnd = src.indexOf("\n  }", wStart);
   assert.ok(wStart !== -1 && wEnd !== -1, "could not bound onWorkflowMaybeChanged");
   const body = src.slice(wStart, wEnd);
-  const readAt = body.search(/client\?\.commandsInFlight\?\.\(\) > 0/);
-  const commitAt = body.search(/^\s*currentWorkflowId = /m);
-  assert.notEqual(readAt, -1, "the re-target must consult the in-flight count");
-  assert.notEqual(commitAt, -1, "the re-target must still commit the new workflow id");
-  assert.ok(readAt < commitAt, "the count must be read BEFORE the id is committed");
-
-  // …and the wait must be BOUNDED: unbounded turns a race into a wedge, which is worse.
-  assert.match(body, /workflowRetargetDeferrals < MAX_WORKFLOW_RETARGET_DEFERRALS/,
-    "the deferral must be bounded so a stuck command cannot strand the tab");
-  assert.match(body, /^\s*workflowRetargetDeferrals = 0;/m,
-    "…and the budget must reset once the re-target proceeds");
-  // …and the budget must be released on the no-change path too, not only when a deferred
-  // switch proceeds. A counter that only ratchets one way leaves an ABANDONED switch
-  // (deferred a tick, then the id settles back) part-spent, so the next genuine switch
-  // gets fewer deferrals than it is owed.
-  const resets = (body.match(/^\s*workflowRetargetDeferrals = 0;/gm) || []).length;
-  assert.ok(resets >= 2, "the deferral budget must reset on the no-change path as well");
+  assert.match(body, /^\s*currentWorkflowId = /m, "the re-target must still commit the new workflow id");
+  assert.equal(
+    /commandsInFlight/.test(body.replace(/\/\/[^\n]*/g, "")),
+    false,
+    "the poll must not decide for itself whether to re-target — that is sendHello's job now",
+  );
 });

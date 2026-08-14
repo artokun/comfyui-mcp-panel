@@ -511,6 +511,7 @@ import {
   buildHelloPayload,
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
+import { createRehelloGate } from "./lib/rehello-gate.js";
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
 import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
@@ -18331,21 +18332,34 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     }
   }
   let socketSeq = 0;
-  // #1095 — orchestrator→panel commands currently executing on this client.
+  // #1095 — a RE-advertise must not withdraw the tab mapping a command is routed to.
   //
-  // A re-hello makes the backend DROP this socket's prior tab mapping (deliberately —
-  // it is what stops a background workflow's output leaking into this tab). If a command
-  // is in flight against that mapping when it is withdrawn, the orchestrator loses the
-  // route mid-command and reports OUTCOME UNKNOWN for work that actually applied. The
-  // workflow poll cannot see that on its own, so the client — which owns the window
-  // between a command frame arriving and its reply going out — counts it and the panel
-  // reads it before re-targeting.
+  // A hello makes the backend DROP this socket's prior tab mapping (deliberately — it is
+  // what stops a background workflow's output leaking into this tab). If a command is in
+  // flight against that mapping when it is withdrawn, the orchestrator loses the route
+  // mid-command and reports OUTCOME UNKNOWN for work that actually applied.
   //
-  // Incremented where the command branch begins, decremented in deliverReply, which
-  // every command path reaches exactly once. A leak here can only DELAY a re-target,
-  // never block it: the reader bounds its own waiting (see onWorkflowMaybeChanged), so
-  // the worst case degrades to today's behaviour rather than wedging the tab.
-  let commandsInFlight = 0;
+  // The gate lives HERE, at the mechanism, and not at the workflow poll that first
+  // exposed the bug. The first cut gated `onWorkflowMaybeChanged`; review showed that
+  // covers one re-advertise out of four (the #607 fence, the #310 free_vram
+  // re-advertise and the #508 self-heal re-registration all call sendHello too) — and
+  // that it made the reported symptom MORE reachable, because holding the poll's hello
+  // back keeps the orchestrator's cached workflow_uuid stale for longer, which trips the
+  // fence, which re-hellos ungated from inside the command branch. Whole argument and
+  // the two budget classes: lib/rehello-gate.js.
+  //
+  // `advertiseHello` is a hoisted declaration below; the arrow defers the read until the
+  // gate actually fires, so this cannot capture it before it exists.
+  const rehelloGate = createRehelloGate({
+    advertise: () => advertiseHello(),
+    now: monotonicNow,
+  });
+  // #1095 — the socket a hello has actually LANDED on. Only a hello that REPLACES an
+  // existing mapping can strand a command; the FIRST hello on a socket creates one and
+  // withdraws nothing, so gating it would be pure loss — a tab that never registers at
+  // all, which is strictly worse than the race. Every other caller (#654's refused-route
+  // retry included) is a re-advertise by definition and passes through the gate.
+  let advertisedSock = null;
   function markConnected() {
     handshakeDone = true;
     handshakenSock = sock;
@@ -18636,11 +18650,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
      *  Returns true only when the frame was actually handed to an open socket. */
     const deliverReply = (reply, cmd, superseded) => {
       // #1095 — the command is finished the moment its reply is handed over, whatever
-      // happens to it after. Decremented here rather than at each `return` because every
-      // command path reaches this exactly once, and floored at 0 so a double-delivery
-      // (a retry, a future refactor) can never drive the count negative and permanently
-      // convince the workflow poll that nothing is running.
-      if (commandsInFlight > 0) commandsInFlight--;
+      // happens to it after. Released here rather than at each `return` because every
+      // command path reaches this exactly once, and the gate floors the count at 0 so a
+      // double-delivery (a retry, a future refactor) can never drive it negative and
+      // permanently convince the gate that nothing is running.
+      rehelloGate.ended();
       const socketOpen = thisSock.readyState === WebSocket.OPEN;
       let sendThrew = false;
       if (socketOpen) {
@@ -18706,13 +18720,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // is a clean, safe-to-retry negative — and deliver/journal that refusal like any
         // other reply.
         if (isCommandFrame) {
-          // #1095 — deliverReply decrements the in-flight count, so this refusal must
-          // balance it. The count is CLIENT-scoped while this branch runs on a RETIRED
-          // socket, so an unpaired decrement here would discount a command still running
-          // on the live socket and let the workflow poll re-target out from under it —
-          // the exact race this counter exists to prevent, reintroduced by its own
-          // bookkeeping. Nothing is executed either way; this keeps the pair balanced.
-          commandsInFlight++;
+          // #1095 — deliverReply RELEASES an in-flight mark, so this refusal must first
+          // take one. The count is CLIENT-scoped while this branch runs on a RETIRED
+          // socket, so an unpaired release here would discount a command still running on
+          // the live socket and let a re-advertise fire out from under it — the exact race
+          // this gate exists to prevent, reintroduced by its own bookkeeping. Nothing is
+          // executed either way; this keeps the pair balanced.
+          //
+          // Deliberately marked with NO command name. `began(cmd)` declares how long a
+          // command may hold the route, and `msg.cmd` here can be `ask_user` — a
+          // 30-second human budget for a refusal that completes in microseconds. The
+          // budget is a MAX over the batch and only clears at drain, so over-declaring
+          // once would pin the route for half a minute. Anonymous means the machine
+          // budget, which for an instant refusal is already generous.
+          rehelloGate.began();
           deliverReply(
             {
               rid: msg.rid,
@@ -18826,22 +18847,24 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // #1095 — the command is now IN FLIGHT against this socket's tab mapping, and
         // stays so until deliverReply hands its reply over. That covers an executor that
         // SUSPENDS (run/save await; ask_user blocks on the user), which is precisely the
-        // window a workflow-change re-hello would withdraw the route in.
+        // window a re-advertise would withdraw the route in.
+        //
+        // `msg.cmd` is passed because the command's own name is what sets how long it may
+        // hold the route: `ask_user`/`request_secret` are paced by a PERSON and get the
+        // human budget, everything else the machine one (lib/rehello-gate.js).
         //
         // Marked HERE, past the #517 dedupe/retry region, not at the top of the branch.
         // Everything above returns on five paths that never reach deliverReply — a
         // superseded socket after a retry mismatch, a rejected retry, a defensive ledger
         // catch, a superseded socket after the duplicate await, and the duplicate replay —
-        // and the last two answer with a direct `thisSock.send`, not deliverReply. An
-        // increment above would leak on every one of them, and a leaked count is not
-        // harmless: it never returns to 0, so EVERY later workflow switch waits out the
-        // full deferral budget. Found by parsing the branch; two hand reads of it missed
-        // these paths entirely.
+        // and the last two answer with a direct `thisSock.send`, not deliverReply. A mark
+        // above would leak on every one of them, and a leaked mark is not harmless: the
+        // count never returns to 0, so EVERY later re-advertise waits out the full budget.
+        // Found by parsing the branch; two hand reads of it missed these paths entirely.
         //
         // From here to deliverReply there is no other exit: the executor's throws are
-        // caught below and turned into a reply, so increment and decrement are exactly
-        // paired.
-        commandsInFlight++;
+        // caught below and turned into a reply, so mark and release are exactly paired.
+        rehelloGate.began(msg.cmd);
         const settleRid = commandRidLedger.begin(msg.rid, fingerprint, commandEpoch);
         let reply;
         // #581 — retain the tracker belonging to the command's completed edit.
@@ -19472,11 +19495,33 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     });
   }
 
+  /** #1095 — THE entry point for advertising this tab. Every caller goes through here:
+   *  the socket-open hello, the workflow re-target, the #607 fence recovery, the #310
+   *  free_vram re-advertise, the #508 self-heal re-registration and the #654 refused-route
+   *  retry. That is the point — the deferral is a property of the MECHANISM, so a caller
+   *  added later is gated by construction instead of being the next ungated hole.
+   *
+   *  Contract unchanged: a promise resolving to whether the hello reached the wire. A
+   *  deferred hello resolves when it eventually goes out (or false if the client was torn
+   *  down first), so the #607 budget still counts only what the orchestrator received. */
+  function sendHello() {
+    // A hello that REPLACES this socket's mapping is the only one that can strand a
+    // command. The first hello on a socket creates the mapping — there is nothing to
+    // withdraw, and deferring it would leave the tab unregistered while commands pile up
+    // against a route that does not exist yet. `advertisedSock` is set only on the success
+    // path below, so a hello that never landed does not arm the gate either.
+    if (!sock || sock !== advertisedSock) return advertiseHello();
+    return rehelloGate.request();
+  }
+
   /** Returns a promise resolving to whether the hello actually REACHED THE WIRE.
    *  Every existing caller ignores it; the #607 re-hello does not, because a
    *  recovery that throttles itself on the strength of a send that never happened
-   *  stays wedged while believing it is being polite. */
-  function sendHello() {
+   *  stays wedged while believing it is being polite.
+   *
+   *  #1095 — call `sendHello()`, not this, unless you can show the send must not wait for
+   *  in-flight commands. This is the ungated send the gate drives. */
+  function advertiseHello() {
     if (!sock || sock.readyState !== WebSocket.OPEN) return Promise.resolve(false);
     // #291 — a hello BINDS this socket to an agent session, and not always the one
     // it was bound to a moment ago. Besides the socket-open hello, the panel
@@ -19590,6 +19635,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // Published only now, for the same reason the epoch advances only now:
           // a hello that never reached the wire advertised nothing.
           lastAdvertisedWorkflowUuid = advertisedWorkflowUuid;
+          // #1095 — this socket now HAS a mapping, so every later hello on it is a
+          // re-advertise and goes through the gate. Recorded on the same success path and
+          // for the same reason as the two lines above: a hello that never left the tab
+          // established nothing, and arming the gate on it would defer the retry that
+          // could actually register this tab.
+          advertisedSock = target;
           // #654 — registration succeeded: the refused-hello retry budget is
           // replenished and any pending retry is moot.
           routeRefusalRetries = 0;
@@ -19974,6 +20025,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       } catch {}
       sock = null;
       handshakenSock = null;
+      // #1095 — a parked re-advertise belongs to the connection being replaced. Firing it
+      // into a DIFFERENT bridge would register this tab somewhere the caller never asked
+      // for, which is the corruption class #508 already refuses to risk. Dropped, not
+      // flushed; the new socket's own open hello registers the tab.
+      rehelloGate.cancel();
+      advertisedSock = null;
       connect();
     },
     currentUrl() {
@@ -19982,13 +20039,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     isConnected() {
       return !!sock && sock.readyState === WebSocket.OPEN;
     },
-    /** #1095 — how many orchestrator→panel commands are mid-execution. Read by the
-     *  workflow poll before it re-targets this socket, because a re-hello withdraws the
-     *  tab mapping those commands are routed to. Read-only by design: only the command
-     *  path may move it, and a caller that could reset it would be able to manufacture
-     *  the very race this exists to close. */
+    /** #1095 — diagnostics only. The in-flight count is NOT exported for callers to gate
+     *  on: an earlier cut had the workflow poll read it and decide for itself, and that is
+     *  precisely the design review rejected — one caller gated while three others
+     *  re-advertise freely. The decision belongs to sendHello. */
     commandsInFlight() {
-      return commandsInFlight;
+      return rehelloGate.inFlight();
     },
     stop() {
       // Close the socket and stop reconnecting, but stay re-startable (unlike
@@ -20006,6 +20062,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       } catch {}
       sock = null;
       handshakenSock = null;
+      // #1095 — see setUrl: a parked hello must never outlive the socket it was queued for.
+      rehelloGate.cancel();
+      advertisedSock = null;
     },
     destroy() {
       closed = true;
@@ -20019,6 +20078,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       } catch {}
       sock = null;
       handshakenSock = null;
+      // #1095 — and a torn-down panel must not leave a timer armed to hello from a closure
+      // nothing owns any more.
+      rehelloGate.cancel();
+      advertisedSock = null;
     },
   };
 }
@@ -27054,51 +27117,31 @@ function buildPanel() {
       /* reconnect path retries the hello */
     }
   }
-  // #1095 — how many consecutive polls have deferred a workflow re-target because a
-  // command was in flight. At 600ms per tick this budget is ~3s, comfortably longer than
-  // a normal graph mutation and far shorter than any command timeout, so a healthy batch
-  // finishes inside it while a stuck command cannot strand the tab on the old route.
-  const MAX_WORKFLOW_RETARGET_DEFERRALS = 5;
-  let workflowRetargetDeferrals = 0;
+  // #1095 — THIS POLL DOES NOT GATE ANYTHING, AND THAT IS THE FIX.
+  //
+  // The first cut deferred the whole function while a command was in flight, so that the
+  // re-hello below could not withdraw the route mid-command. Review rejected it on three
+  // counts, all of which this arrangement answers by moving the wait into sendHello:
+  //
+  //   1. It covered ONE re-advertise. The #607 fence, the #310 free_vram re-advertise and
+  //      the #508 self-heal all call sendHello too, and the fence fires from inside the
+  //      command branch — so deferring here made the orchestrator's cached workflow_uuid
+  //      staler, tripped the fence more often, and routed MORE traffic through the one
+  //      re-hello that was still ungated.
+  //   2. Its budget was five poll ticks (~3 s), which is nothing to an `ask_user` waiting
+  //      on a person. The bound is now contributed by the commands themselves.
+  //   3. Returning early swallowed the caller's INLINE work. `panelHooks.applyChatScope`
+  //      nulls `currentWorkflowId` and calls this expecting the re-bind to happen now; it
+  //      then repaints the context ring and announces the scope change. A deferred return
+  //      announced a re-bind that had not happened.
+  //
+  // So everything below commits unconditionally, exactly as it did before #1095, and only
+  // the hello waits. See lib/rehello-gate.js.
   function onWorkflowMaybeChanged() {
     const wf = activeWorkflowRef();
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
-    if (wfid === currentWorkflowId) {
-      // #1095 — nothing pending, so nothing is being deferred: release the budget here
-      // too. It is only reset once a deferred switch finally proceeds, and this early
-      // return skips that — so a switch that was deferred a tick or two and then ABANDONED
-      // (the user switches back, or the id settles to what it already was) would leave
-      // the budget part-spent, and the next genuine switch would get fewer deferrals than
-      // it is owed. A counter that only ever ratchets one way is the same shape as the
-      // stale-marker class this file keeps finding.
-      workflowRetargetDeferrals = 0;
-      return; // case 1: no change
-    }
-
-    // #1095 — a workflow change re-targets this socket, and rehelloForWorkflow's own note
-    // says the backend DROPS the socket's prior tab mapping when it does. That is correct
-    // (it stops a background workflow's output leaking here) but it must not happen while
-    // a command is routed to that mapping: the orchestrator loses the route mid-command
-    // and reports OUTCOME UNKNOWN for work that actually applied, then "Connected: none"
-    // until the new mapping settles. Creating a workflow and immediately applying a batch
-    // of mutations is exactly that window — this poll runs every 600ms, so a tick lands
-    // between two commands.
-    //
-    // Deferred BEFORE `currentWorkflowId` is committed, which is the whole subtlety:
-    // advancing the id and deferring only the hello would swallow the change forever,
-    // because the next tick's early return above would treat it as already handled.
-    // Returning here leaves the id untouched, so the poll IS the retry — no new timer.
-    //
-    // BOUNDED, because an unbounded wait converts a race into a wedge, which is worse:
-    // a command whose reply is never delivered would strand the tab on the old workflow's
-    // route permanently. After the budget the re-target proceeds regardless, degrading to
-    // exactly today's behaviour rather than to something new.
-    if (client?.commandsInFlight?.() > 0 && workflowRetargetDeferrals < MAX_WORKFLOW_RETARGET_DEFERRALS) {
-      workflowRetargetDeferrals++;
-      return;
-    }
-    workflowRetargetDeferrals = 0;
+    if (wfid === currentWorkflowId) return; // case 1: no change
 
     const initial = currentWorkflowId == null;
     const followsPanel = historyScopeFollowsPanel();
