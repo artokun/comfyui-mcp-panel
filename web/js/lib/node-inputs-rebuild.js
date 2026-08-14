@@ -48,11 +48,50 @@
  *  the frontend appends it to that same pick list. */
 const DEFINITION_OWNED_INPUT_KEYS = new Set([
   "name",
-  "type",
+  // `type` is DELIBERATELY NOT HERE, though the frontend overlays it too.
+  //
+  // The rebuild explains a type difference MECHANICALLY, but "explained" is not
+  // the question this function answers — it answers whether the live graph
+  // reproduces the SAVED content. A slot saved as IMAGE that loads as MASK
+  // because the node definition changed between save and load is a different
+  // connection contract, and proving content across it would publish a fence for
+  // a graph an agent's next write could land on wrongly (review, P1). Definition
+  // drift is exactly when a caller should NOT be told the open was faithful.
   "shape",
   "localized_name",
   "widget",
 ]);
+
+/**
+ * A canonical encoding that distinguishes values `JSON.stringify` conflates.
+ *
+ * `JSON.stringify(a ?? null)` — the first version of this comparison — made
+ * `null`, `undefined` and an ABSENT property identical, and `NaN` identical to
+ * all three (`JSON.stringify(NaN) === "null"`). So a field going from `null` to
+ * gone, or to `NaN`, read as no difference at all — in a function whose entire
+ * job is to refuse unexplained differences, and directly contradicting its own
+ * "presence before value" note (review, P1).
+ *
+ * Recursive, because the conflation applies at every depth, not just the top.
+ */
+function canonical(value) {
+  if (value === undefined) return "u";
+  if (value === null) return "n";
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return "#NaN";
+    if (Object.is(value, -0)) return "#-0";
+    return `#${value}`;
+  }
+  if (typeof value !== "object") return `${typeof value}:${String(value)}`;
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  // Key-sorted, so property order is not mistaken for a difference.
+  return `{${Object.keys(value)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`)
+    .join(",")}}`;
+}
+
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 
 /** A slot's identity for pairing. The frontend keys its rebuild off `name`, so
  *  that is the only honest way to pair two slots across a reorder. */
@@ -106,11 +145,15 @@ export function inputsDifferOnlyByDefinitionRebuild(expectedInputs, actualInputs
       const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
       for (const key of keys) {
         if (DEFINITION_OWNED_INPUT_KEYS.has(key)) continue;
-        const a = before[key];
-        const b = after[key];
-        if (a === b) continue;
-        // Structural values (e.g. a `pos` pair) compare by shape, not identity.
-        if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) return false;
+        // PRESENCE FIRST, and as its own answer. A key on one side only is a
+        // difference whatever its value would have been — collapsing that into a
+        // value comparison is how an absent field starts matching an explicit
+        // null.
+        const inBefore = hasOwn(before, key);
+        const inAfter = hasOwn(after, key);
+        if (inBefore !== inAfter) return false;
+        if (!inBefore) continue;
+        if (canonical(before[key]) !== canonical(after[key])) return false;
       }
     }
     return true;

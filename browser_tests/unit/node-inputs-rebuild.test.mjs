@@ -31,11 +31,51 @@ test("REORDERING alone is explained — the live order is the definition's", () 
   assert.equal(inputsDifferOnlyByDefinitionRebuild(saved, live), true);
 });
 
-test("a definition-owned key changing is explained", () => {
-  // `type`, `shape`, `localized_name` and `widget` are taken from the definition
-  // on every load, so the file's values are advisory and cannot indicate loss.
-  const saved = [slot("image", { type: "IMAGE", shape: 7, localized_name: "Image" })];
-  const live = [slot("image", { type: "MASK", shape: 3, localized_name: "Bild" })];
+test("a presentation key changing is explained", () => {
+  // `shape`, `localized_name` and `widget` are taken from the definition on every
+  // load and carry no connection semantics, so the file's values cannot indicate
+  // loss.
+  const saved = [slot("image", { shape: 7, localized_name: "Image" })];
+  const live = [slot("image", { shape: 3, localized_name: "Bild" })];
+  assert.equal(inputsDifferOnlyByDefinitionRebuild(saved, live), true);
+});
+
+test("a changed slot TYPE is NOT explained — definition drift is not proof", () => {
+  // The frontend overlays `type` from the definition, so a difference IS
+  // mechanically explained by the rebuild — and admitting it anyway was a
+  // false PROVEN (review). "Explained" is not the question; "does the live graph
+  // reproduce the SAVED content" is, and IMAGE→MASK is a different connection
+  // contract that a later agent write could land on wrongly. An earlier version
+  // of this very test asserted the opposite.
+  const saved = [slot("image", { type: "IMAGE" })];
+  const live = [slot("image", { type: "MASK" })];
+  assert.equal(inputsDifferOnlyByDefinitionRebuild(saved, live), false);
+});
+
+test("null, undefined, ABSENT and NaN are all distinguished", () => {
+  // JSON.stringify(x ?? null) made every one of these identical — including NaN,
+  // which stringifies to "null" — in a function whose whole job is refusing
+  // unexplained differences (review). Each pair must refuse.
+  const pairs = [
+    [slot("a", { dir: null }), slot("a", { dir: undefined })],
+    [slot("a", { dir: null }), slot("a")],
+    [slot("a", { dir: undefined }), slot("a")],
+    [slot("a", { dir: null }), slot("a", { dir: NaN })],
+    [slot("a", { dir: 0 }), slot("a", { dir: -0 })],
+    [slot("a", { dir: { x: null } }), slot("a", { dir: { x: NaN } })],
+  ];
+  for (const [before, after] of pairs) {
+    assert.equal(
+      inputsDifferOnlyByDefinitionRebuild([before], [after]),
+      false,
+      `${JSON.stringify(before)} vs ${JSON.stringify(after)}`,
+    );
+  }
+});
+
+test("key ORDER inside a structural value is not a difference", () => {
+  const saved = [slot("a", { meta: { x: 1, y: 2 } })];
+  const live = [slot("a", { meta: { y: 2, x: 1 } })];
   assert.equal(inputsDifferOnlyByDefinitionRebuild(saved, live), true);
 });
 
@@ -135,7 +175,11 @@ test("a THROWING slot proves nothing — the catch must answer false", () => {
   // guard before the try, so the catch block itself was never exercised and
   // flipping it to `return true` changed nothing observable. A getter that throws
   // is the shape that actually reaches it.
-  const hostile = { name: "image" };
+  // The slot must otherwise MATCH, or an earlier check answers first and the
+  // catch is never reached — which is what happened in the first version of this
+  // test: `type` was present on one side only, so presence-differs returned false
+  // before anything read the getter, and mutating the catch changed nothing.
+  const hostile = { name: "image", type: "IMAGE" };
   Object.defineProperty(hostile, "link", {
     enumerable: true,
     get() {
