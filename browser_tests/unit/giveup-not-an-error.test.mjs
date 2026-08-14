@@ -81,12 +81,22 @@ test("#1489 it carries a NOTE, which is what makes an executed event describe it
   assert.doesNotMatch(body, /images:/, "and must not attach outputs");
 });
 
-test("#1489 the note states the UNKNOWN honestly — no failure, no output", () => {
+test("#1489 the note states the UNKNOWN honestly, in BOTH directions", () => {
   const body = giveUpBody();
   assert.match(body, /could NOT be confirmed/i, "says the outcome is unknown");
-  assert.match(body, /not a reported failure/i, "and explicitly is not a failure claim");
-  assert.match(body, /no output was produced/i, "and does not imply a render landed");
-  assert.match(body, /Re-queue it if you still need it/i, "and names the action");
+  assert.match(body, /NOT a reported failure/i, "and is explicitly not a failure claim");
+
+  // Review, P1 — and this test blessed the defect a moment ago. The first version
+  // asserted "no output was produced", which is a claim this path CANNOT substantiate:
+  // a run that emitted outputs before the connection dropped, then was cancelled before
+  // its terminal status, reaches give-up with real artifacts on disk. Telling the agent
+  // nothing was produced invites re-queueing an expensive or side-effecting run.
+  //
+  // That is the same error the fix is about, pointed the other way: I replaced one
+  // unsubstantiated claim ("it ERRORED") with another ("nothing was produced").
+  assert.doesNotMatch(body, /no output was produced/i, "must not claim an absence it cannot see");
+  assert.match(body, /not proof nothing was produced/i, "says so explicitly");
+  assert.match(body, /get_history/, "and names the reader that CAN answer it");
 });
 
 test("#1489 everything else on the give-up path is unchanged", () => {
@@ -113,7 +123,13 @@ test("#1489 run_error is STILL used where a failure is actually known", () => {
   // that interrupts the agent, and a real render failure must keep using it — a change
   // that simply deleted the urgent class everywhere would pass every assertion above
   // while making genuine errors silent.
-  const errorSends = [...PANEL.matchAll(/kind: "run_error"/g)].length;
+  //
+  // STRIPPED, and review had to point that out: the first version scanned the raw
+  // monolith, and the comments THIS COMMIT ADDED quote `kind: "run_error"` while
+  // explaining why give-up no longer uses it. So the guard would have passed with every
+  // executable urgent send downgraded — a test that reads prose and reports PASS, which
+  // is the dangerous direction of exactly the mistake it was written to prevent.
+  const errorSends = [...stripComments(PANEL).matchAll(/kind: "run_error"/g)].length;
   assert.ok(
     errorSends > 0,
     "at least one path must still report a KNOWN failure as urgent, or errors go unnoticed",

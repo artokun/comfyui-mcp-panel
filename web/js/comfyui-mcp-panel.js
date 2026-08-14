@@ -28517,8 +28517,10 @@ function buildPanel() {
         note:
           `The outcome of your queued run (prompt ${promptId}) could NOT be confirmed after ` +
           `reconnecting — the server has no history for it, which is what a cancelled or ` +
-          `interrupted run looks like. This is not a reported failure: nothing was observed ` +
-          `going wrong, and no output was produced. Re-queue it if you still need it.`,
+          `interrupted run looks like. This is NOT a reported failure: nothing was observed ` +
+          `going wrong. It is also not proof nothing was produced — if the connection dropped ` +
+          `mid-run, any outputs it did write are simply not recorded here, so check ` +
+          `get_history (action:"list") before re-queueing anything expensive.`,
       });
       appendSystem(
         tr("panel.render_status_unknown_for_prompt_safe_to", "Render status unknown for prompt {promptId} — safe to requeue.", { promptId }),
