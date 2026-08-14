@@ -694,3 +694,179 @@ test("#813 the rect is still refreshed during a restore — the fix does not sto
   assert.deepEqual(n.pos, [100, 100], "restored");
   assert.ok(nodeAreaIsLive(n), "the cached rect must track the restore, not be left describing the moved position");
 });
+
+// ---------------------------------------------------------------------------
+// #813 — a COLLAPSED member is not a node that refused to move
+//
+// The reporter's group held four `size:[225,0]` collapsed nodes. Every one was
+// classified stuck AFTER its position had been written, and the same nodes moved
+// fine one-by-one with panel_move_node. The stuck verdict never came from the
+// position write; it came from comparing the cached rect against the panel's
+// COLLAPSED PILL model while the engine's own updateArea() had just written its
+// own extents back.
+// ---------------------------------------------------------------------------
+
+test("#813 a collapsed member whose engine updateArea() restores full extents still MOVES", () => {
+  // The reporter's node, on a build whose updateArea() authoritatively recomputes the rect
+  // the way this file already models it (see the #355 test above). The recompute uses
+  // size — [225, 0] — so the rect comes back as [x, y-30, 225, 30]... which happens to
+  // equal the pill here. Give it a _collapsed_width that DIFFERS from size[0], which is
+  // what a real collapsed node has, and the two models diverge exactly as reported.
+  const n = {
+    id: 24,
+    pos: [100, 100],
+    size: [225, 0],
+    flags: { collapsed: true },
+    _collapsed_width: 80,
+    boundingRect: [100, 70, 80, 30], // the pill, as the move's pre-flight left it
+    updateArea() {
+      // The engine knows nothing about the panel's pill: it recomputes from size.
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, this.size[0], this.size[1] + 30];
+    },
+  };
+
+  const r = moveGroupMembers([n], 1400, -140);
+
+  assert.deepEqual(r.stuck, [], "a collapsed node with a writable rect is not stuck");
+  assert.deepEqual(r.moved, [n], "…it moved");
+  assert.deepEqual(n.pos, [1500, -40], "to the reporter's target");
+  assert.ok(nodeAreaIsLive(n), "and its cached rect is back on the panel's pill convention");
+});
+
+test("#813 the pill is forced, never the full box — #416 area overstatement stays closed", () => {
+  // The correction must write the COLLAPSED footprint. Writing the engine's full-box
+  // extents would make a collapsed node claim the area of its expanded self, and
+  // membership is rect-first, so it would capture neighbours it does not overlap.
+  const n = {
+    id: 25,
+    pos: [0, 0],
+    size: [225, 400],
+    flags: { collapsed: true },
+    _collapsed_width: 80,
+    boundingRect: [0, -30, 80, 30],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, this.size[0], this.size[1] + 30];
+    },
+  };
+
+  moveGroupMembers([n], 10, 10);
+
+  assert.deepEqual(
+    [...n.boundingRect],
+    [10, -20, 80, 30],
+    "the collapsed pill (80x30), not the 225x430 box the engine recomputed",
+  );
+});
+
+test("#813 a rect that genuinely cannot be corrected is STILL stuck (#408 preserved)", () => {
+  // The load-bearing half. A frozen rect cannot be made to track the node, membership is
+  // rect-first, and leaving such a node "moved" would report it in a group it has left. The
+  // fix gives the rect one more chance to be corrected — it does not stop asking.
+  const n = {
+    id: 26,
+    pos: [100, 100],
+    size: [225, 0],
+    flags: { collapsed: true },
+    _collapsed_width: 80,
+    boundingRect: Object.freeze([100, 70, 80, 30]),
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "an uncorrectable rect still refuses");
+  assert.deepEqual(r.stuck, [n]);
+});
+
+test("#813 an EXPANDED member is unaffected — its two models already agree", () => {
+  const n = {
+    id: 27,
+    pos: [100, 100],
+    size: [200, 100],
+    boundingRect: [100, 70, 200, 130],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, this.size[0], this.size[1] + 30];
+    },
+  };
+
+  const r = moveGroupMembers([n], 10, 10);
+
+  assert.deepEqual(r.stuck, []);
+  assert.deepEqual([...n.boundingRect], [110, 80, 200, 130]);
+});
+
+test("#813 a rect exposed by a COPYING getter is not reported moved (review P2)", () => {
+  // `boundingRect` backed by a getter that hands out a fresh array each read. syncNodeArea
+  // mutates and verifies the throwaway copy, so its own verdict is true while the node's
+  // real rect never changed. Trusting that would report the node moved and then let the
+  // next rect-first membership read drop it from the group it was just moved into. This
+  // file already documents the same accessor shape for `pos` in writePoint.
+  const real = [100, 70, 80, 30];
+  const n = {
+    id: 30,
+    pos: [100, 100],
+    size: [225, 0],
+    flags: { collapsed: true },
+    _collapsed_width: 80,
+    get boundingRect() {
+      return [...real]; // a COPY: writes to it are dropped
+    },
+    updateArea() {
+      /* engine cannot move a rect it is handed by copy either */
+    },
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "a rect whose writes cannot be observed is not 'moved'");
+  assert.deepEqual(r.stuck, [n]);
+  assert.deepEqual(real, [100, 70, 80, 30], "and the underlying rect really was never updated");
+});
+
+test("#813 an EXPANDED node's authoritative extents are not overwritten (review P2)", () => {
+  // A custom node whose updateArea() computes visible bounds reaching past `size` — a
+  // legitimate engine answer that differs from the panel's generic footprint model. The
+  // collapsed repair must not fire here: overwriting the engine's rect and reporting
+  // success would make later rect-first membership wrong.
+  const n = {
+    id: 31,
+    pos: [100, 100],
+    size: [200, 100],
+    // Deliberately WIDER than size — the node draws outside its box.
+    boundingRect: [100, 70, 400, 300],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, 400, 300];
+    },
+  };
+
+  const r = moveGroupMembers([n], 10, 10);
+
+  assert.deepEqual(r.stuck, [n], "an expanded node with a non-generic rect is still stuck");
+  assert.deepEqual(
+    [...n.boundingRect],
+    [110, 80, 400, 300],
+    "and its authoritative extents survive — never replaced by the 200x130 generic model",
+  );
+});
+
+test("#813 a node whose flags accessor THROWS is stuck, not repaired", () => {
+  // The collapsed repair is gated on reading `flags.collapsed`, and that read can throw on
+  // a disposed or hostile node. It must fail CLOSED: an unreadable node is not one this can
+  // show to have moved. (syncNodeArea would also fail on the same accessor, so the two
+  // guards agree — this pins the behaviour rather than the implementation of it.)
+  const n = {
+    id: 32,
+    pos: [100, 100],
+    size: [225, 0],
+    get flags() {
+      throw new TypeError("disposed");
+    },
+    boundingRect: [0, 0, 1, 1], // deliberately wrong, so a repair would have to be attempted
+  };
+
+  let r;
+  assert.doesNotThrow(() => {
+    r = moveGroupMembers([n], 50, 25);
+  }, "a hostile accessor must never escape the mover");
+  assert.deepEqual(r.moved, [], "an unreadable node is not reported moved");
+  assert.deepEqual(r.stuck, [n]);
+});
