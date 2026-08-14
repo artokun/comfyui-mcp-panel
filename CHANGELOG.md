@@ -6,6 +6,332 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.40] - 2026-08-14
+
+### Fixed
+- a group whose members are COLLAPSED nodes now moves, instead of being refused after those members positions had already been written (#813)
+
+## [0.14.39] - 2026-08-14
+
+### Fixed
+- a widget edit is no longer refused just because the /object_info probe went silent while ComfyUI was busy rendering — it is authorized from the last whole schema observed on the same backend connection, which a restart always invalidates (#1223)
+
+## [0.14.38] - 2026-08-14
+
+### Fixed
+- translating the error disarmed every ComfyUI-Manager fallback (#1230)
+
+
+## [0.14.37] - 2026-08-14
+
+### Fixed
+- a run whose outcome could not be confirmed is reported as a neutral event instead of an urgent error, so cancelling a large batch no longer tells the agent every prompt ERRORED (#1226, comfyui-mcp#1489)
+
+
+## [0.14.36] - 2026-08-14
+
+### Fixed
+- panel_open_workflow now asks the SERVER whether the file exists before refusing, so a workflow staged into the workflows folder out-of-band is reported as a stale list rather than a missing file (#1222, comfyui-mcp#1448)
+
+
+## [0.14.35] - 2026-08-14
+
+### Fixed
+- a graph mutation refused during a reconnect now says so in a FIELD the caller can key on, instead of only in the sentence (#1216, comfyui-mcp#1529)
+
+
+## [0.14.34] - 2026-08-14
+
+### Fixed
+- every release since 0.14.31 writes two sections for one version (#1219)
+- rebuild combo options during the reapply sweep, and disclose an empty authoritative list (#1218)
+
+
+## [0.14.33] - 2026-08-14
+
+### Fixed
+- panel_get_errors is a READ, so the dirty-tab mutation fence no longer refuses it as "this mutation" (#1211, comfyui-mcp#1478)
+- bound the remaining unbounded network awaits (#1201)
+
+## [0.14.32] - 2026-08-14
+
+### Fixed
+- a faithful workflow_open no longer reports CONTENT_UNVERIFIED just because the frontend rebuilt each node's `inputs` from its definition (#1208, comfyui-mcp#1467)
+
+## [0.14.31] - 2026-08-14
+
+### Fixed
+- panel_open_workflow no longer claims the workflow list "WAS re-read from the server" when it cannot know that — the frontend's sync swallows its own errors (#1206, comfyui-mcp#1448)
+
+## [0.14.30] - 2026-08-14
+
+### Fixed
+- the video storyboard sampler now names WHICH failure it hit, instead of reporting six different causes as one silent nothing (comfyui-mcp#1493)
+
+## [0.14.29] - 2026-08-13
+
+### Fixed
+
+- **A backend switch that cannot complete no longer leaves the panel claiming the new one (#1184) (#1196).**
+  Picking a different provider committed the choice — in memory, to the chips, and to the
+  stored runtime pick — before checking whether the old provider's session could be safely
+  ended. When that check failed the switch stopped there, and because the stored pick
+  outlives the tab, a reload adopted a backend the panel had never actually connected to.
+  The conversation replay armed for the new provider was left armed too, so the next
+  message shipped the whole prior transcript back to the provider that already had it.
+  Nothing is committed now until the switch is known to be possible, and a switch that
+  stops says so instead of failing silently.
+
+## [0.14.28] - 2026-08-13
+
+### Fixed
+
+- **Adding a node no longer waits forever on a ComfyUI that stopped answering (#1180) (#1186).**
+  When the connection to ComfyUI goes half-open — the socket is up, the server never
+  replies — a request does not fail, it simply never returns. Five requests for the node
+  schema on the add-a-node and refresh-nodes paths had no time limit, so the panel parked
+  on the first one it reached and the add landed minutes later, after the reply it belonged
+  to had already been given up on. Each now gives up on its own and falls through to the
+  handling that was already written for a schema it could not read. The log read that runs
+  while *explaining* one of those failures is bounded too; it was inheriting the very stall
+  it was called to describe.
+  **No change on a healthy ComfyUI**, where these all answer in well under a second.
+
+## [0.14.27] - 2026-08-13
+
+### Fixed
+- bound the two drive waits on the CivitAI fetch, so a slow CivitAI no longer makes a healthy panel look dead (#1189)
+
+## [0.14.26] - 2026-08-13
+
+### Changed
+
+- **Restarting the agent holds its exclusion flag until the reconnect (#1171).**
+  The panel keeps one flag so that restarting the agent and reloading it cannot run at the
+  same time, but the restart released it as soon as the request came back — while it was
+  still ending the current turn, clearing the markers that say a turn is in flight,
+  invalidating the old session, and reconnecting. The flag is now held until the reconnect,
+  which is what the reload path already did, so the two agree.
+  **No visible change when the panel manages ComfyUI's agent the usual way**: this
+  distribution's restart route always answers "not restarted" (the orchestrator runs
+  out-of-band), so the work this now protects is skipped anyway. It matters for setups
+  whose restart route really does restart the agent, and it removes the window before one
+  of those hits it.
+
+### Fixed
+## [0.14.25] - 2026-08-13
+
+### Fixed
+
+- **Setting a widget no longer hangs for 30 seconds after a ComfyUI restart (#1161).**
+  Once ComfyUI had been restarted mid-session, setting any widget on any node timed out,
+  every time, while every other panel command answered instantly — reading the graph,
+  renaming a node, listing workflows, queueing a run. Setting a widget is the one action
+  that reads the backend's node definitions before it writes, and a restart can leave the
+  browser holding a connection that never answers and never fails, so that read waited
+  forever.
+  The panel already had a second way to ask — a direct request that keeps working when
+  the first route does not — but it was never reached, because nothing gave up on the
+  first one. The lookup now has an overall time budget, so a route that stops answering falls
+  through to the one that does and the write simply succeeds. The budget covers the whole
+  lookup rather than being handed to each step in turn, so the wait cannot stack — but the
+  second route is also guaranteed a share of it, because a first route that stops answering
+  would otherwise use the budget up and leave nothing for the route that still works. A
+  route that answers quickly hands back the time it did not use, so a slow install still
+  gets the whole budget to finish in.
+  The budget is twenty seconds, which is generous rather than tight: fetching the whole
+  node-definition document was measured at well under a second even on a large install with
+  sixty-odd node packs. If nothing answers, the refusal names every attempt and says how
+  long each one was actually given, rather than quoting a wait it never spent.
+
+### Fixed
+## [0.14.24] - 2026-08-12
+
+### Fixed
+- **A successful agent restart no longer leaves the old turn's state armed against a
+  fresh agent (#1166).** When a restart genuinely replaces the agent, the panel retires
+  the markers that say a turn is in flight. Those clears all sat after a step that can
+  bail out — if the old session could not be invalidated durably, the restart returned
+  early and skipped every one of them. The killed turn, a pending soft-reload marker and
+  the restart-resume marker were all left armed against an agent that no longer existed,
+  so the next reconnect could announce a reload that never happened, or resume the very
+  conversation the restart was meant to discard. They are now retired before that step,
+  so nothing it does can skip them.
+  That pause itself is deliberate and stays: reconnecting there would restore the session
+  the restart exists to throw away. What it did not do was say so — the status chip, dot
+  and buttons still showed a live connection, so the panel contradicted its own message
+  and left no way to act on it. It now shows the real state and restores the Connect
+  button.
+
+## [0.14.23] - 2026-08-12
+
+### Fixed
+- **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
+  the outage accounting added for #1145, found by review of that change rather than in
+  the wild. A turn beginning while the bridge was still down zeroed the measured outage
+  but left the outage itself running, so it was later measured from before that turn
+  existed. Reachable in ordinary use: sending a message needs only an open socket, not a
+  completed handshake, and the socket comes back well before the model list does — so
+  typing into that gap could draw "your connection dropped mid-task — continue exactly
+  what you were doing" on top of the message just sent, making the agent restart or
+  duplicate the work it was asked to do.
+  A turn start now ENDS the outage rather than only zeroing the total. What that frame
+  proves is narrow but sufficient: a turn is in flight. The nudge exists solely to
+  rescue an agent left IDLE — a session resumed with full context and nothing pending —
+  so once a turn is running there is nothing to rescue, whether it is the original turn
+  re-announced by an orchestrator that survived or a new one just typed into a replaced
+  agent. Nudging either is the harm. The converse still holds and is covered by tests:
+  an orchestrator that died has no turn to announce, so its nudge fires as before.
+
+## [0.14.22] - 2026-08-12
+
+### Fixed
+- let a truncated provider hint be read on hover (#1165)
+- translate the "why can't I use this provider" hints in all 11 languages (#1162)
+- translate the 22 strings that answer "why can't I use this provider" (#1160)
+
+- **A ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
+  resumed agent its connection dropped mid-task and to continue what it was doing, and it
+  fires only for a REAL restart — judged by how long the bridge was gone. But the panel
+  assigns its socket before the connection resolves, so a REFUSED reconnect attempt is
+  still the active socket and ran the close handler in full, re-stamping the drop time.
+  With backoff doubling, the retries land near one, three, seven and fifteen seconds, so
+  the attempt that finally connected was separated from the previous failed close by only
+  that attempt's delay. The guard weighed its own retry cadence, not the outage: a genuine
+  restart returning inside about seven seconds measured roughly four and lost its nudge,
+  leaving the agent idle with a resumed session and no pending turn — after exactly the
+  event the nudge exists for. The outage is now stamped once, by the first close that
+  begins it, and its duration measured at the handshake that ends it.
+  A second reading of the same guard is closed with it: a drop stamp answers "how long
+  since the last drop, whenever that was", and kept answering after the outage it
+  described had ended — so a `ready` repeating on a live socket (the panel re-advertises
+  after every successful `free_vram`, #310) could be told about a drop from ten minutes
+  and two reconnects earlier. That is #1138's defect with a real timestamp in place of the
+  zero sentinel. What the guard reads is now a measured duration, scoped to the turn now
+  running, and a handshake that ended no outage records nothing rather than inheriting the
+  previous one.
+  The accounting moved into a tracker with unit tests that drive it through the real
+  sequence — drop, refused retry, refused retry, handshake — because no single call can
+  distinguish a drop from the third refused attempt, and a source scan over the panel
+  could not have caught this (a review previously proved by mutation that such scans stay
+  green through an inversion). Each guard was mutation-checked against those tests.
+  The two sibling `ready`-ack branches were audited for the same class and are clean: the
+  reboot-resume branch already decides on an observed drop rather than elapsed time
+  ("elapsed time is not evidence of a new connection; an observed drop is"), and the
+  soft-reload branch reads a marker it sets and clears itself. The mid-task branch was the
+  only one deriving a restart from a clock.
+
+## [0.14.21] - 2026-08-12
+
+### Added
+- Brazilian Portuguese (pt-BR) panel catalog — 1107 keys + 52 settings (#1156)
+- Russian (ru) panel catalog — 1161 keys, all four plural forms (#1155)
+- complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
+### Fixed
+- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
+## [0.14.20] - 2026-08-12
+
+### Added
+- Spanish (es) panel catalog (#1152)
+- add the Arabic (ar) panel catalog (#1143)
+- add the Traditional Chinese (zh-TW) panel catalog (#1153)
+- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
+- add the Turkish (tr) panel catalog (#1148)
+- add the Persian (fa) panel catalog (#1147)
+### Fixed
+- a definitions difference that is only link renumbering is not a content change (#1125)
+- the status pill froze because onStatus threw on every status frame (#1154)
+## [0.14.19] - 2026-08-12
+
+### Added
+- complete the Japanese panel translation (999 keys) (#1140)
+
+### Fixed
+- name every uninstalled node type before queueing, not one rejection at a time (#1129)
+- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
+
+
+## [0.14.18] - 2026-08-12
+
+### Fixed
+
+- **A live-socket re-advertise no longer reads as a fresh connect, so a benign reconnect
+  cannot tell you your connection dropped mid-task (#1138).** The panel injects a user
+  message — "Your connection dropped mid-task … continue exactly what you were doing" —
+  plus a transcript line whenever a `ready` ack arrives with a mid-task marker set. The
+  guard meant to suppress that on a live session read `Date.now() - lastBridgeDownAt <
+  6000`, and that timestamp is `0` until the bridge socket actually closes. So a bridge
+  that never dropped presented as a ~56-year gap — the longest possible — which a
+  long-gap-means-real-restart heuristic read as the strongest possible evidence of a
+  restart. The guard was exactly inverted in the case it existed to catch: the better
+  established that nothing had dropped, the more confidently it fired.
+  Reachable in normal use, because `ready` repeats on a live socket and the panel
+  re-advertises after every successful `free_vram` by design (#310). Freeing VRAM
+  mid-task could therefore tell you your connection had dropped when nothing had, and
+  tell a still-working agent to resume — making it restart or duplicate the render it was
+  already running.
+  A real restart still nudges, including exactly at the six-second boundary. The decision
+  moved into a pure predicate so it is covered by behaviour rather than by a source scan:
+  a review demonstrated by mutation that token-presence tests over this file stay green
+  when such a guard is inverted, which is the one regression that matters here.
+  Two related problems were found and deliberately left for their own issue rather than
+  patched here: every FAILED reconnect attempt re-stamps that timestamp, so the gap can
+  measure a backoff step instead of the outage; and the other `ready`-ack branches have
+  not been audited for the same sentinel exposure.
+
+## [0.14.17] - 2026-08-12
+
+### Added
+- freeze the English catalog and give translators a rendering instrument (#1135)
+
+### Fixed
+- the status chip must report the socket the session actually uses (#1137)
+- disclose the foreign source state on a FAILING open too (#1131)
+- a successful open must not report a canvas it did not verify (#1110)
+- say whether the workflow list was actually re-read, and stop blaming the folder (#1123)
+- advertise the vendored tool vocabulary in the hello (#1119)
+- a numeric from_output reuses the rail slot instead of minting one named "4" (#1117)
+- panel_screenshot stops throwing when a node has no type (#1115)
+- render the effort LABEL, not the raw token
+- the connect-screen blurb, and a broader audit than sinks can give
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- wire the strings no coverage metric could see
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- Korean is complete — every panel string now has a translation
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- fill Korean from 37% to 50% — the visible chrome was untranslated
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.16 (#1132)
+- 0.14.15 (#1128)
+- 0.14.14 (#1121)
+- re-vendor the tool vocabulary — the handshake found real drift (#1120)
+- 0.14.13 (#1118)
+- 0.14.12 (#1116)
+- 0.14.11 (#1113)
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
 ## [0.14.16] - 2026-08-12
 
 ### Fixed

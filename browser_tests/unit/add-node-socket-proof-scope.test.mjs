@@ -34,6 +34,7 @@
 // entirely in which payload the CALL SITE hands to which question.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -70,6 +71,12 @@ assert.ok(awaitWidgetsMatch, "could not locate awaitRequiredCustomWidgetRegistra
 
 const placementMatch = panelSrc.match(/\nfunction placementFor\(graph, pos\) \{[\s\S]*?\n\}/);
 assert.ok(placementMatch, "could not locate placementFor");
+
+// #1180 — the SHIPPED bounded fetch, extracted rather than re-implemented. A harness copy
+// can drift from the real one, and then these tests prove nothing about what ships. Same
+// extraction technique this file already uses for graph_add_node itself.
+const boundedMatch = panelSrc.match(/\nasync function boundedGetNodeDefs\([\s\S]*?\n\}/);
+assert.ok(boundedMatch, "could not locate boundedGetNodeDefs in panel source");
 
 // ---------------------------------------------------------------------------
 // The reporter's install: seedvr2_videoupscaler, freshly installed, ComfyUI restarted,
@@ -180,11 +187,25 @@ function makeComfy() {
   return { app, LG, graph, registry };
 }
 
+// #1180 — READ from the panel, never restated here. Shared, because this block existed
+// verbatim in both widen harnesses, and the whole point of reading a constant instead of
+// copying it is that one copy cannot drift from another.
+import {
+  CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
+  NODE_DEFS_FETCH_TIMEOUT_MS,
+  NODE_DEFS_NO_ANSWER,
+  PANEL_SRC as widenSrcForConsts,
+  WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+  monotonicNow,
+} from "./_panel-constants.mjs";
+
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
 function realGraphAddNode(comfy, overrides = {}) {
   const { app, LG, graph } = comfy;
   const context = { app, LG, graph, rootGraph: graph, workflow: { uuid: "wf" } };
   const calls = { single: [], whole: 0 };
+  // #1223 — what the add filed into the last-observed-schema snapshot, and with what epoch.
+  const snapshotFilings = [];
 
   const api = {
     // The whole-schema route. Counting it is how these tests prove #780's saving survives.
@@ -208,6 +229,15 @@ function realGraphAddNode(comfy, overrides = {}) {
     awaitObjectInfoHistorySeed: async () => {},
     recordObjectInfoTypes: (defs) => defs,
     objectInfoHistory: { wasTypeEverDefined: () => false },
+    // #1223 — the last-observed-schema snapshot the add path files its WHOLE payload into,
+    // and the connection epoch it stamps that with. Both are module scope in the real file,
+    // so this rebuilt scope has to name them or the executor throws ReferenceError.
+    //
+    // A RECORDING spy, not a stub: the add is one of the readers that must feed the
+    // fallback, and the epoch it stamps has to be the one at the WHOLE request — not the
+    // one before the optional per-class probe that may precede it.
+    objectInfoSnapshot: { record: (defs, opts) => (snapshotFilings.push({ defs, opts }), true), clear: () => {} },
+    backendReconnectEpoch: 0,
     api,
     refreshComfyNodeDefs: async (defs) => app.registerNodesFromDefs(defs ?? backendObjectInfo()),
     summarizeNode: (node) => ({
@@ -227,8 +257,38 @@ function realGraphAddNode(comfy, overrides = {}) {
     isRegisteredNodeType,
     fetchSingleNodeDef,
     describeUnmaterializedRequiredWidgets,
+    // #1180 — the panel's bounded `api.getNodeDefs()` and its timeout sentinel. Both are
+    // module-scope in the real file; this harness rebuilds `graph_add_node` in a synthetic
+    // scope, so every collaborator it names has to be injected here. Real `withTimeout`, so
+    // the bound is exercised rather than stubbed away.
+    NODE_DEFS_NO_ANSWER,
+    WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+    monotonicNow,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
+    withTimeout,
     ...overrides,
   };
+
+  // Resolved from `deps` at CALL time, not closed over the `api` above: several tests pass
+  // their own `api` through `overrides` to drive the widen (null / {} / non-object), and a
+  // helper bound to the default would quietly call the wrong one and report the default's
+  // healthy schema instead of the payload under test.
+  if (!("boundedGetNodeDefs" in deps)) {
+    // The SHIPPED helper, built from panel source. A hand-written copy here would let the
+    // real one regress while these tests stayed green — the exact way a harness can make a
+    // suite prove nothing. `api` is resolved from `deps` at call time because several tests
+    // pass their own through overrides to drive the widen.
+    const build = new Function(
+      "api",
+      "withTimeout",
+      "NODE_DEFS_NO_ANSWER",
+      "NODE_DEFS_FETCH_TIMEOUT_MS",
+      `${boundedMatch[0]}
+       return boundedGetNodeDefs;`,
+    );
+    deps.boundedGetNodeDefs = (timeoutMs) =>
+      build(deps.api, withTimeout, NODE_DEFS_NO_ANSWER, NODE_DEFS_FETCH_TIMEOUT_MS)(timeoutMs);
+  }
 
   const names = Object.keys(deps);
   const factory = new Function(
@@ -240,7 +300,7 @@ function realGraphAddNode(comfy, overrides = {}) {
      const executors = {${addNodeMatch[0]}};
      return executors.graph_add_node;`,
   );
-  return { graph_add_node: factory(...names.map((n) => deps[n])), calls };
+  return { graph_add_node: factory(...names.map((n) => deps[n])), calls, snapshotFilings };
 }
 
 // ---------------------------------------------------------------------------
@@ -550,4 +610,115 @@ test("#821: a failed widen leaves the guard exactly as it fails closed today", a
     /no installed node outputs "SEEDVR2_DIT"/,
   );
   assert.equal(comfy.graph._nodes.length, 0);
+});
+
+test("#1180 EXECUTED: a widen whose getNodeDefs never answers returns rather than parking", async () => {
+  // The other #1180 tests are structural. This one runs the SHIPPED bounded fetch — built
+  // from panel source above, not re-implemented — against a getNodeDefs that never settles,
+  // which is the half-open connection this issue is about.
+  //
+  // Two things must hold, and only execution shows them: it RETURNS, and it returns the
+  // answer that makes the caller KEEP its narrower proof rather than weaken it to an empty
+  // socket set (the #695/#700 false-cause message).
+  const build = new Function(
+    "api",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
+    `${boundedMatch[0]}
+     return boundedGetNodeDefs;`,
+  );
+  const shipped = build(
+    { getNodeDefs: () => new Promise(() => {}) },
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    10000,
+  );
+
+  // NEVER await this unbounded. node --test has no default timeout, so a helper that lost
+  // its bound would park the whole suite instead of naming itself — verified: removing the
+  // bound made `npm run test:unit` hang rather than fail. A regression must be a red test,
+  // not a hung CI job.
+  const settled = (p, what) =>
+    Promise.race([
+      p,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${what} never settled — the bound is gone`)), 3000),
+      ),
+    ]);
+
+  const started = Date.now();
+  const result = await settled(shipped(60), "the bounded fetch"); // scaled-down bound; the shipped defaults are pinned structurally
+  const elapsed = Date.now() - started;
+
+  assert.equal(result, NODE_DEFS_NO_ANSWER, "a call that never answers must resolve the sentinel");
+  assert.ok(elapsed < 2000, `it must return on the bound, took ${elapsed}ms`);
+
+  // …and the widen maps that to null, which is what "keep the proof you already have" is.
+  const whole = result === NODE_DEFS_NO_ANSWER ? null : result;
+  assert.equal(whole, null, "the widen must treat a non-answer as doubt, not as an empty schema");
+
+  // The bound is real, not decorative: a generous one lets the same call through.
+  const answering = build(
+    { getNodeDefs: () => new Promise((r) => setTimeout(() => r({ A: { output: ["T"] } }), 30)) },
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    10000,
+  );
+  assert.equal(await settled(answering(5), "the 5ms bound"), NODE_DEFS_NO_ANSWER, "a 5ms bound must cut off a 30ms answer");
+  assert.deepEqual(await settled(answering(1000), "the 1s bound"), { A: { output: ["T"] } }, "…and a 1s bound must not");
+});
+
+test("#1180: the registration wait measures itself on the monotonic clock", () => {
+  // This deadline gates #580's protection: it is how long the panel waits for a V3 class's
+  // custom widgets to finish registering before refusing to build the node. Measured on the
+  // wall clock, an NTP correction, a DST change or a VM resume between the two reads either
+  // ends the wait instantly — reporting widgets unmaterialised without ever having polled
+  // for them — or extends it past the command budget entirely.
+  //
+  // The panel already settled this question once, for the /object_info oracle, and it cost
+  // three review rounds. Asserted here because the fix is two characters and reverting it is
+  // invisible: the mutation back to Date.now() passed the entire suite.
+  const fn = widenSrcForConsts.slice(
+    widenSrcForConsts.indexOf("async function awaitRequiredCustomWidgetRegistration("),
+    widenSrcForConsts.indexOf("\n}", widenSrcForConsts.indexOf("async function awaitRequiredCustomWidgetRegistration(")),
+  );
+  assert.ok(fn.length > 0, "the registration wait must be findable");
+  assert.match(fn, /const startedAt = monotonicNow\(\);/, "the deadline must be taken on the monotonic clock");
+  assert.match(fn, /while \(monotonicNow\(\) < deadline\)/, "…and the poll must read the SAME clock it was set on");
+  assert.doesNotMatch(fn, /Date\.now\(\)/, "no wall-clock reading may survive in this function");
+});
+
+test("#1223: the add files a WHOLE schema, and never a single-class payload", async () => {
+  // graph_add_node is one of the readers that must feed the last-observed-schema fallback:
+  // an add that registers a new type is often the last thing to have read a whole map, and
+  // dropping it leaves the next render-time widget edit refused for want of it.
+  //
+  // UNREGISTERED type ⇒ the #780 fast path is skipped and the WHOLE schema is fetched.
+  const comfy = makeComfy();
+  delete comfy.LG.registered_node_types.SeedVR2VideoUpscaler;
+  const { graph_add_node, snapshotFilings } = realGraphAddNode(comfy);
+  await graph_add_node({ class_type: 'SeedVR2VideoUpscaler', workflow_uuid: 'wf' });
+
+  assert.equal(snapshotFilings.length, 1, 'one whole schema was fetched, so one is filed');
+  const [{ defs, opts }] = snapshotFilings;
+  assert.ok(Object.keys(defs).length > 1, 'the WHOLE map, not a single-class payload');
+  assert.equal(opts.whole, true, 'and the wholeness claim is stated');
+  assert.equal(
+    opts.observedAtEpoch,
+    opts.currentEpoch,
+    'the epoch must be read where the WHOLE request goes out — a reconnect during the ' +
+      'optional per-class probe before it would leave this stale and the record rejected',
+  );
+});
+
+test("#1223: an add that takes the single-class fast path files NOTHING", async () => {
+  // A one-entry /object_info/<Type> payload reaching the snapshot would make every other
+  // type read as absent, and the #458 ever-seen gate would diagnose the whole install as
+  // removed packs. The fast path only runs for an ALREADY-REGISTERED type.
+  const comfy = makeComfy();
+  const { graph_add_node, snapshotFilings, calls } = realGraphAddNode(comfy);
+  await graph_add_node({ class_type: 'SeedVR2VideoUpscaler', workflow_uuid: 'wf' });
+  assert.ok(calls.single.length > 0, 'the fast path ran');
+  assert.deepEqual(snapshotFilings, [], 'and nothing was filed from it');
 });

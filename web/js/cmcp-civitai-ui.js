@@ -16,6 +16,11 @@ import {
   filtersDirty, bitmask, parseCreatorQuery, levelLabel,
 } from "./cmcp-civitai.js";
 import { summarizeSearchFilters } from "./lib/civitai-search-echo.js";
+import {
+  awaitReloadWithin,
+  classifyHighlightOutcome,
+  RELOAD_WAIT_BUDGET_MS,
+} from "./lib/civitai-reload-wait.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
@@ -373,6 +378,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     activeReloadPromise: null,
     activeLoadPromise: null,
   };
+
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
   }
@@ -1188,6 +1194,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const blob = await (await fetch(it.fullUrl)).blob();
       const name = `civitai_ref_${it.id}.${it.type === "video" ? "mp4" : "jpeg"}`;
       const ref = await ctx.uploadBlobToInput(blob, name);
+      // #1188 — `uploadBlobToInput` answers null for EVERY failure, and neither branch below
+      // checked. Muted, that announced "Saved {name} to ComfyUI inputs." for an upload that
+      // wrote nothing; unmuted, `ref.filename` threw a TypeError whose message ("Cannot read
+      // properties of null") told the user nothing about the upload. Pre-existing, but #1188
+      // makes null reachable by a new route — a bounded upload that gives up now returns it
+      // where the call previously hung — so the fabricated success is left no wider than it
+      // was found. `close()` is deliberately not called: a failed share leaves the explorer
+      // open to retry, exactly as the catch below does.
+      if (!ref) {
+        toast(tr("civitai_ui.share_failed", "Share failed: {error}", { error: name }));
+        return;
+      }
       if (ctx.isMuted()) {
         toast(tr("civitai_ui.saved_to_comfyui_inputs", "Saved {name} to ComfyUI inputs.", { name }));
       } else {
@@ -2181,7 +2199,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     //
     // `loading` is still reported below — this only removes the window where the
     // honest answer was available and we returned the empty one instead.
-    try { await state.activeReloadPromise; } catch { /* surfaces via state.error below */ }
+    //
+    // Bounded since comfyui-mcp#1520: the wait is on CivitAI, so an unbounded
+    // one hands our reply deadline to a third party and the caller gets a bridge
+    // timeout carrying nothing. On expiry we answer with what we have —
+    // `loading: true` plus `reloadPending: true` — which is the same honest
+    // interim answer panel#793 was fine with, just arriving on time.
+    const reloadSettled = await awaitReloadWithin(state.activeReloadPromise, RELOAD_WAIT_BUDGET_MS);
     _assertOpen();
     const model = isModelTab();
     const source = model ? state.models : state.items;
@@ -2192,6 +2216,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       done: !!state.done,
       renderRev: state.renderRev,
       truncated: source.length > ser.items.length,
+      // True when we gave up waiting on the in-flight fetch rather than seeing
+      // it finish (#1520). Distinguishes "a reload is still running and I waited
+      // as long as I safely could" from "loading just started" — both report
+      // `loading: true`, but only the first means re-reading shortly is the
+      // right move rather than a busy-poll.
+      reloadPending: !reloadSettled,
       // Disambiguate an empty grid (issues #190/#375): `error` is a non-null
       // upstream failure (retry, don't narrow filters); `authenticated` reflects
       // the CivitAI session; on the favorites tab `favoritesStatus` explains an
@@ -2223,15 +2253,34 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     _assertOpen();
     const list = (Array.isArray(ids) ? ids : (ids != null ? [ids] : [])).map((x) => String(x));
     const rev = state.renderRev;
-    try { await state.activeReloadPromise; } catch { /* fetch error surfaces elsewhere */ }
+    // Bounded since comfyui-mcp#1520 — see RELOAD_WAIT_BUDGET_MS. On expiry we
+    // install NOTHING and say so, following the `superseded` path directly
+    // below: this function already establishes that returning `highlighted: 0`
+    // with the set untouched is the right answer when it cannot safely act.
+    //
+    // Deliberately not installing late in the background. Today a bridge timeout
+    // here is a false failure — the caller is told the command failed and the
+    // glow lands anyway — and quietly applying after we reported `pending` would
+    // keep exactly that confusion. The caller re-issues; `driveHighlight` clears
+    // before installing, so a retry is idempotent.
+    const reloadSettled = await awaitReloadWithin(state.activeReloadPromise, RELOAD_WAIT_BUDGET_MS);
     _assertOpen();
-    if (state.renderRev !== rev) {
-      // A reload/tab/filter superseded this highlight while we awaited: these ids
-      // belonged to the OLD search and MUST NOT be installed on the new
-      // generation (they'd glow same-id cards from a different query). Bail
-      // without touching the current set — the agent can re-issue against the
-      // new results (codex finding).
-      return { highlighted: 0, missing: list, renderRev: state.renderRev, superseded: true };
+    // A reload/tab/filter can supersede this highlight while we wait: those ids
+    // belonged to the OLD search and MUST NOT be installed on the new generation
+    // (they'd glow same-id cards from a different query). The bounded wait adds
+    // a second bail-out, and `superseded` takes precedence over `pending` — see
+    // classifyHighlightOutcome, where that precedence is pinned.
+    const outcome = classifyHighlightOutcome({
+      revChanged: state.renderRev !== rev,
+      reloadSettled,
+    });
+    if (outcome !== "install") {
+      return {
+        highlighted: 0,
+        missing: list,
+        renderRev: state.renderRev,
+        [outcome]: true, // superseded | pending — bail without touching the set
+      };
     }
     // Replacement: strip the prior set, install the new one, then paint.
     driveClearHighlight();

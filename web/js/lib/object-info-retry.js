@@ -37,17 +37,32 @@ export function objectInfoLooksTransient(defs) {
  * Fetch node definitions, retrying a transient failure.
  *
  * @param {() => Promise<any>} getDefs the frontend's `api.getNodeDefs`, already bound
- * @param {{delays?: number[], sleep?: (ms: number) => Promise<void>}} [opts]
+ * @param {{delays?: number[], sleep?: (ms: number) => Promise<void>,
+ *          shouldRetry?: (err: any) => boolean}} [opts]
  *   `sleep` is injectable so tests run instantly and deterministically instead of
  *   depending on real timers.
+ *
+ *   `shouldRetry` exists because #1180 gave callers a way to fail that costs something.
+ *   This schedule was sized for attempts that fail INSTANTLY — a connection refused while
+ *   the backend restarts — where another attempt is free: no bytes moved, so spreading
+ *   three of them over 800ms only widens the window a blip can hide in. An attempt
+ *   abandoned by a TIMEOUT is the opposite: `withTimeout` does not cancel, so the first
+ *   attempt is still downloading the whole document while the second starts, and each
+ *   retry makes the link it is retrying on slower. One schedule cannot serve both, and
+ *   picking a single compromise number for them is how this issue's earlier attempt lost
+ *   #954's case. The caller says which kind of failure it just saw.
  * @returns {Promise<any>} the definitions
  * @throws the LAST error, when every attempt threw — so the caller's verdict still reports
  *   `object_info_fetch_failed` with a real `detail`, exactly as before. Retrying must not
  *   convert a genuine outage into a different, vaguer failure.
  */
-export async function fetchNodeDefsWithRetry(getDefs, { delays = OBJECT_INFO_RETRY_DELAYS_MS, sleep } = {}) {
+export async function fetchNodeDefsWithRetry(
+  getDefs,
+  { delays = OBJECT_INFO_RETRY_DELAYS_MS, sleep, shouldRetry } = {},
+) {
   const wait = typeof sleep === "function" ? sleep : (ms) => new Promise((r) => setTimeout(r, ms));
   const steps = Array.isArray(delays) ? delays : OBJECT_INFO_RETRY_DELAYS_MS;
+  const retryable = typeof shouldRetry === "function" ? shouldRetry : () => true;
   let lastError;
   let lastValue;
   for (let attempt = 0; attempt <= steps.length; attempt++) {
@@ -58,6 +73,9 @@ export async function fetchNodeDefsWithRetry(getDefs, { delays = OBJECT_INFO_RET
       lastError = undefined;
     } catch (err) {
       lastError = err;
+      // Stop NOW, not after sleeping: a failure the caller calls un-retryable is one whose
+      // work is still running, and waiting only lets it overlap whatever comes next.
+      if (!retryable(err)) throw err;
     }
     if (attempt < steps.length) await wait(steps[attempt]);
   }

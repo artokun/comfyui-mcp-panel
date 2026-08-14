@@ -83,6 +83,65 @@ test("isManagerRouteMissing: ONLY the proven-404 marker qualifies a mutation ret
   assert.equal(isManagerUnreachable(new Error(UNREACHABLE)), true);
 });
 
+/** #423 (review P1) — build managerV2/managerCall over a fetchApi that REJECTS. */
+function buildTransportsOverRejectingFetch(thrown) {
+  const src = readPanelSource();
+  const factory = new Function(
+    "api",
+    "classifyManager404",
+    "markManagerUnreachable",
+    "managerFetchFailureMessage",
+    `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
+${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
+return { managerV2, managerCall };`,
+  );
+  return factory(
+    {
+      fetchApi: async () => {
+        throw thrown;
+      },
+    },
+    classifyManager404,
+    ManagerInstall.markManagerUnreachable,
+    (route, err) => `Manager ${route} could not be delivered: ${err?.message}`,
+  );
+}
+
+// #423, second blind spot (review P1). A REJECTED fetch — as opposed to a null response —
+// escaped the ladder twice over: managerV2 wrapped it untagged, and managerCall had no
+// catch at all, so "Failed to fetch" propagated raw. Neither wording has ever matched the
+// gate, so a transport failure skipped the legacy retry AND the /object_info fallback that
+// exists for exactly this case.
+test("managerV2/managerCall tag a REJECTED fetch — but never as route-missing", async () => {
+  const { managerV2: mv2, managerCall: mcall } = buildTransportsOverRejectingFetch(
+    new TypeError("Failed to fetch"),
+  );
+  for (const call of [mv2, mcall]) {
+    const err = await call("customnode/installed").then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err instanceof Error, "must reject with an Error");
+    assert.ok(isManagerUnreachable(err), "the idempotent-GET fallback ladder must see it");
+    // The safety boundary, and the reason tagging this is allowed at all: a rejection
+    // proves nothing about delivery, so it must never authorize re-sending a MUTATION.
+    assert.equal(isManagerRouteMissing(err), false, "a rejection is not a proven 404");
+  }
+});
+
+test("an aborted Manager fetch is still the caller's own — never an unreachable verdict", async () => {
+  const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
+  const { managerV2: mv2, managerCall: mcall } = buildTransportsOverRejectingFetch(abort);
+  for (const call of [mv2, mcall]) {
+    const err = await call("customnode/installed").then(
+      () => null,
+      (e) => e,
+    );
+    assert.equal(err, abort, "passes through unchanged");
+    assert.notEqual(err.managerTransportUnreachable, true, "and is never tagged");
+  }
+});
+
 // The marker itself is minted by the REAL transports — extract them and prove:
 // a 404 response tags the error; a no-response (null) failure does NOT.
 test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-response case", async () => {
@@ -93,6 +152,10 @@ test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-respo
   const factory = new Function(
     "api",
     "classifyManager404",
+    // #423 — the transports now TAG their no-response throw so the fallback ladder
+    // recognises it without reading the (translated) message. Real implementation,
+    // same as classifyManager404.
+    "markManagerUnreachable",
     `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
 ${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
 return { managerV2, managerCall };`,
@@ -104,6 +167,7 @@ return { managerV2, managerCall };`,
     const { managerV2: mv2, managerCall: mcall } = factory(
       { fetchApi: async () => res },
       classifyManager404,
+      ManagerInstall.markManagerUnreachable,
     );
     for (const call of [mv2, mcall]) {
       const err = await call("manager/queue/status").then(
@@ -116,6 +180,14 @@ return { managerV2, managerCall };`,
         isManagerRouteMissing(err),
         res !== null && res.status === 404,
         `marker only for the proven 404 (res=${JSON.stringify(res)})`,
+      );
+      // #423 — whichever way it failed, the fallback ladder must be able to SEE it
+      // without reading the sentence. The 404 branch carries managerRouteMissing;
+      // the no-response branch is tagged by the transport itself. A translated
+      // message disarmed every rung of the ladder for 11 of 12 shipped locales.
+      assert.ok(
+        isManagerRouteMissing(err) || err.managerTransportUnreachable === true,
+        `structurally recognisable (res=${JSON.stringify(res)})`,
       );
     }
   }
@@ -177,6 +249,7 @@ function buildDialectHarness({ fetchApi, managerCall, managerV2, AbortSignalImpl
     "managerCall",
     "managerV2",
     "isManagerUnreachable",
+    "markManagerUnreachable",
     "dialectRetryTarget",
     "MANAGER_FETCH_TIMEOUT_MS",
     "AbortSignal",
@@ -195,6 +268,7 @@ return { managerGet, getDialectCache: () => managerDialectCache };`,
     managerCall,
     managerV2,
     isManagerUnreachable,
+    ManagerInstall.markManagerUnreachable,
     dialectRetryTarget,
     15000,
     AbortSignalImpl,

@@ -166,6 +166,42 @@ export function unparsedCallSites(src, file, parsed) {
   return out;
 }
 
+/**
+ * Turn the SOURCE CHARACTERS between the quotes back into the string the engine builds.
+ *
+ * Everything here captures a literal by slicing the raw source, which leaves escape sequences
+ * as the two characters they are written as. `"…?\n\nThis DELETES…"` reached the catalog as a
+ * backslash followed by an `n`, and a confirm dialog rendered that verbatim; `\"` and `\'`
+ * did the same in a toast and a provider hint. English is affected too, because the panel
+ * loads the `en` catalog rather than falling back to the source expression — so this was
+ * visible to every user in every language, in 13 strings, and no gate could see it: key
+ * parity, placeholder parity and plural categories are all still perfectly correct.
+ */
+function unescapeLiteral(raw) {
+  return String(raw).replace(
+    /\\(u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|[\s\S])/g,
+    (whole, _tail, uBrace, u4, x2) => {
+      if (uBrace) return String.fromCodePoint(parseInt(uBrace, 16));
+      if (u4) return String.fromCharCode(parseInt(u4, 16));
+      if (x2) return String.fromCharCode(parseInt(x2, 16));
+      const ch = whole[1];
+      switch (ch) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        case '0': return '\0';
+        // A backslash-newline is a line continuation: it contributes nothing to the value.
+        case '\n': return '';
+        // \\ \" \' \` and anything else stands for the character itself.
+        default: return ch;
+      }
+    },
+  );
+}
+
 function readConverted(src, file) {
   const out = [];
   // `tr(` + a quoted key + `,` + either a quoted string or a `{ one: …, other: … }` object.
@@ -182,11 +218,11 @@ function readConverted(src, file) {
       // line limit. Reading only the first literal put HALF a sentence in the catalog: English
       // still rendered correctly (it evaluates the whole expression at runtime), so every
       // translated language silently lost the rest and nothing in English could reveal it.
-      let text = str[2];
+      let text = unescapeLiteral(str[2]);
       let tail = rest.slice(str[0].length);
       let more;
       while ((more = tail.match(/^\s*\+\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/))) {
-        text += more[2];
+        text += unescapeLiteral(more[2]);
         tail = tail.slice(more[0].length);
       }
       // `"Hello " + name` is a different animal: the variable never reaches the catalog at
@@ -205,7 +241,7 @@ function readConverted(src, file) {
       let f;
       while ((f = form.exec(body)) !== null) {
         if (!['zero', 'one', 'two', 'few', 'many', 'other'].includes(f[1])) continue;
-        out.push({ key: `${key}_${f[1]}`, text: f[3], file, line, converted: true });
+        out.push({ key: `${key}_${f[1]}`, text: unescapeLiteral(f[3]), file, line, converted: true });
       }
     }
   }

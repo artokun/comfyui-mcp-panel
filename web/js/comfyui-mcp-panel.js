@@ -62,17 +62,32 @@
 // shim can throw synchronously and deadlock the module loader. We grab them from
 // window.comfyAPI once it's ready instead (see registerExtensionWhenReady at the
 // bottom). Deferral approach contributed by @FreesoSaiFared.
+// Used by the unpack preflight's divergence scan. It was called without ever being imported,
+// so that path threw ReferenceError rather than refusing cleanly (#1136 sweep).
+import { resolvePromotedInnerTarget } from "./lib/widget-write.js";
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
 import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
+// #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
+// it is how this repo keeps producing near-duplicate bugs, per that file's own header.
+import { withTimeout } from "./lib/bounded-step.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
-import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
+import {
+  describeUploadFailure,
+  describeUploadTimeout,
+  describeTimedOutUpload,
+  attachmentSummaryLine,
+  boundedUpload,
+  readFileFacts,
+  readErrorBody,
+  UPLOAD_NO_ANSWER,
+} from "./lib/attachment-upload.js";
 import {
   buildInstallRequest,
   classifyInstallOutcome,
@@ -83,6 +98,7 @@ import {
   installedListRoute,
   isManagerRouteMissing,
   isManagerUnreachable,
+  markManagerUnreachable,
   isMethodNotAllowed,
   assertBatchOk,
   legacyUpdateBody,
@@ -134,6 +150,8 @@ import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
+  emptyComboListsOnGraph,
+  emptyComboNote,
   refreshComboOptionsFromDefs,
   collectAllGraphs,
   collectMissingNodeTypeReasons,
@@ -178,12 +196,21 @@ import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-lab
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
-import { fetchNodeDefsWithRetry } from "./lib/object-info-retry.js";
+// #1184 — the ORDER a backend switch commits in. A module because the defect is an
+// ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
+import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
+import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
-import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
+import {
+  watchPostReconnectSettle,
+  graphMutationReconnectGate,
+  reconnectRefusalError,
+  readReconnectRefusal,
+} from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
 import {
@@ -242,10 +269,24 @@ import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
 import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
+import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import {
+  unrunnableNodeIds,
+  describeUnrunnable,
+  missingNodeRunRefusal,
+  graphToPromptUnusable,
+  unserializableGraphRefusal,
+  unresolvedNodeTypes,
+} from "./lib/missing-node-preflight.js";
+import {
+  classifyWorkflowRefresh,
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
+import { classifyDiskProbe } from "./lib/workflow-disk-probe.js";
+/** #1448 — wall-clock bound on the refusal-path /userdata probe. Generous: it only
+ *  ever runs when the open is already failing, and a slow answer still beats none. */
+const WORKFLOW_DISK_PROBE_MS = 4000;
 import { describeCanvasDrawFailure } from "./lib/canvas-draw-failure.js";
 import {
   describeQueuePromptChain,
@@ -453,6 +494,8 @@ import {
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  shouldNudgeAfterMidTaskReconnect,
+  createBridgeOutageTracker,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -476,6 +519,7 @@ import {
 // CommonJS); copying the file to .mjs and re-checking does, instantly. Any future edit
 // here should be verified that way.
 import { tr, LOCALES, loadCatalog, pickLocale, applyDirection, currentLocale } from "./lib/i18n.js";
+import { bridgeFallbackPlan } from "./lib/bridge-liveness-fallback.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -510,6 +554,30 @@ let armRunReconcileSweepRef = null;
 // no perpetual timer; a redundant sweep is harmless (reconcile is idempotent — the
 // delivered/terminal fences make double-delivery unreachable).
 const RUN_RECONCILE_SWEEP_MS = 20000;
+
+/**
+ * Display label per connection status. The KEY is the state token, which stays English because
+ * it is compared and keyed on all over the panel; only the VALUE is translated. Each value is a
+ * function so the catalog is read at paint time — a plain string here would capture the English
+ * fallback at import, before loadCatalog() has run, and freeze the pill in English forever.
+ *
+ * Every key is a literal so `i18n-extract` can see it. That is the whole point: the shape this
+ * replaced built the key at runtime, which no static scan can follow.
+ *
+ * MODULE SCOPE, deliberately (#1136). This was first written inside `createBridgeClient`, while
+ * its only reader — `onStatus` — lives in `buildPanel`. Those are sibling functions, so the name
+ * was never in scope at the point of use and `onStatus` threw `ReferenceError` on the FIRST
+ * status frame. The socket still connected and chat worked normally, so the visible symptom was
+ * a status pill frozen on "disconnected" during a perfectly healthy session — and everything
+ * below that line in the handler (the Connect button label, the dot class, the dead-bridge
+ * liveness fallback) silently never ran either. Keep this at module scope; the guard in
+ * browser_tests/unit/status-label-scope.test.mjs fails if it moves back inside a function.
+ */
+const STATUS_LABEL = {
+  connected: () => tr("panel.status_connected", "connected"),
+  connecting: () => tr("panel.status_connecting", "connecting"),
+  disconnected: () => tr("panel.status_disconnected", "disconnected"),
+};
 
 // Execution-error capture so graph_get_errors can report the most recent failure
 // even if it predates the agent's question. Wired once `api` is ready (via
@@ -686,6 +754,181 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
   recordOpenReceipt(openReceipts, receipt);
   return receipt;
 }
+/**
+ * #1180 — how long any ONE `api.getNodeDefs()` may take before the caller gives up on it.
+ *
+ * #1161 established the failure: after a ComfyUI restart the tab can hold a half-open
+ * connection, so `api.getNodeDefs()` never settles — it does not throw, it simply never
+ * answers. That issue bounded the `/object_info` oracle, which fixed `set_widget`; the
+ * sibling call sites were left unbounded and still hang, which is the worse shape of the
+ * two because it makes the behaviour hard to report: after a restart, setting a widget
+ * works and adding a node does not.
+ *
+ * SIZED FROM THE SAME MEASUREMENT, not a fresh guess. The bounded work is one call for the
+ * whole node-definition document: measured in this repo at 5,413,770 bytes / 167 ms on a
+ * 63-pack install (#767), and live at ~366ms on a 4304-type install while fixing #1161.
+ * 10s is roughly 27x the slowest of those and matches the share #1161's oracle gives its
+ * own client route, so the two paths agree about what "too long" means. It stays well
+ * inside the bridge's 30s command budget, so the caller sees its own refusal rather than a
+ * bare timeout naming nothing.
+ *
+ * Do NOT re-size this from the ~14.5s figure in #610: that measures the forced refresh —
+ * the download plus registerNodesFromDefs plus rebuilding every combo — which is a
+ * different operation. Sizing a bound from it cost #1161 three review rounds.
+ */
+const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
+
+/**
+ * #1180 — ONE budget for a whole `registerComfyNodeDefs` run, shared by its phases.
+ *
+ * PER-PHASE BOUNDS DO NOT COMPOSE, and three review rounds on this issue were spent
+ * relearning that. Each phase was sized on its own and each number looked defensible, but
+ * a run performs them in SEQUENCE: the retried fetch (up to this budget plus the
+ * schedule's waiting) and then the combo refresh, which issues its own /object_info and
+ * had a 10s bound of its own. Roughly 19.8s per run — and `makeRefreshCoalescer`
+ * guarantees a forced `panel_refresh_nodes` pays the in-flight run AND its own, serially,
+ * so about 39.6s before a reply is composed. Past the bridge's 20s READ default and past
+ * the 30s command budget both, which is the #1161 symptom this fix reintroduced twice.
+ *
+ * A run therefore carries a DEADLINE, and each bounded phase gets what is left of it
+ * rather than a private allowance. Two serialized runs then cost 2 x this, and that is the
+ * number sized against the read default — 18,000ms against 20,000ms — because that product
+ * is what the user actually waits through.
+ *
+ * WHAT THE DEADLINE DOES NOT COVER, said plainly so this is not read as a total. Two calls
+ * run INSIDE the window without drawing from it: `registerNodesFromDefs` and
+ * `reapplyDefsToLiveNodes`. Both are deliberately unbounded — see the note at the
+ * registration call — so a run can exceed this budget, and the 18,000ms figure is the cost
+ * of the WAITING this panel controls, not a ceiling on wall-clock. It is the right number
+ * to size against the read default anyway: those two are local work that either completes
+ * in milliseconds or has already hung the page for reasons no bound here can reach.
+ *
+ * On a monotonic clock, like every other elapsed-time measurement in this panel: a
+ * wall-clock jump mid-run must not hand a phase a negative or enormous remainder.
+ *
+ * WHAT IT COSTS, stated rather than left to be discovered. An install whose /object_info
+ * consistently takes longer than the remaining budget gets a worded
+ * `object_info_fetch_failed` where an unbounded panel would eventually have succeeded.
+ * That is a real narrowing and it is the direction this repo has regressed in before. It
+ * is accepted because the alternative is the reported bug — a command that never ends —
+ * and a recoverable, worded refusal beats a hang.
+ *
+ * MEASURED, in the page, on this rig — ComfyUI 0.32.0, frontend 1.48.7, 4320 node types.
+ * These are the phase costs this budget is actually spent on, and they are recorded here
+ * because every previous number in this area was a guess that later reviews quoted back as
+ * a measurement:
+ *
+ *     api.getNodeDefs()          456 ms warm, 1062 ms COLD (the first read after a load
+ *                                or a restart — which is the one a refresh usually pays)
+ *     registerNodesFromDefs()   3972 ms   unbounded local work, EXCLUDED from this budget
+ *     refreshComboInNodes()     4846 ms   its own /object_info, then a walk of every node
+ *                                rewriting each combo widget's options
+ *
+ * Two things follow. First, the exclusion of local work is not a nicety: without it the
+ * combo phase here would be left 4572 ms for a 4846 ms job and would be abandoned on a
+ * COMPLETELY HEALTHY machine, reporting `combo_refresh_failed` on every refresh. That was
+ * measured, not reasoned about — the unit suite passed either way.
+ *
+ * Second, the margin that remains is thinner than this number suggests. The fetch may use
+ * its full 6000 ms share and still succeed, which would leave the combo phase 3000 ms
+ * against a measured 4846 ms need. That case is #1193; it needs the combo phase to have a
+ * floor rather than only a remainder, and that is a design change rather than a constant.
+ */
+const NODE_DEFS_RUN_BUDGET_MS = 9000;
+/**
+ * The share of a run's budget the FETCH phase may consume, leaving the rest for the combo
+ * refresh that follows it. Two thirds: the fetch is the phase that must survive a retry
+ * schedule, while the combo phase is a single call.
+ *
+ * A share, not a second constant, so the two cannot be changed into disagreement.
+ */
+const NODE_DEFS_FETCH_SHARE = 2 / 3;
+//
+// #954's SCHEDULE, UNFORKED. An earlier pass here cut it to a single 200ms delay, reasoning
+// that a bound which does not cancel lets three abandoned attempts download the whole
+// document at once and contend with each other. That is true, and the conclusion drawn
+// from it was still wrong: it also cut the window a RESTART-time blip can hide in from
+// 800ms to 200ms, which is the dimension #954 was actually sized on. A backend taking half
+// a second to start accepting connections was bridged before and would not have been after.
+//
+// The two failure modes have opposite economics, so the schedule is the wrong place to
+// separate them:
+//
+//   an attempt that fails INSTANTLY  — connection refused; no bytes moved, so another
+//                                      attempt is free and more of them is strictly better
+//   an attempt abandoned by a TIMEOUT — still downloading; a second attempt races the first
+//                                      and makes the link it is retrying on slower
+//
+// So the SCHEDULE stays #954's and the DECISION moves to the caller: `shouldRetry` below
+// stops the loop the moment an attempt is abandoned, rather than sleeping and stacking a
+// second download on top of it. Instant failures keep all three attempts across 800ms.
+const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
+
+/**
+ * What is left of a run's budget, for the phase about to start.
+ *
+ * Never returns a non-positive number: `withTimeout` treats those as NO BOUND, so an
+ * exhausted budget expressed literally would silently remove the bound at exactly the
+ * moment the run is already too slow — the failure this whole issue is about, arriving
+ * through the mechanism meant to prevent it. A spent budget yields 1ms, which times out
+ * immediately and truthfully.
+ */
+function nodeDefsBudgetLeft(deadline, share = 1) {
+  const left = deadline - monotonicNow();
+  return Math.max(1, Math.floor(left * share));
+}
+
+/** Sentinel: this call did not answer in time, as distinct from anything it could return. */
+const NODE_DEFS_NO_ANSWER = Symbol("node-defs-timeout");
+
+/**
+ * The combo refresh's three outcomes, kept apart.
+ *
+ * `refreshComboInNodes()` resolves undefined on success, so "it worked" cannot be
+ * expressed as a value it returns — hence a sentinel for success too, rather than a
+ * boolean that a rejection and a timeout would both have to share. The verdict downstream
+ * words those two differently, and the caller's remedy is different for each.
+ */
+const COMBO_OK = Symbol("combo-refreshed");
+const COMBO_NO_ANSWER = Symbol("combo-timeout");
+
+/**
+ * `api.getNodeDefs()`, bounded. Resolves the sentinel when the call does not answer, so a
+ * caller can tell "never answered" apart from "answered nothing" — the distinction #982
+ * was about, and the reason this does not simply resolve null for both.
+ *
+ * THIS ONE MAY THROW, unlike the `/object_info` oracle next door, and the difference is
+ * deliberate. That oracle documents "every failure path returns `defs: null`" because its
+ * callers await it with no catch. These three call sites are the opposite: each already
+ * sits under handling that attributes a `getNodeDefs` throw to the fetch, with its detail,
+ * and existing tests pin that wording. So this behaves exactly as the bare `await` it
+ * replaced — propagating what that would have propagated — and adds only the bound.
+ *
+ * Probed for hangs rather than assumed: a `getNodeDefs` that returns a never-settling
+ * thenable is bounded (the sentinel, at the bound); one that throws synchronously, returns
+ * a throwing or revoked Proxy, rejects with a Symbol, or is itself a throwing getter all
+ * throw — each exactly as the unbounded original did.
+ */
+async function boundedGetNodeDefs(timeoutMs = NODE_DEFS_FETCH_TIMEOUT_MS) {
+  if (typeof api?.getNodeDefs !== "function") return null;
+  // REIFY BEFORE BOUNDING. `withTimeout` never rejects by contract — it degrades a
+  // rejection through `onTimeout()` exactly as it does a timeout — so wrapping the call
+  // directly would collapse "it threw" into "it never answered" and lose the error. The
+  // refresh path attributes a getNodeDefs throw to the fetch, with its detail, and existing
+  // tests pin that wording; a first version of this swallowed it with `.catch(() => null)`
+  // and broke four of them. Same shape #1161's oracle uses, for the same reason.
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(() => api.getNodeDefs())
+      .then((value) => ({ value }), (err) => ({ err })),
+    timeoutMs,
+    () => NODE_DEFS_NO_ANSWER,
+  );
+  if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+  if ("err" in settled) throw settled.err;
+  return settled.value;
+}
+
 // Monotonic "now" — performance.now() when available (never runs backwards),
 // falling back to Date.now() only if the environment lacks it.
 function monotonicNow() {
@@ -716,6 +959,18 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // #716 — one /object_info per BURST of widget writes, instead of one per write.
 const objectInfoCache = createObjectInfoCache();
+// #1223 — the last WHOLE /object_info observed on the CURRENT backend connection, so a
+// widget edit is not refused merely because the schema probe went silent while ComfyUI was
+// busy rendering. Consulted only AFTER the oracle has failed, and only under the four
+// fail-closed conditions in lib/object-info-snapshot.js.
+//
+// RECORDS WHOLE SCHEMAS ONLY, and every call site must say `whole: true` to claim it. A
+// per-class /object_info/<Type> payload — which recordObjectInfoTypes legitimately also
+// receives, from the add_node single-def path — must NEVER reach it: one type present would
+// make all ~4300 others read as absent, and the #458 ever-seen gate would then diagnose the
+// whole install as removed packs. The three sites below are the startup seed, the refresh
+// run's own fetch, and the set_widget whole-payload route.
+const objectInfoSnapshot = createObjectInfoSnapshot();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
@@ -728,9 +983,23 @@ function seedObjectInfoHistory() {
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         if (typeof api?.getNodeDefs === "function") {
+          // #1223 — the epoch BEFORE the request goes out. On a normal startup this is the
+          // ONLY whole /object_info read that happens: registerComfyNodeDefs does not run
+          // unless something triggers a refresh. Without recording here, the reported case
+          // — the first widget edit lands while ComfyUI is rendering and both probes time
+          // out — found no snapshot and was refused exactly as before the fix.
+          const observedAtEpoch = backendReconnectEpoch;
           const defs = await api.getNodeDefs();
           if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
             recordObjectInfoTypes(defs);
+            // A whole payload, and this is the only reader of it — nothing registers these
+            // defs, so no beforeRegisterNodeDef hook can have mutated them yet. `record`
+            // still copies out the type names rather than trusting that.
+            objectInfoSnapshot.record(defs, {
+              observedAtEpoch,
+              currentEpoch: backendReconnectEpoch,
+              whole: true,
+            });
             markObjectInfoHistorySeeded();
             return;
           }
@@ -787,7 +1056,15 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let defsRegistered = false;
   let comboApiPresent = false;
   let comboRan = false;
+  // Whether the combo phase FAILED, tracked apart from the value it failed with — see the
+  // note at the assignment. A falsy rejection is still a failure.
+  let comboFailed = false;
   let phase = "fetch";
+  // #1180 — ONE deadline for this whole run. Every bounded phase below draws from what is
+  // left of it, so the run's cost is this budget rather than the sum of numbers that each
+  // looked reasonable alone. Taken here, before any phase starts, so a slow fetch is paid
+  // for by the combo phase rather than added to it.
+  let runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -796,6 +1073,16 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
   // be wrong in the dangerous direction.
   objectInfoCache.invalidate();
+  // #1223 — retire the last-observed snapshot on the SAME event and for the SAME reason.
+  // This function runs exactly when something suspects the schema moved, and a snapshot
+  // that survived a suspicion would authorize writes the burst cache has already been told
+  // not to. Re-recorded below if this run's fetch succeeds, so the cost of being wrong here
+  // is one refused write during an outage, not a stale authorization.
+  objectInfoSnapshot.clear();
+  // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
+  // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
+  // can never be filed under post-restart provenance.
+  const runStartedAtEpoch = backendReconnectEpoch;
   let thrown = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
@@ -820,7 +1107,89 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // and fatal to a tool call. Bounded (~800ms worst case) because this blocks the call,
       // and the LAST error is rethrown so a genuine outage still reports what it always did.
       // (~800ms is the added WAITING; the three requests themselves are unbounded — codex.)
-      defs = await fetchNodeDefsWithRetry(() => api.getNodeDefs());
+      // #1180 — each ATTEMPT is bounded, not just the waiting between them. The comment
+      // above is explicit that the ~800ms is added waiting and "the three requests
+      // themselves are unbounded", so one half-open connection parked `panel_refresh_nodes`
+      // indefinitely: the retry loop only advances once an attempt SETTLES, and this one
+      // never did. A bounded attempt that does not answer is a failed attempt, so a
+      // transient stall now costs ONE attempt instead of the whole command, and a genuine
+      // outage still rethrows as before.
+      //
+      // ONE attempt, not a retried one, and that is deliberate — see `shouldRetry` below.
+      // This sentence used to say a stall "costs a retry", which was true of an earlier
+      // version of this fix and stopped being true when the retry decision moved to the
+      // caller. A stalled attempt is still downloading, so retrying it races the retry
+      // against its own predecessor; the loop stops instead. Only failures that cost
+      // nothing — a connection refused while the backend restarts — get all three.
+      //
+      // ABANDONED ATTEMPTS ARE NOT CANCELLED, and this bound CREATES that. An earlier version
+      // of this comment claimed the overlap predated it; that was wrong and worth correcting
+      // rather than quietly dropping. Before, an attempt that never settled never returned,
+      // so the loop never advanced and exactly ONE request was ever in flight — the command
+      // hung, but the link stayed clear. Now attempt one is abandoned at the bound and keeps
+      // downloading while attempt two starts, so a slow-but-healthy backend can end up
+      // serving up to three concurrent whole-document responses that contend with each other
+      // and make the next attempt slower still.
+      //
+      // That is a real cost of the fix, not a pre-existing one. It is accepted because the
+      // alternative is the reported bug — a command that never ends — but it is the reason
+      // to be careful about raising the attempt COUNT, which multiplies the overlap, rather
+      // than the per-attempt bound, which reduces it.
+      //
+      // A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT. `fetchNodeDefsWithRetry` rethrows the
+      // LAST error so the caller's verdict reports what actually failed — but with a
+      // timeout now able to BE that last error, a genuine backend failure would be buried
+      // under "did not answer" and the remedy would blame the wrong thing. So a real error
+      // is remembered and preferred: a stall reports as a stall only when nothing better
+      // was learned.
+      //
+      // A SEPARATE FLAG, because the error's VALUE cannot answer this. `throw null` and
+      // `throw undefined` are failures a backend can really produce — "#635: a FALSY thrown
+      // value still counts as a failure" exists for exactly that — so testing
+      // `lastRealError === null` would forget them and let a synthesized timeout speak for
+      // a failure the backend had actually named.
+      let sawRealError = false;
+      // The LAST real error, which is what `fetchNodeDefsWithRetry` itself rethrows ("#954:
+      // the LAST error wins, not the first"). This used to keep the FIRST one instead, so
+      // the panel and the module it calls disagreed about the same sequence for no stated
+      // reason, and the guard that did it conflated two questions: whether a real error was
+      // seen at all, and which of them to report. Only the first question needs a flag.
+      let lastRealError = null;
+      // Whether the attempt that just failed was ABANDONED rather than answered. Tracked
+      // beside the error rather than encoded into it, because the error thrown for a stall
+      // is deliberately a REAL one when there was one — so the value cannot be asked which
+      // kind of failure it represents without undoing that.
+      let lastAttemptTimedOut = false;
+      defs = await fetchNodeDefsWithRetry(
+        async () => {
+          // Unreachable as written — `shouldRetry` ends the loop on the first timeout, so
+          // this can never be observed true on entry. Kept because it is the invariant that
+          // makes the flag safe, not a consequence of it: a future `shouldRetry` that
+          // permits one retry after a stall would, without this line, mark every later
+          // attempt as timed out and stop the loop for a reason that had already passed.
+          lastAttemptTimedOut = false;
+          let result;
+          try {
+            result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
+          } catch (err) {
+            sawRealError = true;
+            lastRealError = err;
+            throw err;
+          }
+          if (result === NODE_DEFS_NO_ANSWER) {
+            lastAttemptTimedOut = true;
+            if (sawRealError) throw lastRealError;
+            throw new Error("api.getNodeDefs() did not answer within this refresh's remaining budget");
+          }
+          return result;
+        },
+        {
+          delays: NODE_DEFS_RETRY_DELAYS_MS,
+          // An abandoned attempt is still downloading the whole document. Retrying it races
+          // the retry against its own predecessor; an instantly-refused one costs nothing.
+          shouldRetry: () => !lastAttemptTimedOut,
+        },
+      );
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -838,13 +1207,69 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // (A throw here is attributed to "record": the fetch itself already succeeded,
     // and registration has not been attempted yet — the verdict must not claim it.)
     phase = "record";
+    // The budget measures WAITING THIS PANEL CONTROLS, and everything from here to the combo
+    // phase is neither waiting nor controllable — so the clock stops across it and the
+    // deadline is pushed out by exactly what it took.
+    //
+    // From HERE, not from the registration call: `recordObjectInfoTypes` walks every type in
+    // the payload (4304 of them on this rig), which is local CPU work of exactly the kind
+    // this rule exists to exclude. Starting the exclusion at the next phase would have left
+    // one arbitrary slice of local work still spending the waiting budget, and an arbitrary
+    // rule is one nobody can apply correctly later.
+    //
+    // Without this the deliberately-unbounded registration SPENT the run's deadline instead
+    // of merely escaping it, which starved the phase after it. On the install #610 measured
+    // — where the whole refresh is about 14.5s, most of it registration and the combo
+    // rebuild — the deadline was already gone by the combo phase, `nodeDefsBudgetLeft` fell
+    // to its 1ms floor, and a HEALTHY `refreshComboInNodes()` was abandoned before it could
+    // start. Every panel_refresh_nodes on that machine then reported combo_refresh_failed
+    // and told the user to reload the tab, for a refresh that had in fact succeeded; worse,
+    // `nodeDefsRefreshConfirmed` stayed false, which is what reopens #610's false "model
+    // still missing".
+    //
+    // The 1ms floor is right for a budget spent WAITING — it fails immediately and
+    // truthfully. It is wrong for one spent computing, and telling those apart is the whole
+    // reason the deadline moves here rather than the floor being softened.
+    const localWorkStartedAt = monotonicNow();
     recordObjectInfoTypes(defs);
+    // #1223 — the payload a later widget write falls back to when the backend goes silent
+    // mid-render. Recorded BEFORE registerNodesFromDefs runs below, and `record` copies out
+    // the type names, so a beforeRegisterNodeDef hook mutating these definitions in place
+    // (Comfy's upload hook adds an input the backend never declared) cannot reach it.
+    //
+    // ONLY WHEN THIS RUN FETCHED THE PAYLOAD ITSELF. A caller-supplied `preloadedDefs` is
+    // not provably whole: assertAddNodeResolvableRefreshing re-reads the registry across an
+    // await and can pass its SINGLE-CLASS defs to refresh(), and a one-type map recorded
+    // here would make every other type read as absent — the ever-seen gate would then
+    // report the entire install as removed packs.
+    if (!preloadedDefs) {
+      objectInfoSnapshot.record(defs, {
+        observedAtEpoch: runStartedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
     // is set ONLY when the registration call actually ran — a frontend without
     // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
     phase = "register";
     if (defs && typeof a.registerNodesFromDefs === "function") {
+      // #1180 — this await stays UNBOUNDED, and that is the decision, not an omission. It is
+      // the last await on this path without a time limit, so it will be asked about again.
+      // Both reasons were checked against the frontend build this ComfyUI actually serves
+      // (comfyui-frontend-package 1.48.7), not inferred:
+      //
+      // A bound could not be applied safely. `withTimeout` does not cancel, so giving up
+      // here would set `defsRegistered = true` for a registration still in progress and send
+      // `reapplyDefsToLiveNodes` at classes that have not been minted yet — a corrupted
+      // registry reported as a good one, which is worse than waiting.
+      //
+      // And there would be nothing left to rescue. ComfyUI's own `registerNodes()` awaits
+      // this same call during startup, so a hook that hangs it has already hung the page's
+      // own load: the panel is not adding a hazard, it is sharing one that already stopped
+      // the app. (`registerNodesFromDefs` awaits `invokeExtensionsAsync("addCustomNodeDefs")`
+      // first, so third-party extension code does run inside this await.)
       await a.registerNodesFromDefs(defs);
       defsRegistered = true;
     }
@@ -856,15 +1281,83 @@ async function registerComfyNodeDefs(preloadedDefs) {
       const rootGraph = a.graph ?? a.canvas?.graph;
       if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
     }
+    // Hand back the time the unbounded local work took. After this, what remains of the
+    // deadline is what remains of the WAITING allowance, which is what the phase below
+    // draws on.
+    runDeadline += monotonicNow() - localWorkStartedAt;
     // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
     // models resolve and stale entries clear (#185/#181/#223).
     phase = "combo";
     comboApiPresent = typeof a.refreshComboInNodes === "function";
     if (comboApiPresent) {
-      await a.refreshComboInNodes();
-      comboRan = true;
+      // #1180 — BOUNDED, and this was the fifth place the same mistake had to be found.
+      // The fetch phase above is bounded, but `refreshComboInNodes()` issues its own
+      // /object_info request (see the note at the combo-trust check), so a connection that
+      // goes half-open between the two phases parks the run here instead. Worse, the
+      // PAYLOAD-CARRYING path — `graph_add_node`'s `refresh(freshDefs)` — skips the fetch
+      // entirely and reaches this line with the bound never consulted at all.
+      //
+      // The outcome is REIFIED — a timeout, a throw and a success are three different
+      // things and this has to tell them apart, the way `boundedGetNodeDefs` does.
+      // Collapsing the first two into one `false` did two wrong things at once: it
+      // discarded the real cause of a combo that threw, and then it reported that throw
+      // as a stall by fabricating a "did not answer within 10000ms" message for a failure
+      // that had landed instantly.
+      //
+      // ABANDONING THIS ONE IS NOT LIKE ABANDONING A FETCH, and that is the cost of the
+      // bound rather than an argument against it. Read from the frontend build this ComfyUI
+      // serves: `refreshComboInNodes` -> `reloadNodeDefs`, whose only long await is its own
+      // `getNodeDefs()`. Everything after that — `registerNodeDef` for every id, then a
+      // walk of the whole graph rewriting each combo widget's options — runs whenever that
+      // fetch finally resolves. So a combo phase given up on does not stop: it mutates the
+      // graph later, after this run has already reported that combos are stale, and it does
+      // so outside `makeRefreshCoalescer`, which only serialises runs the panel starts.
+      //
+      // Accepted, because the alternative is the reported bug. The mutation it eventually
+      // performs is the CORRECT one — fresher defs than the verdict claimed — so the run's
+      // report is pessimistic rather than wrong, and `nodeDefsRefreshConfirmed` staying
+      // false keeps the caller in over-report-safe mode either way. The unbounded version
+      // did the same mutation at the same moment; the only thing the bound changes is that
+      // the panel stops waiting for it.
+      const comboSettled = await withTimeout(
+        Promise.resolve()
+          .then(() => a.refreshComboInNodes())
+          .then(() => COMBO_OK, (err) => ({ err })),
+        nodeDefsBudgetLeft(runDeadline),
+        () => COMBO_NO_ANSWER,
+      );
+      comboRan = comboSettled === COMBO_OK;
+      if (!comboRan) {
+        // A SEPARATE FLAG, for the third time on this path and the same reason each time:
+        // `throw null` and `throw undefined` are failures a backend can really produce, so
+        // a falsy `thrown` cannot mean "nothing failed". Reading the phase guard below off
+        // `thrown` alone put #635's hole back at this new site — a combo that rejected with
+        // a falsy value advanced the phase to "done" and vanished from the verdict's
+        // `failed` test. The `!comboRan` backstop still names the right reason, which is
+        // exactly why this was invisible.
+        comboFailed = true;
+        // `thrown` is provably null here: a throw inside this try would have jumped to the
+        // catch. The `?? ` that used to guard this assignment could never fire.
+        thrown =
+          comboSettled === COMBO_NO_ANSWER
+            ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget")
+            : comboSettled.err;
+        // WARN HERE, because reifying the outcome took this failure off the throwing path
+        // and the catch below is the only place that logged one. The browser console was
+        // the sole record of a failed combo refresh for anyone not reading a tool reply,
+        // and it went silent when the throw stopped happening.
+        console.warn("[comfyui-mcp-panel] combo refresh did not complete:", thrown);
+      }
     }
-    phase = "done";
+    // Leave the combo phase ONLY when it produced no failure.
+    //
+    // `describeNodeDefRefresh` reads `phase` to name the cause, and an unconditional
+    // "done" here made a combo failure come out as `register_failed` — whose remedy tells
+    // the user that re-registering the node definitions failed, when registration had in
+    // fact just succeeded a few lines above. The comment that used to sit here asserted
+    // the opposite outcome, `combo_refresh_failed`, which the code has never produced:
+    // `thrown` is set without `didThrow`, and the verdict's `failed` test accepts either.
+    if (!comboFailed) phase = "done";
   } catch (e) {
     thrown = e;
     didThrow = true;
@@ -918,6 +1411,28 @@ async function registerComfyNodeDefs(preloadedDefs) {
       verdict.stale_placeholders = stale;
       verdict.stale_placeholders_note = stalePlaceholderNote(stale);
     }
+    // #1172 — DISCLOSE an authoritative list that came back empty.
+    //
+    // Every input `describeNodeDefRefresh` takes is STRUCTURAL — app present, defs obtained,
+    // register ran, combo API present, combo resolved — so `refreshed: true` was a claim
+    // about API calls resolving, not about the definitions being usable. The payload said
+    // `ckpt_name: [[], {…}]` and the panel had it in hand at register and reapply, and
+    // discarded it; the agent then found out at queue time via `Value not in list (… not
+    // in [])`.
+    //
+    // `refreshed` stays TRUE. A server with zero checkpoints is a real answer, and #507/#1133
+    // establish that empty lists are sometimes legitimate — flipping the verdict to false
+    // would re-refuse via the verdict exactly what #1133 deliberately permits via the write
+    // path. Disclosure, not failure.
+    //
+    // Read from `defs`, which is already in hand, and NOT by re-reading widgets after
+    // `app.refreshComboInNodes()` resolves: #1193 wants to stop waiting on that call, and a
+    // disclosure that depended on it would report nothing if it were ever abandoned.
+    const empties = emptyComboListsOnGraph(getGraphCtx().rootGraph, defs);
+    if (empties.length) {
+      verdict.empty_combo_lists = empties;
+      verdict.empty_combo_lists_note = emptyComboNote(empties);
+    }
   } catch {
     /* a diagnosis must never turn a successful refresh into a failure */
   }
@@ -956,12 +1471,14 @@ function setupListeners() {
     api.addEventListener("reconnecting", () => {
       nodeDefsRefreshConfirmed = false;
       comfyBackendSocketDown = true;
+      objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
     });
     api.addEventListener("status", (ev) => {
       // A null status payload is ComfyUI's "backend connection lost" signal.
       if (ev?.detail == null) {
         nodeDefsRefreshConfirmed = false;
         comfyBackendSocketDown = true;
+        objectInfoSnapshot.clear(); // #1223 — same reasoning as `reconnecting`.
       }
     });
     // ComfyUI's own socket to its backend re-establishing is the reliable
@@ -969,6 +1486,7 @@ function setupListeners() {
     // stale node registry + combos then (#221/#171/#185/#181).
     api.addEventListener("reconnected", () => {
       comfyBackendSocketDown = false;
+      objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
       // #433: the frontend may now restore a stale/wrong active tab — bump the
       // epoch and arm the monotonic possibly-stale window. Bumping the epoch
       // invalidates any EARLIER resync so a pre-reconnect open can't clear this
@@ -1008,7 +1526,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.14.16";
+const PANEL_VERSION = "0.14.40";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -1048,6 +1566,60 @@ let cmcpOauthOnBackendsPush = null;
 // and never read back (only a masked preview comes down).
 function cmcpApiBase() {
   return `${cmcpConsoleUrl}/api/secrets?token=${encodeURIComponent(cmcpConsoleToken)}`;
+}
+
+/**
+ * #1188 — how long a credentials-console request may take before it gives up.
+ *
+ * Longer than the 2s status probes because this one is a user-initiated write to a
+ * possibly-remote orchestrator console, not a startup nicety: giving up early on a save
+ * that would have succeeded is worse here than waiting a moment longer.
+ */
+const CMCP_SECRETS_TIMEOUT_MS = 8000;
+
+/** Sentinel: this call did not answer, as distinct from anything it could return. */
+const CMCP_SECRETS_NO_ANSWER = Symbol("cmcp-secrets-timeout");
+
+/**
+ * The credentials console's three requests, bounded — headers AND body.
+ *
+ * #1188, same failure as #1161/#1180: after a ComfyUI or orchestrator restart the tab can
+ * hold a half-open connection where a request neither answers nor fails, so there is
+ * nothing for `try/catch` to catch. Here that wedges the UI rather than a command — the
+ * button stays disabled reading "Saving…" or "Clearing…" forever, and because the panel
+ * only re-enables it in the catch, the user cannot even retry without reopening the frame.
+ *
+ * BOTH HALVES, because `fetch` resolves as soon as the response head arrives and the bytes
+ * stream afterwards inside `json()`. Bounding the request alone leaves the part that
+ * actually waits unbounded — exactly what shipped in #1180's first attempt at the log read.
+ *
+ * Rejects on timeout rather than resolving a sentinel, so it lands in the SAME catch that
+ * already handles a failed save: the error is shown and the button is re-enabled. No new
+ * branch, and no new catalog string for a frozen catalog (#1135).
+ *
+ * @returns {Promise<any>} the parsed body
+ */
+async function cmcpSecretsRequest(init) {
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(async () => {
+        const resp = await (init ? fetch(cmcpApiBase(), init) : fetch(cmcpApiBase()));
+        return { resp, body: await resp.json() };
+      })
+      .then((value) => ({ value }), (err) => ({ err })),
+    CMCP_SECRETS_TIMEOUT_MS,
+    () => CMCP_SECRETS_NO_ANSWER,
+  );
+  if (settled === CMCP_SECRETS_NO_ANSWER) {
+    // NOT a `tr()` key. The English catalog is frozen (#1135) and English is GENERATED from
+    // the code, so a new key here means a pass over eleven locale files. This message goes
+    // through `showErr`, which already renders the orchestrator's own untranslated `d.error`
+    // text the same way — so an English sentence here is consistent with what that path
+    // shows today rather than a regression in coverage.
+    throw new Error("The credentials console did not respond — check that the orchestrator is still running, then try again.");
+  }
+  if ("err" in settled) throw settled.err;
+  return settled.value;
 }
 function cmcpOpenCredentialsFrame(client) {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
@@ -1108,11 +1680,10 @@ function cmcpOpenCredentialsFrame(client) {
       showErr("");
       btn.disabled = true; btn.textContent = tr("panel.saving", "Saving…");
       try {
-        const resp = await fetch(cmcpApiBase(), {
+        const { resp, body: d } = await cmcpSecretsRequest({
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, value }),
         });
-        const d = await resp.json();
         // `d.error` is the orchestrator's own (English) reason; only OUR fallback is ours to
         // translate — the server text is passed through untouched, as it always has been.
         if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.save_failed", "save failed"));
@@ -1138,11 +1709,10 @@ function cmcpOpenCredentialsFrame(client) {
       showErr("");
       clearBtn.disabled = true; clearBtn.textContent = tr("panel.clearing", "Clearing…");
       try {
-        const resp = await fetch(cmcpApiBase(), {
+        const { resp, body: d } = await cmcpSecretsRequest({
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, clear: true }),
         });
-        const d = await resp.json();
         if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.clear_failed", "clear failed"));
         badge.textContent = tr("panel.not_set", "not set");
         input.placeholder = tr("panel.paste_key", "paste key");
@@ -1158,8 +1728,7 @@ function cmcpOpenCredentialsFrame(client) {
 
   (async () => {
     try {
-      const resp = await fetch(cmcpApiBase());
-      const d = await resp.json();
+      const { resp, body: d } = await cmcpSecretsRequest();
       if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.could_not_load", "could not load"));
       list.innerHTML = "";
       for (const s of (d.slots || [])) list.appendChild(row(s));
@@ -2830,11 +3399,38 @@ const RELOAD_POST_TIMEOUT_MS = 10000;
 // resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
 // (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
 const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
-// Wall-clock (ms) of the last bridge drop — module-scoped so it survives panel
-// remounts. A FAST reconnect (panel swap / WS blip; orchestrator alive) vs a
-// SLOW one (real ComfyUI restart; orchestrator died + respawned) is how we tell
-// a spurious bounce from a real one — only the slow case fires the resume nudge.
-let lastBridgeDownAt = 0;
+// The OUTAGE the mid-task nudge weighs. A FAST reconnect (panel swap / WS blip;
+// orchestrator alive) vs a SLOW one (real ComfyUI restart; orchestrator died +
+// respawned) is how we tell a spurious bounce from a real one — only the slow case
+// fires the resume nudge. Module-scoped so it survives panel remounts.
+//
+// #1145 — this used to be a single "last drop" stamp rewritten by every close, and a
+// close is NOT once per outage. `connect()` assigns `sock` before the socket opens, so
+// a REFUSED retry during a restart is still the active socket and runs the close
+// handler in full. With backoff doubling from RECONNECT_BASE_MS the retries land near
+// t=1s/3s/7s/15s, so the successful attempt was separated from the previous failed
+// close by only THAT attempt's delay: the guard weighed one backoff step instead of the
+// outage, and a genuine restart returning inside ~7s lost its nudge.
+//
+// The accounting lives in session-rebind.js because the defect is a SEQUENCE — four
+// closes in a row, each resetting the clock — and only a sequence can demonstrate it.
+// A tracker there is driven through the real order of events by unit tests; a source
+// scan over THIS file could not have caught it (#1096 proved such scans stay green
+// through an inversion). It distinguishes the first close of an outage from the refused
+// retries that follow, the handshake that ends one from a re-advertise that ends
+// nothing, and scopes what it measured to the turn now running — so an outage that
+// ended before this turn began is not re-read as this turn's (the #1138 defect with a
+// stale timestamp in place of the 0 sentinel).
+//
+// On the MONOTONIC clock, not the wall clock. This measures an elapsed window, and
+// `web/js/lib/reconnect-staleness.js` already fixed the rule for that class after a
+// prior review ("monotonic timestamp (performance.now) … codex P1"); `monotonicNow()`
+// exists for it. With `Date.now()` an NTP or DST correction landing inside a reconnect
+// decides the answer: a forward jump turns a two-second blip into a long outage and
+// nudges an agent whose turn never stopped, a backward jump erases a real restart and
+// leaves it idle. Both are the failure this issue is about, arriving through the clock
+// instead of through the backoff.
+const bridgeOutage = createBridgeOutageTracker({ now: monotonicNow });
 // One-shot flag set right before a frontend (page) reload WE trigger, so that
 // after the reload we re-activate our own sidebar tab. ComfyUI restores the
 // last active tab BEFORE our extension re-registers it, so it can't reopen ours
@@ -5041,13 +5637,43 @@ async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
  *  frontend, api.fetchApi resolves the identical URL the UI hits — so this works
  *  against the bundled Desktop Manager without the MCP/cm-cli path. */
 async function managerV2(route, { method = "GET", body, signal } = {}) {
-  const res = await api.fetchApi(`/v2/${route}`, {
-    method,
-    ...(signal ? { signal } : {}),
-    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
-  });
+  let res;
+  try {
+    res = await api.fetchApi(`/v2/${route}`, {
+      method,
+      ...(signal ? { signal } : {}),
+      ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+  } catch (err) {
+    // comfyui-mcp#1472 — a THROW here reached the caller as bare "Failed to fetch",
+    // with no route, no status and no body, so an install could not be diagnosed at
+    // all. There is no status or body to report (no usable response arrived), but the
+    // ROUTE exists and was being discarded.
+    //
+    // It does NOT decide whether a re-send is safe, which is what an earlier version of
+    // this comment claimed. A fetch rejection establishes neither delivery nor
+    // non-delivery — a CORS block, or a connection dropped after the request was
+    // delivered, look identical from here — so the message tells the caller to check
+    // current state before retrying a MUTATING call.
+    // An abort is the caller's own doing and must pass through untouched.
+    if (err?.name === "AbortError") throw err;
+    // #423, second blind spot (found in review). This is untagged AND its wording has
+    // never matched the gate's regex, so a transport-level failure has always skipped
+    // the whole fallback ladder — including the /object_info search that exists for
+    // exactly this case. Tagging it is safe in the direction that matters: this flag
+    // gates IDEMPOTENT GETs only. `isManagerRouteMissing`, the one predicate allowed to
+    // re-send a MUTATION, still requires a proven 404 and does not read this — which is
+    // what keeps the paragraph above true.
+    throw markManagerUnreachable(
+      new Error(managerFetchFailureMessage(route, err), { cause: err }),
+    );
+  }
   if (!res) {
-    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    // #423 — TAG it. The fallback ladder must recognise this without reading the
+    // sentence; a translated message silently disarmed every rung of it.
+    throw markManagerUnreachable(
+      new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
+    );
   }
   if (res.status === 404) {
     // A 404 is a PROVEN route-level rejection — no handler ran. Tag it so the
@@ -5090,13 +5716,30 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
  *  released 3.x ComfyUI-Manager whose queue lives under /manager/* with
  *  per-operation routes. Same error handling as managerV2. */
 async function managerCall(route, { method = "GET", body, signal } = {}) {
-  const res = await api.fetchApi(`/${route}`, {
-    method,
-    ...(signal ? { signal } : {}),
-    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
-  });
+  let res;
+  try {
+    res = await api.fetchApi(`/${route}`, {
+      method,
+      ...(signal ? { signal } : {}),
+      ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+  } catch (err) {
+    // #423, second blind spot (found in review). The docstring above claims "same error
+    // handling as managerV2" and it was not true: there was no catch here at all, so a
+    // fetch rejection propagated raw ("Failed to fetch") — no route, no tag, and no
+    // match for the gate's regex, which skipped the fallback ladder entirely. This is
+    // the LEGACY transport, i.e. the very rung the ladder falls back TO.
+    if (err?.name === "AbortError") throw err;
+    throw markManagerUnreachable(
+      new Error(managerFetchFailureMessage(route, err), { cause: err }),
+    );
+  }
   if (!res) {
-    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    // #423 — TAG it. The fallback ladder must recognise this without reading the
+    // sentence; a translated message silently disarmed every rung of it.
+    throw markManagerUnreachable(
+      new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)"),
+    );
   }
   if (res.status === 404) {
     // See managerV2: a 404 is the PROVEN route-level rejection the #605
@@ -5318,10 +5961,14 @@ async function detectManagerDialect({ signal } = {}) {
     managerDialectCache = "legacy";
     return managerDialectCache;
   }
-  throw new Error(
-    "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
-      "nor /manager/queue/status answered with a queue status). Is the built-in " +
-      "Manager installed and enabled on the connected ComfyUI?",
+  // #423 — TAG it: neither dialect answered, so every dialect-routed GET above
+  // this is entitled to its fallback regardless of the panel's language.
+  throw markManagerUnreachable(
+    new Error(
+      "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
+        "nor /manager/queue/status answered with a queue status). Is the built-in " +
+        "Manager installed and enabled on the connected ComfyUI?",
+    ),
   );
 }
 
@@ -5712,6 +6359,30 @@ function awaitMediaEvent(el, name, timeoutMs) {
  * Same-origin /view means the canvas is NOT tainted, so toBlob works. Returns a
  * PNG Blob, or null if the video can't be decoded/sampled. Never throws.
  */
+/**
+ * A storyboard attempt that failed, and WHY (comfyui-mcp#1493).
+ *
+ * The builder used to answer every failure with a bare `null`: an undecodable
+ * codec, a canvas it could not get, frames that never painted, and a sheet that
+ * would not encode all looked identical to the caller. The reply then had to say
+ * "the panel is not told which" — which was honest, and useless, because the
+ * builder knew exactly and threw it away.
+ *
+ * THIS IS TRUTHY, so a caller must test `.reason` BEFORE treating the result as
+ * a sheet — `if (!sheet)` alone would sail past it and try to upload a plain
+ * object. `produceSheet` is the only consumer and does exactly that. Said
+ * plainly because the tempting summary — "existing checks keep working" — is
+ * false, and a wrong reassurance in a comment outlives the person who wrote it.
+ *
+ * What it DOES preserve is the meaning of `null`: a builder that returns nothing
+ * still reports nothing, so a test double of `async () => null` keeps meaning
+ * what it means today. That is why the existing "NO invented cause" test stays
+ * valid instead of being rewritten to accommodate this change.
+ */
+function storyboardFailure(reason) {
+  return { reason };
+}
+
 async function buildVideoStoryboard(url) {
   const video = document.createElement("video");
   video.muted = true;
@@ -5739,7 +6410,16 @@ async function buildVideoStoryboard(url) {
     const duration = Number(video.duration);
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    if (!isFinite(duration) || duration <= 0 || !vw || !vh) return null;
+    if (!isFinite(duration) || duration <= 0 || !vw || !vh) {
+      // #1493 — say WHICH. A caller that only sees `null` cannot tell a codec
+      // the browser will not decode from a frame it could not paint, and the
+      // two need different advice.
+      return storyboardFailure(
+        !isFinite(duration) || duration <= 0
+          ? "the browser reported no usable duration for it (its codec may not be decodable here — VP9/AV1 .webm is the usual case)"
+          : "the browser reported zero video dimensions for it (its codec may not be decodable here)",
+      );
+    }
 
     const n = storyboardFrameCount();
     const cellW = STORYBOARD.CELL_W;
@@ -5753,7 +6433,7 @@ async function buildVideoStoryboard(url) {
     canvas.width = pad * 2 + cols * cellW + (cols - 1) * gap;
     canvas.height = pad * 2 + rows * cellH + (rows - 1) * gap;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
+    if (!ctx) return storyboardFailure("this browser refused a 2D canvas context, so no sheet could be drawn");
     ctx.fillStyle = "#111114";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -5790,10 +6470,10 @@ async function buildVideoStoryboard(url) {
         ctx.fillText(String(i + 1).padStart(2, "0"), x + 4, y + 4);
       }
     }
-    if (!painted) return null;
+    if (!painted) return storyboardFailure("its metadata loaded but not one of the sampled frames could be painted (seeking never produced an image)");
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-    if (!blob) return null;
+    if (!blob) return storyboardFailure("the contact sheet was drawn but the canvas would not encode it to PNG (a cross-origin frame taints the canvas)");
     // #648 — the grid has COLS*ROWS CELLS, but a video with unseekable frames
     // paints fewer and leaves the rest blank. storyboardFrameCount() reports the
     // capacity, not the sample count, so a caller reading only that would tell
@@ -5808,7 +6488,12 @@ async function buildVideoStoryboard(url) {
     }
     return blob;
   } catch {
-    return null; // decode/seek/metadata failure → caller falls back to video-only
+    // The metadata wait itself timed out, or decode/seek threw.
+    return storyboardFailure(
+      "the browser never delivered its metadata within " +
+        Math.round(STORYBOARD.META_TIMEOUT_MS / 1000) +
+        "s, or decoding threw (its codec may not be decodable here)",
+    );
   } finally {
     cleanup();
   }
@@ -8429,6 +9114,47 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
+/**
+ * #1180 — the widen runs INSIDE the registration wait above, so its bound has to fit
+ * there. The generic 10s node-defs bound is TWICE this function's whole 5s deadline: a
+ * timed-out widen would consume the entire wait and leave the poll loop nothing, so the
+ * add would report unmaterialized widgets having never actually looked for them.
+ *
+ * Half the registration deadline, derived from it rather than picked, so the two cannot
+ * drift apart.
+ *
+ * The widen runs BEFORE the polling loop and inside its deadline, so every millisecond it
+ * spends is one #580's wait does not get — which is why it takes a fraction and not the
+ * generic node-defs bound, and why it cannot simply be raised. The add path already
+ * composes to roughly 26.5s of bounds against the bridge's 30s command budget.
+ *
+ * WHAT THAT COSTS, stated because the earlier note here quietly implied it could not
+ * happen. This is one whole-document fetch. Measured on this rig, ComfyUI 0.32.0 with 4304
+ * types, and the three numbers disagree enough to be worth separating:
+ *
+ *     transfer alone (curl)                    7,440,820 bytes    532 ms
+ *     api.getNodeDefs() in the page, warm       median of 5       354 ms  (max seen 767)
+ *     api.getNodeDefs() in the page, COLD       first call       1062 ms
+ *
+ * The cold figure is the relevant one and it is the one nobody measured before: this runs
+ * during an add, which is typically the first whole-schema read after a page load or a
+ * backend restart. Against it, 2500ms is about 2.4x — not the 4.7x the transfer number
+ * suggests, and nowhere near the "order of magnitude" this comment used to claim from
+ * #767's 167ms and a ~366ms reading. The document also grows with the installed pack count
+ * (it was 5,413,770 bytes when #767 measured it), and the panel supports a ComfyUI reached
+ * over a configured bridge URL rather than localhost.
+ *
+ * Where the whole schema takes longer than this bound, the widen is abandoned, the caller
+ * keeps its single-class proof, and #821's case comes back: a class is refused for a link
+ * datatype that a SIBLING node on the canvas already outputs.
+ *
+ * That is a real narrowing and it is accepted for the same reason as the rest of this
+ * issue — the refusal is worded and clears on a retry, where the hang it replaced was
+ * neither. What it is NOT is headroom, and the number to revisit when the add path's total
+ * has room is this one.
+ */
+const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 2);
+
 async function awaitRequiredCustomWidgetRegistration(
   nodeData,
   comfyApp,
@@ -8438,7 +9164,12 @@ async function awaitRequiredCustomWidgetRegistration(
   widenSocketProof,
   liveNodeOfClass,
 ) {
-  const startedAt = Date.now();
+  // MONOTONIC, like every other elapsed-time measurement in this panel. On the wall clock
+  // an NTP correction, a DST change or a VM resume between these two reads either ends the
+  // wait instantly — reporting widgets unmaterialised without having polled for them — or
+  // extends it far past the command budget. This deadline gates #580's protection, so it
+  // is the wrong one to measure on a clock that can move.
+  const startedAt = monotonicNow();
   const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   let socketTypes = knownSocketTypes;
   const check = () =>
@@ -8463,7 +9194,7 @@ async function awaitRequiredCustomWidgetRegistration(
       unavailable = check();
     }
   }
-  while (Date.now() < deadline) {
+  while (monotonicNow() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
     unavailable = check();
@@ -8498,7 +9229,7 @@ async function awaitRequiredCustomWidgetRegistration(
   // a message that says which input is stuck and which of the two causes it is, instead of
   // asserting the single cause that sent #695's reporter to the wrong place.
   throw new Error(
-    unavailableRequiredWidgetMessage(unavailable, classType, Date.now() - startedAt),
+    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt),
   );
 }
 
@@ -8520,7 +9251,7 @@ function revalidateGraphMutationContext(captured) {
     backendDown: comfyBackendSocketDown,
     bindingSettleWindow: postReconnectBindingSettleWindow(),
   });
-  if (reconnectGate) throw new Error(reconnectGate);
+  if (reconnectGate) throw reconnectRefusalError(reconnectGate);
   const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
   if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
     throw new Error(
@@ -8622,7 +9353,18 @@ const GRAPH_TOOL_EXECUTORS = {
           stale_placeholders_note: verdict.stale_placeholders_note,
         }
       : {};
-    if (refreshed) return { ok: true, refreshed: true, ...stale };
+    // #1172 — forwarded through the SAME hole #981 fell into. The `refreshed: true` branch
+    // below returns a fixed object literal, so a field the verdict carries but this whitelist
+    // does not name is silently dropped on exactly the successful path where the disclosure
+    // matters most. Adding the field to the verdict without adding it here would look correct
+    // in every unit test of the verdict and report nothing to the agent.
+    const emptyCombos = verdict != null && typeof verdict === "object" && verdict.empty_combo_lists?.length
+      ? {
+          empty_combo_lists: verdict.empty_combo_lists,
+          empty_combo_lists_note: verdict.empty_combo_lists_note,
+        }
+      : {};
+    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos };
     return {
       ok: true,
       refreshed: false,
@@ -8662,10 +9404,25 @@ const GRAPH_TOOL_EXECUTORS = {
   // holds and gets `unchanged: true` with no payload when the TYPE SET still matches.
   // What that does and does not establish is stated in the reply, not implied.
   async graph_get_object_info({ if_none_match } = {}) {
+    // #1223 — the epoch at issuance. This command reads the WHOLE schema and does not go
+    // through the burst cache, so every success here is a first-hand observation of the
+    // connection it was issued on, and there is no cache hit to exclude.
+    const observedAtEpoch = backendReconnectEpoch;
     const { defs, failures } = await fetchWholeObjectInfo({
       getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
       fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
     });
+    // #1223 — file it. A reader that successfully obtains a whole schema and drops it on the
+    // floor leaves the next render-time widget edit refused for want of the very map this
+    // command just read. Recorded BEFORE the fingerprint/if_none_match early-returns below,
+    // so a caller polling with `if_none_match` still keeps the snapshot fed.
+    if (defs) {
+      objectInfoSnapshot.record(defs, {
+        observedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     // THE ORIGIN THAT ACTUALLY ANSWERED (codex). `comfyuiUrlForAgent()` prefers a
     // user-set Remote-URL override, but this fetch goes through the page's own `api`
     // client — so on an install where those differ, reporting the override would
@@ -9996,6 +10753,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // schema — a sibling class is where a custom link datatype is produced. Remember
     // which payload we got, because a single-class map is not evidence about siblings.
     let freshDefsAreSingleClass = false;
+    // #1223 — the epoch at the moment the WHOLE fetch is issued, or null if this add never
+    // issued one. Set inside the branch below rather than out here: for an already-registered
+    // type the resolver first runs the per-class probe, and a reconnect landing during THAT
+    // probe would leave this holding the old epoch — so the later record would be rejected
+    // and the snapshot (already cleared by the reconnect) would stay empty, refusing the very
+    // next render-time widget edit. The epoch has to be read where the request goes out.
+    let addNodeObservedAtEpoch = null;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
         // #767 — ask about ONE type instead of re-downloading the whole schema.
@@ -10017,7 +10781,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // falls through to the identical full fetch below, so no refusal, removal
         // verdict or history check is decided on anything new.
         if (isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
-          const one = await fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route));
+          // #1180 — THE FAST PATH IS BOUNDED TOO, and it has to be: it runs FIRST, so a
+          // half-open connection hangs here before the bounded fallback below is ever
+          // reached. Bounding only the fallback left `graph_add_node` hanging on exactly
+          // the connection this issue is about. `fetchSingleNodeDef` awaits both the
+          // response and its body, so the whole call is wrapped rather than the request
+          // alone. A timeout resolves null, which is the same answer it already gives for
+          // every other doubt and which sends the add to the full fetch — no new branch.
+          const one = await withTimeout(
+            fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route)),
+            NODE_DEFS_FETCH_TIMEOUT_MS,
+            () => null,
+          );
           if (one) {
             freshDefs = recordObjectInfoTypes(one);
             freshDefsAreSingleClass = true;
@@ -10025,9 +10800,16 @@ const GRAPH_TOOL_EXECUTORS = {
             return freshDefs;
           }
         }
-        freshDefs = recordObjectInfoTypes(
-          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-        );
+        // #1180 — BOUNDED. Unbounded, a half-open connection after a ComfyUI restart hung
+        // `graph_add_node` here until the caller's own 30s timeout, which is the #1161
+        // failure this command was left out of. A call that does not answer is treated as
+        // one that answered nothing: `recordObjectInfoTypes(null)` yields no defs, and the
+        // add then fails closed on the same path an empty payload already takes, rather
+        // than parking.
+        // #1223 — read the epoch HERE, immediately before the whole request is issued.
+        addNodeObservedAtEpoch = backendReconnectEpoch;
+        const whole = await boundedGetNodeDefs();
+        freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
@@ -10040,6 +10822,26 @@ const GRAPH_TOOL_EXECUTORS = {
       // pack that is not installed, and the refusal used to name only the latter.
       readImportFailures: () => readPackImportFailures(api),
     });
+    // #1223 — file the WHOLE map this resolver fetched, when it fetched one.
+    //
+    // AFTER the resolver, not inside it: when a type needs registering the resolver calls
+    // `refresh`, and `registerComfyNodeDefs` CLEARS the snapshot at the start of its run.
+    // Recording earlier would simply be wiped. Skipping it altogether — which the earlier
+    // `!preloadedDefs` rule did, since the resolver hands its payload in as `preloadedDefs`
+    // — left an add that registers a new type with NO snapshot at all, so the very next
+    // render-induced probe timeout reproduced the refusal this issue exists to remove.
+    //
+    // `freshDefsAreSingleClass` is the panel's OWN record of which question it asked, so it
+    // is the honest wholeness claim; the single-class fast path is only taken for an
+    // already-registered type, and it sets that flag. Mutation by a beforeRegisterNodeDef
+    // hook (#700) is irrelevant here because `record` copies out only the type NAMES.
+    if (freshDefs && !freshDefsAreSingleClass && addNodeObservedAtEpoch !== null) {
+      objectInfoSnapshot.record(freshDefs, {
+        observedAtEpoch: addNodeObservedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY
     // registered class; the resolver only refreshes absent classes, so
@@ -10081,7 +10883,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // and #780's 1,667x saving is kept for every add that does not need it.
     const widenSocketProof = freshDefsAreSingleClass
       ? async () => {
-          const whole = typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null;
+          // #1180 — BOUNDED, and the timeout lands on the SAFE side by construction. This
+          // helper already answers null for every doubtful payload, and the caller keeps
+          // the proof it holds when it gets null; a call that never answers is the most
+          // doubtful case there is, so it takes that same path. Unbounded, this hung the
+          // add on the very path that was about to refuse — the worst place to park,
+          // because the user is already being told something went wrong.
+          // The sentinel needs no unwrapping here: it is a Symbol, so the doubt guard
+          // below rejects it exactly as it rejects every other non-object payload, and
+          // returns null — which is what "keep the proof already in hand" means. Mapping
+          // it first was a second spelling of the same decision.
+          const whole = await boundedGetNodeDefs(WIDEN_SOCKET_PROOF_TIMEOUT_MS);
           // "I did not find out" is not "nothing outputs anything", and the difference
           // matters because the caller REPLACES its proof with whatever comes back.
           // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is
@@ -10751,6 +11563,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // its refusal, so the message would name routes another call tried. Declared in the
     // handler's own scope, so each invocation reports what IT observed.
     let oracleFailures = [];
+    // #1223 — null while the authorization came from a LIVE probe; the oracle's failure
+    // note once it came from the last-observed snapshot instead. Per-request for the same
+    // reason `oracleFailures` is: a concurrent write must not make THIS reply claim a
+    // provenance it did not have.
+    let setWidgetSchemaFromSnapshot = null;
+    // #1223 — why the snapshot could not stand in, kept OFF the route list so the route
+    // count stays honest. Per-request for the same reason the other two are.
+    let snapshotIneligibility = "";
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -10834,6 +11654,20 @@ const GRAPH_TOOL_EXECUTORS = {
       // after a restart-without-reload. Mirrors graph_add_node.
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () => {
+        // #1223 — the epoch at which THIS CALL actually fetched, or null if it did not.
+        //
+        // Set INSIDE the loader, which the burst cache runs only on a miss. Capturing it
+        // out here instead was a defect: a CACHE HIT returns a payload fetched up to a TTL
+        // ago, and a reconnect can land in between — the reconnect's own refresh is
+        // payload-less and gets coalesced into any in-flight run, so it never reaches
+        // `objectInfoCache.invalidate()` either. The pre-reconnect schema would then be
+        // stamped with the post-reconnect epoch and retained with no TTL at all, which is
+        // precisely the #458 hole this file promises not to open.
+        //
+        // A JOINED read (another call's in-flight request) leaves this null for the same
+        // reason and is likewise not recorded: this call cannot vouch for when that fetch
+        // was issued. Only the call that actually asked may file the answer as evidence.
+        let observedAtEpoch = null;
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
@@ -10851,6 +11685,9 @@ const GRAPH_TOOL_EXECUTORS = {
           // The OUTCOME rides through the cache, not just the schema (codex): a second
           // concurrent write JOINS this in-flight read and never runs its own loader, so
           // returning bare defs would leave that caller's refusal naming no routes at all.
+          // This body runs ONLY on a cache miss, so this is the moment the request is
+          // issued — the only epoch that can honestly be attributed to the answer.
+          observedAtEpoch = backendReconnectEpoch;
           return fetchWholeObjectInfo({
             getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
             fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
@@ -10858,11 +11695,62 @@ const GRAPH_TOOL_EXECUTORS = {
         });
         const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
+        if (defs) {
+          // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
+          // above), so it is one #1223's fallback may hold — but ONLY when this call issued
+          // the fetch itself, and only if no reconnect landed while it was in flight.
+          //
+          // This guard is DEFENCE IN DEPTH, and mutation testing reports removing it as a
+          // surviving mutant for that reason: `record` independently rejects a non-finite
+          // `observedAtEpoch`, which is exactly what a cache hit leaves here. It is kept
+          // because it states the rule at the point of decision — "only the caller that
+          // asked may file the answer" — rather than leaving it to be inferred from a
+          // validation two files away.
+          if (observedAtEpoch !== null) {
+            objectInfoSnapshot.record(defs, {
+              observedAtEpoch,
+              currentEpoch: backendReconnectEpoch,
+              whole: true,
+            });
+          }
+          return recordObjectInfoTypes(defs);
+        }
+        // #1223 — the probe produced nothing. If it went SILENT (rather than answering
+        // something unusable) and this backend connection has not been interrupted since a
+        // whole schema was last read, authorize from that snapshot instead of refusing a
+        // write the backend would accept. Every other cause still falls through to the
+        // unchanged #458 refusal below, which now also explains why the snapshot was not
+        // eligible — a caller told "no schema" when the real cause was a reconnect goes
+        // looking in the wrong place (#982).
+        const fallback = objectInfoSnapshot.authorize({
+          epoch: backendReconnectEpoch,
+          socketDown: comfyBackendSocketDown,
+          outcomes: outcome?.outcomes,
+        });
+        if (fallback.defs) {
+          // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
+          // and it was verified against a schema nobody could re-fetch — an agent that is
+          // not told that cannot tell this apart from a fully live authorization.
+          setWidgetSchemaFromSnapshot = objectInfoOracleFailureNote(oracleFailures);
+          // NOT recorded into the ever-seen history: it is not a new observation of the
+          // backend, it is the old one being re-read. Recording it would let a snapshot
+          // keep its own types "ever seen" after the backend stopped defining them.
+          return fallback.defs;
+        }
+        // NOT appended to `oracleFailures`. That array is the list of TRANSPORT ROUTES, and
+        // objectInfoOracleFailureNote renders "Tried N routes:" from its length — splicing
+        // a non-route entry in made a two-transport failure report three routes tried, which
+        // is #982's own defect (a refusal asserting something that did not happen) committed
+        // by the code written to avoid it.
+        snapshotIneligibility = fallback.reason;
         return recordObjectInfoTypes(defs);
       },
       // What the last oracle attempt observed, so a refusal can say which routes were
-      // tried and what each one did instead of asserting an unreachable backend.
-      describeObjectInfoFailure: () => objectInfoOracleFailureNote(oracleFailures),
+      // tried and what each one did instead of asserting an unreachable backend — then,
+      // separately, why the last-observed schema could not stand in for them either.
+      describeObjectInfoFailure: () =>
+        objectInfoOracleFailureNote(oracleFailures) +
+        (snapshotIneligibility ? ` The last-observed schema was not usable either — ${snapshotIneligibility}.` : ""),
       // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
       // /object_info that the backend reported earlier this session is a REMOVED backend
       // node — refuse (non-forgeable; client shape/name/provenance can't prove this).
@@ -10967,6 +11855,13 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* best-effort visual cleanup — never fail the write over it */
     }
+    // #1223 — DISCLOSE the provenance of the authorization, on a field of its own rather
+    // than in `warning`. That channel is single-slot and priority-ordered (link-driven
+    // outranks control_after_generate), so appending here would silently displace a warning
+    // about what the write actually DOES — a strictly worse trade than a separate field.
+    if (setWidgetSchemaFromSnapshot !== null && result && typeof result === "object") {
+      return { ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) };
+    }
     return result;
   },
 
@@ -10984,14 +11879,30 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     let oracleFailures = [];
-    const outcome = await objectInfoCache.read(async () =>
-      fetchWholeObjectInfo({
+    // #1223 — the epoch at which THIS CALL fetched, or null if the burst cache answered from
+    // store or this read joined another call's request. Set inside the loader for the same
+    // reason graph_set_widget's is: only the caller that issued the request can say which
+    // connection the answer describes.
+    let observedAtEpoch = null;
+    const outcome = await objectInfoCache.read(async () => {
+      observedAtEpoch = backendReconnectEpoch;
+      return fetchWholeObjectInfo({
         getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
         fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-      }),
-    );
+      });
+    });
     const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
     oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    // #1223 — this command already paid for a WHOLE /object_info; dropping it leaves the
+    // next render-time widget edit refused for want of the map just read. Same argument the
+    // history note below already makes for its own trust root.
+    if (defs && observedAtEpoch !== null) {
+      objectInfoSnapshot.record(defs, {
+        observedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     // Feed the #458 observed-backend-history trust root. This command never consults that
     // history, so skipping it would be harmless HERE — but we just paid for a full
     // /object_info, and discarding the observation makes a LATER set_widget less able to
@@ -11740,6 +12651,67 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
+    }
+    // comfyui-mcp#1460 — PRE-FLIGHT the node types. An unregistered type still draws
+    // on the canvas and is still included by ComfyUI's own graphToPrompt, with
+    // `class_type: undefined` — so the server answers "has no class_type" for ONE
+    // node, and the caller removes it, retries, and meets the next. Measured on a
+    // live rig; every missing type is knowable before the first queue.
+    //
+    // Refusing is safe here and nowhere else: a run carrying an unregistered type
+    // cannot succeed, so this blocks no working run. It fails SOFT — a lookup that
+    // could not be reached is `unknown`, never `missing`, because refusing on a
+    // failed metadata probe would trade one false failure for another.
+    try {
+      // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already
+      // dropped or rewritten every virtual and frontend-only node (Note, Reroute,
+      // PrimitiveNode, an extension's own display node), so what survives with no
+      // class_type is exactly what the server cannot execute — and nothing else.
+      //
+      // The earlier version probed /object_info per canvas type, which refused runs
+      // that would have SUCCEEDED because those virtual nodes have no object_info
+      // entry (review). It also cost one sequential round trip per type, capped at
+      // 200, against a snapshot that could drift from what the run actually sent.
+      // None of that applies here: no network, no cap, and the bytes inspected are
+      // the bytes that would have been POSTed.
+      const built = await app.graphToPrompt();
+      // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
+      // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
+      // result that does not exist has no unrunnable entries in it — and the check below
+      // reads `[]` as "the graph is fine". The undefined then reaches ComfyUI's own
+      // queuePrompt, which dereferences `.workflow` on it, and the caller gets
+      // "Cannot read properties of undefined (reading 'workflow')": a message that names
+      // nothing, reads like a panel crash, and gave the reporter no reason to suspect
+      // their graph. The run-to-node path has always refused this properly (#556); the
+      // full-graph path did not.
+      if (graphToPromptUnusable(built)) {
+        // Name what the FRONTEND could not resolve, from the ROOT graph — serialization is
+        // root-scoped, so scanning the currently VIEWED graph would miss a missing pack that
+        // lives in a subgraph, or lives at the root while the user is inside one (review).
+        // Types only, and only unregistered ones: a graph that failed to serialize for some
+        // other reason reports no cause rather than a wrong one.
+        throw new Error(
+          unserializableGraphRefusal(
+            // `LG` is a local in other functions, NOT in scope here — the panel-scope gate
+            // caught it as a live ReferenceError on CI. Read LiteGraph the same way those
+            // locals are initialised.
+            unresolvedNodeTypes(
+              rootGraph ?? graph,
+              (window.LiteGraph ?? globalThis.LiteGraph)?.registered_node_types ?? {},
+            ),
+          ),
+        );
+      }
+      const badIds = unrunnableNodeIds(built);
+      if (badIds.length) {
+        const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
+        throw new Error(missingNodeRunRefusal(describeUnrunnable(badIds, liveNodes)));
+      }
+    } catch (err) {
+      // Only OUR refusal propagates. Anything else (a broken fetch, a frontend
+      // without api.fetchApi) leaves the run exactly as it was before this existed —
+      // a pre-flight that becomes a new failure mode is worse than no pre-flight.
+      if (err instanceof Error && /^NOT queued:/.test(err.message)) throw err;
     }
     // Clamp batch_count to a sane range: coerce to a positive integer and cap it,
     // so an absurd value can't queue thousands of prompts (each of which would
@@ -13053,10 +14025,53 @@ const GRAPH_TOOL_EXECUTORS = {
       if (typeof s.syncWorkflows !== "function") {
         refresh = "unavailable";
       } else {
+        // #1448 r2 — "ok" must mean OBSERVED, not "the call returned".
+        //
+        // `syncWorkflows` is a VueUse `useAsyncState` execute wrapper, and the
+        // workflow store builds it with only `{immediate:false}` — so
+        // `throwError` is undefined, a failed re-read is caught into a private
+        // `error` ref, and execute RESOLVES NORMALLY. The store never exposes
+        // that ref. So the catch below cannot fire on a real frontend, and the
+        // previous version set "ok" unconditionally and told the agent "the
+        // workflow list WAS re-read from the server first" — a claim stronger
+        // than the wording this issue was filed about, and one nothing checked.
+        //
+        // What IS observable is the store itself. A genuine re-read rebuilds the
+        // list: entries appear, disappear (measured on a live rig: 109 → 107),
+        // or the array identity changes. Seeing any of that PROVES the read ran.
+        // Seeing none of it does not prove failure — an unchanged directory
+        // re-reads to an identical list — so that case is reported as exactly
+        // what it is: unconfirmed.
+        const fingerprintStore = () => {
+          const open = s.openWorkflows ?? [];
+          const saved = s.workflows ?? [];
+          // Counts AND array identity: a rebuild usually replaces the arrays even
+          // when the contents happen to match. classifyWorkflowRefresh decides.
+          return { counts: `${open.length}/${saved.length}`, open, saved };
+        };
+        // Is array IDENTITY informative on this frontend? A reactive getter that
+        // materialises a fresh array per access would make the identity test
+        // fire on every refresh, reporting "changed" unconditionally and putting
+        // the original bug back in new wording (review). Two reads with nothing
+        // between them answer it: if identity already differs, it carries no
+        // information and only counts are compared.
+        // Calibrated PER LIST: the store may expose one as a plain array and the
+        // other as a reactive getter, and a single flag would disable identity
+        // for both the moment either is fresh (review, round 2).
+        const control = fingerprintStore();
+        const before = fingerprintStore();
+        const openIdentityMeaningful = control.open === before.open;
+        const savedIdentityMeaningful = control.saved === before.saved;
         try {
           await s.syncWorkflows();
-          refresh = "ok";
+          const after = fingerprintStore();
+          refresh = classifyWorkflowRefresh(before, after, {
+            openIdentityMeaningful,
+            savedIdentityMeaningful,
+          });
         } catch (err) {
+          // Kept for a frontend that DOES set throwError, and for a store that
+          // throws synchronously before ever reaching useAsyncState.
           refresh = `failed: ${err?.message ?? err}`;
           console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
         }
@@ -13068,8 +14083,64 @@ const GRAPH_TOOL_EXECUTORS = {
       // (codex review). A successful re-read REMOVES stale entries — measured on a
       // live rig, the store went 109 to 107 — so a pre-refresh snapshot can offer a
       // workflow the re-read just deleted as an example of what is addressable.
-      const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
-      throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known })));
+      // #1448 — ASK THE SERVER before asserting the file is not there. Everything
+      // above this line is an in-memory scan of the frontend's store, and that store
+      // was MEASURED to lag disk in both directions: a file staged into the
+      // workflows folder out-of-band is on disk and absent from the store until a
+      // sync lands, and a file deleted out-of-band stays in the store after it is
+      // gone. The panel cannot even tell whether the sync succeeded. So this is the
+      // only step in the path that can contradict a stale list with evidence.
+      //
+      // Runs only on the refusal path — never on a successful open — so the extra
+      // round-trip costs nothing in the normal case.
+      //
+      // BOUNDED (codex P1). The refusal path had no deadline: a /userdata that accepts
+      // the request and never answers would hang panel_open_workflow forever, turning a
+      // wrong message into no message at all. withTimeout never rejects, so the timeout
+      // lands in the same fail-open "unknown" as every other failure.
+      // ABORTED, not merely abandoned (review r2). withTimeout stops us WAITING but
+      // cannot cancel the request, so a server that accepts and never answers would
+      // leave one live fetch per failed open, accumulating until the browser's
+      // connection pool is exhausted. Same idiom as fetchImageBytes.
+      const probeCtrl = new AbortController();
+      const probeTimer = setTimeout(() => probeCtrl.abort(), WORKFLOW_DISK_PROBE_MS);
+      const disk = await withTimeout(
+        (async () => {
+          try {
+            const reply = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false", {
+              signal: probeCtrl.signal,
+            });
+            return classifyDiskProbe(
+              {
+                ok: reply?.ok === true,
+                status: reply?.status,
+                body: reply?.ok ? await reply.json() : undefined,
+              },
+              path,
+            );
+          } catch (err) {
+            // FAIL OPEN. Every earlier round of this issue shipped a message that
+            // claimed more than it knew; a probe that turned a stale list into a
+            // confident "your file does not exist" would be that bug with more
+            // authority.
+            return { onDisk: "unknown", why: err?.message ?? String(err) };
+          }
+        })(),
+        WORKFLOW_DISK_PROBE_MS,
+        () => ({ onDisk: "unknown", why: `no answer within ${WORKFLOW_DISK_PROBE_MS}ms` }),
+      );
+      clearTimeout(probeTimer);
+      // The probe added an await to a path that previously had none, which widens the
+      // window for another sync or command to land the target in the store (codex P2).
+      // Re-check once: if it is addressable now, OPEN it rather than refusing with a
+      // verdict that went stale while we were proving it.
+      const late = find();
+      if (late) {
+        target = late;
+      } else {
+        const known = knownSelectorSample([...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]);
+        throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known, disk })));
+      }
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
@@ -17022,20 +18093,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       void sendHello();
     }, ROUTE_REFUSAL_RETRY_MS);
   }
-  /**
-   * Display label per connection status. The KEY of this map is the state token, which stays
-   * English because it is compared (`s !== "connected"` below) and keyed on elsewhere; only
-   * the VALUE is translated. Lazily via a function because this sits at module-adjacent scope
-   * and would otherwise capture the fallback before the catalog loads.
-   *
-   * Every key is a literal so `i18n-extract` can see it. That is the whole point: the previous
-   * shape built the key at runtime, which no static scan can follow.
-   */
-  const STATUS_LABEL = {
-    connected: () => tr("panel.status_connected", "connected"),
-    connecting: () => tr("panel.status_connecting", "connecting"),
-    disconnected: () => tr("panel.status_disconnected", "disconnected"),
-  };
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
@@ -17043,7 +18100,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // working), the provider-onboarding card is moot — hide it regardless of the
     // readiness probe, which can be wrong (e.g. a CLI the orchestrator's PATH
     // can't see). try/catch guards the case where the card isn't built yet.
-    if (s === "connected") { try { onboard.hidden = true; } catch {} }
+    // The onboarding card is hidden by the PANEL's own onStatus handler, which is where
+    // `onboard` actually lives. This used to reach for it from here — a sibling scope — so it
+    // threw ReferenceError on every connect, and the try/catch that was meant to guard "the
+    // card isn't built yet" swallowed that instead. The card simply never auto-hid.
     // #952 — the SOCKET this status is about. `"connected"` re-fires on every
     // re-handshake, so the string alone cannot distinguish a replacement connection
     // from the live one saying hello again; the id can, and a consumer that ignores
@@ -17109,6 +18169,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     handshakeDone = true;
     handshakenSock = sock;
     clearHandshake();
+    // #1145 — a real handshake is where an outage ENDS and its duration is finally
+    // known. Here and not at bare socket-open for the same reason the replay below is:
+    // an open socket only proves something holds the port, a `models` frame proves an
+    // orchestrator is behind it. A handshake that ended no outage records nothing (see
+    // the tracker in session-rebind.js).
+    bridgeOutage.noteHandshake();
     // Remember the user wants the agent connected, so we auto-reconnect after a
     // ComfyUI reboot / panel reopen (until they explicitly Disconnect). Mirror it
     // into the "Auto-connect on load" setting so the toggle reflects reality.
@@ -17826,7 +18892,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                   backendDown: comfyBackendSocketDown,
                   bindingSettleWindow: postReconnectBindingSettleWindow(),
                 });
-                if (reconnectGate) throw new Error(reconnectGate);
+                if (reconnectGate) throw reconnectRefusalError(reconnectGate);
               }
               const { graph, rootGraph } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
@@ -17914,6 +18980,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
           reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
+          const reconnectRefusal = readReconnectRefusal(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -17921,6 +18988,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // .message) would become the dead literal "[object Object]" on the
             // wire (#276). coerceMessageText extracts .message/.error or JSONs.
             error: coerceMessageText(err?.message ?? err),
+            // #1529 — the trusted side's own statement that the executor never
+            // ran, published as a FIELD. `error` is unchanged, so every existing
+            // reader is unaffected; a reader that wants to retry safely keys on
+            // this instead of matching the sentence, which a genuine mid-write
+            // failure could also contain.
+            //
+            // Via readReconnectRefusal, never `err.cmcpRefusal` directly: the
+            // raw property is inherited and settable, so an error thrown AFTER a
+            // write could carry it and be retried into a duplicate node. The
+            // reader answers the stronger question — did the gate mint this,
+            // pre-executor? — and returns a freshly built object.
+            ...(reconnectRefusal ? { refusal: reconnectRefusal } : {}),
           };
         }
         // Settle the rid ledger BEFORE the dead-socket drop below (#517): even
@@ -18146,7 +19225,27 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }
       pendingCalls.clear();
       clearHandshake();
-      lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
+      // #1145 — the OUTAGE begins at the FIRST close of a sequence and every close
+      // after it belongs to the same outage. A refused reconnect attempt reaches here
+      // exactly like a real drop does (`sock` is assigned at construction, so a socket
+      // that never opened is still the active one), and re-stamping on those reset the
+      // clock to the last backoff step. The tracker ignores all but the first; the
+      // outage stands until markConnected() ends it.
+      //
+      // A panel-DRIVEN teardown never reaches here — stop()/setUrl()/destroy() null
+      // `sock` synchronously, so their late close fails the isActive() guard above.
+      // #1146 called that harmless on the grounds that every such path clears
+      // MID_TASK_KEY, and that is not quite true: connectBackend() clears it only when
+      // `switching`. (hardRestart() had the same hole and no longer does — #1166.)
+      //
+      // A WEDGED orchestrator is not covered here either: it holds its socket OPEN and
+      // answers nothing, so no close ever fires and no outage is recorded for a death
+      // the panel then resolves by force-respawning it. Both gaps are real and are
+      // tracked as their own issue rather than patched from here — two attempts to
+      // record those deaths from the teardown side turned a MISSED nudge into a FALSE
+      // one, because the teardown functions cannot distinguish "the orchestrator died"
+      // from "the user changed the bridge URL" or "the agent has not booted yet".
+      bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
         // connecting-vs-terminal based on the patience window). Do NOT flip to
@@ -18829,6 +19928,11 @@ const PANEL_CSS = `
 }
 .cmcp-settings > summary::before { content: "▸"; transition: transform 0.15s; }
 .cmcp-settings[open] > summary::before { transform: rotate(90deg); }
+/* A collapsed disclosure caret points AT the text it would reveal, which is leftwards in
+   Arabic and Persian; CSS content cannot go through tr(), so mirror it here. The open state
+   points down in both directions, so it keeps the plain rotation. */
+[dir="rtl"] .cmcp-settings > summary::before { transform: scaleX(-1); }
+[dir="rtl"] .cmcp-settings[open] > summary::before { transform: rotate(90deg); }
 .cmcp-settings-body { padding: 0 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
 .cmcp-label { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8462); color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-input {
@@ -20685,33 +21789,40 @@ function buildPanel() {
     // refreshes immediately. Windows env vars do NOT reach an already-running
     // orchestrator (processes snapshot their env at spawn), which is exactly
     // the trap a #help user fell into — so the hints lead with the card.
+    // These 22 strings are the panel's entire answer to "why can't I use this provider", and
+    // every one of them shipped in English to every locale. No detector could see them: the
+    // literal sits at a `return`, not next to a display sink, so the unwired scan has nothing
+    // to anchor on and coverage cannot miss a key that was never created.
+    //
+    // Command text stays verbatim inside the translated sentence — `ollama serve`, `codex
+    // login`, `MOONSHOT_API_KEY` are things the user types or an env var name, not prose.
     if (r.cli === false) {
       // For openrouter, "cli" is really "API key present" — no CLI to install.
-      if (b.backend === "openrouter") return "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately";
+      if (b.backend === "openrouter") return tr("panel.not_ready_openrouter_no_key", "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately");
       // For custom, "cli" is "a base URL is configured" — nothing to install.
-      if (b.backend === "custom") return "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)";
-      if (b.backend === "ollama") return "Ollama not installed — get it at ollama.com/download";
-      if (b.backend === "lmstudio") return "LM Studio not installed — get it at lmstudio.ai";
-      if (b.backend === "llamacpp") return "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)";
-      if (b.backend === "antigravity") return "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.";
-      if (b.backend === "pi") return "Install the pi CLI (pi.dev) and configure a provider (set a provider API key, or run `pi` once and `/login`).";
-      return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
+      if (b.backend === "custom") return tr("panel.not_ready_custom_no_endpoint", "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)");
+      if (b.backend === "ollama") return tr("panel.not_ready_ollama_not_installed", "Ollama not installed — get it at ollama.com/download");
+      if (b.backend === "lmstudio") return tr("panel.not_ready_lmstudio_not_installed", "LM Studio not installed — get it at lmstudio.ai");
+      if (b.backend === "llamacpp") return tr("panel.not_ready_llamacpp_not_on_path", "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)");
+      if (b.backend === "antigravity") return tr("panel.not_ready_antigravity_install_cli", "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.");
+      if (b.backend === "pi") return tr("panel.not_ready_pi_install_cli", "Install the pi CLI (pi.dev) and configure a provider (set a provider API key, or run `pi` once and `/login`).");
+      return tr("panel.not_ready_cli_not_installed", "{label} CLI not installed", { label: BACKEND_LABELS[b.backend] || b.backend });
     }
-    if (b.backend === "codex") return "Not signed in — Sign in via API Keys (▾ menu) or run: codex login";
-    if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
-    if (b.backend === "antigravity") return "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.";
-    if (b.backend === "pi") return "No provider configured — set a provider API key (e.g. ANTHROPIC_API_KEY) or run `pi` once and `/login`.";
-    if (b.backend === "grok") return "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok";
-    if (b.backend === "kimi") return "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi";
-    if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
-    if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
-    if (b.backend === "llamacpp") return "llama-server not running — llama-server -m model.gguf --jinja -c 16384";
-    if (b.backend === "openrouter") return "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "moonshot") return "No Moonshot API key — add MOONSHOT_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "glm") return "No z.ai API key — add ZAI_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "minimax") return "No MiniMax API key — add MINIMAX_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately";
-    if (b.backend === "custom") return "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)";
-    return "Not signed in — run: claude auth login";
+    if (b.backend === "codex") return tr("panel.not_ready_codex_signed_out", "Not signed in — Sign in via API Keys (▾ menu) or run: codex login");
+    if (b.backend === "gemini") return tr("panel.not_ready_gemini_signed_out", "Not signed in — run: gemini (then sign in with Google)");
+    if (b.backend === "antigravity") return tr("panel.not_ready_antigravity_install_cli", "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.");
+    if (b.backend === "pi") return tr("panel.not_ready_pi_no_provider", "No provider configured — set a provider API key (e.g. ANTHROPIC_API_KEY) or run `pi` once and `/login`.");
+    if (b.backend === "grok") return tr("panel.not_ready_grok_signed_out", "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok");
+    if (b.backend === "kimi") return tr("panel.not_ready_kimi_signed_out", "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi");
+    if (b.backend === "ollama") return tr("panel.not_ready_ollama_not_running", "Ollama not running — run: ollama serve");
+    if (b.backend === "lmstudio") return tr("panel.not_ready_lmstudio_not_running", "LM Studio server not running — LM Studio → Developer → Start Server");
+    if (b.backend === "llamacpp") return tr("panel.not_ready_llamacpp_not_running", "llama-server not running — llama-server -m model.gguf --jinja -c 16384");
+    if (b.backend === "openrouter") return tr("panel.not_ready_openrouter_no_key", "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "moonshot") return tr("panel.not_ready_moonshot_no_key", "No Moonshot API key — add MOONSHOT_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "glm") return tr("panel.not_ready_glm_no_key", "No z.ai API key — add ZAI_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "minimax") return tr("panel.not_ready_minimax_no_key", "No MiniMax API key — add MINIMAX_API_KEY via API Keys (▾ menu by “connected”); takes effect immediately");
+    if (b.backend === "custom") return tr("panel.not_ready_custom_no_endpoint", "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)");
+    return tr("panel.not_ready_claude_signed_out", "Not signed in — run: claude auth login");
   }
 
   function renderBackendChips(backends) {
@@ -20926,7 +22037,13 @@ function buildPanel() {
     "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
   advToggle.addEventListener("click", () => {
     advWrap.hidden = !advWrap.hidden;
-    advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
+    // Both arrow states need a key of their own. The FIRST render went through tr(), but
+    // this handler rewrote the label from a literal — so one click reverted the control to
+    // English and nothing ever put it back. A coverage check cannot see this: the key
+    // exists, is translated, and is used; it is just overwritten on interaction.
+    advToggle.textContent = advWrap.hidden
+      ? tr("panel.advanced", "Advanced ▸")
+      : tr("panel.advanced_expanded", "Advanced ▾");
   });
 
   // NOTE: the provider switcher (backendLabel + backendChips) moved INTO the model
@@ -21059,6 +22176,11 @@ function buildPanel() {
     custom: { label: tr("panel.custom_endpoint_any_openai_compatible", "Custom endpoint (any OpenAI-compatible)"), install: "", login: tr("panel.set_the_base_url_and_api_key", "Set the base URL (and API key if needed) in Settings › Custom endpoint") },
   };
   let anyReady = false;
+  // The last connection status THIS panel was told about. The bridge client keeps its own
+  // `lastStatus` for de-duping, but that lives in `createBridgeClient` — a sibling scope — so
+  // reading it from here threw ReferenceError and took the whole provider-list render with it
+  // (#1136). The panel has to remember what it was handed.
+  let liveStatus = null;
   // (autoPickDone is module-scoped now — once per PAGE, not per mount, so workflow
   // switches can't re-arm the spurious provider fallback.)
   const onboard = document.createElement("div");
@@ -21164,7 +22286,7 @@ function buildPanel() {
     anyReady = typeof data?.any_ready === "boolean" ? data.any_ready : list.some((b) => b.ready);
     // Never show the setup card while connected — a live agent means a provider
     // works, whatever the probe reports.
-    if (list.length && !anyReady && lastStatus !== "connected") {
+    if (list.length && !anyReady && liveStatus !== "connected") {
       renderOnboard(list);
       onboard.hidden = false;
     } else {
@@ -21847,10 +22969,20 @@ function buildPanel() {
     // #43: the LAST RUNTIME pick (STORAGE_KEY_BACKEND, already in selectedBackend)
     // must survive a panel REMOUNT — navigating away and back was silently swapping
     // an active Codex session to the durable default (Claude) and dropping the
-    // conversation. A Settings-dialog change to the default already writes
-    // STORAGE_KEY_BACKEND (via applyBackend→connectBackend), so the two only diverge
-    // after a session-only chip pick — and then the runtime pick wins. Fall back to
-    // the durable default ONLY when there's no runtime pick yet (first-ever load).
+    // conversation. A Settings-dialog change to the default USUALLY writes
+    // STORAGE_KEY_BACKEND too (via applyBackend→connectBackend), so the two normally
+    // diverge only after a session-only chip pick — and then the runtime pick wins. Fall
+    // back to the durable default ONLY when there's no runtime pick yet (first-ever load).
+    //
+    // #1184 — "usually", not "always", and the exception is deliberate. A switch whose
+    // session invalidation fails now commits NOTHING, including this key, so the runtime
+    // pick keeps naming the backend the panel is actually connected to. The Settings value
+    // and the runtime pick then disagree, and this resolves in favour of the runtime pick,
+    // which is the correct half: it is the one backed by a live connection. Before that
+    // fix the key was written first and the divergence resolved the other way — a reload
+    // adopting a backend the panel had never reached, which is the bug #1184 reports.
+    // (ComfyUI persists the Settings value before notifying us at all, so the dialog will
+    // still show the un-taken choice; that half is #1198.)
     let runtimePick = null;
     try {
       runtimePick = window.localStorage.getItem(STORAGE_KEY_BACKEND);
@@ -22359,6 +23491,14 @@ function buildPanel() {
       if (small) {
         const s = document.createElement("small");
         s.textContent = small;
+        // The row deliberately truncates this line rather than the provider NAME (see the
+        // cmcp-provider call site), and the CSS is nowrap + ellipsis. For a not-ready
+        // provider this line carries the recovery instruction — and the actionable part is
+        // TERMINAL in every one of them ("… — run: ollama serve", "… or run `pi` once and
+        // /login"), so the ellipsis eats precisely what the user needs. With no title there
+        // was no way to recover it at all. Already true of the 109-character English string;
+        // translations run up to 40% longer. The chip path next door has always done this.
+        s.title = small;
         el.appendChild(s);
       }
       // Always render the check (visibility toggled) so the column is reserved
@@ -23204,6 +24344,54 @@ function buildPanel() {
     ssSet(SESSION_KEY, null);
     if (thread) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
+    // #1171 — DELIBERATELY UNBOUNDED, after a bound was added here and removed again.
+    //
+    // The reasoning for adding one: hardRestart now holds the reload re-entrancy guard
+    // across this call, so an await that never settles would latch that guard for the rest
+    // of the session. That is a real shape — it is what two earlier attempts at the sibling
+    // bug produced — but it is not reachable through this store, and the bound cost more
+    // than the hazard it removed.
+    //
+    // WHY IT SETTLES. `flush()` awaits the store's serial `_writePromise`. Every write in
+    // that chain resolves on all THREE terminal transaction outcomes — complete, error and
+    // abort — `db.transaction(...)` is itself wrapped in try/catch, and `openDb` is capped
+    // by `IDB_OPEN_TIMEOUT_MS` and resolves null past it. There is no modelled path on
+    // which this promise simply never settles.
+    //
+    // (Named in prose rather than as handler identifiers on purpose: the registry parity
+    // scan flags a shipped file carrying both an svg mention and those literal tokens, and
+    // this comment tripped it once already.)
+    //
+    // MEASURED, against a store whose IndexedDB `open` fires no handler at all — the worst
+    // slow store there is. It SETTLES, on the store's own 2s open cap, which is the property
+    // the widened guard depends on.
+    //
+    // WHAT IT REPORTS DEPENDS ON HOW MUCH HISTORY THERE IS, and an earlier version of this
+    // comment got that wrong in a way worth recording. A capped open makes `idbMergeWrite`
+    // yield null, so `persist()` falls back to the LOCAL SHADOW's completeness — and the
+    // shadow is deliberately partial past `LOCAL_SHADOW_THREADS` (20) and
+    // `LOCAL_SHADOW_MESSAGES` (200). Measured:
+    //
+    //     1 thread /   5 messages   flush() -> true    (this returns true)
+    //     1 thread / 400 messages   flush() -> ok:false (this returns FALSE)
+    //    30 threads                 flush() -> ok:false (this returns FALSE)
+    //
+    // So for any user with real history, a two-second disk hiccup answers false here. That
+    // is not a store fault and there is nothing to fix in this function — but the callers
+    // must treat false as "could not confirm", not as "the store is broken", and the
+    // backend-switch caller currently cannot (see #1184).
+    //
+    // The first probe of this used a single five-message thread and generalised from it,
+    // which is the same class of error as sizing a bound from the wrong measurement. Test
+    // the heavy case: `browser_tests/unit/chat-history-store.test.mjs`.
+    //
+    // WHAT THE BOUND COST. `flush()` awaits the WHOLE queued chain — including the
+    // full-snapshot write `persistThreads()` enqueues one line above — so a timeout meant
+    // "the queue was busy", not "the store is broken". It gave this function a new way to
+    // answer false for a healthy store, and that answer lands on two exits that cannot
+    // absorb it: connectBackend abandons a switch whose chips, prefs and armed replay have
+    // already committed to the new backend, and hardRestart skips `client.start()` and
+    // strands the bridge for a write that then lands a moment later.
     const result = await historyStore.flush();
     return result === true || result?.ok === true;
   }
@@ -23559,6 +24747,14 @@ function buildPanel() {
       b.appendChild(badge);
     }
     if (opts.mid) b.dataset.mid = opts.mid;
+    // Keep the message's own text next to the bubble, because ✎-edit falls back to reading
+    // the bubble when the pending record has been evicted — and `b.textContent` is the
+    // WHOLE subtree, which by now includes the workflow-version badge ("{count} nodes · …")
+    // and any attachment chips. Those are translated, so the fallback would paste UI text
+    // into the composer, in a different language than the one that was tested. Only live
+    // messages carry a mid and only those are reachable from editMsg, so this stays bounded
+    // to the send queue rather than every replayed bubble in history.
+    if (opts.mid) b.dataset.raw = typeof text === "string" ? text : String(text ?? "");
     // Hover edit/rollback button — only on live messages (those with a mid).
     // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
     if (opts.mid) {
@@ -23858,7 +25054,11 @@ function buildPanel() {
 
     const apply = (collapsed) => {
       card.classList.toggle("cmcp-media-collapsed", collapsed);
-      btn.textContent = collapsed ? "▸" : "▾";
+      // The catalog mirrors the collapsed caret for RTL (Arabic ships ◂ for panel.advanced),
+      // so a hard-coded ▸ here renders pointing the wrong way next to translated ones.
+      btn.textContent = collapsed
+        ? tr("panel.caret_collapsed", "▸")
+        : tr("panel.caret_expanded", "▾");
       const title = showHideTitle(collapsed);
       btn.title = title;
       btn.setAttribute("aria-label", title);
@@ -24479,7 +25679,12 @@ function buildPanel() {
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
-          what: "question",
+          // Spliced into a TRANSLATED sentence downstream, so an English literal here reads
+          // as "…الذي أرسل question، لذا…". The consumer's own nullish fallback for this hole
+          // never rescues it, because this path always supplies a value.
+          // Described rather than quoted: writing that fallback's call shape here would read
+          // as an unparseable call site to the extractor's round-trip guard.
+          what: tr("panel.question", "question"),
         }),
       abandon,
     });
@@ -24854,7 +26059,9 @@ function buildPanel() {
   function editMsg(mid) {
     const entry = pendingMsgs.get(mid);
     const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
-    const raw = entry?.raw ?? bubble?.textContent ?? "";
+    // `bubble.textContent` is the last resort only: it flattens the badge and chips that
+    // paintUser appends, all of which are translated (see the dataset.raw note there).
+    const raw = entry?.raw ?? bubble?.dataset?.raw ?? bubble?.textContent ?? "";
     deleteMsg(mid); // cancels on server + removes bubble + trailing record
     setComposerValue(raw);
     input.focus();
@@ -26463,6 +27670,12 @@ function buildPanel() {
       // unknown status falls back to the raw token, which is the current behaviour anyway.
       // Described, not illustrated: writing the rejected form here would trip the guard.
       statusText.textContent = STATUS_LABEL[state]?.() ?? state;
+      liveStatus = state;
+      // Once the agent is up, a provider demonstrably works, so the setup card is moot
+      // whatever the readiness probe says. This side effect used to live in the client's
+      // emitStatus, which cannot see `onboard`. try/catch still guards the genuine case the
+      // original comment described: a status arriving before the card is built.
+      if (state === "connected") { try { onboard.hidden = true; } catch {} }
       // #952 — a card painted on a connection that has since been REPLACED can no longer
       // deliver an answer. The trigger is the socket's identity, not the status string:
       // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
@@ -26493,7 +27706,15 @@ function buildPanel() {
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
-      connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      // The status pill three lines up routes through STATUS_LABEL; this button was missed
+      // in the same sweep, so the pill translated and the control beside it stayed English
+      // in every locale. The raw token still drives the branch (and `disabled` above) —
+      // only the rendered label goes through tr(), which is the whole point of fixing this
+      // at the render boundary rather than translating the state.
+      connectBtn.textContent =
+        state === "connecting"
+          ? tr("panel.connecting_button", "Connecting…")
+          : tr("panel.connect", "Connect");
       // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
       // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
       // again. The bound only prevents a loop WITHIN one unsuccessful connect. Also
@@ -26831,6 +28052,14 @@ function buildPanel() {
         showThinking();
         noteActivity(); // turn start = real activity → seed the silence clock
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
+        // #1145 — and arm it against THIS turn's outages only. The nudge tells the agent
+        // its connection dropped mid-task; an outage that ended before the turn began is
+        // not evidence about the turn now running, and leaving it standing is how a
+        // `ready` that merely repeats on a live socket (a #310 free_vram re-advertise,
+        // say) would read a long-settled drop as this turn's and nudge a working agent.
+        // Same defect #1138 fixed for the never-dropped sentinel, one step along: there
+        // the stale value was 0, here it is a real duration from an earlier outage.
+        bridgeOutage.noteTurnStarted();
       } else if (state === "done") {
         agentWorking = false;
         // Turn over: drop the owner so a later reconnect re-push (which has no
@@ -27253,7 +28482,32 @@ function buildPanel() {
         // the agent's turn kept running — so a "you dropped" nudge is false AND
         // would inject a spurious turn into a live session. A real ComfyUI restart
         // takes many seconds to come back, so a long gap since the drop = real.
-        if (Date.now() - lastBridgeDownAt < 6000) return;
+        //
+        // #1138 — AND the bridge must actually have dropped. The drop stamp this used to
+        // read was 0 until the bridge socket closed, and 0 did not mean "no drop" to the
+        // subtraction it fed: `Date.now() - 0` is ~56 years, the LONGEST possible gap,
+        // which this heuristic reads as the most certain evidence of a real restart.
+        // So the guard was exactly inverted in the case it exists to catch — the
+        // better established it was that nothing dropped, the more confidently it
+        // nudged. The intent above was right from the start; only the sentinel's
+        // arithmetic betrayed it.
+        //
+        // Reachable on a LIVE socket because `ready` repeats on one (see the client's
+        // own note): a re-advertise draws a fresh handshake, and #310 re-advertises
+        // after every successful free_vram by design. So a user who freed VRAM
+        // mid-task could be told their connection had dropped — and the agent told to
+        // resume work it was still doing — with no drop anywhere in the session.
+        //
+        // #1145 — and the interval weighed is the OUTAGE this turn saw, measured once at
+        // the handshake that ended it, not `Date.now()` minus a stamp every failed retry
+        // rewrote. A stamp read at this moment answers "how long since the last drop,
+        // whenever that was"; the question here is "how long was THIS connection gone".
+        //
+        // The decision moved into session-rebind.js so it is unit-tested by BEHAVIOUR.
+        // A source-scan over this file could only assert the guard's tokens are present,
+        // and #1096's review demonstrated by mutation that such a test stays green when
+        // the guard is inverted — which is the one regression that matters here.
+        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         client.sendUserMessage(
@@ -27332,10 +28586,27 @@ function buildPanel() {
       const fd = new FormData();
       fd.append("image", blob, name);
       if (type) fd.append("type", type);
-      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-      if (res.status !== 200) return null;
-      const info = await res.json();
-      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
+      // #1188 — bounded, request AND body. On timeout this resolves the sentinel and falls
+      // through to the SAME `null` this function already returns for every other failure,
+      // so no caller learns a new shape.
+      //
+      // FIVE call sites, counted rather than remembered: cmcp-apps-ui.js:1697,
+      // cmcp-civitai-ui.js:1196, cmcp-training-ui.js:754, lib/media-preview.js:893 and
+      // lib/run-completion-frame.js:407. An earlier version of this comment said "all four
+      // already branch on a null ref today" and was wrong on both halves — there were five,
+      // and civitai's did not branch at all: muted it announced a save that never happened,
+      // unmuted it dereferenced `ref.filename`. That is fixed at the site. The claim is only
+      // safe to make BECAUSE it was checked, which is the reason it now names each one.
+      const out = await boundedUpload(
+        async () => {
+          const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+          if (res.status !== 200) return null;
+          const info = await res.json();
+          return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
+        },
+        { size: blob?.size, withTimeout },
+      );
+      return out === UPLOAD_NO_ANSWER ? null : out;
     } catch {
       return null;
     }
@@ -27490,12 +28761,35 @@ function buildPanel() {
     // cancelled/disconnected). It's been evicted from the ledger; surface a
     // one-time "status unknown, safe to requeue" notice so the agent stops waiting.
     onReconcileGiveUp: ({ promptId }) => {
+      // comfyui-mcp#1489 (defect 3) — AN UNCONFIRMABLE RUN IS NOT A FAILED ONE.
+      //
+      // This used to send `kind: "run_error"`, whose own text said the outcome "could
+      // not be confirmed … likely cancelled … safe to requeue" — while the orchestrator
+      // routes any run_error through `injectRunError`, which INTERRUPTS the live turn,
+      // front-queues it, and tells the agent "The user's workflow run just ERRORED …
+      // diagnose it". Cancel a 26-prompt batch and that is 26 interrupts asserting a
+      // failure this panel never observed. #1507 stopped them compounding across turns;
+      // they were still 26 urgent errors for 26 unknowns.
+      //
+      // The correct pattern is the sibling branch above, and its comment already argues
+      // this case: `executed` with a note is the existing NON-URGENT event protocol and
+      // does not claim an output was produced. Interrupted knows the run was cancelled;
+      // give-up knows only that it cannot tell — and "cannot tell" is further from "it
+      // failed", not closer. `run_error` has to keep meaning WE KNOW IT FAILED, or the
+      // agent cannot act on it.
+      //
+      // Everything else this path does is unchanged: the delivery-unconfirmed flag
+      // (#585), the reboot-marker prune, and the one-time surfacing below.
       const sent = client.sendFrame({
         type: "agent_event",
-        kind: "run_error",
-        error:
-          `Render status for prompt ${promptId} could not be confirmed after reconnecting ` +
-          `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
+        kind: "executed",
+        note:
+          `The outcome of your queued run (prompt ${promptId}) could NOT be confirmed after ` +
+          `reconnecting — the server has no history for it, which is what a cancelled or ` +
+          `interrupted run looks like. This is NOT a reported failure: nothing was observed ` +
+          `going wrong. It is also not proof nothing was produced — if the connection dropped ` +
+          `mid-run, any outputs it did write are simply not recorded here, so check ` +
+          `get_history (action:"list") before re-queueing anything expensive.`,
       });
       appendSystem(
         tr("panel.render_status_unknown_for_prompt_safe_to", "Render status unknown for prompt {promptId} — safe to requeue.", { promptId }),
@@ -28502,10 +29796,36 @@ function buildPanel() {
   // no agent answers on the bridge. Reset on each user Connect AND on a successful
   // handshake (both call resetAutoReclaim) so it can re-appear for a later drop.
   let externalHintShown = false;
+  /** Bridges this session already fell back to, so two dead ports cannot loop. */
+  const bridgeFallbacksTried = new Set();
   function showExternalHintOnce() {
     if (externalHintShown) return;
-    externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
+    // #1136 — before declaring nobody is listening, try the bridge that SHOULD be
+    // there. A configured URL can outlive the process that owned it (a migrated
+    // ephemeral port, or one the user typed before the orchestrator moved), and in
+    // external-orchestrator mode nothing corrects it: /connect is deliberately not
+    // POSTed, so the advertised bridge_url never arrives. Liveness is already known
+    // HERE — this runs precisely because the dial failed — so no guess about who
+    // chose the URL is needed.
+    const plan = bridgeFallbackPlan({
+      configured: bridge,
+      fallback: defaultBridgeUrlFor(selectedBackend),
+      attempted: bridgeFallbacksTried,
+    });
+    if (plan) {
+      bridgeFallbacksTried.add(plan.key);
+      appendSystem(plan.notice);
+      // { persist: false } is REQUIRED, not incidental. setUrl saves the URL as the
+      // bridge default unless told otherwise, so persisting here would (a) make the
+      // notice's "your configured URL has NOT been changed" a lie, and (b) write the
+      // fallback in as a new default that can itself go stale later — manufacturing
+      // the very bug this fixes. The flag exists for exactly this: "ephemeral URLs
+      // ... so they don't get saved as the bridge default and go stale next load".
+      client.setUrl(plan.url, { persist: false });
+      return; // the hint is only true once the fallback has failed too
+    }
+    externalHintShown = true;
     appendSystem(
       tr(
         "panel.no_agent_is_listening_on_the_bridge",
@@ -28969,81 +30289,106 @@ function buildPanel() {
   }
 
   async function connectBackend(id) {
-    // CENTRALIZED per-backend seeding: every switch path routes through here — the
-    // backend chips, the model-popover provider row, AND the Settings backend combo
-    // (panelHooks.applyBackend). When the target backend differs from the one prefs
-    // currently reflect (connectedBackend if connected, else the last-picked
-    // selectedBackend), seed prefs from the NEW backend's group BEFORE connecting, so
-    // the post-handshake push uses the new backend's model/effort — never the
-    // previous backend's stale values. A re-pick of the same backend doesn't reseed.
-    const prevBackend = connectedBackend || selectedBackend;
-    if (id !== prevBackend) seedPrefsForBackendSwitch(id);
-    selectedBackend = id;
-    try {
-      window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
-    } catch {
-      // localStorage unavailable — selection just won't persist.
-    }
-    // FIX 1 — do NOT write SETTING_BACKEND here. A live composer/chip backend switch
-    // is TEMPORARY/session-only and must NOT change the saved Settings default. The
-    // old setSetting(SETTING_BACKEND, id) re-entered through SETTING_BACKEND.onChange →
-    // applyBackend → connectBackend → setSetting → … (ComfyUI fires onChange async,
-    // AFTER setSetting's suppressSettingOnChange has already reset), so each switch
-    // overlapped multiple connects and the bridge's close-old-on-new-hello looped
-    // (the 9181 "ready"/"waiting" storm). The Settings "Default agent backend" now
-    // changes ONLY when the user edits it in the Settings dialog. Runtime selection
-    // still persists in STORAGE_KEY_BACKEND above (drives backendNow()'s timings).
-    renderBackendChips(
-      Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
-        backend: el.dataset.backend,
-        running: el.dataset.running === "1",
-      })),
-    );
-    // Switching to a DIFFERENT backend than we're connected to: agent sessions are
-    // NOT shareable across providers, so start FRESH for the new one (fix #2).
-    // Sending the saved (foreign) session id on hello makes the new orchestrator
-    // try to resume a session it doesn't own (stuck awaiting handshake +
-    // a spurious re-send). Mirror newChat()'s session-clear so getResume() → null;
-    // the visible chat log stays, only the agent session resets.
-    const switching = connectedBackend !== null && connectedBackend !== id;
-    if (switching) {
-      // Switching providers abandons the old agent session (not portable across
-      // backends). End the turn locally — like the Disconnect handler — so the
-      // working indicator doesn't outlive the session we're dropping (the client
-      // .stop() below sets closed=true, suppressing the onStatus that would hide).
-      endTurnLocally();
-      // Replay the visible transcript to the NEW provider as one-shot context so
-      // its fresh session has the conversation (session/thinking aren't portable
-      // across providers). Consumed by the next user message, then auto-cleared.
-      const replay = buildReplayTranscript();
-      if (replay) client.armContext(replay);
-      // The old provider's session must be durably invalid before any reconnect
-      // can observe it. If reconnect fails or the browser closes here, reload
-      // still starts fresh instead of restoring a foreign session.
-      if (!await invalidateDurableAgentSession()) return;
-    }
-    // Reflect the picked backend in the composer placeholder immediately; onModels
-    // reaffirms it authoritatively from the handshake (fix #3).
-    setAskPlaceholder(id);
-    // CLEAN TEARDOWN before the (re)connect (fix #1). The old fromChip path bypassed
-    // the in-flight guard, so a chip pick could OVERLAP a sticky-reconnect already
-    // in flight — re-delivering the prior pending message (a visible duplicate) and
-    // starting a reconnect storm that trips the orchestrator's bounded-restart
-    // give-up ("the agent session keeps dropping"). Tearing the bridge down and
-    // clearing the guard first means EXACTLY ONE connect runs for the new backend.
-    client.stop();
-    connecting = false;
-    // FIX 2 — refresh the bridge URL (and the Advanced URL field) before
-    // reconnecting. Single-port now, so this is normally the same 9180 URL for
-    // every backend — it still matters when a custom Bridge URL override is set.
-    // /connect's returned bridge_url still applies on top. The client is stopped, so
-    // setUrl only updates its `url` here (its connect() no-ops while closed);
-    // connectAgent's client.start() opens it. urlInput has no settings onChange wired,
-    // so updating it can't re-enter the storm.
-    const nextUrl = configuredBridgeUrlFor(id);
-    urlInput.value = nextUrl;
-    if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
-    void connectAgent({ fromChip: true });
+    // #1184 — the ORDER lives in lib/backend-switch.js, and it is an order rather than a
+    // repair. This function used to commit the new backend — prefs, `selectedBackend`,
+    // `localStorage`, the chips, `endTurnLocally()`, the armed replay — and only THEN check
+    // whether the old provider's session could be durably invalidated, returning silently
+    // when it could not. The panel was left claiming a backend it had never connected to,
+    // and `STORAGE_KEY_BACKEND` outlives the tab, so a reload adopted that choice for good.
+    //
+    // Committing later rather than rolling back: an undo would have to restore six pieces
+    // of state, and `armContext` has no disarm affordance at all.
+    const { switched } = await runBackendSwitch(id, {
+      liveBackend: () => connectedBackend,
+      pickedBackend: () => selectedBackend,
+      // The old provider's session must be durably invalid before any reconnect can observe
+      // it. If the reconnect fails or the browser closes, a reload must start fresh rather
+      // than restore a foreign session.
+      invalidate: () => invalidateDurableAgentSession(),
+      // CENTRALIZED per-backend seeding: every switch path routes through here — the backend
+      // chips, the model-popover provider row, AND the Settings backend combo
+      // (panelHooks.applyBackend). Seeding from the NEW backend's group before connecting is
+      // what stops the post-handshake push carrying the previous backend's stale
+      // model/effort. A re-pick of the same backend does not reseed; the caller decides.
+      seedPrefs: (next) => seedPrefsForBackendSwitch(next),
+      // ONE STEP, deliberately. `renderBackendChips` highlights on `selectedBackend` and
+      // `connectAgent` POSTs it, so these three writes have to land together and before the
+      // connect; splitting them silently connects to the previous backend.
+      commitSelection: (next) => {
+        selectedBackend = next;
+        try {
+          window.localStorage.setItem(STORAGE_KEY_BACKEND, next);
+        } catch {
+          // localStorage unavailable — the selection just won't persist.
+        }
+        // FIX 1 — do NOT write SETTING_BACKEND here. A live composer/chip switch is
+        // TEMPORARY/session-only and must not change the saved Settings default. The old
+        // setSetting(SETTING_BACKEND, id) re-entered through SETTING_BACKEND.onChange →
+        // applyBackend → connectBackend → setSetting → … (ComfyUI fires onChange async,
+        // AFTER suppressSettingOnChange has reset), so each switch overlapped multiple
+        // connects and the bridge's close-old-on-new-hello looped (the 9181
+        // "ready"/"waiting" storm). Runtime selection persists in STORAGE_KEY_BACKEND above.
+        renderBackendChips(
+          Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
+            backend: el.dataset.backend,
+            running: el.dataset.running === "1",
+          })),
+        );
+      },
+      // Like the Disconnect handler: the working indicator must not outlive the session
+      // being dropped (the client .stop() below sets closed=true, suppressing the onStatus
+      // that would hide it).
+      endTurn: () => endTurnLocally(),
+      // Agent sessions are NOT shareable across providers, so the new one starts fresh and
+      // the visible transcript is replayed to it as one-shot context (session/thinking are
+      // not portable). Consumed by the next user message, then auto-cleared.
+      buildReplay: () => buildReplayTranscript(),
+      armContext: (replay) => client.armContext(replay),
+      teardownAndConnect: (next) => {
+        // Reflect the picked backend in the composer placeholder immediately; onModels
+        // reaffirms it authoritatively from the handshake (fix #3).
+        setAskPlaceholder(next);
+        // CLEAN TEARDOWN before the (re)connect (fix #1). The old fromChip path bypassed the
+        // in-flight guard, so a chip pick could OVERLAP a sticky-reconnect already in flight
+        // — re-delivering the prior pending message (a visible duplicate) and starting a
+        // reconnect storm that trips the orchestrator's bounded-restart give-up. Tearing the
+        // bridge down and clearing the guard first means EXACTLY ONE connect runs.
+        client.stop();
+        connecting = false;
+        // FIX 2 — refresh the bridge URL (and the Advanced URL field) before reconnecting.
+        // Single-port now, so this is normally the same 9180 URL for every backend; it still
+        // matters when a custom Bridge URL override is set. /connect's returned bridge_url
+        // still applies on top. The client is stopped, so setUrl only updates its `url`
+        // here; connectAgent's client.start() opens it.
+        const nextUrl = configuredBridgeUrlFor(next);
+        urlInput.value = nextUrl;
+        if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
+        void connectAgent({ fromChip: true });
+      },
+      // REASON-AWARE, and there is only one reason left that warrants saying anything.
+      //
+      // INVALIDATE_FAILED is the #1184 case: no backend state committed, still on the old
+      // provider, and the switch genuinely did not happen. hardRestart's existing line says
+      // that, and it is honest at this site only because the reorder means nothing has been
+      // committed by the time it runs. It is narrower than it looks, though: the SESSION is
+      // already invalid regardless (the invalidate destroys it before reporting), so this
+      // speaks for the switch and not for the session — #1198 tracks the rest.
+      //
+      // There used to be a second, SUPERSEDED, for a handshake landing mid-await. That path
+      // no longer aborts — dropping the user's explicit pick was worse than the race — so
+      // there is nothing left to disclose there. The guard on the reason stays, because a
+      // future outcome must opt IN to borrowing this string rather than inherit it.
+      disclose: (reason) => {
+        if (reason !== BACKEND_SWITCH.INVALIDATE_FAILED) return;
+        appendSystem(
+          tr(
+            "panel.the_old_session_could_not_be_invalidated",
+            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+          ),
+        );
+      },
+    });
+    return switched;
   }
 
   // Soft reload: pick up new code WITHOUT restarting ComfyUI, keeping this
@@ -29208,47 +30553,126 @@ function buildPanel() {
     reloading = true;
     appendSystem(tr("panel.restarting_the_agent_backend", "Restarting the agent backend…"));
     let ok = false;
+    // #1171 — THE GUARD MUST SPAN THE WORK IT PROTECTS. This `try` used to close right
+    // after the POST, with `reloading = false` in its `finally`, while the function kept
+    // going: retiring the turn and three markers, invalidating the durable session, then
+    // reconnecting. From the moment the POST settled the flag was open, so a second restart
+    // — or a soft reload, which shares the flag — could run against that tail and interleave
+    // two teardowns of the same session state.
+    //
+    // Released just before the reconnect, which is `softReload`'s existing shape (its
+    // `beforeStart` hook does the same thing for the same reason), with the `finally` as the
+    // backstop for a throw.
+    //
+    // The tail's one await is the durable invalidation, and it is deliberately UNBOUNDED —
+    // see the note there. Widening a guard over an await that could hang would trade a race
+    // for a wedge, which is what two earlier attempts at the sibling bug produced, so that
+    // await settling is a precondition of this shape rather than an incidental detail.
+    //
+    // WHAT THIS DOES AND DOES NOT CHANGE HERE. The whole guarded tail lives inside
+    // `if (ok)`, and this pack's `/comfyui_mcp_panel/hard_restart` answers `{"ok": false}`
+    // with a 503 unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so on
+    // THIS distribution `ok` is always false, the tail is skipped, and the two shapes
+    // execute identically. The change is therefore preparatory here: it is correct for a
+    // deployment whose restart route really restarts the agent, and it stops the window
+    // existing before one of those meets it. Anyone measuring for a behaviour change on a
+    // stock install will find none, and that is expected rather than a broken fix.
     try {
-      client.stop(); // drop the bridge so the old orchestrator can release the port
-      const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
-      const data = await res.json().catch(() => ({}));
-      if (data?.ok) {
-        ok = true;
-      } else {
-        // `data.message` is the pack's own text and arrives already-worded; only our own
-        // fallback is ours to translate.
+      try {
+        client.stop(); // drop the bridge so the old orchestrator can release the port
+        const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (data?.ok) {
+          ok = true;
+        } else {
+          // `data.message` is the pack's own text and arrives already-worded; only our own
+          // fallback is ours to translate.
+          appendSystem(
+            data?.message ||
+              tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
+          );
+        }
+      } catch (err) {
         appendSystem(
-          data?.message ||
-            tr("panel.restart_failed_try_disconnect_then_connect_or", "Restart failed — try Disconnect then Connect, or fully restart ComfyUI."),
+          tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
+            error: coerceMessageText(err?.message ?? err),
+          }),
         );
       }
-    } catch (err) {
-      appendSystem(
-        tr("panel.couldn_t_reach_comfyui_to_restart_the", "Couldn't reach ComfyUI to restart the agent: {error}", {
-          error: coerceMessageText(err?.message ?? err),
-        }),
-      );
+      if (ok) {
+        // #1166 — retire everything that asserts a live turn HERE: inside the success
+        // branch, because only a restart that actually happened killed the turn, and
+        // BEFORE the invalidate below, whose failure path returns early and skipped all of
+        // it. That early return was the real defect — not the branch itself.
+        //
+        // Deliberately NOT hoisted to the top of the function. An earlier attempt did
+        // that, on the reasoning that a deliberate restart abandons the turn whatever the
+        // outcome, and it was wrong here: this pack's /hard_restart answers `{ok: false}`
+        // unconditionally (`__init__.py`, "orchestrator runs out-of-band"), so `ok` is
+        // ALWAYS false, nothing is ever killed, and the old orchestrator's turn keeps
+        // running. Retiring at the top therefore cleared the state of a LIVE turn on the
+        // only path this pack takes — the working indicator vanishing while the agent
+        // works, and a follow-up message painting inline instead of queueing. The
+        // reconnect's `turn:working` re-announce normally repairs that, but endTurnLocally()
+        // opens a 300ms straggler window (STALE_WORKING_GUARD_MS) that can swallow it on a
+        // local bridge. The indicator staying up through a restart that did not happen is
+        // not a bug; the turn really is still running.
+        //
+        // All three markers, because retiring only some of them is how this class survives
+        // a fix: the turn itself, the soft-reload marker (a hard restart supersedes a
+        // pending reload), and the restart-resume marker plus its #585 watch (a fresh agent
+        // must not resume the conversation this restart discarded). The Disconnect handler
+        // retires the same set in the same order, minus its USER_DISCONNECTED_KEY latch,
+        // which belongs only to an explicit Disconnect because a restart intends to return.
+        endTurnLocally();
+        ssSet(SOFT_RELOAD_KEY, null);
+        ssSet(REBOOT_KEY, null);
+        stopRebootWatch();
+        forgetRebootResumeAttempt();
+        // Start FRESH on reconnect: clear the saved session id so hello sends no
+        // resume (resuming would restore the wedged shell). Don't arm the resume
+        // nudge. The reconnect spins up a brand-new agent.
+        if (!await invalidateDurableAgentSession()) {
+          appendSystem(
+            tr(
+              "panel.the_old_session_could_not_be_invalidated",
+              "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
+            ),
+          );
+          // #1166 — this early return DELIBERATELY skips the client.start() below, and is
+          // left that way. It looks like the #379/#419 "a reload never leaves a bridge
+          // dead" invariant being violated, but reconnecting here would restore the very
+          // session the restart exists to discard, and the pause is disclosed to the user
+          // in the line above rather than silent.
+          //
+          // But a disclosure in the transcript is not enough on its own: the bridge is now
+          // down for good on this path, and until this the chip, dot and buttons still
+          // showed the connected state, so the panel contradicted its own message and left
+          // no affordance to act on it. Paint the real state and restore Connect, so the
+          // "paused" the line above describes is something the user can actually end. This
+          // is the Disconnect handler's UI block, minus its opt-out latch — the pause is
+          // this restart's, not a standing decision to stay disconnected.
+          connectBtn.hidden = false;
+          disconnectBtn.hidden = true;
+          connectBtn.disabled = false;
+          connectBtn.textContent = tr("panel.connect", "Connect");
+          statusText.textContent = tr("panel.status_disconnected", "disconnected");
+          dot.className = "cmcp-dot";
+          settingsBox.hidden = false;
+          return;
+        }
+        // Both markers are already retired at the top, on every exit rather than only this
+        // one (#1166).
+        appendSystem(
+          tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
+        );
+      }
     } finally {
+      // #1171 — released here, once, covering every exit from the tail above including
+      // the invalidate-failure early return. `softReload` clears the same flag at the same
+      // point for the same reason: the reconnect is the handover, and holding the guard
+      // across it would block the next restart on a connect that may never settle.
       reloading = false;
-    }
-    if (ok) {
-      // Start FRESH on reconnect: clear the saved session id so hello sends no
-      // resume (resuming would restore the wedged shell). Don't arm the resume
-      // nudge. The reconnect spins up a brand-new agent.
-      if (!await invalidateDurableAgentSession()) {
-        appendSystem(
-          tr(
-            "panel.the_old_session_could_not_be_invalidated",
-            "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
-          ),
-        );
-        return;
-      }
-      ssSet(SOFT_RELOAD_KEY, null);
-      ssSet(MID_TASK_KEY, null);
-      appendSystem(
-        tr("panel.agent_restarted_with_a_fresh_session_your", "Agent restarted with a fresh session — your message history is still here."),
-      );
     }
     // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
     // restore the bridge we dropped (the old backend may still be intact).
@@ -29358,10 +30782,10 @@ function buildPanel() {
         const label = outcome?.snapshot?.label;
         appendSystem(
           describeRevertOutcome(outcome, {
-            // `action` is spliced INTO describeRevertOutcome's own English refusal/failure
-            // sentences (lib/graph-revert.js), so translating it here would produce a
-            // half-translated line. It stays English until that lib is converted too.
-            action: "revert",
+            // `action` is spliced INTO describeRevertOutcome's own refusal/failure
+            // sentences (lib/graph-revert.js). Those are translated now, and the lib
+            // supplies this same word as its default — so passing it here would only
+            // duplicate the key.
             // Two whole sentences rather than one with a conditional clause: the label is
             // the user's own snapshot title, and a language that reorders the sentence
             // needs the placeholder to move with it.
@@ -29508,11 +30932,16 @@ function buildPanel() {
     const q = query.toLowerCase();
     const items = [];
     const wf = getWorkflowTitle();
-    if (!q || "workflow".includes(q) || wf.toLowerCase().includes(q)) {
+    // `workflow` is a match token, a display label, AND the literal the agent parses out of
+    // `insert` — three jobs for one word. Only the LABEL is translated; the token stays
+    // English so `@wo` keeps working on a Latin keyboard, and the translated label is added
+    // as a second match so the word in the user's own language matches too.
+    const wfLabel = tr("panel.at_menu_workflow", "workflow — {title}", { title: wf });
+    if (!q || "workflow".includes(q) || wfLabel.toLowerCase().includes(q) || wf.toLowerCase().includes(q)) {
       items.push({
         icon: "pi-file",
-        label: `workflow — ${wf}`,
-        small: "context",
+        label: wfLabel,
+        small: tr("panel.at_menu_context", "context"),
         insert: `@workflow:"${wf}" `,
       });
     }
@@ -29525,7 +30954,9 @@ function buildPanel() {
           items.push({
             icon: n.subgraph ? "pi-sitemap" : "pi-circle",
             label,
-            small: n.subgraph ? "subgraph" : n.type,
+            // `n.type` is a registered node-type id and must stay raw; the word beside it
+            // is ours to translate.
+            small: n.subgraph ? tr("panel.at_menu_subgraph", "subgraph") : n.type,
             insert: `@node:${n.id}(${name}) `,
           });
         }
@@ -29540,7 +30971,12 @@ function buildPanel() {
         let added = 0;
         for (const t of Object.keys(LG.registered_node_types)) {
           if (t.toLowerCase().includes(q)) {
-            items.push({ icon: "pi-box", label: t, small: "node type", insert: `@type:${t} ` });
+            items.push({
+              icon: "pi-box",
+              label: t,
+              small: tr("panel.at_menu_node_type", "node type"),
+              insert: `@type:${t} `,
+            });
             added += 1;
             if (added >= 5) break;
           }
@@ -29850,26 +31286,59 @@ function buildPanel() {
       try {
         const fd = new FormData();
         fd.append("image", file, name);
-        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-        if (res.status === 200) {
-          const info = await res.json();
+        // #1188 — read the measurements ONCE, before anything can fail on them. A `size` or
+        // `type` that throws would otherwise throw AGAIN inside the catch that reports it,
+        // escape the handler, and REJECT `att.ready` — which the send path awaits and is
+        // not built to have reject.
+        const { size, mediaType } = readFileFacts(file);
+        // #1188 — bounded, request AND body. Without this a half-open connection after a
+        // ComfyUI restart leaves `att.ready` pending forever. `att.ready` catches
+        // everything internally so it never REJECTS — it simply never settles, and the
+        // composer awaits `Promise.all(pending.map((a) => a.ready))` before sending. The
+        // user is then unable to send the message at all, with nothing on screen saying why.
+        const observed = {};
+        const outcome = await boundedUpload(
+          async () => {
+            const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+            if (res.status === 200) return { info: await res.json() };
+            // #1188 — record the status the INSTANT it is known. The body has its own,
+            // shorter bound, but that bound runs INSIDE the outer one: a head arriving near
+            // the outer deadline with a stalling body would otherwise let the outer bound
+            // report an answered-and-REFUSED upload as "no response".
+            observed.status = res.status;
+            observed.statusText = res.statusText;
+            // #756 — a non-200 had NO else at all. The status was in hand and thrown
+            // away, leaving "upload failed" as the whole of what anyone could learn.
+            // The body gets its OWN shorter bound: a refusal we can already name must not
+            // be downgraded to "no response" just because ComfyUI's explanation stalls.
+            return {
+              failure: describeUploadFailure({
+                status: res.status,
+                statusText: res.statusText,
+                body: (observed.body = await readErrorBody(res, withTimeout)),
+                name,
+                size,
+                mediaType,
+              }),
+            };
+          },
+          { size, withTimeout },
+        );
+        if (outcome === UPLOAD_NO_ANSWER) {
+          att.uploadError = describeTimedOutUpload({ observed, name, size, mediaType });
+        } else if (outcome?.failure) {
+          att.uploadError = outcome.failure;
+        } else {
+          const info = outcome.info;
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
-        } else {
-          // #756 — a non-200 had NO else at all. The status was in hand and thrown
-          // away, leaving "upload failed" as the whole of what anyone could learn.
-          att.uploadError = describeUploadFailure({
-            status: res.status,
-            statusText: res.statusText,
-            body: await res.text().catch(() => null),
-            name,
-            size: file.size,
-            mediaType: file.type,
-          });
         }
       } catch (err) {
-        // #756 — the bare catch swallowed transport failures identically.
-        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
+        // #756 — the bare catch swallowed transport failures identically. The measurements
+        // are re-read defensively here too: this catch also runs for a throw raised BEFORE
+        // readFileFacts, so it cannot assume those locals exist.
+        const facts = readFileFacts(file);
+        att.uploadError = describeUploadFailure({ error: err, name, size: facts.size, mediaType: facts.mediaType });
       }
     })();
     att.ready.then(renderAttachmentChips, () => {}); // refresh once the thumb loads
@@ -29898,26 +31367,58 @@ function buildPanel() {
         const fd = new FormData();
         // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
         fd.append("image", file, name);
-        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-        if (res.status === 200) {
-          const info = await res.json();
+        // #1188 — read the measurements ONCE. Same reason as the image path above: a
+        // throwing `size`/`type` getter would throw again inside the reporting catch and
+        // reject `att.ready`.
+        const { size, mediaType } = readFileFacts(file);
+        // #1188 — bounded, request AND body. This path is the reason the bound is sized by
+        // payload rather than flat: it exists specifically for video, so a fixed number
+        // would either cut off a legitimate large upload or wait absurdly long for a small
+        // one. Same wedge as the image path above — a never-settling `att.ready` blocks the
+        // composer's `Promise.all` on send.
+        const observed = {};
+        const outcome = await boundedUpload(
+          async () => {
+            const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+            if (res.status === 200) return { info: await res.json() };
+            // #1188 — record the status the INSTANT it is known. The body has its own,
+            // shorter bound, but that bound runs INSIDE the outer one: a head arriving near
+            // the outer deadline with a stalling body would otherwise let the outer bound
+            // report an answered-and-REFUSED upload as "no response".
+            observed.status = res.status;
+            observed.statusText = res.statusText;
+            // #756 — a non-200 had NO else at all. The status was in hand and thrown
+            // away, leaving "upload failed" as the whole of what anyone could learn.
+            // The body gets its OWN shorter bound: a refusal we can already name must not
+            // be downgraded to "no response" just because ComfyUI's explanation stalls.
+            return {
+              failure: describeUploadFailure({
+                status: res.status,
+                statusText: res.statusText,
+                body: (observed.body = await readErrorBody(res, withTimeout)),
+                name,
+                size,
+                mediaType,
+              }),
+            };
+          },
+          { size, withTimeout },
+        );
+        if (outcome === UPLOAD_NO_ANSWER) {
+          att.uploadError = describeTimedOutUpload({ observed, name, size, mediaType });
+        } else if (outcome?.failure) {
+          att.uploadError = outcome.failure;
+        } else {
+          const info = outcome.info;
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
-        } else {
-          // #756 — a non-200 had NO else at all. The status was in hand and thrown
-          // away, leaving "upload failed" as the whole of what anyone could learn.
-          att.uploadError = describeUploadFailure({
-            status: res.status,
-            statusText: res.statusText,
-            body: await res.text().catch(() => null),
-            name,
-            size: file.size,
-            mediaType: file.type,
-          });
         }
       } catch (err) {
-        // #756 — the bare catch swallowed transport failures identically.
-        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
+        // #756 — the bare catch swallowed transport failures identically. The measurements
+        // are re-read defensively here too: this catch also runs for a throw raised BEFORE
+        // readFileFacts, so it cannot assume those locals exist.
+        const facts = readFileFacts(file);
+        att.uploadError = describeUploadFailure({ error: err, name, size: facts.size, mediaType: facts.mediaType });
       }
     })();
   }
@@ -30285,9 +31786,9 @@ function buildPanel() {
     if (!reverted) {
       appendSystem(
         describeRevertOutcome(outcome, {
-          // English on purpose — see the /revert call site: `action` is interpolated into
-          // the lib's own untranslated refusal/failure sentences.
-          action: "rewind the canvas",
+          // Interpolated into the lib's own sentences as {action}; both sides are
+          // translated now, so a language that needs to reorder can move the hole.
+          action: tr("graph_revert.action_rewind_the_canvas", "rewind the canvas"),
           restoredText: "",
           noneText: recalled
             ? tr(
@@ -30388,8 +31889,8 @@ function buildPanel() {
         const outcome = await revertGraphSnapshotByMid(mid);
         appendSystem(
           describeRevertOutcome(outcome, {
-            // English on purpose — see the /revert call site.
-            action: "roll back the canvas",
+            // See the /revert call site: {action} rides into a translated sentence.
+            action: tr("graph_revert.action_roll_back_the_canvas", "roll back the canvas"),
             restoredText: tr("panel.canvas_reverted_to_before_this_message", "↩ Canvas reverted to before this message."),
             noneText: tr("panel.no_graph_snapshot_for_this_message_canvas", "No graph snapshot for this message — canvas left as-is."),
           }),

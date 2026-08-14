@@ -262,7 +262,10 @@ export function openSidePanel(ctx = {}, opts = {}) {
     const c = contents.get(activeKey);
     const has = c ? (typeof c.hasSearch === "function" ? c.hasSearch() : !!c.hasSearch) : false;
     searchEl.style.display = has ? "" : "none";
-    if (has && c) searchEl.placeholder = c.searchPlaceholder || "Search…";
+    // Every provider supplies a translated placeholder today, so this branch is dead — but a
+    // literal here reverts the SHARED box to English for the first provider that omits one,
+    // and there would be no literal in that provider's file for any scanner to find.
+    if (has && c) searchEl.placeholder = c.searchPlaceholder || tr("sidepanel_ui.search", "Search…");
   }
   searchEl.addEventListener("input", () => {
     const c = contents.get(activeKey);

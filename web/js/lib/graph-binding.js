@@ -1,3 +1,10 @@
+import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
+import { nodeInputsDifferOnlyByDefinitionRebuild } from "./node-inputs-rebuild.js";
+import {
+  isEmptyBaselineMismatch,
+  emptyBaselineNote,
+  emptyBaselineRemedy,
+} from "./empty-baseline-deadend.js";
 /**
  * Detect a graph READ that is out of sync with the ACTIVE workflow (panel#389).
  *
@@ -788,16 +795,31 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
  * PROVEN", and a lost `color` is a lost authored value — it must be able to hold
  * the proof back even though it is cosmetic to look at.
  *
- * ONE FIELD, and only the one that was MEASURED. An earlier cut also listed `pos`
- * and `order`, on the reasoning that they are layout too. Neither was observed
- * being rewritten by anything, `pos` is authored by the user dragging a node, and
- * `order` is execution-order state in a LiteGraph-derived graph — proving content
- * across a changed `order` would publish a fence for a graph whose observable
- * behaviour changed (codex). What the live install actually rewrote, on every open
- * of every saved workflow, was node HEIGHT. So that is the whole set, and it grows
- * only when a measurement says it must.
+ * ONLY FIELDS THAT WERE MEASURED, and each one carries its own check below —
+ * membership here is necessary, never sufficient. An earlier cut also listed
+ * `pos` and `order`, on the reasoning that they are layout too. Neither was
+ * observed being rewritten by anything, `pos` is authored by the user dragging a
+ * node, and `order` is execution-order state in a LiteGraph-derived graph —
+ * proving content across a changed `order` would publish a fence for a graph
+ * whose observable behaviour changed (codex). Both remain OUT.
+ *
+ *   `size`   — the live install rewrote node HEIGHT on every open of every saved
+ *              workflow. Admitted only when the difference is height-only.
+ *   `inputs` — #1467. MEASURED in comfyui_frontend_package 1.48.7:
+ *              `ComfyNode.prototype.configure` GENERATES the live array from the
+ *              node definition (definition order, with `name`/`type`/`shape`/
+ *              `localized_name`/`widget` overlaid from it, unknown saved slots
+ *              appended), so a faithful open cannot round-trip what was saved.
+ *              Admitted only when every difference fits that rebuild.
+ *
+ * `widgets_values` is deliberately absent despite ALSO being rewritten on every
+ * load (`migrateWidgetsValues`): it is the field a genuine partial load drops,
+ * which is what #1111/#1089 are about, so admitting it would gut this guard.
+ *
+ * The rule stands: this grows only when a measurement says it must, and the
+ * measurement has to characterise the rewrite well enough to write its check.
  */
-const RECOMPUTED_NODE_FIELDS = new Set(["size"]);
+const RECOMPUTED_NODE_FIELDS = new Set(["size", "inputs"]);
 
 /**
  * Did the live root reproduce this state's CONTENT — allowing for the geometry the
@@ -880,7 +902,41 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
     // unexplained by anything the node comparison establishes.
-    if (surfaces.length !== 1 || surfaces[0] !== "nodes") return NOT_PROVEN;
+    // #886 — a `definitions` surface may accompany `nodes`, but ONLY when the whole
+    // of it is link renumbering. Measured: the frontend regenerates link identity
+    // inside subgraph definitions on load (state.lastLinkId advanced 2092 -> 2106 on
+    // a real 4-subgraph workflow) while node ids, types and topology stay identical.
+    // Before this, a faithful open of ANY workflow containing subgraphs reported
+    // CONTENT_UNVERIFIED — binding proven, nodes perfect, refused on a surface nobody
+    // had characterised.
+    //
+    // Everything else still refuses. `definitionsDifferOnlyByLinkRenumber` returns
+    // false for anything it cannot fully account for, and the caller reads that as
+    // "not proven" — never as "changed".
+    // The surface set must be a subset of { nodes, definitions } — nothing else is
+    // accounted for, and an unaccounted surface refuses.
+    //
+    // `definitions` is admitted ONLY when the difference there is pure link
+    // renumbering, which is what loading a persisted workflow does to
+    // definitions.subgraphs (measured: state.lastLinkId 2092 -> 2106).
+    //
+    // `nodes` is NOT required to be present. The earlier version demanded it, which
+    // review caught: the reported #886 case is a graph where definitions is the ONLY
+    // differing surface, so requiring `nodes` refused exactly the case this exists to
+    // prove — a fix wired into a branch its own bug report cannot reach.
+    const unique = [...new Set(surfaces)];
+    if (!unique.length) return NOT_PROVEN;
+    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return NOT_PROVEN;
+    if (unique.includes("definitions")) {
+      if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
+        return NOT_PROVEN;
+      }
+    }
+    // A definitions-only difference is fully accounted for once the renumber check
+    // passes: there is no node difference to classify.
+    if (!unique.includes("nodes")) {
+      return { proven: true, exact: false, fields: [] };
+    }
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
     // mutation: `classifyNodeDifference` only computes `fields` once the sets match, so
@@ -896,6 +952,28 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // width, or an arbitrary replacement, would have been PROVEN on the strength of a
     // measurement about something else. Every differing size must be height-only.
     if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, actualState?.nodes)) {
+      return NOT_PROVEN;
+    }
+    // #1467 — `inputs` is REBUILT by the frontend, not restored, and admitting it
+    // needs the same treatment `size` gets: characterise the rewrite and require
+    // every difference to fit it, rather than allowlisting the field name and
+    // waving through any change that lands in it.
+    //
+    // MEASURED (comfyui_frontend_package 1.48.7, ComfyNode.prototype.configure,
+    // which runs before LiteGraph's): the live array is generated by walking the
+    // node DEFINITION, overlaying `name`/`type`/`shape`/`localized_name`/`widget`
+    // from it, and appending saved slots the definition does not know. So its
+    // order is the definition's and five of its keys come from the definition on
+    // every load — a faithful open cannot reproduce the saved array.
+    //
+    // `nodeInputsDifferOnlyByDefinitionRebuild` returns false for anything that
+    // rewrite does not explain — a slot name appearing or vanishing, a changed
+    // `link`, any other key that moved — and false reads as NOT PROVEN here,
+    // never as "changed".
+    if (
+      fields.includes("inputs") &&
+      !nodeInputsDifferOnlyByDefinitionRebuild(state?.nodes, actualState?.nodes)
+    ) {
       return NOT_PROVEN;
     }
     // An empty field list with a differing `nodes` surface means the two disagreed
@@ -1760,6 +1838,28 @@ const READ_ONLY_GRAPH_COMMANDS = new Set([
   "graph_get_subgraph",
   "graph_list_subgraphs",
   "graph_screenshot",
+  // #1478 — `graph_get_errors` reads the error surface and writes nothing. It was
+  // missing here, so `graphCommandMayMutateWorkflow` called it a MUTATION and a
+  // dirty tab refused it as `dirty-mutation-binding-unproven` — a message that
+  // calls a read "this mutation" and prescribes reloading the tab or re-opening
+  // the workflow, neither of which a read should ever cost.
+  //
+  // It is also the worst possible moment to refuse it: the reporter had just
+  // loaded a pack whose nodes were already red, which is exactly when this tool
+  // is the one to call. They fell back to filesystem globs.
+  //
+  // WHY THIS LIST IS THE FIX AND NOT THE GUARD. Membership here lowers the bar
+  // for a command, so it is an enumeration that must stay conservative: a read
+  // aimed at the wrong canvas returns wrong DATA, while a mutation aimed there
+  // corrupts a graph, and that asymmetry is the whole reason reads have a lower
+  // bar at all. So this grows one verified command at a time, never by pattern.
+  //
+  // `graph_get_object_info` and `graph_prompt_director_audit` are also absent and
+  // also look like reads, but "looks like" is not the standard for weakening a
+  // guard — they stay out until someone establishes it the way this one was
+  // (the orchestrator's own tool description says "Read-only", and its executor
+  // touches no graph state).
+  "graph_get_errors",
 ]);
 
 export function graphCommandMayMutateWorkflow(command) {
@@ -2244,7 +2344,16 @@ export function graphBindingRefusalMessage(verdict) {
       `session, it does not rebind the canvas.`
     );
   }
-  const expectation = sizesDisagree
+  // #803 — an EMPTY baseline against a populated canvas is not evidence of a different
+  // graph. The panel captures a workflow's state on user input, so a reconnect or a
+  // ComfyUI restart can leave it empty for a canvas that is perfectly correct. Asserting
+  // "bound to a different graph" here is the #796 shape: cannot-determine rendered as
+  // is-not-the-case. What gets REFUSED is unchanged (#565 rejected a zero-node skip);
+  // only the claim is.
+  const emptyBaseline = sizesDisagree && isEmptyBaselineMismatch({ expected, live });
+  const expectation = emptyBaseline
+    ? emptyBaselineNote(live)
+    : sizesDisagree
     ? `the workflow reports ${expected} node(s) but the live canvas holds ${live} — it is bound to a ` +
       `different graph`
     : measured && expected > 0
@@ -2260,13 +2369,30 @@ export function graphBindingRefusalMessage(verdict) {
   // disagreement at equal size does not even establish that much: it is exactly
   // the ambiguity above, and resolving it in the text is how this message misled
   // three readers.
-  const cause = sizesDisagree
+  const cause = emptyBaseline
+    ? ""
+    : sizesDisagree
     ? `The canvas therefore holds a graph other than the one the workflow describes, so this ` +
       `command was NOT applied. A load, tab switch or reconnect leaving the command on the wrong ` +
       `canvas is the usual explanation — the panel observed the mismatch, not the event.`
     : `The panel cannot tell whether this is a DIFFERENT workflow's canvas or this workflow's own ` +
       `canvas drifted from the state it last captured, so it was NOT applied.`;
-  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation}. ${cause} ${remedy}`;
+  // #803 — the remedy is REPLACED for the empty-baseline case, not appended to. The
+  // standing advice ("re-open the active workflow tab") is what turned this into a
+  // dead end: the captured state is refreshed only after a command SUCCEEDS, so while
+  // this refusal stands the repair that would refresh it is itself blocked, and the
+  // retry fails identically. A reload is the step known to break the loop.
+  const finalRemedy = emptyBaseline ? emptyBaselineRemedy() : remedy;
+  // Join the non-empty parts rather than collapsing whitespace across the whole
+  // string. The collapse was only there to absorb the empty `cause` in this branch,
+  // and review was right that it overreached: it rewrote INTERPOLATED content too
+  // (verdict.reason, the existing remedy), so a value carrying meaningful newlines or
+  // repeated spaces would have been silently reflowed. This change is scoped to the
+  // claim and the remedy; it has no business touching either of those.
+  const parts = [emptyBaseline ? expectation : `${expectation}.`, cause, finalRemedy].filter(
+    (s) => typeof s === "string" && s.trim() !== "",
+  );
+  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${parts.join(" ")}`;
 }
 
 /**
