@@ -38,8 +38,16 @@
  * NAMES ARE NOT POSITIONAL. rgthree's `loraWidgetsCounter` is monotonic and `configure()`
  * re-mints rows from serialized ORDER, so after removing `lora_1` the next created row is
  * NOT necessarily `lora_1`. When the row that appears is not the one asked for, it is
- * removed again and the refusal names the row that WOULD be created — leaving nothing
- * behind is what makes a refusal safe to retry.
+ * removed again and the refusal names the row that WOULD be created.
+ *
+ * AND THE COUNTER IS REWOUND WITH IT, which is the part that makes that refusal usable.
+ * `addNewLoraWidget` increments before it names, and removing the row does not undo the
+ * increment — so a refusal that only removed the widget would say `the next row is
+ * "lora_7" … nothing was changed. Set "lora_7" instead` while having already moved the next
+ * name to `lora_8`. Following the advice refuses again, one name further along, forever.
+ * That was measured, not reasoned about. Undoing the mutation means undoing BOTH halves of
+ * it; when the counter cannot be rewound the message stops promising a retry that would not
+ * work. Leaving nothing behind is what makes a refusal safe to retry.
  */
 
 import { isLoraSlotObject } from "./widget-write.js";
@@ -85,6 +93,50 @@ export function isRgthreeLoraRowCreation(node, widgetName, value) {
   }
 }
 
+/**
+ * rgthree's monotonic row counter, when this node exposes a readable one.
+ *
+ * Read so a refusal can put it BACK — see `restoreRowCounter`. Never used to DECIDE
+ * anything: the name that appeared is established by comparing the widget list, because a
+ * pack-private field is not a contract and the whole point of the post-verify is that the
+ * call's effect is the only thing worth trusting.
+ */
+function readRowCounter(node) {
+  try {
+    const n = node?.loraWidgetsCounter;
+    return typeof n === "number" && Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Put the counter back after a refusal removed the row that advanced it.
+ *
+ * WITHOUT THIS THE REFUSAL IS A TRAP. `addNewLoraWidget` does `loraWidgetsCounter++` before
+ * it names the row, and removing the row does not undo the increment. So a refusal that
+ * says `the next row is "lora_7" … nothing was changed. Set "lora_7" instead` was wrong on
+ * BOTH counts the moment it was printed: something *had* changed, and the very next call
+ * mints `lora_8`. Following the advice refuses again, one name further along, forever —
+ * measured on a faithful stand-in before this was written.
+ *
+ * Best-effort and narrow: only ever lowers a counter this call raised, never touches one it
+ * cannot read, and the caller only asks once the row is confirmed gone — restoring while a
+ * row still holds the name would hand the next mint a duplicate.
+ */
+function restoreRowCounter(node, previous) {
+  if (previous === null) return false;
+  try {
+    if (typeof node.loraWidgetsCounter === "number" && node.loraWidgetsCounter > previous) {
+      node.loraWidgetsCounter = previous;
+      return true;
+    }
+  } catch {
+    /* an unwritable counter is reported by the caller's wording, never raised */
+  }
+  return false;
+}
+
 /** Drop a widget the node grew but that we are not keeping. Best-effort, never throws. */
 function removeCreatedRow(node, widget) {
   try {
@@ -118,6 +170,9 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
   }
 
   const before = widgetNames(node);
+  // Snapshot the counter BEFORE the mint, so either refusal below can put it back and mean
+  // it when it says nothing was changed. See `restoreRowCounter`.
+  const counterBefore = readRowCounter(node);
 
   beforeChange?.();
   try {
@@ -152,6 +207,9 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
   }
 
   if (appended.length === 0) {
+    // No row appeared, but the counter may still have been bumped before whatever went
+    // wrong. Put it back, or this failed attempt silently costs the node a row name.
+    restoreRowCounter(node, counterBefore);
     throw new Error(
       `Cannot create "${widgetName}" on node ${node?.id}: addNewLoraWidget() ran but added ` +
         `no widget. Nothing was changed.`,
@@ -163,12 +221,26 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     // Take it back out — a refusal that leaves a stray row behind cannot be safely retried.
     const created = (node.widgets ?? []).find((w) => appended.includes(w?.name));
     if (created) removeCreatedRow(node, created);
+    // ONLY once the row is really gone: restoring the counter while the name is still held
+    // would point the next mint at a duplicate. `removeCreatedRow` is best-effort, so ask
+    // the node rather than assuming the call worked.
+    const rowIsGone = !created || !(node.widgets ?? []).includes(created);
+    const rewound = rowIsGone && restoreRowCounter(node, counterBefore);
     const real = appended.join(", ");
+    // The remedy is only truthful if the counter went back. When it did not — an older pack
+    // with no readable counter, or one that refuses the write — `real` is the name this
+    // attempt CONSUMED, and the next one lands further along. Say which world we are in
+    // rather than printing advice that cannot work; a wrong remedy costs a name per retry.
+    const remedy = rewound
+      ? `The row that was created has been removed again and the row counter was rewound — ` +
+        `nothing was changed. Set "${real}" instead.`
+      : `The row that was created has been removed again, but this node's row counter could ` +
+        `not be rewound, so "${real}" is now used up and the next row will be named later ` +
+        `still. Ask the user to click "➕ Add Lora" on the node and then set the row it adds.`;
     throw new Error(
       `Cannot create "${widgetName}" on node ${node?.id}: this node's next row is "${real}", ` +
         `not "${widgetName}" (rgthree numbers rows from a counter that only ever increases, ` +
-        `so a removed row's name is not reused). The row that was created has been removed ` +
-        `again — nothing was changed. Set "${real}" instead.`,
+        `so a removed row's name is not reused). ${remedy}`,
     );
   }
 

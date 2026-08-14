@@ -22,8 +22,17 @@ import {
 
 const SLOT = { on: true, lora: "x.safetensors", strength: 0.5, strengthTwo: null };
 
-/** A Power Lora Loader as it looks fresh from panel_add_node: no rows yet. */
-function loader({ counter = 1, addNew = true, widgets = null } = {}) {
+/**
+ * A Power Lora Loader as it looks fresh from panel_add_node: no rows yet.
+ *
+ * Modelled on the pack's SHIPPED source (`rgthree-comfy/web/comfyui/power_lora_loader.js`),
+ * which increments `this.loraWidgetsCounter` and only then derives the row name from it: the
+ * increment happens first and is never undone by removing the row. `nextRow` says which row
+ * the next mint produces; the counter itself therefore starts one BELOW it.
+ *
+ * `trackCounter: false` stands in for a pack build that keeps no counter we can read.
+ */
+function loader({ nextRow = 1, addNew = true, widgets = null, trackCounter = true } = {}) {
   const node = {
     id: 153,
     type: POWER_LORA_LOADER_TYPE,
@@ -38,10 +47,15 @@ function loader({ counter = 1, addNew = true, widgets = null } = {}) {
       if (i >= 0) node.widgets.splice(i, 1);
     },
   };
+  let shadow = nextRow - 1; // used when the node exposes no readable counter
+  if (trackCounter) node.loraWidgetsCounter = nextRow - 1;
   if (addNew) {
     // rgthree's real behaviour: a MONOTONIC counter, so names are not positional.
     node.addNewLoraWidget = () => {
-      node.widgets.push({ name: `lora_${counter++}`, value: { on: true, lora: null, strength: 1, strengthTwo: null } });
+      let n;
+      if (trackCounter) n = ++node.loraWidgetsCounter;
+      else n = ++shadow;
+      node.widgets.push({ name: `lora_${n}`, value: { on: true, lora: null, strength: 1, strengthTwo: null } });
     };
   }
   return node;
@@ -155,7 +169,7 @@ test("#757 a MONOTONIC counter: the wrong row is taken back out and the real nam
   // rgthree's loraWidgetsCounter only ever increases, so after a row is removed the next
   // created row is NOT the removed name. A refusal that left the stray row behind could not
   // be safely retried.
-  const n = loader({ counter: 7 });
+  const n = loader({ nextRow: 7 });
   const before = n.widgets.length;
   assert.throws(
     () => createRgthreeLoraRow(n, "lora_1", {}),
@@ -165,8 +179,60 @@ test("#757 a MONOTONIC counter: the wrong row is taken back out and the real nam
   assert.ok(!n.widgets.some((w) => w.name === "lora_7"), "including the row it minted");
 });
 
+test("#757 the refusal's remedy actually WORKS — the row counter is rewound too", () => {
+  // The defect this pins: `addNewLoraWidget` increments the counter BEFORE it names the row,
+  // and removing the row does not undo the increment. Rolling back only the widget left a
+  // refusal that said `nothing was changed. Set "lora_7" instead` having already moved the
+  // next name to lora_8 — so obeying it refused again, one name further along, forever.
+  // Measured before it was fixed; this is the assertion that would have caught it.
+  const n = loader({ nextRow: 7 });
+  let named = null;
+  try {
+    createRgthreeLoraRow(n, "lora_1", {});
+    assert.fail("expected a refusal");
+  } catch (err) {
+    named = err.message.match(/next row is "(lora_\d+)"/)?.[1];
+    assert.match(err.message, /counter was rewound/);
+  }
+  assert.equal(named, "lora_7");
+  assert.equal(n.loraWidgetsCounter, 6, "the increment the refusal undid");
+  // Doing exactly what the refusal said must succeed. A remedy that cannot be obeyed is
+  // worse than no remedy: it reads as actionable and costs a row name on every attempt.
+  assert.deepEqual(createRgthreeLoraRow(n, named, {}), { created: "lora_7" });
+});
+
+test("#757 a call that adds nothing does not silently burn a row name either", () => {
+  const n = loader({ nextRow: 4 });
+  n.addNewLoraWidget = () => {
+    n.loraWidgetsCounter++; // incremented, then whatever appends the row failed
+  };
+  assert.throws(() => createRgthreeLoraRow(n, "lora_4", {}), /ran but added no widget/);
+  assert.equal(n.loraWidgetsCounter, 3, "'nothing was changed' includes the counter");
+});
+
+test("#757 a pack with no readable counter is told the truth, not an unusable remedy", () => {
+  // Nothing can be rewound here, so `lora_9` really is used up. Promising "set lora_9
+  // instead" would be advice that cannot work — name the state instead.
+  const n = loader({ nextRow: 9, trackCounter: false });
+  assert.throws(
+    () => createRgthreeLoraRow(n, "lora_2", {}),
+    /next row is "lora_9"[\s\S]*could not be rewound[\s\S]*"lora_9" is now used up/,
+  );
+  assert.ok(!("loraWidgetsCounter" in n), "no counter was invented on the node");
+});
+
+test("#757 the counter is NOT rewound while the stray row is still on the node", () => {
+  // Rewinding past a name a surviving row still holds would point the next mint at a
+  // duplicate — a worse outcome than the burnt name.
+  const n = loader({ nextRow: 5 });
+  n.removeWidget = () => {}; // a node that protects its rows
+  assert.throws(() => createRgthreeLoraRow(n, "lora_1", {}), /could not be rewound/);
+  assert.equal(n.loraWidgetsCounter, 5, "left alone, because lora_5 is still there");
+  assert.ok(n.widgets.some((w) => w.name === "lora_5"));
+});
+
 test("#757 the stray row is removed even on a node with no removeWidget method", () => {
-  const n = loader({ counter: 9 });
+  const n = loader({ nextRow: 9 });
   delete n.removeWidget;
   const before = n.widgets.length;
   assert.throws(() => createRgthreeLoraRow(n, "lora_2", {}), /next row is "lora_9"/);
