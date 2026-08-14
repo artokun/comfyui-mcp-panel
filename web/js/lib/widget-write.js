@@ -6,6 +6,10 @@ import { explainNumericNormalization, normalizationNote } from "./widget-normali
 // throw INSIDE the span that attributes the throw to the callback body) and cannot
 // depend on globals a page could later redefine.
 const reflectApply = Reflect.apply;
+
+/** #1569 — "no clean sample of what would be queued". Distinct from any value a
+ *  serializer could legitimately return, including undefined and null. */
+const SERIALIZER_UNAVAILABLE = Symbol("cmcp-serializer-unavailable");
 // A module-load capture cannot defend against a `Reflect.apply` that was already
 // replaced BEFORE this module evaluated (codex round 2). Nothing here can: at that
 // point the page owns the intrinsics the whole panel runs on. Written down rather
@@ -1158,6 +1162,39 @@ export function applyWidgetWrite(
       ? JSON.stringify(a) === JSON.stringify(b)
       : Object.is(a, b);
   const previousClone = deepClone(previous);
+
+  /**
+   * #1569 — what ComfyUI will actually QUEUE for this widget, sampled safely.
+   *
+   * `graphToPrompt` does not send `w.value`; it asks the widget for `serializeValue()`
+   * when it defines one. A custom node that keeps its authoritative state elsewhere
+   * derives that from the state, so a plain assignment can move the canvas and leave the
+   * queue untouched — which is #1569: success reported, `panel_query_graph` showing the
+   * new strings, and the run producing the old subject.
+   *
+   * Returns SERIALIZER_UNAVAILABLE for anything that is not a clean sample: no
+   * serializer, a throwing one, or a lookup that throws. Every one of those means "no
+   * evidence", never "diverged" — this is a diagnostic and must not fail a write that
+   * would have worked.
+   */
+  const sampleSerialized = () => {
+    let fn;
+    try {
+      fn = w.serializeValue;
+    } catch {
+      return SERIALIZER_UNAVAILABLE; // a throwing accessor is not a verdict
+    }
+    if (typeof fn !== "function") return SERIALIZER_UNAVAILABLE;
+    try {
+      // Same intrinsic capture as the callback invocation above (#976), and the same
+      // argument shape ComfyUI passes: the node and this widget's index.
+      const index = Array.isArray(targetNode?.widgets) ? targetNode.widgets.indexOf(w) : -1;
+      return deepClone(reflectApply(fn, w, [targetNode, index]));
+    } catch {
+      return SERIALIZER_UNAVAILABLE; // a serializer that cannot run under inspection
+    }
+  };
+  const serializedBefore = sampleSerialized();
   const previousParentClone = parentWidget ? deepClone(previousParent) : undefined;
   // #477: prior values (+ deep clones) of the secondary display proxies, so rollback
   // restores them exactly and a stateful hook mutating a restored object in place is
@@ -1307,6 +1344,33 @@ export function applyWidgetWrite(
   // decide. A throw on a verified write is DISCLOSED on the success result
   // (`write_warning`); only a write that ALSO fails verification fails + rolls
   // back, with the throw named as the likely cause.
+  /**
+   * #1569 — did the value that will be QUEUED fail to move, for a write that really
+   * asked it to?
+   *
+   * Every condition here is a reason to stay silent, because a false positive turns a
+   * working write into a refusal:
+   *   - no clean sample on either side (no serializer, or one that throws) → no evidence;
+   *   - the caller did not actually change the widget → nothing was expected to move;
+   *   - the widget itself did not take the value → the checks above own that failure and
+   *     say something more specific.
+   */
+  const serializedDidNotMove = () => {
+    // The ONE unavailability guard, and it is load-bearing: without it a widget with no
+    // serializer samples SERIALIZER_UNAVAILABLE on both sides, those compare equal, and
+    // every ordinary write is flagged.
+    //
+    // A second guard on the AFTER sample looked prudent and was dead: an unavailable AFTER
+    // can only be compared against an AVAILABLE before (this line guarantees it), and a
+    // sentinel is never structurally equal to a real value, so it already returns false.
+    // Mutation testing found it — neither guard could be killed while both existed, because
+    // each covered for the other. Removed rather than kept as unreachable reassurance.
+    if (serializedBefore === SERIALIZER_UNAVAILABLE) return false;
+    if (structurallyEqual(previousClone, expected)) return false;
+    if (!matchesExpected(w.value)) return false;
+    return structurallyEqual(serializedBefore, sampleSerialized());
+  };
+
   let failure = null;
   let originalErr = null;
   let driftFailure = false;
@@ -1335,6 +1399,28 @@ export function applyWidgetWrite(
       // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
       // that would have worked. Diagnosis, never a gate.
       describeNonValueBearingWidget(w, targetNode);
+  } else if (serializedDidNotMove()) {
+    // #1569 — the widget took the value and the QUEUE will not see it.
+    //
+    // Compared BEFORE against AFTER rather than against the requested value, which is
+    // what makes this safe: a serializer that legitimately TRANSFORMS (a combo emitting
+    // an index, a normaliser) still MOVES when the value moves, so it passes. Only a
+    // serializer that ignores the widget entirely — the reported prompt-builder, which
+    // rebuilds its payload from internal state — produces an identical sample either
+    // side of a real change.
+    //
+    // Reported as a FAILURE because the alternative is what shipped: success, a canvas
+    // showing the new strings, and a run using the old ones. The reporter set the same
+    // fields repeatedly before concluding the node was at fault.
+    failure =
+      `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) accepted the value on the ` +
+      `canvas, but the node still serializes the OLD one for the queue: wrote ` +
+      `${JSON.stringify(expected)}, and what would be sent to ComfyUI is unchanged at ` +
+      `${JSON.stringify(serializedBefore)}. This node defines its own serializeValue() and builds ` +
+      `it from internal state that a widget write does not reach, so running now would use the ` +
+      `previous value (#1569). Setting it again will not help. Drive this input another way — ` +
+      `for a prompt builder, wire a CLIPTextEncode into the sampler's conditioning instead — or ` +
+      `edit the field in the ComfyUI UI so the node's own handler updates that state.`;
   } else if (parentWidget && !matchesExpected(parentWidget.value)) {
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
