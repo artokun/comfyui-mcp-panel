@@ -6,6 +6,2498 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.40] - 2026-08-14
+
+### Fixed
+- a group whose members are COLLAPSED nodes now moves, instead of being refused after those members positions had already been written (#813)
+
+## [0.14.39] - 2026-08-14
+
+### Fixed
+- a widget edit is no longer refused just because the /object_info probe went silent while ComfyUI was busy rendering — it is authorized from the last whole schema observed on the same backend connection, which a restart always invalidates (#1223)
+
+## [0.14.38] - 2026-08-14
+
+### Fixed
+- translating the error disarmed every ComfyUI-Manager fallback (#1230)
+
+
+## [0.14.37] - 2026-08-14
+
+### Fixed
+- a run whose outcome could not be confirmed is reported as a neutral event instead of an urgent error, so cancelling a large batch no longer tells the agent every prompt ERRORED (#1226, comfyui-mcp#1489)
+
+
+## [0.14.36] - 2026-08-14
+
+### Fixed
+- panel_open_workflow now asks the SERVER whether the file exists before refusing, so a workflow staged into the workflows folder out-of-band is reported as a stale list rather than a missing file (#1222, comfyui-mcp#1448)
+
+
+## [0.14.35] - 2026-08-14
+
+### Fixed
+- a graph mutation refused during a reconnect now says so in a FIELD the caller can key on, instead of only in the sentence (#1216, comfyui-mcp#1529)
+
+
+## [0.14.34] - 2026-08-14
+
+### Fixed
+- every release since 0.14.31 writes two sections for one version (#1219)
+- rebuild combo options during the reapply sweep, and disclose an empty authoritative list (#1218)
+
+
+## [0.14.33] - 2026-08-14
+
+### Fixed
+- panel_get_errors is a READ, so the dirty-tab mutation fence no longer refuses it as "this mutation" (#1211, comfyui-mcp#1478)
+- bound the remaining unbounded network awaits (#1201)
+
+## [0.14.32] - 2026-08-14
+
+### Fixed
+- a faithful workflow_open no longer reports CONTENT_UNVERIFIED just because the frontend rebuilt each node's `inputs` from its definition (#1208, comfyui-mcp#1467)
+
+## [0.14.31] - 2026-08-14
+
+### Fixed
+- panel_open_workflow no longer claims the workflow list "WAS re-read from the server" when it cannot know that — the frontend's sync swallows its own errors (#1206, comfyui-mcp#1448)
+
+## [0.14.30] - 2026-08-14
+
+### Fixed
+- the video storyboard sampler now names WHICH failure it hit, instead of reporting six different causes as one silent nothing (comfyui-mcp#1493)
+
+## [0.14.29] - 2026-08-13
+
+### Fixed
+
+- **A backend switch that cannot complete no longer leaves the panel claiming the new one (#1184) (#1196).**
+  Picking a different provider committed the choice — in memory, to the chips, and to the
+  stored runtime pick — before checking whether the old provider's session could be safely
+  ended. When that check failed the switch stopped there, and because the stored pick
+  outlives the tab, a reload adopted a backend the panel had never actually connected to.
+  The conversation replay armed for the new provider was left armed too, so the next
+  message shipped the whole prior transcript back to the provider that already had it.
+  Nothing is committed now until the switch is known to be possible, and a switch that
+  stops says so instead of failing silently.
+
+## [0.14.28] - 2026-08-13
+
+### Fixed
+
+- **Adding a node no longer waits forever on a ComfyUI that stopped answering (#1180) (#1186).**
+  When the connection to ComfyUI goes half-open — the socket is up, the server never
+  replies — a request does not fail, it simply never returns. Five requests for the node
+  schema on the add-a-node and refresh-nodes paths had no time limit, so the panel parked
+  on the first one it reached and the add landed minutes later, after the reply it belonged
+  to had already been given up on. Each now gives up on its own and falls through to the
+  handling that was already written for a schema it could not read. The log read that runs
+  while *explaining* one of those failures is bounded too; it was inheriting the very stall
+  it was called to describe.
+  **No change on a healthy ComfyUI**, where these all answer in well under a second.
+
+## [0.14.27] - 2026-08-13
+
+### Fixed
+- bound the two drive waits on the CivitAI fetch, so a slow CivitAI no longer makes a healthy panel look dead (#1189)
+
+## [0.14.26] - 2026-08-13
+
+### Changed
+
+- **Restarting the agent holds its exclusion flag until the reconnect (#1171).**
+  The panel keeps one flag so that restarting the agent and reloading it cannot run at the
+  same time, but the restart released it as soon as the request came back — while it was
+  still ending the current turn, clearing the markers that say a turn is in flight,
+  invalidating the old session, and reconnecting. The flag is now held until the reconnect,
+  which is what the reload path already did, so the two agree.
+  **No visible change when the panel manages ComfyUI's agent the usual way**: this
+  distribution's restart route always answers "not restarted" (the orchestrator runs
+  out-of-band), so the work this now protects is skipped anyway. It matters for setups
+  whose restart route really does restart the agent, and it removes the window before one
+  of those hits it.
+
+### Fixed
+## [0.14.25] - 2026-08-13
+
+### Fixed
+
+- **Setting a widget no longer hangs for 30 seconds after a ComfyUI restart (#1161).**
+  Once ComfyUI had been restarted mid-session, setting any widget on any node timed out,
+  every time, while every other panel command answered instantly — reading the graph,
+  renaming a node, listing workflows, queueing a run. Setting a widget is the one action
+  that reads the backend's node definitions before it writes, and a restart can leave the
+  browser holding a connection that never answers and never fails, so that read waited
+  forever.
+  The panel already had a second way to ask — a direct request that keeps working when
+  the first route does not — but it was never reached, because nothing gave up on the
+  first one. The lookup now has an overall time budget, so a route that stops answering falls
+  through to the one that does and the write simply succeeds. The budget covers the whole
+  lookup rather than being handed to each step in turn, so the wait cannot stack — but the
+  second route is also guaranteed a share of it, because a first route that stops answering
+  would otherwise use the budget up and leave nothing for the route that still works. A
+  route that answers quickly hands back the time it did not use, so a slow install still
+  gets the whole budget to finish in.
+  The budget is twenty seconds, which is generous rather than tight: fetching the whole
+  node-definition document was measured at well under a second even on a large install with
+  sixty-odd node packs. If nothing answers, the refusal names every attempt and says how
+  long each one was actually given, rather than quoting a wait it never spent.
+
+### Fixed
+## [0.14.24] - 2026-08-12
+
+### Fixed
+- **A successful agent restart no longer leaves the old turn's state armed against a
+  fresh agent (#1166).** When a restart genuinely replaces the agent, the panel retires
+  the markers that say a turn is in flight. Those clears all sat after a step that can
+  bail out — if the old session could not be invalidated durably, the restart returned
+  early and skipped every one of them. The killed turn, a pending soft-reload marker and
+  the restart-resume marker were all left armed against an agent that no longer existed,
+  so the next reconnect could announce a reload that never happened, or resume the very
+  conversation the restart was meant to discard. They are now retired before that step,
+  so nothing it does can skip them.
+  That pause itself is deliberate and stays: reconnecting there would restore the session
+  the restart exists to throw away. What it did not do was say so — the status chip, dot
+  and buttons still showed a live connection, so the panel contradicted its own message
+  and left no way to act on it. It now shows the real state and restores the Connect
+  button.
+
+## [0.14.23] - 2026-08-12
+
+### Fixed
+- **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
+  the outage accounting added for #1145, found by review of that change rather than in
+  the wild. A turn beginning while the bridge was still down zeroed the measured outage
+  but left the outage itself running, so it was later measured from before that turn
+  existed. Reachable in ordinary use: sending a message needs only an open socket, not a
+  completed handshake, and the socket comes back well before the model list does — so
+  typing into that gap could draw "your connection dropped mid-task — continue exactly
+  what you were doing" on top of the message just sent, making the agent restart or
+  duplicate the work it was asked to do.
+  A turn start now ENDS the outage rather than only zeroing the total. What that frame
+  proves is narrow but sufficient: a turn is in flight. The nudge exists solely to
+  rescue an agent left IDLE — a session resumed with full context and nothing pending —
+  so once a turn is running there is nothing to rescue, whether it is the original turn
+  re-announced by an orchestrator that survived or a new one just typed into a replaced
+  agent. Nudging either is the harm. The converse still holds and is covered by tests:
+  an orchestrator that died has no turn to announce, so its nudge fires as before.
+
+## [0.14.22] - 2026-08-12
+
+### Fixed
+- let a truncated provider hint be read on hover (#1165)
+- translate the "why can't I use this provider" hints in all 11 languages (#1162)
+- translate the 22 strings that answer "why can't I use this provider" (#1160)
+
+- **A ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
+  resumed agent its connection dropped mid-task and to continue what it was doing, and it
+  fires only for a REAL restart — judged by how long the bridge was gone. But the panel
+  assigns its socket before the connection resolves, so a REFUSED reconnect attempt is
+  still the active socket and ran the close handler in full, re-stamping the drop time.
+  With backoff doubling, the retries land near one, three, seven and fifteen seconds, so
+  the attempt that finally connected was separated from the previous failed close by only
+  that attempt's delay. The guard weighed its own retry cadence, not the outage: a genuine
+  restart returning inside about seven seconds measured roughly four and lost its nudge,
+  leaving the agent idle with a resumed session and no pending turn — after exactly the
+  event the nudge exists for. The outage is now stamped once, by the first close that
+  begins it, and its duration measured at the handshake that ends it.
+  A second reading of the same guard is closed with it: a drop stamp answers "how long
+  since the last drop, whenever that was", and kept answering after the outage it
+  described had ended — so a `ready` repeating on a live socket (the panel re-advertises
+  after every successful `free_vram`, #310) could be told about a drop from ten minutes
+  and two reconnects earlier. That is #1138's defect with a real timestamp in place of the
+  zero sentinel. What the guard reads is now a measured duration, scoped to the turn now
+  running, and a handshake that ended no outage records nothing rather than inheriting the
+  previous one.
+  The accounting moved into a tracker with unit tests that drive it through the real
+  sequence — drop, refused retry, refused retry, handshake — because no single call can
+  distinguish a drop from the third refused attempt, and a source scan over the panel
+  could not have caught this (a review previously proved by mutation that such scans stay
+  green through an inversion). Each guard was mutation-checked against those tests.
+  The two sibling `ready`-ack branches were audited for the same class and are clean: the
+  reboot-resume branch already decides on an observed drop rather than elapsed time
+  ("elapsed time is not evidence of a new connection; an observed drop is"), and the
+  soft-reload branch reads a marker it sets and clears itself. The mid-task branch was the
+  only one deriving a restart from a clock.
+
+## [0.14.21] - 2026-08-12
+
+### Added
+- Brazilian Portuguese (pt-BR) panel catalog — 1107 keys + 52 settings (#1156)
+- Russian (ru) panel catalog — 1161 keys, all four plural forms (#1155)
+- complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
+### Fixed
+- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
+## [0.14.20] - 2026-08-12
+
+### Added
+- Spanish (es) panel catalog (#1152)
+- add the Arabic (ar) panel catalog (#1143)
+- add the Traditional Chinese (zh-TW) panel catalog (#1153)
+- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
+- add the Turkish (tr) panel catalog (#1148)
+- add the Persian (fa) panel catalog (#1147)
+### Fixed
+- a definitions difference that is only link renumbering is not a content change (#1125)
+- the status pill froze because onStatus threw on every status frame (#1154)
+## [0.14.19] - 2026-08-12
+
+### Added
+- complete the Japanese panel translation (999 keys) (#1140)
+
+### Fixed
+- name every uninstalled node type before queueing, not one rejection at a time (#1129)
+- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
+
+
+## [0.14.18] - 2026-08-12
+
+### Fixed
+
+- **A live-socket re-advertise no longer reads as a fresh connect, so a benign reconnect
+  cannot tell you your connection dropped mid-task (#1138).** The panel injects a user
+  message — "Your connection dropped mid-task … continue exactly what you were doing" —
+  plus a transcript line whenever a `ready` ack arrives with a mid-task marker set. The
+  guard meant to suppress that on a live session read `Date.now() - lastBridgeDownAt <
+  6000`, and that timestamp is `0` until the bridge socket actually closes. So a bridge
+  that never dropped presented as a ~56-year gap — the longest possible — which a
+  long-gap-means-real-restart heuristic read as the strongest possible evidence of a
+  restart. The guard was exactly inverted in the case it existed to catch: the better
+  established that nothing had dropped, the more confidently it fired.
+  Reachable in normal use, because `ready` repeats on a live socket and the panel
+  re-advertises after every successful `free_vram` by design (#310). Freeing VRAM
+  mid-task could therefore tell you your connection had dropped when nothing had, and
+  tell a still-working agent to resume — making it restart or duplicate the render it was
+  already running.
+  A real restart still nudges, including exactly at the six-second boundary. The decision
+  moved into a pure predicate so it is covered by behaviour rather than by a source scan:
+  a review demonstrated by mutation that token-presence tests over this file stay green
+  when such a guard is inverted, which is the one regression that matters here.
+  Two related problems were found and deliberately left for their own issue rather than
+  patched here: every FAILED reconnect attempt re-stamps that timestamp, so the gap can
+  measure a backoff step instead of the outage; and the other `ready`-ack branches have
+  not been audited for the same sentinel exposure.
+
+## [0.14.17] - 2026-08-12
+
+### Added
+- freeze the English catalog and give translators a rendering instrument (#1135)
+
+### Fixed
+- the status chip must report the socket the session actually uses (#1137)
+- disclose the foreign source state on a FAILING open too (#1131)
+- a successful open must not report a canvas it did not verify (#1110)
+- say whether the workflow list was actually re-read, and stop blaming the folder (#1123)
+- advertise the vendored tool vocabulary in the hello (#1119)
+- a numeric from_output reuses the rail slot instead of minting one named "4" (#1117)
+- panel_screenshot stops throwing when a node has no type (#1115)
+- render the effort LABEL, not the raw token
+- the connect-screen blurb, and a broader audit than sinks can give
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- wire the strings no coverage metric could see
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- Korean is complete — every panel string now has a translation
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- fill Korean from 37% to 50% — the visible chrome was untranslated
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.16 (#1132)
+- 0.14.15 (#1128)
+- 0.14.14 (#1121)
+- re-vendor the tool vocabulary — the handshake found real drift (#1120)
+- 0.14.13 (#1118)
+- 0.14.12 (#1116)
+- 0.14.11 (#1113)
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.16] - 2026-08-12
+
+### Fixed
+
+- **`panel_open_workflow` now warns when the graph it painted may be another
+  workflow's (#1089).** The reporter got a clean success — right path, right
+  filename, right `workflow_uuid`, `modified: false` — while the canvas held the
+  graph of the workflow they had just saved-as FROM. No warning of any kind. Their
+  next calls were `panel_remove_node`, and Save-As preserves ids, so those
+  deletions would largely have LANDED, on the wrong workflow, silently.
+  Nothing was fooled, which is why no existing check caught it. All four parts of
+  the post-repaint proof are taken against the root the LOADER produced; none of
+  them looks at the state the load was handed. When that state holds another
+  workflow's graph, the open reproduces it faithfully and every part passes — each
+  a true statement about a poisoned SOURCE. That is also why the other report on
+  the same end state (#1111) DID warn while this one did not: there the state had
+  not been contaminated, so the comparison had something to disagree with.
+  The reply now carries `foreign_source_state` when the state provably held a
+  different OPEN workflow's identity. It says to verify the graph before editing,
+  explains that every other field on the reply is TRUE of the tab and says nothing
+  about which graph the state held, and names the disk recovery together with its
+  cost — a tab reporting no unsaved edits can still lose values a NODE wrote
+  rather than the user (a populated wildcard, a rolled seed, #874).
+  It says MAY be, not IS, and deliberately: a tab switch can leave this tab's OWN
+  graph sitting under another tab's metadata residue (#817), which is
+  indistinguishable from a foreign graph, so only the caller's comparison
+  separates them.
+  **This warns, it does not prevent.** Two stronger remedies were built and
+  removed, and both are recorded in the code so they are not tried again. Refusing
+  the open removes the repaint's root re-stamp — the one documented heal for a
+  conflicting root tag — and strands every `graph_*` command, including the
+  `panel_load_workflow` the refusal recommended, whose own error sends the caller
+  back into the refusal. Auto-correcting from disk cannot be gated safely, because
+  the tab's modified flag is wrong in both directions: it misses node-written
+  values, and it stays spuriously set for the life of any tab the panel opened
+  cold.
+
+- **The same finding now rides a FAILING open too (#1089).** It was attached to the
+  success reply only, so an open that also failed content verification dropped it —
+  the worse combination, and the one #1111 reported: a mismatch WAS announced and
+  the canvas was still the previous workflow's. The content warning says to re-read
+  the graph; it did not say the state was another workflow's, which is the part
+  that explains why the re-read looks plausible rather than alarming.
+
+### Changed
+
+- **Korean is complete — every panel string now has a translation (#1080).** The
+  visible chrome had been left untranslated at 37% coverage; the connect-screen
+  blurb, the effort label (which rendered its raw token rather than a name), and a
+  set of strings no coverage metric could see are now wired.
+
+## [0.14.15] - 2026-08-12
+
+### Fixed
+
+- **`panel_open_workflow` no longer claims a refresh it never performed (#1448).**
+  The refusal said the file "isn't among the saved/open workflows even after a
+  refresh" — for a file the reporter had confirmed on disk INSIDE that folder,
+  twice. Both ways the refresh can fail to happen were silent: a frontend without
+  `syncWorkflows` skipped it entirely, and a throw was swallowed by a
+  `console.warn` no agent session reads. It now reports which actually occurred —
+  list re-read, no sync method on this frontend, or re-read failed with the reason
+  — and says outright that a skipped or failed re-read is NOT evidence the file is
+  absent.
+  Its remedy also stopped naming the wrong cause: "for a file outside the
+  workflows folder" reads as a diagnosis, and sent someone away from a file that
+  was exactly where they thought. `panel_load_workflow` is still offered, as a
+  branch rather than a verdict.
+  The refusal now also shows the selector SHAPES the store actually holds, which
+  are not guessable from outside: `path` is `workflows/X.json`, `filename` carries
+  NO extension, and `key` does.
+
+## [0.14.14] - 2026-08-12
+
+### Fixed
+
+- **The panel now says WHICH tool vocabulary it vendored, at connect (#236).**
+  The panel calls MCP tool names as bare string literals and validates them
+  against a vendored copy of the vocabulary — which proves the literals match
+  that copy, never that the copy matches the server it is talking to. When the
+  two disagreed, the failure surfaced at call time as `unknown tool`, which
+  reads as a broken panel and gives an agent nothing to act on.
+  The hello now carries a hash of the vendored vocabulary, and the orchestrator
+  compares it at connect (comfyui-mcp 0.51.13). A version string cannot do this
+  job: two builds of one version can carry different vocabularies, and two
+  versions can carry identical ones.
+  Safe in both directions of skew — an orchestrator that predates the check
+  ignores the field, and one that has it reads an ABSENT hash as unverified,
+  never as disagreement.
+- **Re-vendored the tool vocabulary.** The first live run of that handshake
+  found real drift: the vendored copy was missing `panel_remove_widget`, 91
+  panel tools against the server's 92. Found by the mechanism built for it
+  rather than by someone hitting `unknown tool`.
+
+## [0.14.13] - 2026-08-11
+
+### Fixed
+
+- **A numeric `from_output` no longer mints a junk rail slot named "4" (#1114).**
+  Inside a subgraph, `panel_connect({ from_output: 4, ... })` replied `exposed`
+  rather than `connected` and left a permanent rail input literally named `"4"`,
+  visible on the parent subgraph node too. The rail lookup gated its index branch
+  on `typeof ref === "number"`, but MCP argument coercion delivers `4` as the
+  string `"4"` — so the lookup missed, and the caller read the miss as "no such
+  slot" and created one. A lookup that failed closed would have been a refusal;
+  this one edited the graph.
+  The index parse is deliberately strict (`"04"` and `"007"` are names, not
+  index 4 and 7), so a mistyped name cannot land silently on an unrelated slot.
+  And when a ref matches BOTH a slot name and a different index — a rail whose
+  slots are digit-named out of order — it now refuses and names both candidates
+  instead of guessing, because nothing at that point can tell which was meant.
+
+## [0.14.12] - 2026-08-11
+
+### Fixed
+- panel_screenshot stops throwing when a node has no type (#1115)
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.11 (#1113)
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.11] - 2026-08-11
+
+### Fixed
+- an open that detects the wrong graph must refuse, not just say so (#1112)
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.10 (#1109)
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.10] - 2026-08-11
+
+### Fixed
+- stop asking every run-to-node caller to report a permanent fallback (#1107)
+- refuse a write to rgthree's Fast Groups toggle — it is a derived readout (#1106)
+- a correction to an identical value is not a correction (#1104)
+- warn when a direct write lands on a link-driven widget (#1102)
+- name both ChatGPT routes, and stop the label map gating the handshake (#1100)
+- a host probe must not shrink an authoritative provider list (#1094)
+- don't capture another workflow's canvas into the tab being opened (#1092)
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.9 (#1105)
+- 0.14.8 (#1103)
+- 0.14.7 (#1101)
+- 0.14.6 (#1099)
+- 0.14.5 (#1093)
+- 0.14.4 (#1091)
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.9] - 2026-08-11
+
+> #1085: adding an ImageCropV2 warned that this tab's node definitions were out of date and
+> that a value had been replaced — showing the old and new values side by side, identical.
+
+### Fixed
+- adding a node no longer reports a value as "corrected" when nothing about it changed. The
+  check compared values by identity rather than by content, and a value that is a group of
+  numbers — like ImageCropV2's crop region — is a fresh group every time it is read, so it
+  never matched itself. Every add of such a node raised the warning and told you to reload
+  the tab.
+
+### Changed
+- values are now compared by what they contain, at any nesting depth. A value that genuinely
+  changed is still corrected and still reported — that warning exists for a real case and it
+  keeps working.
+- anything the comparison cannot read faithfully is treated as changed rather than guessed
+  at, which is what it did before. That is the safe direction: it can mention a correction
+  that was not needed, but it will never stay silent about one that was.
+
+## [0.14.8] - 2026-08-11
+
+> #1087: setting a widget inside a subgraph reported success and changed nothing about the
+> render — a run asked for 10 steps and sampled at 14, with nothing to indicate the value
+> had been ignored.
+
+### Fixed
+- setting a widget that is fed by a connection now tells you it will not affect the render.
+  When a subgraph promotes a widget to its outer node, the inner copy is driven by that
+  connection and the outer value is what actually runs — so writing the inner one stored a
+  number nothing reads. The write still happens (that inner value is the subgraph's stored
+  default, and setting it is a reasonable thing to want), but the reply now says plainly that
+  it will not change the output, and points at the outer node to set instead.
+
+### Changed
+- the check reuses exactly what the graph outline already shows for these widgets, so it
+  reports the same connection the outline names rather than a second opinion.
+- writing the widget on the OUTER subgraph node is unchanged and still the way to make it
+  take effect — that path already updates both copies, and it does not warn.
+
+## [0.14.7] - 2026-08-11
+
+> #1084: the provider picker showed "ChatGPT" next to a lowercase "chatgpt", which looked
+> like an accidental duplicate and gave you nothing to choose between.
+
+### Fixed
+- both ways of reaching ChatGPT are now named. They are genuinely different routes to the
+  same subscription — **ChatGPT (Codex)** runs it through the Codex app-server, **ChatGPT
+  (direct OAuth)** talks to it directly with no extra process — and only the first had a
+  name, so the second showed its raw id.
+- the panel now knows which provider it is connected to when you use the direct-OAuth route.
+  This was the larger half: the panel decided whether a provider was "known" by whether it
+  had a display name for it, so the unnamed one skipped the step that records the connection
+  — leaving the remembered provider, the "Ask …" prompt and the highlighted chip all showing
+  the previous one.
+
+### Changed
+- a provider your agent machine reports but this panel version has never heard of is now
+  accepted rather than ignored, and shown under its own id until a release names it. New
+  providers can land before the panel ships a label for them, and that ordering is normal.
+- ComfyUI's Settings dropdown lists both routes too, so the default provider can be set to
+  either.
+
+## [0.14.6] - 2026-08-11
+
+> #1083: connect to ChatGPT, reopen the model picker, and LM Studio, llama.cpp, Custom
+> endpoint and Copilot are gone — with no way back to a Custom endpoint you had configured.
+
+### Fixed
+- the provider list no longer loses providers after connecting. The panel learns which
+  providers exist from two places: the machine actually running your agents, which knows
+  about all of them, and ComfyUI itself, which only knows a shorter built-in list. A routine
+  background refresh from ComfyUI was replacing the full list with the short one, so
+  everything past OpenRouter disappeared from the picker.
+
+### Changed
+- the shorter list is now merged into the fuller one instead of replacing it. A provider
+  ComfyUI knows about but your agent machine did not mention is still added, and one it has
+  stopped reporting can still go away — what it can no longer do is delete a provider the
+  agent machine told us about.
+- a provider's Running indicator still updates from those refreshes, so this does not trade
+  a disappearing provider for one that looks permanently idle.
+- the "(experimental)" marking and its terms-of-service warning on GitHub Copilot are now
+  held back from those refreshes too, so a routine poll cannot quietly drop the warning.
+
+## [0.14.5] - 2026-08-11
+
+> #968: opening one workflow could silently give it a DIFFERENT workflow's graph — and
+> every check said it was fine, honestly. This is the cause, found and fixed.
+
+### Fixed
+- switching to a workflow no longer copies the previous tab's graph into it. The panel
+  switched tabs, then took a snapshot of the canvas, then repainted — and the snapshot ran
+  while the canvas still showed the tab you were leaving. So the workflow you opened had the
+  OTHER one's graph written into its unsaved state, was marked as edited, and was then
+  repainted from exactly that. Every check afterwards compared the canvas to that state and
+  agreed, because by then they genuinely matched. Only the file on disk disagreed, which is
+  why reloading from disk was the one thing that fixed it.
+
+### Changed
+- the snapshot is now skipped when the canvas provably belongs to another workflow. When it
+  provably belongs to the one being opened — the ordinary case, and the one the snapshot was
+  added for — nothing changes at all.
+- one case is knowingly not covered: a canvas the panel has never tagged cannot be attributed
+  to anyone, so it is still snapshotted as before. Guessing there would mean either
+  overwriting your live edits or writing the wrong graph, and neither is worth doing on a
+  guess.
+
+
+## [0.14.4] - 2026-08-11
+
+### Fixed
+- resolve subgraph-qualified node ids instead of coercing them to NaN (#1090)
+- rgthree seeds are invisible to the batch-repeat warning (#1082)
+- core SaveGLB is addable — a 3D file union names formats nothing OUTPUTS (#1078)
+- defect (2) — scope the #226 guard to the hazard it names (#1075)
+- satisfy the tool-vocabulary gate, which this batch tripped four ways
+
+### Changed
+- 0.14.3 (#1086)
+- 0.14.2 (#1081)
+- 0.14.1 (#1076)
+- 0.13.9 (#1072)
+
+
+## [0.14.3] - 2026-08-11
+
+> #1339: a batch of ten came back as ten identical images, with nothing said about it. The
+> warning that exists for exactly this looked for ComfyUI's own `control_after_generate`
+> widget — and rgthree's Seed node DELETES that widget, so the most widely used custom seed
+> node was invisible to it.
+
+### Fixed
+
+- a batch that will reuse one seed now says so when the seed comes from an rgthree Seed node.
+
+### Changed
+
+- it reports the thing that actually decides the outcome: whether the node is ARMED (its
+  seed widget holding `-1`, `-2` or `-3`) or holds a concrete number that is submitted
+  verbatim for every item. It stays quiet when the node genuinely varies — measured, an
+  armed node gets a fresh seed per item even in a scoped batch, so the older warning's
+  reasoning does not apply to it and is not reused.
+- an armed node can still repeat when its `randomMin`/`randomMax` properties — or the seed
+  widget's step — admit a single value. Measured over 200 draws, `min=0 max=5 step=100`
+  returns ONE value while `min < max` looks perfectly healthy. That case is named too, with
+  the remedy that fits it.
+- a muted or bypassed seed node is not named, since it contributes nothing to the run.
+
+### Notes
+
+- your seeds are never rewritten. This says what will happen; it does not change your values.
+
+
+## [0.14.2] - 2026-08-11
+
+> #1062: asking the agent to add `SaveGLB` always failed. It is the only core node that
+> writes a `.glb`, so while this was broken you could not build an image-to-3D or
+> text-to-3D workflow through the panel at all.
+
+### Fixed
+- `SaveGLB` can be added again. Its `mesh` input accepts a list of 3D formats, and the panel
+  refused to place the node unless it could prove every single one was a real connection
+  type. Seven of the fourteen are formats ComfyUI can WRITE that nothing on your machine
+  PRODUCES — so the proof could never be found, on any install, and retrying or refreshing
+  the node list could not help. ComfyUI's core 3D file formats now count as connection
+  types on their own.
+
+### Changed
+- the check that this relaxes is the one that stops a node being added when an input needs a
+  widget that never loaded, so it was loosened narrowly and in one direction only: the list
+  of 3D formats is a fixed set of the 13 ComfyUI ships, not a `FILE_3D_*` pattern. A custom
+  node inventing its own `FILE_3D_…` type is still held to the same proof as before, and an
+  input that asks for a real widget still waits for it.
+- an input that names the widget it draws as (`widgetType`) is now correctly treated as a
+  widget rather than a connection — a gap found while making the above safe, which could
+  have let a node be added with neither a value nor a connection on a required input. Where
+  that name is one of the four built-in kinds, it needs nothing loaded and no longer waits.
+
+
+## [0.14.1] - 2026-08-11
+
+> #1066, the other half: 0.13.9 stopped a URL-derived tab from building an unwritable
+> `workflows/http://…/YourName.json`, but the tab still could not be saved. A second guard
+> refused every name, because it could not prove what was on disk at the URL path — and
+> nothing can. This is the fix that lets the tab save.
+
+### Fixed
+- a temporary tab whose path came from a URL now saves. The refusal came from a safety guard
+  that protects against a save MOVING (destroying) the original file. That could happen when
+  ComfyUI's `saveWorkflowAs` was the copy route — it moves a temporary rather than copying
+  it. The panel stopped using it some time ago; the only relocating route left builds a new
+  workflow in memory and writes that, never touching the source's file. So the guard now runs
+  after the route is chosen and refuses only when no move-free route exists.
+
+### Changed
+- three separate attempts to prove such a source absent are recorded in #1066 as dead ends,
+  because the trap is easy to fall into: the path shape (`://`) proves nothing — on Linux a
+  real folder can legally be named `notes://draft`; the `isTemporary` flag proves nothing —
+  real saved files can carry it after a load race; and ComfyUI's `/userdata` answers a
+  URL-shaped path with a **500**, not a "not found", so the disk cannot answer either. The fix
+  does not add a fourth attempt. It stops needing the proof.
+- the "the original is gone" safety check now also runs for a source that could not be
+  classified, which is the case with the least evidence and so the one that most needs
+  checking afterwards. Its message now reports what was observed rather than blaming the save:
+  two checks can prove a file DISAPPEARED, not who removed it.
+
+### Notes
+- your workflows are protected by the same rule as before — a save may never remove a file
+  that exists. What changed is only where that rule can be broken, and the check that catches
+  it if it ever is.
+
+
+## [0.14.0] - 2026-08-11
+
+> The panel shipped English-only while ComfyUI ships 12 languages, so setting ComfyUI to
+> Korean gave you an English sidebar inside a Korean app.
+
+### Added
+- the panel, every sub-panel and its helper text are translated — roughly 1,000 strings.
+  Korean, Simplified Chinese and Japanese are filled in; the other eight fall back to English
+  per string until they are. The 52 rows in ComfyUI's own Settings dialog translate too.
+- a **Panel language** setting: follow ComfyUI's language automatically, or pick one of the
+  same 12 explicitly.
+- Arabic and Persian lay out right-to-left, scoped to the panel so ComfyUI's canvas is
+  untouched.
+
+### Changed
+- counts read correctly in every language. "1 model / 3 models" is an English rule; Korean has
+  one form, Russian four, Arabic six, and the panel now uses each language's actual rules.
+
+### Notes
+- this entry was written after the fact — 0.14.0 shipped without one, which meant the panel's
+  own changelog view had nothing to show for the release.
+
+
+## [0.13.9] - 2026-08-11
+
+> #1066: open an output image in ComfyUI and it mints a temporary workflow tab whose path is
+> the URL the asset came from. Renaming that tab replaces only its filename — so the URL
+> stays on as the tab's folder, and the tab could not be saved under ANY name.
+
+### Fixed
+- saving such a tab no longer builds `workflows/http://127.0.0.1:8188/api/YourName.json` and
+  fails with a 500. A URL-shaped folder is recognised and the save is redirected to the
+  workflows root, the same as any other unwritable location.
+
+### Changed
+- a URL-derived tab is deliberately NOT treated as an "external file". That classification
+  drives a copy route whose whole premise is a real file on disk to copy — and a URL is not
+  one, so treating it that way kept the tab unsaveable by a different path. This is why the
+  reporter's own first successful save required treating the URL source as never persisted.
+- one known cost, taken deliberately: on Linux/macOS a folder can legally be named with
+  `://` in it, and a tab in such a folder now has its Save-As redirected to the workflows
+  root. A redirected save is visible and recoverable; the 500 it replaces was not. Windows
+  cannot hit this at all, since `:` is illegal in a filename there.
+
+
+## [0.13.8] - 2026-08-11
+
+> #968: three reports of the panel saying a tab was bound to the workflow you asked for
+> while the canvas held a DIFFERENT workflow's graph — once queueing the wrong one. Every
+> check reported healthy, and every check was telling the truth.
+
+### Added
+- `panel_open_workflow` on an already-open tab now compares the file it just read against
+  the canvas, and says so when they share **no node ids at all**. In the report that was 44
+  nodes on screen against 40 in the file with none in common — which is not what editing
+  looks like.
+
+### Changed
+- it is a DISCLOSURE, not a refusal. Clearing a tab and rebuilding, or pasting a whole graph
+  in before saving, look the same from here, so the note names those alternatives and leaves
+  the judgement to you. A refusal built on that ambiguity would be a wrong-graph refusal of
+  its own — the same class of harm as the bug.
+- why nothing caught this before: the repaint loads from the tab's own state and proves the
+  canvas against **that state**, while the staleness check compares the file against the
+  tab's **baseline**. Both pass honestly when the tab's own state is carrying another
+  workflow's graph. Nobody compared the file to the canvas, even though that code path had
+  already read the file.
+
+
+## [0.13.7] - 2026-08-11
+
+> artokun/comfyui-mcp#938: an agent could WRITE a dynamic widget row and could delete the
+> whole NODE, but had no way to delete one row — the add/remove affordance is a canvas-drawn
+> button it cannot click.
+
+### Added
+
+- `graph_remove_widget` removes ONE dynamic widget row (rgthree Power Lora Loader `lora_N`,
+  Impact/Inspire list rows). Undoable with Ctrl+Z.
+
+### Fixed
+
+- the remaining rows are NOT renumbered. `lora_N` is a monotonic id, not a position:
+  `configure()` re-mints the names from serialized ORDER on every load, and the backend
+  reads `**kwargs` filtered by name prefix, so gaps never reach it. The reply lists the
+  remaining names, because an agent that assumed renumbering would address the wrong row.
+
+### Changed
+
+- removal is refused, with the specific reason, for an input the BACKEND declares (it would
+  change what is sent at queue time), a frontend-generated control widget, a widget whose
+  input slot currently has a link, and a subgraph container's promoted widgets. Node
+  definitions that could not be READ are reported as unknown rather than treated as
+  "declares nothing" — the difference between those two is the only thing separating a row
+  from a KSampler's `steps`.
+
+### Fixed
+- a DUPLICATE delivery of a request the panel is already running no longer waits forever on
+  it (#646). The command ledger marks a command in-flight and never evicts that entry —
+  dropping an unsettled command would let a replay apply the same mutation twice — so an
+  executor that never returned left every redelivery awaiting a promise that could not
+  resolve, and the panel answered nothing at all. The duplicate now gets a real answer:
+  still running, nothing was applied twice, do not retry, read the graph to see whether it
+  took effect.
+- that wait is bounded by the CALLER's own deadline, never by a number the panel invents. A
+  fixed timeout is wrong in both directions — too high rescues nobody, too low reports
+  "still running" for a command that was merely slow. The panel cannot see that deadline
+  today, so absent it the behaviour is unchanged; this half activates when the orchestrator
+  sends the timeout it already computes.
+
+
+## [0.13.6] - 2026-08-11
+
+> #968: three reports of the panel saying "bound to the requested workflow" while graph
+> commands kept hitting the previous one — once queueing the wrong workflow outright. They
+> have not converged because, after the fact, a stale binding and a fresh one look identical.
+
+### Added
+- a workflow-instance refusal now reports **what last moved the active workflow**, when
+  anything did. If a panel command made the move it is named. If nothing claimed it, the
+  refusal says so — and says plainly that this does NOT prove the panel was uninvolved,
+  because not every command can register a claim. What it does establish either way is that
+  a binding taken before that move is stale.
+
+### Changed
+- it decides nothing, deliberately. No refusal becomes an acceptance, and a refusal with no
+  move to report is byte-for-byte what it was. Widening trust on an entry route nobody has
+  identified is how a refusal turns into the silent wrong-graph edit this issue is about.
+- ruled out along the way, and recorded on the issue: `panel_open_workflow` forces the canvas
+  repaint itself and verifies it, both of its skip paths fail closed, and the report where
+  the wrong workflow was queued ran on a build that already had both protections. So the
+  binding is correct when it is made, and something re-points the tab afterwards.
+
+
+## [0.13.5] - 2026-08-11
+
+> #1369: `panel_add_node` applied a node definition's declared default over a widget's
+> value whenever the two differed. For a COMBO whose option list does not CONTAIN that
+> default, the "correction" wrote a value the node cannot accept — and reported success.
+
+### Fixed
+
+- a stale-schema "correction" no longer rewrites a valid COMBO widget to a value the node
+  cannot accept (#1369). The live KJNodes def is
+  `"sage_attention": [["disabled","auto",...], {"default": false}]` — the widget held a
+  valid `"disabled"` and was overwritten with `false`.
+- when a declared default is absent from that same definition's option list, the existing
+  value is KEPT and the refusal recorded, rather than written and called a correction.
+
+### Changed
+
+- verified against this machine's live ComfyUI (4183 node types): of 1105 combo inputs
+  carrying a default, 1083 corrections still apply and 22 are refused. The 22 are the
+  reported KJNodes case plus model-filename defaults naming files not installed here,
+  which ComfyUI's own `validate_inputs` would reject as well. No valid default was
+  refused — the direction that would have quietly disabled the correction entirely.
+
+## [0.13.4] - 2026-08-10
+
+> #584: a ComfyUI tab that keeps running OLD panel JS after a reload, so the orchestrator
+> sees a stale version and refuses graph writes. This is a backstop for hosts that leave the
+> door open — not a cure, and the notes below say exactly which.
+
+### Fixed
+- the pack now gives its own `/extensions/comfyui-mcp-panel/` assets a cache policy on hosts
+  that set none, matching the value current ComfyUI already applies to every extension.
+  Older ComfyUI builds serve extension files with an ETag from mtime+size and no policy,
+  which is the shape that lets a replaced file keep being served from cache.
+
+### Changed
+- **Measured before claiming**: ComfyUI 0.31.1 already sends `Cache-Control: no-store` for
+  every `/extensions/` path, so on current builds this changes nothing. The staleness
+  reproduced while developing 0.13.3 turned out not to be a cache at all — it was a reload
+  cancelled by ComfyUI's unsaved-changes prompt.
+- A first attempt used a weaker header and was described as a no-op. It was not: this pack's
+  middleware runs INSIDE ComfyUI's own, so the host's `setdefault` preserved the weaker
+  value and the panel's assets ended up with a LOOSER policy than every other pack's. The
+  shipped version matches the host's value, so that inversion cannot happen.
+
+
+## [0.13.3] - 2026-08-10
+
+> #753: the panel's text was small and the obvious fix did nothing. Overriding
+> `.cmcp-root { font-size }` scaled almost nothing, because every inner size was `rem` —
+> resolved against the PAGE root, not the panel.
+
+### Added
+- **`--cmcp-fs`, one variable that scales the panel's text.** Set it on `:root` or
+  `.cmcp-root` in a user stylesheet (default `0.8125rem`) and every panel font size follows,
+  including the CivitAI explorer, the Apps tab and the modals. Measured: overriding it to
+  1.5x moves 2110 of 2476 rendered elements by exactly that.
+- It does NOT scale spacing, icons, or the handful of elements that carry a fixed pixel
+  size, and the setting's tooltip now says so rather than promising more.
+
+### Changed
+- 214 inner font sizes became `calc(var(--cmcp-fs, 0.8125rem) * k)`, each reproducing its
+  original pixel size at the default — verified element by element against a capture of the
+  panel taken before the change, with no drift beyond sub-pixel rounding.
+- The "Panel UI scale (%)" setting is unchanged and is still the way to scale the panel as a
+  whole. Its tooltip used to explain why a stylesheet override could not work; that trap is
+  gone, so it now names the knob that does.
+
+### Fixed
+- the status caret set its size through a JS assignment rather than a stylesheet rule, so it
+  had been missed by every sweep. It scales with the rest now.
+
+
+## [0.13.2] - 2026-08-10
+
+> #945: the panel could not tell one workflow OBJECT from another without looking at the
+> canvas — so two guards that decide whether an identity belongs to a copy were deciding
+> nothing at all.
+
+### Fixed
+- a workflow that is not the one on screen can now be asked for its own identity (#945).
+  The three fields that lookup used are absent on current ComfyUI, so it answered null
+  every time, and both fork guards behind it short-circuited on their first line. It now
+  falls back to the workflow's own captured state — but only for a workflow that is NOT
+  mounted, and the reason for that restriction is the whole of this fix: for the workflow
+  on screen, that field is a clone of the live canvas, so reading it there would answer
+  "whose identity is this?" with "whatever is on screen", which is precisely what the
+  caller asked it not to do.
+- the mounted check compares identity the way the rest of the panel does, rather than with
+  `===`. ComfyUI hands out reactive proxies in some places and raw objects in others, and
+  the path that matters most here unwraps deliberately — measured on this machine, the
+  active workflow IS a proxy whose raw target is a different object, so a strict comparison
+  would have let the canvas back in with no race required.
+
+### Changed
+- where identity is WRITTEN is untouched. Embedding into the workflow's captured state
+  moves where identity persists — it stops reaching the graph that a save serializes — and
+  was reverted once for exactly that. Reading a field is not writing it.
+
+
+## [0.13.1] - 2026-08-10
+
+> The other half of #952. A question card whose connection was replaced already stopped
+> looking answerable in 0.13.0; the command behind it, however, was left waiting forever.
+
+### Fixed
+- withdrawing an interactive card now ENDS the command behind it (#952). `panel_ask` and
+  the secret request are the only commands whose executor blocks on a person, and retiring
+  their card deliberately did not resolve its promise — so the executor stayed suspended,
+  its entry in the command ledger stayed in flight, and entries in flight are never
+  evicted, by design. Every withdrawn question kept a slot for the life of the tab and held
+  the ledger's bound out of reach; a duplicate delivery of that request id then waited on a
+  promise that could never resolve, and the panel answered nothing at all. Retirement now
+  settles the command explicitly, as a failure that fabricates no answer.
+- a payload-free failure for those two commands is no longer rewritten as "the panel
+  collected the response, but the connection dropped" when nothing was collected. Replies
+  that actually carry the person's own input are redacted exactly as before.
+
+### Changed
+- a correction to this project's own notes on #952, recorded because the plan rested on it:
+  the orchestrator mints its session epoch once per PROCESS, so a tab reconnecting to the
+  same process keeps its ledger scope. The earlier claim that a reconnect lands in a new
+  scope and fails open into a duplicate card was wrong; that only happens across an
+  orchestrator restart.
+
+
+## [0.13.0] - 2026-08-10
+
+> A panel connected to a ComfyUI the orchestrator cannot reach — a tunnel, a proxy URL, a
+> loopback-only host — could not convert its own live canvas. Anything that pairs a captured
+> graph with node definitions took the graph from the panel and the definitions from
+> whatever COMFYUI_URL points at, which is the same machine locally and a different one
+> remotely.
+
+### Added
+- the panel can now serve the node definitions of the ComfyUI it is actually looking at,
+  fetched by the browser that is already talking to it (#1006). That is the panel half of
+  the fix; the orchestrator side dispatches to it.
+- the reply names which ComfyUI answered, and refuses rather than returning a partial
+  schema — a conversion run on half a schema produces a wrong answer, not a smaller one.
+- the payload is large (4183 node types on the machine this was built against), so a caller
+  can pass back a fingerprint and be told the type set is unchanged instead of receiving it
+  again. The reply says what that does not cover: a combo list or a widget name can change
+  without changing which types exist.
+
+### Fixed
+- mark a question card whose connection dropped, instead of leaving two live ones (#952) (#1027)
+- a created tab must leave a fence its own commands can pass (#1019) (#1025)
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.2 (#1028)
+- 0.12.1 (#1026)
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.12.2] - 2026-08-10
+
+> When the panel loses its connection while the agent is waiting on a question, the card
+> stays on screen and stays clickable — but its answer can no longer reach anyone. If the
+> agent asks again after reconnecting you get two identical questions, one of which does
+> nothing, and until now the panel left you to work out which.
+
+### Fixed
+- a question card whose connection has been replaced is now visibly retired: its buttons
+  stop working and it says the connection dropped and to answer the newer card (#952).
+- the same for a secret request, with wording that never sends you to paste a token into
+  the chat — that card exists so the value reaches the orchestrator through a masked input
+  the agent never sees.
+- a card is only retired when the connection that ASKED for it has actually been replaced.
+  A reconnect that lands on the same socket, or a re-handshake (which happens routinely),
+  leaves a live card alone — as does the Settings token field, which has no agent behind
+  it and still works after a reconnect.
+- a created tab must leave a fence its own commands can pass (#1019) (#1025)
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.1 (#1026)
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.12.1] - 2026-08-10
+
+> When a command is refused because it targets a different workflow than the canvas, the
+> panel offers two recoveries: re-target, or re-open the workflow you meant. For a tab that
+> has never been saved — the one a fresh `panel_new_workflow` just made — the second is not
+> available, because opening resolves a workflow by its path and that tab has none. A
+> reporter had to work that out for themselves.
+
+### Fixed
+- the refusal now says so, when the panel can actually see it: the active tab is unsaved, so
+  re-opening cannot re-select THAT tab, and re-targeting is the route if the canvas you want
+  is the active one (#1019).
+- the note is kept narrow on purpose. Opening a different, saved workflow still works — the
+  refusal means the command targeted something other than the active canvas, and that
+  something may well be a saved workflow the existing remedy reaches perfectly well.
+- a saved tab reads exactly as before, and a tab the panel could not read says nothing at
+  all: an unproven fact has no place in a refusal.
+- report the provenance a catalogue answer can actually establish (#890) (#1023)
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.12.0 (#1024)
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.12.0] - 2026-08-10
+
+> Searching for a custom node pack and getting "no matches" reads as "that pack does not
+> exist". It can equally mean the list that was searched predates the pack: a machine whose
+> network blocks the registry does not get an empty catalogue from ComfyUI-Manager, it gets
+> a full one that may be months old, and nothing in the answer distinguishes the two.
+
+### Fixed
+- a node search that matches nothing now says how many packs it searched, that the request
+  asked Manager for its cached copy, and — explicitly — that Manager does not report
+  whether it honoured that, when the data was fetched, or whether it came from the network,
+  the on-disk cache or the copy bundled with Manager (#890). So the result stops implying a
+  pack does not exist when what it actually shows is that it was not in the list searched.
+- the panel deliberately makes no guess about staleness. Measured on a working install, the
+  served catalogue is not the bundled map (5583 packs against 4884, sharing about 1800
+  entries), so the obvious "is this the bundled copy" test would never fire — it would ship
+  as a check that always passes and quietly reassures.
+- a search that finds something is unchanged, and an empty catalogue keeps its existing
+  stronger answer: nothing was searched at all.
+- Save-As must leave a fence the next command can pass (#978) (#1021)
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.99 (#1022)
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.11.99] - 2026-08-10
+
+> After a Save-As, graph tools could keep refusing even for an agent that did exactly what
+> the reply told it to do. The reply said to re-target to the new workflow, and that clears
+> one guard — but ComfyUI activates the saved copy without repainting the canvas, so the
+> canvas is still showing the workflow you saved FROM. The second guard then refuses,
+> correctly, and nothing said why.
+
+### Fixed
+- a Save-As reply now says that no canvas repaint was requested, and that re-targeting may
+  therefore not be enough for graph tools: if a graph command is then refused for a
+  root-workflow-uuid mismatch, that is the reason, and opening the saved workflow is what
+  brings it onto the canvas (#978).
+- the warning is stated conditionally rather than asserted, because a tab switch or a
+  reconnect can repaint during the save — the panel knows the save did not ask for a
+  repaint, not what the canvas holds by the time the reply is read.
+- a FIRST save of an unsaved workflow no longer gets any of that: it keeps the same
+  identity, nothing is about to be refused, and telling that caller to re-target and
+  re-open would have sent them fixing a problem they do not have.
+- stop refusing a write for object_info that a reconnect never restored (#982) (#1018)
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.98 (#1020)
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.11.98] - 2026-08-10
+
+> A widget write could be refused for "object_info is unavailable — the backend is
+> unreachable or the fetch failed" on a machine where ComfyUI was answering perfectly
+> well. Two problems in one sentence: the panel had only one way to ask for the schema,
+> and when that way failed it reported a cause it had never established. The reporter went
+> checking a backend that was fine.
+
+### Fixed
+- a widget write no longer gives up when the frontend's own `getNodeDefs()` call fails —
+  it asks the same question again over plain HTTP, which is the route that answers when
+  the client does not (#982). Verified live: with the client made to throw, the fallback
+  returned the full 4183-type schema on this install.
+- the refusal now says what actually happened rather than naming a cause. It reports that
+  no usable schema was obtained and lists what each route did, so a backend that answers
+  by hand and a panel that cannot use it are told apart immediately.
+- an EMPTY schema from the frontend client is treated as its answer, not as a failure to
+  answer, so the fallback can never overrule a deliberate deny-all with a broader one.
+  Everything else about the fence is unchanged: only a usable schema authorizes a write.
+- the diagnostic text is bounded — control characters collapsed, per-entry length capped,
+  at most four routes named with the remainder counted — because it comes from a backend
+  or an extension and ends up in a message someone reads.
+- a tab switch onto a MODIFIED workflow still refuses on a stale tag (#995) (#1016)
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.97 (#1017)
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.11.97] - 2026-08-10
+
+> A workflow with unsaved edits could have every graph tool refused after a tab switch,
+> including read-only ones, while the panel's own tab list confirmed the intended
+> workflow active. ComfyUI reuses one canvas object across tabs and leaves the previous
+> workflow's identity tag on it; the escape that handles that was written for a CLEAN tab
+> only, and the report was filed on a modified one. Reproduced live through UI clicks:
+> the canvas provably matched the active workflow and the panel refused anyway.
+
+### Fixed
+- a READ on a canvas whose content matches the active workflow's own state is no longer
+  refused because the canvas carries the previous tab's identity tag, even when the
+  workflow has unsaved edits (#995). Nothing is written: the tag is left exactly as it
+  was, and the refusal is lifted for that one call.
+- mutations are deliberately NOT included. Content equality against an edited tab's
+  snapshot cannot say WHOSE canvas is mounted — two tabs can hold the same graph — and a
+  write on that evidence could land on the wrong one. The bypass is opt-in, set in a
+  single place for the commands classified read-only, so nothing else can acquire it by
+  omission.
+- an open workflow holding the same content as the canvas now blocks the bypass rather
+  than being skipped as unprovable, since with edits allowed on both sides a twin would
+  otherwise be invisible. Verified on the live install: a real twin blocked it, and with
+  no twin present the read went through.
+- stop a faithful workflow_open reporting CONTENT_UNVERIFIED and withholding the fence (#1001) (#1013)
+- stop claiming a complete refresh that did not rehydrate anything (#981) (#1011)
+
+### Changed
+- 0.11.96 (#1015)
+- 0.11.95 (#1012)
+
+
+## [0.11.96] - 2026-08-10
+
+> A report said the post-load compare in `workflow_open` was racing the frontend's
+> normalisation. It is not a race. Sampling that compare at 0ms, one animation frame,
+> 50ms, 250ms, 1s and 2s after the load resolved gave an identical answer every time — it
+> is deterministic, and it fires for any workflow whose stored node sizes are not what
+> this frontend computes. A perfect open was reported as unverified, and because that
+> verdict throws, the open never published the workflow identity, so the NEXT command was
+> refused too. The reporter needed four calls to reach a state the panel already believed
+> it was in.
+
+### Fixed
+- an open that reproduced a workflow faithfully no longer reports its content unverified,
+  and no longer withholds the workflow identity the following command needs (#1001).
+  Content is proven when every node came back with the same id, type and serialized
+  fields apart from node HEIGHT — the one thing the frontend was measured recomputing on
+  load — with the width unchanged and both values readable numbers. Anything else,
+  including a changed width, still refuses.
+- the same compare reported a phantom difference on every node of every saved workflow.
+  The frontend stamps `showAdvanced` on each node it instantiates with the value
+  `undefined`, which no saved file can carry because JSON drops it. A key present with
+  `undefined` now reads as absent; a key present as `null` still counts, since JSON does
+  carry null and a nulled widget value is a real loss.
+- when an open proves content that way, the reply says so — which field differed, that
+  every difference was a height, and that the panel observed the difference rather than
+  its cause. Saving from there writes the recomputed value, which is now stated rather
+  than left to be discovered.
+
+### Changed
+- 0.11.95 (#1012)
+
+
+## [0.11.95] - 2026-08-10
+
+> `panel_refresh_nodes` said `{ok:true, refreshed:true}` while `panel_get_errors` kept
+> listing the same classes as missing, after the packs were installed and ComfyUI was
+> restarted. Both answers were right, which is why neither helped: the definitions really
+> were re-fetched, and the nodes really were still broken. Measured on the running
+> install — registering a class does not rehydrate a node that was placed while the class
+> was unknown. It keeps no definition, and the frontend's missing-node record is a
+> load-time snapshot nothing ever clears. Clearing that snapshot would have been the
+> obvious fix and the wrong one: `get_errors` would report clean while the canvas still
+> held a dead node. The refresh now reports what it actually left behind.
+
+### Fixed
+- a refresh that leaves placeholders behind now says so, instead of reporting a clean
+  result the canvas contradicts (#981). The reply carries `requires_reload`, the affected
+  nodes, and a note that names the remedy — save the workflow, then reopen that saved
+  workflow — and is explicit that this is an attempt rather than a guarantee, since a
+  class present in the registry can still fail to construct. Verified live, on a canvas
+  where exactly that happened.
+- the first version of this check reported four false positives — `Note`, `Reroute`,
+  `PrimitiveNode` and `MarkdownNote` all lack a backend definition, so a canvas with a
+  single Note on it would have demanded a workflow reload after every refresh. The scan
+  is now confined to types the frontend itself recorded as missing when the workflow
+  loaded, and asks the client registry rather than `/object_info`: the server having a
+  definition is not the same as this page being able to build the node.
+
+
+## [0.11.94] - 2026-08-10
+
+> Covers changes since 0.11.93.
+
+### Added
+
+- **"Run to node" with a batch now warns that your seed will not change (#988).**
+  Someone ran `panel_run` with `to_node_id` and `batch_count: 3` on a workflow whose
+  KSampler was set to randomize. Three prompts were accepted; the first took 22
+  seconds and the rest finished in about a fifth of a second, returning the same file
+  and the same image.
+
+  Every item used the same seed. Measured by comparing the actual requests: an
+  unscoped batch of three sends three different seeds, and a scoped batch of three
+  sends the same seed three times. ComfyUI does not advance `control_after_generate`
+  between the items of a *partial* execution — which is what running to a node is —
+  so the later prompts are duplicates it answers from cache. Checked in both of
+  ComfyUI's widget-control modes, and it happens in both.
+
+  The panel now says so when you queue that combination: which controls will repeat,
+  why, and the two things that do work — `batch_count: 1` several times setting the
+  value yourself, or dropping `to_node_id` so the run is unscoped.
+
+  **It does not silently change your seeds.** Doing that would mean re-implementing
+  ComfyUI's own widget behaviour — randomize, increment and decrement all differ, each
+  with its own range — on the one path where the panel already has to patch the
+  request. The warning also says what it cannot know: it lists every such control in
+  the workflow, because it cannot tell which ones a scoped run actually reaches.
+
+
+## [0.11.93] - 2026-08-10
+
+> Covers changes since 0.11.92.
+
+### Added
+
+- **A repeated render result now says so (#986).** Someone had the same finished clip
+  announced to the agent six times in about thirty seconds — each with a different
+  prompt id, each with a "render time" of a tenth of a second against a first render
+  that had taken almost eleven minutes. Every one asked the agent to respond, and
+  nothing told it these were the same file it had already reviewed.
+
+  They were separate prompts, because the runs were re-queued from the canvas and
+  ComfyUI answered each from its cache. The panel's existing check compares prompt
+  ids, so it had nothing to match on. It now also compares what the run actually
+  produced: a completion whose output files were already delivered says which earlier
+  run delivered them, and whether it finished too fast to have rendered anything.
+
+  **Nothing is held back.** An earlier version of this suppressed the repeats
+  outright, and that turned out not to be safe — a node that writes to a fixed
+  filename can produce a genuinely different result in under a second, and there is no
+  way to tell that apart from a cached replay. Withholding a render you waited for is
+  worse than an extra message, so every completion still arrives; it just arrives
+  labelled.
+
+  The label is careful about what it knows: the panel compares file *references*, not
+  file contents, and says so, and it does not claim a run did real work when all it can
+  see is that the run was not suspiciously fast.
+
+
+## [0.11.92] - 2026-08-10
+
+> Covers changes since 0.11.91.
+
+### Fixed
+
+- **Unpacking a subgraph no longer throws away the values you set on it (#979).**
+  Someone unpacked a subgraph and got the pack's template prompt back instead of the
+  long custom one they had written, and a duration of 2 instead of the 15 they had
+  set. Model and VAE choices survived; the values they had actually typed did not.
+
+  When a widget is promoted to the outside of a subgraph, the value you see on the
+  parent is the one that renders. Unpacking inlined the **inner** node's value
+  instead — usually whatever the pack shipped as a default. Since unpacking is
+  destructive, the parent's value was gone at that point, and the only fix was
+  remembering what it had been and typing it back.
+
+  The values are now carried inward before the subgraph is taken apart, and the
+  result says which ones moved.
+
+  The rest of this change is about what happens when that carry goes wrong. Custom
+  nodes can do arbitrary things when a widget is written — clamp the value, throw
+  halfway, change something else on the node. If any of that happens, the panel now
+  **restores the workflow and refuses to unpack**, rather than pulling the subgraph
+  apart around a value it cannot account for. Refusing leaves everything intact and
+  recoverable; guessing would not.
+
+
+## [0.11.91] - 2026-08-10
+
+> Covers changes since 0.11.90.
+
+### Changed
+
+- **"Run to node" falling back to a request repair now tells you a version that
+  works (#996).** When the panel runs a single branch, it asks ComfyUI to scope the
+  run. On some frontend builds that request never carries the scope, so the panel
+  writes it into the request itself and says so — a fallback that works, but one the
+  message asked you to report while giving you nothing to compare against.
+
+  It now carries one measured fact: on **ComfyUI frontend 1.48.7** the scope does
+  reach the request, so the fallback is not expected there and trying that build may
+  be the quickest workaround. That was established by capturing the outgoing request
+  on 1.48.7 — which shows the request is built correctly, not that a whole run
+  behaves differently, and the message says so rather than implying more.
+
+  It still does **not** claim which builds are affected. That is one build measured;
+  turning it into a version range would repeat a mistake this file has made before,
+  when a range covering builds nobody had tested told three reporters their own
+  evidence could not be happening.
+
+
+## [0.11.90] - 2026-08-10
+
+> Covers changes since 0.11.89.
+
+### Added
+
+- **`panel_run` now warns when your workflow has outputs inside a muted subgraph that
+  will render anyway (#985).** Someone ran a workflow with one active source subgraph
+  and two muted ones. All three rendered — Wan, LTXV and MiniMax H3 loaded in turn,
+  three videos saved, 18 minutes 44 seconds — and the run reported plain success.
+
+  The cause is not in this panel, and the fix cannot be either. ComfyUI applies a
+  subgraph's mute/bypass **only at the top level of a workflow**. Mute a subgraph
+  that sits inside another subgraph and it is ignored: everything in it still runs.
+  A whole-workflow run hands prompt building to ComfyUI, so pressing ComfyUI's own
+  Queue button does exactly the same thing. Measured on ComfyUI 0.31.1 with frontend
+  1.48.7, for mute and bypass alike.
+
+  What the panel can stop doing is being quiet about it. A whole-workflow run now
+  names the output nodes that sit inside a nested muted or bypassed subgraph, in the
+  one-line summary as well as the full result, so you can interrupt instead of
+  finding out when the renders land. Running to a specific output node
+  (`to_node_id`) scopes execution correctly and is the way to render just the branch
+  you want.
+
+  Two things it deliberately does **not** do. It does not change what executes —
+  quietly dropping nodes from a run you asked for would be its own kind of wrong. And
+  it does not claim to know your ComfyUI version: the warning is read from your
+  workflow's structure, so on a build that handles nested subgraphs properly it will
+  warn about a run that was fine. The message says so, and tells you how to check.
+  Muting a **top-level** subgraph — the ordinary way to switch a branch off — is
+  silent, because that one genuinely works.
+
+
+## [0.11.89] - 2026-08-10
+
+> Covers changes since 0.11.88.
+
+### Fixed
+
+- **`panel_get_errors` no longer reports a problem and "no errors" in the same
+  answer (#984).** The panel has two ways of finding a widget that names a file the
+  server does not have: the snapshot ComfyUI takes when a workflow loads, and a live
+  check against the server's current node list. The live one was added later, and the
+  "no errors recorded" verdict was never taught about it — so a defect only the live
+  check could see was reported in the payload while the summary said
+  `Checked errors — none`.
+
+  The case that shows it: a `CheckpointLoader` whose `config_name` names a
+  `models/configs` file that is not there. No missing-**model** tracking covers that
+  folder, so the load-time snapshot has nothing, and the live check is the only one
+  that knows. Both halves now decide the verdict together.
+
+  Two related corrections came out of reviewing it:
+
+  - **The same missing file is no longer counted twice.** Both halves usually find
+    it, and the summary was adding the lists — reporting six problems where there
+    were three.
+  - **A widget that is driven by a connection is no longer judged on its own value.**
+    When you convert a widget to an input and connect something, ComfyUI keeps the
+    widget around and runs the connection instead; its leftover value is often stale.
+    Checking it reported an error on a workflow that runs perfectly well.
+
+  Worth saying plainly for anyone who filed something like this: if `panel_get_errors`
+  reports clean while your canvas shows red loaders, this fix may not be your problem.
+  The originally reported shape did not reproduce — with loaders naming absent files,
+  including subfolder-qualified ones with backslashes, every layer detected them
+  correctly. A tool refusal in the same report pointed at a stale panel bundle in the
+  browser instead, for which the remedy is a hard refresh.
+
+
+## [0.11.88] - 2026-08-10
+
+> Covers changes since 0.11.87.
+
+### Fixed
+
+- **A widget write that a node's own callback breaks no longer reads as the panel
+  failing (#976).** `panel_set_widget` would apply your value, verify by read-back that
+  it was in effect, refuse to roll it back — and then say "an exception was thrown while
+  applying the write". Which reads as *the panel failed to apply your write*. It is the
+  opposite of what happened, and it is why this was reported as a panel defect.
+
+  The reporter's node was `MiniMaxH3Director`, but the same message appears on a stock
+  `CLIPTextEncode` whose callback is made to throw, so nothing about it was specific to
+  that pack.
+
+  The wording named nothing on purpose. A widget write touches value setters on the
+  widget, the promoted rail and the display proxies; it reads properties that can be
+  throwing accessors; and assigning to a frozen widget throws with no node code involved
+  at all. Blaming "the callback" for any of those would be a guess.
+
+  So the panel now measures it instead of guessing. The callback is looked up and its
+  arguments are evaluated before the attributed step begins, and only an exception coming
+  out of the attempt to invoke it is attributed — which is why the disclosure says
+  "attempt to invoke" and never that the callback ran: a value that is not a function, a
+  class, and a revoked proxy all throw without any code of theirs executing. When the
+  callback is not a function at all, it says that outright.
+
+  It does not go further than that. It does not say who supplied the callback, and it
+  does not assign fault: the panel invokes callbacks programmatically, and that alone is
+  enough to make a callback written for a mouse click throw. What it does say, first, is
+  that your value is in effect.
+
+  Two things found on the way, both of which could hide a real problem:
+
+  - a callback doing `throw undefined` (or `null`, `0`, `""`) produced **no warning at
+    all** — the write reported clean while the callback's side effects had not run
+  - a thrown value that fights back (a proxy whose `message` and prototype both throw)
+    could break the report that exists to disclose it, losing the failure entirely
+
+### Changed
+
+- Documentation corrections to two binding claims and a run-scope build range (#970,
+  #752), and e2e cleanup that no longer leaves saved workflows behind or passes against
+  the wrong orchestrator (#907, #847).
+
+
+## [0.11.87] - 2026-08-09
+
+### Fixed
+- **A failed install by git URL now points at the tool that can actually do it (#920).**
+  When you install a pack that is not in the node registry, ComfyUI-Manager cannot clone
+  your URL — it resolves installs from its own database, and the parameter that would
+  carry a URL is accepted and then ignored. The failure now tells you to use
+  `install_custom_node` instead: that one runs on the machine rather than in the browser,
+  so it clones the repository into `custom_nodes/` itself.
+
+  Worth saying explicitly because `panel_install_node`'s own description tells you to
+  prefer it over `install_custom_node` — which is backwards for this case, and following
+  it leaves you stuck. The message now says the preference does not apply here, and notes
+  where the fallback cannot help either: a remote ComfyUI has no local tree to clone into.
+
+
+## [0.11.86] - 2026-08-09
+
+> Covers changes since 0.11.85.
+
+### Changed
+
+- **Editing many widgets in a row is no longer slow (#716).** Every `panel_set_widget`
+  re-downloaded ComfyUI's entire node schema before writing — on an install with 63 custom
+  node packs that is 5.4 MB and roughly 170 ms, every single time. A prompt-editing task
+  that touched 29 widgets paid for it 29 times.
+
+  A burst of writes now shares one download instead of taking one each. Measured on the
+  test rig: 12 widget writes went from 12 downloads to 1.
+
+  The safety check those downloads exist for is unchanged. A write is still authorised
+  against the live backend's node list, and that list is re-read the moment anything the
+  panel can see could have changed it — a node refresh, an install, a completed download,
+  or a reconnect. The one case it cannot see is a pack uninstalled through ComfyUI's own
+  Manager while an agent is mid-edit, which leaves a window of up to 1.5 seconds; that is
+  written down in the code rather than left for someone to discover.
+
+### Fixed
+
+- **A changelog entry no longer repeats a release that already shipped.** Version tags here
+  lag the releases themselves, and the generator preferred the newest tag over the newest
+  release commit — so with `v0.11.84` tagged and 0.11.85 untagged, this entry initially
+  re-listed a fix 0.11.85 had already announced. It now takes whichever of the two is
+  actually newer, decided by ancestry rather than by date.
+
+
+## [0.11.85] - 2026-08-09
+
+> Covers changes since 0.11.84.
+
+### Fixed
+
+- **A refresh that lands while ComfyUI is reconnecting no longer reports a dead server
+  (#954).** Calling `panel_refresh_nodes` just after a restart-related operation could come
+  back `object_info_fetch_failed` — "Failed to fetch" — while other reads succeeded moments
+  later against the same server. Worse than the false failure was its advice: it told you to
+  check that the ComfyUI process was still running, sending you after something that was
+  never down.
+
+  The fetch now retries three times over about half a second before giving up, which is
+  enough to cross a reconnect blip. The panel already did this at startup, so the same
+  hiccup was survivable when the page loaded and fatal to an agent tool call a minute later.
+  A backend that really is gone still reports exactly what it reported before, with the same
+  detail — a retry that turned a real outage into a vaguer message would trade one wrong
+  answer for another.
+
+
+## [0.11.84] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.11.83] - 2026-08-09
+
+> Covers changes since 0.11.82.
+
+### Added
+
+- **The panel now tells you what changed when it updates under you (#758).** It installs
+  from the Comfy Registry and the orchestrator runs the latest agent, so the version can
+  move without you asking — and the first sign was usually something behaving differently
+  than you remembered, which reads as a bug rather than a release.
+
+  On the first load after an update the transcript shows what shipped between the version
+  this browser last saw and this one, each line tagged Added, Fixed or Changed. That
+  distinction is the point: "this used to work differently on purpose" is a different
+  message from "this was broken". It appears once, says nothing on a fresh install, and
+  says nothing if you roll back.
+
+  Settings → Comfy MCP Agent → About → **Show what is new** re-opens it whenever you want,
+  since a line in a transcript scrolls away and the request was for somewhere to look.
+
+### Fixed
+
+- **A failed install by git URL now says what is actually wrong (#920).** Passing a
+  repository URL for a pack that is not in the node registry failed with
+  *"Node '<name>@<version>' not found in [...]"* — a registry lookup naming an id you never
+  supplied, which reads like a lookup bug and sends you to re-check spelling and channels.
+  It now explains that this is a registry lookup, that ComfyUI-Manager's `repository`
+  parameter is accepted and then ignored by its install handler, and what does work: clone
+  into `custom_nodes/` and restart, ask the author to publish, or — two steps, not one —
+  run with `--enable-manager-legacy-ui` (which *replaces* the v2 Manager API) **and** set
+  `allow_git_url_install = true` in `config.ini`, without which that route answers 404.
+
+  Also **corrects the 0.11.75 entry**, which claimed installing from a GitHub URL "actually
+  clones it now". It does not, and that entry now says so.
+
+## [0.11.82] - 2026-08-09
+
+> Covers changes since 0.11.81.
+
+### Added
+
+- **`panel_open_workflow` now reports which workflow it observed to be active, beside the
+  one that was requested (refs #887).** The reply named only the target, so a caller could
+  not tell "the requested workflow is active" from "the requested workflow is what you
+  asked for" — and a Save-As taken on that reading writes the live canvas, which may be a
+  different workflow. The reply carries `active_routing_key` and `active_matches_target`
+  (true, false, or null when it could not be read), with a warning when they disagree.
+
+  This is groundwork, not the fix: the contradictory "you are NOT on the wrong workflow"
+  message is composed by the orchestrator, which does not read these fields yet, so nothing
+  user-visible changes until it does. #887 stays open.
+
+## [0.11.81] - 2026-08-09
+
+> Covers changes since 0.11.80.
+
+### Fixed
+
+- **A Save-As no longer strands the agent that performed it (#941).** `panel_save_workflow`
+  with a new name writes the copy and switches the active canvas to it — which fences the
+  very session that asked for the save, so every following `panel_*` graph call is refused.
+  That is survivable only if the reply says what to re-fence to, and it did not: it reported
+  the identity as unavailable, while the next call was refused *using* an identity the panel
+  had declined to publish one call earlier.
+
+  The identity read is deliberately pure — a fence refreshed from a value a read invented
+  would be agreeing with itself rather than observing anything — and a Save-As activates a
+  brand-new object nothing had established an identity for. So the read honestly found
+  nothing while the fence, whose own read mints, immediately found one. The identity is now
+  established as part of the save, from the record the save itself produced and proved
+  active, never from a later look at whichever canvas happens to be current. A Save-As that
+  cannot produce one still reports absence rather than substituting a different canvas.
+
+- Name the canvas swap point, from the canvas-rebuild side (#944).
+
+
+## [0.11.80] - 2026-08-09
+
+> Covers changes since 0.11.79.
+
+### Fixed
+
+- **Your first chat about a workflow no longer disappears when you filter to that
+  workflow (#847).** Chat, start a second chat, then tick "Current workflow only": the
+  first conversation vanished, even though both were held on the same canvas.
+
+  The panel saves an unsaved workflow before a turn ("grounding", #330), and ComfyUI
+  replaces the workflow object at that save. Every carrier that could hand the identity
+  to the successor is empty at that instant — the object maps are keyed on the object
+  that just went away, the embedded uuid is unreadable because the fields it is looked
+  for in are all absent on this frontend, and the path alias gets written from the new
+  id. So the successor minted a fresh identity and the conversation from seconds earlier
+  was left holding one that nothing answered to.
+
+  The tab's pre-save route id is now captured *inside* the grounding transaction and
+  filed under the path that save produced. That location matters: an observer watching
+  the change afterwards cannot prove the old id was this tab's past rather than a
+  workflow you switched away from, which is why the panel deliberately migrates nothing
+  there. The save knows by causation — it is the panel's own call, on its own active
+  workflow — so nothing is inferred.
+
+  Scope is small on purpose: these forms are consulted by the history filter alone.
+  They never resolve a workflow's identity, authorize a graph write, or restore a
+  session. One limit stays open and is documented rather than hidden — deleting a
+  workflow and creating a new one with the same name can show the old chats under the
+  new one, since a path is not proof of ownership.
+
+
+## [0.11.79] - 2026-08-09
+
+> Covers changes since 0.11.78.
+
+### Fixed
+
+- **The e2e suite stops leaving saved workflows in your library, and says so when it
+  cannot be sure (#907).** Specs that persist a workflow were leaving the file behind:
+  1272 of 1288 files in the dev workflow directory were test output. Per-spec cleanup
+  could not fix it, because it sat at the end of a test body and so never ran when a
+  test failed. Cleanup is now suite-level, and deletes only files that appeared during
+  the run AND carry the suite's own name prefix — ComfyUI names an unnamed save
+  `Untitled <date> <time>`, which is exactly what it names YOURS, so nothing keyed on
+  that name is safe to delete automatically. Anything else that appears is reported by
+  name rather than removed or ignored. Developer-facing only; nothing in the shipped
+  panel changes.
+
+## [0.11.78] - 2026-08-09
+
+> Covers changes since 0.11.77.
+
+### Fixed
+
+- **A tab now measures its own module cache instead of asking you to open DevTools
+  (#584).** This issue has had five fixes and keeps coming back, because each was built
+  on a hypothesis about the browser cache that nobody had measured — and the only way to
+  measure it was to ask someone whose tab was already wedged to read their Network tab.
+  The panel now reports, per module, whether it came from the server, from cache, or via
+  a 304 revalidation, and says so when the version check reads healthy but the modules
+  did not. That branch used to return silently, which is the shape this issue keeps
+  returning with: one version constant looking fine while the page it belongs to does
+  not behave like it. A healthy load stays silent. The same summary goes into the
+  diagnostics you copy into an issue, so the next report arrives with the measurement
+  already in it.
+
+## [0.11.77] - 2026-08-09
+
+> Covers changes since 0.11.76. The first entry this generator produced correctly.
+
+### Fixed
+
+- **Generating a changelog no longer replays the entire history into one release
+  (#932).** Every entry was built from the first commit onward, so a release claimed
+  ~200 commits of already-shipped work as its own. Both release matchers had been
+  written for commit shapes this repo has never produced: the base search grepped for
+  `release:` / `chore(release):`, which matched nothing and fell through to
+  `rev-list --max-parents=0` — the root commit — and the predicate that keeps release
+  commits *out* of an entry required the version to be the whole subject, so releases
+  were written into the entries announcing them. Releases here read
+  `0.11.76 — <description> (#930) (#931)`, and now both rules key on a version at the
+  start of the subject.
+
+  The fix is deliberately not a `git log --grep`. `--grep` searches the whole commit
+  message and matches per line, so `^<version>` also fires on a *body* line — in this
+  repo's own history it selects 7521519, an ordinary `fix(subgraph):` commit, which
+  would have anchored a release on itself and silently truncated the entry. Subjects
+  are read from `%s` and matched in JS, by the same predicate the generator already
+  used, so there is one rule rather than two that can drift.
+
+  This was worked around by hand for all fourteen releases from 0.11.63 to 0.11.76.
+  A silent workaround is how a broken tool survives that long.
+
+
+## [0.11.76] - 2026-08-09
+
+> Covers changes since 0.11.75.
+
+### Fixed
+
+- **A subgraph boundary rail is no longer reported as a node that doesn't exist
+  (comfyui-mcp#1294).** `panel_query_graph` hands out a subgraph's rails as
+  `rails.output.rail_node_id: "-20"`. Passing that back to an edit answered *"No node with
+  id -20 in the current graph … The id may be from a different workflow, or the node was
+  removed. Re-read with panel_graph_outline before retrying."* Every clause after the
+  first was false — the id came from that graph, from the panel's own read, one call
+  earlier — and the remedy re-read the surface that produced it, so following it looped.
+  The failure now names what the id actually is, notes that `panel_move_node` takes a rail
+  id (position only) while `panel_move_rail` addresses it by side, and says plainly that
+  no unexpose operation exists rather than implying one.
+
+## [0.11.75] - 2026-08-10
+
+> Covers changes since 0.11.74.
+
+### Fixed
+
+- **The install request now carries your repository URL (#920).** The panel used to reduce
+  a GitHub URL to just the repo's name and throw the rest away; it now sends the URL in the
+  `repository` field ComfyUI-Manager's API declares for it.
+
+  **This does not yet make such an install succeed, and this entry originally said it did —
+  that was wrong.** ComfyUI-Manager v4's v2 install handler accepts the field and then ignores it: it
+  reads only `id`, `selected_version`, `channel`, `mode` and `skip_post_install`,
+  and resolves the clone URL from its own database instead. A pack that is not in the
+  registry still cannot be installed by URL on a stock v4, and you will still see
+  *"Node '<name>@<version>' not found in [...]"*.
+
+  The change is kept because it is what the documented API asks for and it will start
+  working if Manager implements the field — but it is forward-compatibility, not a fix.
+
+  What works today for an unlisted pack, least effort first: `git clone` into
+  `custom_nodes/` and restart, or ask the pack author to publish to the registry. There is
+  a legacy git-URL route, but reaching it takes two steps — `--enable-manager-legacy-ui`
+  (which *replaces* the v2 Manager API rather than adding to it) **and**
+  `allow_git_url_install = true` in ComfyUI-Manager's `config.ini`; an unlisted pack is
+  rated "high+" risk and without that setting the route answers 404. Tracking in #920.
+
+## [0.11.74] - 2026-08-09
+
+> Covers changes since 0.11.73.
+
+### Fixed
+
+- **Saving a subgraph over a built-in name no longer sends you looking for a delete
+  button that isn't there (#636).** When the name clashes, the panel refuses and suggests
+  deleting the existing one from ComfyUI's library. But ComfyUI won't delete the
+  subgraphs it ships with — and on a stock install nearly all of them are its own, so the
+  clash you're most likely to hit is the one where that advice can't be followed.
+
+  It now recognises a built-in and says the name can't be freed, so the only thing left is
+  to pick a different one. Clashes with a subgraph you saved yourself still suggest
+  deleting it, and so does any case where the panel can't tell — withholding an option
+  that might work is worse than offering one you'd rule out in seconds.
+
+## [0.11.73] - 2026-08-09
+
+> Covers changes since 0.11.72.
+
+### Fixed
+
+- **The saved-subgraph list no longer claims every blueprint is yours (#636).** Listing
+  saved subgraphs reported `is_global: false` for all of them — including the ones
+  ComfyUI ships — because it read a property blueprints do not have. The agent had no way
+  to tell a bundled subgraph from one you saved.
+
+  It now asks ComfyUI, using the same call ComfyUI's own library menu uses. Where that
+  answer can't be trusted — an older frontend, or one that names blueprints in a shape
+  the panel doesn't recognise — the field is `null` rather than a guess. "I can't tell"
+  and "this one is yours" are different answers, and reporting the second in place of the
+  first is exactly what was wrong before.
+
+## [0.11.72] - 2026-08-09
+
+> Covers changes since 0.11.71.
+
+### Fixed
+
+- **You can add a saved subgraph by the name you see in the library (#636).** Asking for
+  one by its name failed with *"No saved subgraph blueprint"*, because current ComfyUI
+  stores them under a generated id and the panel only looked for that. The name shown in
+  the library — the only one you'd think to use — was the one thing that didn't work,
+  while the unreadable id did.
+
+  It now accepts either. The id is still tried first, so nothing that already worked
+  changes.
+
+  If two saved subgraphs share the same library name, it says so and asks for the id
+  instead of picking one. Adding the wrong graph quietly is worse than being asked to be
+  specific. And if the lookup itself fails, the error says that rather than claiming you
+  never saved it.
+
+  Same cause as the name-clash fix in 0.11.71. Updating an existing saved subgraph is
+  still not possible from the agent — that part of the report remains open.
+
+## [0.11.71] - 2026-08-09
+
+> Covers changes since 0.11.70.
+
+### Fixed
+
+- **Saving a subgraph under a name you've already used is caught again (#636).** The
+  panel refuses to save a reusable subgraph over an existing one, because replacing it
+  needs ComfyUI's own confirmation dialog — which an agent has no way to answer. On
+  current ComfyUI that check had stopped working: blueprints are now stored under a
+  generated id rather than the name you gave them, so the panel was comparing your name
+  against an id it could never equal, and saw no clash at all.
+
+  It now also compares the name shown in the library, which is where your name actually
+  lives. Older ComfyUI versions that store blueprints by name are unaffected, and a
+  different subgraph is still not treated as a clash.
+
+  Updating an existing saved subgraph is still not possible from the agent — that half
+  of the report is open.
+
+## [0.11.70] - 2026-08-09
+
+> Covers changes since 0.11.69.
+
+### Fixed
+
+- **A video your browser can't play now says so instead of showing a blank card (#909).**
+  Asking the agent to show a video reported success and displayed nothing, because the
+  tool answers for handing the video to the page — not for whether the browser could
+  actually decode it. An MP4 in an older format (MPEG-4 Part 2) is the reported case.
+
+  The card now says the format can't be played and suggests re-encoding as H.264 or
+  WebM, instead of leaving you to guess whether the video is broken, still loading, or
+  never arrived.
+
+  Two things it deliberately does not do: it does not report a failure when a working
+  video is simply scrolled out of view (tearing one down looks identical to a decode
+  error from the outside), and it does not keep retrying media it has already failed on,
+  which would make the message flicker away each time you scrolled back.
+
+## [0.11.69] - 2026-08-09
+
+> Covers changes since 0.11.68.
+
+### Security
+
+- **A workflow you open can no longer lie to the agent about your graph (#904).** The
+  graph outline the agent reads marks nodes with short status tags — `[bypass]` and
+  `[mute]` mean a node isn't running, `[after_gen=randomize]` means ComfyUI quietly
+  changes that value on every run. Node titles and widget values were written into that
+  same text as-is, so text containing one of those tags was indistinguishable from a tag
+  the panel had actually emitted.
+
+  This is reachable by **workflows you download**, not just by what you type: a prompt in
+  a shared JSON could make the agent believe a node was disabled, or that a value was
+  being rewritten behind its back, and act on it.
+
+  Values are not censored to fix it — bracket syntax like `[cat|dog]` is ordinary prompt
+  content, and deleting it would corrupt what you asked to see. Instead a value
+  containing brackets is now quoted, so a tag outside quotes is always the panel's own.
+  Ordinary values are unchanged. Titles, which were already quoted, can no longer end
+  their own quoting early.
+
+  Found while fixing #636 and verified against a live ComfyUI before and after.
+
+## [0.11.68] - 2026-08-09
+
+> Covers changes since 0.11.67.
+
+### Fixed
+
+- **The graph outline now shows widgets you've renamed (#636).** If you rename a
+  subgraph's promoted widgets, the canvas shows your new names — but the outline the
+  agent reads kept listing the original keys. One user was told their renames "hadn't
+  stuck" when they plainly had, and only a screenshot settled it.
+
+  The detailed reader was fixed for this in 0.11.42. The outline — the quick overview an
+  agent reaches for first — was not, so the misleading answer was still one call away. It
+  now shows both: `width=512 [renamed "Frame Width"]`. The original name stays first,
+  because that is the one you use to set the value; the name you gave it rides alongside.
+
+  Only renamed widgets are annotated, so an ordinary graph's outline is unchanged.
+
+### Security
+
+- **A renamed widget can no longer forge a status tag in the outline (#636).** The outline
+  is written for the agent to read, and marks widgets with tags like
+  `[after_gen=randomize]` — which means ComfyUI silently rewrites that value on every run.
+  Because widget names are yours to choose, a name containing the right punctuation could
+  close its own tag and invent one of those, describing behaviour the node does not have.
+  Names are now escaped so they cannot break out.
+
+## [0.11.67] - 2026-08-09
+
+> Covers changes since 0.11.66.
+
+### Fixed
+
+- **Adding a node no longer refuses a type your install can clearly handle (#636).**
+  Asking the agent to add `SaveVideo` failed with *"Required custom widget VIDEO have not
+  registered"* — on a canvas where a working `SaveVideo` was already sitting. Retrying
+  never helped, because nothing about the check could change.
+
+  The check asks whether a datatype could still be a widget that hasn't finished loading.
+  It answers that by looking at whether any installed node *produces* that type. On an
+  install where nothing happens to produce it, the answer is permanently "can't tell", and
+  the node becomes unaddable forever — even though ComfyUI builds it perfectly well.
+
+  The panel now also looks at the canvas. If a node of that same type is already there,
+  how ComfyUI actually built it is visible: an input wired as a connection is a
+  connection, and one shown as a widget already has what it needs. That is exactly the
+  evidence the reporter was staring at while being told the node couldn't be added.
+
+  This only ever lets an attempt proceed — the newly added node is still checked before
+  you're told it worked, so a genuinely missing widget still fails, and a still-loading
+  one still gets its full wait first. Nothing changes for a type the canvas can't vouch
+  for.
+
+  The other half of that report — `SaveVideo`'s `codec` input — was already fixed in
+  0.11.44. Verified here against a live ComfyUI: `SaveVideo` now adds cleanly.
+
+## [0.11.66] - 2026-08-09
+
+> Covers changes since 0.11.65.
+
+### Fixed
+
+- **Updating a node pack no longer dead-ends on some Manager builds (#367).** On certain
+  built-in Manager v4 installs, asking the agent to update a pack failed instantly with
+  `HTTP 405` — the Manager refuses that particular request on that build, even though
+  listing and installing work fine.
+
+  The panel already knows how to talk to those builds; it has a second route for exactly
+  this case. It just never tried it. There *was* a fallback, but it dropped to the old
+  3.x-style routes, which a modern Manager doesn't serve either — so the retry failed
+  too, and update was unusable while a perfectly good route sat unused.
+
+  Now it tries that route before giving up, and remembers which one worked so later
+  updates go straight there. On a build where the original request is fine, nothing
+  changes — verified against a live Manager here, which accepts it and doesn't serve the
+  alternative at all.
+
+  One honest caveat: on the builds this unblocks, the Manager reports no per-task
+  result, so the update is reported as *queued* rather than confirmed. Check
+  `panel_node_queue_status` and restart ComfyUI to load the updated pack. That is the
+  best answer that Manager can give — the bug was getting no answer at all.
+
+## [0.11.65] - 2026-08-09
+
+> Covers changes since 0.11.64.
+
+### Fixed
+
+- **Re-opening the current workflow no longer sends the agent in a circle (#702).**
+  Re-opening the tab that is already open answers "the canvas IS this workflow's, but I
+  can't call the contents byte-identical" — normal, and not a failure. What that answer
+  did not say is that it carries no refreshed workflow stamp, so the agent's *next*
+  command was rejected as belonging to a different workflow. And the answer ended by
+  recommending exactly that next command.
+
+  Two people followed that advice into the rejection and concluded the only way out was
+  reloading the whole panel. It wasn't: listing workflows re-publishes the current
+  identity and the read then goes through — one call, no reload. The reply now says so.
+
+  Nothing about how the panel decides which canvas it is bound to changed; the answer
+  was right and only its advice was wrong. All four phrasings of that outcome carry the
+  correction, and it stays off the case where the workflow genuinely *cannot* be
+  confirmed, because there reloading really is the remedy.
+
+## [0.11.64] - 2026-08-09
+
+> Covers changes since 0.11.63.
+
+### Fixed
+
+- **A blank canvas no longer refuses every graph tool (#833).** An empty canvas is the
+  ordinary state you are in right before asking the agent to build a workflow — and it
+  was the one state where the agent could not read the graph at all. Nothing cleared it:
+  re-targeting, creating a new workflow, and re-opening the tab all failed, and the
+  latest report adds that it survived both a hard refresh and a ComfyUI restart.
+
+  The guard was not treating "0 nodes" as a wrong canvas, as it appeared. It was
+  treating it as *unproven*, and on a blank canvas neither available proof can ever
+  succeed: identifying a canvas by its contents is impossible when there are none — every
+  blank canvas looks alike — and the other proof requires an unmodified tab, which a
+  blank one never is, because creating or clearing it is what marks it modified.
+
+  An empty canvas is now accepted as genuinely empty when both the canvas and the
+  workflow are independently shown to hold nothing. There is no content to attribute to
+  the wrong workflow, which is the same reasoning the panel already used elsewhere; it
+  simply could not be reached here. A canvas that merely *looks* empty because a
+  workflow is still loading is still refused, using ComfyUI's own loading signal.
+
+  **Reading works; building does not yet.** Adding nodes to a blank canvas is still
+  refused. Proving there is nothing to lose is enough to trust what a read returns, but
+  not enough to say *which* workflow an empty canvas belongs to — and a reconnect can
+  leave the canvas belonging to one blank tab while the panel is pointed at another, so
+  the first node could land on the wrong one. That half is tracked on #833 and needs a
+  real identity proof rather than a relaxation.
+
+## [0.11.63] - 2026-08-09
+
+> Covers changes since 0.11.62.
+
+### Fixed
+
+- **Closing a workflow no longer discards changes a node made (#882).** ComfyUI decides
+  whether a tab has unsaved work from a snapshot it takes when *you* type or click.
+  Anything a node set for you is invisible to it — an ImpactWildcardEncode populate, a
+  `control_after_generate` roll, a subgraph's promoted widgets — so the tab kept
+  reporting itself as clean while the canvas already differed from the file.
+
+  Two guards exist precisely to stop work being thrown away, and both believed that
+  report. Closing a workflow refuses when there are unsaved changes, because closing
+  bypasses ComfyUI's own save prompt — it saw "clean" and closed, and the values were
+  gone. The confirmation before an operation overwrites the canvas was skipped the same
+  way, so the canvas was replaced without anyone being asked.
+
+  Measured: after a save the tab reads clean, correctly. After a node writes a value it
+  still reads clean — wrong. Refreshing the snapshot flips it to modified, which is the
+  truth.
+
+  Both guards now refresh the snapshot before trusting it, and — this is the part that
+  matters — they only trust the answer when the refresh can be shown to have actually
+  happened. ComfyUI silently skips it while a graph is loading, while an undo is
+  replaying, and in a few other moments, in a way that is indistinguishable from success
+  from the outside. When it cannot be established that the refresh landed, the close
+  refuses and the confirmation is shown, rather than assuming. `force: true` still
+  closes, so nothing becomes unclosable.
+
+  Fourth and last of a family: #696, #874 and #878 were the same stale snapshot read in
+  other places — this one was the guards meant to protect you from it.
+
+## [0.11.62] - 2026-08-09
+
+> Covers changes since 0.11.61.
+
+### Fixed
+
+- **Saving a workflow no longer writes stale values over your file (#878).** Saving
+  in place persisted ComfyUI's change snapshot rather than the live canvas, and that
+  snapshot only records what a *user* typed or clicked. So anything a node had set
+  for you was written out at its old value: an ImpactWildcardEncode populate, a
+  `control_after_generate` roll, a subgraph's promoted widgets.
+
+  Measured: with 1337 on the canvas, the file on disk received the node's default of
+  512. Nothing errored, and the canvas still showed 1337 — a save does not repaint —
+  so the file quietly disagreed with the screen until the next reopen.
+
+  Saving under a *new* name already refreshed the canvas first; the route that
+  overwrites an existing file was the one that did not. It now does, and refuses the
+  save outright if that refresh fails rather than writing something it knows is
+  behind.
+
+
+## [0.11.61] - 2026-08-09
+
+> Covers changes since 0.11.60.
+
+### Fixed
+- Centring on a node now honours the zoom you asked for. `panel_canvas` with
+  `action:"center_on_node"` accepted a `scale` and quietly ignored it, so "centre on node
+  42 at 1.5x" centred at whatever zoom happened to be set — and the reply echoed the old
+  zoom back, so nothing said the request had been dropped. The zoom is applied before the
+  centring (applying it afterwards would slide the node straight back off-centre), the
+  reply reports the zoom that took effect, and a scale outside the accepted range is
+  refused rather than silently clamped — the same range `action:"zoom"` already enforced
+  (#876, #754)
+
+## [0.11.60] - 2026-08-09
+
+> Covers changes since 0.11.59.
+
+### Fixed
+
+- **Reopening a workflow no longer silently reverts values a node set for you
+  (#874).** Reopening an already-open workflow repaints the canvas from ComfyUI's
+  change snapshot rather than from the file — and that snapshot only records what
+  a *user* typed or clicked. So anything a node wrote by itself was quietly rolled
+  back: an ImpactWildcardEncode populate, a `control_after_generate` roll, a
+  subgraph's promoted widgets. Nothing errored, and the graph looked right
+  afterwards, which is why it read as "my edits didn't stick" rather than as a bug.
+
+  Measured: a value of 1337 on the canvas came back as the node's default of 512.
+  The panel now asks ComfyUI to capture the live canvas before it repaints, so what
+  is on screen is what gets restored.
+
+
+## [0.11.59] - 2026-08-09
+
+> Covers changes since 0.11.58.
+
+### Fixed
+
+- **An open Chat history pane now updates itself when you save a workflow
+  (#847, partial).** The list was painted once when the pane opened, so if you
+  saved a workflow while it was on screen it kept showing the pre-save answer
+  until you closed and reopened it.
+
+  This does not yet fix the related report that a chat held on a workflow *before*
+  its first save can drop out of "Current workflow only". That needs the panel to
+  prove an old identity belonged to the same tab, and it currently cannot — the
+  workflow object is replaced by the save, and "no other tab claims this id" is not
+  the same as "this tab owned it". Guessing there would attach one workflow's
+  conversations to another, so it stays unfixed and #847 stays open.
+
+
+## [0.11.58] - 2026-08-09
+
+> Covers changes since 0.11.57.
+
+### Fixed
+
+- **Reopening a workflow no longer reads as though work went missing (#696).** When
+  the canvas came back with an unfamiliar per-node field — a display toggle like
+  `showAdvanced` from rgthree or Impact, alongside the usual re-measured sizes —
+  `panel_open_workflow` said it could not tell whether "the load only partly
+  applied", which sent people hunting for work to redo that was never gone.
+
+  The panel had been deciding this by checking every differing field against a list
+  of names it considered harmless, so one flag it had never seen was enough. It now
+  reports what it actually proved: every node that was loaded is on the canvas with
+  the same id and type, so no node was lost — whatever fields differ, and without
+  needing to know what any of them mean. A difference confined to sizes, positions
+  and colours still gets the stronger answer, that the widget values and links
+  matched too.
+
+  Also stopped claiming the difference was something "the ComfyUI frontend
+  recomputes on load". Node colours are on that same list and nothing recomputes
+  them, so that was untrue whenever a colour differed.
+
+
+## [0.11.57] - 2026-08-09
+
+> Covers changes since 0.11.56.
+
+### Fixed
+
+- **The panel no longer eats the storage ComfyUI needs for your workflow tabs
+  (#861).** Chat history kept every pre-v3 transcript in `localStorage` in full,
+  forever. That budget belongs to the whole origin, not to the panel, so past a
+  point ComfyUI itself could not save workflow drafts — "Failed to save workflow
+  draft", and every open workflow tab gone on the next browser restart, with
+  nothing in any log pointing at the panel.
+
+  Those transcripts had nowhere else to live, which is why they were never
+  trimmed: capping them would have been deleting them. They now have a durable
+  home of their own, and only then is the local copy bounded — by size, since one
+  transcript full of pasted JSON outweighs hundreds of short ones. Nothing is
+  dropped that is not safely stored elsewhere first: if the durable copy cannot be
+  written, nothing is trimmed at all.
+
+  Deleting a chat now removes it for good, including from the new store, and a
+  delete that fails is retried rather than quietly forgotten.
+
+
+## [0.11.56] - 2026-08-09
+
+> Covers changes since 0.11.55.
+
+### Fixed
+
+- **A first save no longer hides the chat you had before it (#847).** "Current
+  workflow only" showed one of two conversations held on the same tab and the
+  same canvas, minutes apart. Saving a workflow migrates its route id
+  (`tmp:<uuid>` to `wf:<path>`) and re-mints its storage uuid at the same
+  moment, so a chat recorded before the save shared no identity with the live
+  workflow and dropped out of a filter named for the workflow it was actually
+  held on. The filter now also accepts the workflow's pre-save id, which the
+  panel already records — nothing about lineage is guessed, so another
+  workflow's conversation still cannot be pulled in. Threads written before a
+  save are matched within the session; carrying that across a reload needs the
+  stamps rewritten at the save boundary and is still open.
+
+
+## [0.11.55] - 2026-08-09
+
+> Covers changes since 0.11.54.
+
+### Fixed
+
+- **A deferred tool is no longer read as an absent one (#857).** The live-canvas
+  disclosure asked one binary question — is `panel_graph_outline` in your toolset
+  or not — and on a backend that defers tool schemas, neither answer is true. A
+  Codex session found nothing in its initially advertised tools, found
+  `mcp__panel__panel_graph_outline` in the lazy registry, called it, and got the
+  live 41-node graph; it had still been told to report the canvas unreachable and
+  hand the user three remedies for a healthy install. The lookup now comes first
+  and covers both surfaces — a tool you can call is present wherever it came from
+  — and it stops after one check, so a session that genuinely has no canvas tools
+  still reaches its remedies instead of searching forever.
+
+
+## [0.11.54] - 2026-08-09
+
+> Covers changes since 0.11.53.
+
+### Fixed
+
+- **The reboot reply now says WHICH ComfyUI it restarted (#851).** `comfy_reboot`
+  returned the route (`/v2/manager/reboot`) and never the host, so a caller could
+  not tell which server had just gone down. When the panel drives a ComfyUI that
+  is not the orchestrator's headless `COMFYUI_URL`, that gap sends a confirmation
+  timeout to a fallback aimed at the other machine — which answers "No ComfyUI
+  process found on port 8188" while the panel was operating on the live one all
+  along. Every branch now carries `target`, and the two failure messages name the
+  host in prose; an unknown target is omitted rather than reported blank. The
+  confirmation card and its timeout wording are orchestrator-side and unchanged.
+
+
+## [0.11.53] - 2026-08-09
+
+> Covers changes since 0.11.52.
+
+### Fixed
+- `panel_add_node`'s schema-drift refusal pointed at the wrong recovery. When a node class's
+  required inputs changed since the page loaded its schema — moving a model file between
+  folders is enough — the panel correctly refuses to build the stale shape, but it told you to
+  reload the whole ComfyUI tab. `panel_refresh_nodes` clears the same condition in place and
+  costs no canvas state: it re-fetches `/object_info` and re-registers the class, which is
+  exactly what the refusal is waiting for. The message now leads with that, keeps the tab reload
+  as the fallback, and says what the refresh does NOT fix — nodes already on the canvas keep the
+  shape they were created with (#852)
+
+## [0.11.52] - 2026-08-09
+
+> Covers changes since 0.11.51.
+
+### Added
+- **Panel UI scale.** A new setting in ComfyUI Settings (Comfy MCP Agent → General → "Panel UI
+  scale (%)") scales the whole Agent sidebar — text, icons and spacing together — from 100% to
+  250%. Reported by a user on Windows 11 for whom the panel text was barely readable.
+
+  Worth knowing if you tried to fix this yourself: overriding `.cmcp-root { font-size }` in a
+  user stylesheet does **not** work, and that is not your mistake. The panel's inner sizes are
+  `rem`, which resolve against the page root rather than against the panel, so most text ignores
+  the override. This setting is the supported way to scale the panel (#753)
+
+## [0.11.51] - 2026-08-09
+
+> Covers changes since 0.11.50.
+
+### Fixed
+- Switching workflow tabs could leave every `panel_*` graph tool refusing the ACTIVE workflow
+  with `root-workflow-uuid-mismatch`, until the user re-opened the workflow that was already
+  open. ComfyUI reuses one canvas object across tabs and does not reset its metadata, so the
+  previous workflow's identity tag stays behind on a canvas that now holds the new one's graph.
+
+  The panel could already recover a canvas carrying NO tag — it proves the canvas is the active
+  workflow's by comparing content, then stamps it. It could not recover one carrying the WRONG
+  tag, because that stamp is never overwritten. A wrong tag was therefore stickier than no tag:
+  a byte-identical canvas was allowed in one case and refused in the other. The same content
+  proof now settles both.
+
+  Deliberately unchanged: a canvas that is genuinely a different workflow's still refuses, and
+  so does an ambiguous one — a second clean tab holding identical content, a tab with unsaved
+  edits (whose state can lag the real canvas), or a check that could not run at all (#817)
+
+## [0.11.50] - 2026-08-09
+
+> Covers changes since 0.11.49.
+
+### Fixed
+- An interactive card the agent had just created could stop responding to it mid-turn.
+  `panel_ui_render` returned a card_id and an immediate `panel_ui_update` failed with
+  "no live card" — no click, no dismissal, no view switch. Any repaint of the chat feed
+  between the two calls (which happens on its own) replayed the card as a finished, inert
+  one and dropped the handle the update needs. An unanswered card now comes back live
+  under the same id the agent was given; an answered or dismissed one still comes back
+  inert, so a question you already answered is never re-offered. Card ids are also now
+  collision-resistant across a page reload, and the provisional paint that runs before the
+  panel has decided which conversation is authoritative stays inert deliberately, so a
+  card can never come back live in a conversation that is about to be replaced
+  (#837, #832)
+
+## [0.11.49] - 2026-08-09
+
+> Covers changes since 0.11.48.
+
+### Fixed
+- An EMPTY (0-node) workflow no longer wedges every `panel_*` graph tool. A blank canvas is
+  exactly the state a user is in right before asking the agent to build something, and it was
+  the one state in which nothing could be read or edited — with no recovery: re-targeting
+  reported success without changing anything, `panel_new_workflow` made it worse, and
+  `panel_open_workflow` could not prove its rebind. A browser refresh was the only exit.
+
+  The panel proves a canvas genuinely empty before trusting a 0-node read, and that proof
+  required every value in the workflow's `extra` to be empty — which nothing on a real install
+  satisfies, because ComfyUI stamps `extra.frontendVersion` into every workflow it writes and
+  installed extensions add their own per-workflow flags. So no blank workflow was ever provably
+  empty, and the fallback (stamping the canvas with the workflow's identity) is refused when
+  another blank tab could equally explain the empty canvas. Two blank tabs therefore had no exit
+  at all — and `panel_new_workflow` creates the second one, which is why that step escalated it.
+
+  A version stamp is not a graph. Booleans and numbers in `extra` are now admitted (a graph
+  cannot be encoded in one), and named version strings are admitted when they look like version
+  strings. Anything structured — or any text carrying JSON delimiters, wherever it appears — is
+  still treated as content, so a canvas that actually holds something is never proven empty
+  (#833)
+
+## [0.11.48] - 2026-08-09
+
+> Covers changes since 0.11.47.
+
+### Fixed
+- A run that finished without producing an image or a video now tells the agent it
+  finished, instead of leaving it waiting forever. `panel_run` promises the agent it will
+  be notified automatically and instructs it not to poll — so for a run whose outputs are
+  text, or a cache hit that saves no file, that notification could never arrive and the
+  agent stalled silently until the user prompted again. The promise is what turned a quiet
+  completion into a wedged session. The completion is now delivered on the live path and
+  recovered by the `/history` reconcile, including when the bridge was down at the moment
+  it first fired. Only runs the panel itself queued are affected — a render you start on
+  the canvas yourself is still silent (#831, #356)
+- `panel_open_workflow` reported a repaint the ComfyUI frontend had performed FAITHFULLY as a
+  possible partial load. The content check names the graph SURFACES that disagreed, and `nodes`
+  is one surface holding the whole serialized node array — so "the graph differs on: nodes" came
+  out identically whether a node had vanished or the frontend had merely re-measured every box on
+  load, which it routinely does. A reporter read that after a healthy open and went looking for
+  work to redo that was never gone. The disclosure now says which of the two it observed: when
+  every loaded node is on the canvas with the same id and type and only presentation differs, it
+  says so and names the fields. A changed widget value, title, flag or mode is NOT presentation
+  and still gets the full warning, and the verdict itself is unchanged — the open still reports
+  the content as unconfirmed (#825, #830)
+- A stray NUL byte in `layout-engine.js` made git treat the file as binary, so it had no
+  reviewable diff; the edge-dedup key it separated is also now collision-proof, which it was not
+  (#825, #830)
+
+## [0.11.47] - 2026-08-09
+
+> Covers changes since 0.11.46.
+
+### Added
+- Large images and videos can be collapsed **in place** in the chat transcript. Every media
+  card gets a disclosure chevron; collapsed, it becomes a one-line stub naming the file that
+  is itself the way back (click, Enter or Space). This is the opposite of the existing `⛶`
+  button, which opens the lightbox — one goes smaller, one goes bigger. Collapse state is
+  remembered in `sessionStorage`, so it survives a reload and a thread switch inside the tab
+  and clears when the tab closes. Collapsing a video releases its decoded `<video>`
+  immediately instead of leaving it decoding behind a hidden box, and expanding an
+  off-screen card does not resurrect one (#818, #823)
+
+### Fixed
+- An EMPTY ComfyUI-Manager catalogue no longer renders as “no matches”. A `getmappings`
+  response with no packs in it came back as `count: 0` — exactly what a healthy catalogue
+  returns when a query matches nothing — so the two were indistinguishable, and a user
+  whose Manager had no catalogue at all concluded the pack did not exist and kept trying
+  variations of a search that could never succeed. A zero-pack catalogue is now reported as
+  its own state: nothing was searched, so nothing follows about whether the pack exists.
+  The message names the host the catalogue actually comes from (Manager’s default channel,
+  not the pack-install registry) and the causes ComfyUI-Manager really produces an empty
+  one from — offline mode with no cache yet, or missing/unreadable Manager data files.
+  Note that a network failure does NOT empty the catalogue: Manager falls back to the copy
+  bundled in its own package, so a blocked channel surfaces as a STALE list rather than an
+  empty one, and telling stale from current is a gap this does not close (#808, #826)
+
+## [0.11.46] - 2026-08-08
+
+> Covers changes since 0.11.45.
+
+### Fixed
+- `panel_add_node` refused a node whose input types ARE produced by nodes already on the
+  canvas. The socket proof — "which datatypes does some installed node output?" — was being
+  read off the single-class `/object_info` payload introduced in 0.11.45 for the cheap
+  per-class existence check, so any custom link datatype produced by a SIBLING node read as
+  unproven and the refusal claimed "no installed node outputs X" while the node producing X
+  sat on the canvas. Nothing could clear it: `panel_refresh_nodes` re-registers the class,
+  which is exactly what armed the fast path. The proof is now widened against the whole
+  schema on the path that is about to refuse, so the cheap path is kept for every add that
+  does not need it (#822, #821)
+- `panel_move_group` treated a restored node position as an unrestorable node, so a
+  rollback reported failure after it had in fact succeeded (#819)
+- `panel_update_node` sent extra fields that made Manager v4's untagged Pydantic union
+  match `InstallPackParams` instead of `UpdatePackParams` and crash (#816)
+
+## [0.11.45] - 2026-08-08
+
+> Covers changes since 0.11.44. Versions 0.11.42-0.11.44 shipped without CHANGELOG sections;
+> see their release commits (#709, #722, #743) until those are backfilled.
+
+### Added
+- show whether the QR's URL survives an orchestrator restart (#770)
+- return the workflow_uuid it just minted (#762)
+
+### Fixed
+- a value the widget's own grid explains is NOT a failed write (#806)
+- the soft_reload REPLY reports the refusal, not "scheduled" (#803)
+- refuse an agent reload that unsaved work will block (#801)
+- report the workflow instance a save leaves active (#800)
+- try the option key the api layer actually reads (#799)
+- scan the live graph for unavailable widget values (#745) (#798)
+- civitai_results reported an empty feed; e2e stubbed a retired endpoint (#796)
+- the internal-logs endpoint is NOT under /api — both readers were no-ops (#792)
+- an unknown node type may be a pack that FAILED TO IMPORT (#791)
+- a missing node type may be a pack that FAILED TO IMPORT (#790)
+- a union of PRIMITIVES needs no registered widget (#789)
+- find the tab button the way 1.50 marks it, at the SECOND site too (#786)
+- a blank tab is never an acceptable failure state (#785)
+- the sidebar guard must not destroy on an UNKNOWN active tab (#784)
+- say that a capture frames the WHOLE graph (#783)
+- read the reason ComfyUI logged instead of repeating the one it made up (#782)
+- a combo refresh that found nothing is not a refresh (#781)
+- API-format workflows ARE loadable — import them (#778)
+- drop the frontend version range, print what the body held (#777)
+- name the button the panel cannot press (#776)
+- disclose that missing-asset detection is load-time only (#774)
+- say when a commanded frontend reload did not happen (#773)
+- a userdata 400 says what it can mean, and where the real cause is (#772)
+- keep the upload status and the exception (#764)
+- report the comparison, not a cause the panel never observed (#763)
+- let an UNSAVED canvas publish its established identity (#761)
+- let the recovery probe through both target guards (#759)
+
+### Changed
+- give gotoStep the 15s its capability probe actually takes (#797)
+- recover 9 e2e tests — off-by-default flags and a routed mount probe (#795)
+- declare every reach into ComfyUI's own DOM (#787)
+- verify ONE node type, not the whole schema (#780)
+
+
 ## [0.11.41] - 2026-08-05
 
 ### Fixed

@@ -893,6 +893,56 @@ test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED fr
   assert.match(note, /If it did not, its queue-time widget hooks ran/,
     "the hook consequence is conditional on the unobserved branch");
   assert.match(note, /does not change which nodes execute/, "and its blast radius is bounded honestly");
+  // #996 — the note used to end by sending reporters off to file with nothing to
+  // compare against. There is now one MEASURED fact to give them: on 1.48.7 the
+  // positional shape DOES put partial_execution_targets into the request, captured
+  // from the outgoing body, so the capability exists upstream and upgrading may be
+  // the shortest fix.
+  assert.match(
+    note,
+    /On ComfyUI_frontend 1\.48\.7 the positional argument shape DOES carry the scope/,
+    "the measured build is named, together with what was measured about it",
+  );
+  assert.match(note, /measured by capturing the outgoing body/, "and how it was established");
+  // The ask survives — one datum is not a diagnosis — but WHAT it asks for changed
+  // (#996). Two reports arrived with the build and the ComfyUI_frontend version this
+  // used to request, and neither identified the cause: the version is not what
+  // differs. It now asks for the queue-chain line, which names the two links that
+  // can silently drop the scope.
+  // This assertion reads the note's SOURCE, so it can only see the delegation —
+  // the wording now lives in web/js/lib/queue-prompt-chain.js and is asserted
+  // behaviourally in queue-prompt-chain.test.mjs, against the same patched-chain
+  // shape measured on a live 1.48.7 (app.queuePrompt wrapped by a custom node,
+  // api.queuePrompt wrapped by rgthree). That is a stronger check than a grep for
+  // a sentence, which is why the sentence moved.
+  assert.match(note, /describeQueuePromptChainForReport\(/, "the ask survives, via the shared builder");
+  // …and it reads the globals through the GUARDED accessor. Inlining `window.app`
+  // here would put a throwing getter outside every guard in the library — a
+  // mutation doing exactly that survived every behavioural test, because the call
+  // site is only reachable in a browser.
+  assert.match(note, /queuePromptChainDeps\(\)/, "the globals are read through the guarded accessor");
+  assert.doesNotMatch(
+    note,
+    /including your ComfyUI_frontend version/,
+    "it no longer asks for the datum that failed to identify the cause twice",
+  );
+  // The workaround must name the version that was actually measured. "upgrading may
+  // help" does not say to WHAT, and no 1.48.6→1.48.7 end-to-end result was taken
+  // (codex).
+  assert.match(note, /trying ComfyUI_frontend 1\.48\.7 may be the quickest workaround/i,
+    "the workaround names the measured build, not upgrading in general");
+  // And the datum is bounded to what capturing a request body can show.
+  assert.match(note, /establishes that the request is built correctly there, not that a whole run behaves differently/,
+    "serialization is not end-to-end behaviour, and the note says so");
+  // #752's lesson, which this change sits one edit away from repeating: a version
+  // RANGE is a claim about builds nobody here has measured. One build must not
+  // become one. The first version of this guard missed "all 1.48.x builds" and
+  // "1.48.6 through 1.48.9" (codex), so it matches the SHAPES a range takes.
+  assert.doesNotMatch(
+    note,
+    /affects versions|all builds (before|after)|all 1\.\d+\.x|\d+\.\d+\.\d+\s*(-|–|through|to)\s*\d+\.\d+\.\d+|1\.4\d\s*-\s*1\.\d+/i,
+    "one measured build must never be inflated into a range",
+  );
 });
 
 test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key, never reported as 'no key at all'", async () => {

@@ -1,6 +1,7 @@
 import { test, expect } from './fixtures/panelTest'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
 
+
 const THREADS_KEY = 'comfyui-mcp.panel.threads'
 const META_KEY = 'comfyui-mcp.panel.historyMeta'
 
@@ -22,7 +23,7 @@ async function forceWorkflowScope(page: import('@playwright/test').Page) {
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
   return page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const req = indexedDB.open('comfyui-mcp-panel-history')
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
     })
@@ -44,7 +45,7 @@ async function indexedHasMessage(
 ): Promise<boolean> {
   return page.evaluate(async (wanted) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const req = indexedDB.open('comfyui-mcp-panel-history')
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
     })

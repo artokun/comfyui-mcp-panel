@@ -175,15 +175,23 @@ export function unavailableRequiredWidgetReport(
   // reproduce the very error this fixes one level down.
   const socketDeclared = new Set();
   const widgetDeclared = new Set();
+  // #1062 (codex) — types for which EVERY carrying input resolves to a widget the core
+  // frontend builds natively (`widgetType ?? type` naming a primitive). Held to the same
+  // "every, not some" discipline as socketDeclared directly below, and for the same reason:
+  // one input's native hint must not waive a sibling that needs a real constructor.
+  const nativeWidgetDeclared = new Set();
+  const nonNativeDeclared = new Set();
   const inputsByType = new Map();
   for (const [name, spec] of Object.entries(required)) {
     const type = inputWidgetType(spec);
     if (!type) continue;
     (inputDeclaredAsSocket(spec) ? socketDeclared : widgetDeclared).add(type);
+    (inputDeclaresNativeWidgetType(spec) ? nativeWidgetDeclared : nonNativeDeclared).add(type);
     if (!inputsByType.has(type)) inputsByType.set(type, []);
     inputsByType.get(type).push(name);
   }
   for (const type of widgetDeclared) socketDeclared.delete(type);
+  for (const type of nonNativeDeclared) nativeWidgetDeclared.delete(type);
 
   const report = [];
   for (const [type, inputs] of inputsByType) {
@@ -191,12 +199,25 @@ export function unavailableRequiredWidgetReport(
     // ComfyUI's own `INT:seed` / `INT:noise_seed` keys and any union a pack chooses to
     // register — so the whole string is checked first, before it is decomposed.
     if (typeof widgetConstructors?.[type] === "function") continue;
+    // #1062 (codex) — a NATIVE widget hint resolves without any registration, so there is
+    // nothing here a retry could be waiting for. Checked before the member analysis because
+    // it is a statement about the INPUT's own resolution, independent of what the declared
+    // type's members are or whether anything outputs them.
+    if (nativeWidgetDeclared.has(type)) continue;
     const members = declaredTypeMembers(type);
     if (!members.length) continue;
     // Every member is a datatype no widget constructor will ever appear for: a built-in
     // connection type, or one the CURRENT backend declares as some node's output.
+    // #1062 — `isCore3dFileType` is a THIRD way for a member to be proven a link datatype,
+    // alongside the built-in allowlist and the live output proof. It exists because the
+    // output proof cannot see a core datatype that no INSTALLED node happens to emit; see
+    // its own comment. The quantifier is still `every` — a proven member never vouches for
+    // an unproven one.
     const linkProven = members.every(
-      (member) => SAFE_SOCKET_TYPES.has(member) || knownSocketTypes?.has?.(member) === true,
+      (member) =>
+        SAFE_SOCKET_TYPES.has(member) ||
+        isCore3dFileType(member) ||
+        knownSocketTypes?.has?.(member) === true,
     );
     // A SINGLE built-in connection datatype is waived on the type alone. Unchanged from
     // before this fix, and sound for the same reason it was then: ComfyUI registers no
@@ -343,6 +364,79 @@ export function isCoreDynamicV3Type(type) {
 }
 
 /**
+ * #1062 — ComfyUI's core 3D FILE-FORMAT datatypes.
+ *
+ * These are link datatypes that OFTEN NOTHING INSTALLED OUTPUTS, which is the specific
+ * blind spot in the output-proof oracle: `knownSocketTypes` proves a type is a link
+ * datatype by finding some node that emits it, so a datatype that is real but simply has
+ * no producer on THIS install is indistinguishable from an unregistered custom widget.
+ *
+ * That is not hypothetical, it is the whole of #1062. Core `SaveGLB` declares
+ * `mesh: ("MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,
+ * FILE_3D_USDZ,FILE_3D_PLY,FILE_3D_SPLAT,FILE_3D_SPZ,FILE_3D_KSPLAT,FILE_3D_SPLAT_ANY,
+ * FILE_3D_POINT_CLOUD_ANY,FILE_3D", {tooltip})`. Measured against a live ComfyUI 0.31 with
+ * 4183 node definitions: SEVEN of those members are emitted by some node
+ * (MESH, FILE_3D_GLB, FILE_3D_OBJ, FILE_3D_FBX, FILE_3D_SPLAT_ANY,
+ * FILE_3D_POINT_CLOUD_ANY, FILE_3D) and SEVEN are emitted by nothing at all
+ * (FILE_3D_GLTF, FILE_3D_STL, FILE_3D_USDZ, FILE_3D_PLY, FILE_3D_SPLAT, FILE_3D_SPZ,
+ * FILE_3D_KSPLAT) — a union naming formats ComfyUI can WRITE but that no installed node
+ * PRODUCES. So `linkProven` was false, and SaveGLB — the only core node that writes a
+ * .glb — could not be placed on the canvas at all.
+ *
+ * WHY NOT #1062'S OWN PROPOSED FIX (`every` -> `some` over the members): because a proven
+ * member must not vouch for an unproven one. An empty config counts as socket-shaped, so
+ * the input-level bar cannot catch `("MESH,ZIPN_STYLE_GALLERY", {})` — only `every` does,
+ * and `some` would admit that node while silently skipping a widget that never registered
+ * (#580's false accept). That invariant is pinned by its own test and is UNCHANGED here:
+ * the quantifier stays `every`. What changes is what a member can be proven BY.
+ *
+ * AN EXPLICIT SET, NOT A `FILE_3D_*` PREFIX — deliberately the opposite choice from
+ * `COMFY_*_V3` above, because the two namespaces have opposite ownership. `COMFY_*_V3` is
+ * ComfyUI's reserved prefix, so covering the family is right and enumerating it would rot.
+ * `FILE_3D_*` is not reserved: a pack is free to invent `FILE_3D_ACME`, and a prefix rule
+ * would launder exactly the unregistered custom member the invariant above exists to
+ * refuse. This is a closed list of the 13 members ComfyUI core ships — verified against the
+ * shipped 1.50.3 frontend, where all 13 appear in the `dataTypes` translation tables (one
+ * entry per locale) and NONE appears as a widget constructor. A future core format is a
+ * one-line addition and fails closed until then, which is the safe direction.
+ *
+ * The caller still requires the input to declare itself socket-shaped, so a node using one
+ * of these types while declaring widget-value keys keeps waiting for its constructor.
+ */
+const CORE_3D_FILE_TYPES = new Set([
+  "FILE_3D",
+  "FILE_3D_FBX",
+  "FILE_3D_GLB",
+  "FILE_3D_GLTF",
+  "FILE_3D_KSPLAT",
+  "FILE_3D_OBJ",
+  "FILE_3D_PLY",
+  "FILE_3D_POINT_CLOUD_ANY",
+  "FILE_3D_SPLAT",
+  "FILE_3D_SPLAT_ANY",
+  "FILE_3D_SPZ",
+  "FILE_3D_STL",
+  "FILE_3D_USDZ",
+]);
+
+/**
+ * EXACT match, no normalisation (codex). Trimming and upper-casing looked like tidiness and
+ * was a hole in the closed-list claim above: every other registry here keys on the declared
+ * spelling verbatim — the widget-constructor lookup and `knownSocketTypes` both do — so a
+ * required input declared `file_3d_gltf`, or a single-member `" FILE_3D_GLTF "`, is a
+ * DIFFERENT identifier from the core type everywhere else in this module. Normalising here
+ * would have let those be waived as proven core sockets, which is precisely the laundering
+ * the explicit set exists to prevent, and would additionally have made the refusal text
+ * claim the backend declares that exact spelling as a link datatype when it does not.
+ *
+ * Union members arrive already trimmed from `declaredTypeMembers`; a single type does not,
+ * and that asymmetry is the store's, not ours to paper over.
+ */
+export function isCore3dFileType(type) {
+  return typeof type === "string" && CORE_3D_FILE_TYPES.has(type);
+}
+
+/**
  * Whether a required input DECLARES itself as a link socket rather than a prompt value.
  *
  * This is the input-level half of the #626 waiver, and it is a POSITIVE reading of the
@@ -354,6 +448,44 @@ export function isCoreDynamicV3Type(type) {
  * Deliberately NOT inferred from the type: the same datatype can be a widget on one node
  * and a socket on another, which is exactly why the output-side evidence was insufficient.
  */
+/**
+ * #1062 (codex re-review) — whether an input's `widgetType` hint names a widget the CORE
+ * FRONTEND IMPLEMENTS ITSELF.
+ *
+ * The companion to putting `widgetType` in WIDGET_VALUE_CONFIG_KEYS. That key correctly says
+ * "this input is a widget, not a socket", which is what stops an unregistered custom widget
+ * from being waived as a link. But it is not the whole ruling, and taking it as the whole
+ * ruling was a false REFUSAL — the exact mirror of the accept it fixed.
+ *
+ * ComfyUI resolves the widget as `widgetType ?? type`, so `("FILE_3D_GLTF", {widgetType:
+ * "STRING"})` renders a NATIVE STRING widget. Nothing registers a constructor for
+ * FILE_3D_GLTF and nothing ever will, so refusing it waits on evidence that cannot arrive
+ * (#796) — the same failure #788 fixed for `("FLOAT,INT", {widgetType: "FLOAT"})`, which
+ * this file already documents. The difference is only that #788 read the resolution off the
+ * declared TYPE and this reads it off the hint, which is the half that actually wins.
+ *
+ * A NON-primitive hint is unchanged and still fails closed: `{widgetType: "ACME_GALLERY"}`
+ * genuinely needs a constructor no core frontend provides, and that is the case the key-list
+ * addition exists to catch.
+ */
+function inputDeclaresNativeWidgetType(spec) {
+  if (!Array.isArray(spec)) return false;
+  const config = spec[1];
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  // EXACT match against the primitive set, deliberately NOT via isPrimitiveWidgetType
+  // (codex). That helper trims and upper-cases, which is right where it is used — the #788
+  // waiver feeds it union MEMBERS, and whitespace around a comma is the store's syntax
+  // rather than part of the identifier. Here the value is an identifier the frontend looks
+  // up verbatim, so normalising would waive `"string"` and `" STRING "` as native widgets
+  // when ComfyUI would resolve neither, granting the waiver to a name that is not the
+  // primitive. Same exact-spelling discipline as isCore3dFileType, and for the same reason.
+  //
+  // Left isPrimitiveWidgetType untouched rather than tightening it globally: it predates
+  // this and #788 depends on its current behaviour, so narrowing it here is the change that
+  // is actually justified by the evidence.
+  return typeof config.widgetType === "string" && PRIMITIVE_WIDGET_TYPES.has(config.widgetType);
+}
+
 export function inputDeclaredAsSocket(spec) {
   if (!Array.isArray(spec)) return false;
   // A legacy combo (choices as the first tuple item) is always a widget — it exists to
@@ -390,6 +522,21 @@ const WIDGET_VALUE_CONFIG_KEYS = [
   "video_upload",
   "audio_upload",
   "placeholder",
+  // #1062 (codex) — `widgetType` is the strongest widget declaration of all, and it was
+  // missing. It is not a value like the keys above; it is the input naming the widget it
+  // renders as, which the stock frontend resolves with `widgetType ?? type` (verified in
+  // the shipped bundle, and already documented by the #788 case
+  // `("FLOAT,INT", {widgetType: "FLOAT", …})`).
+  //
+  // Its absence was latent rather than harmless: an input declaring ONLY `widgetType` — no
+  // `default`, no range — counted as socket-shaped, so `socketDeclared` held it and the
+  // input-level bar waved it through. Nothing reached that state before, because such a
+  // type still had to clear `linkProven` and an unproduced datatype never did. Adding the
+  // core-3D proof removed that accidental second lock, which is what surfaced this:
+  // `("FILE_3D_GLTF", {widgetType: "STRING"})` would have been added as a socket while
+  // genuinely being a STRING widget — a node with neither a widget value nor a link, which
+  // is exactly #580's false accept.
+  "widgetType",
 ];
 
 /**
@@ -490,11 +637,198 @@ function inputValueConfig(spec) {
  * Pure apart from the node it is handed; returns [] when there is nothing current to
  * compare against, so a frontend-only type is untouched.
  */
-export function applyCurrentDefWidgetValues(node, currentDef) {
+/** Own ENUMERABLE DATA keys, or null when the object carries anything a key-by-key
+ *  comparison cannot faithfully see (#1085 codex): a SYMBOL key, a NON-ENUMERABLE own
+ *  property, or an ACCESSOR. Accessors matter twice over — a getter would be INVOKED by the
+ *  comparison, so two different shapes can read equal, and a THROWING getter would crash a
+ *  path that used to be a bare `!==`. `allowLength` skips an array's own non-enumerable
+ *  `length`, which every array has.
+ *
+ *  Returning null means "cannot compare structurally", and the caller then falls back to
+ *  identity — the answer `!==` gave before any of this existed. */
+function plainDataKeys(obj, allowLength) {
+  const out = [];
+  for (const key of Reflect.ownKeys(obj)) {
+    if (typeof key === "symbol") return null;
+    if (allowLength && key === "length") continue;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (!desc || !desc.enumerable || !("value" in desc)) return null;
+    out.push(key);
+  }
+  return out;
+}
+
+/** A canonical ARRAY INDEX key. `String(Number(k)) === k` is NOT this test: it accepts
+ *  "Infinity", "1.5" and "1e+21" (codex).
+ *
+ *  REDUNDANT TODAY, and said plainly rather than implied otherwise — mutation-verified:
+ *  loosening this predicate breaks no test. What actually closed that hole was switching
+ *  the array branch from a 0..length WALK to a comparison of the PRESENT KEY SET, which
+ *  visits every own key including the ones that are not indices. This kept as an explicit
+ *  refusal because a key that is not an index has no business in a value being compared as
+ *  an array, and because it is what would still hold if the loop ever went back to walking
+ *  indices. */
+function isArrayIndexKey(key) {
+  const n = Number(key);
+  return Number.isInteger(n) && n >= 0 && n < 2 ** 32 - 1 && String(n) === key;
+}
+
+/** #1085 — whether two widget values are the SAME VALUE, not the same reference.
+ *
+ *  `!==` is the right question for a scalar and the wrong one for an OBJECT default, where
+ *  it is true for every pair of distinct references no matter what they contain. Core
+ *  `ImageCropV2` declares `crop_region` as `{x, y, width, height}`, and each `/object_info`
+ *  read materialises a fresh object — so every add "corrected" that widget from
+ *  `{"x":0,"y":0,"width":512,"height":512}` to the identical `{"x":0,"y":0,"width":512,
+ *  "height":512}` and warned that the tab's schema was STALE. Nothing had changed, and the
+ *  advice that came with it (reload the tab before editing further) was work the user did
+ *  not need to do.
+ *
+ *  Structural, not `JSON.stringify`: key ORDER differs freely between two readings of the
+ *  same definition, and stringify would call those unequal — reproducing the bug through a
+ *  second mechanism. Prototypes must match too, so a plain object never compares equal to a
+ *  class instance that happens to carry the same keys.
+ *
+ *  FAILS TOWARD TODAY'S BEHAVIOUR wherever it declines to compare: a proxy that throws, an
+ *  exotic object, an accessor or a symbol key all answer "different", which is exactly what
+ *  `!==` answered before this existed — a spurious correction at worst, never a missed one.
+ *  A CYCLE is the one case that is decided rather than refused: re-encountering a pair means
+ *  the traversal closed a loop, and two structures that agree everywhere else agree there.
+ *
+ *  ON HANGING PROXY TRAPS, since a structural compare reads what `!==` did not: for an
+ *  OBJECT-valued widget this exposure is not new. `!==` was true for every object, so a
+ *  correction was always recorded, and the caller's disclosure interpolates
+ *  `JSON.stringify(c.from)` — which invokes the same ownKeys/get/getOwnPropertyDescriptor
+ *  traps. A non-returning trap already hung there. Comparing first REDUCES the exposure:
+ *  when the values are equal there is now no correction, so nothing is stringified.
+ *
+ *  NOT full parity, and the difference is named rather than glossed (codex): this also calls
+ *  `Object.getPrototypeOf`, which JSON serialization does not, so a proxy whose
+ *  `getPrototypeOf` trap never returns is newly reachable. There is no general defence — a
+ *  non-returning trap cannot be interrupted from JS, and no reliable proxy detection exists —
+ *  and a widget value of that shape means custom-node code that already runs in the page.
+ */
+function sameWidgetValue(a, b) {
+  // GUARDED ENTRY (codex). Everything below can touch a live widget value, and a live value
+  // can be a PROXY: Array.isArray, getPrototypeOf, Reflect.ownKeys,
+  // getOwnPropertyDescriptor, hasOwnProperty and a plain property read are all trap points,
+  // and a REVOKED proxy throws on the first of them. The path this replaced was a bare
+  // `!==`, which touches nothing — so without this, adding a node could fail outright where
+  // it used to succeed. Any throw (including a RangeError from an over-deep structure)
+  // answers "different", which is exactly what `!==` said.
+  //
+  // A trap that HANGS rather than throws is not guardable from here, and is not introduced
+  // by this change alone — any structural read of such a value has the same exposure.
+  try {
+    return sameWidgetValueDeep(a, b, new WeakMap());
+  } catch {
+    return false;
+  }
+}
+
+function sameWidgetValueDeep(a, b, seen) {
+  // Numbers first, so the two IEEE oddities are answered deliberately rather than by
+  // whichever operator happened to be used: NaN equals NaN (a NaN default would otherwise
+  // "change" on every single add), and -0 equals +0 (Object.is alone says they differ, which
+  // would invent a correction `!==` never reported). Everything else uses Object.is.
+  if (typeof a === "number" && typeof b === "number") {
+    return a === b || (Number.isNaN(a) && Number.isNaN(b));
+  }
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+
+  // CYCLE DETECTION, replacing a depth cap. Two successive caps (8, then 100) were both
+  // wrong in the same way (codex): a cap is a limit on SHAPE, and any equal structure past
+  // it received the exact spurious correction this fix exists to remove — then got
+  // reassigned, re-aliasing the widget to the definition's object. There is no depth at
+  // which that is the right answer.
+  //
+  // Tracking the (a, b) pairs already compared bounds a cycle EXACTLY. A finite structure is
+  // then limited only by the CALL STACK rather than by a constant — which is not the same as
+  // unlimited (codex), and the earlier wording claiming otherwise was wrong. Past that the
+  // recursion overflows, the guarded entry catches the RangeError, and the answer degrades to
+  // "different" — the pre-fix answer. Materially better than a cap of 8 or 100, which real
+  // values could reach; a JSON widget default cannot approach the stack. Re-encountering a pair means the traversal closed a loop, and the
+  // standard reading is co-inductive: the pair is equal unless something else proves
+  // otherwise. A stack deep enough to overflow still ends in the guarded entry's catch,
+  // which answers "different".
+  //
+  // Pairs are retained for the WHOLE traversal, not just the current path (codex) — that is
+  // ordinary bisimulation and is what makes sibling branches cheap; it is stated here
+  // because "on this path" was the wrong description of it.
+  //
+  // ACCEPTED LIMIT of that reading: it compares SHAPE, not aliasing topology. A self-cycle
+  // (`a.self === a`) and a two-object mutual cycle (`b.self = c; c.self = b`) are bisimilar
+  // and compare EQUAL though the objects differ. Unreachable in this function's actual job:
+  // the value being compared against is `config.default`, which comes from /object_info and
+  // is therefore JSON — and JSON cannot express a cycle at all. Recorded rather than fixed,
+  // because distinguishing topologies costs real complexity for a case the input format
+  // rules out.
+  let partners = seen.get(a);
+  if (partners?.has(b)) return true;
+  if (!partners) seen.set(a, (partners = new Set()));
+  partners.add(b);
+
+  const aIsArray = Array.isArray(a);
+  if (aIsArray !== Array.isArray(b)) return false;
+  if (aIsArray) {
+    // Array subclasses are not plain arrays; compare them by identity like any other
+    // exotic object (the check below would otherwise be skipped for the array branch).
+    if (Object.getPrototypeOf(a) !== Array.prototype || Object.getPrototypeOf(b) !== Array.prototype) {
+      return false;
+    }
+    if (a.length !== b.length) return false;
+    // Compare the PRESENT INDEX KEYS rather than walking 0..length (codex). A single valid
+    // sparse index of 4294967294 sets length to 4294967295, and a length walk would spin
+    // through billions of absent slots and freeze the tab. This also compares hole-ness for
+    // free: a hole simply has no own key, so `[,1]` and `[0,1]` differ by key set.
+    const aIdx = plainDataKeys(a, true);
+    const bIdx = plainDataKeys(b, true);
+    if (!aIdx || !bIdx) return false;
+    if (aIdx.length !== bIdx.length) return false;
+    if (!aIdx.every(isArrayIndexKey) || !bIdx.every(isArrayIndexKey)) return false;
+    for (const key of aIdx) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+      if (!sameWidgetValueDeep(a[key], b[key], seen)) return false;
+    }
+    return true;
+  }
+
+  // PLAIN OBJECTS ONLY (codex). `Object.keys` sees no content on a Date, Map, Set,
+  // ArrayBuffer or DataView, so two instances of any of them compared EQUAL whatever they
+  // held — again a real change reported as none. An /object_info default is JSON and can be
+  // none of these, but a live widget value can, so the structural path is restricted to the
+  // shape it was written for and everything else falls back to the identity answer
+  // `Object.is` already gave — which is exactly what `!==` did before this existed.
+  //
+  const aProto = Object.getPrototypeOf(a);
+  if (aProto !== Object.getPrototypeOf(b)) return false;
+  if (aProto !== Object.prototype && aProto !== null) return false;
+  // A PLAIN object can still carry symbol-keyed or non-enumerable own properties, which
+  // Object.keys does not see (codex). An earlier version of this comment claimed the
+  // prototype restriction disposed of them — it does not, and a test asserted that false
+  // negative under a title saying it could not happen. Refuse to compare structurally when
+  // either side has any such property; identity then answers, as it did before this existed.
+  const aKeys = plainDataKeys(a, false);
+  const bKeys = plainDataKeys(b, false);
+  if (!aKeys || !bKeys) return false;
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(
+    (k) => Object.prototype.hasOwnProperty.call(b, k) && sameWidgetValueDeep(a[k], b[k], seen),
+  );
+}
+
+export function applyCurrentDefWidgetValues(node, currentDef, out) {
   const required = currentDef?.input?.required;
   if (!required || typeof required !== "object") return [];
   const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
   const corrections = [];
+  /** #1369 — corrections REFUSED because the definition's own default is not a member of
+   *  its own option list. Reported rather than dropped: the node is usable, but the
+   *  caller should know its schema is self-contradictory, and silently declining to act
+   *  is the same class of omission as silently acting. */
+  const rejected = [];
   for (const [name, spec] of Object.entries(required)) {
     const widget = widgets.find((w) => w?.name === name);
     if (!widget) continue; // a socket, or a widget that never materialized — not ours
@@ -511,8 +845,38 @@ export function applyCurrentDefWidgetValues(node, currentDef) {
       }
     }
     // 2) The VALUE comes from the CURRENT definition, never the stale registered one.
-    if (Object.prototype.hasOwnProperty.call(config, "default") && widget.value !== config.default) {
-      widget.value = config.default;
+    //    …UNLESS the definition contradicts itself. #1369: KJNodes declares
+    //
+    //      "sage_attention": [ ["disabled","auto",…], { "default": false } ]
+    //
+    //    a COMBO whose default is not a member of its own option list — a leftover from
+    //    when that input was a BOOLEAN. Applying it faithfully (which is what this
+    //    function is FOR) rewrote a perfectly good "disabled" to `false`, and ComfyUI
+    //    then refused the run with `Value not in list`.
+    //
+    //    The enum is already in hand — it is the same spec this default came from — so
+    //    the check costs nothing. A default outside it is DISCARDED rather than clamped
+    //    or coerced: there is no defensible way to pick a replacement from an option list
+    //    the node author evidently did not mean, and the value the widget already holds
+    //    came from the registered schema and is at least a real member.
+    // #1085 — VALUE equality, not reference equality. An object default is a fresh object on
+    // every /object_info read, so `!==` reported a correction on every add of a node whose
+    // default is structured (ImageCropV2's `crop_region`), and the "schema is STALE" warning
+    // that follows was raised about a value that had not changed.
+    if (
+      Object.prototype.hasOwnProperty.call(config, "default") &&
+      !sameWidgetValue(widget.value, config.default)
+    ) {
+      const comboOptions = Array.isArray(spec?.[0])
+        ? spec[0]
+        : Array.isArray(config.options)
+          ? config.options
+          : null;
+      if (comboOptions && !comboOptions.includes(config.default)) {
+        rejected.push({ name, proposed: config.default, kept: widget.value });
+      } else {
+        widget.value = config.default;
+      }
     }
     // 3) A numeric value still outside the CURRENT range (no default declared, or a
     //    default the def itself contradicts) is clamped rather than shipped invalid.
@@ -520,8 +884,16 @@ export function applyCurrentDefWidgetValues(node, currentDef) {
       if (typeof config.min === "number" && widget.value < config.min) widget.value = config.min;
       if (typeof config.max === "number" && widget.value > config.max) widget.value = config.max;
     }
-    if (widget.value !== before) corrections.push({ name, from: before, to: widget.value });
+    // Same reason (#1085): after an assignment above, `before` and the new value can be
+    // distinct objects holding identical content, and only a structural compare can say so.
+    if (!sameWidgetValue(widget.value, before)) corrections.push({ name, from: before, to: widget.value });
   }
+  // Reported through an OPT-IN out-param rather than as a property on the returned array.
+  // The first cut attached `corrections.rejected` and claimed every existing caller was
+  // unaffected — wrong, and the #626 tests said so immediately: `.length` survives that
+  // but `assert.deepEqual` compares own properties, so four passing tests went red. A
+  // caller that does not ask for rejections gets exactly the array it always got.
+  if (out && typeof out === "object") out.rejected = rejected;
   return corrections;
 }
 
@@ -552,4 +924,61 @@ export function missingRequiredWidgetMaterializations(node, widgetConstructors, 
     if (!widget || widget.options?.serialize === false) missing.push(name);
   }
   return missing;
+}
+
+/**
+ * Which unavailable entries a node of the SAME CLASS, already live on the canvas,
+ * does NOT explain (#636).
+ *
+ * The type reasoning above asks what SHOULD happen: does some node output this
+ * datatype, does this input declare itself socket-shaped. On a backend where nothing
+ * outputs the type, a socket-shaped input has no proof and fails closed forever — no
+ * retry can change it, because every input to the decision is a snapshot. That is the
+ * reported case: `SaveVideo` refused for `VIDEO` on an install whose node set never
+ * outputs one.
+ *
+ * A live node of that class answers a different question: what DID happen. ComfyUI
+ * already built this class on THIS backend — an input that came out as a link SLOT is a
+ * socket, one that came out as a WIDGET had its constructor.
+ *
+ * It is a WITNESS, not a proof (codex). A widget can survive from an earlier
+ * registration, or have been converted to a slot, so it does not guarantee a fresh node
+ * materialises identically — and the argument must NOT rest on "extensions never
+ * unregister". What makes admitting it safe is that it only permits an ATTEMPT: the
+ * newly created node still goes through missingRequiredWidgetMaterializations before any
+ * success is reported, and that post-creation check is the real soundness boundary. The
+ * worst case here is a creation attempt that then fails closed.
+ *
+ * So this is deliberately NOT a relaxation of the type rules. It adds evidence rather
+ * than lowering a bar: an input the live node does not account for stays unavailable, so
+ * #580's protection is untouched for every case this cannot observe.
+ *
+ * Requires EVERY input carrying the type to be accounted for. A def can require the same
+ * datatype twice, and explaining one occurrence says nothing about the other — the same
+ * "every, not some" rule the socket/widget split above is built on.
+ */
+export function unavailableEntriesLiveNodeCannotExplain(report, liveNode) {
+  if (!Array.isArray(report) || !report.length) return [];
+  if (!liveNode || typeof liveNode !== "object") return report;
+  let widgetNames;
+  let slotNames;
+  try {
+    widgetNames = new Set(
+      (Array.isArray(liveNode.widgets) ? liveNode.widgets : [])
+        .map((w) => (w && typeof w.name === "string" ? w.name : null))
+        .filter(Boolean),
+    );
+    slotNames = new Set(
+      (Array.isArray(liveNode.inputs) ? liveNode.inputs : [])
+        .map((i) => (i && typeof i.name === "string" ? i.name : null))
+        .filter(Boolean),
+    );
+  } catch {
+    return report; // an unreadable node explains nothing
+  }
+  return report.filter((entry) => {
+    const inputs = Array.isArray(entry?.inputs) ? entry.inputs : [];
+    if (!inputs.length) return true; // nothing to check against ⇒ unexplained
+    return !inputs.every((name) => widgetNames.has(name) || slotNames.has(name));
+  });
 }

@@ -36,6 +36,9 @@ import {
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
   sealProvenRootBinding,
+  rootContentProvesActiveWorkflow,
+  rootContentProvesActiveWorkflowDespiteEdits,
+  contentProofExclusiveAmongOpen,
   serializedStateProvenEmpty,
 } from "../../web/js/lib/graph-binding.js";
 import {
@@ -275,6 +278,9 @@ function buildDirtyStaleRouteHarness({
     "resolveGraphRootUuidRebind",
     "postReconnectSettleWindow",
     "sealProvenRootBinding",
+    "rootContentProvesActiveWorkflow",
+    "rootContentProvesActiveWorkflowDespiteEdits",
+    "contentProofExclusiveAmongOpen",
     "graphRootMatchesState",
     "sameWorkflowObject",
     "app",
@@ -297,6 +303,9 @@ function buildDirtyStaleRouteHarness({
     // harnesses default to OUTSIDE the window and opt in explicitly.
     () => postReconnectWindow === true,
     sealProvenRootBinding,
+    rootContentProvesActiveWorkflow,
+    rootContentProvesActiveWorkflowDespiteEdits,
+    contentProofExclusiveAmongOpen,
     graphRootMatchesState,
     sameWorkflowObject,
     { graph: rootB, extensionManager: { workflow: { openWorkflows } } },

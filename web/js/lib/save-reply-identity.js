@@ -57,11 +57,69 @@ export function saveReplyIdentity(identity, { savedAs = false } = {}) {
     ...(savedAs
       ? {
           workflow_instance_changed: true,
+          // #978 — RE-FENCING MAY NOT BE ENOUGH, and saying only "re-fence" stranded a
+          // reporter who did it correctly and was still refused. ComfyUI's own store moves
+          // the active pointer without repainting: `workflowStore.openWorkflow` does not
+          // call `loadGraphData` (only `workflowService.openWorkflow` does), and the
+          // Save-As adapter documents this as the reason it persists the copy from the
+          // SOURCE tab. So this save does not ASK for a repaint — which is all that is
+          // established here. Whether the canvas still holds the source graph WHEN THE
+          // CALLER READS THIS is not observed: a user switching tabs, or a reconnect
+          // restoring one, can repaint during the save's awaits. If it was not repainted,
+          // the graph fence compares the live root's identity against the active
+          // workflow's and refuses — correctly, because the canvas really is the other
+          // workflow's — and `panel_open_workflow` is what brings the copy onto it.
+          // WHAT IS ESTABLISHED is that the save did not ASK for a repaint (codex): it
+          // activates through the store, and nothing here observes the root at reply
+          // time. A user switching tabs, or a reconnect restoring one, could repaint the
+          // copy during the save's awaits — so the consequence is stated conditionally
+          // rather than asserted. Naming the cause of a refusal a caller may be about to
+          // hit is the whole value; claiming the refusal will happen is not supported.
+          canvas_repaint_not_requested: true,
           workflow_instance_note:
-            "Save-As made a DIFFERENT workflow active. A session still fenced to the " +
+            "Save-As made a DIFFERENT workflow active, so a session still fenced to the " +
             "previous instance will have every following command refused with \"workflow " +
-            "instance mismatch\" — re-fence it to the workflow_uuid reported here.",
+            "instance mismatch\" — re-fence it to the workflow_uuid reported here. That " +
+            "may not be enough for GRAPH tools: this save activates the copy WITHOUT " +
+            "asking for a canvas repaint, so unless something else repainted it, the " +
+            "canvas still holds the source workflow's graph. If a graph command is then " +
+            "refused for a root-workflow-uuid mismatch, that is why, and it is refusing " +
+            "correctly. Open the saved workflow (panel_open_workflow) to put it on the " +
+            "canvas before reading or editing the graph (#978).",
         }
       : {}),
   };
+}
+
+/**
+ * Should the panel ESTABLISH an identity for the canvas a save just made active (#941)?
+ *
+ * The #716 rule this sits next to is that a READ must never establish identity — a fence
+ * refreshed from a value a read invented is agreeing with itself rather than observing
+ * anything. `establishedWorkflowReplyIdentity` therefore refuses to mint, and that is
+ * right.
+ *
+ * But a Save-As is not a read. It is a mutation whose entire job is to make a DIFFERENT
+ * workflow active, and the object it activates is brand new — nothing has ever established
+ * an identity for it. So the reply found none and said so honestly, while the fence, whose
+ * own read DOES mint, immediately saw one. Measured on 0.11.80:
+ *
+ *     workflow_save({name}) -> { saved: true, saved_as: true, workflow_identity_unavailable: true }
+ *     graph_outline()       -> "workflow instance mismatch: ... issued for instance b273a69f,
+ *                               and the active canvas reports 14d699d3"
+ *
+ * The panel knew the new identity well enough to refuse the next call with it, and had
+ * refused to report it one call earlier. Every `panel_*` graph tool is then dead for the
+ * session, and the documented recovery is fence-exempt but cannot re-derive what was never
+ * published — which left the reporter choosing between a ComfyUI restart and ~3h of queued
+ * renders (#941).
+ *
+ * Establishing it as part of the save closes that gap at the only moment the panel knows
+ * the new instance and the caller does not. Deliberately NOT widened to every save: an
+ * in-place save keeps the same object, whose identity is already established, so there is
+ * nothing to mint and no reason to touch it. Only the case that strands a caller.
+ */
+export function shouldEstablishIdentityAfterSave({ savedAs = false, alreadyEstablished = false } = {}) {
+  if (alreadyEstablished) return false;
+  return savedAs === true;
 }

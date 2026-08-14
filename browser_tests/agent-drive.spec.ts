@@ -73,9 +73,28 @@ async function stubCivitai(page: import('@playwright/test').Page, pages: Record<
     call += 1
     route.fulfill({ json: body })
   })
-  // Media proxy — a 1px PNG is enough for <img>/<video> src.
+  // Media proxy. This must be a DECODABLE image, not just the PNG signature.
+  //
+  // #847 — it used to be `Buffer.from([0x89, 0x50, 0x4e, 0x47])`, four bytes that
+  // look like a PNG header and are not a PNG. Chrome fails to decode it and fires
+  // `error` on the <img>, and the card's own handler responds by hiding itself:
+  //
+  //     img.addEventListener("error", () => { card.style.display = "none" })
+  //
+  // …which is correct product behaviour (a broken thumbnail should not leave a dead
+  // tile in the grid) and made every card in this file disappear a moment after it
+  // rendered. Assertions RACED that error event: `toBeVisible()` won often enough
+  // that the specs mostly passed, and `append-on-scroll` — which waits for a second
+  // page before asserting — lost about one run in three. The card was in the DOM
+  // with the right class the whole time; it was `display: none`.
+  //
+  // A real 1x1 PNG decodes, so no card hides and nothing is racing.
+  const ONE_PIXEL_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  )
   await page.route('**/comfyui_mcp_panel/civitai/media*', (route) =>
-    route.fulfill({ body: Buffer.from([0x89, 0x50, 0x4e, 0x47]), contentType: 'image/png' })
+    route.fulfill({ body: ONE_PIXEL_PNG, contentType: 'image/png' })
   )
   // Signed-out OAuth status so the favorites tab / account button stay inert.
   await page.route('**/comfyui_mcp_panel/civitai/oauth/status', (route) =>

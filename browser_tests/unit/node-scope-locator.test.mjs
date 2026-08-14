@@ -132,13 +132,13 @@ test("WIRING: resolveNode builds its error through describeMissingNode", async (
   // at source. Without it every one of them reverts to the bare message.
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.match(src, /import \{ describeMissingNode \} from "\.\/lib\/node-scope-locator\.js";/);
+  assert.match(src, /import \{ describeMissingNode(?:, describeRailNodeTarget)? \} from "\.\/lib\/node-scope-locator\.js";/);
   const fn = src.slice(src.indexOf("function resolveNode(graph, nodeId) {"));
   const body = fn.slice(0, fn.indexOf("function normalizeLegacyNodeId"));
   assert.ok(body.includes("describeMissingNode(nodeId, rootGraph, viewingRoot)"),
     "the failure path must go through the locator");
   // The lookup itself must be unchanged — this is diagnostics only, never a wider search.
-  assert.ok(body.includes("graph.getNodeById(Number(nodeId))"),
+  assert.ok(body.includes("graph.getNodeById(canonicalNodeId(nodeId))"),
     "resolution must still be scoped to the current graph");
   // And the diagnostic must not be able to break the call.
   assert.ok(body.includes("} catch {"), "reading the root must be guarded");

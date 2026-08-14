@@ -1,3 +1,4 @@
+import { tr } from "./i18n.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -478,16 +479,34 @@ function bodyQueueMark(bodyText) {
  *
  * The previous single "scope_missing" verdict covered FOUR different states
  * and its message asserted one specific cause for all of them ("this frontend
- * build ignored the run-to-node argument"). That assertion is a BUCKET
- * narrated as a CAUSE, and the evidence says it is usually the wrong cause:
- * every ComfyUI_frontend build from 1.42 through 1.50 demonstrably accepts
- * BOTH `app.queuePrompt` third-argument shapes (the positional
- * `NodeExecutionId[]` natively on older builds, and on newer builds through an
- * `Array.isArray(optionsOrQueueNodeIds)` normalisation into
- * `{ queueNodeIds }`), and both funnel into `api.queuePrompt`'s
- * `options.partialExecutionTargets` → `body.partial_execution_targets`. Three
- * separate field reports on #556 pasted that asserted cause verbatim into the
- * tracker, which is precisely why the real cause is still unknown.
+ * That assertion is a BUCKET narrated as a CAUSE. Three separate field reports
+ * on #556 pasted that asserted cause verbatim into the tracker, which is
+ * precisely why the real cause stayed unknown for so long.
+ *
+ * #752 - this paragraph USED to continue: "every ComfyUI_frontend build from
+ * 1.42 through 1.50 demonstrably accepts BOTH third-argument shapes ... and both
+ * funnel into api.queuePrompt's options.partialExecutionTargets ->
+ * body.partial_execution_targets". It is FALSE on at least one build, and it was
+ * the same defect this paragraph is ABOUT: a claim about builds nobody here had
+ * run, stated as demonstrated.
+ *
+ * MEASURED on a live ComfyUI_frontend 1.48.7 - intercepting POST /prompt and
+ * BLOCKING it so nothing queued - calling app.queuePrompt(0, 1, third):
+ *
+ *   positional [id]             -> partial_execution_targets: ["9"]
+ *   { queueNodeIds: [id] }      -> partial_execution_targets: {"queueNodeIds":["9"]}
+ *   { partialExecutionTargets } -> partial_execution_targets: {"partialExecutionTargets":["9"]}
+ *
+ * The third argument is copied into the body VERBATIM; nothing unwraps an
+ * options object. So on that build only the positional shape yields a usable
+ * target list, and either options shape puts an OBJECT where the server expects
+ * an array. readScopeFromBody's `not_a_list` state is what catches it - which is
+ * why that state must stay: the KEY being present is not evidence the scope
+ * landed, and a presence-only check would have accepted a malformed body.
+ *
+ * Which builds honour which shape is still not something this file can assert.
+ * The shapes are tried in order and the emitted request is measured; that is the
+ * only claim available from inside one of them.
  *
  * So the states are now reported separately, the message states only what was
  * OBSERVED, and the body's top-level keys ride along as evidence.
@@ -877,7 +896,7 @@ const SCOPE_DROPPED_RESPONSE = () =>
     JSON.stringify({
       error: {
         type: "partial_execution_scope_dropped",
-        message: "run-to-node scope was not applied; nothing was queued",
+        message: tr("run_scope_guard.run_to_node_scope_was_not_applied", "run-to-node scope was not applied; nothing was queued"),
       },
     }),
     { status: 400, headers: { "Content-Type": "application/json" } },

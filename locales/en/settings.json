@@ -1,0 +1,210 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "Star on GitHub",
+    "tooltip": "Enjoying the ComfyUI Agent Panel? A GitHub star genuinely helps. Opens the repo in a new tab."
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "What's new",
+    "tooltip": "Show recent changes in the panel transcript — what shipped in this version and the ones before it. The panel can update from the Comfy Registry without you asking, so this is where to check when something behaves differently than you remember."
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "Documentation",
+    "tooltip": "Guides for the panel, tools, local LLMs and troubleshooting — comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "Community",
+    "tooltip": "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab."
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "Need help?",
+    "tooltip": "Stuck? This copies a short diagnostics summary (panel version, backend, ComfyUI, OS) to your clipboard and opens the Discord — paste it into your message so we can help fast."
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "Default agent backend",
+    "tooltip": "Which background agent the panel connects to by default. Claude runs on your Claude subscription; ChatGPT runs on your Codex (ChatGPT) account; Gemini runs on your Google (Gemini) login. Seeds the panel's backend (and which group below seeds the runtime); you can still switch live in the model picker (a live switch is session-only and does NOT change this default)."
+  },
+  "comfyui-mcp_chatScope": {
+    "name": "Chat conversation scope",
+    "tooltip": "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts."
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "Auto-connect on load",
+    "tooltip": "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. Off by default — the orchestrator is otherwise only started by an explicit Connect click."
+  },
+  "comfyui-mcp_language": {
+    "name": "Panel language",
+    "tooltip": "Language for the panel's own text. Detect follows ComfyUI's language setting, so changing ComfyUI's language changes the panel too. Anything not yet translated falls back to English. Takes effect when the panel is reopened or reloaded."
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "Control via Mobile app (beta)",
+    "tooltip": "Show the Remote-control pairing button (QR) in the panel header and the beta app download links below. The mobile app is in BETA and rapidly changing — expect rough edges, breaking changes between builds, and occasional re-pairing. Pairing stays on your own machine/network unless you explicitly choose Internet mode."
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "Show Apps",
+    "tooltip": "Show the Apps button in the toolbar — the micro-app layer (convert a workflow into a one-click app, run it locally or on a pod, publish/explore). Off by default; the flag is also sent to a connected mobile app."
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "Show Training",
+    "tooltip": "Show the Training button in the toolbar — the LoRA training wizard (dataset gather/label/launch/monitor). Off by default; the flag is also sent to a connected mobile app."
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "Show RunPod / Local",
+    "tooltip": "Show the RunPod / Local host button in the toolbar — deploy/start/stop/connect a cloud GPU pod, or switch back to local. Off by default; the flag is also sent to a connected mobile app."
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "Get the beta app",
+    "tooltip": "Tester downloads for the ComfyUI MCP mobile app. iOS installs via Apple TestFlight; Android via Firebase App Distribution. Both channels are beta: builds update frequently and may require re-pairing with this panel."
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "Panel UI scale (%)",
+    "tooltip": "Scales the whole Agent sidebar — text, icons and spacing together. Raise it if the panel is hard to read on a high-DPI or large display. 100% is the default; 100-250. Applies immediately, to every open panel. Note that overriding `.cmcp-root { font-size }` in a user stylesheet does NOT work: the panel's inner sizes are `rem`, which resolve against the page root rather than the panel, so most text ignores it. This setting is the supported way to scale the panel."
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "Render stall warning (seconds)",
+    "tooltip": "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged (e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps are legitimately slow, so keep this generous. Default 180s; range 15–3600. Applies when the orchestrator next starts — Disconnect then Connect (or /restart) to change it for a running agent."
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "Remote ComfyUI URL (advanced)",
+    "tooltip": "Point the AGENT at a remote ComfyUI instead of this machine — e.g. a RunPod pod at https://xxxxxxxx-8188.proxy.runpod.net. Leave BLANK to drive the local ComfyUI (default). When set, the agent's tools (queue, models, history, uploads) target the remote server, and local-only tools (download_model / installer packs / model scans) are disabled. Applies when the orchestrator next starts — Disconnect then Connect to change it. Your live canvas still follows whichever ComfyUI you opened in the browser."
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "Bridge URL (advanced)",
+    "tooltip": "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider (default ws://127.0.0.1:9180). Only change this if you start the orchestrator on a non-default port (COMFYUI_MCP_BRIDGE_PORT). Applies on the next Connect."
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "Zoom to agent edits",
+    "tooltip": "When the agent changes a node's value, smoothly zoom the canvas to that node (with padding) so you watch the change land, then zoom back out to fit the whole graph once edits go quiet. Scoped to value edits — wiring and node placement don't move the view. On by default; turn off to keep the canvas still."
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "Preferred models",
+    "tooltip": "Your own favorite models, comma-separated — Ollama tags (artokun/gemma4-comfyui-mcp:e4b — our ComfyUI fine-tune, gemma4:12b, qwen3:4b) and/or OpenRouter ids (xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). They pin to the TOP of the model picker (marked ★ when not in the discovered catalog). Persisted by the orchestrator, so they survive restarts and apply immediately."
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "Endpoint type",
+    "tooltip": "How the Ollama backend talks to its endpoint. 'Ollama (local)' uses the native /api/chat on your local Ollama. 'OpenAI-compatible' speaks /chat/completions — use it for OpenRouter, vLLM, LM Studio, DeepSeek etc. (set the base URL below; the API key comes from the orchestrator's env, e.g. OPENROUTER_API_KEY). Applies to NEW sessions — Disconnect then Connect after changing."
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "Endpoint base URL",
+    "tooltip": "Base URL for the endpoint above. Leave BLANK for local Ollama (http://127.0.0.1:11434). For OpenAI-compatible endpoints include the /v1 (e.g. https://openrouter.ai/api/v1). Applies to NEW sessions — Disconnect then Connect after changing."
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "Endpoint base URL",
+    "tooltip": "Any OpenAI-compatible endpoint — vLLM, DeepSeek, Together, Azure OpenAI, a llama-server on another box… Include the /v1 (e.g. http://192.168.1.20:8000/v1). Persisted by the orchestrator and applies immediately; if the server needs a key, use “Set API key…” below. Leave blank to disable this provider."
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "Default model",
+    "tooltip": "Default model for the Claude background agent, chosen from the models fetched for Claude (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Claude this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "Default model",
+    "tooltip": "Default model for the ChatGPT background agent, chosen from the models fetched for ChatGPT (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to ChatGPT this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "Default model",
+    "tooltip": "Default model for the Gemini background agent, chosen from the models fetched for Gemini (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Gemini this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "Default model",
+    "tooltip": "Default model for the Antigravity background agent, chosen from the models fetched for Antigravity (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Antigravity this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "Default model",
+    "tooltip": "Default model for the Pi background agent, chosen from the models fetched for Pi (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Pi this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "Default model",
+    "tooltip": "Default model for the Grok background agent, chosen from the models fetched for Grok (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Grok this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "Default model",
+    "tooltip": "Default model for the Kimi background agent, chosen from the models fetched for Kimi (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Kimi this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "Default model",
+    "tooltip": "Default model for the Kimi K3 background agent, chosen from the models fetched for Kimi K3 (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Kimi K3 this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "Default model",
+    "tooltip": "Default model for the GLM (z.ai) background agent, chosen from the models fetched for GLM (z.ai) (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to GLM (z.ai) this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "Default model",
+    "tooltip": "Default model for the MiniMax background agent, chosen from the models fetched for MiniMax (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to MiniMax this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "Default model",
+    "tooltip": "Default model for the Ollama background agent, chosen from the models fetched for Ollama (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Ollama this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "Default model",
+    "tooltip": "Default model for the OpenRouter background agent, chosen from the models fetched for OpenRouter (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to OpenRouter this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "Default model",
+    "tooltip": "Default model for the LM Studio background agent, chosen from the models fetched for LM Studio (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to LM Studio this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "Default model",
+    "tooltip": "Default model for the llama.cpp background agent, chosen from the models fetched for llama.cpp (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to llama.cpp this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "Default model",
+    "tooltip": "Default model for the Custom endpoint background agent, chosen from the models fetched for Custom endpoint (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Custom endpoint this may show only 'Auto' + your saved choice."
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "Default reasoning effort",
+    "tooltip": "Default reasoning effort for the Claude agent, from its scale (low–max). 'Model default' leaves it unset."
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "Default reasoning effort",
+    "tooltip": "Default reasoning effort for the ChatGPT agent, from its scale (none–ultra). 'Model default' leaves it unset."
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "Default reasoning effort",
+    "tooltip": "Gemini exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "Default reasoning effort",
+    "tooltip": "Antigravity exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "Default reasoning effort",
+    "tooltip": "Pi exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "Default reasoning effort",
+    "tooltip": "Grok exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "Default reasoning effort",
+    "tooltip": "Kimi exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "Default reasoning effort",
+    "tooltip": "Kimi K3 exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "Default reasoning effort",
+    "tooltip": "GLM (z.ai) exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "Default reasoning effort",
+    "tooltip": "MiniMax exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "OpenRouter API key",
+    "tooltip": "Securely store your OpenRouter API key. Opens a masked input; the value goes straight to the orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready)."
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "Custom endpoint API key",
+    "tooltip": "Securely store your Custom endpoint API key. Opens a masked input; the value goes straight to the orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready)."
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "CivitAI token",
+    "tooltip": "Securely store your CivitAI API token. Opens a masked input; the value goes straight to the orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready)."
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "HuggingFace token",
+    "tooltip": "Securely store your HuggingFace API token. Opens a masked input; the value goes straight to the orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready)."
+  }
+}

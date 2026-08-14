@@ -30,7 +30,10 @@ const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 /** The paintSecret body, from its signature to the next top-level function. */
 function paintSecretBody() {
   const src = readFileSync(PANEL_JS, "utf8");
-  const start = src.indexOf("function paintSecret(msg) {");
+  // #952 threaded the painting socket id through, so the signature carries a second
+  // parameter now. Anchored on the NAME rather than the whole signature so the next
+  // parameter does not break a layout guard that has nothing to do with it.
+  const start = src.indexOf("function paintSecret(");
   assert.notEqual(start, -1, "paintSecret must exist");
   const end = src.indexOf("\n  function ", start + 1);
   assert.notEqual(end, -1, "paintSecret must be followed by another function");

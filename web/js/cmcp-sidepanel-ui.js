@@ -22,13 +22,20 @@ import { createCivitaiContent } from "./cmcp-civitai-ui.js";
 import { createAppsContent } from "./cmcp-apps-ui.js";
 import { createTrainingContent } from "./cmcp-training-ui.js";
 import { createLocalContent } from "./cmcp-runpod-ui.js";
+import { tr } from "./lib/i18n.js";
 
 // key → content factory + tab presentation. Order = tab-bar order.
+//
+// `label` is a GETTER, not a value. This array is built at MODULE SCOPE, which runs at import
+// time — before setup() has awaited loadCatalog() — so a plain `label: tr(...)` would capture
+// the English fallback permanently and no translation could ever appear, however complete the
+// catalog was. A getter defers the lookup to the moment the label is read (line ~313), by
+// which point the catalog is loaded. Every consumer still just reads `.label`.
 const TABS = [
-  { key: "civitai", label: "CivitAI", icon: "pi-images", factory: createCivitaiContent },
-  { key: "apps", label: "Apps", icon: "pi-th-large", factory: createAppsContent },
-  { key: "training", label: "Training", icon: "pi-bolt", factory: createTrainingContent },
-  { key: "local", label: "RunPod", icon: "pi-server", factory: createLocalContent },
+  { key: "civitai", get label() { return tr("sidepanel_ui.civitai", "CivitAI"); }, icon: "pi-images", factory: createCivitaiContent },
+  { key: "apps", get label() { return tr("sidepanel_ui.apps", "Apps"); }, icon: "pi-th-large", factory: createAppsContent },
+  { key: "training", get label() { return tr("sidepanel_ui.training", "Training"); }, icon: "pi-bolt", factory: createTrainingContent },
+  { key: "local", get label() { return tr("sidepanel_ui.runpod", "RunPod"); }, icon: "pi-server", factory: createLocalContent },
 ];
 // Legacy per-surface alias classes applied to the modal while that tab is active.
 const ALIAS = { civitai: "cmcp-civitai-modal", training: "cmcp-tr-modal", apps: "cmcp-apps-modal" };
@@ -47,10 +54,10 @@ function injectCss() {
   .cmcp-cv-head { display: flex; align-items: center; gap: .5rem; padding: .6rem .7rem;
     border-bottom: 1px solid var(--p-content-border-color, #3f3f46); flex-wrap: wrap; }
   .cmcp-cv-tabs { display: flex; gap: .25rem; flex-wrap: wrap; }
-  .cmcp-sp-title { font-weight: 600; font-size: .85rem; color: var(--p-text-color, #fafafa); padding: 0 .25rem; }
+  .cmcp-sp-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462); color: var(--p-text-color, #fafafa); padding: 0 .25rem; }
   .cmcp-cv-tab { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .55rem;
     border-radius: 8px; border: 1px solid transparent; background: transparent;
-    color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; font-size: .8rem; }
+    color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); }
   /* Active tab uses the ComfyUI/PrimeVue theme primary so it inverts correctly in
      light + dark (precedent: .cmcp-btn primary). */
   .cmcp-cv-tab.active { background: var(--p-primary-color, #3a7bd5);
@@ -66,7 +73,7 @@ function injectCss() {
     background: var(--p-primary-color, #3a7bd5); }
   .cmcp-cv-body { position: relative; flex: 1; overflow-y: auto; padding: .6rem; }
   .cmcp-cv-frow { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
-  .cmcp-cv-chip { padding: .25rem .5rem; border-radius: 999px; font-size: .75rem; cursor: pointer;
+  .cmcp-cv-chip { padding: .25rem .5rem; border-radius: 999px; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); cursor: pointer;
     border: 1px solid var(--p-content-border-color,#3f3f46); background: transparent; color: var(--p-text-color,#fafafa); }
   .cmcp-cv-chip.on { background: var(--p-primary-color,#3a7bd5); border-color: transparent; color:#fff; }
   /* Agent-driven "glow" — shared across every surface (steps, cards, fields). */
@@ -146,7 +153,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
   const titleEl = el("div", "cmcp-sp-title");
   const closeBtn = el("button", "cmcp-cv-iconbtn");
   closeBtn.innerHTML = '<i class="pi pi-times"></i>';
-  closeBtn.title = "Close";
+  closeBtn.title = tr("sidepanel_ui.close", "Close");
   closeBtn.style.marginLeft = "auto";
   head.append(titleEl, closeBtn);
 
@@ -156,7 +163,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
   // body's own input[type=text] fields (e.g. training's dataset-name/trigger,
   // which specs locate positionally).
   searchEl.type = "search";
-  searchEl.placeholder = "Search…";
+  searchEl.placeholder = tr("sidepanel_ui.search", "Search…");
   const extras = el("div", "cmcp-cv-frow"); // content-provided subnav content
   extras.style.flex = "1 1 auto";
   subnav.append(searchEl, extras);
@@ -255,7 +262,10 @@ export function openSidePanel(ctx = {}, opts = {}) {
     const c = contents.get(activeKey);
     const has = c ? (typeof c.hasSearch === "function" ? c.hasSearch() : !!c.hasSearch) : false;
     searchEl.style.display = has ? "" : "none";
-    if (has && c) searchEl.placeholder = c.searchPlaceholder || "Search…";
+    // Every provider supplies a translated placeholder today, so this branch is dead — but a
+    // literal here reverts the SHARED box to English for the first provider that omits one,
+    // and there would be no literal in that provider's file for any scanner to find.
+    if (has && c) searchEl.placeholder = c.searchPlaceholder || tr("sidepanel_ui.search", "Search…");
   }
   searchEl.addEventListener("input", () => {
     const c = contents.get(activeKey);

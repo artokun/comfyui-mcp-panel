@@ -1,0 +1,210 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "GitHub でスターを付ける",
+    "tooltip": "ComfyUI エージェントパネルは気に入りましたか？GitHub のスターは本当に励みになります。リポジトリを新しいタブで開きます。"
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "新着情報",
+    "tooltip": "最近の変更をパネルの会話ログに表示します — このバージョンとそれ以前のバージョンで何が入ったかがわかります。パネルは指示がなくても Comfy Registry から更新されることがあるため、記憶と挙動が違うときはここを確認してください。"
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "ドキュメント",
+    "tooltip": "パネル、ツール、ローカル LLM、トラブルシューティングのガイド — comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "コミュニティ",
+    "tooltip": "comfyui-mcp の Discord に参加 — お知らせ、コツ、サポート。新しいタブで開きます。"
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "困ったときは",
+    "tooltip": "行き詰まりましたか？短い診断情報（パネルのバージョン、バックエンド、ComfyUI、OS）をクリップボードにコピーして Discord を開きます — メッセージに貼り付けていただければ素早くお手伝いできます。"
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "既定のエージェントバックエンド",
+    "tooltip": "パネルが既定で接続するバックグラウンドエージェントです。Claude は Claude のサブスクリプション、ChatGPT は Codex（ChatGPT）アカウント、Gemini は Google（Gemini）のログインで動作します。パネルのバックエンドと、下のどのグループがランタイムを初期化するかを決めます。モデルピッカーからその場で切り替えることもできますが、その切り替えはセッション限りで、この既定値は変わりません。"
+  },
+  "comfyui-mcp_chatScope": {
+    "name": "チャットの適用範囲",
+    "tooltip": "Panel: 1 つの会話がすべてのキャンバスに付いて回ります。Workflow: 保存済みのワークフローごとに専用のチャット群を保持し、埋め込み UUID で識別するため、名前を変えても履歴は残り、複製は別々になります。Ask: ワークフローを切り替えるたびに現在の会話を引き継ぐかを選べます。いずれのモードも ComfyUI/MCP を完全に再起動しても維持されます。"
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "起動時に自動接続",
+    "tooltip": "パネルを開いたときに「接続」を押さなくてもエージェントを自動で接続し、ローカルのオーケストレーターを起動します。既定はオフで、その場合オーケストレーターは「接続」を明示的に押したときにだけ起動します。"
+  },
+  "comfyui-mcp_language": {
+    "name": "パネルの言語",
+    "tooltip": "パネル自身のテキストの言語です。「Detect」は ComfyUI の言語設定に従うため、ComfyUI の言語を変えるとパネルも変わります。未翻訳の箇所は英語で表示されます。パネルを開き直すか再読み込みすると反映されます。"
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "モバイルアプリで操作（ベータ）",
+    "tooltip": "パネルのヘッダーにリモート操作のペアリングボタン（QR）を、下にベータ版アプリのダウンロードリンクを表示します。モバイルアプリはベータ版で変化が速く、粗さやビルド間の互換性の断絶、ときどき再ペアリングが必要になります。インターネットモードを自分で選ばない限り、ペアリングは自分のマシンとネットワークの中に留まります。"
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "アプリを表示",
+    "tooltip": "ツールバーに「アプリ」ボタンを表示します — ワークフローをワンクリックアプリに変換し、ローカルまたは Pod で実行し、公開・探索できるミニアプリ層です。既定はオフで、この設定は接続中のモバイルアプリにも送られます。"
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "トレーニングを表示",
+    "tooltip": "ツールバーに「トレーニング」ボタンを表示します — LoRA 学習ウィザード（データセットの収集・ラベル付け・実行・監視）です。既定はオフで、この設定は接続中のモバイルアプリにも送られます。"
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "RunPod / ローカルを表示",
+    "tooltip": "ツールバーに RunPod / ローカルホストのボタンを表示します — クラウド GPU の Pod をデプロイ・開始・停止・接続したり、ローカルに戻したりできます。既定はオフで、この設定は接続中のモバイルアプリにも送られます。"
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "ベータ版アプリを入手",
+    "tooltip": "ComfyUI MCP モバイルアプリのテスター向けダウンロードです。iOS は Apple TestFlight、Android は Firebase App Distribution からインストールします。どちらもベータ版で、ビルドは頻繁に更新され、このパネルとの再ペアリングが必要になることがあります。"
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "パネル UI の拡大率（%）",
+    "tooltip": "エージェントサイドバー全体（文字・アイコン・余白）をまとめて拡大縮小します。高 DPI や大画面で読みにくいときは上げてください。既定は 100% で、範囲は 100-250 です。開いているすべてのパネルに即座に適用されます。なお、ユーザースタイルシートで `.cmcp-root { font-size }` を上書きしても効きません: パネル内部のサイズは `rem` で、パネルではなくページのルートを基準に解決されるため、ほとんどの文字は無視します。パネルを拡大する正式な方法はこの設定です。"
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "レンダー停滞の警告（秒）",
+    "tooltip": "ComfyUI のレンダーがまったく進まない状態がどれだけ続いたら、レンダーが停止・ハングしているように見える（例: メモリ不足で止まったサンプラーのステップ）とエージェントに警告し、もう一度キューに入れるのではなく中止・再実行するよう伝えるかを決めます。動画のステップはもともと遅いので、余裕を持たせてください。既定は 180 秒、範囲は 15–3600 です。オーケストレーターの次回起動時に適用されます — 実行中のエージェントに反映するには、切断してから接続し直す（または /restart）してください。"
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "リモート ComfyUI の URL（上級）",
+    "tooltip": "エージェントの向き先をこのマシンではなくリモートの ComfyUI にします — 例: https://xxxxxxxx-8188.proxy.runpod.net の RunPod ポッド。ローカルの ComfyUI を使う場合は空欄のままにしてください（既定）。設定すると、エージェントのツール（キュー、モデル、履歴、アップロード）はリモートのサーバーを対象にし、ローカル専用ツール（ download_model / インストーラーパック / モデルスキャン）は無効になります。オーケストレーターの次回起動時に適用されるため、変更するには切断してから接続し直してください。目の前のキャンバスは、ブラウザーで開いた ComfyUI に従ったままです。"
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "ブリッジ URL（上級）",
+    "tooltip": "パネルのオーケストレーターブリッジの WebSocket URL です — 現在は 1 つのブリッジがすべてのプロバイダーを受け持ちます（既定 ws://127.0.0.1:9180）。オーケストレーターを既定以外のポート（ COMFYUI_MCP_BRIDGE_PORT ）で起動する場合にのみ変更してください。次回の接続時に適用されます。"
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "エージェントの編集にズーム",
+    "tooltip": "エージェントがノードの値を変更すると、キャンバスがそのノードへ滑らかにズーム（余白付き）して変更が反映される様子を確認でき、編集が落ち着くとグラフ全体が収まるまでズームアウトします。値の変更のみが対象で、配線やノードの配置ではビューは動きません。既定はオンで、オフにするとキャンバスは動きません。"
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "お気に入りのモデル",
+    "tooltip": "よく使うモデルをカンマ区切りで指定します — Ollama のタグ（artokun/gemma4-comfyui-mcp:e4b — 私たちの ComfyUI ファインチューン、gemma4:12b、qwen3:4b）や OpenRouter の ID（xiaomi/mimo-v2.5、moonshotai/kimi-k2.5）が使えます。モデルピッカーの最上部に固定され、検出済みのカタログにないものは ★ が付きます。オーケストレーターが保存するため、再起動しても残り、すぐに反映されます。"
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "エンドポイントの種類",
+    "tooltip": "Ollama バックエンドがエンドポイントと通信する方法です。「Ollama (local)」はローカルの Ollama のネイティブな /api/chat を使います。「OpenAI-compatible」は /chat/completions を話すので、OpenRouter、vLLM、LM Studio、DeepSeek などに使ってください（ベース URL は下で設定し、API キーはオーケストレーターの環境変数（例: OPENROUTER_API_KEY ）から取得します）。新しいセッションから適用されるため、変更後は切断してから接続し直してください。"
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "エンドポイントのベース URL",
+    "tooltip": "上のエンドポイントのベース URL です。ローカルの Ollama（http://127.0.0.1:11434）を使う場合は空欄のままにしてください。OpenAI 互換のエンドポイントでは /v1 まで含めます（例: https://openrouter.ai/api/v1）。新しいセッションから適用されるため、変更後は切断してから接続し直してください。"
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "エンドポイントのベース URL",
+    "tooltip": "OpenAI 互換であればどのエンドポイントでも構いません — vLLM、DeepSeek、Together、Azure OpenAI、別のマシンで動く llama-server など。/v1 まで含めてください（例: http://192.168.1.20:8000/v1）。オーケストレーターが保存し、すぐに反映されます。サーバーがキーを必要とする場合は、下の「API キーを設定…」を使ってください。空欄にするとこのプロバイダーは無効になります。"
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "既定のモデル",
+    "tooltip": "Claude のバックグラウンドエージェントで使う既定のモデルです。Claude 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Claude に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "既定のモデル",
+    "tooltip": "ChatGPT のバックグラウンドエージェントで使う既定のモデルです。ChatGPT 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。ChatGPT に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "既定のモデル",
+    "tooltip": "Gemini のバックグラウンドエージェントで使う既定のモデルです。Gemini 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Gemini に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "既定のモデル",
+    "tooltip": "Antigravity のバックグラウンドエージェントで使う既定のモデルです。Antigravity 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Antigravity に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "既定のモデル",
+    "tooltip": "Pi のバックグラウンドエージェントで使う既定のモデルです。Pi 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Pi に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "既定のモデル",
+    "tooltip": "Grok のバックグラウンドエージェントで使う既定のモデルです。Grok 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Grok に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "既定のモデル",
+    "tooltip": "Kimi のバックグラウンドエージェントで使う既定のモデルです。Kimi 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Kimi に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "既定のモデル",
+    "tooltip": "Kimi K3 のバックグラウンドエージェントで使う既定のモデルです。Kimi K3 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Kimi K3 に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "既定のモデル",
+    "tooltip": "GLM (z.ai) のバックグラウンドエージェントで使う既定のモデルです。GLM (z.ai) 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。GLM (z.ai) に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "既定のモデル",
+    "tooltip": "MiniMax のバックグラウンドエージェントで使う既定のモデルです。MiniMax 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。MiniMax に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "既定のモデル",
+    "tooltip": "Ollama のバックグラウンドエージェントで使う既定のモデルです。Ollama 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Ollama に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "既定のモデル",
+    "tooltip": "OpenRouter のバックグラウンドエージェントで使う既定のモデルです。OpenRouter 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。OpenRouter に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "既定のモデル",
+    "tooltip": "LM Studio のバックグラウンドエージェントで使う既定のモデルです。LM Studio 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。LM Studio に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "既定のモデル",
+    "tooltip": "llama.cpp のバックグラウンドエージェントで使う既定のモデルです。llama.cpp 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。llama.cpp に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "既定のモデル",
+    "tooltip": "Custom endpoint のバックグラウンドエージェントで使う既定のモデルです。Custom endpoint 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Custom endpoint に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "既定の推論強度",
+    "tooltip": "Claude エージェントの既定の推論強度です。そのスケール（low–max）から選びます。「Model default」のままにすると未設定になります。"
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "既定の推論強度",
+    "tooltip": "ChatGPT エージェントの既定の推論強度です。そのスケール（none–ultra）から選びます。「Model default」のままにすると未設定になります。"
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "既定の推論強度",
+    "tooltip": "Gemini には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "既定の推論強度",
+    "tooltip": "Antigravity には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "既定の推論強度",
+    "tooltip": "Pi には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "既定の推論強度",
+    "tooltip": "Grok には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "既定の推論強度",
+    "tooltip": "Kimi には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "既定の推論強度",
+    "tooltip": "Kimi K3 には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "既定の推論強度",
+    "tooltip": "GLM (z.ai) には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "既定の推論強度",
+    "tooltip": "MiniMax には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "OpenRouter API キー",
+    "tooltip": "OpenRouter の API キーを安全に保存します。マスクされた入力欄が開き、値はオーケストレーターの 0600 ストア（~/.comfyui-mcp）へ直接渡されます — ComfyUI の設定、ログ、チャット履歴、エージェントのコンテキストに書き込まれることは決してありません。必要なのはブリッジだけです（先に「接続」を押してください — プロバイダーが準備できている必要はありません）。"
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "カスタムエンドポイント API キー",
+    "tooltip": "カスタムエンドポイントの API キーを安全に保存します。マスクされた入力欄が開き、値はオーケストレーターの 0600 ストア（~/.comfyui-mcp）へ直接渡されます — ComfyUI の設定、ログ、チャット履歴、エージェントのコンテキストに書き込まれることは決してありません。必要なのはブリッジだけです（先に「接続」を押してください — プロバイダーが準備できている必要はありません）。"
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "CivitAI トークン",
+    "tooltip": "CivitAI の API トークンを安全に保存します。マスクされた入力欄が開き、値はオーケストレーターの 0600 ストア（~/.comfyui-mcp）へ直接渡されます — ComfyUI の設定、ログ、チャット履歴、エージェントのコンテキストに書き込まれることは決してありません。必要なのはブリッジだけです（先に「接続」を押してください — プロバイダーが準備できている必要はありません）。"
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "HuggingFace トークン",
+    "tooltip": "HuggingFace の API トークンを安全に保存します。マスクされた入力欄が開き、値はオーケストレーターの 0600 ストア（~/.comfyui-mcp）へ直接渡されます — ComfyUI の設定、ログ、チャット履歴、エージェントのコンテキストに書き込まれることは決してありません。必要なのはブリッジだけです（先に「接続」を押してください — プロバイダーが準備できている必要はありません）。"
+  }
+}

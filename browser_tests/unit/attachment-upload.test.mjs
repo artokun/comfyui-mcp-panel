@@ -110,15 +110,35 @@ test("#756 WIRING: both upload paths record the status and the exception", () =>
   // The helper being right proves nothing if the call sites still discard. Pin the
   // two sites that had the defect, and that neither bare form survives.
   const src = readFileSync(PANEL_JS, "utf8");
+  // #1188 moved the exchange inside a bounded callback, so the non-200 description is now
+  // BUILT there and assigned by the caller. Same contract — the status must still be
+  // captured on both paths — pinned at both ends of the new shape so neither half can be
+  // dropped: a `failure:` nobody reads, or an `att.uploadError` fed by something else.
   assert.equal(
-    (src.match(/att\.uploadError = describeUploadFailure\(\{\s*\r?\n?\s*status: res\.status/g) || []).length,
+    (src.match(/failure: describeUploadFailure\(\{\s*\r?\n?\s*status: res\.status/g) || []).length,
     2,
     "both upload paths must record a non-200 status",
   );
   assert.equal(
-    (src.match(/catch \(err\) \{[\s\S]{0,200}?att\.uploadError = describeUploadFailure\(\{ error: err/g) || []).length,
+    (src.match(/att\.uploadError = outcome\.failure;/g) || []).length,
+    2,
+    "…and both must surface it as the attachment's error",
+  );
+  // Window widened from 200 to 500: #1188 added a defensive re-read of the file's
+  // measurements inside each catch, which pushed the assignment further from `catch (err) {`.
+  // The contract is unchanged — the caught exception must still be what gets reported.
+  assert.equal(
+    (src.match(/catch \(err\) \{[\s\S]{0,500}?att\.uploadError = describeUploadFailure\(\{ error: err/g) || []).length,
     2,
     "both upload paths must record the caught exception",
+  );
+  // #1188 — and neither catch may read `file.size`/`file.type` directly. A throwing getter
+  // there throws a SECOND time while reporting the first failure, escapes the handler, and
+  // rejects `att.ready` — which the send path awaits and cannot handle.
+  assert.equal(
+    (src.match(/catch \(err\) \{[\s\S]{0,500}?describeUploadFailure\(\{ error: err, name, size: file\.size/g) || []).length,
+    0,
+    "the reporting catch must not re-read a property that may be what threw",
   );
   assert.ok(
     !src.includes("/* upload failed — the chip still references it by name as a fallback */"),

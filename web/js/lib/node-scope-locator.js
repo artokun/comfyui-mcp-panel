@@ -152,3 +152,60 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot) {
     `this is one route to that node, not necessarily the only one.`
   );
 }
+
+/**
+ * The message for an id that IS resolvable — as a subgraph BOUNDARY RAIL — but is
+ * not an ordinary node the write can act on (artokun/comfyui-mcp#1294).
+ *
+ * WHAT WAS WRONG. `panel_query_graph` reports the rails it found as
+ * `rails.output.rail_node_id: "-20"`. Passing that straight back to a write got:
+ *
+ *     No node with id -20 in the current graph — and it is not in any other scope
+ *     either (searched the root graph and 4 subgraph(s)). The id may be from a
+ *     different workflow, or the node was removed. Re-read with panel_graph_outline
+ *     before retrying.
+ *
+ * Every clause after the first is false. The id did not come from another workflow;
+ * it came from THIS graph, from our own read, one call earlier. Nothing was removed.
+ * And the remedy sends the caller to re-read a surface that will hand back the very
+ * same id — the loop the reporter actually ran.
+ *
+ * This is the #697 mistake in a new place: the reads and the writes ask different
+ * questions, and the failure described only the write's answer. There the missing
+ * axis was SCOPE; here it is KIND. A rail is a real, addressable thing — `move_rail`
+ * and `panel_move_node` both take exactly this id (#302) — so "no such node" is not
+ * even true of the panel's own tool surface.
+ *
+ * WHAT IS AND IS NOT CLAIMED. It says what the id is, that this operation works on
+ * ordinary nodes, and what does work today. It does NOT promise a removal path,
+ * because there is none: `expose_subgraph_input`/`expose_subgraph_output`/`move_rail`
+ * exist and no unexpose does. Naming the invasive workaround is honest; inventing a
+ * tool name would send the caller to a command that does not exist.
+ *
+ * @param {number|string} nodeId
+ * @param {"input"|"output"} rail
+ */
+export function describeRailNodeTarget(nodeId, rail) {
+  const side = rail === "input" ? "INPUT" : "OUTPUT";
+  return (
+    `Id ${nodeId} resolves to this subgraph's ${side} BOUNDARY RAIL in the graph you ` +
+    `are viewing — the pseudo-node panel_query_graph reports as ` +
+    `rails.${rail}.rail_node_id. It is not an ordinary node, and this operation acts ` +
+    `on ordinary graph nodes and their links, which is why it cannot take it. ` +
+    `panel_move_node DOES accept a rail id, but only to reposition it (pos only — a ` +
+    `rail has nothing else to set); panel_move_rail addresses the same rail by SIDE ` +
+    `("${rail}") rather than by id. ` +
+    `There is currently NO unexpose/remove-boundary operation: expose_subgraph_input, ` +
+    `expose_subgraph_output and panel_move_rail are the whole boundary surface. To ` +
+    `REMOVE an exposed slot today, remove or replace the interior node feeding it and ` +
+    `the boundary slot is cleaned up automatically. ` +
+    // The one thing this CANNOT rule out, stated rather than glossed over: node ids
+    // are arbitrary integers, so an ordinary node may once have held this id and been
+    // removed. Then the id really is stale and re-reading is right — which is why the
+    // message says what resolved, not "your id is fine".
+    `(If you meant an ORDINARY node with this id, there is none in the graph you are ` +
+    `viewing. A removed node's id can collide with a rail's, so re-read ` +
+    `panel_graph_outline if that is your case — but an id taken from ` +
+    `rails.${rail}.rail_node_id is not.)`
+  );
+}

@@ -12,6 +12,7 @@ import {
   unavailableRequiredCustomWidgetTypes,
   unavailableRequiredWidgetMessage,
   unavailableRequiredWidgetReport,
+  unavailableEntriesLiveNodeCannotExplain,
 } from "../../web/js/lib/node-widget-materialization.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -523,14 +524,17 @@ test("#626: graph_add_node actually CONSUMES the reconciliation and discloses it
   assert.match(src, /applyCurrentDefWidgetValues,/, "imported");
   assert.match(
     src,
-    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef\);/,
+    // The optional third arg is #1369's rejected-corrections out-param. Kept optional
+    // here so this pins the WIRING — called on the created node with the CURRENT def —
+    // rather than an argument count, which is what made it fail on an unrelated change.
+    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef(, correctionOut)?\);/,
     "called on the created node with the CURRENT def",
   );
   assert.match(src, /added\.schema_value_corrections = valueCorrections;/, "disclosed on the result");
   // …and it must run BEFORE the node is added to the graph, or the graph briefly holds
   // the stale value and an undo step captures it.
   assert.ok(
-    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);") <
+    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef") <
       src.indexOf("      graph.add(node);"),
     "reconciliation must precede graph.add",
   );
@@ -704,23 +708,251 @@ test("#695: a union registered under its own key in the widget registry is a wid
   assert.deepEqual(unavailableRequiredWidgetReport(def, { "IMAGE,MASK": () => {} }, new Set(), def), []);
 });
 
-test("#695: a union with ONE unproven member still fails closed", () => {
-  // SaveGaussianSplat.model_3d = FILE_3D_SPLAT_ANY,FILE_3D_PLY,… — proving some members
-  // is not proving the type, so the guard is not weakened into "any member counts".
-  const def = { input: { required: { model_3d: ["FILE_3D_SPLAT_ANY,FILE_3D_PLY", {}] } } };
+test("#695/#1062: a socket-shaped union hiding an unproven CUSTOM member stays blocked", () => {
+  // Recast (codex) to state the invariant this protects, rather than an incidental reading
+  // of a file-format union — which is what made #1062 look like an oversight when it is an
+  // intentional false negative.
+  //
+  // THE INVARIANT: a proven socket member must not LAUNDER an unregistered,
+  // output-unproven custom member into an accepted node. An EMPTY config makes it concrete,
+  // because `{}` counts as socket-shaped — so `socketDeclared` contains the union and the
+  // input-level bar cannot catch it. Only requiring EVERY member to be proven does.
+  //
+  // This is why #1062's one-word `every` -> `some` is unsafe: `MESH` alone would admit the
+  // node below and silently skip a widget that never registered (#580's false accept).
+  const custom = { input: { required: { thing: ["MESH,ZIPN_STYLE_GALLERY", {}] } } };
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["FILE_3D_SPLAT_ANY"]), def),
-    ["FILE_3D_SPLAT_ANY,FILE_3D_PLY"],
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["MESH"]), custom),
+    ["MESH,ZIPN_STYLE_GALLERY"],
+    "a proven MESH does not vouch for an unregistered custom member",
   );
+  // Either proof clears it: a constructor registered under the exact union key...
   assert.deepEqual(
     unavailableRequiredCustomWidgetTypes(
-      def,
-      {},
-      new Set(["FILE_3D_SPLAT_ANY", "FILE_3D_PLY"]),
-      def,
+      custom,
+      { "MESH,ZIPN_STYLE_GALLERY": () => {} },
+      new Set(["MESH"]),
+      custom,
     ),
     [],
   );
+  // ...or output proof for EVERY member.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["MESH", "ZIPN_STYLE_GALLERY"]), custom),
+    [],
+  );
+});
+
+test("#695: a union with ONE unproven member still fails closed", () => {
+  // Proving SOME members is not proving the type, so the guard is not weakened into "any
+  // member counts". #1062 re-targeted the EXAMPLE without touching the RULE: this used to
+  // use SaveGaussianSplat's ("FILE_3D_SPLAT_ANY,FILE_3D_PLY"), and both of those are now
+  // proven core 3D file datatypes — so the pair no longer demonstrates an unproven member.
+  // The quantifier under test is unchanged; only a genuinely unproven member can show it.
+  const def = { input: { required: { model_3d: ["ACME_SPLAT_ANY,ACME_PLY", {}] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(["ACME_SPLAT_ANY"]), def), [
+    "ACME_SPLAT_ANY,ACME_PLY",
+  ]);
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["ACME_SPLAT_ANY", "ACME_PLY"]), def),
+    [],
+  );
+});
+
+test("#1062: core SaveGLB is addable — a 3D file union names formats nothing installed OUTPUTS", () => {
+  // The reported dead end, with the declaration read verbatim from a live ComfyUI
+  // /object_info. SaveGLB is the only core node that writes a .glb, so while this failed,
+  // no image-to-3D or text-to-3D graph could be built with panel tools at all.
+  //
+  // Only MESH is passed as output-proven here, and that is the real measurement rather
+  // than a convenience: on a live 4183-node install, seven of these members are emitted by
+  // some node and seven (GLTF, STL, USDZ, PLY, SPLAT, SPZ, KSPLAT) are emitted by nothing.
+  // The union is a list of formats ComfyUI can WRITE, not a list of things it produces.
+  const saveGlb = {
+    input: {
+      required: {
+        mesh: [
+          "MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,FILE_3D_USDZ," +
+            "FILE_3D_PLY,FILE_3D_SPLAT,FILE_3D_SPZ,FILE_3D_KSPLAT,FILE_3D_SPLAT_ANY," +
+            "FILE_3D_POINT_CLOUD_ANY,FILE_3D",
+          { tooltip: "Mesh or 3D file to save" },
+        ],
+        filename_prefix: ["STRING", { default: "3d/ComfyUI", multiline: false }],
+      },
+    },
+  };
+  // `filename_prefix` is an ordinary STRING widget, so the live frontend's own constructor
+  // is supplied for it — that is what the real call site passes. Leaving it out would make
+  // this a test about STRING registration rather than about the union.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(saveGlb, { STRING: () => {} }, new Set(["MESH"]), saveGlb),
+    [],
+    "SaveGLB is addable without waiting for a widget that never registers",
+  );
+  // The union is what was blocking: with the SAME registry, an unproven CUSTOM member in
+  // its place still fails closed, so this is not passing because the registry got richer.
+  const custom = {
+    input: {
+      required: {
+        mesh: ["MESH,ZIPN_STYLE_GALLERY", { tooltip: "x" }],
+        filename_prefix: ["STRING", { default: "3d/ComfyUI", multiline: false }],
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, { STRING: () => {} }, new Set(["MESH"]), custom),
+    ["MESH,ZIPN_STYLE_GALLERY"],
+  );
+});
+
+test("#1062 #580 INTACT: the 3D waiver is a CLOSED list, not a FILE_3D_* prefix", () => {
+  // The whole risk of this fix is laundering: `FILE_3D_*` is NOT a reserved namespace the
+  // way `COMFY_*_V3` is, so a pack can invent one. A prefix rule would admit it and skip a
+  // widget that never registered — the exact #580 false accept the `every` quantifier
+  // exists to prevent. An invented member must therefore still block, even sitting beside
+  // a core sibling and a proven MESH.
+  const acme = { input: { required: { thing: ["MESH,FILE_3D_GLB,FILE_3D_ACME", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(acme, {}, new Set(["MESH"]), acme),
+    ["MESH,FILE_3D_GLB,FILE_3D_ACME"],
+    "an invented FILE_3D_ACME is not vouched for by its core-looking neighbours",
+  );
+  // Output proof still clears it, exactly as for any other custom datatype.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(acme, {}, new Set(["MESH", "FILE_3D_ACME"]), acme),
+    [],
+  );
+});
+
+test("#1062 #580 (codex): a bare `widgetType` is a WIDGET declaration, not a socket", () => {
+  // The false accept codex found. `widgetType` was missing from WIDGET_VALUE_CONFIG_KEYS,
+  // so an input declaring ONLY it — no default, no range — counted as socket-shaped. That
+  // was inert while an unproduced datatype could never clear `linkProven`; adding the
+  // core-3D proof removed that accidental second lock. Without this, the node below is
+  // added as a socket while genuinely being a STRING widget: neither value nor link.
+  // A NON-primitive hint needs a constructor no core frontend provides, and is the case
+  // that must fail closed. This is the actual false accept: without `widgetType` in the
+  // key list it was socket-shaped and waived as a link.
+  const custom = { input: { required: { mesh: ["FILE_3D_GLTF", { widgetType: "ACME_GALLERY" }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, {}, new Set(), custom),
+    ["FILE_3D_GLTF"],
+    "an input naming a CUSTOM widget it renders as is not a socket",
+  );
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(custom, { FILE_3D_GLTF: () => {} }, new Set(), custom),
+    [],
+    "its own constructor still clears it, like any other widget",
+  );
+  // The same hint on a UNION is a widget too — the #788 ruling, now enforced by the key
+  // list rather than by that union happening to also carry `default`.
+  const union = {
+    input: { required: { mesh: ["MESH,FILE_3D_GLB", { widgetType: "ACME_GALLERY" }] } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(union, {}, new Set(["MESH"]), union), [
+    "MESH,FILE_3D_GLB",
+  ]);
+});
+
+test("#1062 (codex re-review): a PRIMITIVE `widgetType` hint resolves natively — never refused", () => {
+  // The over-correction the first fix introduced, caught on re-review. ComfyUI resolves
+  // `widgetType ?? type`, so this renders a NATIVE STRING widget. Nothing registers a
+  // constructor for FILE_3D_GLTF and nothing ever will, so refusing it waits on evidence
+  // that cannot arrive (#796) — the same failure #788 fixed, read off the hint instead of
+  // off the declared type.
+  const native = { input: { required: { mesh: ["FILE_3D_GLTF", { widgetType: "STRING" }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(native, {}, new Set(), native),
+    [],
+    "a native primitive widget needs no registration",
+  );
+  // Independent of the declared type entirely — an unproven CUSTOM type with a primitive
+  // hint resolves the same way, because the hint is the half that wins.
+  const acme = { input: { required: { thing: ["ZIPN_STYLE_GALLERY", { widgetType: "INT" }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(acme, {}, new Set(), acme), []);
+  // "Every, not some": a sibling input on the same type that needs a REAL constructor is
+  // not waived by its native-hinted neighbour.
+  const mixed = {
+    input: {
+      required: {
+        a: ["ZIPN_STYLE_GALLERY", { widgetType: "INT" }],
+        b: ["ZIPN_STYLE_GALLERY", { default: "none" }],
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(mixed, {}, new Set(), mixed), [
+    "ZIPN_STYLE_GALLERY",
+  ]);
+});
+
+test("#1062 (codex): the native-widget waiver takes the EXACT primitive spelling only", () => {
+  // The waiver is a claim that ComfyUI will resolve `widgetType` to a native widget, and
+  // ComfyUI looks that name up verbatim. `"string"` is not `"STRING"`, so waiving it would
+  // grant the waiver to a name that resolves to nothing — the same laundering the core-3D
+  // set is exact to avoid. Every one of these must stay refused.
+  const refused = [
+    { widgetType: "string" },
+    { widgetType: " STRING " },
+    { widgetType: "Int" },
+    { widgetType: "ACME_GALLERY" },
+    { widgetType: null },
+    { widgetType: 42 },
+    { widgetType: ["STRING"] },
+    { widgetType: { type: "STRING" } },
+    {},
+  ];
+  for (const config of refused) {
+    const def = { input: { required: { thing: ["ZIPN_STYLE_GALLERY", config] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+      ["ZIPN_STYLE_GALLERY"],
+      `widgetType ${JSON.stringify(config.widgetType)} must not be waived as native`,
+    );
+  }
+  // Only the exact spellings resolve.
+  for (const widgetType of ["STRING", "INT", "FLOAT", "BOOLEAN"]) {
+    const def = { input: { required: { thing: ["ZIPN_STYLE_GALLERY", { widgetType }] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+      [],
+      `widgetType "${widgetType}" resolves natively`,
+    );
+  }
+});
+
+test("#1062 #580 (codex): the core-3D set matches the DECLARED SPELLING, not a normalised one", () => {
+  // The other bypass. Every registry in this module keys on the spelling as declared — the
+  // widget-constructor lookup and knownSocketTypes both do — so a lower-case or
+  // space-padded name is a DIFFERENT identifier, and a custom type is free to use one.
+  // Normalising inside the core-3D check would have laundered exactly those.
+  const lower = { input: { required: { mesh: ["file_3d_gltf", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(lower, {}, new Set(), lower),
+    ["file_3d_gltf"],
+    "a lower-case custom type is not the core datatype",
+  );
+  const padded = { input: { required: { mesh: [" FILE_3D_GLTF ", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(padded, {}, new Set(), padded),
+    [" FILE_3D_GLTF "],
+    "a single (non-union) type is not trimmed by declaredTypeMembers, so it stays distinct",
+  );
+  // Sanity: the exact core spelling IS matched, so this is a spelling rule and not a
+  // regression that disabled the waiver.
+  const exact = { input: { required: { mesh: ["FILE_3D_GLTF", {}] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(exact, {}, new Set(), exact), []);
+});
+
+test("#1062: a core 3D file input declaring a WIDGET value still waits for its constructor", () => {
+  // The type-level waiver never overrides the input-level bar. A declaration carrying
+  // widget-value keys is a widget that ACCEPTS those links, not a socket — the same ruling
+  // #626/#788 reached for ("FLOAT,INT", {widgetType, default, …}).
+  const widgetish = {
+    input: { required: { mesh: ["MESH,FILE_3D_GLB", { default: "none", options: ["none"] }] } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(widgetish, {}, new Set(["MESH"]), widgetish), [
+    "MESH,FILE_3D_GLB",
+  ]);
 });
 
 test("#695: the report names the stuck INPUT and which of the two causes it is", () => {
@@ -781,18 +1013,33 @@ test("#695: graph_add_node consumes the report and message, and names the class"
   );
   assert.match(
     src,
-    /unavailableRequiredWidgetReport\(nodeData, comfyApp\?\.widgets, knownSocketTypes, currentDef\)/,
+    /unavailableRequiredWidgetReport\(nodeData, comfyApp\?\.widgets, socketTypes, currentDef\)/,
     "the poll checks the report",
   );
   assert.match(
     src,
-    /unavailableRequiredWidgetMessage\(unavailable, classType, Date\.now\(\) - startedAt\)/,
-    "the refusal is built from the report, with the elapsed wait",
+    // #1180 — monotonicNow, not Date.now. `startedAt` is read from the monotonic clock, so
+    // subtracting a wall-clock reading from it reports an elapsed wait of roughly 1.7e12 ms.
+    /unavailableRequiredWidgetMessage\(unavailable, classType, monotonicNow\(\) - startedAt\)/,
+    "the refusal is built from the report, with the elapsed wait — measured on ONE clock",
   );
   assert.match(
     src,
-    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*\)/,
-    "the class_type reaches the message",
+    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*widenSocketProof,/,
+    "the class_type reaches the message, and #821's widen reaches the guard",
+  );
+  // #636 — the live-canvas evidence must reach it too, or the refusal it exists to
+  // convert stays permanent on a backend that never outputs the datatype.
+  assert.match(src, /unavailableEntriesLiveNodeCannotExplain,/, "imported");
+  assert.match(
+    src,
+    /unavailableEntriesLiveNodeCannotExplain\(unavailable, live\)/,
+    "the guard consults the live node before refusing",
+  );
+  assert.match(
+    src,
+    /nodes\.find\(\(n\) => n\?\.type === cls\)/,
+    "and the caller supplies a resolver that finds a node of the SAME class",
   );
 });
 
@@ -973,4 +1220,98 @@ test("#686 a registered constructor still wins — the waiver never shadows a re
     unavailableRequiredCustomWidgetTypes(def, { ...REGISTERED, [AUTOGROW]: () => {} }, undefined, def),
     [],
   );
+});
+
+// ── #636: the canvas as evidence of last resort ────────────────────────────
+//
+// `SaveVideo` was refused with 'Required custom widget "VIDEO" have not registered' on a
+// canvas that already held a WORKING SaveVideo. Reproduced exactly, at this level: with
+// nothing in the backend outputting VIDEO, `video: ["VIDEO"]` is socket-shaped but not
+// link-proven, so it fails closed — and no retry can clear it, because every input to
+// that decision is a snapshot.
+//
+// (The OTHER half of that node, `codec: COMFY_DYNAMICCOMBO_V3`, was already waived by
+// #686. Verified against a live ComfyUI: SaveVideo adds fine where something outputs
+// VIDEO, which is why this only reproduces on the reporter's shape.)
+
+const SAVE_VIDEO_DEF = {
+  input: {
+    required: {
+      video: ["VIDEO"],
+      filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+      format: ["COMBO", { options: ["auto"] }],
+      codec: ["COMFY_DYNAMICCOMBO_V3", { options: [] }],
+    },
+  },
+};
+const BASIC_WIDGETS = { STRING: () => {}, COMBO: () => {} };
+
+test("#636: VIDEO fails closed only where nothing outputs it", () => {
+  const report = (known) =>
+    unavailableRequiredWidgetReport(null, BASIC_WIDGETS, known, SAVE_VIDEO_DEF);
+  assert.deepEqual(report(new Set(["VIDEO"])), [], "output-proven ⇒ addable (a normal install)");
+  const refused = report(new Set());
+  assert.equal(refused.length, 1, "the reporter's backend refuses");
+  assert.equal(refused[0].type, "VIDEO");
+  assert.deepEqual(refused[0].inputs, ["video"]);
+});
+
+test("#636: a live node of the class explains an input that materialised as a SLOT", () => {
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), SAVE_VIDEO_DEF);
+  // What ComfyUI actually built here: `video` came out as a link slot, so it is a socket
+  // and there is no constructor to wait for — observed, not inferred.
+  const live = { type: "SaveVideo", inputs: [{ name: "video" }], widgets: [{ name: "filename_prefix" }] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, live), []);
+});
+
+test("#636: a widget on the live node explains it too", () => {
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), SAVE_VIDEO_DEF);
+  const live = { type: "SaveVideo", inputs: [], widgets: [{ name: "video" }] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, live), []);
+});
+
+test("#636: it ADDS evidence — it never lowers the bar", () => {
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), SAVE_VIDEO_DEF);
+  // No live node at all: unchanged, still refused. This is the #580 case.
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, null), refused);
+  // A live node that does NOT account for the input explains nothing.
+  const unrelated = { type: "SaveVideo", inputs: [{ name: "audio" }], widgets: [{ name: "format" }] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, unrelated), refused);
+  // An unreadable node explains nothing.
+  assert.deepEqual(
+    unavailableEntriesLiveNodeCannotExplain(refused, { get widgets() { throw new Error("boom"); } }),
+    refused,
+  );
+});
+
+test("#636: an entry naming NO inputs can never be explained away", () => {
+  // Nothing to check the live node against, so there is nothing it could have observed.
+  // Treating that as explained would waive a type on the mere PRESENCE of a same-class
+  // node, which is the accept-all-unknown shape #580 exists to prevent.
+  const live = { type: "X", inputs: [{ name: "video" }], widgets: [{ name: "video" }] };
+  for (const entry of [{ type: "VIDEO" }, { type: "VIDEO", inputs: [] }, { type: "VIDEO", inputs: null }]) {
+    assert.deepEqual(
+      unavailableEntriesLiveNodeCannotExplain([entry], live),
+      [entry],
+      JSON.stringify(entry),
+    );
+  }
+});
+
+test("#636: EVERY input carrying the type must be accounted for, not just one", () => {
+  // A def can require the same datatype twice. Explaining one occurrence says nothing
+  // about the other — the same rule the socket/widget split is built on.
+  const twice = {
+    input: { required: { video: ["VIDEO"], video_b: ["VIDEO"] } },
+  };
+  const refused = unavailableRequiredWidgetReport(null, BASIC_WIDGETS, new Set(), twice);
+  assert.deepEqual(refused[0].inputs, ["video", "video_b"]);
+  const half = { type: "X", inputs: [{ name: "video" }], widgets: [] };
+  assert.deepEqual(
+    unavailableEntriesLiveNodeCannotExplain(refused, half),
+    refused,
+    "half an explanation is not an explanation",
+  );
+  const both = { type: "X", inputs: [{ name: "video" }, { name: "video_b" }], widgets: [] };
+  assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, both), []);
 });

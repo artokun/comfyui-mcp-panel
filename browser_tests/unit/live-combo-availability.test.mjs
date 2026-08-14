@@ -23,6 +23,7 @@ import {
   comboInputsOf,
   optionsLookLikeFiles,
   comboAvailabilityNote,
+  linkDrivenWidgetNames,
 } from "../../web/js/lib/live-combo-availability.js";
 
 /** An /object_info/<class> body in the verified shape. */
@@ -223,3 +224,79 @@ test("#745 WIRING: get_errors actually calls the scan, inside its budget", async
   assert.match(src, /unavailable_widget_values: liveScan\.unavailable/)
   assert.match(src, /unchecked_nodes: liveScan\.unknown/)
 })
+
+// ---------------------------------------------------------------------------
+// #984 — a widget the graph does not READ must not be judged. When a widget is
+// converted to an input, ComfyUI keeps it in `node.widgets` AND adds an input of
+// the same name; while that input is CONNECTED the queue reads the link and the
+// widget's own `.value` is dead weight, frequently a stale leftover from before
+// the conversion. Verified against a live ComfyUI: converting KSampler's
+// `sampler_name` leaves the widget in `node.widgets` and adds a `sampler_name`
+// input alongside the connection inputs. Judging that value reports an error on a
+// workflow that runs correctly — which mattered once #984 made the scan's findings
+// decide whether get_errors may say "no errors recorded".
+// ---------------------------------------------------------------------------
+
+const inputEntry = (name, link, widgetName) => ({
+  name,
+  link,
+  ...(widgetName ? { widget: { name: widgetName } } : {}),
+});
+
+test("#984 a CONNECTED widget-input's stale value is not judged", async () => {
+  const n = node(1, "KSampler", [{ name: "sampler_name", value: "left_over_from_before" }]);
+  n.inputs = [inputEntry("model", 3), inputEntry("sampler_name", 7, "sampler_name")];
+  const res = await scanComboAvailability([n], async () => SAMPLER);
+  assert.deepEqual(res.unavailable, [], "the link supplies this value — the widget's copy is not used");
+});
+
+test("#984 an UNCONNECTED widget-input is still judged (link: null)", async () => {
+  const n = node(1, "KSampler", [{ name: "sampler_name", value: "not_a_sampler" }]);
+  n.inputs = [inputEntry("sampler_name", null, "sampler_name")];
+  const res = await scanComboAvailability([n], async () => SAMPLER);
+  assert.equal(res.unavailable.length, 1, "nothing drives it, so the widget value is what runs");
+  assert.equal(res.unavailable[0].value, "not_a_sampler");
+});
+
+test("#984 the skip matches by NAME when the input carries no widget back-reference", async () => {
+  const n = node(1, "KSampler", [{ name: "sampler_name", value: "stale" }]);
+  n.inputs = [inputEntry("sampler_name", 12)]; // older frontend shape
+  const res = await scanComboAvailability([n], async () => SAMPLER);
+  assert.deepEqual(res.unavailable, []);
+});
+
+test("#984 a connected input never silences a DIFFERENT widget", async () => {
+  const n = node(1, "KSampler", [
+    { name: "sampler_name", value: "not_a_sampler" },
+    { name: "scheduler", value: "normal" },
+  ]);
+  n.inputs = [inputEntry("scheduler", 4, "scheduler")]; // a different widget is linked
+  const res = await scanComboAvailability(
+    [n],
+    async () => classBody("KSampler", { sampler_name: [["euler"], {}], scheduler: [["normal"], {}] }),
+  );
+  assert.equal(res.unavailable.length, 1);
+  assert.equal(res.unavailable[0].widget, "sampler_name", "only the linked widget is exempt");
+});
+
+test("#984 a node with no inputs array, or a malformed one, is judged exactly as before", async () => {
+  const mk = (inputs) => {
+    const n = node(1, "KSampler", [{ name: "sampler_name", value: "not_a_sampler" }]);
+    if (inputs !== undefined) n.inputs = inputs;
+    return n;
+  };
+  for (const inputs of [undefined, null, [], "nope", [null], [{}], [{ name: "sampler_name" }]]) {
+    const res = await scanComboAvailability([mk(inputs)], async () => SAMPLER);
+    assert.equal(res.unavailable.length, 1, `must still judge with inputs=${JSON.stringify(inputs)}`);
+  }
+});
+
+test("#984 linkDrivenWidgetNames reports only CONNECTED inputs", () => {
+  assert.deepEqual(
+    [...linkDrivenWidgetNames({ inputs: [inputEntry("a", 1), inputEntry("b", null), inputEntry("c", 0, "c_w")] })],
+    ["a", "c_w"],
+    "link 0 is a real link id; only null/undefined mean unconnected",
+  );
+  assert.deepEqual([...linkDrivenWidgetNames(null)], []);
+  assert.deepEqual([...linkDrivenWidgetNames({ inputs: {} })], []);
+});

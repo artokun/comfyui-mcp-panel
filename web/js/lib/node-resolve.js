@@ -605,14 +605,28 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * backend-only behaviour.
  */
 export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)", opts = {}) {
-  const { registry, node, wasTypeEverDefined } = opts;
+  const { registry, node, wasTypeEverDefined, describeObjectInfoFailure } = opts;
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
+    // #982 — SAY WHAT HAPPENED, not a disjunction. "the backend is unreachable or the
+    // fetch failed" names two causes and establishes neither, and the reporter went
+    // checking a backend that was answering `/object_info/VAELoader` perfectly well while
+    // reading this. When the oracle recorded what each route actually did, that is
+    // appended; when it recorded nothing, the sentence stays as it was.
+    let observed = "";
+    try {
+      observed = typeof describeObjectInfoFailure === "function" ? describeObjectInfoFailure() || "" : "";
+    } catch {
+      observed = ""; // a diagnostic must never replace the refusal it is describing
+    }
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
-        `ComfyUI backend (object_info is unavailable — the backend is unreachable or the fetch ` +
-        `failed). Refusing to write rather than trust a possibly-stale node cache (#458). ` +
-        `Reconnect ComfyUI and retry.`,
+        `ComfyUI backend — no usable /object_info schema was obtained.${observed} ` +
+        `Refusing to write rather than trust a possibly-stale node cache (#458). ` +
+        `Reconnect ComfyUI and retry. If /object_info answers when you run it by hand, ` +
+        `compare it with what each route above reported — one of them may have answered ` +
+        `without returning a usable schema, which is a different fault from an ` +
+        `unreachable backend (#982).`,
     );
   }
   if (!freshBackendDefinesType(freshDefs, type)) {

@@ -42,6 +42,14 @@ const capped = (v, n) => str(v) && v.length <= n;
 /**
  * Validate + normalize a raw card spec. Returns { ok:true, spec } with defaults
  * applied, or { ok:false, errors:[...] }. Never throws.
+ *
+ * NOT TRANSLATED, deliberately. These read as user-facing because
+ * renderA2UIFailCard puts them on screen, but every one of them names a field of
+ * the A2UI wire schema (`components array is required`, `duplicate id "x"`) and
+ * the audience is whoever is writing the agent that emitted the bad card. They are
+ * also the text a user pastes into a bug report; translating them would mean the
+ * maintainer receives a Korean rendering of a schema violation and cannot grep for
+ * it. The card's own chrome around them (title, "tap to view raw") IS translated.
  */
 export function validateA2UISpec(raw) {
   const errors = [];
@@ -221,6 +229,7 @@ export function validateA2UISpec(raw) {
 // ---------------------------------------------------------------------------
 
 import { mountStandardComponent } from "./cmcp-a2ui-lit-adapter.js";
+import { tr } from "./lib/i18n.js";
 
 export const A2UI_CSS = `
 :root {
@@ -249,41 +258,41 @@ export const A2UI_CSS = `
 }
 .cmcp-a2ui { border: 1px solid var(--p-content-border-color, #3f3f46); border-left: 3px solid var(--p-primary-color, #3a7bd5);
   border-radius: 8px; padding: 0.6rem 0.7rem; margin: 0.35rem 0; background: var(--p-content-background, #1f1f23);
-  font-size: 0.8rem; position: relative; }
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); position: relative; }
 .cmcp-a2ui.resolved { opacity: 0.85; }
-.cmcp-a2ui-title { font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em;
+.cmcp-a2ui-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); text-transform: uppercase; letter-spacing: 0.05em;
   opacity: 0.7; margin-bottom: 0.4rem; padding-right: 1.2rem; }
 .cmcp-a2ui-x { position: absolute; top: 0.35rem; right: 0.4rem; background: none; border: none; cursor: pointer;
-  color: var(--p-text-muted-color, #a1a1aa); font-size: 0.7rem; line-height: 1; padding: 0.15rem; }
+  color: var(--p-text-muted-color, #a1a1aa); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); line-height: 1; padding: 0.15rem; }
 .cmcp-a2ui-x:hover { color: var(--p-text-color, #e4e4e7); }
 .cmcp-a2ui-row { display: flex; flex-direction: row; gap: 0.4rem; flex-wrap: wrap; align-items: flex-start; }
 .cmcp-a2ui-col { display: flex; flex-direction: column; gap: 0.4rem; }
 .cmcp-a2ui-card { border: 1px solid var(--p-content-border-color, #3f3f46); border-radius: 6px; padding: 0.5rem;
   display: flex; flex-direction: column; gap: 0.4rem; background: var(--p-content-hover-background, #26262a); }
 .cmcp-a2ui-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.cmcp-a2ui h1, .cmcp-a2ui h2, .cmcp-a2ui h3 { margin: 0.1rem 0; font-size: 0.95rem; }
-.cmcp-a2ui h1 { font-size: 1.05rem; } .cmcp-a2ui h3 { font-size: 0.85rem; }
+.cmcp-a2ui h1, .cmcp-a2ui h2, .cmcp-a2ui h3 { margin: 0.1rem 0; font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.1692); }
+.cmcp-a2ui h1 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.2923); } .cmcp-a2ui h3 { font-size: calc(var(--cmcp-fs, 0.8125rem) * 1.0462); }
 .cmcp-a2ui hr { border: none; border-top: 1px solid var(--p-content-border-color, #3f3f46); margin: 0.3rem 0; width: 100%; }
 .cmcp-a2ui-btn { display: block; width: 100%; text-align: left; padding: 0.4rem 0.6rem; border-radius: 6px; cursor: pointer;
   border: 1px solid var(--p-content-border-color, #3f3f46); background: var(--p-content-hover-background, #26262a);
-  color: var(--p-text-color, #e4e4e7); font-size: 0.78rem; }
+  color: var(--p-text-color, #e4e4e7); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.96); }
 .cmcp-a2ui-btn:hover:not(:disabled) { border-color: var(--p-primary-color, #3a7bd5); }
 .cmcp-a2ui-btn.primary { background: var(--p-primary-color, #3a7bd5); border-color: transparent; color: #fff; }
 .cmcp-a2ui-btn:disabled { opacity: 0.45; cursor: default; }
 .cmcp-a2ui-btn.chosen { border-color: var(--p-primary-color, #3a7bd5); box-shadow: 0 0 0 1px var(--p-primary-color, #3a7bd5) inset; opacity: 1; }
 .cmcp-a2ui-field { display: flex; flex-direction: column; gap: 0.2rem; }
-.cmcp-a2ui-field > span { font-size: 0.68rem; opacity: 0.75; }
+.cmcp-a2ui-field > span { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8369); opacity: 0.75; }
 .cmcp-a2ui input[type="text"], .cmcp-a2ui select { background: var(--p-form-field-background, #18181b);
   border: 1px solid var(--p-content-border-color, #3f3f46); border-radius: 5px; color: inherit;
-  padding: 0.3rem 0.45rem; font-size: 0.78rem; width: 100%; box-sizing: border-box; }
+  padding: 0.3rem 0.45rem; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.96); width: 100%; box-sizing: border-box; }
 .cmcp-a2ui-check { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }
 .cmcp-a2ui img { max-width: 100%; border-radius: 6px; display: block; }
-.cmcp-a2ui-cap { font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); margin-top: 0.15rem; }
+.cmcp-a2ui-cap { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); color: var(--p-text-muted-color, #a1a1aa); margin-top: 0.15rem; }
 .cmcp-a2ui svg { max-width: 100%; height: auto; display: block; }
 .cmcp-a2ui-fail { border-left-color: var(--p-orange-400, #fb923c); }
-.cmcp-a2ui-fail pre { max-height: 12rem; overflow: auto; font-size: 0.68rem; background: var(--p-form-field-background, #18181b);
+.cmcp-a2ui-fail pre { max-height: 12rem; overflow: auto; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8369); background: var(--p-form-field-background, #18181b);
   border-radius: 5px; padding: 0.4rem; margin: 0.3rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-.cmcp-a2ui-choice { font-weight: 600; margin-top: 0.35rem; color: var(--p-primary-color, #6ea8fe); font-size: 0.75rem; }
+.cmcp-a2ui-choice { font-weight: 600; margin-top: 0.35rem; color: var(--p-primary-color, #6ea8fe); font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231); }
 .cmcp-a2ui-lit-leaf { display: block; width: 100%; }
 .cmcp-a2ui-lit-leaf.chosen { outline: 2px solid var(--p-primary-color, #3a7bd5); outline-offset: 2px; border-radius: 6px; }
 .cmcp-a2ui-lit-leaf.cmcp-a2ui-lit-inert { opacity: 0.55; pointer-events: none; }
@@ -380,7 +389,7 @@ function buildGraphSVG(c) {
 function buildGraphFallbackList(c) {
   const div = document.createElement("div");
   div.className = "cmcp-a2ui-text";
-  div.textContent = "Graph: " + c.nodes.map((n) => n.label).join(" · ");
+  div.textContent = tr("a2ui.graph", "Graph: ") + c.nodes.map((n) => n.label).join(" · ");
   return div;
 }
 
@@ -541,8 +550,23 @@ let _cardSeq = 0;
  * onAction(text): user clicked a button / submitted — send `text` as a visible
  * chat message and mark the card resolved. onDismiss(): user hit ✕.
  */
-export function renderA2UICard(spec, { onAction, onDismiss } = {}) {
-  const cardId = `a2ui-${Date.now().toString(36)}-${++_cardSeq}`;
+export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = {}) {
+  // panel#832 — a caller may supply the id instead of minting one. A repaint that
+  // re-renders an UNRESOLVED record has to come back as the SAME card: the agent is
+  // holding the id it was given at render time, and a fresh id would leave
+  // panel_ui_update failing for a new reason rather than the old one. Minting stays
+  // the default, so every ordinary render is unchanged.
+  const cardId =
+    typeof reuseId === "string" && reuseId
+      ? reuseId
+      : // panel#832 (codex) — `_cardSeq` restarts at 0 on every module load, and an id
+        // REUSED from a persisted record does not advance it. Minting from
+        // Date.now()+counter alone therefore has a path where a fresh id equals one a
+        // repaint has already put back in `liveA2uiCards`, silently overwriting that
+        // entry so an update lands on the wrong card. A random nonce removes the class
+        // rather than narrowing it — the id is an opaque handle, so nothing depends on
+        // it being sequential or on encoding a time.
+        `a2ui-${Date.now().toString(36)}-${++_cardSeq}-${Math.random().toString(36).slice(2, 8)}`;
   const el = document.createElement("div");
   el.className = "cmcp-a2ui";
   el.dataset.cardId = cardId;
@@ -579,7 +603,7 @@ export function renderA2UICard(spec, { onAction, onDismiss } = {}) {
       const x = document.createElement("button");
       x.type = "button";
       x.className = "cmcp-a2ui-x";
-      x.title = "Dismiss";
+      x.title = tr("a2ui.dismiss", "Dismiss");
       x.textContent = "✕";
       x.addEventListener("click", () => {
         if (resolved) return;
@@ -641,11 +665,23 @@ export function renderA2UIFailCard(rawText, errors) {
   el.className = "cmcp-a2ui cmcp-a2ui-fail";
   const t = document.createElement("div");
   t.className = "cmcp-a2ui-title";
-  t.textContent = "Unsupported card";
+  t.textContent = tr("a2ui.unsupported_card", "Unsupported card");
   el.appendChild(t);
   const why = document.createElement("div");
   why.className = "cmcp-a2ui-text";
-  why.textContent = (errors && errors.length ? errors.slice(0, 3).join("; ") : "could not render") + " — tap to view raw";
+  // The validator's own `errors` stay in English on purpose — they name spec fields
+  // ("component.type must be a string"), which is the vocabulary of the JSON below, not
+  // prose. Only the two pieces of chrome around them are translated.
+  //
+  // The reason is a `{reason}` HOLE rather than a fragment concatenated onto a leading
+  // " — ", for two independent reasons. Edge whitespace inside a catalog value is the kind
+  // of thing a translator (or a JSON round-trip) drops silently, and `i18n-check` validates
+  // holes, not whitespace — so the separator lives in the sentence, where losing it is
+  // visible. And the panel ships ar/fa: an RTL sentence does not necessarily put the
+  // affordance AFTER the reason, so interpolating lets the translator order both halves
+  // while concatenating would pin them to English's order.
+  const reason = errors && errors.length ? errors.slice(0, 3).join("; ") : tr("a2ui.could_not_render", "could not render");
+  why.textContent = tr("a2ui.tap_to_view_raw", "{reason} — tap to view raw", { reason });
   why.style.cursor = "pointer";
   const pre = document.createElement("pre");
   pre.textContent = typeof rawText === "string" ? rawText : JSON.stringify(rawText, null, 2);

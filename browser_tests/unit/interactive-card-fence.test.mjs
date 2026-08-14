@@ -32,6 +32,10 @@ import {
   classifyInteractiveCard,
   refusedInteractiveCardError,
 } from "../../web/js/lib/interactive-card-fence.js";
+// #1145 — the shipped onTurn("working") body scopes the mid-task nudge's outage
+// evidence to the turn it starts, so the lifecycle harness below has to supply the
+// real tracker along with the rest of onTurn's closure.
+import { createBridgeOutageTracker } from "../../web/js/lib/session-rebind.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -235,7 +239,10 @@ test("an unknown reason still produces a refusal, never an empty or partial stri
 
 /** Pull one 4-space-indented object-literal method out of the panel source. */
 function extractMethod(name) {
-  const re = new RegExp(`\\n {4}${name}\\(msg\\) \\{[\\s\\S]*?\\n {4}\\},`);
+  // #952 threaded the painting socket id through these callbacks, so they take a second
+  // parameter now. Matched on the NAME and an open paren, so a later parameter cannot
+  // break a guard that is about the fence rather than the signature.
+  const re = new RegExp(`\\n {4}${name}\\(msg[^)]*\\) \\{[\\s\\S]*?\\n {4}\\},`);
   const m = panelSrc.match(re);
   assert.ok(m, `could not locate ${name} in the panel source`);
   return m[0];
@@ -548,7 +555,7 @@ function buildLifecycle() {
     const { classifyInteractiveCard, refusedInteractiveCardError, paintQuestion, paintSecret,
             bumpThinking, noteActivity, lsSet, SECRET_SET_AT_PREFIX, console,
             showThinking, hideThinking, ssSet, MID_TASK_KEY, getGraphCtx, workflowStableUuid,
-            STALE_WORKING_GUARD_MS, now } = deps;
+            STALE_WORKING_GUARD_MS, now, bridgeOutage } = deps;
     let agentWorking = false;
     let liveTurnThreadId = null;
     let lastMintedThreadId = null;
@@ -603,6 +610,11 @@ function buildLifecycle() {
     workflowStableUuid: () => "wf-1",
     STALE_WORKING_GUARD_MS: guardMs,
     now: () => clock,
+    // #1145 — onTurn("working") scopes the mid-task nudge's outage evidence to the turn
+    // it is starting. The REAL tracker, on this harness's clock, so the injected surface
+    // stays the shipped one rather than a stub that would keep passing if the call
+    // changed shape (this section exists to run the shipped lifecycle, not a copy of it).
+    bridgeOutage: createBridgeOutageTracker({ now: () => clock }),
   });
   return { ...built, painted, tick: (ms) => { clock += ms; }, at: () => clock };
 }
