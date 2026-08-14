@@ -315,8 +315,18 @@ function buildEntry(ver, range, highlights = "") {
   // dangerous: an upstream issue number that happens to equal an unrelated panel PR number
   // would suppress that PR's commit from the auto body, silently dropping shipped work.
   //
-  // Cross-namespace dedupe is not solvable by number. The duplication it was reaching for is
-  // prevented by the post-write assertion at the bottom of this file instead.
+  // Cross-namespace dedupe is not solvable by number, and NOTHING here replaces it. An
+  // earlier version of this comment pointed at "the post-write assertion at the bottom of
+  // this file" — an assertion that was removed in the same change as unreachable, so the
+  // comment claimed a protection that did not exist.
+  //
+  // Stated accurately: a highlight citing `comfyui-mcp#1478` and a commit carrying panel PR
+  // `#1211` for the same change will BOTH be listed, as two bullets in one section.
+  // `changelog-integrity.test.mjs` catches duplicate version HEADINGS; it does not compare
+  // bullet text, so this particular redundancy is unguarded and is caught only by a human
+  // reading the release notes. That is a smaller problem than the duplicate sections this
+  // issue was about — a reader sees one release saying a thing twice, not two releases — and
+  // fixing it needs an identifier map the repo does not have.
   const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
   const commits = parseCommits(range);
   const auto = autoBody(commits, covered);
