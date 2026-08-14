@@ -78,7 +78,16 @@ import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
-import { describeUploadFailure, attachmentSummaryLine } from "./lib/attachment-upload.js";
+import {
+  describeUploadFailure,
+  describeUploadTimeout,
+  describeTimedOutUpload,
+  attachmentSummaryLine,
+  boundedUpload,
+  readFileFacts,
+  readErrorBody,
+  UPLOAD_NO_ANSWER,
+} from "./lib/attachment-upload.js";
 import {
   buildInstallRequest,
   classifyInstallOutcome,
@@ -1464,6 +1473,60 @@ let cmcpOauthOnBackendsPush = null;
 function cmcpApiBase() {
   return `${cmcpConsoleUrl}/api/secrets?token=${encodeURIComponent(cmcpConsoleToken)}`;
 }
+
+/**
+ * #1188 — how long a credentials-console request may take before it gives up.
+ *
+ * Longer than the 2s status probes because this one is a user-initiated write to a
+ * possibly-remote orchestrator console, not a startup nicety: giving up early on a save
+ * that would have succeeded is worse here than waiting a moment longer.
+ */
+const CMCP_SECRETS_TIMEOUT_MS = 8000;
+
+/** Sentinel: this call did not answer, as distinct from anything it could return. */
+const CMCP_SECRETS_NO_ANSWER = Symbol("cmcp-secrets-timeout");
+
+/**
+ * The credentials console's three requests, bounded — headers AND body.
+ *
+ * #1188, same failure as #1161/#1180: after a ComfyUI or orchestrator restart the tab can
+ * hold a half-open connection where a request neither answers nor fails, so there is
+ * nothing for `try/catch` to catch. Here that wedges the UI rather than a command — the
+ * button stays disabled reading "Saving…" or "Clearing…" forever, and because the panel
+ * only re-enables it in the catch, the user cannot even retry without reopening the frame.
+ *
+ * BOTH HALVES, because `fetch` resolves as soon as the response head arrives and the bytes
+ * stream afterwards inside `json()`. Bounding the request alone leaves the part that
+ * actually waits unbounded — exactly what shipped in #1180's first attempt at the log read.
+ *
+ * Rejects on timeout rather than resolving a sentinel, so it lands in the SAME catch that
+ * already handles a failed save: the error is shown and the button is re-enabled. No new
+ * branch, and no new catalog string for a frozen catalog (#1135).
+ *
+ * @returns {Promise<any>} the parsed body
+ */
+async function cmcpSecretsRequest(init) {
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(async () => {
+        const resp = await (init ? fetch(cmcpApiBase(), init) : fetch(cmcpApiBase()));
+        return { resp, body: await resp.json() };
+      })
+      .then((value) => ({ value }), (err) => ({ err })),
+    CMCP_SECRETS_TIMEOUT_MS,
+    () => CMCP_SECRETS_NO_ANSWER,
+  );
+  if (settled === CMCP_SECRETS_NO_ANSWER) {
+    // NOT a `tr()` key. The English catalog is frozen (#1135) and English is GENERATED from
+    // the code, so a new key here means a pass over eleven locale files. This message goes
+    // through `showErr`, which already renders the orchestrator's own untranslated `d.error`
+    // text the same way — so an English sentence here is consistent with what that path
+    // shows today rather than a regression in coverage.
+    throw new Error("The credentials console did not respond — check that the orchestrator is still running, then try again.");
+  }
+  if ("err" in settled) throw settled.err;
+  return settled.value;
+}
 function cmcpOpenCredentialsFrame(client) {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
     alert(tr("panel.connect_the_panel_first_the_credentials_console", "Connect the panel first — the credentials console isn't available yet."));
@@ -1523,11 +1586,10 @@ function cmcpOpenCredentialsFrame(client) {
       showErr("");
       btn.disabled = true; btn.textContent = tr("panel.saving", "Saving…");
       try {
-        const resp = await fetch(cmcpApiBase(), {
+        const { resp, body: d } = await cmcpSecretsRequest({
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, value }),
         });
-        const d = await resp.json();
         // `d.error` is the orchestrator's own (English) reason; only OUR fallback is ours to
         // translate — the server text is passed through untouched, as it always has been.
         if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.save_failed", "save failed"));
@@ -1553,11 +1615,10 @@ function cmcpOpenCredentialsFrame(client) {
       showErr("");
       clearBtn.disabled = true; clearBtn.textContent = tr("panel.clearing", "Clearing…");
       try {
-        const resp = await fetch(cmcpApiBase(), {
+        const { resp, body: d } = await cmcpSecretsRequest({
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, clear: true }),
         });
-        const d = await resp.json();
         if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.clear_failed", "clear failed"));
         badge.textContent = tr("panel.not_set", "not set");
         input.placeholder = tr("panel.paste_key", "paste key");
@@ -1573,8 +1634,7 @@ function cmcpOpenCredentialsFrame(client) {
 
   (async () => {
     try {
-      const resp = await fetch(cmcpApiBase());
-      const d = await resp.json();
+      const { resp, body: d } = await cmcpSecretsRequest();
       if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.could_not_load", "could not load"));
       list.innerHTML = "";
       for (const s of (d.slots || [])) list.appendChild(row(s));
@@ -28144,10 +28204,27 @@ function buildPanel() {
       const fd = new FormData();
       fd.append("image", blob, name);
       if (type) fd.append("type", type);
-      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-      if (res.status !== 200) return null;
-      const info = await res.json();
-      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
+      // #1188 — bounded, request AND body. On timeout this resolves the sentinel and falls
+      // through to the SAME `null` this function already returns for every other failure,
+      // so no caller learns a new shape.
+      //
+      // FIVE call sites, counted rather than remembered: cmcp-apps-ui.js:1697,
+      // cmcp-civitai-ui.js:1196, cmcp-training-ui.js:754, lib/media-preview.js:893 and
+      // lib/run-completion-frame.js:407. An earlier version of this comment said "all four
+      // already branch on a null ref today" and was wrong on both halves — there were five,
+      // and civitai's did not branch at all: muted it announced a save that never happened,
+      // unmuted it dereferenced `ref.filename`. That is fixed at the site. The claim is only
+      // safe to make BECAUSE it was checked, which is the reason it now names each one.
+      const out = await boundedUpload(
+        async () => {
+          const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+          if (res.status !== 200) return null;
+          const info = await res.json();
+          return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
+        },
+        { size: blob?.size, withTimeout },
+      );
+      return out === UPLOAD_NO_ANSWER ? null : out;
     } catch {
       return null;
     }
@@ -30804,26 +30881,59 @@ function buildPanel() {
       try {
         const fd = new FormData();
         fd.append("image", file, name);
-        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-        if (res.status === 200) {
-          const info = await res.json();
+        // #1188 — read the measurements ONCE, before anything can fail on them. A `size` or
+        // `type` that throws would otherwise throw AGAIN inside the catch that reports it,
+        // escape the handler, and REJECT `att.ready` — which the send path awaits and is
+        // not built to have reject.
+        const { size, mediaType } = readFileFacts(file);
+        // #1188 — bounded, request AND body. Without this a half-open connection after a
+        // ComfyUI restart leaves `att.ready` pending forever. `att.ready` catches
+        // everything internally so it never REJECTS — it simply never settles, and the
+        // composer awaits `Promise.all(pending.map((a) => a.ready))` before sending. The
+        // user is then unable to send the message at all, with nothing on screen saying why.
+        const observed = {};
+        const outcome = await boundedUpload(
+          async () => {
+            const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+            if (res.status === 200) return { info: await res.json() };
+            // #1188 — record the status the INSTANT it is known. The body has its own,
+            // shorter bound, but that bound runs INSIDE the outer one: a head arriving near
+            // the outer deadline with a stalling body would otherwise let the outer bound
+            // report an answered-and-REFUSED upload as "no response".
+            observed.status = res.status;
+            observed.statusText = res.statusText;
+            // #756 — a non-200 had NO else at all. The status was in hand and thrown
+            // away, leaving "upload failed" as the whole of what anyone could learn.
+            // The body gets its OWN shorter bound: a refusal we can already name must not
+            // be downgraded to "no response" just because ComfyUI's explanation stalls.
+            return {
+              failure: describeUploadFailure({
+                status: res.status,
+                statusText: res.statusText,
+                body: (observed.body = await readErrorBody(res, withTimeout)),
+                name,
+                size,
+                mediaType,
+              }),
+            };
+          },
+          { size, withTimeout },
+        );
+        if (outcome === UPLOAD_NO_ANSWER) {
+          att.uploadError = describeTimedOutUpload({ observed, name, size, mediaType });
+        } else if (outcome?.failure) {
+          att.uploadError = outcome.failure;
+        } else {
+          const info = outcome.info;
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
-        } else {
-          // #756 — a non-200 had NO else at all. The status was in hand and thrown
-          // away, leaving "upload failed" as the whole of what anyone could learn.
-          att.uploadError = describeUploadFailure({
-            status: res.status,
-            statusText: res.statusText,
-            body: await res.text().catch(() => null),
-            name,
-            size: file.size,
-            mediaType: file.type,
-          });
         }
       } catch (err) {
-        // #756 — the bare catch swallowed transport failures identically.
-        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
+        // #756 — the bare catch swallowed transport failures identically. The measurements
+        // are re-read defensively here too: this catch also runs for a throw raised BEFORE
+        // readFileFacts, so it cannot assume those locals exist.
+        const facts = readFileFacts(file);
+        att.uploadError = describeUploadFailure({ error: err, name, size: facts.size, mediaType: facts.mediaType });
       }
     })();
     att.ready.then(renderAttachmentChips, () => {}); // refresh once the thumb loads
@@ -30852,26 +30962,58 @@ function buildPanel() {
         const fd = new FormData();
         // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
         fd.append("image", file, name);
-        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-        if (res.status === 200) {
-          const info = await res.json();
+        // #1188 — read the measurements ONCE. Same reason as the image path above: a
+        // throwing `size`/`type` getter would throw again inside the reporting catch and
+        // reject `att.ready`.
+        const { size, mediaType } = readFileFacts(file);
+        // #1188 — bounded, request AND body. This path is the reason the bound is sized by
+        // payload rather than flat: it exists specifically for video, so a fixed number
+        // would either cut off a legitimate large upload or wait absurdly long for a small
+        // one. Same wedge as the image path above — a never-settling `att.ready` blocks the
+        // composer's `Promise.all` on send.
+        const observed = {};
+        const outcome = await boundedUpload(
+          async () => {
+            const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+            if (res.status === 200) return { info: await res.json() };
+            // #1188 — record the status the INSTANT it is known. The body has its own,
+            // shorter bound, but that bound runs INSIDE the outer one: a head arriving near
+            // the outer deadline with a stalling body would otherwise let the outer bound
+            // report an answered-and-REFUSED upload as "no response".
+            observed.status = res.status;
+            observed.statusText = res.statusText;
+            // #756 — a non-200 had NO else at all. The status was in hand and thrown
+            // away, leaving "upload failed" as the whole of what anyone could learn.
+            // The body gets its OWN shorter bound: a refusal we can already name must not
+            // be downgraded to "no response" just because ComfyUI's explanation stalls.
+            return {
+              failure: describeUploadFailure({
+                status: res.status,
+                statusText: res.statusText,
+                body: (observed.body = await readErrorBody(res, withTimeout)),
+                name,
+                size,
+                mediaType,
+              }),
+            };
+          },
+          { size, withTimeout },
+        );
+        if (outcome === UPLOAD_NO_ANSWER) {
+          att.uploadError = describeTimedOutUpload({ observed, name, size, mediaType });
+        } else if (outcome?.failure) {
+          att.uploadError = outcome.failure;
+        } else {
+          const info = outcome.info;
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
           att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
-        } else {
-          // #756 — a non-200 had NO else at all. The status was in hand and thrown
-          // away, leaving "upload failed" as the whole of what anyone could learn.
-          att.uploadError = describeUploadFailure({
-            status: res.status,
-            statusText: res.statusText,
-            body: await res.text().catch(() => null),
-            name,
-            size: file.size,
-            mediaType: file.type,
-          });
         }
       } catch (err) {
-        // #756 — the bare catch swallowed transport failures identically.
-        att.uploadError = describeUploadFailure({ error: err, name, size: file.size, mediaType: file.type });
+        // #756 — the bare catch swallowed transport failures identically. The measurements
+        // are re-read defensively here too: this catch also runs for a throw raised BEFORE
+        // readFileFacts, so it cannot assume those locals exist.
+        const facts = readFileFacts(file);
+        att.uploadError = describeUploadFailure({ error: err, name, size: facts.size, mediaType: facts.mediaType });
       }
     })();
   }

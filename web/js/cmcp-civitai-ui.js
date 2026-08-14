@@ -1194,6 +1194,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const blob = await (await fetch(it.fullUrl)).blob();
       const name = `civitai_ref_${it.id}.${it.type === "video" ? "mp4" : "jpeg"}`;
       const ref = await ctx.uploadBlobToInput(blob, name);
+      // #1188 — `uploadBlobToInput` answers null for EVERY failure, and neither branch below
+      // checked. Muted, that announced "Saved {name} to ComfyUI inputs." for an upload that
+      // wrote nothing; unmuted, `ref.filename` threw a TypeError whose message ("Cannot read
+      // properties of null") told the user nothing about the upload. Pre-existing, but #1188
+      // makes null reachable by a new route — a bounded upload that gives up now returns it
+      // where the call previously hung — so the fabricated success is left no wider than it
+      // was found. `close()` is deliberately not called: a failed share leaves the explorer
+      // open to retry, exactly as the catch below does.
+      if (!ref) {
+        toast(tr("civitai_ui.share_failed", "Share failed: {error}", { error: name }));
+        return;
+      }
       if (ctx.isMuted()) {
         toast(tr("civitai_ui.saved_to_comfyui_inputs", "Saved {name} to ComfyUI inputs.", { name }));
       } else {
