@@ -203,7 +203,12 @@ import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
-import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
+import {
+  watchPostReconnectSettle,
+  graphMutationReconnectGate,
+  reconnectRefusalError,
+  readReconnectRefusal,
+} from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
 import {
@@ -9147,7 +9152,7 @@ function revalidateGraphMutationContext(captured) {
     backendDown: comfyBackendSocketDown,
     bindingSettleWindow: postReconnectBindingSettleWindow(),
   });
-  if (reconnectGate) throw new Error(reconnectGate);
+  if (reconnectGate) throw reconnectRefusalError(reconnectGate);
   const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
   if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
     throw new Error(
@@ -18558,7 +18563,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                   backendDown: comfyBackendSocketDown,
                   bindingSettleWindow: postReconnectBindingSettleWindow(),
                 });
-                if (reconnectGate) throw new Error(reconnectGate);
+                if (reconnectGate) throw reconnectRefusalError(reconnectGate);
               }
               const { graph, rootGraph } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
@@ -18646,6 +18651,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
           reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
+          const reconnectRefusal = readReconnectRefusal(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -18653,6 +18659,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // .message) would become the dead literal "[object Object]" on the
             // wire (#276). coerceMessageText extracts .message/.error or JSONs.
             error: coerceMessageText(err?.message ?? err),
+            // #1529 — the trusted side's own statement that the executor never
+            // ran, published as a FIELD. `error` is unchanged, so every existing
+            // reader is unaffected; a reader that wants to retry safely keys on
+            // this instead of matching the sentence, which a genuine mid-write
+            // failure could also contain.
+            //
+            // Via readReconnectRefusal, never `err.cmcpRefusal` directly: the
+            // raw property is inherited and settable, so an error thrown AFTER a
+            // write could carry it and be retried into a duplicate node. The
+            // reader answers the stronger question — did the gate mint this,
+            // pre-executor? — and returns a freshly built object.
+            ...(reconnectRefusal ? { refusal: reconnectRefusal } : {}),
           };
         }
         // Settle the rid ledger BEFORE the dead-socket drop below (#517): even
