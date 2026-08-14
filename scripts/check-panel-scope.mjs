@@ -35,6 +35,7 @@
  * is not a typing gate and untyped JS stays untyped.
  */
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -52,12 +53,38 @@ const IGNORED_PATH = /[\\/]vendor[\\/]/;
 
 const ENTRIES = ['web/js/comfyui-mcp-panel.js'];
 
+/**
+ * The checker must be RUNNABLE, and its absence must be loud.
+ *
+ * This gate lived on a `catch` that harvests tsc's diagnostics — because tsc exits non-zero
+ * whenever it emits any, which for this file is always. A tsc that could not START lands in
+ * the same catch with empty stdout, produces zero findings, and prints OK. So in any
+ * checkout without `node_modules/typescript` — a fresh git worktree, most obviously — the
+ * gate reported "every name resolves" while checking nothing.
+ *
+ * Found by probing it with a name I knew was undefined: it passed. CI, which has the
+ * dependency, was failing on a real ReferenceError (`LG`, comfyui-mcp#1582) at the same
+ * time the local run said OK.
+ */
+const TSC = path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
+if (!existsSync(TSC)) {
+  console.error(
+    `[check-panel-scope] CANNOT RUN — TypeScript is not installed at ${TSC}.\n\n` +
+      'This gate is the only thing that catches a name resolving in a sibling function ' +
+      'instead of this one, which throws ReferenceError the moment that line runs. It ' +
+      'used to print OK in this situation, which is worse than not running at all. ' +
+      'Run `npm install` here (a fresh git worktree does not inherit node_modules).',
+  );
+  process.exit(2);
+}
+
 let raw = '';
+let ran = false;
 try {
   execFileSync(
     process.execPath,
     [
-      path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'),
+      TSC,
       '--noEmit', '--allowJs', '--checkJs',
       '--target', 'ES2022', '--module', 'ES2022', '--moduleResolution', 'bundler',
       '--lib', 'ES2022,DOM,DOM.Iterable',
@@ -66,10 +93,25 @@ try {
     ],
     { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
   );
+  ran = true;
 } catch (e) {
   // tsc exits non-zero whenever it emits ANY diagnostic, and this file is full of ordinary
   // untyped-JS complaints. A non-zero exit is expected; the diagnostics are the payload.
   raw = `${e.stdout ?? ''}${e.stderr ?? ''}`;
+  // …but a tsc that never STARTED (ENOENT, EACCES, a corrupt install) lands in this same
+  // catch with nothing to parse. Zero output is not zero findings.
+  if (!raw.trim()) {
+    console.error(
+      `[check-panel-scope] CANNOT RUN — tsc produced no output (${e.code ?? e.message}). ` +
+        'Refusing to report a pass for a check that did not run.',
+    );
+    process.exit(2);
+  }
+  ran = true;
+}
+if (!ran) {
+  console.error('[check-panel-scope] CANNOT RUN — the checker did not execute.');
+  process.exit(2);
 }
 
 const findings = [];

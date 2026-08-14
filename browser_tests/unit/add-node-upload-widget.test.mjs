@@ -225,6 +225,11 @@ function realGraphAddNode(comfy, overrides = {}) {
     awaitObjectInfoHistorySeed: async () => {},
     recordObjectInfoTypes: (defs) => defs,
     objectInfoHistory: { wasTypeEverDefined: () => false },
+    // #1223 — module state in the real file; this rebuilt scope has to name it or the
+    // executor throws ReferenceError. See the #700 tests below for why THIS harness cares:
+    // the payload the add files is the same map registerNodesFromDefs mutates in place.
+    objectInfoSnapshot: { record: () => true, clear: () => {} },
+    backendReconnectEpoch: 0,
     api: { getNodeDefs: async () => backendObjectInfo() },
     refreshComfyNodeDefs: async (defs) => app.registerNodesFromDefs(defs ?? backendObjectInfo()),
     summarizeNode: (node) => ({
