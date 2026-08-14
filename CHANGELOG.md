@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.38] - 2026-08-14
+
+### Fixed
+- translating the error disarmed every ComfyUI-Manager fallback (#1230)
+
+
 ## [0.14.37] - 2026-08-14
 
 ### Fixed
