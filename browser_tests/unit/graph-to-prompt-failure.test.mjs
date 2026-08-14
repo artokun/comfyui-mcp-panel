@@ -22,6 +22,7 @@ import {
   unrunnableNodeIds,
   graphToPromptUnusable,
   unserializableGraphRefusal,
+  unresolvedNodeTypes,
 } from "../../web/js/lib/missing-node-preflight.js";
 
 test("#1582 unrunnableNodeIds cannot speak for a result that does not exist", () => {
@@ -139,6 +140,12 @@ async function buildPreflight({ graphToPrompt, nodes = [], registry = {} }) {
     "missingNodeRunRefusal",
     "graphToPromptUnusable",
     "unserializableGraphRefusal",
+    // #1582 review: the block became ROOT-scoped, so the harness has to supply the root
+    // graph and the walker. Not injecting them made the extracted body throw a
+    // ReferenceError that the pre-flight catch swallows — which is exactly the silent
+    // failure this file exists to stop, one layer down.
+    "rootGraph",
+    "unresolvedNodeTypes",
     `return async function preflight() {\n${body}\n};`,
   );
   return factory(
@@ -150,6 +157,8 @@ async function buildPreflight({ graphToPrompt, nodes = [], registry = {} }) {
     mod.missingNodeRunRefusal,
     mod.graphToPromptUnusable,
     mod.unserializableGraphRefusal,
+    { _nodes: nodes },
+    mod.unresolvedNodeTypes,
   );
 }
 
@@ -208,4 +217,119 @@ test("#1582 BEHAVIOUR: the #1460 unrunnable-node refusal still fires", async () 
   assert.match(msg, /^NOT queued:/);
   assert.match(msg, /cannot be executed by the server/);
   assert.match(msg, /GoneNode/);
+});
+
+// ── ROOT SCOPE (review, P1). graphToPrompt serializes the WHOLE workflow, so naming
+//    offenders from the currently VIEWED graph misses a missing pack inside a subgraph —
+//    or at the root while the user is inside one. The first extraction test modelled a
+//    single flat graph and passed despite exactly that scope bug.
+
+test("#1582 unresolved types are collected from NESTED subgraphs", () => {
+  const root = {
+    _nodes: [
+      { id: 1, type: "KSampler" },
+      { id: 2, type: "SubgraphNode", subgraph: { _nodes: [{ id: 3, type: "LCKreaSampler" }] } },
+    ],
+  };
+  const types = unresolvedNodeTypes(root, { KSampler: {}, SubgraphNode: {} });
+  assert.deepEqual(types, ["LCKreaSampler"]);
+});
+
+test("#1582 …and from a subgraph nested inside a subgraph", () => {
+  const root = {
+    _nodes: [
+      {
+        id: 1,
+        type: "SubgraphNode",
+        subgraph: {
+          _nodes: [
+            { id: 2, type: "SubgraphNode", subgraph: { _nodes: [{ id: 3, type: "DeepMissing" }] } },
+          ],
+        },
+      },
+    ],
+  };
+  assert.deepEqual(unresolvedNodeTypes(root, { SubgraphNode: {} }), ["DeepMissing"]);
+});
+
+test("#1582 a CYCLE cannot spin the walk", () => {
+  // A subgraph referencing an ancestor must terminate. Without the seen-set this hangs the
+  // panel at the exact moment it is trying to explain a failure.
+  const root = { _nodes: [{ id: 1, type: "Missing1" }] };
+  root._nodes.push({ id: 2, type: "SubgraphNode", subgraph: root });
+  const types = unresolvedNodeTypes(root, { SubgraphNode: {} });
+  assert.deepEqual(types, ["Missing1"]);
+});
+
+test("#1582 duplicates across subgraphs are reported once", () => {
+  const root = {
+    _nodes: [
+      { id: 1, type: "LCKreaSampler" },
+      { id: 2, type: "SubgraphNode", subgraph: { _nodes: [{ id: 3, type: "LCKreaSampler" }] } },
+    ],
+  };
+  assert.deepEqual(unresolvedNodeTypes(root, { SubgraphNode: {} }), ["LCKreaSampler"]);
+});
+
+test("#1582 a fully-registered workflow yields nothing", () => {
+  const root = {
+    _nodes: [
+      { id: 1, type: "KSampler" },
+      { id: 2, type: "SubgraphNode", subgraph: { _nodes: [{ id: 3, type: "CLIPTextEncode" }] } },
+    ],
+  };
+  assert.deepEqual(unresolvedNodeTypes(root, { KSampler: {}, SubgraphNode: {}, CLIPTextEncode: {} }), []);
+});
+
+test("#1582 junk graphs answer nothing rather than throwing", () => {
+  // This runs while composing a failure message. Throwing here would replace a useful
+  // refusal with a second, unrelated error.
+  for (const junk of [null, undefined, 42, "graph", {}, { _nodes: null }, { _nodes: [null, 7] }]) {
+    assert.deepEqual(unresolvedNodeTypes(junk, {}), [], String(junk));
+  }
+});
+
+test("#1582 BEHAVIOUR: the refusal names a type from a SUBGRAPH", async () => {
+  const preflight = await buildPreflight({
+    graphToPrompt: async () => undefined,
+    nodes: [
+      { id: 1, type: "KSampler" },
+      { id: 2, type: "SubgraphNode", subgraph: { _nodes: [{ id: 3, type: "LCKreaSampler" }] } },
+    ],
+    registry: { KSampler: {}, SubgraphNode: {} },
+  });
+  // The pre-flight reads rootGraph; buildPreflight wires graph as both, so nest there.
+  const msg = await (async () => {
+    try {
+      await preflight();
+      return "__NO_REFUSAL__";
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  })();
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /LCKreaSampler/, "a type that only exists inside a subgraph must be named");
+});
+
+test("#1582 a cycle is visited ONCE, not re-walked to the depth cap", () => {
+  // Termination alone is not the property. The depth cap already guarantees that, so a
+  // missing seen-set does not hang — it re-walks the cycle at every level, which for a wide
+  // graph is combinatorial work while the panel is trying to explain a failure.
+  //
+  // Counted rather than timed: `_nodes` is a getter, so the number of reads IS the number
+  // of visits, and the assertion cannot flake on a slow machine.
+  let reads = 0;
+  const root = {
+    get _nodes() {
+      reads += 1;
+      return nodes;
+    },
+  };
+  const nodes = [
+    { id: 1, type: "Missing1" },
+    { id: 2, type: "SubgraphNode", subgraph: root },
+  ];
+  const types = unresolvedNodeTypes(root, { SubgraphNode: {} });
+  assert.deepEqual(types, ["Missing1"]);
+  assert.equal(reads, 1, `the cyclic graph must be walked once, was walked ${reads} times`);
 });

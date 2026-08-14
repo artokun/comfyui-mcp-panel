@@ -78,6 +78,45 @@ export function graphToPromptUnusable(built) {
 }
 
 /**
+ * #1582 — every node type in the workflow the frontend cannot resolve, ROOT-SCOPED.
+ *
+ * Serialization is root-scoped: `graphToPrompt` walks the whole workflow, including every
+ * nested subgraph, whichever one the user happens to be looking at. Naming the offenders
+ * from the CURRENTLY VIEWED graph therefore misses them whenever the missing pack lives in
+ * a subgraph — or lives at the root while the user is inside one — leaving the generic
+ * refusal on exactly the large workflows this matters most for (review). The reported graph
+ * has 317 nodes.
+ *
+ * Bounded and cycle-safe: a `seen` set over graph objects, so a subgraph that references an
+ * ancestor cannot spin, and a depth cap in case something exotic slips past that.
+ */
+export function unresolvedNodeTypes(rootGraph, registry) {
+  const reg = registry && typeof registry === "object" ? registry : {};
+  const out = new Set();
+  const seen = new Set();
+  const walk = (g, depth) => {
+    if (!g || typeof g !== "object" || depth > 12 || seen.has(g)) return;
+    seen.add(g);
+    // Read each accessor ONCE. `_nodes` can be a getter, and testing it with isArray and
+    // then reading it again invokes that getter twice — harmless here, but it makes "how
+    // many times was this graph visited?" unanswerable, which is the property the cycle
+    // guard is judged on.
+    const own = g._nodes;
+    const alt = own === undefined ? g.nodes : undefined;
+    const nodes = Array.isArray(own) ? own : Array.isArray(alt) ? alt : [];
+    for (const n of nodes) {
+      const type = typeof n?.type === "string" ? n.type : null;
+      if (type && !Object.prototype.hasOwnProperty.call(reg, type)) out.add(type);
+      // A SubgraphNode carries its definition; both shapes appear across frontend versions.
+      walk(n?.subgraph, depth + 1);
+    }
+    for (const sub of Array.isArray(g.subgraphs) ? g.subgraphs : []) walk(sub, depth + 1);
+  };
+  walk(rootGraph, 0);
+  return [...out];
+}
+
+/**
  * The refusal for a graph that could not be serialized at all.
  *
  * Mirrors what the run-to-node path has always said (#556) so the two paths stop giving

@@ -275,6 +275,7 @@ import {
   missingNodeRunRefusal,
   graphToPromptUnusable,
   unserializableGraphRefusal,
+  unresolvedNodeTypes,
 } from "./lib/missing-node-preflight.js";
 import {
   classifyWorkflowRefresh,
@@ -12480,20 +12481,16 @@ const GRAPH_TOOL_EXECUTORS = {
       // their graph. The run-to-node path has always refused this properly (#556); the
       // full-graph path did not.
       if (graphToPromptUnusable(built)) {
-        const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
-        const registry = LG?.registered_node_types ?? {};
-        // Name what the FRONTEND could not resolve. Types only, from the canvas, because
-        // the serialized prompt is what failed to exist — and only unregistered ones, so
-        // a graph that failed to serialize for some other reason reports no cause rather
-        // than a wrong one.
-        const unresolved = [
-          ...new Set(
-            liveNodes
-              .map((n) => (typeof n?.type === "string" ? n.type : null))
-              .filter((t) => t && !Object.prototype.hasOwnProperty.call(registry, t)),
+        // Name what the FRONTEND could not resolve, from the ROOT graph — serialization is
+        // root-scoped, so scanning the currently VIEWED graph would miss a missing pack that
+        // lives in a subgraph, or lives at the root while the user is inside one (review).
+        // Types only, and only unregistered ones: a graph that failed to serialize for some
+        // other reason reports no cause rather than a wrong one.
+        throw new Error(
+          unserializableGraphRefusal(
+            unresolvedNodeTypes(rootGraph ?? graph, LG?.registered_node_types ?? {}),
           ),
-        ];
-        throw new Error(unserializableGraphRefusal(unresolved));
+        );
       }
       const badIds = unrunnableNodeIds(built);
       if (badIds.length) {
