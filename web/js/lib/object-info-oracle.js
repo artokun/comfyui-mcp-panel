@@ -292,10 +292,22 @@ export const TRANSPORT_OUTCOME = Object.freeze({
  * HTTP response, so tagging it ANSWERED_UNUSABLE both disabled the fallback for every
  * proxied install and blamed the backend for a message it never sent (#982's exact defect).
  *
- * 502 and 504 only. 503 is deliberately excluded: ComfyUI itself can serve it, so it is not
- * unambiguously the proxy, and this must not guess.
+ * 504 ONLY, and the exclusions are the whole point:
+ *
+ *   - 502 Bad Gateway is what nginx and Caddy emit IMMEDIATELY when they cannot CONNECT to
+ *     the upstream — a stopped or restarting ComfyUI. That is evidence the process is GONE,
+ *     which is the opposite of the evidence this is looking for. Including it was a real
+ *     defect caught in review: on a frontend whose `getNodeDefs()` swallows its network
+ *     error and returns nothing, a 502 arriving BEFORE the websocket-down event produced an
+ *     all-silent outcome list, and the pre-restart schema would then authorize — and report
+ *     as successful — a write to a type the restart had removed.
+ *   - 503 can be served by ComfyUI itself, so it is not unambiguously the proxy.
+ *
+ * 504 Gateway Timeout is the one that means what this needs: the proxy CONNECTED and the
+ * upstream did not answer within its read timeout. Connected-but-quiet is a running
+ * process, which is the same event as a bare client-side timeout.
  */
-const GATEWAY_STATUSES = Object.freeze([502, 504]);
+const GATEWAY_STATUSES = Object.freeze([504]);
 
 /**
  * Fetch the whole `/object_info` schema, trying the frontend client first and the raw

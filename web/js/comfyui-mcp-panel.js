@@ -11603,11 +11603,20 @@ const GRAPH_TOOL_EXECUTORS = {
       // after a restart-without-reload. Mirrors graph_add_node.
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () => {
-        // #1223 — the epoch BEFORE the read is issued. The burst cache deliberately
-        // RETURNS a result to its waiter even after an invalidation has retired it from
-        // storage, so without this the retired answer could be promoted into a store with
-        // no TTL at all, stamped with whatever epoch happened to be current when it landed.
-        const observedAtEpoch = backendReconnectEpoch;
+        // #1223 — the epoch at which THIS CALL actually fetched, or null if it did not.
+        //
+        // Set INSIDE the loader, which the burst cache runs only on a miss. Capturing it
+        // out here instead was a defect: a CACHE HIT returns a payload fetched up to a TTL
+        // ago, and a reconnect can land in between — the reconnect's own refresh is
+        // payload-less and gets coalesced into any in-flight run, so it never reaches
+        // `objectInfoCache.invalidate()` either. The pre-reconnect schema would then be
+        // stamped with the post-reconnect epoch and retained with no TTL at all, which is
+        // precisely the #458 hole this file promises not to open.
+        //
+        // A JOINED read (another call's in-flight request) leaves this null for the same
+        // reason and is likewise not recorded: this call cannot vouch for when that fetch
+        // was issued. Only the call that actually asked may file the answer as evidence.
+        let observedAtEpoch = null;
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
@@ -11625,6 +11634,9 @@ const GRAPH_TOOL_EXECUTORS = {
           // The OUTCOME rides through the cache, not just the schema (codex): a second
           // concurrent write JOINS this in-flight read and never runs its own loader, so
           // returning bare defs would leave that caller's refusal naming no routes at all.
+          // This body runs ONLY on a cache miss, so this is the moment the request is
+          // issued — the only epoch that can honestly be attributed to the answer.
+          observedAtEpoch = backendReconnectEpoch;
           return fetchWholeObjectInfo({
             getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
             fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
@@ -11634,13 +11646,15 @@ const GRAPH_TOOL_EXECUTORS = {
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
         if (defs) {
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
-          // above), so it is one #1223's fallback may hold. Refused if a reconnect landed
-          // while the read was in flight.
-          objectInfoSnapshot.record(defs, {
-            observedAtEpoch,
-            currentEpoch: backendReconnectEpoch,
-            whole: true,
-          });
+          // above), so it is one #1223's fallback may hold — but ONLY when this call issued
+          // the fetch itself, and only if no reconnect landed while it was in flight.
+          if (observedAtEpoch !== null) {
+            objectInfoSnapshot.record(defs, {
+              observedAtEpoch,
+              currentEpoch: backendReconnectEpoch,
+              whole: true,
+            });
+          }
           return recordObjectInfoTypes(defs);
         }
         // #1223 — the probe produced nothing. If it went SILENT (rather than answering

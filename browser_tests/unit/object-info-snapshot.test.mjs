@@ -185,19 +185,37 @@ test("#1223 a PROXY gateway error is the backend not answering, not the backend 
       })
     ).outcomes.map((o) => o.kind);
 
-  for (const status of [502, 504]) {
+  assert.deepEqual(
+    await kinds(504),
+    [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.NO_ANSWER],
+    "504 Gateway Timeout: the proxy CONNECTED and the upstream did not answer in time",
+  );
+  // 502 is deliberately NOT in the set, and this is the correction review forced. nginx and
+  // Caddy emit it IMMEDIATELY when they cannot CONNECT to a stopped or restarting ComfyUI —
+  // evidence the process is GONE, the opposite of what this licenses on. Counting it as
+  // silence let a pre-restart schema authorize a write to a type the restart removed, on any
+  // frontend whose getNodeDefs swallows its own network error.
+  //
+  // 503 is excluded because ComfyUI itself can serve it, so it is not unambiguously a proxy.
+  for (const status of [502, 503, 500]) {
     assert.deepEqual(
       await kinds(status),
-      [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.NO_ANSWER],
-      `status ${status} is the proxy reporting silence`,
+      [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
+      `status ${status} is an ANSWER, not silence`,
     );
   }
-  // 503 is deliberately NOT in the set: ComfyUI itself can serve it, so it is not
-  // unambiguously the proxy and this must not guess.
-  assert.deepEqual(
-    await kinds(503),
-    [TRANSPORT_OUTCOME.NO_ANSWER, TRANSPORT_OUTCOME.ANSWERED_UNUSABLE],
-    "503 stays an answer — it is not unambiguously a proxy",
+});
+
+test("#1223 a 502 cannot license the fallback even when every other route went quiet", () => {
+  // The exact shape from review: a client that swallows its error and returns nothing, plus
+  // a proxy 502 arriving BEFORE the websocket-down event. Every gate except this one is
+  // satisfied, so the tag is the only thing standing between it and a #458 regression.
+  assert.equal(
+    noBackendAnswerEstablished([
+      { route: "client", kind: TRANSPORT_OUTCOME.NOTHING_RETURNED },
+      { route: "http", kind: TRANSPORT_OUTCOME.ANSWERED_UNUSABLE },
+    ]),
+    false,
   );
 });
 
@@ -474,6 +492,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
      const getFreshObjectInfo = async () => ${body};
      return {
        getFreshObjectInfo,
+       setEpoch: (n) => { backendReconnectEpoch = n; },
        readNote: () => setWidgetSchemaFromSnapshot,
        readIneligibility: () => snapshotIneligibility,
        readFailures: () => oracleFailures,
@@ -517,6 +536,28 @@ test("#1223 SHIPPED: a reconnect DURING the read means the answer is not snapsho
   });
   assert.equal(await o.getFreshObjectInfo(), SCHEMA, "the caller still gets its answer");
   assert.equal(snapshot.peek().held, false, "but it is NOT filed as evidence about the new connection");
+});
+
+test("#1223 SHIPPED: a CACHE HIT is never filed as evidence — it can predate a reconnect", async () => {
+  // The burst cache serves a payload fetched up to a TTL ago. A reconnect can land in
+  // between, and the reconnect's own refresh is payload-less — so it is coalesced into any
+  // in-flight run and never reaches objectInfoCache.invalidate() either. Capturing the
+  // epoch outside the loader stamped that pre-reconnect schema as current and kept it with
+  // no TTL at all. Only the call that ISSUED the fetch may file the answer.
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: { getNodeDefs: async () => SCHEMA }, snapshot, epoch: 5 });
+
+  await o.getFreshObjectInfo();
+  assert.deepEqual(snapshot.peek(), { held: true, epoch: 5 }, "the fetching call files it");
+
+  snapshot.clear(); // what a reconnect does
+  o.setEpoch(6); // ...and the epoch it bumps
+  assert.equal(await o.getFreshObjectInfo(), SCHEMA, "the cache still answers its waiter");
+  assert.equal(
+    snapshot.peek().held,
+    false,
+    "but a payload fetched before the reconnect is not evidence about the connection after it",
+  );
 });
 
 test("#1223 SHIPPED: the reported case — hung probes fall back and disclose", async () => {
