@@ -149,6 +149,8 @@ import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
+  emptyComboListsOnGraph,
+  emptyComboNote,
   refreshComboOptionsFromDefs,
   collectAllGraphs,
   collectMissingNodeTypeReasons,
@@ -1341,6 +1343,28 @@ async function registerComfyNodeDefs(preloadedDefs) {
       verdict.requires_reload = true;
       verdict.stale_placeholders = stale;
       verdict.stale_placeholders_note = stalePlaceholderNote(stale);
+    }
+    // #1172 — DISCLOSE an authoritative list that came back empty.
+    //
+    // Every input `describeNodeDefRefresh` takes is STRUCTURAL — app present, defs obtained,
+    // register ran, combo API present, combo resolved — so `refreshed: true` was a claim
+    // about API calls resolving, not about the definitions being usable. The payload said
+    // `ckpt_name: [[], {…}]` and the panel had it in hand at register and reapply, and
+    // discarded it; the agent then found out at queue time via `Value not in list (… not
+    // in [])`.
+    //
+    // `refreshed` stays TRUE. A server with zero checkpoints is a real answer, and #507/#1133
+    // establish that empty lists are sometimes legitimate — flipping the verdict to false
+    // would re-refuse via the verdict exactly what #1133 deliberately permits via the write
+    // path. Disclosure, not failure.
+    //
+    // Read from `defs`, which is already in hand, and NOT by re-reading widgets after
+    // `app.refreshComboInNodes()` resolves: #1193 wants to stop waiting on that call, and a
+    // disclosure that depended on it would report nothing if it were ever abandoned.
+    const empties = emptyComboListsOnGraph(getGraphCtx().rootGraph, defs);
+    if (empties.length) {
+      verdict.empty_combo_lists = empties;
+      verdict.empty_combo_lists_note = emptyComboNote(empties);
     }
   } catch {
     /* a diagnosis must never turn a successful refresh into a failure */
@@ -9225,7 +9249,18 @@ const GRAPH_TOOL_EXECUTORS = {
           stale_placeholders_note: verdict.stale_placeholders_note,
         }
       : {};
-    if (refreshed) return { ok: true, refreshed: true, ...stale };
+    // #1172 — forwarded through the SAME hole #981 fell into. The `refreshed: true` branch
+    // below returns a fixed object literal, so a field the verdict carries but this whitelist
+    // does not name is silently dropped on exactly the successful path where the disclosure
+    // matters most. Adding the field to the verdict without adding it here would look correct
+    // in every unit test of the verdict and report nothing to the agent.
+    const emptyCombos = verdict != null && typeof verdict === "object" && verdict.empty_combo_lists?.length
+      ? {
+          empty_combo_lists: verdict.empty_combo_lists,
+          empty_combo_lists_note: verdict.empty_combo_lists_note,
+        }
+      : {};
+    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos };
     return {
       ok: true,
       refreshed: false,

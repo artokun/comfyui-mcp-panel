@@ -259,8 +259,16 @@ test("#981 (codex r2) source guard: the disclosure survives the SUCCESS path of 
   // success path the warning existed and no caller could ever see it. Found by tracing
   // the consumers of the verdict, not by reading the producer.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.match(src, /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale \};/, "forwarded on success");
+  // #1172 added a SECOND disclosure that rides the same branch. The hole is the branch's
+  // fixed object literal, so the guard now names every field that must survive it — adding a
+  // third disclosure without extending this line is the same bug again.
+  assert.match(
+    src,
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos \};/,
+    "forwarded on success",
+  );
   assert.match(src, /stale_placeholders_note: verdict\.stale_placeholders_note/, "and the note with it");
+  assert.match(src, /empty_combo_lists_note: verdict\.empty_combo_lists_note/, "…and #1172's note too");
   // `ok` must stay true: the refresh did what it claims, and the reload flag is about
   // the canvas, not about the refresh having failed.
   assert.ok(!/ok: false/.test(src.slice(src.indexOf("async refresh_nodes()"), src.indexOf("graph_serialize()"))),
