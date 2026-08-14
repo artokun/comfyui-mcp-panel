@@ -1463,6 +1463,60 @@ let cmcpOauthOnBackendsPush = null;
 function cmcpApiBase() {
   return `${cmcpConsoleUrl}/api/secrets?token=${encodeURIComponent(cmcpConsoleToken)}`;
 }
+
+/**
+ * #1188 — how long a credentials-console request may take before it gives up.
+ *
+ * Longer than the 2s status probes because this one is a user-initiated write to a
+ * possibly-remote orchestrator console, not a startup nicety: giving up early on a save
+ * that would have succeeded is worse here than waiting a moment longer.
+ */
+const CMCP_SECRETS_TIMEOUT_MS = 8000;
+
+/** Sentinel: this call did not answer, as distinct from anything it could return. */
+const CMCP_SECRETS_NO_ANSWER = Symbol("cmcp-secrets-timeout");
+
+/**
+ * The credentials console's three requests, bounded — headers AND body.
+ *
+ * #1188, same failure as #1161/#1180: after a ComfyUI or orchestrator restart the tab can
+ * hold a half-open connection where a request neither answers nor fails, so there is
+ * nothing for `try/catch` to catch. Here that wedges the UI rather than a command — the
+ * button stays disabled reading "Saving…" or "Clearing…" forever, and because the panel
+ * only re-enables it in the catch, the user cannot even retry without reopening the frame.
+ *
+ * BOTH HALVES, because `fetch` resolves as soon as the response head arrives and the bytes
+ * stream afterwards inside `json()`. Bounding the request alone leaves the part that
+ * actually waits unbounded — exactly what shipped in #1180's first attempt at the log read.
+ *
+ * Rejects on timeout rather than resolving a sentinel, so it lands in the SAME catch that
+ * already handles a failed save: the error is shown and the button is re-enabled. No new
+ * branch, and no new catalog string for a frozen catalog (#1135).
+ *
+ * @returns {Promise<any>} the parsed body
+ */
+async function cmcpSecretsRequest(init) {
+  const settled = await withTimeout(
+    Promise.resolve()
+      .then(async () => {
+        const resp = await (init ? fetch(cmcpApiBase(), init) : fetch(cmcpApiBase()));
+        return { resp, body: await resp.json() };
+      })
+      .then((value) => ({ value }), (err) => ({ err })),
+    CMCP_SECRETS_TIMEOUT_MS,
+    () => CMCP_SECRETS_NO_ANSWER,
+  );
+  if (settled === CMCP_SECRETS_NO_ANSWER) {
+    // NOT a `tr()` key. The English catalog is frozen (#1135) and English is GENERATED from
+    // the code, so a new key here means a pass over eleven locale files. This message goes
+    // through `showErr`, which already renders the orchestrator's own untranslated `d.error`
+    // text the same way — so an English sentence here is consistent with what that path
+    // shows today rather than a regression in coverage.
+    throw new Error("The credentials console did not respond — check that the orchestrator is still running, then try again.");
+  }
+  if ("err" in settled) throw settled.err;
+  return settled.value;
+}
 function cmcpOpenCredentialsFrame(client) {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
     alert(tr("panel.connect_the_panel_first_the_credentials_console", "Connect the panel first — the credentials console isn't available yet."));
@@ -1522,11 +1576,10 @@ function cmcpOpenCredentialsFrame(client) {
       showErr("");
       btn.disabled = true; btn.textContent = tr("panel.saving", "Saving…");
       try {
-        const resp = await fetch(cmcpApiBase(), {
+        const { resp, body: d } = await cmcpSecretsRequest({
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, value }),
         });
-        const d = await resp.json();
         // `d.error` is the orchestrator's own (English) reason; only OUR fallback is ours to
         // translate — the server text is passed through untouched, as it always has been.
         if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.save_failed", "save failed"));
@@ -1552,11 +1605,10 @@ function cmcpOpenCredentialsFrame(client) {
       showErr("");
       clearBtn.disabled = true; clearBtn.textContent = tr("panel.clearing", "Clearing…");
       try {
-        const resp = await fetch(cmcpApiBase(), {
+        const { resp, body: d } = await cmcpSecretsRequest({
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ slot: s.id, clear: true }),
         });
-        const d = await resp.json();
         if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.clear_failed", "clear failed"));
         badge.textContent = tr("panel.not_set", "not set");
         input.placeholder = tr("panel.paste_key", "paste key");
@@ -1572,8 +1624,7 @@ function cmcpOpenCredentialsFrame(client) {
 
   (async () => {
     try {
-      const resp = await fetch(cmcpApiBase());
-      const d = await resp.json();
+      const { resp, body: d } = await cmcpSecretsRequest();
       if (!resp.ok || !d.ok) throw new Error(d.error || tr("panel.could_not_load", "could not load"));
       list.innerHTML = "";
       for (const s of (d.slots || [])) list.appendChild(row(s));
