@@ -95,7 +95,13 @@ test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async (
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
   const at = src.indexOf("const built = await app.graphToPrompt();");
   assert.ok(at > 0, "the pre-flight's graphToPrompt call must still be recognisable");
-  const block = src.slice(at, at + 1800);
+  // Bounded by the pre-flight's OWN catch, not a byte count. A fixed 1800 truncated
+  // `unrunnableNodeIds(built)` the moment the guard's comment grew — which is the third
+  // time today a fixed window in this repo reported missing wiring that was present
+  // (#1472, #1460, here). The block ends where its catch begins; say that instead.
+  const endOfTry = src.indexOf("} catch (err) {", at);
+  assert.ok(endOfTry > at, "the pre-flight try block must still be recognisable");
+  const block = src.slice(at, endOfTry);
   const guard = block.indexOf("graphToPromptUnusable(built)");
   const offenders = block.indexOf("unrunnableNodeIds(built)");
   assert.ok(guard > -1, "the unusable-result guard must exist");
@@ -121,7 +127,7 @@ test("#1582 the refusal keeps the prefix its own catch requires", async () => {
 //    the same real-source extraction pattern manager-dialect.test.mjs uses.
 
 /** Pull the pre-flight try/catch out of the monolith and run it with injected deps. */
-async function buildPreflight({ graphToPrompt, nodes = [], registry = {} }) {
+async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry = {} }) {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
   const marker = src.indexOf("      // Inspect the SERIALIZED prompt");
@@ -146,11 +152,20 @@ async function buildPreflight({ graphToPrompt, nodes = [], registry = {} }) {
     // failure this file exists to stop, one layer down.
     "rootGraph",
     "unresolvedNodeTypes",
+    // The block reads LiteGraph off `window` (`LG` is a local in other functions and is
+    // NOT in scope there — the panel-scope gate caught that). Node has no `window`, so
+    // without this the extracted body throws a ReferenceError that the pre-flight catch
+    // swallows, and the test sees no refusal at all.
+    "window",
     `return async function preflight() {\n${body}\n};`,
   );
+  // The VIEWED graph is deliberately a DIFFERENT object from the root when the caller
+  // supplies one: the pre-flight must read the ROOT (serialization is root-scoped), and a
+  // harness that passes the same object for both cannot tell the two apart — a mutation
+  // swapping rootGraph for graph survived exactly that way.
   return factory(
     { graphToPrompt },
-    { _nodes: nodes },
+    { _nodes: viewedNodes ?? nodes },
     { registered_node_types: registry },
     mod.unrunnableNodeIds,
     mod.describeUnrunnable,
@@ -159,6 +174,7 @@ async function buildPreflight({ graphToPrompt, nodes = [], registry = {} }) {
     mod.unserializableGraphRefusal,
     { _nodes: nodes },
     mod.unresolvedNodeTypes,
+    { LiteGraph: { registered_node_types: registry } },
   );
 }
 
@@ -332,4 +348,21 @@ test("#1582 a cycle is visited ONCE, not re-walked to the depth cap", () => {
   const types = unresolvedNodeTypes(root, { SubgraphNode: {} });
   assert.deepEqual(types, ["Missing1"]);
   assert.equal(reads, 1, `the cyclic graph must be walked once, was walked ${reads} times`);
+});
+
+test("#1582 BEHAVIOUR: the scan reads the ROOT graph, not the one on screen", async () => {
+  // The user is inside a subgraph, so the viewed graph holds nothing interesting. The
+  // missing pack is at the root — and serialization is root-scoped, so it is what broke.
+  const preflight = await buildPreflight({
+    graphToPrompt: async () => undefined,
+    nodes: [{ id: 1, type: "LCKreaSampler" }], // root
+    viewedNodes: [{ id: 9, type: "KSampler" }], // what is on screen
+    registry: { KSampler: {} },
+  });
+  const msg = await preflight().then(
+    () => "__NO_REFUSAL__",
+    (e) => (e instanceof Error ? e.message : String(e)),
+  );
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /LCKreaSampler/, "a root-level missing type must be named while viewing a subgraph");
 });
