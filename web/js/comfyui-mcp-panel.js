@@ -28492,12 +28492,33 @@ function buildPanel() {
     // cancelled/disconnected). It's been evicted from the ledger; surface a
     // one-time "status unknown, safe to requeue" notice so the agent stops waiting.
     onReconcileGiveUp: ({ promptId }) => {
+      // comfyui-mcp#1489 (defect 3) — AN UNCONFIRMABLE RUN IS NOT A FAILED ONE.
+      //
+      // This used to send `kind: "run_error"`, whose own text said the outcome "could
+      // not be confirmed … likely cancelled … safe to requeue" — while the orchestrator
+      // routes any run_error through `injectRunError`, which INTERRUPTS the live turn,
+      // front-queues it, and tells the agent "The user's workflow run just ERRORED …
+      // diagnose it". Cancel a 26-prompt batch and that is 26 interrupts asserting a
+      // failure this panel never observed. #1507 stopped them compounding across turns;
+      // they were still 26 urgent errors for 26 unknowns.
+      //
+      // The correct pattern is the sibling branch above, and its comment already argues
+      // this case: `executed` with a note is the existing NON-URGENT event protocol and
+      // does not claim an output was produced. Interrupted knows the run was cancelled;
+      // give-up knows only that it cannot tell — and "cannot tell" is further from "it
+      // failed", not closer. `run_error` has to keep meaning WE KNOW IT FAILED, or the
+      // agent cannot act on it.
+      //
+      // Everything else this path does is unchanged: the delivery-unconfirmed flag
+      // (#585), the reboot-marker prune, and the one-time surfacing below.
       const sent = client.sendFrame({
         type: "agent_event",
-        kind: "run_error",
-        error:
-          `Render status for prompt ${promptId} could not be confirmed after reconnecting ` +
-          `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
+        kind: "executed",
+        note:
+          `The outcome of your queued run (prompt ${promptId}) could NOT be confirmed after ` +
+          `reconnecting — the server has no history for it, which is what a cancelled or ` +
+          `interrupted run looks like. This is not a reported failure: nothing was observed ` +
+          `going wrong, and no output was produced. Re-queue it if you still need it.`,
       });
       appendSystem(
         tr("panel.render_status_unknown_for_prompt_safe_to", "Render status unknown for prompt {promptId} — safe to requeue.", { promptId }),
