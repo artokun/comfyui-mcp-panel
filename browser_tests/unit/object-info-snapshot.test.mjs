@@ -661,16 +661,18 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   const sites = [...PANEL_SRC.matchAll(/objectInfoSnapshot\.record\(/g)];
   assert.equal(
     sites.length,
-    4,
-    "startup seed, refresh run, set_widget oracle, add_node resolver — add one and justify it here",
+    6,
+    "startup seed, refresh run, set_widget oracle, add_node resolver, get_object_info, " +
+      "remove_widget — every reader that obtains a WHOLE schema files it, and adding one " +
+      "means justifying it here",
   );
   // The add_node site is gated on the panel's own record of WHICH question it asked. A
   // single-class /object_info/<Type> payload reaching the snapshot would make every other
   // type read as absent and the ever-seen gate diagnose the install as removed packs.
   assert.match(
     PANEL_SRC,
-    /if \(freshDefs && !freshDefsAreSingleClass\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
-    "add_node files its payload only when it fetched the WHOLE schema",
+    /if \(freshDefs && !freshDefsAreSingleClass && addNodeObservedAtEpoch !== null\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    "add_node files its payload only when it fetched the WHOLE schema, and only then",
   );
   for (const site of sites) {
     const call = PANEL_SRC.slice(site.index, site.index + 260);

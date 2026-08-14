@@ -9401,10 +9401,25 @@ const GRAPH_TOOL_EXECUTORS = {
   // holds and gets `unchanged: true` with no payload when the TYPE SET still matches.
   // What that does and does not establish is stated in the reply, not implied.
   async graph_get_object_info({ if_none_match } = {}) {
+    // #1223 — the epoch at issuance. This command reads the WHOLE schema and does not go
+    // through the burst cache, so every success here is a first-hand observation of the
+    // connection it was issued on, and there is no cache hit to exclude.
+    const observedAtEpoch = backendReconnectEpoch;
     const { defs, failures } = await fetchWholeObjectInfo({
       getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
       fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
     });
+    // #1223 — file it. A reader that successfully obtains a whole schema and drops it on the
+    // floor leaves the next render-time widget edit refused for want of the very map this
+    // command just read. Recorded BEFORE the fingerprint/if_none_match early-returns below,
+    // so a caller polling with `if_none_match` still keeps the snapshot fed.
+    if (defs) {
+      objectInfoSnapshot.record(defs, {
+        observedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     // THE ORIGIN THAT ACTUALLY ANSWERED (codex). `comfyuiUrlForAgent()` prefers a
     // user-set Remote-URL override, but this fetch goes through the page's own `api`
     // client — so on an install where those differ, reporting the override would
@@ -10735,9 +10750,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // schema — a sibling class is where a custom link datatype is produced. Remember
     // which payload we got, because a single-class map is not evidence about siblings.
     let freshDefsAreSingleClass = false;
-    // #1223 — the epoch before ANY fetch inside the resolver goes out, so a whole map it
-    // obtains can be filed with honest provenance below.
-    const addNodeObservedAtEpoch = backendReconnectEpoch;
+    // #1223 — the epoch at the moment the WHOLE fetch is issued, or null if this add never
+    // issued one. Set inside the branch below rather than out here: for an already-registered
+    // type the resolver first runs the per-class probe, and a reconnect landing during THAT
+    // probe would leave this holding the old epoch — so the later record would be rejected
+    // and the snapshot (already cleared by the reconnect) would stay empty, refusing the very
+    // next render-time widget edit. The epoch has to be read where the request goes out.
+    let addNodeObservedAtEpoch = null;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
         // #767 — ask about ONE type instead of re-downloading the whole schema.
@@ -10784,6 +10803,8 @@ const GRAPH_TOOL_EXECUTORS = {
         // one that answered nothing: `recordObjectInfoTypes(null)` yields no defs, and the
         // add then fails closed on the same path an empty payload already takes, rather
         // than parking.
+        // #1223 — read the epoch HERE, immediately before the whole request is issued.
+        addNodeObservedAtEpoch = backendReconnectEpoch;
         const whole = await boundedGetNodeDefs();
         freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
@@ -10811,7 +10832,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // is the honest wholeness claim; the single-class fast path is only taken for an
     // already-registered type, and it sets that flag. Mutation by a beforeRegisterNodeDef
     // hook (#700) is irrelevant here because `record` copies out only the type NAMES.
-    if (freshDefs && !freshDefsAreSingleClass) {
+    if (freshDefs && !freshDefsAreSingleClass && addNodeObservedAtEpoch !== null) {
       objectInfoSnapshot.record(freshDefs, {
         observedAtEpoch: addNodeObservedAtEpoch,
         currentEpoch: backendReconnectEpoch,
@@ -11851,14 +11872,30 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     let oracleFailures = [];
-    const outcome = await objectInfoCache.read(async () =>
-      fetchWholeObjectInfo({
+    // #1223 — the epoch at which THIS CALL fetched, or null if the burst cache answered from
+    // store or this read joined another call's request. Set inside the loader for the same
+    // reason graph_set_widget's is: only the caller that issued the request can say which
+    // connection the answer describes.
+    let observedAtEpoch = null;
+    const outcome = await objectInfoCache.read(async () => {
+      observedAtEpoch = backendReconnectEpoch;
+      return fetchWholeObjectInfo({
         getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
         fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-      }),
-    );
+      });
+    });
     const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
     oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    // #1223 — this command already paid for a WHOLE /object_info; dropping it leaves the
+    // next render-time widget edit refused for want of the map just read. Same argument the
+    // history note below already makes for its own trust root.
+    if (defs && observedAtEpoch !== null) {
+      objectInfoSnapshot.record(defs, {
+        observedAtEpoch,
+        currentEpoch: backendReconnectEpoch,
+        whole: true,
+      });
+    }
     // Feed the #458 observed-backend-history trust root. This command never consults that
     // history, so skipping it would be harmless HERE — but we just paid for a full
     // /object_info, and discarding the observation makes a LATER set_widget less able to
