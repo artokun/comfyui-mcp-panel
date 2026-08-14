@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.31] - 2026-08-13
+
+### Fixed
+- the workflow-list refresh reports what it OBSERVED, not that it was asked for (#1206)
+
+
+## [0.14.31] - 2026-08-14
+
+### Fixed
+- panel_open_workflow no longer claims the workflow list "WAS re-read from the server" when it cannot know that — the frontend's sync swallows its own errors (comfyui-mcp#1448)
+
 ## [0.14.30] - 2026-08-14
 
 ### Fixed
