@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.29] - 2026-08-13
+
 ### Fixed
 
 - **A backend switch that cannot complete no longer leaves the panel claiming the new one (#1184) (#1196).**
