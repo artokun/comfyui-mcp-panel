@@ -39,23 +39,69 @@ export function knownSelectorSample(records, limit = 3) {
 }
 
 /**
+ * Did a workflow-list re-read demonstrably HAPPEN? (#1448 r2)
+ *
+ * `syncWorkflows` is a VueUse `useAsyncState` execute wrapper built without
+ * `throwError`, so it resolves whether the read succeeded or failed and the
+ * store never exposes the error. "The call returned" is therefore no evidence at
+ * all, and treating it as evidence is what made every refusal claim the list had
+ * been re-read.
+ *
+ * What IS evidence is the store changing: a genuine re-read rebuilds the arrays,
+ * so entries appear or disappear (measured on a live rig: 109 → 107) or the
+ * array identity is replaced. Either proves it ran.
+ *
+ * Seeing NEITHER proves nothing — an unchanged directory re-reads to an
+ * identical list — hence "unconfirmed" rather than "failed". Lives here, out of
+ * the DOM-bound panel module, so the decision is testable on its own; mutation
+ * showed the message tests could not see it at all.
+ *
+ * @param {{counts: string, open: unknown, saved: unknown}} before
+ * @param {{counts: string, open: unknown, saved: unknown}} after
+ * @returns {"ok"|"unconfirmed"}
+ */
+export function classifyWorkflowRefresh(before, after) {
+  if (!before || !after) return "unconfirmed"; // nothing to compare — claim nothing
+  const countsMoved = before.counts !== after.counts;
+  const arraysReplaced = before.open !== after.open || before.saved !== after.saved;
+  return countsMoved || arraysReplaced ? "ok" : "unconfirmed";
+}
+
+/**
  * The refusal, saying what was actually done.
  *
- * `refresh` is one of: "ok" (the list was re-read), "unavailable" (this frontend has
- * no syncWorkflows, so it never was), "not-needed", or "failed: <reason>".
+ * `refresh` is one of: "ok" (the re-read was OBSERVED to change the store),
+ * "unconfirmed" (the call resolved but nothing observable changed), "unavailable"
+ * (this frontend has no syncWorkflows, so it never was), "not-needed", or
+ * "failed: <reason>".
+ *
+ * "unconfirmed" exists because the previous three-way split collapsed to a single
+ * outcome in practice (#1448 r2): `syncWorkflows` is a VueUse `useAsyncState`
+ * execute wrapper built without `throwError`, so a failed re-read resolves
+ * normally and the panel cannot see it. Every refusal therefore claimed the list
+ * "WAS re-read" — a stronger assertion than the one this issue was filed about.
+ * The caller now proves the re-read by watching the store change, and says
+ * "unconfirmed" when it cannot.
  */
 export function openWorkflowNotFoundMessage({ path, refresh, known = [] } = {}) {
   const refreshClause =
     refresh === "ok"
-      ? `The workflow list WAS re-read from the server first, and it still does not contain it.`
-      : refresh === "unavailable"
-        ? `The list was NOT re-read: this ComfyUI frontend exposes no workflow-sync method, so a ` +
-          `file staged since the tab loaded may simply not be known yet. Reload the ComfyUI browser ` +
-          `tab and try again before concluding the file is missing.`
-        : typeof refresh === "string" && refresh.startsWith("failed")
-          ? `The re-read of the workflow list FAILED (${refresh.slice("failed: ".length)}), so this ` +
-            `is not evidence the file is absent — the list may simply be stale.`
-          : `The list was already current.`;
+      ? `The workflow list WAS re-read from the server first (the list changed), and it still does ` +
+        `not contain it.`
+      : refresh === "unconfirmed"
+        ? `A re-read of the workflow list was requested and returned, but NOTHING in the list ` +
+          `changed — so this panel cannot confirm the list was actually refreshed, and cannot ` +
+          `treat the absence as proof the file is missing. (This frontend's sync swallows its own ` +
+          `errors, so a silent failure looks exactly like a directory that did not change.) If the ` +
+          `file IS on disk, reload the ComfyUI browser tab and try again.`
+        : refresh === "unavailable"
+          ? `The list was NOT re-read: this ComfyUI frontend exposes no workflow-sync method, so a ` +
+            `file staged since the tab loaded may simply not be known yet. Reload the ComfyUI browser ` +
+            `tab and try again before concluding the file is missing.`
+          : typeof refresh === "string" && refresh.startsWith("failed")
+            ? `The re-read of the workflow list FAILED (${refresh.slice("failed: ".length)}), so this ` +
+              `is not evidence the file is absent — the list may simply be stale.`
+            : `The list was already current.`;
 
   const shape = known.length
     ? ` Saved workflows here are addressed as e.g. ${known.map((k) => `"${k}"`).join(", ")} — the ` +

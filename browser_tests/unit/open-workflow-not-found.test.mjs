@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
+  classifyWorkflowRefresh,
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "../../web/js/lib/open-workflow-not-found.js";
@@ -26,6 +27,54 @@ test("#1448 a re-read that HAPPENED is stated as such", () => {
   const t = msg({ refresh: "ok" });
   assert.match(t, /list WAS re-read/);
   assert.match(t, /still does not contain it/);
+});
+
+test("#1448 r2 the re-read verdict is DECIDED from the store, both directions", () => {
+  // Mutation found this gap: the message tests and the source-text wiring test
+  // could both pass while the comparison itself was inverted or halved. The
+  // decision lives in lib/ precisely so it can be driven here.
+  const openA = [{ path: "a" }];
+  const savedA = [{ path: "b" }];
+  const fp = (counts, open, saved) => ({ counts, open, saved });
+
+  // Nothing moved: same counts, same array identities → cannot confirm.
+  assert.equal(
+    classifyWorkflowRefresh(fp("1/1", openA, savedA), fp("1/1", openA, savedA)),
+    "unconfirmed",
+  );
+  // A count changed (the 109 → 107 case) → proof it ran.
+  assert.equal(
+    classifyWorkflowRefresh(fp("1/109", openA, savedA), fp("1/107", openA, savedA)),
+    "ok",
+  );
+  // Counts identical but the arrays were REPLACED → also proof it ran. Dropping
+  // this half is a mutation that survived a count-only comparison.
+  assert.equal(
+    classifyWorkflowRefresh(fp("1/1", openA, savedA), fp("1/1", [{ path: "a" }], [{ path: "b" }])),
+    "ok",
+  );
+  // A missing sample claims nothing rather than defaulting to confident.
+  assert.equal(classifyWorkflowRefresh(null, fp("1/1", openA, savedA)), "unconfirmed");
+  assert.equal(classifyWorkflowRefresh(fp("1/1", openA, savedA), null), "unconfirmed");
+});
+
+test("#1448 r2 an UNCONFIRMED re-read never claims the list was refreshed", () => {
+  // The state that did not exist before, and the one that is now almost always
+  // right: syncWorkflows resolves whether or not the read succeeded, so unless
+  // the store visibly changed we cannot say it happened.
+  const t = msg({ refresh: "unconfirmed" });
+  assert.doesNotMatch(t, /WAS re-read/, "it must not assert what it could not observe");
+  assert.match(t, /cannot confirm/i);
+  // …and it must not let the caller conclude the file is missing.
+  assert.match(t, /cannot treat the absence as proof|not.*proof the file is missing/i);
+  // The reason the panel is blind here is worth saying once, in place.
+  assert.match(t, /swallows its own\s+errors/i);
+});
+
+test("#1448 r2 a CONFIRMED re-read still says so, and says why it is confident", () => {
+  const t = msg({ refresh: "ok" });
+  assert.match(t, /WAS re-read/);
+  assert.match(t, /the list changed/, "the claim now carries the evidence for itself");
 });
 
 test("#1448 a frontend with no sync method does NOT claim a refresh", () => {
@@ -95,11 +144,41 @@ test("#1448 WIRING: the caller records the outcome instead of assuming one", () 
   // The behavioural tests cannot see the call site, and the defect WAS the call site:
   // a perfect message still lies if the caller passes a refresh state it never checked.
   const panel = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
-  assert.match(panel, /import \{\s*knownSelectorSample,\s*openWorkflowNotFoundMessage,\s*\} from "\.\/lib\/open-workflow-not-found\.js";/);
+  // Members required, not an exact list: pinning the whole specifier meant that
+  // ADDING an import broke this test for no reason, which is churn rather than
+  // coverage. What matters is that each name comes from this module.
+  const spec = panel.match(
+    /import \{([\s\S]*?)\} from "\.\/lib\/open-workflow-not-found\.js";/,
+  );
+  assert.ok(spec, "the panel must import from lib/open-workflow-not-found.js");
+  for (const name of [
+    "knownSelectorSample",
+    "openWorkflowNotFoundMessage",
+    "classifyWorkflowRefresh",
+  ]) {
+    assert.ok(spec[1].includes(name), `the panel must import ${name} from that module`);
+  }
   // Every branch the refresh can take must be reachable from the call site.
   assert.match(panel, /refresh = "unavailable"/, "a frontend without syncWorkflows");
-  assert.match(panel, /refresh = "ok"/, "a successful re-read");
   assert.match(panel, /refresh = `failed: \$\{err\?\.message \?\? err\}`/, "a thrown re-read");
+  // #1448 r2 — "ok" must be EARNED, not assigned. This used to pin the literal
+  // `refresh = "ok"`, which was satisfied by the unconditional assignment that
+  // was the defect: syncWorkflows resolves even when the re-read failed, so
+  // every refusal claimed the list had been re-read. Pin the discrimination
+  // instead — both outcomes present, and the store observed to decide between
+  // them.
+  assert.doesNotMatch(
+    panel,
+    /await s\.syncWorkflows\(\);\s*\n\s*refresh = "ok";/,
+    "an unconditional 'ok' after the call is exactly the bug",
+  );
+  assert.match(panel, /const before = fingerprintStore\(\);/, "the store is sampled BEFORE");
+  assert.match(panel, /const after = fingerprintStore\(\);/, "...and AFTER the re-read");
+  assert.match(
+    panel,
+    /refresh = classifyWorkflowRefresh\(before, after\);/,
+    "the verdict comes from the shared decision, not an inline guess",
+  );
   // The sample must be taken AFTER the refresh (codex review). A successful re-read
   // removes stale entries — measured 109 -> 107 on a live rig — so a snapshot taken
   // before it can offer a workflow that no longer exists as an example.

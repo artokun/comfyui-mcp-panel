@@ -258,6 +258,7 @@ import {
   missingNodeRunRefusal,
 } from "./lib/missing-node-preflight.js";
 import {
+  classifyWorkflowRefresh,
   knownSelectorSample,
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
@@ -13651,10 +13652,38 @@ const GRAPH_TOOL_EXECUTORS = {
       if (typeof s.syncWorkflows !== "function") {
         refresh = "unavailable";
       } else {
+        // #1448 r2 — "ok" must mean OBSERVED, not "the call returned".
+        //
+        // `syncWorkflows` is a VueUse `useAsyncState` execute wrapper, and the
+        // workflow store builds it with only `{immediate:false}` — so
+        // `throwError` is undefined, a failed re-read is caught into a private
+        // `error` ref, and execute RESOLVES NORMALLY. The store never exposes
+        // that ref. So the catch below cannot fire on a real frontend, and the
+        // previous version set "ok" unconditionally and told the agent "the
+        // workflow list WAS re-read from the server first" — a claim stronger
+        // than the wording this issue was filed about, and one nothing checked.
+        //
+        // What IS observable is the store itself. A genuine re-read rebuilds the
+        // list: entries appear, disappear (measured on a live rig: 109 → 107),
+        // or the array identity changes. Seeing any of that PROVES the read ran.
+        // Seeing none of it does not prove failure — an unchanged directory
+        // re-reads to an identical list — so that case is reported as exactly
+        // what it is: unconfirmed.
+        const fingerprintStore = () => {
+          const open = s.openWorkflows ?? [];
+          const saved = s.workflows ?? [];
+          // Counts AND array identity: a rebuild usually replaces the arrays even
+          // when the contents happen to match. classifyWorkflowRefresh decides.
+          return { counts: `${open.length}/${saved.length}`, open, saved };
+        };
+        const before = fingerprintStore();
         try {
           await s.syncWorkflows();
-          refresh = "ok";
+          const after = fingerprintStore();
+          refresh = classifyWorkflowRefresh(before, after);
         } catch (err) {
+          // Kept for a frontend that DOES set throwError, and for a store that
+          // throws synchronously before ever reaching useAsyncState.
           refresh = `failed: ${err?.message ?? err}`;
           console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
         }
