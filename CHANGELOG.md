@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.35] - 2026-08-14
+
+### Fixed
+- a graph mutation refused during a reconnect now says so in a FIELD the caller can key on, instead of only in the sentence (#1216, comfyui-mcp#1529)
+
+
 ## [0.14.34] - 2026-08-14
 
 ### Fixed
