@@ -81,6 +81,7 @@ import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import {
   describeUploadFailure,
   describeUploadTimeout,
+  describeTimedOutUpload,
   attachmentSummaryLine,
   boundedUpload,
   readFileFacts,
@@ -30801,10 +30802,17 @@ function buildPanel() {
         // everything internally so it never REJECTS — it simply never settles, and the
         // composer awaits `Promise.all(pending.map((a) => a.ready))` before sending. The
         // user is then unable to send the message at all, with nothing on screen saying why.
+        const observed = {};
         const outcome = await boundedUpload(
           async () => {
             const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
             if (res.status === 200) return { info: await res.json() };
+            // #1188 — record the status the INSTANT it is known. The body has its own,
+            // shorter bound, but that bound runs INSIDE the outer one: a head arriving near
+            // the outer deadline with a stalling body would otherwise let the outer bound
+            // report an answered-and-REFUSED upload as "no response".
+            observed.status = res.status;
+            observed.statusText = res.statusText;
             // #756 — a non-200 had NO else at all. The status was in hand and thrown
             // away, leaving "upload failed" as the whole of what anyone could learn.
             // The body gets its OWN shorter bound: a refusal we can already name must not
@@ -30813,7 +30821,7 @@ function buildPanel() {
               failure: describeUploadFailure({
                 status: res.status,
                 statusText: res.statusText,
-                body: await readErrorBody(res, withTimeout),
+                body: (observed.body = await readErrorBody(res, withTimeout)),
                 name,
                 size,
                 mediaType,
@@ -30823,7 +30831,7 @@ function buildPanel() {
           { size, withTimeout },
         );
         if (outcome === UPLOAD_NO_ANSWER) {
-          att.uploadError = describeUploadTimeout({ name, size, mediaType });
+          att.uploadError = describeTimedOutUpload({ observed, name, size, mediaType });
         } else if (outcome?.failure) {
           att.uploadError = outcome.failure;
         } else {
@@ -30874,10 +30882,17 @@ function buildPanel() {
         // would either cut off a legitimate large upload or wait absurdly long for a small
         // one. Same wedge as the image path above — a never-settling `att.ready` blocks the
         // composer's `Promise.all` on send.
+        const observed = {};
         const outcome = await boundedUpload(
           async () => {
             const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
             if (res.status === 200) return { info: await res.json() };
+            // #1188 — record the status the INSTANT it is known. The body has its own,
+            // shorter bound, but that bound runs INSIDE the outer one: a head arriving near
+            // the outer deadline with a stalling body would otherwise let the outer bound
+            // report an answered-and-REFUSED upload as "no response".
+            observed.status = res.status;
+            observed.statusText = res.statusText;
             // #756 — a non-200 had NO else at all. The status was in hand and thrown
             // away, leaving "upload failed" as the whole of what anyone could learn.
             // The body gets its OWN shorter bound: a refusal we can already name must not
@@ -30886,7 +30901,7 @@ function buildPanel() {
               failure: describeUploadFailure({
                 status: res.status,
                 statusText: res.statusText,
-                body: await readErrorBody(res, withTimeout),
+                body: (observed.body = await readErrorBody(res, withTimeout)),
                 name,
                 size,
                 mediaType,
@@ -30896,7 +30911,7 @@ function buildPanel() {
           { size, withTimeout },
         );
         if (outcome === UPLOAD_NO_ANSWER) {
-          att.uploadError = describeUploadTimeout({ name, size, mediaType });
+          att.uploadError = describeTimedOutUpload({ observed, name, size, mediaType });
         } else if (outcome?.failure) {
           att.uploadError = outcome.failure;
         } else {

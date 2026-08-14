@@ -20,6 +20,7 @@ import {
   uploadBoundMs,
   boundedUpload,
   describeUploadTimeout,
+  describeTimedOutUpload,
   readFileFacts,
   readErrorBody,
   UPLOAD_NO_ANSWER,
@@ -214,6 +215,45 @@ test("#1188 a timeout is described as the transport failure it is a species of",
   assert.match(msg, /Whether any bytes reached the server is unknown/);
 });
 
+test("#1188 a status observed before the OUTER bound fires is still reported", async () => {
+  // The race the first fix missed. Giving the body its own shorter bound is not enough,
+  // because that bound runs INSIDE the outer one: a response head arriving near the outer
+  // deadline with a body that then stalls lets the OUTER bound fire first, and a known
+  // HTTP 413 was about to be reported as "no response". Evidence already gathered must
+  // outrank the bound's verdict — the bound knows only that IT stopped waiting.
+  const observed = {};
+  const outcome = await boundedUpload(
+    async () => {
+      // head arrives just under the outer deadline…
+      await new Promise((r) => setTimeout(r, 25));
+      observed.status = 413;
+      observed.statusText = "Payload Too Large";
+      observed.body = await readErrorBody({ text: () => new Promise(() => {}) }, withTimeout, 5000);
+      return { failure: "unreachable — the outer bound fires first" };
+    },
+    { size: 1, withTimeout, boundMs: 40 },
+  );
+  assert.equal(outcome, UPLOAD_NO_ANSWER, "the outer bound must win this race — otherwise nothing is proven");
+  const msg = describeTimedOutUpload({ observed, name: "big.png", size: 4096, mediaType: "image/png" });
+  assert.match(msg, /HTTP 413/, "the status we already held must survive the outer timeout");
+  assert.match(msg, /Payload Too Large/);
+  assert.doesNotMatch(msg, /no response within/, "…and must NOT be downgraded to a transport timeout");
+  // A body that never arrived degrades to the existing body-less refusal wording.
+  assert.match(msg, /sent no body explaining it/);
+});
+
+test("#1188 a genuine no-answer still reads as a transport timeout", () => {
+  // The floor case for the assertion above: with nothing observed, the timeout wording is
+  // still correct. Without this, describeTimedOutUpload could report "HTTP undefined".
+  const msg = describeTimedOutUpload({ observed: {}, name: "x.png", size: 10, mediaType: "image/png", boundMs: 30000 });
+  assert.match(msg, /did not COMPLETE/);
+  assert.doesNotMatch(msg, /HTTP/);
+  // And a malformed record must not be mistaken for a real status.
+  for (const bad of [{ status: undefined }, { status: null }, { status: "nope" }, { status: NaN }]) {
+    assert.match(describeTimedOutUpload({ observed: bad, name: "x" }), /did not COMPLETE/);
+  }
+});
+
 // ── the three monolith call sites ───────────────────────────────────────────────────
 
 /** Source with comment lines removed. The comments here NAME the calls they explain, so a
@@ -280,9 +320,9 @@ test("#1188 a refusal's body is bounded separately from the upload", () => {
   // Otherwise a stalled explanation drags a KNOWN status into the outer bound and it gets
   // reported as "no response" — #756's defect, reintroduced by #1188's own fix.
   assert.equal(
-    (CODE.match(/body: await readErrorBody\(res, withTimeout\),/g) || []).length,
+    (CODE.match(/body: \(observed\.body = await readErrorBody\(res, withTimeout\)\),/g) || []).length,
     2,
-    "both composer sites must bound the error body on its own",
+    "both composer sites must bound the error body on its own, recording it as they go",
   );
   assert.equal(
     (CODE.match(/body: await res\.text\(\)\.catch\(\(\) => null\),/g) || []).length,
@@ -296,6 +336,27 @@ test("#1188 the composer's two sites report the timeout instead of silently succ
   // `outcome.info` on an undefined `info` and throw a TypeError the user cannot act on.
   const guards = (CODE.match(/if \(outcome === UPLOAD_NO_ANSWER\) \{/g) || []).length;
   assert.equal(guards, 2, `both composer sites must branch on the sentinel, saw ${guards}`);
-  const reported = (CODE.match(/att\.uploadError = describeUploadTimeout\(/g) || []).length;
+  // describeTimedOutUpload, NOT describeUploadTimeout: the timeout branch must consult the
+  // status the callback recorded before falling back to the transport wording.
+  const reported = (CODE.match(/att\.uploadError = describeTimedOutUpload\(\{ observed,/g) || []).length;
   assert.equal(reported, 2, `…and both must say so, saw ${reported}`);
+  assert.equal(
+    (CODE.match(/att\.uploadError = describeUploadTimeout\(/g) || []).length,
+    0,
+    "no site may report a timeout without first checking what was observed",
+  );
+});
+
+test("#1188 both composer sites record the status before awaiting the body", () => {
+  // Order matters: recording after the body read would leave the record empty in exactly
+  // the race it exists for.
+  const sites = CODE.split('await boundedUpload(').slice(1);
+  const composer = sites.filter((c) => c.includes('observed.status = res.status;'));
+  assert.equal(composer.length, 2, `both composer sites must record the status, saw ${composer.length}`);
+  for (const body of composer) {
+    const rec = body.indexOf('observed.status = res.status;');
+    const read = body.indexOf('readErrorBody(');
+    assert.ok(rec >= 0 && read > rec, 'the status must be recorded BEFORE the body is awaited');
+  }
+  assert.equal((CODE.match(/const observed = {};/g) || []).length, 2, 'each site needs its own record');
 });

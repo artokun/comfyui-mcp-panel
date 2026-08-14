@@ -269,6 +269,44 @@ export async function boundedUpload(run, { size, withTimeout, boundMs } = {}) {
  * one key means a pass over eleven locale files, and this string reaches the agent and the
  * chip through the same untranslated path #756 already established.
  */
+/**
+ * What to report when the OUTER upload bound fires.
+ *
+ * Giving the refusal body its own shorter bound was not enough on its own. The inner bound
+ * runs *inside* the outer one, so a response head that arrives near the outer deadline — say
+ * at 29.9s of a 30s allowance — with a body that then stalls lets the OUTER bound fire
+ * first. The upload was answered and refused, we hold the status, and it was still about to
+ * be reported as "no response". That is #756's defect ("the status was in hand and thrown
+ * away") surviving the first attempt to fix it.
+ *
+ * So the status is recorded the instant it is known, and a timeout consults that record
+ * before falling back to the transport wording. Evidence already gathered outranks the
+ * bound's own verdict: the bound knows only that IT stopped waiting, which is not the same
+ * as nothing having been observed.
+ *
+ * `observed.body` is deliberately optional. If the outer bound fired while the body was
+ * still arriving, there is no body — and `describeUploadFailure` already has wording for a
+ * refusal that came without one.
+ */
+export function describeTimedOutUpload({ observed, name, size, mediaType, boundMs } = {}) {
+  // ABSENT before COERCED, exactly as `describeSize` insists. `Number(null)` and `Number("")`
+  // are both 0, which is finite — so a coerce-first check turns "no status was ever observed"
+  // into a confident `HTTP null`, fabricating a server answer inside the one function whose
+  // whole job is to distinguish an answer from silence. A first version of this did that.
+  const status = observed?.status;
+  if (status !== null && status !== undefined && status !== "" && Number.isFinite(Number(status))) {
+    return describeUploadFailure({
+      status: observed.status,
+      statusText: observed.statusText,
+      body: observed.body ?? null,
+      name,
+      size,
+      mediaType,
+    });
+  }
+  return describeUploadTimeout({ name, size, mediaType, boundMs });
+}
+
 export function describeUploadTimeout({ name, size, mediaType, boundMs } = {}) {
   const secs = Math.round((Number(boundMs) || uploadBoundMs(size)) / 1000);
   return describeUploadFailure({
