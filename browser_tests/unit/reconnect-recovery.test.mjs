@@ -16,7 +16,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -271,6 +271,38 @@ test("#1529 reader: a genuine gate refusal is published", () => {
   });
 });
 
+test("#1529 mint: only the GATE's own return value may be minted", () => {
+  // Re-review, P0: the mint used to accept any object of the right shape, which
+  // made it an unrestricted authority — a call site added AFTER a write could
+  // hand it a literal and publish "nothing was applied" about a write that had
+  // already landed. The retry then duplicates the node.
+  const handBuilt = {
+    code: "backend-reconnecting",
+    message: "looks exactly like the real thing",
+    applied: false,
+    stage: "pre-executor",
+    retryable: true,
+  };
+  assert.throws(() => reconnectRefusalError(handBuilt), /only be minted from graphMutationReconnectGate/);
+  // A COPY of a genuine refusal is not the genuine refusal either — the brand is
+  // on the object, so spreading it does not carry the authority.
+  const real = graphMutationReconnectGate({ cmd: "graph_run", backendDown: true });
+  assert.throws(() => reconnectRefusalError({ ...real }), /only be minted/);
+  for (const junk of [null, undefined, "backend-reconnecting", 42, []]) {
+    assert.throws(() => reconnectRefusalError(junk), TypeError, String(junk));
+  }
+  // …and the genuine one still mints.
+  assert.equal(readReconnectRefusal(reconnectRefusalError(real))?.code, "backend-reconnecting");
+});
+
+test("#1529 mint: the gate only produces a refusal when it actually REFUSES", () => {
+  // The property that makes gate-provenance meaningful: there is no way to get a
+  // branded object out of the gate on the clean path, so a minted error implies
+  // an instability signal was live.
+  assert.equal(graphMutationReconnectGate({ cmd: "graph_run" }), null);
+  assert.throws(() => reconnectRefusalError(graphMutationReconnectGate({ cmd: "graph_run" })), TypeError);
+});
+
 test("#1529 reader: a FOREIGN error with a perfect-looking payload is refused", () => {
   // The forged case. Every field is exactly right; the only thing missing is
   // that this gate did not mint it — which is the whole claim.
@@ -428,11 +460,53 @@ test("#1529 wiring: the reply builder publishes `refusal` and leaves `error` alo
   );
   // Through the READER, never the raw property — that distinction is the P0.
   assert.match(block, /const reconnectRefusal = readReconnectRefusal\(err\);/);
-  assert.doesNotMatch(
-    SRC,
-    /refusal: err\.cmcpRefusal/,
-    "no reply may publish the raw, inheritable property",
+});
+
+test("#1529 audit: NO shipped module touches the raw property outside a comment", () => {
+  // Re-review, P2: the first version of this asserted `doesNotMatch(SRC,
+  // /refusal: err\.cmcpRefusal/)` — one spelling, in one file. `const r =
+  // err?.cmcpRefusal`, `err["cmcpRefusal"]`, an alias, or a second reply path in
+  // another module all slipped past it while it reported PASS.
+  //
+  // The exact form instead: the token may appear ONLY in reconnect-recovery.js
+  // (which owns it), and anywhere else only inside a comment. Line-level, so no
+  // tokenizer is needed and it cannot mis-bound a slice — the failure that got a
+  // brace-counting version of this deleted.
+  const dir = fileURLToPath(new URL("../../web/js/", import.meta.url));
+  const offenders = [];
+  const walk = (d) => {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const full = join(d, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!entry.name.endsWith(".js")) continue;
+      if (full.replace(/\\/g, "/").endsWith("lib/reconnect-recovery.js")) continue; // the owner
+      const text = readFileSync(full, "utf8");
+      text.split("\n").forEach((line, i) => {
+        if (!line.includes("cmcpRefusal")) return;
+        if (/^\s*(\/\/|\*|\/\*)/.test(line)) return; // a comment may name it
+        offenders.push(`${entry.name}:${i + 1}: ${line.trim()}`);
+      });
+    }
+  };
+  walk(dir);
+  assert.deepEqual(
+    offenders,
+    [],
+    "every consumer must go through readReconnectRefusal, which checks provenance;\n" +
+      "a raw read publishes an inherited or post-write payload as safe-to-retry",
   );
+});
+
+test("#1529 audit: the mint has exactly the two known, PRE-EXECUTOR call sites", () => {
+  // Gate-provenance stops a FORGED refusal but not a genuine one raised late: a
+  // caller could invoke the gate after a write and throw its refusal. Nothing in
+  // the type system can see that, so the remaining guarantee is positional, and
+  // this is what pins it — a third call site fails here and has to be justified.
+  //
+  // The two that exist: revalidateGraphMutationContext's preflight (before
+  // getGraphCtx, before any write) and the dispatch gate (before the executor).
+  const sites = [...SRC.matchAll(/reconnectRefusalError\(/g)].length;
+  assert.equal(sites, 2, "a new mint call site must be reviewed for 'is this before the executor?'");
 });
 
 test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list", () => {

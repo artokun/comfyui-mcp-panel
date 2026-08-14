@@ -133,12 +133,18 @@ export async function watchPostReconnectSettle({
  * @returns {{code: string, message: string, applied: false, stage: "pre-executor",
  *   retryable: true}|null}
  */
+/** Record a refusal as gate-produced and return it unchanged. */
+function brandGateRefusal(refusal) {
+  GATE_REFUSALS.add(refusal);
+  return refusal;
+}
+
 export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSettleWindow = false } = {}) {
   const name = typeof cmd === "string" && cmd ? `"${cmd}"` : "this graph command";
   /** Every refusal from this gate shares these — see the docblock. */
   const base = { applied: false, stage: "pre-executor", retryable: true };
   if (backendDown) {
-    return {
+    return brandGateRefusal({
       ...base,
       code: "backend-reconnecting",
       message:
@@ -146,10 +152,10 @@ export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSe
         `reconnect is in progress), so ${name} was NOT applied — nothing changed. A graph mutation ` +
         `dispatched in this window can land on a canvas the reconnect is about to rebuild. Retry ` +
         `once the tab has reconnected (usually seconds); if it never reconnects, reload the ComfyUI page.`,
-    };
+    });
   }
   if (bindingSettleWindow) {
-    return {
+    return brandGateRefusal({
       ...base,
       code: "post-reconnect-settling",
       message:
@@ -158,7 +164,7 @@ export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSe
         `nothing changed. The panel re-proves the binding automatically (usually within a few ` +
         `seconds); retry in a moment. If this persists past ~30 seconds, re-open the active ` +
         `workflow tab (panel_open_workflow) or reload the panel (panel_reload scope:frontend), then retry.`,
-    };
+    });
   }
   return null;
 }
@@ -185,6 +191,25 @@ const REFUSAL_CODES = new Set(["backend-reconnecting", "post-reconnect-settling"
 const MINTED_REFUSALS = new WeakSet();
 
 /**
+ * The refusal objects `graphMutationReconnectGate` itself produced.
+ *
+ * Re-review, P0: minting used to accept any object of the right shape, which
+ * made `reconnectRefusalError` an unrestricted authority — a call site added
+ * AFTER a graph write could hand it a hand-built literal and publish
+ * "applied:false, safe to retry" about a write that had already landed. The
+ * retry then duplicates the node, which is the exact outcome this whole channel
+ * exists to prevent.
+ *
+ * So the mint's input must come from the gate, and the gate only returns non-null
+ * when it has actually refused. That does not by itself prove the executor had
+ * not run — a caller could still invoke the gate late — but it removes the
+ * forgery path, and the remaining question ("is this call site pre-executor?") is
+ * answered where it must be, at the two call sites, and pinned by a test that
+ * fails if a third appears.
+ */
+const GATE_REFUSALS = new WeakSet();
+
+/**
  * Throwable form: an Error whose message is unchanged from before, carrying the
  * structured refusal on a named property so the reply builder can publish it.
  *
@@ -194,6 +219,18 @@ const MINTED_REFUSALS = new WeakSet();
  * catch in the file is the kind of collision that surfaces months later.
  */
 export function reconnectRefusalError(refusal) {
+  // The mint takes only what the GATE produced. A hand-built literal of the
+  // right shape is rejected loudly rather than minted, so a call site added
+  // after a write cannot manufacture "applied:false, safe to retry" about a
+  // write that already landed (re-review, P0). Throwing rather than returning
+  // null because every caller here is `throw reconnectRefusalError(gate)` — a
+  // null would become a TypeError one line later with no explanation, and a
+  // silent Error would publish no refusal at all while looking fine.
+  if (!refusal || typeof refusal !== "object" || !GATE_REFUSALS.has(refusal)) {
+    throw new TypeError(
+      "reconnectRefusalError: refusals may only be minted from graphMutationReconnectGate's own return value",
+    );
+  }
   const err = new Error(refusal.message);
   // defineProperty, not assignment. `err.cmcpRefusal = …` is an assignment, and
   // an assignment to a property that exists on the PROTOTYPE as non-writable
