@@ -19404,13 +19404,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // MID_TASK_KEY, and that is not quite true: connectBackend() clears it only when
       // `switching`. (hardRestart() had the same hole and no longer does — #1166.)
       //
-      // A WEDGED orchestrator is not covered here either: it holds its socket OPEN and
-      // answers nothing, so no close ever fires and no outage is recorded for a death
-      // the panel then resolves by force-respawning it. Both gaps are real and are
-      // tracked as their own issue rather than patched from here — two attempts to
-      // record those deaths from the teardown side turned a MISSED nudge into a FALSE
-      // one, because the teardown functions cannot distinguish "the orchestrator died"
-      // from "the user changed the bridge URL" or "the agent has not booted yet".
+      // A WEDGED orchestrator is still not covered here, and by design: it holds its
+      // socket OPEN and answers nothing, so no close ever fires. #1168 records that
+      // death where it is actually CONCLUDED (showExternalHintOnce, past the redial and
+      // fallback ladder) via bridgeOutage.noteAgentGone() — not from here and not from
+      // the teardown side, whose functions cannot distinguish "the orchestrator died"
+      // from "the user changed the bridge URL" or "the agent has not booted yet". Two
+      // attempts to stamp it from a teardown turned a MISSED nudge into a FALSE one.
       bridgeOutage.noteBridgeClosed();
       if (!closed) {
         // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
@@ -28913,7 +28913,15 @@ function buildPanel() {
         // A source-scan over this file could only assert the guard's tokens are present,
         // and #1096's review demonstrated by mutation that such a test stays green when
         // the guard is inverted — which is the one regression that matters here.
-        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
+        //
+        // #1168 — and the measured outage is not the only evidence. A WEDGED
+        // orchestrator holds its socket open and answers nothing, so no close fires and
+        // no outage is opened at all; the clock starts only when the wedged process
+        // finally dies, and a user who restarts it promptly measures that restart rather
+        // than the wedge. The panel's own conclusion that nothing is behind the socket
+        // is the direct form of what the duration is a proxy for, so it is passed
+        // alongside and outranks it.
+        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs(), agentGone: bridgeOutage.agentGone() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         if (client.sendUserMessage(
@@ -30259,6 +30267,26 @@ function buildPanel() {
       return; // the hint is only true once the fallback has failed too
     }
     externalHintShown = true;
+    // #1168 — and this is where the panel concludes the agent behind the bridge socket
+    // is GONE, so this is where that death is recorded.
+    //
+    // The site is chosen, not convenient. Everything above is the ladder of reasons the
+    // conclusion might NOT be earned yet — the patient cold-start window, the bounded
+    // handshake redial (the agent-not-ready-YET case), and #1136's fallback dial for a
+    // configured URL that outlived its process. Only past all of them is "no agent is
+    // listening" true, and it is the identical claim: #1136 moved this latch here for
+    // exactly the over-claim this would otherwise repeat. Recording the death anywhere
+    // earlier is what sank the two previous attempts.
+    //
+    // Both callers reach it having established that, not assumed it: the handshake
+    // timeout (an OPEN socket that answered nothing for the full redial ladder — the
+    // WEDGE this issue is about, where no close ever fires and nothing else records a
+    // death) and the terminal `disconnected` status (reconnect patience exhausted). The
+    // panel never kills anything here, which is the point — this distribution CANNOT
+    // respawn the orchestrator (externalOrchestratorMode is hardcoded true, and the
+    // pack's /connect ignores `force` entirely), so the death has to be concluded from
+    // the panel's own observation or not at all.
+    bridgeOutage.noteAgentGone();
     appendSystem(
       tr(
         "panel.no_agent_is_listening_on_the_bridge",

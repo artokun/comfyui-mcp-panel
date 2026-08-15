@@ -83,7 +83,26 @@ export function shouldRehelloAfterCommand(cmd, reply) {
 // `outageMs` is therefore required to be a positive, finite number of milliseconds:
 // absent, zero, negative or unreadable all mean no outage was measured, and no outage
 // means no nudge.
-export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6000 } = {}) {
+//
+// #1168 — `agentGone` is the OTHER kind of evidence, and it outranks the clock.
+//
+// Everything above reasons about a duration because the panel usually cannot observe a
+// death directly, so it infers one from how long the bridge was gone. That inference is
+// exactly backwards in the case this parameter exists for. A WEDGED orchestrator holds
+// its socket OPEN and answers nothing, so no close ever fires and no outage is ever
+// opened; the clock starts only when the wedged process finally dies. A user who
+// restarts it promptly therefore measures the RESTART — a few seconds, under the
+// threshold — and the turn the wedge killed is never resumed, even though the panel had
+// spent a full minute establishing that nothing was behind that socket.
+//
+// So when the caller has CONCLUDED the agent is gone (see `noteAgentGone` on the tracker
+// below), the proxy is not consulted: the thing it was estimating is already known.
+export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6000, agentGone = false } = {}) {
+  // `=== true`, not truthiness, and deliberately not symmetric with the duration checks
+  // below: this branch BYPASSES the guard, so only the literal boolean the tracker sets
+  // may open it. A stray "1"/1/{} from a caller that guessed the field name falls
+  // through to the clock instead of nudging on the strength of a typo.
+  if (agentGone === true) return true;
   if (typeof outageMs !== "number" || !Number.isFinite(outageMs)) return false;
   // Not `> 0` by accident: a measured outage is a real elapsed duration, so a
   // non-positive one is the never-dropped sentinel, an ended-and-consumed outage, or a
@@ -113,6 +132,8 @@ export function shouldNudgeAfterMidTaskReconnect({ outageMs = 0, minOutageMs = 6
 //     outage ENDS and its duration is finally known. A handshake with no outage open is
 //     a re-advertise on a live socket (#310 does one after every free_vram) and records
 //     nothing rather than inheriting the previous outage as if it were its own.
+//   noteAgentGone()     — the panel CONCLUDED the agent behind the bridge socket is gone.
+//     A separate event from a close, and deliberately not spelled as one: see its body.
 //   noteTurnStarted()   — a new agent turn began, so outages that ended before it are no
 //     longer evidence about the turn now running. This is what stops a real but settled
 //     drop from being re-read later as this turn's — the #1138 defect with a stale
@@ -130,6 +151,11 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
   let startedAt = null;
   // The outage the current turn has seen, in ms; 0 means "no drop during this turn".
   let outageMs = 0;
+  // #1168 — whether the panel concluded, DURING THIS TURN, that the agent behind the
+  // bridge socket is gone. Scoped exactly like outageMs above and cleared by the same
+  // event, for the same reason: a death concluded before this turn is not evidence
+  // about the turn running now.
+  let agentGone = false;
   const readClock = () => {
     const t = now();
     return typeof t === "number" && Number.isFinite(t) ? t : null;
@@ -142,6 +168,30 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       // handshake records no duration, so the nudge is withheld — the safe direction:
       // a missed nudge leaves an idle agent, an invented one derails a working agent.
       if (t !== null) startedAt = t;
+    },
+    // #1168 — the panel concluded the agent behind the bridge socket is GONE.
+    //
+    // Deliberately not folded into noteBridgeClosed(): that name means "a socket
+    // closed", and the case this exists for is precisely the one where none does. A
+    // wedged orchestrator holds its connection OPEN and answers nothing, so the close
+    // listener never runs and the death goes unrecorded until the wedged process
+    // eventually dies — by which time the clock measures the user's restart instead of
+    // the outage. Overloading the socket-event name is what let two earlier attempts
+    // read as plausible while being wrong: one stamped the shared teardown helper
+    // (~17 call sites, most of them a LIVE orchestrator being re-pointed), the other
+    // stamped the handshake REDIAL, whose own doc calls it the agent-not-ready-YET
+    // case. Both converted a missed nudge into a false one, which is strictly worse.
+    //
+    // It records a CONCLUSION, not an interval, because no honest interval exists here.
+    // The panel cannot see when the agent behind an open socket stopped answering; it
+    // knows only that it has now given up on it, after the full bounded ladder of
+    // cold-start windows and redials that give-up costs. Manufacturing a duration from
+    // that moment would re-lose the nudge on exactly the fast recovery this is for, so
+    // the reader (`shouldNudgeAfterMidTaskReconnect`) weighs the flag AHEAD of the clock
+    // and this leaves `startedAt`/`outageMs` untouched: an outage a real close opened is
+    // still measured normally, and a death is not also charged as one.
+    noteAgentGone() {
+      agentGone = true;
     },
     noteHandshake() {
       if (startedAt === null) return; // ended no outage — records nothing
@@ -182,6 +232,13 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       // satisfied by simply never nudging.
       startedAt = null;
       outageMs = 0;
+      // #1168 — a concluded death is turn-scoped evidence for the same reason a measured
+      // outage is, and this is the event that scopes it. It is also the whole safety
+      // argument for letting the flag outrank the clock: an orchestrator that turns out
+      // to be ALIVE re-announces its running turn, and that frame lands here and stands
+      // the conclusion down before the `ready` ack can act on it. A dead one has no turn
+      // to announce, so nothing arrives, the flag stands, and the nudge fires.
+      agentGone = false;
     },
     /** The outage the current turn has seen, in ms (0 = none).
      *
@@ -207,6 +264,11 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
       // reports no outage rather than a negative one.
       return t === null ? outageMs : Math.max(0, t - startedAt);
     },
+    /** #1168 — true when the panel concluded, during THIS turn, that the agent behind
+     *  the bridge socket is gone. Unlike outageMs() this is not re-derived from a clock:
+     *  it is the observation itself, and it survives the handshake that recovers the
+     *  connection because the nudge is decided one frame later, on the `ready` ack. */
+    agentGone: () => agentGone,
     /** True while the bridge is down — the outage has begun but not yet ended.
      *  Read by the tests that pin the open/closed transitions; the panel decides on
      *  outageMs() alone, so this stays a state ACCESSOR and never a second predicate. */
