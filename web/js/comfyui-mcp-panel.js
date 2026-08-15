@@ -283,6 +283,11 @@ import {
   unresolvedNodeTypes,
 } from "./lib/missing-node-preflight.js";
 import {
+  danglingInputLinks,
+  disconnectedBoundaryInputs,
+  brokenConversionRefusal,
+} from "./lib/subgraph-conversion-integrity.js";
+import {
   classifyWorkflowRefresh,
   knownSelectorSample,
   openWorkflowNotFoundMessage,
@@ -8301,6 +8306,29 @@ function assertSubgraphNodeLanded(res, graph, what) {
   return node;
 }
 
+/** Confirm the subgraph `convertToSubgraph` produced can actually be SERIALIZED.
+ *
+ *  #1571 — the sibling above answers "did a node land?". A conversion can answer yes to
+ *  that and still leave the new subgraph holding an input that references a link id the
+ *  subgraph does not contain, which is the one condition ComfyUI's own
+ *  `ExecutableNodeDTO.resolveInput` throws `InvalidLinkError` on. The tool reported
+ *  success; the workflow could not be run afterwards, and the run's error named a
+ *  flattened id (`[302:192]`) with no visible connection to this call.
+ *
+ *  Returns the advisory (never fatal) list of unfed boundary input slots so the caller
+ *  can report them on a conversion that is otherwise fine. See
+ *  lib/subgraph-conversion-integrity.js for why the two signals have different weights. */
+function assertSubgraphConversionSerializable(res, node, what) {
+  const dangling = danglingInputLinks(res?.subgraph);
+  const disconnected = disconnectedBoundaryInputs(node);
+  if (dangling.length) {
+    throw new Error(
+      brokenConversionRefusal({ what, subgraphNodeId: node?.id, dangling, disconnected }),
+    );
+  }
+  return disconnected;
+}
+
 function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
   try {
     for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links)) {
@@ -15270,11 +15298,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // `node_id: null` inside a `subgraph:` payload reads as a success with a missing
     // field, not as a failure. Refuse instead — see assertSubgraphNodeLanded.
     const created = assertSubgraphNodeLanded(res, graph, "panel_create_subgraph");
+    // #1571: a node that LANDED can still be unserializable. Refuse rather than report a
+    // success the next run will contradict — see assertSubgraphConversionSerializable.
+    const unfedInputs = assertSubgraphConversionSerializable(res, created, "panel_create_subgraph");
     return {
       subgraph: {
         node_id: created.id,
         name: res?.subgraph?.name ?? null,
         from_nodes: ns.map((n) => n.id),
+        ...(unfedInputs.length ? { unfed_boundary_inputs: unfedInputs } : {}),
       },
     };
   },
@@ -15315,12 +15347,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // Same guard as panel_create_subgraph: a conversion that produced no node must
     // not report a subgraph with a null id.
     const grouped = assertSubgraphNodeLanded(res, graph, "panel_subgraph_group");
+    // #1571 was reported through THIS path: the group held a bypassed node whose input
+    // link did not survive the conversion, and the tool said "subgraph created".
+    const unfedInputs = assertSubgraphConversionSerializable(res, grouped, "panel_subgraph_group");
     return {
       subgraph: {
         node_id: grouped.id,
         name: res?.subgraph?.name ?? null,
         from_group: g.title ?? null,
         from_nodes: ns.map((n) => n.id),
+        ...(unfedInputs.length ? { unfed_boundary_inputs: unfedInputs } : {}),
       },
     };
   },
