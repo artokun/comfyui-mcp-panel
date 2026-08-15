@@ -1,9 +1,9 @@
 // comfyui-mcp#1478 (defect 1) — `graph_load`'s reply now names the workflow identity the
-// load landed on.
+// load landed on, on BOTH of its return paths.
 //
 // The reporter's very next graph call after a successful `panel_load_workflow` failed with
-// `workflow instance mismatch`, deterministically, twice. A blank-canvas load takes the
-// fresh-mint path, so the session's fence still names the pre-load instance.
+// `workflow instance mismatch`, deterministically, twice. Their reply was
+// `{loaded:true, format:"api", node_count:59}` — the API-format branch.
 //
 // The orchestrator could only answer with a CONDITIONAL note ("an API-format load CAN
 // re-mint the instance…") because this reply carried nothing that separated re-minted from
@@ -18,14 +18,16 @@
 // carried in the command's own reply has no such window.
 //
 // The executor lives in the monolith and needs a live `app`, so what is pinned here is the
-// WIRING; the field's behaviour on a real load is verified against the running ComfyUI
-// after merge.
+// WIRING; the one claim that does NOT depend on a live app — that an API-format load forks
+// the per-instance uuid — is pinned behaviourally against the real predicate at the bottom.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+
+import { shouldForkInPlaceReload } from "../../web/js/lib/workflow-chat-identity.js";
 
 const PANEL = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
@@ -41,22 +43,64 @@ function graphLoadBody() {
   return PANEL.slice(start, end);
 }
 
-test("#1478 graph_load's reply carries workflow_uuid", () => {
+/** The shared identity reader both return paths call. */
+function helperBody() {
+  const start = PANEL.indexOf("function loadLandedWorkflowUuid(appRef, targetedWorkflow) {");
+  assert.notEqual(start, -1, "the shared identity reader must still be recognisable");
+  const end = PANEL.indexOf("\n}", start);
+  assert.ok(end > start, "the reader must still be a bounded function");
+  return PANEL.slice(start, end);
+}
+
+test("#1478 BOTH of graph_load's return paths carry workflow_uuid", () => {
+  // The API-format branch returns EARLY, before the UI path's capture ever runs. It is the
+  // branch the reporter was on, so a field added only to the tail of the executor would
+  // publish nothing for the exact call that failed.
   const body = graphLoadBody();
   assert.match(
     body,
+    /\.\.\.\(apiLoadedWorkflowUuid \? \{ workflow_uuid: apiLoadedWorkflowUuid \} : \{\}\),/,
+    "the API-format reply — the reporter's path — must carry the identity",
+  );
+  assert.match(
+    body,
     /\.\.\.\(loadedWorkflowUuid \? \{ workflow_uuid: loadedWorkflowUuid \} : \{\}\),/,
-    "the identity must ride the reply the orchestrator already parses",
+    "and so must the UI-format reply",
   );
 });
 
-test("#1478 the identity is read AFTER the load, and only when it is PROVABLY ours", () => {
+test("#1478 the API path captures its target BEFORE the load, not after", () => {
+  // The capture has to bracket loadApiJson: read afterwards and the "target" is just
+  // whatever is active now, which is the wrong-graph hazard this design exists to avoid.
+  const body = graphLoadBody();
+  const captureAt = body.indexOf("const apiTargetWorkflow");
+  const loadAt = body.indexOf("await app.loadApiJson(");
+  const readAt = body.indexOf("const apiLoadedWorkflowUuid");
+  assert.ok(captureAt !== -1, "the API path must capture the pre-load target");
+  assert.ok(loadAt !== -1, "the API load call must still be recognisable");
+  assert.ok(captureAt < loadAt, "the target is captured BEFORE loadApiJson");
+  assert.ok(readAt > loadAt, "and the identity is read AFTER it has landed");
+  assert.match(
+    body.slice(readAt, readAt + 200),
+    /loadLandedWorkflowUuid\(app, apiTargetWorkflow\)/,
+    "the API path reads through the shared gate, against its own captured target",
+  );
+});
+
+test("#1478 the UI path reads through the same gate, against its own pre-load target", () => {
   const body = graphLoadBody();
   const loadAt = body.indexOf("await app.loadGraphData(");
-  const readAt = body.indexOf("const liveNow");
+  const readAt = body.indexOf("const loadedWorkflowUuid");
   assert.ok(loadAt !== -1, "the load call must still be recognisable");
   assert.ok(readAt > loadAt, "the identity is read after loadGraphData has landed");
+  assert.match(
+    body.slice(readAt, readAt + 200),
+    /loadLandedWorkflowUuid\(app, activeWorkflow\)/,
+    "and against the object captured before the load, never 'what is active now'",
+  );
+});
 
+test("#1478 the identity is published only when it is PROVABLY this load's", () => {
   // THE PROPERTY THAT MATTERS, and the one review had to force. Reading "whatever is
   // active now" after the await is the SAME wrong-graph hazard the orchestrator-side
   // attempt was rejected for: load starts for A, the user switches to B while it awaits,
@@ -65,16 +109,13 @@ test("#1478 the identity is read AFTER the load, and only when it is PROVABLY ou
   //
   // So the reply names a workflow only when the live one IS the object this load
   // targeted. Object identity, not a name: immune to a switch, and unforgeable.
+  const helper = helperBody();
   assert.match(
-    body.slice(readAt, readAt + 420),
-    /rawWorkflowObject\(liveNow\) === rawWorkflowObject\(activeWorkflow\)/,
+    helper,
+    /rawWorkflowObject\(liveNow\) === rawWorkflowObject\(targetedWorkflow\)/,
     "the identity is gated on the live workflow being the very object this load targeted",
   );
-  assert.match(
-    body.slice(readAt, readAt + 520),
-    /provablyOurs\s*\?/,
-    "and the uuid is only read on that branch",
-  );
+  assert.match(helper, /provablyOurs\s*\?/, "and the uuid is only read on that branch");
 });
 
 test("#1478 an unprovable load publishes NOTHING rather than a guess", () => {
@@ -82,40 +123,70 @@ test("#1478 an unprovable load publishes NOTHING rather than a guess", () => {
   // can prove which one is ours. Publishing the active one anyway is worse than publishing
   // none, precisely because the field is trusted enough to claim a fence from. The
   // orchestrator keeps its existing conditional note on that path.
-  const body = graphLoadBody();
-  assert.match(body, /!!activeWorkflow &&/, "no pre-load target ⇒ nothing is provable");
-  assert.match(body, /!!liveNow &&/, "no live workflow ⇒ nothing is provable");
+  const helper = helperBody();
+  assert.match(helper, /!!targetedWorkflow &&/, "no pre-load target ⇒ nothing is provable");
+  assert.match(helper, /!!liveNow &&/, "no live workflow ⇒ nothing is provable");
 });
 
 test("#1478 the field is SHAPE-GATED — only a canonical instance uuid is published", () => {
   // #716's rule. A routing handle or a half-established value would be adopted by the
   // orchestrator as an instance identity and fence future commands against something that
   // is not one. An absent field costs a round trip through the existing fallback.
-  const body = graphLoadBody();
-  assert.match(body, /isCanonicalWorkflowInstanceUuid\(uuid\)/, "gated on the canonical check");
+  const helper = helperBody();
   assert.match(
-    body,
-    /let loadedWorkflowUuid;/,
-    "undefined by default, so every path that cannot prove an identity omits the field",
+    helper,
+    /isCanonicalWorkflowInstanceUuid\(uuid\) \? uuid : undefined/,
+    "a non-canonical value is dropped, not published",
   );
 });
 
 test("#1478 an unreadable identity omits the field instead of throwing", () => {
   // Reading the identity is itself an operation that can fail, and this runs AFTER the
   // graph has already landed — a throw here would turn a successful load into a failed
-  // one, which is strictly worse than the mismatch this is fixing.
-  const body = graphLoadBody();
-  const readAt = body.indexOf("const liveNow");
-  const after = body.slice(readAt);
-  assert.match(after.slice(0, 700), /\} catch \{/, "the read is guarded");
-  assert.doesNotMatch(after.slice(0, 700), /throw /, "and never rethrows");
+  // one, which is strictly worse than the mismatch this is reporting.
+  const helper = helperBody();
+  assert.match(helper, /\} catch \{/, "the read is guarded");
+  // A `throw` STATEMENT, anchored to the start of a line — prose in the comments explaining
+  // why it must not rethrow is not a rethrow, and an assertion that cannot tell the
+  // difference fails on its own documentation.
+  assert.doesNotMatch(helper, /^[ \t]*throw\b/m, "and never rethrows");
+  assert.match(helper, /return undefined;/, "the failure answer is an absent field");
 });
 
-test("#1478 the in-place path still PRESERVES the instance — the field only reports", () => {
-  // The field must not be mistaken for a behaviour change. An in-place load keeps the
+test("#1478 the in-place UI path still PRESERVES the instance — the field only reports", () => {
+  // The field must not be mistaken for a behaviour change. An in-place UI load keeps the
   // instance on purpose (#570 P0b): re-minting there would reject the agent's own
-  // follow-up commands mid-conversation. The reply reports whatever is live, so that path
-  // simply matches the fence and the orchestrator has nothing to say.
+  // follow-up commands mid-conversation. That path therefore simply matches the fence.
   const body = graphLoadBody();
   assert.match(body, /__cmcpKeepInstance: true/, "the in-place keep-instance option is intact");
+});
+
+test("#1478 ROOT CAUSE: an API-format load forks the per-instance uuid", () => {
+  // This is the claim the whole PR rests on, and the one an earlier investigation got
+  // wrong by measuring the workflow OBJECT instead of its identity.
+  //
+  // `loadApiJson` reaches the creation-boundary wrapper WITHOUT `__cmcpKeepInstance`, so
+  // the KEEP branch is unreachable and this predicate decides. API/prompt JSON has no
+  // `extra`, so the incoming uuid is undefined — which differs from the fenced cached
+  // uuid, so the wrapper drops the object's cached uuid and mints a fresh one ONTO THE
+  // SAME OBJECT.
+  //
+  // Hence: the object is unchanged (`afterIsSameObject: true`) while the identity moves.
+  // "The object did not change" is NOT evidence that the fence survived, and the fence
+  // keys on the uuid.
+  assert.equal(
+    shouldForkInPlaceReload({ cachedUuid: "e592452b-c172-416d-a8bc-0ec6b96b56e1", incomingUuid: undefined }),
+    true,
+    "a fenced workflow + API JSON carrying no embedded uuid ⇒ the identity is re-minted",
+  );
+  // The contrast that proves the above is about the MISSING carrier, not about forking
+  // always: the same content reloaded (matching embedded uuid) keeps the instance.
+  assert.equal(
+    shouldForkInPlaceReload({
+      cachedUuid: "e592452b-c172-416d-a8bc-0ec6b96b56e1",
+      incomingUuid: "e592452b-c172-416d-a8bc-0ec6b96b56e1",
+    }),
+    false,
+    "the same uuid arriving back is a reload of the same content — no fork",
+  );
 });
