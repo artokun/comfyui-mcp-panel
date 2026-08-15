@@ -8,15 +8,9 @@
 // real clock is a slow test that eventually becomes a flaky one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  OBJECT_INFO_CACHE_TTL_MS,
-  // #1161 — the timeout arm returns the outcome WRAPPER so the refusal can state its
-  // cause; the tests assert that shape rather than a bare null.
-  CACHE_OUTCOME,
-  // The SHIPPED bound, so a test cannot pass against a value the panel does not use.
-  OBJECT_INFO_READ_WAIT_MS,
-  createObjectInfoCache,
-} from "../../web/js/lib/object-info-cache.js";
+import { OBJECT_INFO_CACHE_TTL_MS, createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
+import { noBackendAnswerEstablished } from "../../web/js/lib/object-info-snapshot.js";
 
 const DEFS = { KSampler: {}, CLIPTextEncode: {} };
 const clock = (start = 1000) => {
@@ -246,127 +240,200 @@ test("#716: a retired request cannot overwrite a newer value — deterministical
   );
 });
 
+// ---------------------------------------------------------------------------
+// #1178 — WHERE THE BOUND FOR #1161 LIVES, and why it may not live here.
+//
+// #1161 was the 30s hang: after a ComfyUI restart the tab can hold a half-open
+// connection, so `api.getNodeDefs()` never settles and every `graph_set_widget`
+// parked until the caller's timeout. Three attempts on #1178 put the bound in THIS
+// file — on the burst cache's own read — and every one of them traded the hang for a
+// refusal. #1179 shipped the answer instead: bound each TRANSPORT inside
+// `fetchWholeObjectInfo`, so a hung client route falls through to the `GET
+// /object_info` fallback #982 added for exactly this failure, and the write SUCCEEDS.
+//
+// A bound here cannot do that. It sits ABOVE the oracle, so it can only choose how to
+// FAIL — and because it would have to be shorter than the oracle's deadline to fire at
+// all, it pre-empts the fallback route before that route is ever asked. Measured on the
+// #1178 branch against this same production loader shape: refused at 8003ms, where the
+// shipped code answers with a usable schema at 10010ms.
+//
+// These three tests pin that outcome from the call site's side, so the next person to
+// reach for a cache-level bound gets a failing test with the reason rather than a fourth
+// rediscovery. Refs artokun/comfyui-mcp-panel#1161.
+// ---------------------------------------------------------------------------
 
-// ── #1161: a fetch that never settles must not park the caller ───────────────
-//
-// The only open P1. After a ComfyUI restart the tab can hold a half-open connection, so
-// getNodeDefs() never settles. graph_set_widget is the one command that consults
-// /object_info before writing, so it alone hung — 30s timeouts on every node while every
-// other command answered instantly — and coalescing made it permanent, because every
-// later read joined the same dead promise.
-//
-// The bound ONLY stops the caller waiting. It deliberately does not retire the request:
-// two earlier attempts did, and each converted a merely SLOW backend into a permanent
-// refusal that was measurably worse than the bug. Everything the cache already guarantees
-// — one fetch per burst, the late payload cached for the next call, staleness governed by
-// invalidate() — is left intact.
-//
-// Nothing here awaits a promise that may not settle: a test that detects its bug by
-// hanging `node --test` (which has no default timeout) reports a wedged suite instead of
-// naming the broken invariant.
-function boundedCache({ waitMs = OBJECT_INFO_READ_WAIT_MS, ttlMs = OBJECT_INFO_CACHE_TTL_MS } = {}) {
-  const timers = new Set();
-  const clock = { t: 1_000_000 };
-  const cache = createObjectInfoCache({
-    ttlMs,
-    waitMs,
-    now: () => clock.t,
-    setTimer: (fn, ms) => { const t = { fn, ms }; timers.add(t); return t; },
-    clearTimer: (t) => timers.delete(t),
-  });
-  return { cache, clock, armed: () => timers.size, fireTimers: () => [...timers].forEach((t) => { timers.delete(t); t.fn(); }) };
+/** A transport that never settles — the half-open connection #1161 was reported on. */
+const NEVER_SETTLES = () => new Promise(() => {});
+
+/**
+ * A deterministic scheduler for the oracle's injected `timers`/`now`.
+ *
+ * The clock advances ONLY when a timer fires, so `elapsed()` is the simulated time the
+ * bound actually waited — which is the assertion that distinguishes "the oracle's bound
+ * answered" from "something else did". A test that slept for a real 10s would be the slow
+ * test this file's header warns about.
+ */
+function fakeSchedule() {
+  let t = 0;
+  let seq = 0;
+  const pending = new Map();
+  return {
+    now: () => t,
+    timers: {
+      setTimer: (fn, ms) => {
+        const id = ++seq;
+        pending.set(id, { at: t + ms, fn });
+        return id;
+      },
+      clearTimer: (id) => pending.delete(id),
+    },
+    elapsed: () => t,
+    /** Advance to the earliest armed timer and fire it. False when none is armed. */
+    fireNext() {
+      let pick = null;
+      for (const [id, entry] of pending) if (pick === null || entry.at < pick.entry.at) pick = { id, entry };
+      if (pick === null) return false;
+      pending.delete(pick.id);
+      t = pick.entry.at;
+      pick.entry.fn();
+      return true;
+    },
+  };
 }
-// The cause is part of the contract, not decoration: without it both call sites compute an
-// empty failure list and the refusal tells the user to hand-check a healthy backend. Review
-// found four of these tests passed with `failures` empty, so the helper asserts it.
-const gaveUp = (o) =>
-  o &&
-  typeof o === "object" &&
-  o[CACHE_OUTCOME] === true &&
-  o.defs === null &&
-  Array.isArray(o.failures) &&
-  o.failures.length > 0 &&
-  // …and short enough to survive the oracle's 200-char per-entry truncation, or the
-  // sentence the user reads ends mid-word.
-  String(o.failures[0]).length <= 200;
 
-// Await a read WITHOUT the ability to hang. `node --test` has no default timeout and waits
-// for the event loop to drain, so a read that never settles wedges the whole suite —
-// reporting a timeout with no clue which invariant broke, and leaving a pending promise
-// alive even when the assertion before it already failed. Round 2 of this review caught
-// exactly that. A real bound here turns "the suite hung" into a named failure.
-const settled = (p, what) =>
-  Promise.race([
-    p,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${what} never settled — the bound did not apply to it`)), 250),
+/**
+ * Await `promise`, firing scheduled timers whenever it is not making progress on its own.
+ *
+ * NEVER awaits a promise that may not settle without also driving the clock forward, which
+ * is what turns a broken bound into a FAILING test rather than a hung `node --test` run.
+ */
+async function settleWith(schedule, promise) {
+  let done = false;
+  let result;
+  let failure;
+  promise.then(
+    (v) => {
+      done = true;
+      result = v;
+    },
+    (e) => {
+      done = true;
+      failure = e ?? new Error("rejected with a falsy value");
+    },
+  );
+  for (let i = 0; i < 100 && !done; i++) {
+    // Drain microtasks first: a step that answers on its own must not be charged a timer.
+    for (let k = 0; k < 20 && !done; k++) await Promise.resolve();
+    if (done) break;
+    // NOTHING ARMED IS NOT THE SAME AS STUCK. The last bounded step clears its timer the
+    // moment it settles, so the final turns of the chain run with an empty schedule — an
+    // earlier version of this driver read that as "no progress possible" and failed a test
+    // whose subject had in fact already answered. Give the chain a full macrotask before
+    // concluding anything, and only then give up.
+    if (!schedule.fireNext()) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (done) break;
+      if (!schedule.fireNext()) break;
+    }
+  }
+  assert.ok(done, "the read never settled — the bound the oracle installs did not fire");
+  if (failure) throw failure;
+  return result;
+}
+
+test("#1178/#1179: a hung client route still reaches the fallback THROUGH the burst cache", async () => {
+  // The production loader shape, exactly as `graph_set_widget` and `graph_remove_widget`
+  // build it: the whole-schema oracle, read through this cache. The client route never
+  // answers; the HTTP route does. The write must be AUTHORIZED, not refused.
+  const schedule = fakeSchedule();
+  const cache = createObjectInfoCache({ now: clock().now });
+  const deadlineMs = 1000;
+  let httpCalls = 0;
+  const outcome = await settleWith(
+    schedule,
+    cache.read(() =>
+      fetchWholeObjectInfo({
+        getNodeDefs: NEVER_SETTLES,
+        fetchApi: async () => {
+          httpCalls += 1;
+          return { ok: true, status: 200, json: async () => ({ KSampler: {}, VAELoader: {} }) };
+        },
+        deadlineMs,
+        timers: schedule.timers,
+        now: schedule.now,
+      }),
     ),
-  ]);
-
-test("#1161: a fetch that never settles is bounded instead of parking the caller", async () => {
-  const { cache, fireTimers } = boundedCache();
-  const read = cache.read(() => new Promise(() => {}));
-  fireTimers();
-  const outcome = await settled(read, "the bounded read");
-  assert.ok(gaveUp(outcome), "the read gives up on THIS call rather than hanging");
-  // It must say WHY: a bare null makes both call sites compute an empty failure list, so
-  // the refusal names no cause and tells the user to hand-check a healthy backend.
-  assert.match(String(outcome.failures?.[0] ?? ""), new RegExp(`did not answer within ${OBJECT_INFO_READ_WAIT_MS}ms`)); // eslint-disable-line
-  void /x/; // ${OBJECT_INFO_READ_WAIT_MS}ms/);
+  );
+  assert.equal(httpCalls, 1, "the fallback route #982 added must actually be asked");
+  assert.deepEqual(Object.keys(outcome.defs ?? {}), ["KSampler", "VAELoader"], "and its answer must reach the fence");
+  // ELAPSED, not merely the outcome: the answer arrives when the CLIENT ROUTE'S share of
+  // the oracle budget runs out (half of it, per object-info-oracle.js), which is the proof
+  // that the oracle's bound is what released this call. A cache-level bound would have to
+  // fire before this to matter, and firing before this is precisely what skips the fallback.
+  assert.equal(schedule.elapsed(), deadlineMs / 2, "released by the oracle's client-route bound");
 });
 
-test("#1161: a JOINER is bounded too — the burst case the bug was reported on", async () => {
-  // The first attempt bounded only the issuing call, so every overlapping call still
-  // parked until the orchestrator's 30s timeout. #716 built this cache for bursts, so
-  // that is the case that matters most.
-  const { cache, fireTimers, armed } = boundedCache();
-  const reads = [cache.read(() => new Promise(() => {})), cache.read(() => new Promise(() => {})), cache.read(() => new Promise(() => {}))];
-  assert.equal(armed(), 3, "every caller arms its own bound, not just the issuer");
-  fireTimers();
-  for (const [i, p] of reads.entries()) assert.ok(gaveUp(await settled(p, `caller ${i}`)), `caller ${i} must give up rather than park`);
+test("#1178: the burst cache arms NO timer of its own — the bound belongs one layer down", async () => {
+  // The decisive guard, written against the CALL rather than the source text so a rename
+  // cannot slip past it. Re-introducing `withTimeout(...)` in `read()` — for the issuer or
+  // for a joiner — arms a real timer here and fails this test with the reason.
+  const realSetTimeout = globalThis.setTimeout;
+  let armed = 0;
+  globalThis.setTimeout = (...args) => {
+    armed += 1;
+    return realSetTimeout(...args);
+  };
+  try {
+    const cache = createObjectInfoCache({ now: clock().now });
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const issuer = cache.read(async () => {
+      await gate;
+      return DEFS;
+    });
+    const joiner = cache.read(async () => DEFS); // coalesces onto the request above
+    release();
+    assert.equal(await issuer, DEFS);
+    assert.equal(await joiner, DEFS, "a joiner gets the same answer, unbounded and unmodified");
+    assert.equal(
+      armed,
+      0,
+      "the cache must not bound its own read: a bound here can only pre-empt the oracle's " +
+        "fallback route, which is how #1178's three attempts each turned the hang into a refusal",
+    );
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
 });
 
-test("#1161: a SLOW backend still works — the late payload is cached for the next call", async () => {
-  // The regression both earlier attempts shipped. Retiring the request on timeout threw
-  // away its own late answer, so a remote or still-loading ComfyUI refused FOREVER: worse
-  // than the bug, which at least cached the payload once it arrived.
-  const { cache, fireTimers } = boundedCache();
-  const defs = { KSampler: {} };
-  let land;
-  const slow = new Promise((resolve) => { land = resolve; });
-  const first = cache.read(() => slow);
-  fireTimers();
-  assert.ok(gaveUp(await settled(first, "the first call")), "the first call gives up waiting");
-  land(defs);
-  await slow;
-  await new Promise((r) => setTimeout(r, 0));
-  let refetched = 0;
-  const second = await cache.read(() => { refetched++; return Promise.resolve({ other: {} }); });
-  assert.equal(refetched, 0, "the late answer populated the cache");
-  assert.deepEqual(second, defs, "…so the next call succeeds instead of refusing forever");
-});
-
-test("#1161: one fetch per burst survives the bound — no request storm", async () => {
-  // Retiring the slot let each bounded-out read issue ANOTHER un-abortable /object_info,
-  // against a browser limit of six connections per host. The slot must stay.
-  const { cache, fireTimers } = boundedCache();
-  let issued = 0;
-  const reads = [];
-  for (let i = 0; i < 5; i++) reads.push(cache.read(() => { issued++; return new Promise(() => {}); }));
-  fireTimers();
-  for (const p of reads) assert.ok(gaveUp(await settled(p, "a burst read")));
-  assert.equal(issued, 1, "a burst against a hung backend must still cost exactly one fetch");
-});
-
-test("#1161: a healthy fetch, a rejection, and the timer cleanup are all unaffected", async () => {
-  const { cache, armed } = boundedCache();
-  const defs = { KSampler: {} };
-  assert.deepEqual(await cache.read(() => Promise.resolve(defs)), defs);
-  assert.equal(armed(), 0, "a settled read leaves no timer armed");
-  // A REJECTION must still propagate. withTimeout never rejects by contract, so the
-  // outcome is reified before it is bounded and unwrapped after — otherwise a network
-  // error that fails instantly would be reported to the user as "did not answer within
-  // 8000ms", which is false. Three #716 tests pin this, and they caught it.
-  const other = boundedCache().cache;
-  await assert.rejects(other.read(() => Promise.reject(new Error("backend down"))), /backend down/);
+test("#1178/#1223: a fully silent backend rides through the cache as SILENCE, not as an answer", async () => {
+  // What the cache hands back when neither route answers has to stay the ORACLE's outcome,
+  // tags and all. #1223's snapshot fallback is licensed on exactly that distinction, so a
+  // cache that substituted a note of its own would disable the fallback for every caller AND
+  // make the refusal name a cause that never happened — the #982 defect, committed one layer
+  // up. (Measured on the #1178 branch: `outcomes` arrived null and the refusal read "the
+  // backend ANSWERED the schema probe with something unusable", which it had not.)
+  const schedule = fakeSchedule();
+  const cache = createObjectInfoCache({ now: clock().now });
+  const outcome = await settleWith(
+    schedule,
+    cache.read(() =>
+      fetchWholeObjectInfo({
+        getNodeDefs: NEVER_SETTLES,
+        fetchApi: NEVER_SETTLES,
+        deadlineMs: 1000,
+        timers: schedule.timers,
+        now: schedule.now,
+      }),
+    ),
+  );
+  // NO FABRICATED SUCCESS. The read is what AUTHORIZES the write, so it runs before any
+  // mutation — a call that ends here refused without touching the graph, and says so.
+  assert.equal(outcome.defs, null, "silence must never read as a usable schema");
+  assert.ok(outcome.failures.length >= 2, "every route that did not answer is named");
+  assert.equal(
+    noBackendAnswerEstablished(outcome.outcomes),
+    true,
+    "the transport tags must survive the cache, or #1223's snapshot fallback is dead on this path",
+  );
 });

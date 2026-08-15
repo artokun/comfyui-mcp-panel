@@ -60,48 +60,16 @@
  * single definition would become the cached schema. A Symbol cannot appear in JSON, so
  * only a producer that deliberately tagged its result can be mistaken for one.
  */
-import { withTimeout } from "./bounded-step.js";
-
 export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
 
 /** How long a fetched payload may be reused. */
 export const OBJECT_INFO_CACHE_TTL_MS = 1500;
 
 /**
- * #1161 — how long a read will WAIT for a fetch before giving up on THIS call.
- *
- * Unbounded was the P1: after a ComfyUI restart the tab can hold a half-open connection,
- * so `getNodeDefs()` never settles. `graph_set_widget` (and `graph_remove_widget`) consult
- * /object_info before writing, so it alone parked forever — every other command on the
- * same tab answered instantly, which is exactly how the report reads.
- *
- * The coalescing below is what made it permanent rather than transient: a hung request
- * stays in the `inflight` slot, so every later read JOINS the same dead promise instead
- * of issuing its own. Nothing settles it, so nothing clears it, and the command is broken
- * for the rest of the session.
- *
- * This is the same hazard the startup seed already bounds, in the same words: "a request
- * that never settles (a hung/half-open connection) would otherwise block the awaiting
- * tool FOREVER. Bounding the wait converts that hang into the correct outcome." Matching
- * that 8s deliberately — the two waits are the same decision about the same endpoint, and
- * a reader comparing them should not have to wonder why they differ.
- */
-export const OBJECT_INFO_READ_WAIT_MS = 8000;
-
-/**
  * @param {{ttlMs?: number, now?: () => number}} [opts] `now` is injectable so tests do not
  *   depend on wall-clock timing, which is how a cache test becomes a flaky test.
  */
-export function createObjectInfoCache({
-  ttlMs = OBJECT_INFO_CACHE_TTL_MS,
-  now = () => Date.now(),
-  waitMs = OBJECT_INFO_READ_WAIT_MS,
-  // Injectable so the bound can be tested without a real 8s wait — the same reason `now`
-  // is injectable. A test that sleeps for the timeout is a slow test that eventually
-  // becomes a flaky one.
-  setTimer = (fn, ms) => setTimeout(fn, ms),
-  clearTimer = (t) => clearTimeout(t),
-} = {}) {
+export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = () => Date.now() } = {}) {
   let value = null;
   let at = 0;
   let inflight = null;
@@ -115,67 +83,6 @@ export function createObjectInfoCache({
   // rather than merely forgetting the value it will produce.
   let generation = 0;
 
-  // #1161 — the timeout note, built once. It is the whole reason the bound returns the
-  // #982 wrapper rather than a bare null: without a stated cause both call sites compute
-  // an empty failure list, and the refusal tells the user to hand-check a backend that
-  // answers /object_info perfectly well.
-  const timedOutOutcome = () => ({
-    [CACHE_OUTCOME]: true,
-    defs: null,
-    failures: [
-      `/object_info did not answer within ${waitMs}ms, so this call stopped waiting. The ` +
-        `request is still running; retry shortly. The backend may be healthy.`,
-    ],
-  });
-
-  /**
-   * Hand a caller the in-flight request, but never let it wait forever.
-   *
-   * Applied to EVERY caller — issuer and joiner alike — because the bound belongs where a
-   * promise is handed out, not where it is created. The first attempt at #1161 bounded
-   * only the issuer, so every concurrent reader still parked on the raw promise, and the
-   * burst case the bug was actually reported on was unfixed.
-   *
-   * Uses the repo's ONE bounded-step primitive rather than a second timeout helper, whose
-   * header says exactly why: "A second timeout helper written alongside the first is how
-   * this repo keeps producing near-duplicate bugs." Two hand-rolled attempts here proved
-   * it. Its at-most-once contract is what stops a joiner receiving a payload this call
-   * already gave up on, and it never rejects, so a throwing timer cannot reinstate the
-   * unbounded wait it exists to remove.
-   *
-   * IT ONLY STOPS THE CALLER WAITING. It does not retire the request, and that is the
-   * whole correction: an earlier version cleared the inflight slot and advanced the
-   * generation, which discarded the fetch's own late payload and converted a merely SLOW
-   * backend — a remote or tunnelled ComfyUI, a 5MB /object_info still loading custom
-   * nodes — into a permanent refusal, measurably worse than the bug. Leaving the request
-   * alone keeps every existing invariant: one fetch per burst, the late payload cached for
-   * the next call, and staleness still governed by invalidate()'s generation bump.
-   */
-  // NOT a bare `withTimeout(request, …)`. That helper NEVER rejects by contract — a
-  // rejected promise degrades through `onTimeout()` exactly as a timeout does — and this
-  // cache must keep propagating a failed fetch. Three #716 tests pin that, and they caught
-  // the regression: without this, a network error that fails instantly would be reported
-  // to the user as "/object_info did not answer within 8000ms", which is simply false.
-  //
-  // So the outcome is REIFIED before it is bounded and unwrapped after: the helper still
-  // provides the settle-at-most-once and never-hang guarantees, while rejection stays a
-  // rejection and only a real timeout produces the timeout outcome.
-  const REJECTED = Symbol("object-info-read-rejected");
-  const boundRead = (request) =>
-    withTimeout(
-      request.then(
-        (v) => ({ v }),
-        (e) => ({ [REJECTED]: e }),
-      ),
-      waitMs,
-      () => ({ timedOut: true }),
-      { setTimer, clearTimer },
-    ).then((r) => {
-      if (r && r.timedOut) return timedOutOutcome();
-      if (r && REJECTED in r) throw r[REJECTED];
-      return r.v;
-    });
-
   return {
     /**
      * Read through the cache.
@@ -188,14 +95,7 @@ export function createObjectInfoCache({
       // that check an invalidation could be overtaken by the very request it was meant to
       // retire. Coalescing matters: a burst arriving faster than the fetch completes would
       // otherwise still issue one request per caller, which is the reported symptom moved.
-      // #1161 — a JOINER is bounded too. The first version of this fix installed the bound
-      // only below, on the path that ISSUES the request, so this early return handed every
-      // concurrent caller the raw unbounded promise and the P1 survived for exactly the
-      // case that matters: #716 built this cache for BURSTS of widget writes, so after a
-      // restart the issuing call gave up at the bound while every overlapping call parked
-      // until the orchestrator's 30s timeout. The bound belongs where a promise is handed
-      // to a caller, not where it is created.
-      if (inflight && inflightGeneration === generation) return boundRead(inflight);
+      if (inflight && inflightGeneration === generation) return inflight;
       const issuedAt = generation;
       // An id captured BEFORE the promise exists, because `finally` must not name the
       // binding it is being assigned to: a fetchDefs() that throws SYNCHRONOUSLY runs the
@@ -256,7 +156,7 @@ export function createObjectInfoCache({
       inflight = request;
       inflightGeneration = issuedAt;
       inflightId = requestId;
-      return boundRead(request);
+      return request;
     },
 
     /**
