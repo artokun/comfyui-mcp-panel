@@ -41,6 +41,15 @@
  * the deadline RE-READS the document instead of deciding on the stale sample
  * that armed it.
  *
+ * WHAT IT SUBSCRIBES TO, AND WHY IT IS NOT THE RAIL. The rail element is a
+ * gate, never a handle: its existence proves "this page has a sidebar we
+ * understand" (no rail, no evidence, no claim), and nothing more. The
+ * subscription that drives sampling watches the DOCUMENT, because ComfyUI
+ * destroys and recreates the rail on focus-, linear- and builder-mode
+ * transitions — a subscription pinned to the first one goes permanently deaf
+ * the first time a user toggles focus mode, which is how a fully tested
+ * watchdog ends up unable to run. See `pollForRail` for the frontend citations.
+ *
  * WHAT THIS DELIBERATELY DOES NOT CHECK — and why (Copilot review, PR #804).
  * An earlier draft also reported "the rail exists but our tab button never
  * joined it within 10s", meaning to catch a frontend that accepts
@@ -346,16 +355,57 @@ export function installSidebarRenderWatchdog({
     if (stopped) return;
     pollTimer = null;
     const t = now();
-    const rail = doc.querySelector(".side-tool-bar-container");
-    if (rail && railSeenAt == null) {
+    const railExists = !!doc.querySelector(".side-tool-bar-container");
+    if (railExists && railSeenAt == null) {
       railSeenAt = t;
-      // The rail exists — from here on, selection changes are observable.
-      // Same subscription the sidebar guard uses: tab selection toggles a
-      // class on the rail's buttons in every frontend generation we know.
+      // A rail exists — from here on, selection changes are observable, so
+      // subscribe. NOTE WHAT IS **NOT** SUBSCRIBED TO: the rail element.
+      //
+      // ComfyUI does not keep one rail element for the life of the page. The
+      // rail is `v-if`-gated, so it is DESTROYED AND RECREATED, not hidden —
+      // verified in the shipped frontend at 1.47.12, 1.48.7, 1.50.3 and 1.51.5:
+      //
+      //   src/components/graph/GraphCanvas.vue
+      //     <SideToolbar v-if="showUI && !isBuilderMode && !linearMode" />
+      //     const showUI = computed(() => !workspaceStore.focusMode && betaMenuEnabled.value)
+      //
+      // and linear mode mounts a SECOND, separate instance of its own
+      // (src/views/LinearView.vue). So focus mode, linear mode and builder mode
+      // each replace the <nav> with a brand-new element. An earlier draft bound
+      // here and then stopped polling for good; after the first such toggle the
+      // subscription pointed at a node that had left the document, nothing was
+      // left to call sample(), and selections on the REPLACEMENT rail were
+      // never sampled — the watchdog went silent in exactly the way it exists
+      // to prevent, while its tests stayed green. Found in review of PR #804.
+      //
+      // The document is the one anchor in this page that cannot be replaced, so
+      // that is what we watch. Nothing about a rail is retained, there is no
+      // reference that can go stale, and no re-binding step exists to get wrong
+      // — the failure is removed rather than detected. `sample()` already reads
+      // the selected button at DOCUMENT scope, so it never cared which rail it
+      // was looking at; only this subscription did.
+      //
+      // childList as well as class, because the two halves of a remount are
+      // different mutations: the user toggling tabs on the new rail is a class
+      // change, but a rail rebuilt WHILE our tab is active comes back with its
+      // button already selected — no attribute ever transitions on it, and the
+      // only observable is that the element appeared.
+      //
+      // Cost: the callback is `sample()` — two querySelectors and some
+      // arithmetic — and MutationObserver batches records into ONE callback per
+      // microtask checkpoint rather than one per record. It also disconnects
+      // for good the moment the check resolves either way (stop() on
+      // fired/satisfied), which for anyone who opens the panel is a second or
+      // two after first paint.
       observer = makeObserver(() => sample());
       if (observer) {
         try {
-          observer.observe(rail, { subtree: true, attributes: true, attributeFilter: ["class"] });
+          observer.observe(doc.documentElement ?? doc, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ["class"],
+          });
         } catch {
           observer = null; // fall back to the poll below
         }
@@ -365,10 +415,11 @@ export function installSidebarRenderWatchdog({
     // rail stops emitting class mutations does not blind the check entirely.
     if (railSeenAt != null) sample();
     if (stopped) return;
-    // Once the observer is watching the rail, it drives sampling and the poll
-    // has nothing left to discover. Without one, keep trickling until the
-    // give-up bound. A page that never grows a rail we recognize simply goes
-    // quiet forever — no rail, no evidence, no claim.
+    // Once the observer is watching, it drives sampling and the poll has
+    // nothing left to discover — and because it watches the document rather
+    // than one element, that stays true across every rail remount. Without one,
+    // keep trickling until the give-up bound. A page that never grows a rail we
+    // recognize simply goes quiet forever — no rail, no evidence, no claim.
     if (observer != null || t - startedAt >= giveUpMs) return;
     pollTimer = setTimer(pollForRail, pollMs);
   };

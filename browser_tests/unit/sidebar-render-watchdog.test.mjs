@@ -286,7 +286,25 @@ function harness({
     getFrontendVersion: () => "9.9.9",
     report: (line) => reports.push(line),
     makeObserver: (cb) => {
-      const o = { cb, observe() {}, disconnect() {} };
+      // A real MutationObserver is REGISTERED ON A NODE. It hears mutations in
+      // that node's tree and nowhere else, and it keeps hearing nothing at all
+      // once that node is detached from the document. The first version of this
+      // stub ignored `observe()`'s target and `mutate()` fired every observer
+      // unconditionally — which made a rail-bound subscription and a
+      // document-bound one indistinguishable, and hid the remount defect below.
+      const o = {
+        cb,
+        target: null,
+        opts: {},
+        observe(node, opts) {
+          this.target = node;
+          this.opts = opts || {};
+        },
+        disconnect() {
+          this.target = null;
+          this.opts = {};
+        },
+      };
       observers.push(o);
       return o;
     },
@@ -318,12 +336,61 @@ function harness({
     clock = until;
   }
 
-  /** Fire every live MutationObserver callback, as a rail class change would. */
-  function mutate() {
-    for (const o of observers) o.cb();
+  /**
+   * A DOM mutation happens. Two things decide whether an observer hears it, and
+   * the stub models both because the defect below hides if either is faked:
+   *
+   *  - WHERE it is registered. A real MutationObserver only hears mutations in
+   *    the tree of the node it was given. A node the frontend has unmounted is
+   *    detached and mutates no more, so a subscription left on a replaced rail
+   *    hears nothing ever again.
+   *  - WHAT it subscribed to. `{attributes:true}` does not deliver childList
+   *    records, so an element that is BORN with the class already set produces
+   *    no attribute record at all — only the insertion is observable.
+   *
+   * @param {"attributes"|"childList"} kind
+   */
+  function mutate(kind = "attributes") {
+    for (const o of observers) {
+      const reachable = o.target === doc || (state.rail != null && o.target === state.rail);
+      if (reachable && o.opts[kind]) o.cb();
+    }
   }
 
-  return { state, reports, advance, mutate, handle, timersLeft: () => timers.length };
+  /**
+   * ComfyUI unmounts the rail and mounts a fresh one. Verified in the shipped
+   * frontend at 1.47.12 / 1.48.7 / 1.50.3 / 1.51.5: the rail is `v-if`-gated,
+   * `<SideToolbar v-if="showUI && !isBuilderMode && !linearMode" />` in
+   * src/components/graph/GraphCanvas.vue, where `showUI` is
+   * `!workspaceStore.focusMode && betaMenuEnabled`. Linear mode is a SECOND,
+   * separate instance (src/views/LinearView.vue). So focus mode, linear mode
+   * and builder mode each replace the element with a brand-new <nav>.
+   *
+   * The old element leaving and the new one arriving are childList mutations,
+   * not attribute ones.
+   */
+  function remountRail(tag = "rail") {
+    state.rail = { tag, n: (remountRail.n = (remountRail.n || 0) + 1) };
+    mutate("childList");
+    return state.rail;
+  }
+
+  return {
+    state,
+    reports,
+    advance,
+    mutate,
+    remountRail,
+    handle,
+    observers,
+    timersLeft: () => timers.length,
+    /** Observers still registered on a node that has left the document. */
+    staleObservers: () =>
+      observers.filter(
+        (o) => o.target != null && o.target !== doc && o.target !== state.rail,
+      ),
+    liveObservers: () => observers.filter((o) => o.target != null),
+  };
 }
 
 test("#779 installer: the healthy first open reports nothing and stands down", () => {
@@ -508,6 +575,155 @@ test("#779 installer: a button that appeared and later VANISHED stays silent", (
   h.state.button = false; // …and now it is gone
   h.advance(20000);
   assert.equal(h.reports.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// The rail REMOUNT. A watchdog that can only hear the first rail is a watchdog
+// that cannot run — the failure shape this project pays for most often.
+// ---------------------------------------------------------------------------
+
+test("#779 P1: a rail REMOUNT must not deafen the watchdog", () => {
+  // Found in pre-merge review of PR #804, reproduced here before fixing.
+  //
+  // The first draft subscribed to the rail ELEMENT and then stopped polling for
+  // good ("once the observer is watching the rail, the poll has nothing left to
+  // discover"). ComfyUI does not keep one rail element for the life of the
+  // page: entering or leaving focus mode / linear mode unmounts the sidebar and
+  // mounts a fresh one. From that instant the subscription pointed at a node
+  // that had left the document, and nothing was left to call sample() — so a
+  // selection on the REPLACEMENT rail was never sampled, and the exact silence
+  // this module exists to break came back.
+  //
+  // Nothing here is about the panel: the panel is broken in precisely the #779
+  // way throughout. Only the detector changes.
+  const h = harness();
+  h.state.rail = { tag: "first" };
+  h.state.button = true;
+  h.advance(60); // the poll finds the rail and subscribes
+
+  h.remountRail("replacement"); // focus-mode toggle: a NEW rail element
+  h.advance(60);
+
+  h.state.selected = modernButton(OURS); // the user opens the Agent tab…
+  h.mutate(); // …and its selection class lands on the new rail
+  h.advance(500); // …and nothing ever paints (windowMs 300 + slack)
+
+  assert.equal(
+    h.reports.length,
+    1,
+    "starvation after a rail remount must still be reported — this is the whole charter",
+  );
+  assert.match(h.reports[0], /no panel content exists/);
+});
+
+test("#779 P1: a rail already carrying our selection when it mounts is still caught", () => {
+  // The other half of the remount, and the reason a class-attribute
+  // subscription alone is not enough: when the frontend rebuilds the rail while
+  // our tab is the active one, the replacement button is BORN selected. There
+  // is no class transition to hear on it — the only observable is that the
+  // element appeared. A detector that watches only attribute changes sleeps
+  // through this one.
+  const h = harness();
+  h.state.rail = { tag: "first" };
+  h.state.button = true;
+  h.advance(60);
+
+  h.state.selected = modernButton(OURS); // our tab is open and healthy…
+  h.state.painted = true;
+  h.mutate();
+  h.advance(20); // …but not yet long enough to retire the watchdog
+
+  h.state.painted = false; // the remount takes our content with it…
+  h.remountRail("replacement"); // …and the new rail is born with us selected
+  h.advance(500);
+
+  assert.equal(h.reports.length, 1, "a re-render that never comes back is starvation");
+});
+
+test("#779 P1: many remounts still produce exactly ONE line, never one per remount", () => {
+  // The re-arming-notice flood (#1489) is a live bug in this panel, so a
+  // detector that re-binds must be held to the same bar it was built to:
+  // one line per genuine starvation, for the life of the page. A fix that
+  // re-installs state on every remount would pass the test above and fail here.
+  const h = harness();
+  h.state.rail = { tag: "first" };
+  h.state.button = true;
+  h.advance(60);
+  h.state.selected = modernButton(OURS);
+  h.mutate();
+  h.advance(500);
+  assert.equal(h.reports.length, 1, "the one line");
+
+  for (let i = 0; i < 8; i += 1) {
+    h.remountRail(`remount-${i}`);
+    h.state.selected = modernButton(OURS);
+    h.mutate();
+    h.advance(2000);
+  }
+  assert.equal(h.reports.length, 1, "eight more remounts, still exactly one line");
+  assert.equal(h.timersLeft(), 0, "a fired watchdog holds no timers across remounts");
+  assert.equal(h.liveObservers().length, 0, "…and no observers");
+});
+
+test("#779 P1: a healthy panel stays silent across remounts, and still retires", () => {
+  // The false-positive direction of the same change: re-binding must not turn a
+  // perfectly normal focus-mode toggle into a report.
+  const h = harness();
+  h.state.rail = { tag: "first" };
+  h.state.button = true;
+  h.advance(60);
+  h.state.selected = modernButton(OURS);
+  h.state.painted = true;
+  h.mutate();
+  h.advance(400); // the paint survives the confirmation dwell → satisfied
+  assert.equal(h.handle.sample().state, "satisfied");
+
+  h.remountRail("replacement");
+  h.state.painted = false; // mid-transition there is genuinely nothing painted
+  h.mutate();
+  h.advance(20000);
+  assert.equal(h.reports.length, 0, "a retired watchdog never speaks again");
+  assert.equal(h.timersLeft(), 0);
+  assert.equal(h.liveObservers().length, 0, "and it let go of everything");
+});
+
+test("#779 P1: no rail element is ever retained, remounted or not", () => {
+  // "Nothing detached is held" is the other half of the defect: a subscription
+  // pinned to a replaced rail keeps a dead subtree reachable for the life of
+  // the page. The structural guarantee is that the watchdog never registers on
+  // a rail at all — so there is no reference that can go stale.
+  const h = harness();
+  h.state.rail = { tag: "first" };
+  h.state.button = true;
+  h.advance(60);
+  assert.equal(h.observers.length, 1, "one subscription, made once");
+  assert.notEqual(
+    h.observers[0].target,
+    h.state.rail,
+    "the subscription must not be pinned to the rail element",
+  );
+
+  for (let i = 0; i < 5; i += 1) {
+    h.remountRail(`remount-${i}`);
+    assert.equal(h.staleObservers().length, 0, "nothing is left watching a departed rail");
+    assert.equal(h.observers.length, 1, "…and no second subscription piles up");
+  }
+
+  h.handle.stop();
+  assert.equal(h.liveObservers().length, 0, "stop() disconnects everything");
+  assert.equal(h.timersLeft(), 0, "…and leaves no timer behind");
+  assert.equal(h.handle.sample().state, "stopped");
+});
+
+test("#779 P1: a remount before the rail is ever seen still arms nothing", () => {
+  // No-evidence-no-claim survives the change: a page whose rail we never saw
+  // must stay silent even if elements come and go, and must still stand down.
+  const h = harness();
+  h.state.selected = modernButton(OURS); // selected and empty the whole time
+  h.mutate();
+  h.advance(WATCHDOG_GIVE_UP_MS + 20000);
+  assert.equal(h.reports.length, 0, "no rail was ever seen, so nothing may speak");
+  assert.equal(h.timersLeft(), 0, "…and the poll stood down at the give-up bound");
 });
 
 // ---------------------------------------------------------------------------
