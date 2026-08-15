@@ -106,13 +106,19 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
    * issuance stamp across the await. A retirement mechanism added here in future is
    * classified here too, rather than silently reading as "live" at every call site.
    *
+   * @typedef {"live"|"cache"|"reconnected"|"retired"|"unknown"} Provenance
+   *
    * @param {() => Promise<any>} fetchDefs the real fetch
    * @param {{stamp?: () => unknown}} [opts] `stamp` is an opaque caller-owned token read at
    *   ISSUANCE and again at delivery — the panel passes its backend-reconnect epoch. This
    *   file never interprets it; it only reports whether it moved. Kept opaque on purpose:
    *   the cache has no business knowing what a reconnect IS, only that the caller has a
    *   fact that must not have changed underneath the request.
-   * @returns {Promise<{value: any, provenance: "live"|"cache"|"reconnected"|"retired"|"unknown"}>}
+   * @returns {Promise<{value: any, provenance: Provenance, provenanceNow: () => Provenance}>}
+   *   `provenance` is the verdict AT DELIVERY — a historical fact that never changes.
+   *   `provenanceNow()` recomputes it on every call, and a caller that awaits anything before
+   *   acting must use that one: definitions can be refreshed, installed, or reconnected during
+   *   those awaits, and each of those moves state the classification reads.
    */
   async function readInternal(fetchDefs, stamp) {
     const readStamp = typeof stamp === "function" ? stamp : null;
@@ -169,6 +175,13 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
         const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
         if (
           issuedAt === generation &&
+          // Round-6, and the same rule the forced path applies: a response that spanned a
+          // RECONNECT describes a backend process that no longer exists. The generation check
+          // above does not cover it — a reconnect can advance the stamp without bumping the
+          // generation — and storing it would serve the dead process's schema to every reader
+          // for the rest of the TTL. The response is still RETURNED to the caller that awaited
+          // it (correctly labelled "reconnected"); it is only refused a place in the cache.
+          stampSurvived({ readStamp, issuedStamp, stampUnreadable }) &&
           payload &&
           typeof payload === "object" &&
           Object.keys(payload).length > 0
@@ -256,6 +269,28 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
   /** A served or joined read: not live now, and no later moment can make it so. */
   const notLive = (why) => ({ provenance: why, provenanceNow: () => why });
 
+  /**
+   * Did the connection the REQUEST was issued on survive to now?
+   *
+   * Used to gate STORING a payload, not just labelling it. A response that spans a reconnect
+   * describes a backend process that no longer exists, and caching it would serve that dead
+   * process's schema to every reader for the rest of the TTL — turning one badly-timed
+   * response into a second and a half of them. The generation check beside it does not cover
+   * this: a reconnect can advance the stamp WITHOUT bumping the generation, which is exactly
+   * the gap that made a joiner report "live" below.
+   *
+   * Fails closed: an unreadable stamp establishes nothing, so nothing is stored.
+   */
+  function stampSurvived(rec) {
+    if (rec.stampUnreadable) return false;
+    if (!rec.readStamp) return true;
+    try {
+      return rec.readStamp() === rec.issuedStamp;
+    } catch {
+      return false;
+    }
+  }
+
   return {
     /**
      * Read through the cache. Unchanged contract: the payload only.
@@ -286,23 +321,17 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
      *      the exact symptom #716 exists to prevent, reintroduced on the recovery path.
      *
      * So this drops the stored value WITHOUT touching the generation or the ordinary in-flight
-     * slot, and keeps its own slot that concurrent forced readers join. A joiner gets "live"
-     * rather than "cache" because the request it rides was issued by a forced read — it
-     * bypassed the TTL by construction, which is the very thing a joiner normally cannot
-     * vouch for. Its own stamp is still captured at join and re-checked at delivery, so a
-     * reconnect landing on ONE joiner is reported to that joiner alone.
+     * slot, and keeps its own slot that concurrent forced readers join. A joiner may reach
+     * "live" — unlike on the ordinary path — because the request it rides was issued by a
+     * forced read and bypassed the TTL by construction, which is the one thing an ordinary
+     * joiner cannot vouch for.
+     *
+     * That is a claim about the PAYLOAD's age and nothing more. Every joiner is still judged
+     * against the REQUEST's issuance stamp, held on the record, because a request cannot
+     * vouch for a CONNECTION that changed after it was issued — see the note at the return.
      */
     async readFresh(fetchDefs, { stamp } = {}) {
       const readStamp = typeof stamp === "function" ? stamp : null;
-      let issuedStamp = null;
-      let stampUnreadable = false;
-      if (readStamp) {
-        try {
-          issuedStamp = readStamp();
-        } catch {
-          stampUnreadable = true;
-        }
-      }
       // Join a forced reread already running under the CURRENT generation. One issued under
       // an older generation is retired and must not be joined — that is what `invalidate()`
       // means, and this method deliberately does not weaken it.
@@ -310,7 +339,18 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
       if (!record) {
         const issuedAt = generation;
         const requestId = ++requestSeq;
-        const promise = (async () => {
+        // The issuance facts live ON THE RECORD, not in this call's scope — see the classify
+        // note below. A joiner must be judged against when the request it rides was ISSUED,
+        // and only the record knows that.
+        const rec = { issuedAt, id: requestId, readStamp, issuedStamp: null, stampUnreadable: false, promise: null };
+        if (readStamp) {
+          try {
+            rec.issuedStamp = readStamp();
+          } catch {
+            rec.stampUnreadable = true;
+          }
+        }
+        rec.promise = (async () => {
           // Yield first, for the same reason the ordinary path does: a synchronously throwing
           // fetchDefs must not run the finally before the slot below is assigned.
           await null;
@@ -319,8 +359,16 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
             const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
             // A forced read produces the freshest payload there is, so it is stored for
             // everyone — under the same still-current-generation and usable-payload guards
-            // the ordinary path applies, and never caching a failure.
-            if (issuedAt === generation && payload && typeof payload === "object" && Object.keys(payload).length > 0) {
+            // the ordinary path applies, and never caching a failure. Plus the stamp: a
+            // response that spanned a reconnect describes a process that is gone, and
+            // storing it would hand that dead schema to every reader for the whole TTL.
+            if (
+              issuedAt === generation &&
+              stampSurvived(rec) &&
+              payload &&
+              typeof payload === "object" &&
+              Object.keys(payload).length > 0
+            ) {
               value = Object.freeze(defs);
               at = now();
             }
@@ -329,11 +377,32 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
             if (freshInflight && freshInflight.id === requestId) freshInflight = null;
           }
         })();
-        record = { promise, issuedAt, id: requestId };
-        freshInflight = record;
+        record = rec;
+        freshInflight = rec;
       }
       const resolved = await record.promise;
-      return { value: resolved, ...verdict(record.issuedAt, issuedStamp, readStamp, stampUnreadable) };
+      // Classified against the RECORD's issuance stamp, never this caller's.
+      //
+      // This is the round-6 defect, and it is the round-5 lesson one level down. `readFresh`
+      // reports "live" to a joiner because the request it rides bypassed the TTL — true, but
+      // the TTL is about the PAYLOAD's age and the stamp is about the CONNECTION. A forced
+      // read issued on epoch A, a reconnect, then a second caller reaching here on epoch B:
+      // capturing the stamp per-caller compared B to B and called a response from the
+      // REPLACED backend live. Reachable whenever the reconnect-triggered node-def refresh
+      // coalesces with one already running, so `invalidate()` never fires and the generation
+      // never moves — and it would let the unreadable-combo fallback blind-write an off-list
+      // value against the old process's schema.
+      //
+      // A request cannot vouch for a connection that changed after it was issued, however
+      // fresh its payload is. Same delivery-time-vs-now distinction `provenanceNow` exists
+      // for, applied to WHICH moment the comparison is anchored at.
+      if (readStamp && !record.readStamp) {
+        // This caller wants reconnect detection on a request issued by one that did not, so
+        // the issuance epoch was never recorded and cannot be reconstructed. Nothing
+        // established, so nothing may read as live.
+        return { value: resolved, ...notLive("unknown") };
+      }
+      return { value: resolved, ...verdict(record.issuedAt, record.issuedStamp, record.readStamp, record.stampUnreadable) };
     },
 
     /**

@@ -379,6 +379,114 @@ test("#1126: two concurrent readFresh callers COALESCE and neither retires the o
   assert.equal(rb.provenance, "live", "and so does the joiner — it rode a forced read, not the TTL");
 });
 
+test("#1126: a JOINER on a reconnect-spanning forced read is NOT live", async () => {
+  // The round-6 defect, and the round-5 lesson one level down. `readFresh` reports "live" to
+  // a joiner because the request it rides bypassed the TTL — true of the PAYLOAD's age, and
+  // irrelevant to the CONNECTION. Capturing the stamp per-caller compared the joiner's own
+  // epoch to itself, so a response issued by the PREVIOUS backend process read as live.
+  //
+  // Reachable in production without any invalidate(): the reconnect-triggered node-def
+  // refresh can coalesce with one already running, so the generation never moves. The
+  // unreadable-combo fallback would then blind-write an off-list value against a schema
+  // published by a backend that no longer exists.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let epoch = 1;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  // Issued on epoch 1.
+  const issuer = cache.readFresh(async () => {
+    await gate;
+    return DEFS;
+  }, { stamp: () => epoch });
+  // …the backend process is replaced while that request is in flight…
+  epoch = 2;
+  // …and a second caller arrives, reading the CURRENT epoch as its own.
+  const joiner = cache.readFresh(async () => DEFS, { stamp: () => epoch });
+  release();
+  const [ri, rj] = [await issuer, await joiner];
+  assert.equal(ri.provenance, "reconnected", "the issuer sees its own stamp moved");
+  assert.equal(
+    rj.provenance,
+    "reconnected",
+    "and so must the joiner — it rode a request ISSUED on the replaced process",
+  );
+  assert.equal(rj.provenanceNow(), "reconnected", "…and re-asking does not launder it either");
+  assert.equal(rj.value, DEFS, "the payload is still delivered; only its authority is denied");
+});
+
+test("#1126: a reconnect-spanning response is never STORED — by either path", async () => {
+  // Labelling it is not enough. Caching a response from a replaced process would serve that
+  // dead schema to every later reader for the whole TTL, as "cache" — so one badly-timed
+  // response becomes a second and a half of them.
+  for (const method of ["readFresh", "readWithProvenance"]) {
+    const c = clock();
+    const cache = createObjectInfoCache({ now: c.now });
+    let epoch = 1;
+    const got = await cache[method](
+      async () => {
+        epoch = 2; // the reconnect lands mid-fetch
+        return DEFS;
+      },
+      { stamp: () => epoch },
+    );
+    assert.equal(got.provenance, "reconnected", `${method}: the caller is told`);
+    // The next reader must go to the server rather than being served the dead schema.
+    let refetched = false;
+    const after = await cache.read(async () => {
+      refetched = true;
+      return { Fresh: {} };
+    });
+    assert.equal(refetched, true, `${method}: the reconnect-spanning payload was not cached`);
+    assert.deepEqual(after, { Fresh: {} });
+  }
+});
+
+test("#1126: an UNREADABLE stamp stores nothing either — nothing established, nothing pinned", async () => {
+  // The storage rule has to fail closed for the same reason the classification does. If the
+  // caller's own connection-identity could not be read, this response cannot be shown to
+  // describe the CURRENT backend — so caching it would pin an unattributable schema for the
+  // whole TTL and hand it to later readers as an ordinary "cache" hit. "Unknown" must cost
+  // a re-fetch, never a stored answer nobody can vouch for.
+  for (const method of ["readFresh", "readWithProvenance"]) {
+    const c = clock();
+    const cache = createObjectInfoCache({ now: c.now });
+    const got = await cache[method](async () => DEFS, {
+      stamp: () => {
+        throw new Error("epoch unreadable");
+      },
+    });
+    assert.equal(got.provenance, "unknown", `${method}: nothing established`);
+    assert.equal(got.value, DEFS, `${method}: the payload still reaches its own caller`);
+    let refetched = false;
+    const after = await cache.read(async () => {
+      refetched = true;
+      return { Fresh: {} };
+    });
+    assert.equal(refetched, true, `${method}: the unattributable payload was not cached`);
+    assert.deepEqual(after, { Fresh: {} });
+  }
+});
+
+test("#1126: a joiner that wants reconnect detection on a stampless request gets UNKNOWN", async () => {
+  // The issuance epoch was never recorded and cannot be reconstructed, so nothing is
+  // established — and nothing established must never read as live.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const issuer = cache.readFresh(async () => {
+    await gate;
+    return DEFS;
+  }); // no stamp
+  const joiner = cache.readFresh(async () => DEFS, { stamp: () => 7 });
+  release();
+  await issuer;
+  const rj = await joiner;
+  assert.equal(rj.provenance, "unknown");
+  assert.equal(rj.provenanceNow(), "unknown", "permanently — the issuance epoch is unrecoverable");
+});
+
 test("#1126: readFresh BYPASSES the stored entry without retiring anything in flight", async () => {
   const c = clock();
   const cache = createObjectInfoCache({ now: c.now });
