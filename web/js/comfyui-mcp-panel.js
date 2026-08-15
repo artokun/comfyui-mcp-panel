@@ -203,6 +203,10 @@ import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
+// #1198 — the Settings path's half of that guard. ComfyUI has already written the saved
+// default by the time it notifies us, so an aborted switch has to be undone there rather
+// than merely not committed.
+import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
@@ -4144,6 +4148,23 @@ function setSetting(id, value) {
   }
 }
 
+/** #1198 — the panel's owner of SETTING_BACKEND, the SAVED default.
+ *
+ *  ComfyUI persists the combo's new value and only then notifies us, so by the time
+ *  #1184's guard can abort the switch the durable default already names a backend the
+ *  panel may never reach — and unlike `STORAGE_KEY_BACKEND` (which the abort already
+ *  leaves alone) that value is not browser-scoped, so it wins on a fresh profile.
+ *
+ *  Undoing it means writing the setting again, which is the re-entrant write that caused
+ *  the 9181 connect storm. This does it safely: a compare-and-swap, so a stale rollback
+ *  cannot clobber a newer pick, plus a value-marker that IDENTIFIES the resulting echo
+ *  instead of trying to suppress it inside a time window. See lib/settings-backend-default.js
+ *  for what the shipped ComfyUI settings store actually does and why that is enough. */
+const settingsBackendDefault = createSettingsBackendDefault({
+  read: () => getSetting(SETTING_BACKEND),
+  write: (value) => setSetting(SETTING_BACKEND, value),
+});
+
 // Drive the secure token flow from a Settings button. Reuses the SAME masked
 // secure input the agent's panel_request_secret tool already opens — the pasted
 // value rides the existing request_secret bridge command straight into the
@@ -4706,9 +4727,20 @@ function panelSettingsList() {
         ];
       },
       defaultValue: "claude",
-      onChange: (v) => {
+      // #1198 — `previous` is ComfyUI's `oldValue`, the second argument it has always passed
+      // and this handler always dropped. It is the ONLY record of what the saved default held
+      // before this change: the store is overwritten the moment this returns, so by the time
+      // the switch has finished awaiting there is nothing left to read. Without it an aborted
+      // switch has no value to roll back to.
+      onChange: (v, previous) => {
+        // ASKED FIRST, BEFORE the suppress flag, and that order is load-bearing. ComfyUI
+        // dispatches onChange synchronously from inside setSetting, so the panel's own
+        // rollback echoes back while `suppressSettingOnChange` is still true — letting the
+        // flag win here would swallow the notification and leave the rollback's marker
+        // outstanding, armed to eat the user's next real pick of that backend.
+        if (settingsBackendDefault.isSelfWrite(v)) return;
         if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyBackend?.(v);
+        panelHooks.applyBackend?.(v, previous);
       },
     },
     // mcp#884 — the "Chat conversation scope" combo is retired: the conversation
@@ -30731,7 +30763,17 @@ function buildPanel() {
     //
     // Committing later rather than rolling back: an undo would have to restore six pieces
     // of state, and `armContext` has no disarm affordance at all.
-    const { switched } = await runBackendSwitch(id, {
+    //
+    // #1198 — the RESULT is returned whole, `reason` included, not just `switched`. The
+    // boolean cannot tell the Settings path what it needs to know: it is false both for an
+    // abort (the panel is still on the old backend, so the saved default must be rolled
+    // back) and for an ordinary first connect or re-pick (the panel IS on `id`, so the
+    // saved default is correct and must stand). Only `reason` separates those two.
+    //
+    // Callers must branch on `reason`, never on this object's truthiness — an object is
+    // always truthy, so `if (await connectBackend(x))` would read as "it switched" on the
+    // abort path too. The three call sites that ignore the result are unaffected.
+    return await runBackendSwitch(id, {
       liveBackend: () => connectedBackend,
       pickedBackend: () => selectedBackend,
       // What the INCOMING backend already has, answered by the STORE under that backend's
@@ -30829,7 +30871,6 @@ function buildPanel() {
         );
       },
     });
-    return switched;
   }
 
   // Soft reload: pick up new code WITHOUT restarting ComfyUI, keeping this
@@ -33136,14 +33177,35 @@ function buildPanel() {
   // idempotent (no-ops when the value already matches) so a setSetting→onChange
   // echo can't loop. Cleared in destroy() so a stale closure can't drive a torn-down
   // panel; the most-recently-mounted panel owns the hooks.
-  panelHooks.applyBackend = (id) => {
+  // #1198 — `previous` is what SETTING_BACKEND held before ComfyUI overwrote it, handed to
+  // us by the settings store. This is the path that owns the SAVED default, and the only
+  // one allowed to write it: a chip or model-popover switch is session-only and must leave
+  // it alone (#1184's FIX 1).
+  panelHooks.applyBackend = async (id, previous) => {
     if (!id || id === selectedBackend) return;
-    appendSystem(tr("panel.default_backend_switched", "Default backend → {backend}.", { backend: BACKEND_LABELS[id] || id }));
     // Route through connectBackend, which CENTRALLY seeds prefs from the new
     // backend's group before connecting (same path as the chips / model-popover
     // provider row) — exactly ONE connect, and the single post-handshake catalog
     // push carries the new backend's values. No set_options is sent here.
-    connectBackend(id);
+    const { reason } = await connectBackend(id);
+    // #1198 — the abort. ComfyUI has ALREADY persisted the new value; #1184's guard runs
+    // too late to stop that, so this puts it back. `rollback` is a compare-and-swap and
+    // no-ops unless the setting still holds the backend whose switch failed, so a user who
+    // changed it again while the invalidate was awaiting keeps their newer choice.
+    if (reason === BACKEND_SWITCH.INVALIDATE_FAILED) {
+      settingsBackendDefault.rollback({ outcome: reason, attempted: id, previous });
+      // Deliberately silent: connectBackend's `disclose` has already said the switch did
+      // not happen, and with the default restored that line is now true of the saved
+      // default too. A second line saying so would need a new catalog key, and the English
+      // catalog is frozen (#1135).
+      return;
+    }
+    // ANNOUNCED ONLY ONCE IT IS TRUE. This used to be printed before the switch was even
+    // attempted, so an aborted switch left the transcript asserting a change to the durable
+    // default that the panel then undid — the false-reassurance shape this repo keeps
+    // fixing. It lands just after connectAgent's "connecting" line now, which reads as the
+    // confirmation it actually is.
+    appendSystem(tr("panel.default_backend_switched", "Default backend → {backend}.", { backend: BACKEND_LABELS[id] || id }));
   };
   // mcp#884 — panelHooks.applyChatScope is gone with the retired scope setting:
   // its only caller was the removed combo's onChange, and keeping a live scope
