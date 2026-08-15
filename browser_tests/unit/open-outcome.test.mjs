@@ -506,7 +506,18 @@ test("#721 P1: dirty rebind success requires the target UUID, never only a read-
   // throws, which withholds the fence). The predicate still refuses anything but a
   // nodes-only, same-set, geometry-only difference.
   assert.match(repaint, /graphRootReproducesStateContent\(\{ rootGraph, state: repaintState \}\)/);
-  assert.match(repaint, /const contentMatches = contentProof\.proven;/);
+  // #1623 — TWO grounds now, and BOTH must be named here. `proven` is the strict
+  // "the content was reproduced"; `presentationOnly` is the weaker "nothing authored
+  // was lost", which is the question the caller acts on and the one the panel's own
+  // disclosure already answered on the same observation. Pinning the expression
+  // rather than either half is deliberate: dropping `presentationOnly` restores the
+  // reported false error, and dropping `proven` silently narrows the #1001 fix.
+  assert.match(repaint, /const contentMatches = contentProof\.proven \|\| contentProof\.presentationOnly;/);
+  // The two disclosures stay SEPARATE. Folding the weaker case into
+  // `openGeometryRewritten` would attach a note asserting a characterised
+  // height-only rewrite to a difference where no such thing was established.
+  assert.match(repaint, /if \(contentProof\.proven && !contentProof\.exact\) \{\r?\n\s*openGeometryRewritten = contentProof\.fields;/);
+  assert.match(repaint, /if \(contentProof\.presentationOnly\) \{\r?\n\s*openPresentationRewritten = contentProof\.fields;/);
   // The ATTEMPT-scoped marker: a workflow uuid can be on the root from a previous load
   // or a rebind heal, so it cannot say that THIS load landed.
   assert.match(repaint, /\[OPEN_PROOF_FIELD\]: openProofMarker/, "the payload must carry a single-use marker");

@@ -126,11 +126,17 @@ test("#886 WIRING: the content proof consults it for a definitions surface", () 
   assert.match(src, /import \{ definitionsDifferOnlyByLinkRenumber \} from "\.\/definitions-renumber\.js";/);
   assert.match(src, /definitionsDifferOnlyByLinkRenumber\(state\?\.definitions, actualState\?\.definitions\)/);
   // The surface set must be a SUBSET of { nodes, definitions }; anything else refuses.
-  assert.match(src, /s !== "nodes" && s !== "definitions"\)\) return NOT_PROVEN;/);
+  // #1623 renamed the refusal value: every refusal AFTER the diff is computed now
+  // carries the separate presentation-only answer out with it instead of discarding
+  // it. What is pinned is unchanged — this surface set still refuses.
+  assert.match(src, /s !== "nodes" && s !== "definitions"\)\) return notProven;/);
+  // ...and `notProven` must be a REFUSAL of the content proof, not a second success
+  // door: a rename that made it `proven: true` would pass the line above.
+  assert.match(src, /const notProven = \{\r?\n\s*proven: false,/);
   // `nodes` must NOT be mandatory. Requiring it refused the reported case outright:
   // #886 is a graph where `definitions` is the ONLY differing surface, so the earlier
   // gate wired this fix into a branch its own bug report could never reach (review).
-  assert.doesNotMatch(src, /if \(!surfaces\.includes\("nodes"\)\) return NOT_PROVEN;/);
+  assert.doesNotMatch(src, /if \(!surfaces\.includes\("nodes"\)\) return (?:NOT_PROVEN|notProven);/);
   assert.match(src, /if \(!unique\.includes\("nodes"\)\)/);
 });
 
