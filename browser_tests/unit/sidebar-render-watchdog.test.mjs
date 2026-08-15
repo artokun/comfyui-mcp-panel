@@ -1,6 +1,5 @@
-// panel#779 — the silence detector: a selected Agent tab with nothing painted,
-// or a registered tab whose button never appears, must produce ONE console line
-// naming both versions and what to do.
+// panel#779 — the silence detector: a selected Agent tab with nothing painted
+// must produce ONE console line naming both versions and what to do.
 //
 // The outage this grew from failed in perfect silence: tab registered,
 // selectable, black rectangle, `.cmcp-root` absent, nothing attributed to us.
@@ -23,11 +22,9 @@ import { dirname, join } from "node:path";
 import {
   RENDER_STARVATION_MS,
   SATISFY_CONFIRM_MS,
-  TAB_APPEAR_DEADLINE_MS,
   WATCHDOG_POLL_MS,
   WATCHDOG_GIVE_UP_MS,
   renderStarvationReport,
-  tabNeverAppearedReport,
   createRenderWatchdog,
   installSidebarRenderWatchdog,
 } from "../../web/js/lib/sidebar-render-watchdog.js";
@@ -62,22 +59,6 @@ test("#779 the starvation line carries everything a support answer needs", () =>
   // default and appears to work exactly when it did nothing (verified live
   // against ComfyUI 0.30.2 while fixing this issue).
   assert.match(line, /--front-end-version Comfy-Org\/ComfyUI_frontend@/, "the workaround, in paste-able form");
-});
-
-test("#779 the appearance line is distinct and equally complete", () => {
-  const line = tabNeverAppearedReport({
-    panelVersion: "0.11.44",
-    frontendVersion: "1.53.0",
-    waitedMs: 10000,
-  });
-  assert.match(line, /^\[comfyui-mcp-panel\]/);
-  assert.match(line, /button never\s+appeared/);
-  assert.match(line, /~10s/);
-  assert.match(line, /0\.11\.44/);
-  assert.match(line, /1\.53\.0/);
-  assert.match(line, /NOT a connection problem/i);
-  assert.match(line, /github\.com\/artokun\/comfyui-mcp-panel\/issues/);
-  assert.match(line, /--front-end-version Comfy-Org\/ComfyUI_frontend@/);
 });
 
 test("#779 unknown versions say 'unknown' — never a guess", () => {
@@ -270,7 +251,6 @@ function legacyButton(id) {
 function harness({
   windowMs = 300,
   confirmMs = 200,
-  appearDeadlineMs = 1000,
   pollMs = 50,
   giveUpMs = 6000,
 } = {}) {
@@ -321,7 +301,6 @@ function harness({
     now: () => clock,
     windowMs,
     confirmMs,
-    appearDeadlineMs,
     pollMs,
     giveUpMs,
   });
@@ -460,17 +439,42 @@ test("#779 installer: the #785 failure shell counts as painted — one voice at 
   assert.equal(h.reports.length, 0);
 });
 
-test("#779 installer: a rail with no button for the deadline says the appearance line", () => {
+test("#779 installer: a rail our button is FILTERED out of is never reported (LinearView)", () => {
+  // The regression this replaces an earlier check for (Copilot review, PR #804).
+  // A rail that exists without our button in it is NOT evidence of a broken
+  // contract: ComfyUI ships a supported view that renders a deliberately
+  // filtered rail — src/views/LinearView.vue mounts
+  //   <SideToolbar :visible-tab-ids="['assets', 'apps']" …>
+  // (present at frontend v1.50.3 AND v1.51.3; reached whenever the user turns
+  // on linear mode, since GraphView.vue renders <LinearView v-if="linearMode"/>).
+  // There, registration succeeded — the frontend's own sidebarTabStore still
+  // lists us, `visibleTabIds` filters only at RENDER time — so reporting "your
+  // panel is broken, relaunch pinned to another frontend" would be a false
+  // statement aimed at a user whose panel is perfectly healthy.
+  //
+  // Filtering and a genuine contract break are indistinguishable from the DOM,
+  // so the honest answer is silence — the same no-evidence-no-claim rule the
+  // starvation check follows for an unreadable marker (#784).
   const h = harness();
   h.state.rail = {}; // the rail exists…
-  // …but our button never joins it, and nothing is ever selectable.
-  h.advance(1500); // past appearDeadlineMs (1000)
-  assert.equal(h.reports.length, 1);
-  assert.match(h.reports[0], /button never\s+appeared/);
-  assert.match(h.reports[0], /9\.9\.9/);
+  h.state.button = false; // …and our button is simply not one of the visible ids
+  h.advance(WATCHDOG_GIVE_UP_MS + 20000);
+  assert.equal(h.reports.length, 0, "a filtered rail must never be called a fault");
+  assert.equal(h.timersLeft(), 0, "…and it stands down rather than watching forever");
+});
+
+test("#779 installer: a filtered rail stays silent even while our tab is selectable later", () => {
+  // The same shape, but the user leaves linear mode: the button turns up late
+  // and everything paints. Nothing was ever wrong, and nothing is ever said.
+  const h = harness();
+  h.state.rail = {};
+  h.advance(600); // rail seen, our button absent throughout
+  h.state.button = true; // back to the full rail
+  h.state.selected = modernButton(OURS);
+  h.state.painted = true;
+  h.mutate();
   h.advance(20000);
-  assert.equal(h.reports.length, 1);
-  assert.equal(h.timersLeft(), 0, "spoken once, then fully stood down");
+  assert.equal(h.reports.length, 0, "late appearance is not a contract break");
 });
 
 test("#779 installer: no rail at all is 'I cannot tell' — permanent silence", () => {
@@ -492,28 +496,18 @@ test("#779 installer: a selected-and-empty tab on a rail-LESS page still says no
   assert.equal(h.timersLeft(), 0);
 });
 
-test("#779 installer: a button that appeared and later VANISHED is out of charter — silent", () => {
-  // Deliberate: the appearance line says "never appeared", and a button that
-  // demonstrably appeared makes that statement false. A vanished tab is also a
-  // different user-visible symptom (gone, not never-there). Pinned so the
-  // latch in pollAppearance reads as a decision, not an oversight.
+test("#779 installer: a button that appeared and later VANISHED stays silent", () => {
+  // A tab that disappears is a different, visibly different symptom (gone, not
+  // never-there) and the watchdog has no evidence about its cause — a filtered
+  // rail produces exactly this transition when the user enters linear mode.
   const h = harness();
   h.state.rail = {};
   h.advance(120); // rail seen, poll running
   h.state.button = true;
-  h.advance(120); // button seen — appearance satisfied, latched
+  h.advance(120);
   h.state.button = false; // …and now it is gone
   h.advance(20000);
   assert.equal(h.reports.length, 0);
-});
-
-test("#779 installer: a button that appears late but within the deadline is fine", () => {
-  const h = harness();
-  h.state.rail = {};
-  h.advance(600); // rail seen, button still absent — inside the deadline
-  h.state.button = true;
-  h.advance(20000);
-  assert.equal(h.reports.length, 0, "slow rail population is not a contract break");
 });
 
 // ---------------------------------------------------------------------------
@@ -540,10 +534,29 @@ test("#779 isPainted at the integration site counts BOTH the root and the failur
 });
 
 test("#779 the exported bounds are what the reports promise", () => {
-  // The report says "~3s"/"~10s" from its inputs; the defaults must match the
-  // constants so a default-config line never claims a window it did not wait.
+  // The report says "~3s" from its inputs; the default must match the constant
+  // so a default-config line never claims a window it did not wait.
   assert.equal(RENDER_STARVATION_MS, 3000);
-  assert.equal(TAB_APPEAR_DEADLINE_MS, 10000);
   assert.ok(WATCHDOG_POLL_MS >= 250, "polling is a trickle, not a hot loop");
   assert.ok(WATCHDOG_GIVE_UP_MS >= 30000);
+});
+
+test("#779 the watchdog reports NOTHING that DOM absence cannot prove", () => {
+  // A structural guard on the module, not on one code path: the only thing this
+  // watchdog is allowed to conclude is starvation (provably-selected + empty).
+  // An earlier draft also concluded "registerSidebarTab was dropped" from a
+  // missing rail button, which a supported filtered rail (LinearView) produces
+  // on a completely healthy panel. If a second report ever comes back, it has
+  // to justify its evidence here first.
+  const src = readFileSync(
+    join(HERE, "../../web/js/lib/sidebar-render-watchdog.js"),
+    "utf8",
+  );
+  const reports = src.match(/^export function \w*[Rr]eport\w*\(/gm) || [];
+  assert.equal(reports.length, 1, `exactly one report survives, found: ${reports.join(", ")}`);
+  assert.match(src, /export function renderStarvationReport\(/);
+  assert.ok(
+    !/findSidebarTabButton/.test(src),
+    "the watchdog must not reason about our rail button's presence at all",
+  );
 });

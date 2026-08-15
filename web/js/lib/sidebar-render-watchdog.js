@@ -15,37 +15,52 @@
  * SECONDS after the failure, not instants: its job is a support answer, not a
  * race.
  *
- * TWO CHECKS, BOTH EVIDENCE-ONLY (the #784 lesson applies to diagnostics too:
+ * ONE CHECK, EVIDENCE-ONLY (the #784 lesson applies to diagnostics too:
  * "I cannot tell" must never be reported as "it is broken"):
  *
- * 1. STARVATION — our tab is PROVABLY the selected one (the rail button carries
- *    our id, read the same dual-generation way the guard reads it) and yet no
- *    `.cmcp-root` and no `.cmcp-failure-shell` exists, continuously for
- *    RENDER_STARVATION_MS, re-verified at expiry. When the selected tab is
- *    another tab, or unidentifiable ("unknown"), the check DISARMS rather than
- *    counts — an unreadable marker is not evidence of our failure. A paint that
- *    SURVIVES SATISFY_CONFIRM_MS while our tab is active retires the check for
- *    the page's lifetime: its charter is first-paint failure, the #779 class;
- *    content that disappears after a confirmed dwell is a different bug with a
- *    different symptom. A mere glimpse of paint retires nothing — the actual
- *    #779 attached the root and removed it in the same mutation flush, and a
- *    live drill proved a glimpse-trusting watchdog sleeps through it.
+ * STARVATION — our tab is PROVABLY the selected one (the rail button carries
+ * our id, read the same dual-generation way the guard reads it) and yet no
+ * `.cmcp-root` and no `.cmcp-failure-shell` exists, continuously for
+ * RENDER_STARVATION_MS, re-verified at expiry. When the selected tab is
+ * another tab, or unidentifiable ("unknown"), the check DISARMS rather than
+ * counts — an unreadable marker is not evidence of our failure. A paint that
+ * SURVIVES SATISFY_CONFIRM_MS while our tab is active retires the check for
+ * the page's lifetime: its charter is first-paint failure, the #779 class;
+ * content that disappears after a confirmed dwell is a different bug with a
+ * different symptom. A mere glimpse of paint retires nothing — the actual
+ * #779 attached the root and removed it in the same mutation flush, and a
+ * live drill proved a glimpse-trusting watchdog sleeps through it.
  *
- * 2. APPEARANCE — the sidebar rail exists but our tab button never showed up in
- *    it within TAB_APPEAR_DEADLINE_MS of the rail being seen. This is what a
- *    frontend that accepts registerSidebarTab() and silently drops the legacy
- *    spec shape would look like: no tab to click, so check 1 can never trigger,
- *    and the panel simply vanishes from the product. If the rail itself cannot
- *    be found, that is "I cannot tell", and the check gives up silently.
+ * WHY THE BOUND IS WHAT IT IS. `render()` attaches `.cmcp-root` (or, if it
+ * throws, the #785 shell) SYNCHRONOUSLY, in the same task ComfyUI calls it
+ * from — there is no async gap in our paint path for a slow machine to widen.
+ * So 3s of selected-and-empty is not "a slow build", it is a no-show; a
+ * machine so loaded that `buildPanel()` takes seconds blocks the main thread,
+ * which delays the deadline timer with it rather than firing it early; and a
+ * paint that lands at any point inside the window disarms the check, because
+ * the deadline RE-READS the document instead of deciding on the stale sample
+ * that armed it.
  *
- * WHY THE BOUNDS ARE WHAT THEY ARE. Render is invoked synchronously when the
- * tab mounts, so 3s of selected-and-empty is not "a slow machine", it is a
- * no-show — and a machine so loaded that timers stall does not fire early,
- * because the deadline itself is a timer. The rail populates in the same
- * render pass that creates it, so 10s from first sighting is generous.
+ * WHAT THIS DELIBERATELY DOES NOT CHECK — and why (Copilot review, PR #804).
+ * An earlier draft also reported "the rail exists but our tab button never
+ * joined it within 10s", meaning to catch a frontend that accepts
+ * registerSidebarTab() and silently drops the legacy spec. That check was
+ * REMOVED: DOM absence cannot support that conclusion, because a shipped,
+ * supported ComfyUI view renders a deliberately FILTERED rail —
+ * `src/views/LinearView.vue` mounts `<SideToolbar :visible-tab-ids="['assets',
+ * 'apps']">` (verified in the frontend repo at both v1.50.3 and v1.51.3, and
+ * reached whenever the user turns on linear mode: `GraphView.vue` renders
+ * `<LinearView v-if="linearMode" />`). In that view `.side-tool-bar-container`
+ * is present and our button is absent while registration succeeded exactly as
+ * designed — the frontend's own registry still lists us
+ * (`sidebarTabStore.sidebarTabs`, which `visibleTabIds` only filters at RENDER
+ * time). The check would therefore have told a user whose panel is perfectly
+ * healthy that their panel is broken and to relaunch ComfyUI pinned to another
+ * frontend. Filtering and a contract break are indistinguishable from the DOM,
+ * so under this module's own rule the honest answer is silence.
  */
 
-import { readActiveSidebarTab, findSidebarTabButton } from "./active-sidebar-tab.js";
+import { readActiveSidebarTab } from "./active-sidebar-tab.js";
 import { VERIFIED_FRONTENDS } from "./comfyui-dom-deps.js";
 
 /** Continuous selected-but-empty time before the starvation line is spoken. */
@@ -57,9 +72,7 @@ export const RENDER_STARVATION_MS = 3000;
  *  the first draft of this watchdog instead of firing it. Never trust one
  *  glimpse of paint. */
 export const SATISFY_CONFIRM_MS = 1500;
-/** Rail seen → our button still absent for this long = the appearance line. */
-export const TAB_APPEAR_DEADLINE_MS = 10000;
-/** Poll cadence for the appearance check (also re-samples starvation). */
+/** Poll cadence while waiting for the rail (also re-samples starvation). */
 export const WATCHDOG_POLL_MS = 500;
 /** Stop polling entirely this long after install — a page with no rail by then
  *  is not going to grow one, and an observerless page costs nothing forever. */
@@ -120,24 +133,6 @@ export function renderStarvationReport(info = {}) {
     `(no .cmcp-root in the document). The tab registered and was selected, yet the panel was ` +
     `either never asked to render or its content was removed as soon as it was attached. ` +
     `That is a compatibility fault between panel ${p} and ComfyUI frontend ${f}. ` +
-    remedyText(info.frontendVersion)
-  );
-}
-
-/**
- * The console line for "registered, and the tab button never appeared".
- *
- * @param {{ panelVersion?: string, frontendVersion?: string, waitedMs?: number }} [info]
- */
-export function tabNeverAppearedReport(info = {}) {
-  const p = info.panelVersion || "unknown";
-  const f = info.frontendVersion || "unknown";
-  const s = Math.round((info.waitedMs ?? TAB_APPEAR_DEADLINE_MS) / 1000);
-  return (
-    `[comfyui-mcp-panel] registerSidebarTab() accepted the Agent tab, but its button never ` +
-    `appeared in the sidebar rail (waited ~${s}s after the rail was seen). This frontend most ` +
-    `likely changed how a custom sidebar tab is declared, in a way panel ${p} does not speak ` +
-    `yet — ComfyUI frontend here is ${f}. ` +
     remedyText(info.frontendVersion)
   );
 }
@@ -244,7 +239,6 @@ export function createRenderWatchdog({
  * @param {(h: unknown) => void} [opts.clearTimer]
  * @param {() => number} [opts.now]
  * @param {number} [opts.windowMs]
- * @param {number} [opts.appearDeadlineMs]
  * @param {number} [opts.pollMs]
  * @param {number} [opts.giveUpMs]
  */
@@ -262,7 +256,6 @@ export function installSidebarRenderWatchdog({
   now = () => Date.now(),
   windowMs = RENDER_STARVATION_MS,
   confirmMs = SATISFY_CONFIRM_MS,
-  appearDeadlineMs = TAB_APPEAR_DEADLINE_MS,
   pollMs = WATCHDOG_POLL_MS,
   giveUpMs = WATCHDOG_GIVE_UP_MS,
 } = {}) {
@@ -286,8 +279,6 @@ export function installSidebarRenderWatchdog({
   let pollTimer = null;
   const startedAt = now();
   let railSeenAt = null;
-  let buttonEverSeen = false;
-  let appearanceSpoken = false;
 
   const machine = createRenderWatchdog({
     tabId,
@@ -351,54 +342,38 @@ export function installSidebarRenderWatchdog({
     return res;
   };
 
-  const pollAppearance = () => {
+  const pollForRail = () => {
     if (stopped) return;
     pollTimer = null;
     const t = now();
     const rail = doc.querySelector(".side-tool-bar-container");
-    if (rail) {
-      if (railSeenAt == null) {
-        railSeenAt = t;
-        // The rail exists — from here on, selection changes are observable.
-        // Same subscription the sidebar guard uses: tab selection toggles a
-        // class on the rail's buttons in every frontend generation we know.
-        observer = makeObserver(() => sample());
-        if (observer) {
-          try {
-            observer.observe(rail, { subtree: true, attributes: true, attributeFilter: ["class"] });
-          } catch {
-            observer = null; // fall back to the poll below
-          }
+    if (rail && railSeenAt == null) {
+      railSeenAt = t;
+      // The rail exists — from here on, selection changes are observable.
+      // Same subscription the sidebar guard uses: tab selection toggles a
+      // class on the rail's buttons in every frontend generation we know.
+      observer = makeObserver(() => sample());
+      if (observer) {
+        try {
+          observer.observe(rail, { subtree: true, attributes: true, attributeFilter: ["class"] });
+        } catch {
+          observer = null; // fall back to the poll below
         }
-      }
-      // `buttonEverSeen` LATCHES, deliberately: the appearance check's charter
-      // is "registration was accepted and the button NEVER appeared". A button
-      // that appeared and later vanished is a different phenomenon — visibly
-      // different to the user (the tab is gone, not never-there), and firing
-      // "never appeared" about a button that demonstrably appeared would be a
-      // false statement. That class stays out of scope (codex gate, declined
-      // with reasons; pinned by test).
-      if (!buttonEverSeen && findSidebarTabButton(doc, tabId)) buttonEverSeen = true;
-      if (!buttonEverSeen && !appearanceSpoken && t - railSeenAt >= appearDeadlineMs) {
-        appearanceSpoken = true;
-        report(tabNeverAppearedReport(versions(t - railSeenAt)));
-        // No button means no way to select the tab: the starvation check can
-        // never trigger, so there is nothing left to watch.
-        stop();
-        return;
       }
     }
     // The poll doubles as a low-rate starvation re-sample, so a frontend whose
-    // rail stops emitting class mutations does not blind check 1 entirely.
+    // rail stops emitting class mutations does not blind the check entirely.
     if (railSeenAt != null) sample();
     if (stopped) return;
-    const buttonPhaseOver = buttonEverSeen || appearanceSpoken;
-    const observerCarriesOn = observer != null && buttonPhaseOver;
-    if (t - startedAt >= giveUpMs || observerCarriesOn) return; // observer (or silence) from here
-    pollTimer = setTimer(pollAppearance, pollMs);
+    // Once the observer is watching the rail, it drives sampling and the poll
+    // has nothing left to discover. Without one, keep trickling until the
+    // give-up bound. A page that never grows a rail we recognize simply goes
+    // quiet forever — no rail, no evidence, no claim.
+    if (observer != null || t - startedAt >= giveUpMs) return;
+    pollTimer = setTimer(pollForRail, pollMs);
   };
 
   sample();
-  pollAppearance();
+  pollForRail();
   return { sample, stop };
 }

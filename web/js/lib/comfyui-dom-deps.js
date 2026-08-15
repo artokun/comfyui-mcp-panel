@@ -36,8 +36,8 @@ export const COMFYUI_DOM_DEPS = [
   },
   {
     selector: ".side-tool-bar-container",
-    why: "The sidebar rail, observed for tab-selection changes by the guard and by the render watchdog (which also waits on it before judging that our tab button never appeared).",
-    fallback: "Retried while the frontend boots; absent means the guard never arms and the watchdog stays silent (no rail, no evidence).",
+    why: "The sidebar rail, observed for tab-selection changes by the guard and by the render watchdog (which waits on it before judging anything at all).",
+    fallback: "Retried while the frontend boots; absent means the guard never arms and the watchdog stays silent (no rail, no evidence). NOTE: the rail's CONTENTS are not evidence — ComfyUI's LinearView renders it filtered via `visible-tab-ids`, so our button being missing from it means nothing.",
     verified: ["1.47.12", "1.50.3"],
   },
   {
