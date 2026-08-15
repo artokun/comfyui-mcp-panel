@@ -1473,7 +1473,16 @@ function setupListeners() {
     // is dispatched: the Manager broadcasts a task's result as the queue drains,
     // and a fast failure drains before the install call has anything to attach a
     // listener to.
-    subscribeManagerTaskResults();
+    //
+    // In its OWN try: everything below this line is load-bearing (backend-down
+    // detection, the reconnect resync), and they share one catch. A diagnostic
+    // capture must not be able to preempt them by throwing first — and being
+    // registered first is what makes it see a drain that lands during startup.
+    try {
+      subscribeManagerTaskResults();
+    } catch (err) {
+      console.warn("[comfyui-mcp-panel] Manager task-result capture unavailable:", err);
+    }
     api.addEventListener("execution_error", (ev) => {
       lastExecFailure = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
     });
