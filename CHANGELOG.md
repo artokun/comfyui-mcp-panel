@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.41] - 2026-08-15
+
+### Fixed
+- graph_load now reports the workflow identity it actually loaded into on BOTH reply paths, including the API-format load the report came from (#1478)
+
+
 ## [0.14.40] - 2026-08-14
 
 ### Fixed
