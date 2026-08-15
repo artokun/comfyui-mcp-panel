@@ -13,7 +13,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -25,6 +25,8 @@ import {
   repairScopeInBody,
   promptContentHash,
   promptContentHashFromBody,
+  canonicalizePrompt,
+  diffPromptCanons,
   collectVolatileInputs,
   verifyScopedPromptBody,
   scopeDroppedError,
@@ -128,6 +130,11 @@ function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_O
       const queueNodeIds =
         shape === "dropping"
           ? undefined
+          : // #752 — an api-layer build: it reads ONLY `partialExecutionTargets`,
+            // the key `api.queuePrompt` actually turns into the request field, and
+            // ignores a positional array and `queueNodeIds` alike.
+            shape === "apiOptions"
+            ? (Array.isArray(arg) ? undefined : arg?.partialExecutionTargets)
           : shape === "shim"
             ? Array.isArray(arg)
               ? arg
@@ -195,10 +202,16 @@ test("#630 queuePromptScopeAttempts: both argument shapes are tried BEFORE the b
   assert.deepEqual(queuePromptScopeAttempts(undefined), [{ arg: undefined, repair: false }]);
   assert.deepEqual(queuePromptScopeAttempts([]), [{ arg: undefined, repair: false }]);
   const attempts = queuePromptScopeAttempts(["76:34"]);
-  assert.equal(attempts.length, 3);
+  assert.equal(attempts.length, 4);
   assert.deepEqual(attempts[0], { arg: ["76:34"], repair: false });
   assert.deepEqual(attempts[1], { arg: { queueNodeIds: ["76:34"] }, repair: false });
-  assert.deepEqual(attempts[2], { arg: ["76:34"], repair: true });
+  // #752 — the api layer reads a DIFFERENT key than the store does. Verified in
+  // a shipped 1.47.12 bundle: the store destructures `queueNodeIds` and calls
+  // `api.queuePrompt(e, m, {partialExecutionTargets: n})`, and only that second
+  // key becomes `partial_execution_targets` in the request. A build whose
+  // app.queuePrompt forwards straight to the api layer ignores both shapes above.
+  assert.deepEqual(attempts[2], { arg: { partialExecutionTargets: ["76:34"] }, repair: false });
+  assert.deepEqual(attempts[3], { arg: ["76:34"], repair: true });
   assert.equal(
     attempts.filter((a) => a.repair).length,
     1,
@@ -371,11 +384,16 @@ test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's o
 test("#630 scopeDroppedError: the no-scope refusal states the OBSERVATION and no longer asserts a cause it cannot see", () => {
   // The pre-#630 message asserted "this frontend build ignored the run-to-node
   // argument" for every no-usable-scope state. That is a bucket narrated as a
-  // cause, and the evidence contradicts it: ComfyUI_frontend 1.42 through 1.50
-  // all accept BOTH app.queuePrompt third-argument shapes and funnel them into
-  // api.queuePrompt's options.partialExecutionTargets. Three #556 field reports
-  // pasted that asserted cause into the tracker, which is why the real cause is
-  // still unknown. The message must survive that lesson.
+  // cause, and three #556 field reports pasted that asserted cause into the
+  // tracker, which is why the real cause is still unknown.
+  //
+  // #752 — THE REPLACEMENT WAS ALSO AN UNEARNED CLAIM, and this comment used to
+  // state it as fact: that ComfyUI_frontend 1.42 through 1.50 all accept BOTH
+  // third-argument shapes. Only 1.47.12 was ever measured. Three field reports on
+  // 1.45.21 — inside that range — hit this path, so the range was wrong, and
+  // saying so in the shipped message told each reporter their own evidence could
+  // not be happening. Whatever this note says next, it may not assert behaviour
+  // of a build nobody here has run.
   const msg = scopeDroppedError({
     toNodeId: 4995,
     verdict: { ok: false, reason: "scope_missing", expected: ["4995"], got: null, bodyKeys: ["client_id", "extra_data", "number", "prompt"] },
@@ -736,9 +754,14 @@ test("#630 integration: a build honoring NEITHER shape is now HONOURED, not refu
     assert.equal(result.scopeAppliedBy, "request_body_repair", "the caller can tell HOW the scope was delivered");
     assert.equal(result.repaired, 1);
     // Both native shapes were tried first and both dropped the scope…
-    assert.equal(app.posted.length, 3, "array shape, options shape, then the repair attempt");
+    assert.equal(
+      app.posted.length,
+      4,
+      "array shape, queueNodeIds shape, partialExecutionTargets shape, then the repair attempt",
+    );
     assert.equal(app.posted[0].partial_execution_targets, undefined);
     assert.equal(app.posted[1].partial_execution_targets, undefined);
+    assert.equal(app.posted[2].partial_execution_targets, undefined);
     // …and exactly ONE request reached ComfyUI, carrying exactly node 14.
     assert.equal(server.calls.length, 1, "the two unrepaired attempts were blocked, not forwarded");
     const sent = JSON.parse(server.calls[0].options.body);
@@ -841,8 +864,20 @@ test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED fr
   // Rebuild the message the caller actually receives: the source spells it as
   // adjacent template chunks joined with `+`, so strip the concatenation
   // scaffolding and assert against the prose itself, not its line breaks.
+  //
+  // #752 — two things the first version of this got wrong, both of which made it
+  // assert against text that is not in the message. It sliced a magic 1800
+  // characters, so growing the note silently pushed the last assertion off the
+  // end; and it did not strip `//` comments, so a comment ABOUT the message read
+  // as part of it. Now it slices to the end of the statement and drops comment
+  // lines, which is what "the message the caller receives" actually means.
+  const end = source.indexOf("\n    }", start);
+  assert.ok(end > start, "the scope_note assignment must be a bounded block");
   const note = source
-    .slice(start, start + 1800)
+    .slice(start, end)
+    .split("\n")
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join("\n")
     .replace(/`\s*\+\s*\n\s*`/g, "")
     .replace(/\s+/g, " ");
   assert.match(note, /OBSERVED: the request ComfyUI received names ONLY node \$\{to_node_id\} as an execution root/,
@@ -858,6 +893,56 @@ test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED fr
   assert.match(note, /If it did not, its queue-time widget hooks ran/,
     "the hook consequence is conditional on the unobserved branch");
   assert.match(note, /does not change which nodes execute/, "and its blast radius is bounded honestly");
+  // #996 — the note used to end by sending reporters off to file with nothing to
+  // compare against. There is now one MEASURED fact to give them: on 1.48.7 the
+  // positional shape DOES put partial_execution_targets into the request, captured
+  // from the outgoing body, so the capability exists upstream and upgrading may be
+  // the shortest fix.
+  assert.match(
+    note,
+    /On ComfyUI_frontend 1\.48\.7 the positional argument shape DOES carry the scope/,
+    "the measured build is named, together with what was measured about it",
+  );
+  assert.match(note, /measured by capturing the outgoing body/, "and how it was established");
+  // The ask survives — one datum is not a diagnosis — but WHAT it asks for changed
+  // (#996). Two reports arrived with the build and the ComfyUI_frontend version this
+  // used to request, and neither identified the cause: the version is not what
+  // differs. It now asks for the queue-chain line, which names the two links that
+  // can silently drop the scope.
+  // This assertion reads the note's SOURCE, so it can only see the delegation —
+  // the wording now lives in web/js/lib/queue-prompt-chain.js and is asserted
+  // behaviourally in queue-prompt-chain.test.mjs, against the same patched-chain
+  // shape measured on a live 1.48.7 (app.queuePrompt wrapped by a custom node,
+  // api.queuePrompt wrapped by rgthree). That is a stronger check than a grep for
+  // a sentence, which is why the sentence moved.
+  assert.match(note, /describeQueuePromptChainForReport\(/, "the ask survives, via the shared builder");
+  // …and it reads the globals through the GUARDED accessor. Inlining `window.app`
+  // here would put a throwing getter outside every guard in the library — a
+  // mutation doing exactly that survived every behavioural test, because the call
+  // site is only reachable in a browser.
+  assert.match(note, /queuePromptChainDeps\(\)/, "the globals are read through the guarded accessor");
+  assert.doesNotMatch(
+    note,
+    /including your ComfyUI_frontend version/,
+    "it no longer asks for the datum that failed to identify the cause twice",
+  );
+  // The workaround must name the version that was actually measured. "upgrading may
+  // help" does not say to WHAT, and no 1.48.6→1.48.7 end-to-end result was taken
+  // (codex).
+  assert.match(note, /trying ComfyUI_frontend 1\.48\.7 may be the quickest workaround/i,
+    "the workaround names the measured build, not upgrading in general");
+  // And the datum is bounded to what capturing a request body can show.
+  assert.match(note, /establishes that the request is built correctly there, not that a whole run behaves differently/,
+    "serialization is not end-to-end behaviour, and the note says so");
+  // #752's lesson, which this change sits one edit away from repeating: a version
+  // RANGE is a claim about builds nobody here has measured. One build must not
+  // become one. The first version of this guard missed "all 1.48.x builds" and
+  // "1.48.6 through 1.48.9" (codex), so it matches the SHAPES a range takes.
+  assert.doesNotMatch(
+    note,
+    /affects versions|all builds (before|after)|all 1\.\d+\.x|\d+\.\d+\.\d+\s*(-|–|through|to)\s*\d+\.\d+\.\d+|1\.4\d\s*-\s*1\.\d+/i,
+    "one measured build must never be inflated into a range",
+  );
 });
 
 test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key, never reported as 'no key at all'", async () => {
@@ -2195,3 +2280,498 @@ test("#556: a NON-output target is refused (not_output) — it can never be an e
   assert.equal(res.ok, false);
   assert.equal(res.code, "not_output");
 });
+
+// ---------------------------------------------------------------------------
+// #659 — JSON-invisible widget values (undefined / function / symbol) must not
+// false-positive the #556 drift guard, and a graph_changed refusal must say
+// WHAT differed instead of asserting a cause.
+// ---------------------------------------------------------------------------
+
+test("#659 promptContentHash: an input whose value JSON cannot transmit is absent on BOTH channels — in-memory output and wire body hash identically", () => {
+  // graphToPrompt assigns inputs[name] = widget.value unconditionally for
+  // serialized widgets, so an async-populated combo that never got a value
+  // (the issue's OllamaConnectivityV2 "model": ((), {}) — empty options, no
+  // default) or a multi-spec COMFY_AUTOGROW_V3 shim widget lands in the
+  // in-memory output as a key with an undefined value. JSON.stringify DROPS
+  // that key from the POST body, so the parsed body never has it — and the
+  // two hashes of the SAME untouched graph used to differ deterministically.
+  const inMemory = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  const wireBody = (inputs3) =>
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: inputs3 }, "9": { class_type: "SaveImage", inputs: {} } } });
+  assert.equal(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "undefined-valued key in memory, key absent on the wire ⇒ SAME hash",
+  );
+  // Functions/symbols are dropped from the wire body exactly like undefined.
+  const withFn = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, cb: () => {} } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(promptContentHash(withFn), promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a function-valued input is equally invisible to the wire");
+  // null IS wire-representable — kept on both channels, so it hashes fine…
+  const withNull = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: null } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(promptContentHash(withNull), promptContentHashFromBody(wireBody({ steps: 20, model: null })),
+    "an explicit null survives the wire and stays covered");
+  // …and undefined → null is a change the wire CARRIES: it must mismatch.
+  assert.notEqual(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody({ steps: 20, model: null })),
+    "a key that APPEARS on the wire (undefined → null/value) is genuine drift, still detected",
+  );
+  // value → absent is equally a wire-carried change: still detected.
+  assert.notEqual(
+    promptContentHash(withNull),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a key that VANISHES from the wire (value → undefined) is genuine drift, still detected",
+  );
+});
+
+test("#659 guard: OUR marked post whose body lacks only a JSON-invisible input is OBSERVED, not refused as graph_changed", async () => {
+  const spy = makeServer();
+  const outputAtQueue = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const guard = createScopedRunGuard({
+    origFetchApi: spy,
+    execIds: ["14"],
+    contentHash: promptContentHash(outputAtQueue),
+    contentCanon: canonicalizePrompt(outputAtQueue),
+    batch: 1,
+    toNodeId: 14,
+    queueMark: MARK_A,
+  });
+  // The frontend's body: JSON.stringify dropped the undefined-valued key.
+  const wireOutput = JSON.parse(JSON.stringify(outputAtQueue));
+  const res = await guard(...promptPost(frontendBody({ output: wireOutput, targets: ["14"] })));
+  assert.equal(res.status, 200, "the same graph through the wire is OUR dispatch");
+  assert.equal(guard.state.observed, 1);
+  assert.equal(spy.calls.length, 1, "dispatched, not refused");
+});
+
+test("#659 guard: normalization is NOT tolerance — the previously-undefined input materializing in the body is genuine drift ⇒ refused, and the refusal NAMES the input", async () => {
+  const spy = makeServer();
+  const outputAtQueue = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const guard = createScopedRunGuard({
+    origFetchApi: spy,
+    execIds: ["14"],
+    contentHash: promptContentHash(outputAtQueue),
+    contentCanon: canonicalizePrompt(outputAtQueue),
+    batch: 1,
+    toNodeId: 14,
+    queueMark: MARK_A,
+  });
+  const drifted = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: "llama3" } },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const res = await guard(...promptPost(frontendBody({ output: drifted, targets: ["14"] })));
+  assert.equal(res.status, 400, "a mid-window edit into the same input still refuses");
+  assert.equal(spy.calls.length, 0, "the drifted prompt never left the tab");
+  assert.equal(guard.state.droppedReason, "graph_changed");
+  assert.match(guard.state.dropped, /3 model/, "the refusal names the differing execId inputName pair");
+  assert.match(guard.state.dropped, /Nothing was queued/);
+});
+
+test("#659 promptContentHash: the JSON-survival probe covers toJSON() returning undefined, and unstringifyable values stay drift-covered (fail closed)", () => {
+  const wireBody = (inputs3) =>
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: inputs3 }, "9": { class_type: "SaveImage", inputs: {} } } });
+  // codex gate r1: an object whose toJSON() yields undefined is dropped from
+  // the wire body exactly like a bare undefined — a type-based filter would
+  // have kept it and hashed it as [name, null], false-refusing again.
+  const withToJsonUndefined = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, odd: { toJSON: () => undefined } } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(
+    promptContentHash(withToJsonUndefined),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a toJSON()-drops-it value is invisible on both channels",
+  );
+  // A value that THROWS on stringify (BigInt) can never be compared against
+  // the wire — fail toward detecting drift: the hash itself refuses to
+  // compute, and dispatchScopedRun's catch turns that into the upfront
+  // fail-closed refusal (unchanged from before #659).
+  assert.throws(
+    () => promptContentHash({ "3": { class_type: "X", inputs: { n: 1n } } }),
+    TypeError,
+    "an unstringifyable value stays covered — the hash fails closed rather than dropping it",
+  );
+});
+
+test("#659 scopeDroppedError: a malformed drift list can never throw out of the refusal's description (codex gate r1)", () => {
+  // verdict.drift is module-internal today, but scopeDroppedError is exported
+  // and runs on the refusal path: odd caller-supplied tokens degrade to the
+  // no-diff guidance, they never escape as a throw.
+  let msg;
+  assert.doesNotThrow(() => {
+    msg = scopeDroppedError({ toNodeId: 5, verdict: { ok: false, reason: "graph_changed", drift: [Symbol("x"), 42, null] } });
+  });
+  assert.match(msg, /queue-time widget hook/, "non-string tokens degrade to the no-diff guidance");
+  assert.match(msg, /Nothing was queued/);
+  // An over-long token is bounded before it reaches a caller-readable error.
+  const long = scopeDroppedError({ toNodeId: 5, verdict: { ok: false, reason: "graph_changed", drift: [`3 ${"x".repeat(500)}`] } });
+  assert.ok(long.length < 1200, "the drift list is length-bounded");
+  assert.match(long, /3 x+/);
+});
+
+test("#659 promptContentHash: the probe uses the REAL input name and its parsed wire value — a key-sensitive toJSON cannot split the channels (codex gate r2)", () => {
+  // toJSON(key) receives the property name: probing under a fixed key would
+  // misjudge a key-sensitive toJSON (drop decision and value both), and
+  // double-invoking a stateful toJSON could flip between probe and canon.
+  // The probe therefore uses the real input name and the canon stores the
+  // probe's PARSED value, so toJSON fires exactly once with the wire's key.
+  const keySensitive = { toJSON: (key) => (key === "model" ? "llama3" : undefined) };
+  const inMemory = { "3": { class_type: "X", inputs: { model: keySensitive } }, "9": { class_type: "Y", inputs: {} } };
+  const wireBody = JSON.stringify({ prompt: { "3": { class_type: "X", inputs: { model: keySensitive } }, "9": { class_type: "Y", inputs: {} } } });
+  assert.equal(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody),
+    'toJSON("model") on both channels ⇒ the same value, the same hash',
+  );
+  let calls = 0;
+  const counting = { toJSON: () => (++calls, 1) };
+  promptContentHash({ "3": { class_type: "X", inputs: { a: counting } } });
+  assert.equal(calls, 1, "toJSON fires exactly once per input per canonicalization");
+});
+
+test("#659 promptContentHash: an own toJSON FUNCTION on the inputs object fails CLOSED, never a false graph_changed (codex gate r3)", () => {
+  // inputs: { steps: 20, toJSON: () => undefined } — the hook protocol makes
+  // the WIRE carry whatever toJSON returns instead of the keys, so no
+  // per-input canonicalization can predict the body's shape. The hash must
+  // refuse to compute (dispatchScopedRun's catch ⇒ the upfront unverifiable
+  // refusal) rather than false-refuse a drift that never happened.
+  const colliding = { "3": { class_type: "X", inputs: { steps: 20, toJSON: () => undefined } } };
+  assert.throws(() => promptContentHash(colliding), TypeError, "unpredictable wire form ⇒ fail closed");
+  // A NON-function toJSON-named input does not trip the hook protocol and
+  // stays fully drift-covered.
+  const harmless = { "3": { class_type: "X", inputs: { steps: 20, toJSON: false } } };
+  assert.equal(
+    promptContentHash(harmless),
+    promptContentHashFromBody(JSON.stringify({ prompt: { "3": { class_type: "X", inputs: { steps: 20, toJSON: false } } } })),
+    "a data-valued toJSON key serializes normally on both channels",
+  );
+});
+
+test("#659 integration: a graph with a toJSON-function inputs collision is refused UPFRONT (unverifiable), queuePrompt never called", async () => {
+  // Pins the end-to-end OUTCOME contract (upfront fail-closed, nothing
+  // queued). The deliberate-throw MECHANISM is pinned by the hash-level test
+  // above: without the canonicalizePrompt guard the probe's own toJSON
+  // hijack still throws by accident, reaching the same outcome by another
+  // path — the hash test is the one that fails there.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const output = {
+      "3": { class_type: "KSampler", inputs: { steps: 20, toJSON: () => undefined } },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget, output });
+    let queuePromptCalled = false;
+    const origQP = app.queuePrompt;
+    app.queuePrompt = async (...a) => { queuePromptCalled = true; return origQP(...a); };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "unverifiable", "fails closed BEFORE dispatch — never a false drift refusal");
+    assert.match(result.error, /cannot be dispatched safely/);
+    assert.equal(queuePromptCalled, false);
+    assert.equal(server.calls.length, 0, "nothing left the tab");
+  } finally {
+    stop();
+  }
+});
+
+test("#659 diffPromptCanons: names input-level changes, node add/remove, and class_type changes — and never throws on odd input", () => {
+  const a = canonicalizePrompt({
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: ["4", 0] } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  });
+  const b = canonicalizePrompt({
+    "3": { class_type: "KSampler", inputs: { steps: 25 } },
+    "10": { class_type: "PreviewAny", inputs: {} },
+  });
+  const tokens = diffPromptCanons(a, b);
+  assert.ok(tokens.includes("3 steps"), "a changed value names the pair");
+  assert.ok(tokens.includes("3 model"), "an input present on only one side names the pair");
+  assert.ok(tokens.includes("9 (node only in queued prompt)"), "a removed node is named");
+  assert.ok(tokens.includes("10 (node only in dispatch body)"), "an added node is named");
+  const c = canonicalizePrompt({ "3": { class_type: "OTHER", inputs: {} } });
+  assert.ok(diffPromptCanons(a, c).includes("3 (class_type changed)"), "a replaced node is named");
+  assert.deepEqual(diffPromptCanons(a, a), [], "identical canons have no drift");
+  assert.equal(diffPromptCanons(null, b), null, "an unusable canon degrades to null");
+  assert.equal(diffPromptCanons("junk", b), null);
+  assert.equal(diffPromptCanons(a, undefined), null);
+});
+
+test("#659 scopeDroppedError: a graph_changed refusal with drift tokens leads with the differing pairs; without them the hook guidance remains", () => {
+  const withDrift = scopeDroppedError({
+    toNodeId: 143,
+    verdict: { ok: false, reason: "graph_changed", drift: ["42 model", "7 (node only in dispatch body)"] },
+  });
+  assert.match(withDrift, /node 143/);
+  assert.match(withDrift, /42 model/);
+  assert.match(withDrift, /7 \(node only in dispatch body\)/);
+  assert.match(withDrift, /Retrying is safe/);
+  assert.match(withDrift, /Nothing was queued/);
+  const bare = scopeDroppedError({ toNodeId: 116, verdict: { ok: false, reason: "graph_changed", drift: null } });
+  assert.match(bare, /queue-time widget hook/, "no diff available ⇒ the candidate-cause guidance stays");
+  assert.match(bare, /Retrying is safe \(nothing was queued\)/);
+});
+
+test("#659 integration: a graph whose serialized widget value is undefined (the issue's OllamaConnectivityV2 shape) no longer false-refuses — the scoped run DISPATCHES", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    // Reproduced live against ComfyUI_frontend 1.47.12 (#659): graphToPrompt's
+    // in-memory output carries `model: undefined` for the empty-options combo;
+    // the POST body drops the key — the old hash pair differed 5/5 with zero
+    // edits and every scoped run was refused as "graph CHANGED".
+    const output = {
+      "3": { class_type: "KSampler", inputs: { steps: 20 } },
+      "7": { class_type: "OllamaConnectivityV2", inputs: { url: "http://127.0.0.1:11434", model: undefined } },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget, output });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "dispatched", "no user edit ⇒ no drift ⇒ the scoped run goes out");
+    assert.equal(server.calls.length, 1);
+    const posted = JSON.parse(server.calls[0].options.body);
+    assert.deepEqual(posted.partial_execution_targets, ["14"]);
+    assert.ok(!("model" in posted.prompt["7"].inputs), "the wire body never carried the JSON-invisible key");
+  } finally {
+    stop();
+  }
+});
+
+test("#659 integration: a graph_changed refusal through dispatchScopedRun NAMES what differed — value edits, rewired links, added/removed nodes", async () => {
+  const stop = keepAlive();
+  try {
+    for (const { drift, token } of [
+      { drift: { "3": { class_type: "KSampler", inputs: { steps: 25 } } }, token: /3 steps/ },
+      { drift: { "9": { class_type: "SaveImage", inputs: { images: ["4", 0] } } }, token: /9 images/ },
+      { drift: { "20": { class_type: "SaveImage", inputs: {} } }, token: /20 \(node only in dispatch body\)/ },
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const driftedOutput = { ...OUR_OUTPUT, ...drift };
+      const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+      app.postDeferred = async (item) => {
+        const body = frontendBody({ output: driftedOutput, number: item.number, targets: ["14"] });
+        app.posted.push(body);
+        return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      };
+      const promise = dispatchScopedRun({
+        app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+        verifyTimeoutMs: 500,
+      });
+      await sleep(20);
+      const res = await app.postDeferred(app.deferredItem);
+      const result = await promise;
+      assert.equal(res.status, 400);
+      assert.equal(result.outcome, "refused");
+      assert.match(result.error, /graph CHANGED/i);
+      assert.match(result.error, token, `the refusal names the drift: ${token}`);
+      assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
+    }
+    // A node REMOVED mid-window is named from the other side.
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const { "9": _dropped, ...shrunkOutput } = OUR_OUTPUT;
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+    app.postDeferred = async (item) => {
+      const body = frontendBody({ output: shrunkOutput, number: item.number, targets: ["14"] });
+      app.posted.push(body);
+      return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+    };
+    const promise = dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500,
+    });
+    await sleep(20);
+    await app.postDeferred(app.deferredItem);
+    const result = await promise;
+    assert.equal(result.outcome, "refused");
+    assert.match(result.error, /9 \(node only in queued prompt\)/, "a removed node is named");
+    assert.equal(server.calls.length, 0);
+  } finally {
+    stop();
+  }
+});
+
+test("#752 the repair keeps WHAT THE BODY CONTAINED, not just that it repaired", async () => {
+  // Three field reports stalled because the note said the scope "did not reach
+  // the request" without saying what did reach it. The guard already computed the
+  // body keys and threw them away — yet a frontend that DROPPED the field and one
+  // that RENAMED it produce the same sentence otherwise, and that is precisely
+  // the distinction the next report has to carry.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14,
+      queueMark: MARK_A, repairScope: true,
+    });
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+    assert.equal(guard.state.repaired, 1, "an absent key is ours to fill");
+    assert.ok(Array.isArray(guard.state.repairedFromKeys), "and the keys survive the repair");
+    assert.deepEqual(
+      guard.state.repairedFromKeys,
+      ["client_id", "number", "prompt"],
+      "exactly what the frontend sent, sorted",
+    );
+    assert.ok(
+      !guard.state.repairedFromKeys.includes("partial_execution_targets"),
+      "the key that was MISSING must never appear in the list of what was present",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#752 the recorded keys are the FIRST repair's, not a growing list", async () => {
+  // A batch repairs once per post. Appending would read as several different
+  // causes in the report when it is one frontend behaving one way.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 2, toNodeId: 14,
+      queueMark: MARK_A, repairScope: true,
+    });
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A, extra_data: {} }));
+    assert.equal(guard.state.repaired, 2);
+    assert.deepEqual(guard.state.repairedFromKeys, ["client_id", "number", "prompt"], "first only");
+  } finally {
+    stop();
+  }
+});
+
+test("#752 an unrepaired run reports no keys, rather than an empty list", async () => {
+  // "" and [] would both render as 'the body carried these keys: ' in the note.
+  // null is the honest value for 'no repair happened, so nothing was observed'.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14,
+      queueMark: MARK_A, repairScope: true,
+    });
+    await guard(
+      ...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A, partial_execution_targets: ["14"] }),
+    );
+    assert.equal(guard.state.repaired, 0, "the frontend delivered it; nothing to repair");
+    assert.equal(guard.state.repairedFromKeys, null);
+  } finally {
+    stop();
+  }
+});
+
+test("#752 NO shipped message asserts a ComfyUI_frontend version range", () => {
+  // The messages claimed this path was "not reproducible against ComfyUI_frontend
+  // 1.42–1.50". Three field reports on 1.45.21 sit INSIDE that range and hit it.
+  // Only 1.47.12 was ever measured here, so the range was never earned — and
+  // shipping it told each reporter their own evidence could not be happening.
+  //
+  // Scanned across ALL shipped panel JS rather than asserted on one string: the
+  // claim lived in TWO places (the graph_run note and the guard's own refusal),
+  // and fixing only the one quoted in the issue would have left the other
+  // shipping the same false statement.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const offenders = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (name.endsWith(".js")) {
+        readFileSync(p, "utf8")
+          .split("\n")
+          .forEach((line, i) => {
+            // A comment ABOUT the removed claim is the record of why; only
+            // shipped prose is the problem.
+            if (/^\s*(\/\/|\*)/.test(line)) return;
+            if (/1\.\d\d\s*[-–]\s*1\.\d\d/.test(line)) offenders.push(`${name}:${i + 1}  ${line.trim()}`);
+          });
+      }
+    }
+  };
+  walk(join(here, "../../web/js"));
+  assert.deepEqual(offenders, [], `these ship a frontend version range:\n${offenders.join("\n")}`);
+});
+
+test("#752 WIRING: the graph_run note actually PRINTS the observed body keys", () => {
+  // Recording them on the guard and never rendering them would leave the note
+  // exactly as unhelpful as it was, with a passing test suite. The value has to
+  // reach the sentence a reporter reads.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+  const start = source.indexOf('accept.scope_applied_by = "request_body_repair"');
+  assert.ok(start > 0);
+  const end = source.indexOf("\n    }", start);
+  const raw = source.slice(start, end);
+  assert.match(raw, /runScopeResult\?\.repairedFromKeys/, "the note reads the recorded keys");
+  assert.match(raw, /repairedFromKeys\.join\(", "\)/, "and renders them into the prose");
+  // Same normalisation as the #630 reconstruction above: the prose is spelled as
+  // adjacent template chunks, so a phrase that reads as one sentence is not one
+  // string in the source.
+  const prose = raw
+    .split("\n")
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join("\n")
+    .replace(/`\s*\+\s*\n\s*`/g, "")
+    .replace(/\s+/g, " ");
+  assert.match(
+    prose,
+    /carried these keys and no partial_execution_targets/,
+    "labelled as what was present INSTEAD of the scope, not as a bare key dump",
+  );
+});
+
+test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, not by body repair", async () => {
+  // Two field reports (frontend 1.45.21) queued correctly but via
+  // `scope_applied_by: "request_body_repair"` — the fallback carrying the whole
+  // feature. Read out of a shipped 1.47.12 bundle, the reason is that the
+  // frontend uses two different option keys at two layers:
+  //
+  //   store: {queueNodeIds} -> api.queuePrompt(e, m, {partialExecutionTargets: n})
+  //   api:   ...n?.partialExecutionTargets && {partial_execution_targets: ...}
+  //
+  // so a build whose app.queuePrompt forwards straight to the api layer ignored
+  // both shapes the panel sent.
+  const stop = keepAlive()
+  try {
+  const server = makeServer()
+  const apiTarget = { fetchApi: server }
+  const app = makeFrontend({ shape: "apiOptions", apiTarget })
+  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 })
+
+  assert.equal(result.outcome, "dispatched")
+  assert.equal(result.scopeAppliedBy, "frontend", "the scope reached the body through app.queuePrompt, not the repair")
+  assert.ok(!result.repaired, "the body-repair fallback must not be needed for this build")
+  // Shapes 1 and 2 are dropped by this build; the third one lands.
+  assert.equal(app.posted.length, 3, "array, queueNodeIds, then the partialExecutionTargets shape")
+  assert.equal(app.posted[0].partial_execution_targets, undefined)
+  assert.equal(app.posted[1].partial_execution_targets, undefined)
+  assert.deepEqual(app.posted[2].partial_execution_targets, ["14"])
+  // Exactly one request reaches ComfyUI, carrying exactly node 14's branch.
+  assert.equal(server.calls.length, 1, "the two dropped attempts were blocked, not forwarded")
+  assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"])
+  } finally {
+    stop()
+  }
+})

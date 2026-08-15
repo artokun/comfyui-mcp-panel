@@ -1,0 +1,206 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "Dar una estrella en GitHub",
+    "tooltip": "¿Te gusta el panel del agente de ComfyUI? Una estrella en GitHub ayuda de verdad. Abre el repositorio en una pestaña nueva."
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "Novedades",
+    "tooltip": "Muestra los cambios recientes en la transcripción del panel: lo que llegó en esta versión y en las anteriores. El panel puede actualizarse desde el Comfy Registry sin que se lo pidas, así que aquí es donde mirar cuando algo se comporte de forma distinta a como lo recuerdas."
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "Documentación",
+    "tooltip": "Guías del panel, las herramientas, los LLM locales y la resolución de problemas — comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "Comunidad",
+    "tooltip": "Únete al Discord de comfyui-mcp: anuncios, consejos y ayuda. Se abre en una pestaña nueva."
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "¿Necesitas ayuda?",
+    "tooltip": "¿Atascado? Esto copia al portapapeles un breve resumen de diagnóstico (versión del panel, backend, ComfyUI, sistema operativo) y abre el Discord — pégalo en tu mensaje para que podamos ayudarte rápido."
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "Backend del agente por defecto",
+    "tooltip": "A qué agente en segundo plano se conecta el panel por defecto. Claude funciona con tu suscripción de Claude; ChatGPT, con tu cuenta de Codex (ChatGPT); Gemini, con tu inicio de sesión de Google (Gemini). Define el backend inicial del panel (y qué grupo de los de abajo alimenta el entorno de ejecución); aún puedes cambiarlo en caliente desde el selector de modelos (ese cambio dura solo la sesión y NO modifica este valor por defecto)."
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "Conectar automáticamente al cargar",
+    "tooltip": "Conecta el agente automáticamente (iniciando el orquestador local) cuando se abre el panel, sin pulsar Conectar. Desactivado por defecto: de lo contrario, el orquestador solo se inicia con un clic explícito en Conectar."
+  },
+  "comfyui-mcp_language": {
+    "name": "Idioma del panel",
+    "tooltip": "Idioma del texto propio del panel. “Detectar” sigue la configuración de idioma de ComfyUI, así que cambiar el idioma de ComfyUI cambia también el del panel. Todo lo que aún no esté traducido se muestra en inglés. Surte efecto al reabrir o recargar el panel."
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "Controlar con la app móvil (beta)",
+    "tooltip": "Muestra el botón de emparejamiento por control remoto (QR) en la cabecera del panel y los enlaces de descarga de la app beta de abajo. La app móvil está en BETA y cambia muy rápido: espera asperezas, cambios incompatibles entre compilaciones y algún reemparejamiento. El emparejamiento se queda en tu propia máquina o red salvo que elijas explícitamente el modo Internet."
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "Mostrar Apps",
+    "tooltip": "Muestra el botón Apps en la barra de herramientas: la capa de micro-apps (convertir un flujo de trabajo en una app de un clic, ejecutarla en local o en un pod, publicarla y explorar las de otros). Desactivado por defecto; la opción también se envía a la app móvil conectada."
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "Mostrar Entrenamiento",
+    "tooltip": "Muestra el botón Entrenamiento en la barra de herramientas: el asistente de entrenamiento de LoRA (reunir, etiquetar, lanzar y seguir el dataset). Desactivado por defecto; la opción también se envía a la app móvil conectada."
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "Mostrar RunPod / Local",
+    "tooltip": "Muestra el botón de host RunPod / Local en la barra de herramientas: desplegar, iniciar, detener o conectar un pod con GPU en la nube, o volver a lo local. Desactivado por defecto; la opción también se envía a la app móvil conectada."
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "Consigue la app beta",
+    "tooltip": "Descargas para probadores de la app móvil de ComfyUI MCP. En iOS se instala con Apple TestFlight; en Android, con Firebase App Distribution. Ambos canales son beta: las compilaciones se actualizan a menudo y pueden exigir volver a emparejar con este panel."
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "Escala de la interfaz del panel (%)",
+    "tooltip": "Escala toda la barra lateral del agente: texto, iconos y espaciado a la vez. Súbela si el panel se lee mal en una pantalla grande o de alta densidad. El valor por defecto es 100%; rango 100-250. Se aplica de inmediato a todos los paneles abiertos. Ten en cuenta que sobrescribir `.cmcp-root { font-size }` en una hoja de estilos de usuario NO funciona: los tamaños internos del panel están en `rem`, que se resuelven contra la raíz de la página y no contra el panel, así que la mayor parte del texto lo ignora. Este ajuste es la forma admitida de escalar el panel."
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "Aviso de render atascado (segundos)",
+    "tooltip": "Cuánto tiempo puede un render de ComfyUI no avanzar NADA antes de avisar al agente de que su render parece atascado o bloqueado (por ejemplo, un paso del sampler colgado por falta de memoria) y pedirle que lo cancele o lo reinicie en lugar de poner otra ejecución en cola. Los pasos de video son legítimamente lentos, así que sé generoso con este valor. Por defecto 180 s; rango 15–3600. Se aplica en el siguiente arranque del orquestador: Desconectar y luego Conectar (o /restart) para cambiarlo en un agente en marcha."
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "URL de ComfyUI remoto (avanzado)",
+    "tooltip": "Apunta el AGENTE a un ComfyUI remoto en lugar de a esta máquina — por ejemplo, un pod de RunPod en https://xxxxxxxx-8188.proxy.runpod.net. Déjalo EN BLANCO para controlar el ComfyUI local (por defecto). Cuando se define, las herramientas del agente (cola, modelos, historial, subidas) apuntan al servidor remoto, y las que solo funcionan en local (download_model, packs del instalador, escaneos de modelos) se desactivan. Se aplica en el siguiente arranque del orquestador: Desconectar y luego Conectar para cambiarlo. Tu lienzo en vivo sigue al ComfyUI que hayas abierto en el navegador."
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "URL del puente (avanzado)",
+    "tooltip": "URL de WebSocket del puente del orquestador del panel: ahora UN solo puente sirve a todos los proveedores (por defecto ws://127.0.0.1:9180). Cámbiala solo si inicias el orquestador en un puerto que no sea el predeterminado (COMFYUI_MCP_BRIDGE_PORT). Se aplica en la siguiente conexión."
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "Acercar a las ediciones del agente",
+    "tooltip": "Cuando el agente cambia el valor de un nodo, acerca suavemente el lienzo a ese nodo (con margen) para que veas cómo llega el cambio, y vuelve a alejarlo hasta encuadrar todo el grafo cuando las ediciones se calman. Solo afecta a las ediciones de valores: el cableado y la colocación de nodos no mueven la vista. Activado por defecto; desactívalo para dejar el lienzo quieto."
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "Modelos preferidos",
+    "tooltip": "Tus modelos favoritos, separados por comas: etiquetas de Ollama (artokun/gemma4-comfyui-mcp:e4b — nuestro ajuste fino para ComfyUI, gemma4:12b, qwen3:4b) o ids de OpenRouter (xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). Se fijan ARRIBA del todo en el selector de modelos (marcados con ★ cuando no están en el catálogo detectado). Los guarda el orquestador, así que sobreviven a los reinicios y se aplican de inmediato."
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "Tipo de endpoint",
+    "tooltip": "Cómo habla el backend de Ollama con su endpoint. 'Ollama (local)' usa el /api/chat nativo de tu Ollama local. 'Compatible con OpenAI' habla /chat/completions: úsalo para OpenRouter, vLLM, LM Studio, DeepSeek, etc. (define la URL base abajo; la clave de API sale del entorno del orquestador, por ejemplo OPENROUTER_API_KEY). Se aplica a las sesiones NUEVAS: Desconectar y luego Conectar tras el cambio."
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "URL base del endpoint",
+    "tooltip": "URL base del endpoint de arriba. Déjala EN BLANCO para el Ollama local (http://127.0.0.1:11434). Para endpoints compatibles con OpenAI incluye el /v1 (por ejemplo, https://openrouter.ai/api/v1). Se aplica a las sesiones NUEVAS: Desconectar y luego Conectar tras el cambio."
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "URL base del endpoint",
+    "tooltip": "Cualquier endpoint compatible con OpenAI: vLLM, DeepSeek, Together, Azure OpenAI, un llama-server en otra máquina… Incluye el /v1 (por ejemplo, http://192.168.1.20:8000/v1). Lo guarda el orquestador y se aplica de inmediato; si el servidor necesita una clave, usa “Definir clave de API…” abajo. Déjalo en blanco para desactivar este proveedor."
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Claude, elegido entre los modelos obtenidos para Claude (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Claude, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de ChatGPT, elegido entre los modelos obtenidos para ChatGPT (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a ChatGPT, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Gemini, elegido entre los modelos obtenidos para Gemini (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Gemini, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Antigravity, elegido entre los modelos obtenidos para Antigravity (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Antigravity, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Pi, elegido entre los modelos obtenidos para Pi (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Pi, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Grok, elegido entre los modelos obtenidos para Grok (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Grok, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Kimi, elegido entre los modelos obtenidos para Kimi (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Kimi, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Kimi K3, elegido entre los modelos obtenidos para Kimi K3 (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Kimi K3, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de GLM (z.ai), elegido entre los modelos obtenidos para GLM (z.ai) (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a GLM (z.ai), puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de MiniMax, elegido entre los modelos obtenidos para MiniMax (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a MiniMax, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Ollama, elegido entre los modelos obtenidos para Ollama (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Ollama, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de OpenRouter, elegido entre los modelos obtenidos para OpenRouter (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a OpenRouter, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de LM Studio, elegido entre los modelos obtenidos para LM Studio (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a LM Studio, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de llama.cpp, elegido entre los modelos obtenidos para llama.cpp (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a llama.cpp, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano del endpoint personalizado, elegido entre los modelos obtenidos para el endpoint personalizado (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes al endpoint personalizado, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Esfuerzo de razonamiento por defecto del agente de Claude, dentro de su escala (de Bajo a Máximo). 'Predeterminado del modelo' lo deja sin definir."
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Esfuerzo de razonamiento por defecto del agente de ChatGPT, dentro de su escala (de Ninguno a Ultra). 'Predeterminado del modelo' lo deja sin definir."
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Gemini no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Antigravity no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Pi no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Grok no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Kimi no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Kimi K3 no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "GLM (z.ai) no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "MiniMax no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "Clave de API de OpenRouter",
+    "tooltip": "Guarda de forma segura tu clave de API de OpenRouter. Abre un campo enmascarado; el valor va directo al almacén 0600 del orquestador (~/.comfyui-mcp) y NUNCA se escribe en los ajustes de ComfyUI, los registros, el historial del chat ni el contexto del agente. Solo necesita el puente (pulsa Conectar primero: no hace falta que ningún proveedor esté listo)."
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "Clave de API del endpoint personalizado",
+    "tooltip": "Guarda de forma segura la clave de API de tu endpoint personalizado. Abre un campo enmascarado; el valor va directo al almacén 0600 del orquestador (~/.comfyui-mcp) y NUNCA se escribe en los ajustes de ComfyUI, los registros, el historial del chat ni el contexto del agente. Solo necesita el puente (pulsa Conectar primero: no hace falta que ningún proveedor esté listo)."
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "Token de CivitAI",
+    "tooltip": "Guarda de forma segura tu token de API de CivitAI. Abre un campo enmascarado; el valor va directo al almacén 0600 del orquestador (~/.comfyui-mcp) y NUNCA se escribe en los ajustes de ComfyUI, los registros, el historial del chat ni el contexto del agente. Solo necesita el puente (pulsa Conectar primero: no hace falta que ningún proveedor esté listo)."
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "Token de HuggingFace",
+    "tooltip": "Guarda de forma segura tu token de API de HuggingFace. Abre un campo enmascarado; el valor va directo al almacén 0600 del orquestador (~/.comfyui-mcp) y NUNCA se escribe en los ajustes de ComfyUI, los registros, el historial del chat ni el contexto del agente. Solo necesita el puente (pulsa Conectar primero: no hace falta que ningún proveedor esté listo)."
+  }
+}

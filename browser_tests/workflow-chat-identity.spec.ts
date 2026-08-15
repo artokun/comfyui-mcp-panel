@@ -70,6 +70,13 @@ test('opening a workflow does not dirty it and first record keeps provenance off
   await panel.connect()
   // The greeting record resolves this workflow's identity as thread
   // provenance (history metadata) without re-stamping the deleted graph tag.
+  //
+  // #847's save-then-assert-the-embed sequence is deliberately NOT carried over.
+  // That assertion held only because the test forced the `workflow` chat scope,
+  // which mcp#884 retires: the graph embed is written solely on the
+  // `workflowStorageKey({ embed: true })` path, and panel scope never calls it.
+  // Under the one shipping mode there is nothing to save and nothing to embed —
+  // provenance lives in history metadata, so the graph is never touched at all.
   await expect.poll(() => page.evaluate((threadsKey) => {
     const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
     return threads.find((t: any) => t.msgs?.length)?.workflowKey ?? null
@@ -84,6 +91,8 @@ test('opening a workflow does not dirty it and first record keeps provenance off
   })
   expect(recorded.embedded).toBeNull()
   expect(recorded.calls).toEqual({ before: 0, after: 0, dirty: 0 })
+  // No cleanup needed: panel scope saves no workflow, so this spec leaves
+  // nothing behind in the user's workflows folder.
 })
 
 test('default mode opens pre-upgrade history without re-keying it', async ({

@@ -501,8 +501,20 @@ test("#508 wiring: an undelivered reply is journaled, replayed after hello, and 
     false,
     "replay must not fire at bare socket-open",
   );
-  const markConnected = src.slice(src.indexOf("function markConnected() {"));
-  assert.match(markConnected.slice(0, 1600), /replayLostReplies\(sock\);/, "replay rides the handshake");
+  // Bound to markConnected's actual BODY, the way the #508 R6 test below bounds
+  // handleUndeliveredReply's. A fixed character window stood in for "inside this
+  // function" and stopped meaning that the moment the function grew a comment
+  // (#1145 added one) — a passing assertion turning into a failing one for a reason
+  // unrelated to what it checks.
+  const mcStart = src.indexOf("function markConnected() {");
+  assert.notEqual(mcStart, -1, "could not locate markConnected in the panel source");
+  // Both ends are asserted: a -1 from either indexOf would slice a window that is not
+  // the function — an unfound END silently degrades `slice` into a near-whole-file scan,
+  // which would pass no matter where replayLostReplies actually sits.
+  const mcEnd = src.indexOf("\n  }", mcStart);
+  assert.notEqual(mcEnd, -1, "could not locate the end of markConnected");
+  const markConnected = src.slice(mcStart, mcEnd);
+  assert.match(markConnected, /replayLostReplies\(sock\);/, "replay rides the handshake");
 });
 
 test("#508 codex R6: an outcome journaled AFTER the replacement socket replayed is delivered anyway", () => {

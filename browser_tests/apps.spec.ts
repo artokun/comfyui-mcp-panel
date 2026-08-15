@@ -13,6 +13,14 @@
 import { test, expect } from './fixtures/panelTest'
 import type { Page, Route } from '@playwright/test'
 
+// panel#793 — the Apps toolbar button is behind a flag that is `defaultValue:
+// false`, and the fixture strips panel settings for hermeticity. Without this
+// every test here spent 30s waiting to click a correctly-hidden button.
+// RunPod is listed too: two tests below drive the RunPod run path.
+test.use({
+  panelFlags: ['comfyui-mcp.featureFlag.apps', 'comfyui-mcp.featureFlag.runpod'],
+})
+
 const APP_ID = '123e4567-e89b-42d3-a456-426614174000'
 
 // 1x1 transparent PNG.
@@ -373,6 +381,12 @@ test('run on RunPod: dry-patches locally, enqueues on the pod via the bridge', a
   expect(uploads[0].filename).toMatch(/^cmcp-app-123e4567-[0-9a-f]{8}-face\.png$/)
   const enqueue = toolCalls.find((c) => c.tool === 'enqueue_workflow')
   expect(enqueue).toBeTruthy()
+  // `action` is REQUIRED on `enqueue_workflow` since the 0.50.0 fold, and the
+  // direct-call channel admits ONLY action:"enqueue" — the other four the fold
+  // brought onto this name (run_url among them) are refused. A frame with no
+  // action, or the wrong one, is rejected before it reaches the queue, and the
+  // vocabulary gate cannot see it because the NAME is alive.
+  expect(enqueue!.args.action).toBe('enqueue')
   const wf = enqueue!.args.workflow as Record<string, { inputs: Record<string, unknown> }>
   expect(wf['6'].inputs.text).toBe('a pod dog')
   expect(wf['5'].inputs.image).toBe('pod_img_00001.png')
@@ -611,35 +625,45 @@ test('explore: registry app opens straight into inputs — star icon, requiremen
   // in it) — both rows must show as actionable, not a gate.
   await page.route(/\/models\/checkpoints/, (route) => route.fulfill({ json: ['sdxl.safetensors'] }))
   // Bridge surface for the deps panel: model install-state checks + downloads
-  // (list_local_models, then download_civitai_model → recheck), node-pack
-  // resolution via the declared-list fallback (extract_workflow_dependencies
-  // fails → list_installed_nodes → install_custom_node).
+  // (list_local_models action:"list", then download_model
+  // action:"download_civitai" → recheck), node-pack resolution via the
+  // declared-list fallback (list_packs action:"extract_deps" fails →
+  // install_custom_node action:"list" → install_custom_node action:"install").
+  //
+  // KEYED ON (tool, action). After the 0.50.0 fold the LIST and the INSTALL are
+  // the same tool name — `install_custom_node` — and so are the recheck and the
+  // download on `download_model`. A name-only stub answers the install with the
+  // pack listing and the missing-model resolve with a download receipt, which
+  // is how a green test would certify a panel that cannot install anything.
   const downloads: Record<string, unknown>[] = []
   let modelListCalls = 0
   mockBridge.onFrame((frame) => {
     if (frame.type !== 'call_tool') return
+    const args = (frame.args || {}) as Record<string, unknown>
+    const action = args.action
     const reply = (result: unknown, ok = true) =>
       mockBridge.send({ type: 'tool_result', cid: frame.cid, ok, result })
-    if (frame.tool === 'list_local_models') {
+    const is = (t: string, a: string) => frame.tool === t && action === a
+    if (is('list_local_models', 'list')) {
       modelListCalls++
       const names = modelListCalls === 1 ? ['sdxl.safetensors'] : ['sdxl.safetensors', 'flux.safetensors']
       reply([{ type: 'text', text: JSON.stringify({ checkpoints: names }) }])
       return
     }
-    if (frame.tool === 'download_civitai_model') {
-      downloads.push(frame.args as Record<string, unknown>)
+    if (is('download_model', 'download_civitai')) {
+      downloads.push(args)
       reply([{ type: 'text', text: 'downloaded flux.safetensors' }])
       return
     }
-    if (frame.tool === 'extract_workflow_dependencies') {
+    if (is('list_packs', 'extract_deps')) {
       reply([{ type: 'text', text: 'not available in the mock' }], false)
       return
     }
-    if (frame.tool === 'list_installed_nodes') {
+    if (is('install_custom_node', 'list')) {
       reply([{ type: 'text', text: '## installed packs\n- some-other-pack' }])
       return
     }
-    if (frame.tool === 'install_custom_node') {
+    if (is('install_custom_node', 'install')) {
       reply([{ type: 'text', text: 'installed' }])
       return
     }

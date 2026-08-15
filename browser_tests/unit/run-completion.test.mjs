@@ -633,3 +633,112 @@ test("#609 wiring: the panel call site feeds the composer the gate's own blind p
     "the note's review request must be conditioned on the SAME blind flag the sendFrame gate strips by",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #986 — the SAME finished output re-announced as separate completions. Six in
+// ~30s, each under a different prompt id with a sub-second "render" time, because
+// the user re-queued from the canvas and ComfyUI served it from cache. The
+// prompt-id fence cannot collapse genuinely different prompts; the OUTPUT is what
+// repeats. These drive the real tracker, so the wiring is what is under test.
+// ---------------------------------------------------------------------------
+
+/** A harness that also captures suppressions and lets the dedupe window be set. */
+function makeDedupeHarness({ duplicateWindowMs = 5 * 60 * 1000 } = {}) {
+  let clock = 0;
+  let seq = 0;
+  const timers = new Map();
+  const flushes = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: (p) => flushes.push(p),
+    duplicateWindowMs,
+    now: () => clock,
+    setTimer: (fn, ms) => {
+      const id = ++seq;
+      timers.set(id, { at: clock + ms, fn });
+      return id;
+    },
+    clearTimer: (id) => timers.delete(id),
+  });
+  return { tracker, flushes, advance: (ms) => (clock += ms) };
+}
+
+/** One canvas run that produces the given video and finishes. */
+const canvasRun = (h, promptId, filename) => {
+  h.tracker.onExecutionStart(promptId);
+  h.tracker.onExecuted(promptId, { images: [], videos: [{ filename, subfolder: "", type: "output" }] });
+  h.tracker.onExecutionSuccess(promptId);
+};
+
+test("#986: the reported burst — every repeat is DELIVERED, and every repeat is labelled", () => {
+  const h = makeDedupeHarness();
+  for (const id of ["2d9d64f5", "c3e90187", "c5184f9e", "4ce0a352", "740ff0f5", "aa11bb22"]) {
+    canvasRun(h, id, "Video_00144.mp4");
+    h.advance(5000); // the reported burst was ~30s across six
+  }
+  assert.equal(h.flushes.length, 6, "no result is ever swallowed");
+  assert.equal(h.flushes[0].duplicateOf, undefined, "the first duplicates nothing");
+  for (const f of h.flushes.slice(1)) {
+    assert.equal(f.duplicateOf, "2d9d64f5", "each repeat names the delivery it duplicates");
+    assert.equal(f.looksCached, true, "and says it did no real work — the 0.1s giveaway");
+  }
+});
+
+test("#986: a PANEL-QUEUED run is delivered even when its output was already seen", () => {
+  // panel_run promised the agent a notification and told it to end its turn.
+  // Suppressing that wedges it forever — strictly worse than the duplicates.
+  const h = makeDedupeHarness();
+  canvasRun(h, "canvas-1", "same.mp4");
+  assert.equal(h.flushes.length, 1);
+  h.tracker.onQueued("panel-1");
+  canvasRun(h, "panel-1", "same.mp4");
+  assert.equal(h.flushes.length, 2, "the run the agent is waiting for always arrives");
+  assert.equal(h.flushes[h.flushes.length-1].duplicateOf, undefined, "not labelled a duplicate");
+});
+
+test("#986: a DIFFERENT output is never collapsed into a previous one", () => {
+  const h = makeDedupeHarness();
+  canvasRun(h, "p1", "Video_00144.mp4");
+  canvasRun(h, "p2", "Video_00145.mp4");
+  assert.equal(h.flushes.length, 2);
+  assert.equal(h.flushes[h.flushes.length-1].duplicateOf, undefined, "not labelled a duplicate");
+});
+
+test("#986: past the window, a deliberate re-render of the same file is a real event again", () => {
+  const h = makeDedupeHarness({ duplicateWindowMs: 1000 });
+  canvasRun(h, "p1", "same.mp4");
+  h.advance(5000);
+  canvasRun(h, "p2", "same.mp4");
+  assert.equal(h.flushes.length, 2, "an hour-later re-render is not a duplicate");
+});
+
+test("#986: a REAL re-render overwriting the same filename is delivered and NOT called cached", () => {
+  // The case that killed suppression: a fixed-name writer producing different bytes.
+  const h = makeDedupeHarness({ duplicateWindowMs: 60 * 60 * 1000 });
+  canvasRun(h, "first", "fixed.mp4");
+  h.tracker.onExecutionStart("second");
+  h.advance(600000);
+  h.tracker.onExecuted("second", { images: [], videos: [{ filename: "fixed.mp4", subfolder: "", type: "output" }] });
+  h.tracker.onExecutionSuccess("second");
+  assert.equal(h.flushes.length, 2, "a real render always arrives");
+  assert.equal(h.flushes[1].duplicateOf, "first", "the filename repeat is still disclosed");
+  assert.equal(h.flushes[1].looksCached, false, "but it is NOT claimed to be a replay");
+});
+
+test("#986 (codex r3): a later `executing` must NOT upgrade a FABRICATED start to trusted", () => {
+  // Partial frame loss: execution_start and the first node's `executing` are both
+  // dropped, so `onExecuted` invents a timestamp. A later `executing` for a SECOND
+  // output node used to mark that invented value trusted — making a genuine long
+  // multi-output render look sub-second AND trusted, which is the shape that gets
+  // suppressed. It must deliver.
+  const h = makeDedupeHarness();
+  // Seed: an earlier run announced the same fixed filename.
+  canvasRun(h, "earlier", "fixed.mp4");
+  assert.equal(h.flushes.length, 1);
+  h.advance(1000);
+  // The genuine second render, with its start frames lost.
+  h.tracker.onExecuted("second", { images: [], videos: [{ filename: "fixed.mp4", subfolder: "", type: "output" }] });
+  h.tracker.onExecutingNode("second", "node-2"); // later signal, different node
+  h.tracker.onExecutionSuccess("second"); // finishes within the cache-hit threshold
+  assert.equal(h.flushes.length, 2, "a real render is delivered even when its duration looks tiny");
+  assert.equal(h.flushes[1].looksCached, false, "an INVENTED duration is never called a cache hit");
+});

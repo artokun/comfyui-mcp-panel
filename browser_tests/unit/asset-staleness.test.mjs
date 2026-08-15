@@ -7,6 +7,12 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+/** #1172 — the wiring assertion reads the shipped monolith, so the disclosure cannot be
+ *  added to the verdict while the forwarding whitelist silently drops it. */
+const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 
 import {
   findNodeByScopedId,
@@ -21,9 +27,12 @@ import {
   reconcileUnknownWidgetNames,
   collectAllGraphs,
   reapplyDefsToLiveNodes,
+  emptyComboListsOnGraph,
+  emptyComboNote,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -787,6 +796,215 @@ test("graphErrorsResultIsClean: FALSE for missing_models / missing_media / missi
   assert.equal(graphErrorsResultIsClean({ missing_node_count: 2 }), false);
 });
 
+test("graphErrorsResultIsClean: FALSE for an unavailable_widget_values-ONLY result (#984)", () => {
+  // Measured on a live install before the fix: a CheckpointLoader whose `config_name`
+  // named an absent models/configs .yaml. No missing-MODEL store adjudicates that
+  // folder, so every load-time surface was empty while the #745 live scan found it —
+  // and the payload carried the finding AND "Checked errors — none".
+  assert.equal(
+    graphErrorsResultIsClean({
+      errored_count: 0,
+      node_errors: null,
+      last_execution_error: null,
+      unavailable_widget_values: [
+        {
+          id: 1,
+          type: "CheckpointLoader",
+          widget: "config_name",
+          value: "totally_absent_config.yaml",
+          kind: "missing_asset",
+        },
+      ],
+    }),
+    false,
+  );
+  // The other kind the scan reports is just as fatal at queue time — a value outside
+  // the options the server publishes — so it must not be treated as cosmetic either.
+  assert.equal(
+    graphErrorsResultIsClean({
+      unavailable_widget_values: [{ id: 2, widget: "sampler_name", value: "nope", kind: "invalid_value" }],
+    }),
+    false,
+  );
+  assert.equal(graphErrorsResultIsClean({ unavailable_widget_values: [] }), true, "an empty list is still clean");
+});
+
+test("#984 (codex): the two detection halves finding the SAME defect count ONCE", () => {
+  // Measured on a live install: three absent UNET files appeared in BOTH the load-time
+  // missingModel store and the #745 live scan. Adding the lists claimed six findings
+  // for three problems — two corroborating signals, not two defects.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [
+      { node_id: 1, file: "a.safetensors", widget: "unet_name" },
+      { node_id: 2, file: "b.safetensors", widget: "unet_name" },
+    ],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "a.safetensors", kind: "missing_asset" },
+      { id: 2, widget: "unet_name", value: "b.safetensors", kind: "missing_asset" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 2);
+  assert.equal(counts.unavailable, 0, "both halves saw the same two files — nothing extra to report");
+});
+
+test("#984 (codex): a live-scan finding the load-time half MISSED is still counted", () => {
+  // The whole reason the live scan exists. CheckpointLoader.config_name is the measured
+  // case: no missing-MODEL store adjudicates models/configs, so this is the only report.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "a.safetensors", widget: "unet_name" }],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "a.safetensors", kind: "missing_asset" }, // dup
+      { id: 7, widget: "config_name", value: "totally_absent_config.yaml", kind: "missing_asset" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 1, "the config_name finding is new information");
+});
+
+test("#984 (codex): overlap is detected even when the store entry omits `widget`", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_media: [{ node_id: 3, file: "in.png" }], // no widget recorded
+    unavailable_widget_values: [{ id: 3, widget: "image", value: "in.png", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 0, "the (node, file) join still catches it");
+});
+
+test("#984 (codex): an unjoinable live-scan entry is counted rather than silently dropped", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "a.safetensors" }],
+    unavailable_widget_values: [{ widget: "unet_name", value: "a.safetensors" }], // no id
+  });
+  assert.equal(counts.unavailable, 1, "no identity to join on ⇒ report it, never assume a duplicate");
+});
+
+test("#984 (codex): node-type surfaces have no widget identity and are never deduped away", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_node_types: ["RIFEInterpolation"],
+    missing_node_count: 2,
+    errored_count: 4,
+  });
+  assert.equal(counts.missingAssets, 3, "1 type + a count of 2");
+  assert.equal(counts.erroredNodes, 4);
+  assert.equal(counts.unavailable, 0);
+});
+
+test("#984 (codex): `unchecked` is reported but is never a finding", () => {
+  const counts = graphErrorsFindingCounts({ unchecked_nodes: [{ id: 9 }, { id: 10 }] });
+  assert.equal(counts.unchecked, 2);
+  assert.equal(counts.missingAssets, 0);
+  assert.equal(counts.unavailable, 0);
+  assert.equal(counts.erroredNodes, 0);
+});
+
+test("#984: the overlap join is injective — a concatenation collision cannot swallow a finding", () => {
+  // Without a field separator, (node "1", file "23") and (node "12", file "3") produce
+  // the same key, and a real live-scan finding is silently deduped away as a phantom
+  // duplicate. Suppressing a finding is the exact failure this whole issue is about.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "1", file: "23" }],
+    unavailable_widget_values: [{ id: "12", value: "3", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 1, "different (node, file) pairs must not collide into one key");
+});
+
+test("#984 (codex r2): a filename containing the separator BYTE cannot forge a duplicate", () => {
+  // A delimiter is not an encoding, whichever byte it is — a POSIX filename may contain
+  // 0x1f, so `(node 1, file "x\x1fy")` and `(node 1, widget "x", value "y")` keyed the
+  // same and the live finding vanished. The fields are escaped now, not just separated.
+  // The collision must be built WITHIN one key shape, or the shape tag masks it — the
+  // first version of this test put the two entries in different shapes and passed
+  // against the broken join, proving nothing. Here both sides key as (node, widget,
+  // file): the store's widget "x" + file "y<SEP>z" and the live entry's widget
+  // "x<SEP>y" + value "z" delimit to the same string.
+  const SEP = String.fromCharCode(31); // built, never written literally into source
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "1", widget: "x", file: `y${SEP}z` }],
+    unavailable_widget_values: [{ id: "1", widget: `x${SEP}y`, value: "z", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 1, "a control byte inside a field must not forge a key collision");
+});
+
+test("#984 (codex r2): a store miss on ONE widget does not swallow a live finding on ANOTHER", () => {
+  // Same node, same filename, different widgets — genuinely two faults. The first
+  // version added the widget-less key unconditionally, so the store's `unet_name` miss
+  // absorbed the live scan's distinct `config_name` finding.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: 1, file: "shared.safetensors", widget: "unet_name" }],
+    unavailable_widget_values: [
+      { id: 1, widget: "unet_name", value: "shared.safetensors", kind: "missing_asset" },
+      { id: 1, widget: "config_name", value: "shared.safetensors", kind: "invalid_value" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 1, "only the widget the store actually named is absorbed");
+});
+
+test("#984 (codex r2): a store entry with NO widget still absorbs any widget on that node", () => {
+  // The other direction: with no widget recorded there is no identity to tell the
+  // node's widgets apart, so the store entry has to be allowed to cover them.
+  const counts = graphErrorsFindingCounts({
+    missing_media: [{ node_id: 3, file: "in.png" }],
+    unavailable_widget_values: [{ id: 3, widget: "image", value: "in.png", kind: "missing_asset" }],
+  });
+  assert.equal(counts.unavailable, 0);
+});
+
+test("#984 (codex r2): a subgraph LOCATOR and a bare id are kept apart, deliberately", () => {
+  // The two producers do not canonicalize locators between them. Treating
+  // "<uuid>:7" and 7 as the same node would merge findings on different nodes;
+  // keeping them apart over-reports at worst. Over-reporting is the safe direction.
+  const counts = graphErrorsFindingCounts({
+    missing_models: [{ node_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890:7", file: "m.safetensors" }],
+    unavailable_widget_values: [{ id: 7, widget: "unet_name", value: "m.safetensors" }],
+  });
+  assert.equal(counts.unavailable, 1);
+});
+
+test("#984: graphErrorsFindingCounts is total — a malformed or absent result yields zeroes", () => {
+  for (const bad of [null, undefined, 42, "x", {}, { missing_models: "nope", unavailable_widget_values: 7 }]) {
+    const c = graphErrorsFindingCounts(bad);
+    assert.deepEqual(c, { erroredNodes: 0, missingAssets: 0, unavailable: 0, unchecked: 0 });
+  }
+});
+
+test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", () => {
+  // The helper above governs the SUMMARY LABEL. The `note: "no errors recorded…"` in
+  // the payload comes from a separate `clean` expression inside the monolith's
+  // executor, which is not importable — and it is the one that produced the
+  // self-contradicting payload. Both must fold in the live scan or the contradiction
+  // simply moves. Deleting either half fails here.
+  const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const cleanExpr = /const clean =([\s\S]{0,600}?);/.exec(panelSrc)?.[1] ?? "";
+  assert.ok(cleanExpr.length > 0, "the `clean` expression must still exist to be checked");
+  assert.match(cleanExpr, /!liveScan\?\.unavailable\?\.length/, "`clean` must account for the live scan (#984)");
+  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount"]) {
+    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399 surfaces must survive: ${surface}`);
+  }
+  // The summary now derives every count from the shared helper above, which is tested
+  // BEHAVIOURALLY. This only pins that the label is wired to it — codex was right that
+  // a source regex cannot prove the wiring, so the regex is kept as thin as possible
+  // and the real assertions live on the importable helper.
+  assert.match(
+    panelSrc,
+    /const counts = graphErrorsFindingCounts\(r\);/,
+    "the summary label must count through the deduping helper, not by adding the lists",
+  );
+  assert.ok(
+    !/\(r\.missing_models\?\.length \|\| 0\) \+/.test(panelSrc),
+    "the old hand-rolled summing must not reappear — it double-counted the overlap",
+  );
+});
+
+test("graphErrorsResultIsClean: unchecked_nodes alone does NOT make a result dirty (#984 scope)", () => {
+  // The scan reports what it could not judge on almost every call. Treating that as an
+  // error would make "Checked errors — none" unreachable on a normal canvas, which is
+  // a different lie. Only what the scan positively FOUND counts.
+  assert.equal(
+    graphErrorsResultIsClean({ unchecked_nodes: [{ id: 9, type: "SomePack" }], unchecked_budget_exhausted: true }),
+    true,
+  );
+});
+
 test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", () => {
   assert.equal(graphErrorsResultIsClean({ node_errors: { 3: { errors: [] } } }), false);
   assert.equal(graphErrorsResultIsClean({ last_execution_error: { node_id: 5 } }), false);
@@ -995,4 +1213,122 @@ test("resolveMissingModelDirectory: NON-ultralytics directories never regress", 
   assert.equal(resolveMissingModelDirectory("loras", "bbox/x.pt"), "loras");
   assert.equal(resolveMissingModelDirectory("ultralytics_extra", "segm/x.pt"), "ultralytics_extra");
   assert.equal(resolveMissingModelDirectory(null, "segm/x.pt"), null);
+});
+
+// ── #1172: the reapply sweep must REBUILD combo options, and empty lists must be disclosed ──
+
+const CKPT_DEF = (values) => ({ input: { required: { ckpt_name: [values, {}] } } });
+
+test("#1172 the reapply sweep repopulates a combo whose option list is empty", () => {
+  // The reported bug. panel_add_node builds the widget from the REGISTERED nodeData, so a
+  // newly added CheckpointLoaderSimple starts with `values: []`. The sweep stamped nodeData
+  // and reconciled UNKNOWN names but never touched options.values, leaving the node unusable
+  // while refresh_nodes answered `refreshed: true`.
+  const node = {
+    id: 1,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", value: "", options: { values: [] } }],
+    constructor: {},
+  };
+  reapplyDefsToLiveNodes(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF(["anime.safetensors", "sd15.ckpt"]) });
+  assert.deepEqual(node.widgets[0].options.values, ["anime.safetensors", "sd15.ckpt"]);
+});
+
+test("#1172 the rebuild reaches nodes inside SUBGRAPHS", () => {
+  // collectAllGraphs already walks them; the rebuild rides the same sweep, so a promoted
+  // inner node must be repaired too rather than silently skipped.
+  const inner = { id: 2, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", options: { values: [] } }], constructor: {} };
+  const root = graphOf([{ id: 1, type: "Host", subgraph: { _nodes: [inner] } }]);
+  reapplyDefsToLiveNodes(root, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) });
+  assert.deepEqual(inner.widgets[0].options.values, ["a.safetensors"]);
+});
+
+test("#1172 a DYNAMIC (function) option source is never clobbered", () => {
+  // #507/#1133 hazard: a client-populated combo derives its own list. Overwriting it with the
+  // backend's array would break exactly the nodes #1133 is making writable.
+  const dynamic = () => ["computed"];
+  const node = { id: 3, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", options: { values: dynamic } }], constructor: {} };
+  reapplyDefsToLiveNodes(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) });
+  assert.equal(node.widgets[0].options.values, dynamic, "a function source must survive the sweep");
+});
+
+test("#1172 emptyComboListsOnGraph reports only EMPTY lists, and only for types on the graph", () => {
+  const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [], constructor: {} };
+  const defs = {
+    CheckpointLoaderSimple: CKPT_DEF([]),
+    // present in the payload but NOT on the graph — the backend may publish dozens of empty
+    // combos for packs the user is not using, and reporting those buries the one that matters.
+    SomeOtherLoader: { input: { required: { other_name: [[], {}] } } },
+  };
+  assert.deepEqual(emptyComboListsOnGraph(graphOf([node]), defs), [
+    { type: "CheckpointLoaderSimple", widget: "ckpt_name" },
+  ]);
+});
+
+test("#1172 FALSE-POSITIVE FLOOR: a populated list discloses nothing", () => {
+  // If this ever goes red the disclosure fires on every refresh and is worthless.
+  const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [], constructor: {} };
+  assert.deepEqual(emptyComboListsOnGraph(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }), []);
+  // A non-combo input (a type string, not an option array) is not an empty combo either.
+  assert.deepEqual(
+    emptyComboListsOnGraph(graphOf([node]), { CheckpointLoaderSimple: { input: { required: { steps: ["INT", { default: 20 }] } } } }),
+    [],
+  );
+  assert.deepEqual(emptyComboListsOnGraph(graphOf([node]), null), []);
+  assert.deepEqual(emptyComboListsOnGraph(null, { CheckpointLoaderSimple: CKPT_DEF([]) }), []);
+});
+
+test("#1172 the note points at the BACKEND, never at another refresh", () => {
+  // The wrong-remedy failure this repo keeps removing: telling the agent to re-run the very
+  // command that just answered. The refresh worked; the server's answer is what is empty.
+  const note = emptyComboNote([{ type: "CheckpointLoaderSimple", widget: "ckpt_name" }]);
+  assert.match(note, /CheckpointLoaderSimple\.ckpt_name/);
+  assert.match(note, /this empty list is what \/object_info answered/i);
+  // …and nothing about the PANEL's internals: the disclosure is built from the payload alone,
+  // so a clause about what the panel did or did not skip overstates what it can establish.
+  assert.doesNotMatch(note, /panel (skipped|failed|missed)/i, "no claim about panel internals");
+  // …and it must NOT predict what a later refresh will return: a second /object_info read can
+  // observe changed server state, so that clause was a prediction dressed as an observation.
+  assert.doesNotMatch(note, /refresh(ing)? again (returns|will return)/i, "no prediction about another command");
+  assert.doesNotMatch(note, /panel_refresh_nodes|try refreshing|refresh the nodes again/i);
+  assert.equal(emptyComboNote([]), "");
+  assert.equal(emptyComboNote(null), "");
+});
+
+test("#1172 the note NAMES NO CAUSE and does not predict another command's outcome", () => {
+  // #756's rule, applied to this note. A first version broke it twice: it inferred "the
+  // backend is not finding it — check model paths, then restart", and it asserted "setting
+  // one of these widgets will be refused". The second is FALSE — set-widget.js treats an
+  // authoritative empty list as unknowable and PERFORMS the write with empty_option_list
+  // (#507/#1133) — and would have talked an agent out of a write that succeeds.
+  const note = emptyComboNote([{ type: "CheckpointLoaderSimple", widget: "ckpt_name" }]);
+  assert.doesNotMatch(note, /model path|restart ComfyUI|not finding|missing/i, "no inferred cause");
+  assert.doesNotMatch(note, /will be refused|cannot be set|must not be set/i, "no false refusal claim");
+  // …and it must say the true thing about writes, so the agent is not left guessing.
+  assert.match(note, /still permitted/i);
+  assert.match(note, /empty_option_list/);
+  // The one inference that IS supportable: the refresh is not what is empty.
+  assert.match(note, /NOT established here/);
+});
+
+test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's hole)", () => {
+  // That branch returns a FIXED object literal, so a field the verdict carries but the
+  // whitelist does not name is dropped on exactly the successful path where it matters.
+  // #981 fell into this hole at this same line; a verdict-only change would look correct in
+  // every unit test and report nothing to the agent.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const code = src.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.match(code, /verdict\.empty_combo_lists = empties;/, "the verdict must carry the field");
+  assert.match(
+    code,
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos \};/,
+    "…and the refreshed:true branch must forward it",
+  );
+  // The spread alone is not enough: `emptyCombos` could still be built without the list
+  // itself, forwarding only the note. Pin BOTH fields of the mapping.
+  assert.match(code, /empty_combo_lists: verdict\.empty_combo_lists,/, "the list must be mapped");
+  assert.match(code, /empty_combo_lists_note: verdict\.empty_combo_lists_note,/, "…and the note");
+  // #1133: an empty list must never flip the verdict to failed — that would re-refuse via the
+  // verdict what #1133 deliberately permits via the write path.
+  assert.doesNotMatch(code, /empty_combo_lists[\s\S]{0,200}?refreshed = false/, "disclosure, not failure");
 });

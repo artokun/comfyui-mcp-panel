@@ -1373,6 +1373,11 @@ test("graphCommandBindingBar: reads get the reduced DISPATCH bar (they re-assert
     assert.deepEqual(graphCommandBindingBar(cmd), {
       includeBaselineReadGuard: false,
       requireDirtyMutationBinding: false,
+      // #995 — the opt-IN that lets a classified read past a STALE TAG on a canvas whose
+      // content equals the active workflow's own snapshot. Set here and nowhere else, so
+      // this list is the whole surface that can reach it; a fence call that omits it (or
+      // any future caller) gets no bypass.
+      staleTagReadBypass: true,
     });
   }
 });

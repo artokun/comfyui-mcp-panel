@@ -41,7 +41,14 @@ test("#111 Settings → About has a docs row that opens the docs site", () => {
   const at = SRC.indexOf('id: "comfyui-mcp.readDocs"');
   assert.notEqual(at, -1, "the About section must have a docs row");
   const row = SRC.slice(at, at + 1200);
-  assert.match(row, /category: cat\("About"/, "it belongs to About, beside Star/Discord/Need-help");
+  // `get category()`, not `category:` — the section label is translated, and the Settings
+  // block is built before the locale catalog loads, so it has to be read lazily (see
+  // browser_tests/unit/i18n.test.mjs). The row's SECTION is what this asserts either way.
+  assert.match(
+    row,
+    /get category\(\)[\s\S]{0,80}?cat\(tr\("panel\.about"/,
+    "it belongs to About, beside Star/Discord/Need-help",
+  );
   // The tooltip names the DESTINATION, never the mechanism. This row renders into
   // ComfyUI's own Settings dialog, outside the sidebar root that wireExternalLinks
   // delegates on, so the anchor's native target=_blank is the whole mechanism —
@@ -60,7 +67,14 @@ test("#111 Settings → About has a docs row that opens the docs site", () => {
   // textContent line left every other assertion in this file green while shipping an
   // unlabeled link, which is functionally the same absence this whole change set out
   // to remove: a signpost nobody can read is not a signpost.
-  const label = row.match(/a\.textContent = "([^"]*)"/);
+  // Accepts either the bare literal or the translated form `tr("key", "English")`. The
+  // asserted string is the ENGLISH FALLBACK in both cases, which is exactly right: it is
+  // what English users see, and what EVERY locale renders when a key is missing from its
+  // catalog. So this still fails if the label is deleted, blanked, or reduced to an icon —
+  // the three regressions it was written to catch — in any language.
+  const label =
+    row.match(/a\.textContent = tr\(\s*"[^"]*"\s*,\s*"([^"]*)"/) ??
+    row.match(/a\.textContent = "([^"]*)"/);
   assert.ok(label, "the docs link must set a visible label");
   const text = label[1].trim();
   assert.notEqual(text, "", "an empty label renders a blank control");
@@ -93,7 +107,21 @@ test("#111 /docs is a LOCAL command — it opens externally, never in-frame", ()
   // a popup — so an assertion that the docs "opened", or that they opened "in a new
   // tab", is a state never observed (and the tab wording is simply wrong on
   // desktop). What survives is the URL plus a conditional remedy.
-  assert.match(code, /Docs: \$\{DOCS_URL\} — if nothing opened, copy that address\./);
+  // Read the note itself, whether it is still a bare template literal or has been
+  // wrapped as `tr("key", "English", { url: DOCS_URL })`. In the translated form the
+  // asserted string is the ENGLISH FALLBACK — what English users see, and what EVERY
+  // locale renders when the key is missing from its catalog — so a dropped remedy or a
+  // fabricated outcome claim is still caught in any language.
+  const translated = code.match(/appendSystem\(\s*tr\(\s*"[^"]*"\s*,\s*"([^"]*)"/);
+  const noteText = translated ? translated[1] : code.match(/appendSystem\(`([^`]*)`/)?.[1];
+  assert.ok(noteText, "the /docs command must put a note in the transcript");
+  if (translated) {
+    // The hole must still be filled from the constant, never a re-typed literal.
+    assert.match(code, /\{\s*url:\s*DOCS_URL\s*\}/, "the note interpolates DOCS_URL");
+    assert.match(noteText, /^Docs: \{url\} — if nothing opened, copy that address\.$/);
+  } else {
+    assert.match(noteText, /^Docs: \$\{DOCS_URL\} — if nothing opened, copy that address\.$/);
+  }
   // ORDER MATTERS. The note is the remedy for the open having failed, so emitting it
   // after the attempt made it conditional on that attempt not throwing — backwards.
   // openExternalUrl is guarded and should not throw, but a remedy that relies on its
@@ -102,8 +130,18 @@ test("#111 /docs is a LOCAL command — it opens externally, never in-frame", ()
     code.indexOf("appendSystem(") < code.indexOf("openExternalUrl("),
     "the URL must reach the transcript BEFORE the open is attempted",
   );
-  assert.doesNotMatch(code, /appendSystem\(`Opening\b/, "must not report an outcome it cannot see");
-  assert.doesNotMatch(code, /appendSystem\([^)]*new tab/, "must not name a mechanism it does not control");
+  // Asserted BOTH ways. Against the note TEXT, because once the string moved inside
+  // `tr(...)` an `appendSystem(\`Opening…` pattern stopped matching the very wording it
+  // exists to forbid. And still ENTRY-WIDE, because `noteText` is the first note only —
+  // narrowing to it would let a SECOND appendSystem added later slip the claim past.
+  assert.doesNotMatch(noteText, /^Opening\b/, "must not report an outcome it cannot see");
+  assert.doesNotMatch(noteText, /new tab/, "must not name a mechanism it does not control");
+  assert.doesNotMatch(
+    code,
+    /appendSystem\(\s*(?:tr\(\s*"[^"]*"\s*,\s*)?[`"']Opening\b/,
+    "no note anywhere in /docs may report an outcome it cannot see",
+  );
+  assert.doesNotMatch(code, /appendSystem\([^;]*new tab/, "no note anywhere in /docs may name a mechanism it does not control");
 });
 
 test("#111 /help says its list is only panel shortcuts, and names where the rest is", () => {

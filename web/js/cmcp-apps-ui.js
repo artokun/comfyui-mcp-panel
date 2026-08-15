@@ -18,6 +18,7 @@
 import { AppBuilder, AppsClient, RegistryClient } from "./cmcp-apps.js";
 import { confirmModal, promptModal, formModal, toast, openSubModal as openSubModalBase } from "./cmcp-modal.js";
 import { chipRow, makeFilterButton, openFilterPanel } from "./cmcp-filter.js";
+import { tr } from "./lib/i18n.js";
 
 let styleInjected = false;
 function injectStyle() {
@@ -34,7 +35,7 @@ function injectStyle() {
 .cmcp-apps-toolbar .spacer{flex:1;}
 /* Buttons: primary pops, everything else reads as a quiet secondary so the
    hierarchy is legible (matches the CivitAI tab's chip/button vocabulary). */
-.cmcp-apps-body .cmcp-btn{align-self:auto;padding:0.4rem 0.75rem;border-radius:8px;font-size:0.8rem;}
+.cmcp-apps-body .cmcp-btn{align-self:auto;padding:0.4rem 0.75rem;border-radius:8px;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);}
 .cmcp-apps-body .cmcp-btn:not(.primary):not(.danger){background:var(--p-surface-800,#27272a);
   color:var(--p-text-color,#fafafa);border:1px solid var(--p-content-border-color,#3f3f46);font-weight:500;}
 .cmcp-apps-body .cmcp-btn:not(.primary):not(.danger):hover{border-color:var(--p-primary-color,#60a5fa);opacity:1;}
@@ -50,15 +51,15 @@ function injectStyle() {
 .cmcp-app-card:hover{border-color:var(--p-primary-color,#60a5fa);transform:translateY(-2px);
   box-shadow:0 6px 18px rgba(0,0,0,0.35);}
 .cmcp-app-card .thumb{aspect-ratio:16/9;background:linear-gradient(135deg,#1b1b20,#0c0c0e) center/cover no-repeat;
-  display:flex;align-items:center;justify-content:center;font-size:1.6rem;opacity:0.9;color:var(--p-text-muted-color,#a1a1aa);}
+  display:flex;align-items:center;justify-content:center;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.9692);opacity:0.9;color:var(--p-text-muted-color,#a1a1aa);}
 .cmcp-app-card .meta{padding:0.5rem 0.6rem 0.55rem;display:flex;flex-direction:column;gap:0.2rem;}
-.cmcp-app-card .name{font-weight:600;font-size:0.83rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.cmcp-app-card .desc{font-size:0.71rem;line-height:1.35;opacity:0.62;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.cmcp-app-card .name{font-weight:600;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0215);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.cmcp-app-card .desc{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8738);line-height:1.35;opacity:0.62;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 .cmcp-app-badges{display:flex;gap:0.3rem;margin-top:0.25rem;flex-wrap:wrap;}
-.cmcp-app-badge{font-size:0.62rem;padding:0.1rem 0.4rem;border-radius:99px;border:1px solid var(--p-content-border-color,#3f3f46);
+.cmcp-app-badge{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7631);padding:0.1rem 0.4rem;border-radius:99px;border:1px solid var(--p-content-border-color,#3f3f46);
   color:var(--p-text-muted-color,#a1a1aa);opacity:0.9;white-space:nowrap;}
 .cmcp-app-badge.hidden-wf{border-color:rgba(245,158,11,0.5);color:#f59e0b;}
-.cmcp-apps-empty{opacity:0.6;font-size:0.85rem;line-height:1.5;padding:2.5rem 1rem;text-align:center;grid-column:1/-1;}
+.cmcp-apps-empty{opacity:0.6;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);line-height:1.5;padding:2.5rem 1rem;text-align:center;grid-column:1/-1;}
 .cmcp-apps-more{grid-column:1/-1;justify-self:center;margin-top:0.4rem;}
 .cmcp-apps-back{align-self:flex-start;}
 .cmcp-apps-detail{display:flex;flex-direction:column;gap:0.8rem;overflow-y:auto;min-height:0;padding-bottom:0.4rem;}
@@ -66,20 +67,20 @@ function injectStyle() {
   border-bottom:1px solid var(--p-content-border-color,#3f3f46);}
 .cmcp-apps-detail-head .thumb{width:104px;height:58px;flex:0 0 auto;border-radius:10px;
   background:linear-gradient(135deg,#1b1b20,#0c0c0e) center/cover no-repeat;
-  display:flex;align-items:center;justify-content:center;font-size:1.3rem;color:var(--p-text-muted-color,#a1a1aa);}
+  display:flex;align-items:center;justify-content:center;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.6);color:var(--p-text-muted-color,#a1a1aa);}
 .cmcp-apps-detail-head .titles{flex:1;min-width:0;}
-.cmcp-apps-detail-head h3{margin:0;font-size:1.05rem;}
-.cmcp-apps-detail-head .desc{font-size:0.78rem;opacity:0.7;margin-top:0.25rem;line-height:1.45;white-space:pre-wrap;}
+.cmcp-apps-detail-head h3{margin:0;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.2923);}
+.cmcp-apps-detail-head .desc{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);opacity:0.7;margin-top:0.25rem;line-height:1.45;white-space:pre-wrap;}
 .cmcp-apps-form{display:flex;flex-direction:column;gap:0.65rem;}
 .cmcp-apps-field{display:flex;flex-direction:column;gap:0.28rem;}
-.cmcp-apps-field>label{font-size:0.7rem;font-weight:600;opacity:0.8;text-transform:uppercase;letter-spacing:0.03em;}
+.cmcp-apps-field>label{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);font-weight:600;opacity:0.8;text-transform:uppercase;letter-spacing:0.03em;}
 .cmcp-apps-field input[type=text],.cmcp-apps-field input[type=number],.cmcp-apps-field textarea,.cmcp-apps-field select{
   padding:0.5rem 0.6rem;border-radius:8px;border:1px solid var(--p-content-border-color,#3f3f46);
-  background:var(--p-surface-950,#111113);color:var(--p-text-color,#fafafa);font-size:0.85rem;font-family:inherit;box-sizing:border-box;width:100%;}
+  background:var(--p-surface-950,#111113);color:var(--p-text-color,#fafafa);font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);font-family:inherit;box-sizing:border-box;width:100%;}
 .cmcp-apps-field input:focus,.cmcp-apps-field textarea:focus,.cmcp-apps-field select:focus{outline:none;border-color:var(--p-primary-color,#60a5fa);}
-.cmcp-apps-field input[type=file]{font-size:0.78rem;}
+.cmcp-apps-field input[type=file]{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);}
 .cmcp-apps-field textarea{min-height:64px;resize:vertical;}
-.cmcp-apps-hint{font-size:0.68rem;opacity:0.6;}
+.cmcp-apps-hint{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.6;}
 /* number-with-bounds slider + synced readout */
 .cmcp-apps-sliderrow{display:flex;gap:0.6rem;align-items:center;}
 .cmcp-apps-sliderrow input[type=range]{flex:1;min-width:0;accent-color:var(--p-primary-color,#60a5fa);}
@@ -91,22 +92,22 @@ function injectStyle() {
 .cmcp-apps-field input[type=color]{width:3rem;height:2rem;padding:0.15rem;border-radius:8px;
   border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-surface-950,#111113);cursor:pointer;}
 .cmcp-apps-runbar{display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;padding-top:0.15rem;}
-.cmcp-apps-status{font-size:0.8rem;opacity:0.85;min-height:1.1em;flex:1 1 8rem;}
+.cmcp-apps-status{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);opacity:0.85;min-height:1.1em;flex:1 1 8rem;}
 .cmcp-apps-status.err{color:#f87171;}
 .cmcp-apps-outputs{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:0.5rem;}
 .cmcp-apps-outputs:empty{display:none;}
 .cmcp-apps-outputs img,.cmcp-apps-outputs video{width:100%;border-radius:10px;display:block;background:#0c0c0e;
   border:1px solid var(--p-content-border-color,#3f3f46);}
-.cmcp-apps-outputs .text-out{grid-column:1/-1;font-size:0.8rem;white-space:pre-wrap;background:rgba(255,255,255,0.04);
+.cmcp-apps-outputs .text-out{grid-column:1/-1;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:pre-wrap;background:rgba(255,255,255,0.04);
   border-radius:8px;padding:0.5rem 0.6rem;}
 .cmcp-apps-pick{display:flex;flex-direction:column;gap:0.1rem;max-height:240px;overflow-y:auto;
   border:1px solid var(--p-content-border-color,#3f3f46);border-radius:10px;padding:0.5rem;background:var(--p-surface-950,#111113);}
-.cmcp-apps-pick label{display:flex;gap:0.45rem;align-items:center;font-size:0.78rem;padding:0.22rem 0.3rem;
+.cmcp-apps-pick label{display:flex;gap:0.45rem;align-items:center;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);padding:0.22rem 0.3rem;
   border-radius:6px;cursor:pointer;transition:background .12s;}
 .cmcp-apps-pick label:hover{background:rgba(255,255,255,0.05);}
-.cmcp-apps-pick .grp{font-size:0.66rem;font-weight:700;opacity:0.6;margin:0.45rem 0 0.15rem;text-transform:uppercase;letter-spacing:0.05em;}
+.cmcp-apps-pick .grp{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8123);font-weight:700;opacity:0.6;margin:0.45rem 0 0.15rem;text-transform:uppercase;letter-spacing:0.05em;}
 .cmcp-apps-pick .grp:first-child{margin-top:0.1rem;}
-.cmcp-apps-warn{font-size:0.75rem;line-height:1.45;color:#f59e0b;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);
+.cmcp-apps-warn{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);line-height:1.45;color:#f59e0b;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);
   border-radius:8px;padding:0.55rem 0.65rem;}
 /* Fallback for danger buttons rendered outside .cmcp-apps-body (defensive). */
 .cmcp-btn.danger{border-color:rgba(248,113,113,0.5);color:#f87171;}
@@ -114,21 +115,21 @@ function injectStyle() {
 .cmcp-deps{display:flex;flex-direction:column;gap:0.75rem;border:1px solid var(--p-content-border-color,#3f3f46);
   border-radius:10px;padding:0.6rem 0.7rem;background:var(--p-surface-950,#111113);flex:0 0 260px;}
 .cmcp-deps-sec{display:flex;flex-direction:column;}
-.cmcp-deps-h{font-size:0.7rem;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.04em;
+.cmcp-deps-h{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.04em;
   padding-bottom:0.25rem;}
 .cmcp-deps-row{display:flex;align-items:center;gap:0.6rem;padding:0.34rem 0.1rem;
   border-top:1px solid rgba(255,255,255,0.05);}
 .cmcp-deps-row:first-of-type{border-top:none;}
 .cmcp-deps-name{flex:1;min-width:0;display:flex;flex-direction:column;gap:0.1rem;}
-.cmcp-deps-name .n{font-size:0.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.cmcp-deps-name .sub{font-size:0.66rem;opacity:0.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.cmcp-deps-status{flex:0 0 auto;font-size:0.78rem;display:flex;align-items:center;gap:0.4rem;max-width:55%;
+.cmcp-deps-name .n{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cmcp-deps-name .sub{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8123);opacity:0.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cmcp-deps-status{flex:0 0 auto;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);display:flex;align-items:center;gap:0.4rem;max-width:55%;
   justify-content:flex-end;text-align:right;}
 .cmcp-deps-ok{color:var(--p-green-400,#4ade80);font-weight:600;white-space:nowrap;}
-.cmcp-deps-status .cmcp-btn{padding:0.28rem 0.6rem;font-size:0.74rem;}
-.cmcp-deps-muted{opacity:0.6;font-size:0.74rem;}
-.cmcp-deps-err{color:#f87171;font-size:0.72rem;}
-.cmcp-deps-note{font-size:0.68rem;opacity:0.6;line-height:1.4;}
+.cmcp-deps-status .cmcp-btn{padding:0.28rem 0.6rem;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9108);}
+.cmcp-deps-muted{opacity:0.6;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9108);}
+.cmcp-deps-err{color:#f87171;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);}
+.cmcp-deps-note{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8369);opacity:0.6;line-height:1.4;}
 .cmcp-deps-spin{width:0.85rem;height:0.85rem;flex:0 0 auto;border:2px solid rgba(255,255,255,0.22);
   border-top-color:var(--p-primary-color,#60a5fa);border-radius:50%;display:inline-block;
   animation:cmcp-deps-spin 0.7s linear infinite;}
@@ -138,11 +139,11 @@ function injectStyle() {
 .cmcp-apps-main>.grow{flex:1;min-width:0;display:flex;flex-direction:column;gap:0.75rem;}
 @media (max-width:720px){.cmcp-apps-main{flex-direction:column;}.cmcp-deps{flex:1 1 auto;width:100%;}}
 .cmcp-apps-title-row{display:flex;align-items:center;gap:0.45rem;}
-.cmcp-apps-starbtn{border:none;background:none;color:inherit;font-size:1.05rem;cursor:pointer;padding:0 0.1rem;line-height:1;}
+.cmcp-apps-starbtn{border:none;background:none;color:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.2923);cursor:pointer;padding:0 0.1rem;line-height:1;}
 .cmcp-apps-starbtn:hover{color:#facc15;}
 .cmcp-apps-starbtn.starred{color:#facc15;}
 .cmcp-apps-starbtn:disabled{opacity:0.4;cursor:default;}
-.cmcp-apps-starcount{font-size:0.78rem;opacity:0.7;}
+.cmcp-apps-starcount{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);opacity:0.7;}
 `;
   const el = document.createElement("style");
   el.textContent = css;
@@ -183,7 +184,11 @@ function toolText(res) {
   if (Array.isArray(r)) return r.map((c) => (c && c.text) || "").join("");
   if (r && Array.isArray(r.content)) return r.content.map((c) => (c && c.text) || "").join("");
   if (typeof r === "string") return r;
-  return res.ok === false ? "The action failed." : "Done.";
+  // These two land in a status line / an Error message the user reads, so they are
+  // translated. Nothing PARSES them — every caller that parses (parseRequiredPacks,
+  // parseModelList, resolveModelCandidate) works on the tool's own text, which only
+  // exists when `r` is present and we returned above.
+  return res.ok === false ? tr("apps_ui.the_action_failed", "The action failed.") : tr("apps_ui.done", "Done.");
 }
 
 // ── run-form model picker helpers ──────────────────────────────────────────
@@ -260,7 +265,7 @@ function presentModelBasenames(res) {
   return set;
 }
 
-/** Parse list_installed_nodes TEXT (formatInstalledNodes shape:
+/** Parse install_custom_node (action:"list") TEXT (formatInstalledNodes shape:
  *    "1. <module> [cnr:<id>, git:<aux>]\n   version: … | enabled")
  *  into a lower-cased Set of every identifier we can match a declared pack
  *  against — the module name plus any cnr / git ids. */
@@ -286,7 +291,7 @@ function parseInstalledNodeSet(text) {
   return set;
 }
 
-/** Parse extract_workflow_dependencies TEXT — the "Required custom node packs"
+/** Parse list_packs (action:"extract_deps") TEXT — the "Required custom node packs"
  *  section only — into [{ pack, installed }]. Each line there is
  *  "- <pack>  — installed" or "- <pack>  — **NOT INSTALLED**" (em-dash U+2014).
  *  Returns { corePacksOnly: true } style via an empty array + a flag when the
@@ -381,12 +386,12 @@ function dedupePacks(packs) {
 async function draftFromCanvas(getApp) {
   const app = getApp();
   if (!app || typeof app.graphToPrompt !== "function") {
-    throw new Error("this frontend can't serialize the graph (graphToPrompt missing)");
+    throw new Error(tr("apps_ui.this_frontend_can_t_serialize_the_graph", "this frontend can't serialize the graph (graphToPrompt missing)"));
   }
   const gp = await app.graphToPrompt(); // { output, workflow }
   const workflow = gp.workflow || app.graph?.serialize?.();
   if (!workflow || !Array.isArray(workflow.nodes)) {
-    throw new Error("couldn't serialize the canvas workflow");
+    throw new Error(tr("apps_ui.couldn_t_serialize_the_canvas_workflow", "couldn't serialize the canvas workflow"));
   }
 
   const imported = AppBuilder.findAppModeConfig(workflow);
@@ -509,20 +514,20 @@ export function createAppsContent(ctx, shell, opts = {}) {
   const _subModals = new Set();
 
   // ── My / Explore toggle → chips in the shared subnav (decision D) ──────────
-  const mineChip = el("button", "cmcp-cv-chip", "My Apps");
-  const exploreChip = el("button", "cmcp-cv-chip", "Explore");
+  const mineChip = el("button", "cmcp-cv-chip", tr("apps_ui.my_apps", "My Apps"));
+  const exploreChip = el("button", "cmcp-cv-chip", tr("apps_ui.explore", "Explore"));
 
   // ── Shared filter affordance (P1c) — the SAME header filter button + chip
   // panel CivitAI uses (cmcp-filter.js). Sort-only for now; structured so
   // tag/category rows drop straight in as the catalogue grows. Shown on Explore
   // (My Apps has nothing to sort). Sort keys match RegistryClient.list.
   const APPS_SORTS = [
-    { value: "trending", label: "Trending" },
-    { value: "new", label: "Newest" },
-    { value: "stars", label: "Most Stars" },
+    { value: "trending", label: tr("apps_ui.trending", "Trending") },
+    { value: "new", label: tr("apps_ui.newest", "Newest") },
+    { value: "stars", label: tr("apps_ui.most_stars", "Most Stars") },
   ];
   const { btn: filterBtn, setActive: setFilterActive } =
-    makeFilterButton({ onOpen: () => openAppsFilters(), title: "Filter apps" });
+    makeFilterButton({ onOpen: () => openAppsFilters(), title: tr("apps_ui.filter_apps", "Filter apps") });
   function syncFilterBtn() {
     filterBtn.style.display = _tab === "explore" ? "" : "none";
     setFilterActive(exploreSort !== "trending"); // "dirty" dot once sort != default
@@ -531,10 +536,10 @@ export function createAppsContent(ctx, shell, opts = {}) {
     openFilterPanel({
       // Thread the tracker so Escape peels the sheet before it can close the panel.
       openModal: (title, onClose) => openSubModalBase(title, onClose, _subModals),
-      title: "Filter apps",
+      title: tr("apps_ui.filter_apps", "Filter apps"),
       render: (wrap, rerender) => {
         chipRow(
-          wrap, "Sort", APPS_SORTS,
+          wrap, tr("apps_ui.sort", "Sort"), APPS_SORTS,
           (v) => exploreSort === v,
           (v) => {
             if (exploreSort === v) return;
@@ -570,9 +575,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
     body.textContent = "";
     if (_tab === "mine") {
       const bar = el("div", "cmcp-apps-toolbar");
-      const convertBtn = makeBtn("＋ Convert current workflow", {
+      const convertBtn = makeBtn(tr("apps_ui.convert_current_workflow", "＋ Convert current workflow"), {
         primary: true,
-        title: "Package the workflow on the canvas as a one-click app.",
+        title: tr("apps_ui.package_the_workflow_on_the_canvas_as", "Package the workflow on the canvas as a one-click app."),
       });
       convertBtn.addEventListener("click", () => showConvert().catch(showError));
       bar.append(convertBtn);
@@ -584,7 +589,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
   async function showMine() {
     const grid = el("div", "cmcp-apps-grid");
-    grid.append(el("div", "cmcp-apps-empty", "Loading…"));
+    grid.append(el("div", "cmcp-apps-empty", tr("apps_ui.loading", "Loading…")));
     body.append(grid);
 
     let apps = [];
@@ -592,7 +597,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       apps = await client.list();
     } catch (e) {
       grid.textContent = "";
-      grid.append(el("div", "cmcp-apps-empty", `Couldn't load apps: ${e.message}`));
+      grid.append(el("div", "cmcp-apps-empty", tr("apps_ui.couldn_t_load_apps", "Couldn't load apps: {error}", { error: e.message })));
       return;
     }
     if (closed) return;
@@ -602,7 +607,10 @@ export function createAppsContent(ctx, shell, opts = {}) {
         el(
           "div",
           "cmcp-apps-empty",
-          "No apps yet. Open a workflow on the canvas, then “Convert current workflow” to make your first one.",
+          tr(
+            "apps_ui.no_apps_yet_open_a_workflow_on",
+            "No apps yet. Open a workflow on the canvas, then “Convert current workflow” to make your first one.",
+          ),
         ),
       );
       return;
@@ -615,11 +623,13 @@ export function createAppsContent(ctx, shell, opts = {}) {
         thumb.textContent = "";
       }
       const meta = el("div", "meta");
-      meta.append(el("div", "name", app.name || "Untitled app"));
+      meta.append(el("div", "name", app.name || tr("apps_ui.untitled_app", "Untitled app")));
       if (app.description) meta.append(el("div", "desc", app.description));
       const badges = el("div", "cmcp-app-badges");
-      if (app.hideWorkflow) badges.append(el("span", "cmcp-app-badge hidden-wf", "hidden workflow"));
-      if (app.published) badges.append(el("span", "cmcp-app-badge", `★ ${app.published.slug || "published"}`));
+      if (app.hideWorkflow) badges.append(el("span", "cmcp-app-badge hidden-wf", tr("apps_ui.hidden_workflow", "hidden workflow")));
+      // The slug itself is a registry identifier and stays verbatim; only the
+      // "not published under a slug yet" placeholder is prose.
+      if (app.published) badges.append(el("span", "cmcp-app-badge", `★ ${app.published.slug || tr("apps_ui.published", "published")}`));
       if (badges.childNodes.length) meta.append(badges);
       card.append(thumb, meta);
       card.addEventListener("click", () => showDetail(app.id).catch(showError));
@@ -635,7 +645,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
         el(
           "div",
           "cmcp-apps-empty",
-          "No registry configured. Set localStorage key “comfyui-mcp.panel.registryUrl” to a deployed registry worker to explore published apps.",
+          // The localStorage key is an identifier, so it is interpolated rather than
+          // written into the translatable text — a translated key would silently
+          // point the user at a setting that does not exist.
+          tr(
+            "apps_ui.no_registry_configured_set_localstorage_key_to",
+            "No registry configured. Set localStorage key “{key}” to a deployed registry worker to explore published apps.",
+            { key: "comfyui-mcp.panel.registryUrl" },
+          ),
         ),
       );
       return;
@@ -648,7 +665,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     async function load(append = false, cursor = "") {
       if (!append) {
         grid.textContent = "";
-        grid.append(el("div", "cmcp-apps-empty", "Loading…"));
+        grid.append(el("div", "cmcp-apps-empty", tr("apps_ui.loading", "Loading…")));
       }
       try {
         const res = await registry.list({ sort: exploreSort, q: exploreQuery.trim(), cursor });
@@ -658,7 +675,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       } catch (e) {
         if (!append) {
           grid.textContent = "";
-          grid.append(el("div", "cmcp-apps-empty", `Registry error: ${e.message}`));
+          grid.append(el("div", "cmcp-apps-empty", tr("apps_ui.registry_error", "Registry error: {error}", { error: e.message })));
         }
       }
     }
@@ -666,7 +683,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       grid.querySelector(".cmcp-apps-empty")?.remove();
       grid.querySelector(".cmcp-apps-more")?.remove();
       if (!apps.length && !grid.childNodes.length) {
-        grid.append(el("div", "cmcp-apps-empty", "No published apps match."));
+        grid.append(el("div", "cmcp-apps-empty", tr("apps_ui.no_published_apps_match", "No published apps match.")));
         return;
       }
       for (const app of apps) {
@@ -675,19 +692,28 @@ export function createAppsContent(ctx, shell, opts = {}) {
         thumb.style.backgroundImage = `url("${registry.thumbnailUrl(app.id)}")`;
         thumb.textContent = "";
         const meta = el("div", "meta");
-        meta.append(el("div", "name", app.name || "Untitled"));
-        meta.append(el("div", "desc", `by ${app.creator || "anonymous"}`));
+        meta.append(el("div", "name", app.name || tr("apps_ui.untitled", "Untitled")));
+        // "anonymous" is the creator NAME the publish flow stores and uploads, not a
+        // label — translating it here would show a different author for the same
+        // person depending on the reader's language.
+        meta.append(el("div", "desc", tr("apps_ui.by", "by {creator}", { creator: app.creator || "anonymous" })));
         const badges = el("div", "cmcp-app-badges");
         badges.append(el("span", "cmcp-app-badge", `★ ${app.stars || 0}`));
-        badges.append(el("span", "cmcp-app-badge", `▶ ${app.runs || 0} runs`));
-        if (app.hide_workflow) badges.append(el("span", "cmcp-app-badge hidden-wf", "hidden"));
+        badges.append(
+          el(
+            "span",
+            "cmcp-app-badge",
+            tr("apps_ui.runs", { one: "▶ {count} run", other: "▶ {count} runs" }, { count: Number(app.runs) || 0 }),
+          ),
+        );
+        if (app.hide_workflow) badges.append(el("span", "cmcp-app-badge hidden-wf", tr("apps_ui.hidden", "hidden")));
         meta.append(badges);
         card.append(thumb, meta);
         card.addEventListener("click", () => showRegistryDetail(app).catch(showError));
         grid.append(card);
       }
       if (nextCursor) {
-        const more = makeBtn("Load more");
+        const more = makeBtn(tr("apps_ui.load_more", "Load more"));
         more.classList.add("cmcp-apps-more");
         more.addEventListener("click", () => load(true, nextCursor));
         grid.append(more);
@@ -712,7 +738,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
    *                  { fileName, directory, source, sourceUrl, civitaiVersionId, … })
    *    customNodes — manifest.deps.customNodes[]  (class_type string | { pack })
    *    getWorkflow — () => Promise<apiPrompt|null>; the API-format prompt handed to
-   *                  extract_workflow_dependencies / resolve_missing_models. Invoked
+   *                  list_packs (action:"extract_deps") / download_model
+   *                  (action:"resolve_missing"). Invoked
    *                  lazily, memoised — at most one bundle fetch even if both
    *                  sections need it.
    *
@@ -726,7 +753,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
       .filter(Boolean);
 
     if (!mods.length && !packs.length) {
-      container.append(el("div", "cmcp-deps-note", "This app declares no external model or node dependencies."));
+      container.append(
+        el("div", "cmcp-deps-note", tr("apps_ui.this_app_declares_no_external_model_or", "This app declares no external model or node dependencies.")),
+      );
       return;
     }
 
@@ -756,7 +785,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     // ── Models ──────────────────────────────────────────────────────────────
     if (mods.length) {
       const sec = el("div", "cmcp-deps-sec");
-      const h = el("div", "cmcp-deps-h", `Models (${mods.length})`);
+      const h = el("div", "cmcp-deps-h", tr("apps_ui.models", "Models ({total})", { total: mods.length }));
       sec.append(h);
       panel.append(sec);
 
@@ -765,7 +794,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const dir = m.directory || m.targetSubfolder || m.dir || "";
         const row = el("div", "cmcp-deps-row");
         const nameWrap = el("div", "cmcp-deps-name");
-        nameWrap.append(el("div", "n", fname || "(unnamed model)"));
+        nameWrap.append(el("div", "n", fname || tr("apps_ui.unnamed_model", "(unnamed model)")));
         if (dir) nameWrap.append(el("div", "sub", `models/${dir}/`));
         const status = el("div", "cmcp-deps-status");
         row.append(nameWrap, status);
@@ -775,23 +804,32 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
       const syncModelHeader = () => {
         const done = rows.filter((r) => r.present).length;
-        h.textContent = `Models (${done}/${rows.length} installed)`;
+        h.textContent = tr("apps_ui.models_installed", "Models ({done}/{total} installed)", { done, total: rows.length });
       };
 
       if (!bridgeReady) {
-        for (const r of rows) { r.status.textContent = ""; r.status.append(el("span", "cmcp-deps-muted", "connect orchestrator")); }
-        sec.append(el("div", "cmcp-deps-note", "Connect the orchestrator to check for and download models."));
+        for (const r of rows) {
+          r.status.textContent = "";
+          r.status.append(el("span", "cmcp-deps-muted", tr("apps_ui.connect_orchestrator", "connect orchestrator")));
+        }
+        sec.append(
+          el(
+            "div",
+            "cmcp-deps-note",
+            tr("apps_ui.connect_the_orchestrator_to_check_for_and", "Connect the orchestrator to check for and download models."),
+          ),
+        );
       } else {
-        for (const r of rows) { r.status.append(spinning("checking…")); }
+        for (const r of rows) { r.status.append(spinning(tr("apps_ui.checking", "checking…"))); }
         (async () => {
           let present = new Set();
-          try { present = presentModelBasenames(await callTool("list_local_models", {})); }
+          try { present = presentModelBasenames(await callTool("list_local_models", { action: "list" })); }
           catch { /* offline / older bridge — treat as unknown */ }
           if (!alive()) return;
           for (const r of rows) {
             r.present = r.fname ? present.has(depBasename(r.fname)) : false;
             r.status.textContent = "";
-            if (r.present) r.status.append(okChip("✓ Installed"));
+            if (r.present) r.status.append(okChip(tr("apps_ui.installed", "✓ Installed")));
             else wireModelDownload(r);
           }
           syncModelHeader();
@@ -799,27 +837,27 @@ export function createAppsContent(ctx, shell, opts = {}) {
       }
 
       function wireModelDownload(r) {
-        const btn = makeBtn("⬇ Download", { primary: true });
+        const btn = makeBtn(tr("apps_ui.download", "⬇ Download"), { primary: true });
         r.status.textContent = "";
         r.status.append(btn);
         const target = r.dir || "checkpoints";
         const show = (node) => { r.status.textContent = ""; r.status.append(node); };
         btn.addEventListener("click", async () => {
           btn.disabled = true;
-          show(spinning("starting…"));
+          show(spinning(tr("apps_ui.starting", "starting…")));
           try {
             const issued = await startModelDownload(r.m, r.fname, target);
             if (!alive()) return;
-            if (!issued) { show(el("span", "cmcp-deps-muted", "no download link")); return; }
+            if (!issued) { show(el("span", "cmcp-deps-muted", tr("apps_ui.no_download_link", "no download link"))); return; }
             // Big files won't have landed by the time the grace-window call
             // resolves — re-check once; if not present yet, point at the tray.
             const nowPresent = await recheckModel(r.fname);
             if (!alive()) return;
-            if (nowPresent) { r.present = true; show(okChip("✓ Installed")); syncModelHeader(); }
-            else show(el("span", "cmcp-deps-muted", "downloading… (see tray)"));
+            if (nowPresent) { r.present = true; show(okChip(tr("apps_ui.installed", "✓ Installed"))); syncModelHeader(); }
+            else show(el("span", "cmcp-deps-muted", tr("apps_ui.downloading_see_tray", "downloading… (see tray)")));
           } catch (e) {
             if (!alive()) return;
-            show(el("span", "cmcp-deps-err", e && e.message ? e.message : "download failed"));
+            show(el("span", "cmcp-deps-err", e && e.message ? e.message : tr("apps_ui.download_failed", "download failed")));
             btn.disabled = false;
           }
         });
@@ -829,7 +867,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     // ── Custom-node packs ─────────────────────────────────────────────────────
     if (packs.length) {
       const sec = el("div", "cmcp-deps-sec");
-      const h = el("div", "cmcp-deps-h", `Custom nodes (${packs.length})`);
+      const h = el("div", "cmcp-deps-h", tr("apps_ui.custom_nodes", "Custom nodes ({total})", { total: packs.length }));
       sec.append(h);
       panel.append(sec);
 
@@ -837,41 +875,47 @@ export function createAppsContent(ctx, shell, opts = {}) {
         for (const c of packs) {
           const row = el("div", "cmcp-deps-row");
           const nameWrap = el("div", "cmcp-deps-name");
-          nameWrap.append(el("div", "n", c));
+          nameWrap.append(el("div", "n", c)); // pack identifier — never translated
           const status = el("div", "cmcp-deps-status");
-          status.append(el("span", "cmcp-deps-muted", "connect orchestrator"));
+          status.append(el("span", "cmcp-deps-muted", tr("apps_ui.connect_orchestrator", "connect orchestrator")));
           row.append(nameWrap, status);
           sec.append(row);
         }
-        sec.append(el("div", "cmcp-deps-note", "Connect the orchestrator to check for and install custom-node packs."));
+        sec.append(
+          el(
+            "div",
+            "cmcp-deps-note",
+            tr("apps_ui.connect_the_orchestrator_to_check_for_and_2", "Connect the orchestrator to check for and install custom-node packs."),
+          ),
+        );
       } else {
         const loading = el("div", "cmcp-deps-row");
-        loading.append(spinning("resolving node packs…"));
+        loading.append(spinning(tr("apps_ui.resolving_node_packs", "resolving node packs…")));
         sec.append(loading);
         (async () => {
           const resolved = await resolveNodePacks(packs);
           if (!alive()) return;
           loading.remove();
           if (!resolved.length) {
-            h.textContent = "Custom nodes (0)";
-            sec.append(el("div", "cmcp-deps-note", "No custom-node packs required."));
+            h.textContent = tr("apps_ui.custom_nodes_0", "Custom nodes (0)");
+            sec.append(el("div", "cmcp-deps-note", tr("apps_ui.no_custom_node_packs_required", "No custom-node packs required.")));
             return;
           }
           const rows = [];
           const syncNodeHeader = () => {
             const done = rows.filter((r) => r.installed).length;
-            h.textContent = `Custom nodes (${done}/${rows.length} installed)`;
+            h.textContent = tr("apps_ui.custom_nodes_installed", "Custom nodes ({done}/{total} installed)", { done, total: rows.length });
           };
           for (const p of resolved) {
             const row = el("div", "cmcp-deps-row");
             const nameWrap = el("div", "cmcp-deps-name");
-            nameWrap.append(el("div", "n", p.pack));
+            nameWrap.append(el("div", "n", p.pack)); // pack identifier — never translated
             const status = el("div", "cmcp-deps-status");
             row.append(nameWrap, status);
             sec.append(row);
             const r = { pack: p.pack, installed: p.installed, row, status };
             rows.push(r);
-            if (p.installed) status.append(okChip("✓ Installed"));
+            if (p.installed) status.append(okChip(tr("apps_ui.installed", "✓ Installed")));
             else wireNodeInstall(r, syncNodeHeader);
           }
           syncNodeHeader();
@@ -879,33 +923,35 @@ export function createAppsContent(ctx, shell, opts = {}) {
       }
 
       function wireNodeInstall(r, onChanged) {
-        const btn = makeBtn("⬇ Install", { primary: true });
+        const btn = makeBtn(tr("apps_ui.install", "⬇ Install"), { primary: true });
         r.status.textContent = "";
         r.status.append(btn);
         const show = (node) => { r.status.textContent = ""; r.status.append(node); };
         btn.addEventListener("click", async () => {
           // Installing a custom node runs that pack's third-party code — gate it.
           const ok = await confirmModal({
-            title: "Install custom-node pack",
-            message:
-              `Install custom node pack “${r.pack}”?\n\n` +
-              "This downloads and runs third-party code. ComfyUI may need to restart to load the new nodes.",
-            confirmLabel: "Install",
+            title: tr("apps_ui.install_custom_node_pack", "Install custom-node pack"),
+            // One literal, not a concatenation: the extractor reads back only the first
+            // string after the key, so a `"a" + "b"` fallback lands in the catalog
+            // truncated — English still renders in full (it uses the fallback) while
+            // every translated language silently loses the rest of the sentence.
+            message: tr("apps_ui.install_custom_node_pack_this_downloads_and", "Install custom node pack “{pack}”?\n\nThis downloads and runs third-party code. ComfyUI may need to restart to load the new nodes.", { pack: r.pack }),
+            confirmLabel: tr("apps_ui.install_2", "Install"),
           });
           if (!ok || !alive()) return;
           btn.disabled = true;
-          show(spinning("installing…"));
+          show(spinning(tr("apps_ui.installing", "installing…")));
           try {
-            const res = await callTool("install_custom_node", { id: r.pack });
+            const res = await callTool("install_custom_node", { action: "install", id: r.pack });
             if (!alive()) return;
-            if (res && res.ok === false) throw new Error(toolText(res) || "install failed");
+            if (res && res.ok === false) throw new Error(toolText(res) || tr("apps_ui.install_failed", "install failed"));
             r.installed = true;
-            show(okChip("✓ Installed"));
+            show(okChip(tr("apps_ui.installed", "✓ Installed")));
             onChanged();
-            toast("Installed — restart ComfyUI to load new nodes.");
+            toast(tr("apps_ui.installed_restart_comfyui_to_load_new_nodes", "Installed — restart ComfyUI to load new nodes."));
           } catch (e) {
             if (!alive()) return;
-            show(el("span", "cmcp-deps-err", e && e.message ? e.message : "install failed"));
+            show(el("span", "cmcp-deps-err", e && e.message ? e.message : tr("apps_ui.install_failed", "install failed")));
             btn.disabled = false;
           }
         });
@@ -933,30 +979,31 @@ export function createAppsContent(ctx, shell, opts = {}) {
       return false;
 
       async function civitai(versionId, subfolder) {
-        const res = await callTool("download_civitai_model", { model_version_id: versionId, target_subfolder: subfolder });
-        if (res && res.ok === false) throw new Error(toolText(res) || "CivitAI download failed");
+        const res = await callTool("download_model", { action: "download_civitai", model_version_id: versionId, target_subfolder: subfolder });
+        if (res && res.ok === false) throw new Error(toolText(res) || tr("apps_ui.civitai_download_failed", "CivitAI download failed"));
         return true;
       }
       async function direct(u, subfolder, filename) {
-        const res = await callTool("download_model", { url: u, target_subfolder: subfolder, ...(filename ? { filename } : {}) });
-        if (res && res.ok === false) throw new Error(toolText(res) || "download failed");
+        const res = await callTool("download_model", { action: "download", url: u, target_subfolder: subfolder, ...(filename ? { filename } : {}) });
+        if (res && res.ok === false) throw new Error(toolText(res) || tr("apps_ui.download_failed", "download failed"));
         return true;
       }
     }
 
-    /** Re-query list_local_models and report whether `fname` has landed. */
+    /** Re-query list_local_models (action:"list") and report whether `fname` has landed. */
     async function recheckModel(fname) {
       if (!fname) return false;
-      try { return presentModelBasenames(await callTool("list_local_models", {})).has(depBasename(fname)); }
+      try { return presentModelBasenames(await callTool("list_local_models", { action: "list" })).has(depBasename(fname)); }
       catch { return false; }
     }
 
-    /** Best-effort candidate parse from resolve_missing_models markdown. Finds
-     *  the `### \`<name>\`` section for this file, then the first CivitAI version
-     *  id (→ download_civitai_model) or an http(s) URL (→ download_model). */
+    /** Best-effort candidate parse from download_model (action:"resolve_missing")
+     *  markdown. Finds the `### \`<name>\`` section for this file, then the first
+     *  CivitAI version id (→ action:"download_civitai") or an http(s) URL
+     *  (→ action:"download"). */
     async function resolveModelCandidate(wf, fname) {
       let text = "";
-      try { text = toolText(await callTool("resolve_missing_models", { workflow: wf })); }
+      try { text = toolText(await callTool("download_model", { action: "resolve_missing", workflow: wf })); }
       catch { return null; }
       if (!text) return null;
       const base = depBasename(fname);
@@ -965,7 +1012,11 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const hdr = line.match(/^###\s+`([^`]+)`/);
         if (hdr) { inMatch = depBasename(hdr[1]) === base; continue; }
         if (!inMatch) continue;
-        const ver = line.match(/\(version\s+(\d{2,})\)/i) || line.match(/version\s+(\d{2,})\)?\s*(?:→|->)?\s*download_civitai_model/i);
+        // Second alternative tracks the tool's OWN prose, which 0.50.0 rewrote
+        // from the retired standalone CivitAI-download name to `download_model
+        // action:"download_civitai"`. It is a fallback for a line the first
+        // pattern misses, so it stays keyed on whatever the tool emits today.
+        const ver = line.match(/\(version\s+(\d{2,})\)/i) || line.match(/version\s+(\d{2,})\)?\s*(?:→|->)?\s*download_model\s+action:"download_civitai"/i);
         if (ver) return { versionId: Number(ver[1]) };
         const url = line.match(/https?:\/\/\S+/);
         if (url) return { url: url[0].replace(/[)\].,]+$/, "") };
@@ -974,18 +1025,19 @@ export function createAppsContent(ctx, shell, opts = {}) {
     }
 
     /** Resolve the declared node deps to [{pack, installed}]. Preferred path:
-     *  extract_workflow_dependencies (maps class_type→pack + reports installed vs
-     *  missing authoritatively). Fallback when the prompt is unavailable (e.g.
-     *  hidden-workflow apps): the connected frontend's live node defs first —
-     *  a registered core class_type (EmptyImage, PreviewImage, …) is not a
-     *  custom pack at all and a registered custom one is already installed —
-     *  then declared class_types vs list_installed_nodes (loose — see
-     *  nodeInstalled) for whatever the live defs can't answer. */
+     *  list_packs (action:"extract_deps") (maps class_type→pack + reports
+     *  installed vs missing authoritatively). Fallback when the prompt is
+     *  unavailable (e.g. hidden-workflow apps): the connected frontend's live
+     *  node defs first — a registered core class_type (EmptyImage,
+     *  PreviewImage, …) is not a custom pack at all and a registered custom one
+     *  is already installed — then declared class_types vs install_custom_node
+     *  (action:"list") (loose — see nodeInstalled) for whatever the live defs
+     *  can't answer. */
     async function resolveNodePacks(declared) {
       const wf = await workflow();
       if (wf) {
         try {
-          const { packs: parsed, coreOnly } = parseRequiredPacks(toolText(await callTool("extract_workflow_dependencies", { workflow: wf })));
+          const { packs: parsed, coreOnly } = parseRequiredPacks(toolText(await callTool("list_packs", { action: "extract_deps", workflow: wf })));
           if (parsed.length) return dedupePacks(parsed);
           if (coreOnly) return [];
         } catch { /* fall through to the declared-list heuristic */ }
@@ -1000,7 +1052,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       }
       if (unknown.length) {
         let installed = new Set();
-        try { installed = parseInstalledNodeSet(toolText(await callTool("list_installed_nodes", {}))); }
+        try { installed = parseInstalledNodeSet(toolText(await callTool("install_custom_node", { action: "list" }))); }
         catch { /* older/offline bridge — everything reads as unknown */ }
         for (const c of unknown) resolved.push({ pack: c, installed: installed.size ? nodeInstalled(installed, c) : false });
       }
@@ -1054,10 +1106,10 @@ export function createAppsContent(ctx, shell, opts = {}) {
     if (closed) return;
     body.textContent = "";
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn("← Explore");
+    const back = makeBtn(tr("apps_ui.explore_2", "← Explore"));
     back.addEventListener("click", () => { _tab = "explore"; showGrid().catch(showError); });
     bar.append(back);
-    body.append(bar, el("div", "cmcp-apps-empty", "Preparing…"));
+    body.append(bar, el("div", "cmcp-apps-empty", tr("apps_ui.preparing", "Preparing…")));
     try {
       const bundle = await registry.bundle(regApp.id);
       await installRegistryBundle(regApp, bundle);
@@ -1075,7 +1127,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     body.textContent = "";
 
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn("← My Apps");
+    const back = makeBtn(tr("apps_ui.my_apps_2", "← My Apps"));
     back.classList.add("cmcp-apps-back");
     back.addEventListener("click", () => showGrid().catch(showError));
     bar.append(back);
@@ -1086,35 +1138,38 @@ export function createAppsContent(ctx, shell, opts = {}) {
         el(
           "div",
           "cmcp-apps-warn",
-          "This workflow already has a ComfyUI APP-mode config — its input/output selection is pre-checked below.",
+          tr(
+            "apps_ui.this_workflow_already_has_a_comfyui_app",
+            "This workflow already has a ComfyUI APP-mode config — its input/output selection is pre-checked below.",
+          ),
         ),
       );
     }
 
     const form = el("div", "cmcp-apps-form");
     const nameField = el("div", "cmcp-apps-field");
-    nameField.append(el("label", "", "App name"));
+    nameField.append(el("label", "", tr("apps_ui.app_name", "App name")));
     const nameInput = document.createElement("input");
     nameInput.type = "text";
     nameInput.maxLength = 120;
-    nameInput.placeholder = "e.g. Studio Portrait";
+    nameInput.placeholder = tr("apps_ui.e_g_studio_portrait", "e.g. Studio Portrait");
     nameField.append(nameInput);
 
     const descField = el("div", "cmcp-apps-field");
-    descField.append(el("label", "", "Description"));
+    descField.append(el("label", "", tr("apps_ui.description", "Description")));
     const descInput = document.createElement("textarea");
-    descInput.placeholder = "What does this app do? What do its inputs mean?";
+    descInput.placeholder = tr("apps_ui.what_does_this_app_do_what_do", "What does this app do? What do its inputs mean?");
     descField.append(descInput);
 
     const thumbField = el("div", "cmcp-apps-field");
-    thumbField.append(el("label", "", "Thumbnail (optional)"));
+    thumbField.append(el("label", "", tr("apps_ui.thumbnail_optional", "Thumbnail (optional)")));
     const thumbInput = document.createElement("input");
     thumbInput.type = "file";
     thumbInput.accept = "image/png,image/jpeg,image/webp";
     thumbField.append(thumbInput);
 
     const pick = el("div", "cmcp-apps-pick");
-    pick.append(el("div", "grp", "Inputs — the endpoints this app exposes"));
+    pick.append(el("div", "grp", tr("apps_ui.inputs_the_endpoints_this_app_exposes", "Inputs — the endpoints this app exposes")));
     for (const cand of draft.inputs) {
       const label = document.createElement("label");
       const cb = document.createElement("input");
@@ -1124,7 +1179,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       label.append(cb, document.createTextNode(`${cand.label} (${cand.kind})`));
       pick.append(label);
     }
-    pick.append(el("div", "grp", "Outputs — what the app shows after a run"));
+    pick.append(el("div", "grp", tr("apps_ui.outputs_what_the_app_shows_after_a", "Outputs — what the app shows after a run")));
     for (const cand of draft.outputs) {
       const label = document.createElement("label");
       const cb = document.createElement("input");
@@ -1136,7 +1191,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     }
 
     const saveRow = el("div", "cmcp-apps-runbar");
-    const saveBtn = makeBtn("Create app", { primary: true });
+    const saveBtn = makeBtn(tr("apps_ui.create_app", "Create app"), { primary: true });
     const status = el("span", "cmcp-apps-status");
     saveRow.append(saveBtn, status);
     form.append(nameField, descField, thumbField, pick, saveRow);
@@ -1146,7 +1201,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       status.classList.remove("err");
       const name = nameInput.value.trim();
       if (!name) {
-        status.textContent = "Name the app first.";
+        status.textContent = tr("apps_ui.name_the_app_first", "Name the app first.");
         status.classList.add("err");
         return;
       }
@@ -1154,7 +1209,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         (c) => pick.querySelector(`input[data-key="${CSS.escape(`${c.nodeId}.${c.widget}`)}"]`)?.checked,
       );
       if (!inputs.length) {
-        status.textContent = "Expose at least one input — an app with no endpoints is just a workflow.";
+        status.textContent = tr("apps_ui.expose_at_least_one_input_an_app", "Expose at least one input — an app with no endpoints is just a workflow.");
         status.classList.add("err");
         return;
       }
@@ -1162,7 +1217,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         .filter((c) => pick.querySelector(`input[data-out="${c.nodeId}"]`)?.checked)
         .map(({ nodeId, kind }) => ({ nodeId, kind }));
       saveBtn.disabled = true;
-      status.textContent = "Saving…";
+      status.textContent = tr("apps_ui.saving", "Saving…");
       try {
         let thumbnail_b64;
         const file = thumbInput.files && thumbInput.files[0];
@@ -1216,7 +1271,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     body.textContent = "";
 
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn(regCtx ? "← Explore" : "← My Apps");
+    const back = makeBtn(regCtx ? tr("apps_ui.explore_2", "← Explore") : tr("apps_ui.my_apps_2", "← My Apps"));
     back.addEventListener("click", () => {
       if (regCtx) _tab = "explore";
       showGrid().catch(showError);
@@ -1234,11 +1289,11 @@ export function createAppsContent(ctx, shell, opts = {}) {
     const titles = el("div", "titles");
     // Title row: name + (registry apps) a star icon right beside it.
     const titleRow = el("div", "cmcp-apps-title-row");
-    titleRow.append(el("h3", "", app.name || "Untitled app"));
+    titleRow.append(el("h3", "", app.name || tr("apps_ui.untitled_app", "Untitled app")));
     if (regCtx) {
       const starBtn = el("button", "cmcp-apps-starbtn", "☆");
       starBtn.type = "button";
-      starBtn.title = "Star this app";
+      starBtn.title = tr("apps_ui.star_this_app", "Star this app");
       const starCount = el("span", "cmcp-apps-starcount", String(regCtx.stars || 0));
       let starred = false;
       let count = Number(regCtx.stars || 0);
@@ -1271,7 +1326,22 @@ export function createAppsContent(ctx, shell, opts = {}) {
     }
     titles.append(titleRow);
     if (regCtx) {
-      titles.append(el("div", "desc", `by ${regCtx.creator || "anonymous"} · ${regCtx.runs || 0} runs · v${regCtx.version || 1}`));
+      // Three strings joined, not one sentence: the run count is a COUNTED string and
+      // has to reach Intl.PluralRules on its own. Baked into a longer sentence the noun
+      // is frozen at the English "runs", which is already wrong at 1 and gives a Russian
+      // or Arabic translator no form to vary at all.
+      titles.append(
+        el(
+          "div",
+          "desc",
+          [
+            // "anonymous" is the stored creator name, not a label — see the Explore card.
+            tr("apps_ui.by", "by {creator}", { creator: regCtx.creator || "anonymous" }),
+            tr("apps_ui.runs_2", { one: "{count} run", other: "{count} runs" }, { count: Number(regCtx.runs) || 0 }),
+            `v${regCtx.version || 1}`,
+          ].join(" · "),
+        ),
+      );
     }
     if (app.description) titles.append(el("div", "desc", app.description));
     head.append(thumb, titles);
@@ -1282,9 +1352,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         el(
           "div",
           "cmcp-apps-warn",
-          "Hidden workflow (best effort): the node graph was never stored with this app, so casual users can't " +
-            "open it — but anyone technical who runs this app can still intercept the prompt via ComfyUI's API. " +
-            "Real protection comes with hosted runs (coming soon).",
+          tr("apps_ui.hidden_workflow_best_effort_the_node_graph", "Hidden workflow (best effort): the node graph was never stored with this app, so casual users can't open it — but anyone technical who runs this app can still intercept the prompt via ComfyUI's API. Real protection comes with hosted runs (coming soon)."),
         ),
       );
     }
@@ -1323,7 +1391,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const inp = document.createElement("input");
         inp.type = "text";
         inp.autocomplete = "off";
-        inp.placeholder = "Pick or type a model…";
+        inp.placeholder = tr("apps_ui.pick_or_type_a_model", "Pick or type a model…");
         inp.className = "cmcp-apps-modelpick";
         const dl = document.createElement("datalist");
         dl.id = `cmcp-models-${key.replace(/[^\w-]/g, "_")}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1337,9 +1405,15 @@ export function createAppsContent(ctx, shell, opts = {}) {
             o.value = v;
             dl.append(o);
           }
+          // Counted string: the plural form is the CATALOG's job, not an inline
+          // `=== 1 ? "" : "s"` — Korean has one form, Russian has four.
           caption.textContent = uniq.length
-            ? `${uniq.length} model${uniq.length === 1 ? "" : "s"} available — type to filter`
-            : "No models found on the server — type a filename.";
+            ? tr(
+                "apps_ui.models_available_type_to_filter",
+                { one: "{count} model available — type to filter", other: "{count} models available — type to filter" },
+                { count: uniq.length },
+              )
+            : tr("apps_ui.no_models_found_on_the_server_type", "No models found on the server — type a filename.");
           return uniq;
         };
         let known = applyOptions([
@@ -1354,7 +1428,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         // undefined and this is a no-op).
         if (typeof callTool === "function") {
           const dir = modelDirForWidget(input.widget);
-          Promise.resolve(callTool("list_local_models", dir ? { model_type: dir } : {}))
+          Promise.resolve(callTool("list_local_models", { action: "list", ...(dir ? { model_type: dir } : {}) }))
             .then((res) => {
               const more = parseModelList(res, dir);
               if (more.length) known = applyOptions([...known, ...more]);
@@ -1383,8 +1457,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const syncDice = () => {
           dice.classList.toggle("primary", randomize);
           dice.title = randomize
-            ? "Seed is randomized on every run — click to fix it"
-            : "Seed is fixed — click to randomize each run";
+            ? tr("apps_ui.seed_is_randomized_on_every_run_click", "Seed is randomized on every run — click to fix it")
+            : tr("apps_ui.seed_is_fixed_click_to_randomize_each", "Seed is fixed — click to randomize each run");
         };
         dice.addEventListener("click", () => {
           randomize = !randomize;
@@ -1455,9 +1529,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
     }
 
     const runRow = el("div", "cmcp-apps-runbar");
-    const runBtn = makeBtn("▶ Run", { primary: true, title: "Queue this app on the local ComfyUI." });
-    const runpodBtn = makeBtn("☁ Run on RunPod", {
-      title: "Queue this app on your connected RunPod pod (see the RunPod panel to connect one).",
+    const runBtn = makeBtn(tr("apps_ui.run", "▶ Run"), { primary: true, title: tr("apps_ui.queue_this_app_on_the_local_comfyui", "Queue this app on the local ComfyUI.") });
+    const runpodBtn = makeBtn(tr("apps_ui.run_on_runpod", "☁ Run on RunPod"), {
+      title: tr("apps_ui.queue_this_app_on_your_connected_runpod", "Queue this app on your connected RunPod pod (see the RunPod panel to connect one)."),
     });
     const status = el("span", "cmcp-apps-status");
     runRow.append(runBtn, runpodBtn, status);
@@ -1484,32 +1558,33 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     // Management row (metadata edit, publish, hide, delete) — below the fold.
     const mgmt = el("div", "cmcp-apps-toolbar");
-    const editBtn = makeBtn("✎ Edit info");
-    const publishBtn = makeBtn(app.published ? "⇪ Update published" : "⇪ Publish", {
-      title: "Share this app to the public registry (Explore tab). Hidden apps upload the run snapshot only — never the graph.",
+    const editBtn = makeBtn(tr("apps_ui.edit_info", "✎ Edit info"));
+    const publishBtn = makeBtn(app.published ? tr("apps_ui.update_published", "⇪ Update published") : tr("apps_ui.publish", "⇪ Publish"), {
+      title: tr("apps_ui.share_this_app_to_the_public_registry", "Share this app to the public registry (Explore tab). Hidden apps upload the run snapshot only — never the graph."),
     });
-    const hideBtn = makeBtn(app.hideWorkflow ? "🔒 Workflow hidden" : "🔓 Hide workflow", {
-      title:
-        "Best effort: deletes the stored node graph so the app only carries the run snapshot. " +
-        "A technical user can still intercept it — see the warning above.",
+    const hideBtn = makeBtn(app.hideWorkflow ? tr("apps_ui.workflow_hidden", "🔒 Workflow hidden") : tr("apps_ui.hide_workflow", "🔓 Hide workflow"), {
+      title: tr("apps_ui.best_effort_deletes_the_stored_node_graph", "Best effort: deletes the stored node graph so the app only carries the run snapshot. A technical user can still intercept it — see the warning above."),
     });
-    const delBtn = makeBtn("🗑 Delete", { danger: true });
+    const delBtn = makeBtn(tr("apps_ui.delete", "🗑 Delete"), { danger: true });
     mgmt.append(editBtn, publishBtn, hideBtn, delBtn);
     detail.append(mgmt);
 
     publishBtn.addEventListener("click", async () => {
       if (!registry.configured) {
-        toast("No registry configured yet — set “comfyui-mcp.panel.registryUrl” to a deployed registry to publish.");
+        toast(
+          tr(
+            "apps_ui.no_registry_configured_yet_set_to_a",
+            "No registry configured yet — set “{key}” to a deployed registry to publish.",
+            { key: "comfyui-mcp.panel.registryUrl" },
+          ),
+        );
         return;
       }
       if (app.hideWorkflow) {
         const ok = await confirmModal({
-          title: "Publish a hidden app?",
-          message:
-            "Publish “" + (app.name || "this app") + "” as a HIDDEN app?\n\n" +
-            "Only the run snapshot is uploaded — never the node graph. This is best-effort " +
-            "privacy, not security: anyone who runs the app can still intercept the prompt.",
-          confirmLabel: "Publish hidden",
+          title: tr("apps_ui.publish_a_hidden_app", "Publish a hidden app?"),
+          message: tr("apps_ui.publish_as_a_hidden_app_only_the", "Publish “{name}” as a HIDDEN app?\n\nOnly the run snapshot is uploaded — never the node graph. This is best-effort privacy, not security: anyone who runs the app can still intercept the prompt.", { name: app.name || tr("apps_ui.this_app", "this app") }),
+          confirmLabel: tr("apps_ui.publish_hidden", "Publish hidden"),
         });
         if (!ok) return;
       }
@@ -1519,11 +1594,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
         try { creatorName = localStorage.getItem("comfyui-mcp.panel.creatorName"); } catch {}
         if (!creatorName) {
           creatorName = await promptModal({
-            title: "Publish to the registry",
-            label: "Creator name",
+            title: tr("apps_ui.publish_to_the_registry", "Publish to the registry"),
+            label: tr("apps_ui.creator_name", "Creator name"),
+            // NOT translated: this value is stored and uploaded as the creator's name.
+            // A localized default would publish the same person under a different
+            // author string in every language.
             value: "anonymous",
             placeholder: "anonymous",
-            submitLabel: "Continue",
+            submitLabel: tr("apps_ui.continue", "Continue"),
           });
           if (creatorName === null) { publishBtn.disabled = false; return; }
           creatorName = creatorName.trim() || "anonymous";
@@ -1551,18 +1629,18 @@ export function createAppsContent(ctx, shell, opts = {}) {
         });
         await showDetail(app.id);
       } catch (e) {
-        toast(`Publish failed: ${e.message}`);
+        toast(tr("apps_ui.publish_failed", "Publish failed: {error}", { error: e.message }));
         publishBtn.disabled = false;
       }
     });
 
     editBtn.addEventListener("click", async () => {
       const vals = await formModal({
-        title: "Edit app info",
-        submitLabel: "Save",
+        title: tr("apps_ui.edit_app_info", "Edit app info"),
+        submitLabel: tr("apps_ui.save", "Save"),
         fields: [
-          { key: "name", label: "App name", value: app.name || "", maxLength: 120 },
-          { key: "description", label: "Description", value: app.description || "", multiline: true, rows: 4 },
+          { key: "name", label: tr("apps_ui.app_name", "App name"), value: app.name || "", maxLength: 120 },
+          { key: "description", label: tr("apps_ui.description", "Description"), value: app.description || "", multiline: true, rows: 4 },
         ],
       });
       if (!vals) return;
@@ -1573,13 +1651,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
     hideBtn.disabled = !!app.hideWorkflow;
     hideBtn.addEventListener("click", async () => {
       const ok = await confirmModal({
-        title: "Hide the workflow?",
-        message:
-          "Hide the workflow for “" + (app.name || "this app") + "”?\n\n" +
-          "This DELETES the stored node graph — the app keeps only its run snapshot and can't be " +
-          "edited as a workflow afterwards. Best-effort privacy, not security: anyone who runs the " +
-          "app can still intercept the prompt via ComfyUI's API.",
-        confirmLabel: "Hide workflow",
+        title: tr("apps_ui.hide_the_workflow", "Hide the workflow?"),
+        message: tr("apps_ui.hide_the_workflow_for_this_deletes_the", "Hide the workflow for “{name}”?\n\nThis DELETES the stored node graph — the app keeps only its run snapshot and can't be edited as a workflow afterwards. Best-effort privacy, not security: anyone who runs the app can still intercept the prompt via ComfyUI's API.", { name: app.name || tr("apps_ui.this_app", "this app") }),
+        confirmLabel: tr("apps_ui.hide_workflow_2", "Hide workflow"),
         danger: true,
       });
       if (!ok) return;
@@ -1589,9 +1663,11 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     delBtn.addEventListener("click", async () => {
       const ok = await confirmModal({
-        title: "Delete app",
-        message: `Delete “${app.name || "this app"}”? This can't be undone.`,
-        confirmLabel: "Delete",
+        title: tr("apps_ui.delete_app", "Delete app"),
+        message: tr("apps_ui.delete_this_can_t_be_undone", "Delete “{name}”? This can't be undone.", {
+          name: app.name || tr("apps_ui.this_app", "this app"),
+        }),
+        confirmLabel: tr("apps_ui.delete_2", "Delete"),
         danger: true,
       });
       if (!ok) return;
@@ -1617,9 +1693,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     /** Local image transfer: same-origin /upload/image. */
     async function uploadImageLocal(f) {
-      status.textContent = "Uploading image…";
+      status.textContent = tr("apps_ui.uploading_image", "Uploading image…");
       const ref = await uploadBlobToInput(f, f.name);
-      if (!ref) throw new Error("image upload failed");
+      if (!ref) throw new Error(tr("apps_ui.image_upload_failed", "image upload failed"));
       return ref.subfolder ? `${ref.subfolder}/${ref.filename}` : ref.filename;
     }
 
@@ -1631,12 +1707,12 @@ export function createAppsContent(ctx, shell, opts = {}) {
      *  upload (codex finding). */
     async function uploadImageToPod(f) {
       if (typeof ctx.uploadMedia !== "function") {
-        throw new Error("pod image transfer needs a newer panel bridge — update the orchestrator");
+        throw new Error(tr("apps_ui.pod_image_transfer_needs_a_newer_panel", "pod image transfer needs a newer panel bridge — update the orchestrator"));
       }
       const unique = `cmcp-app-${app.id.slice(0, 8)}-${crypto.randomUUID().slice(0, 8)}-${f.name}`;
-      status.textContent = `Transferring ${f.name} to the pod…`;
+      status.textContent = tr("apps_ui.transferring_to_the_pod", "Transferring {name} to the pod…", { name: f.name });
       const res = await ctx.uploadMedia(f, unique);
-      if (!res || res.ok === false) throw new Error((res && res.error) || "pod image transfer failed");
+      if (!res || res.ok === false) throw new Error((res && res.error) || tr("apps_ui.pod_image_transfer_failed", "pod image transfer failed"));
       return res.name;
     }
 
@@ -1644,14 +1720,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
       runBtn.disabled = true;
       runpodBtn.disabled = true;
       status.classList.remove("err");
-      status.textContent = "Queueing…";
+      status.textContent = tr("apps_ui.queueing", "Queueing…");
       outputs.textContent = "";
       try {
         const values = await collectValues(uploadImageLocal);
         const res = await client.run(app.id, values);
         const promptId = res.prompt_id;
-        if (!promptId) throw new Error("queue returned no prompt_id");
-        status.textContent = "Running…";
+        if (!promptId) throw new Error(tr("apps_ui.queue_returned_no_prompt_id", "queue returned no prompt_id"));
+        status.textContent = tr("apps_ui.running", "Running…");
         await pollRun(promptId);
       } catch (e) {
         status.textContent = e.message;
@@ -1677,14 +1753,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
               renderOutputs(st);
               return done();
             }
-            status.textContent = st.status === "running" ? "Running…" : "Queued…";
+            status.textContent = st.status === "running" ? tr("apps_ui.running", "Running…") : tr("apps_ui.queued", "Queued…");
           } catch (e) {
             status.textContent = e.message;
             status.classList.add("err");
             return done();
           }
           if (Date.now() > deadline) {
-            status.textContent = "Timed out waiting for the run — it may still finish; check ComfyUI's queue.";
+            status.textContent = tr("apps_ui.timed_out_waiting_for_the_run_it", "Timed out waiting for the run — it may still finish; check ComfyUI's queue.");
             status.classList.add("err");
             return done();
           }
@@ -1704,7 +1780,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
       const detailStatus = st.status_detail || {};
       const msgs = detailStatus.messages || [];
       const failed = msgs.some((m) => Array.isArray(m) && m[0] === "execution_error");
-      status.textContent = failed ? "Run failed — see ComfyUI for details." : "Done.";
+      status.textContent = failed
+        ? tr("apps_ui.run_failed_see_comfyui_for_details", "Run failed — see ComfyUI for details.")
+        : tr("apps_ui.done", "Done.");
       if (failed) status.classList.add("err");
       // Published app → report the run so registry trending works (fire and
       // forget; a popularity signal, never billing).
@@ -1735,7 +1813,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
         }
       }
       if (!outputs.childNodes.length && !failed) {
-        outputs.append(el("div", "text-out", "Run finished with no visible outputs on the selected output nodes."));
+        outputs.append(
+          el("div", "text-out", tr("apps_ui.run_finished_with_no_visible_outputs_on", "Run finished with no visible outputs on the selected output nodes.")),
+        );
       }
     }
 
@@ -1749,23 +1829,30 @@ export function createAppsContent(ctx, shell, opts = {}) {
      *  bridge's upload_media handler FIRST (it writes to the connected target),
      *  then the LOCAL apps route dry-patches the snapshot and the
      *  orchestrator's enqueue_workflow sends it to the pod. Deps pinned to a
-     *  CivitAI version are pushed first (download_civitai_model is
-     *  whitelisted); anything unpinned is reported, not silently skipped. */
+     *  CivitAI version are pushed first (download_model action:"download_civitai"
+     *  is whitelisted); anything unpinned is reported, not silently skipped. */
     async function runOnPod() {
       status.classList.remove("err");
-      if (!callTool) throw new Error("Orchestrator not connected — pod runs go through the bridge.");
+      if (!callTool) {
+        throw new Error(tr("apps_ui.orchestrator_not_connected_pod_runs_go_through", "Orchestrator not connected — pod runs go through the bridge."));
+      }
       const target = typeof getRunpodTarget === "function" ? getRunpodTarget() : null;
       if (!target || target.is_local) {
-        throw new Error("No pod connected — open the RunPod panel (cloud icon in the toolbar) to deploy or connect one first.");
+        throw new Error(
+          tr(
+            "apps_ui.no_pod_connected_open_the_runpod_panel",
+            "No pod connected — open the RunPod panel (cloud icon in the toolbar) to deploy or connect one first.",
+          ),
+        );
       }
       runpodBtn.disabled = true;
       runBtn.disabled = true;
       try {
-        status.textContent = "Preparing…";
+        status.textContent = tr("apps_ui.preparing", "Preparing…");
         const values = await collectValues(uploadImageToPod);
         const dry = await client.run(app.id, values, { dry: true });
         const patched = dry.prompt;
-        if (!patched) throw new Error("couldn't build the prompt snapshot");
+        if (!patched) throw new Error(tr("apps_ui.couldn_t_build_the_prompt_snapshot", "couldn't build the prompt snapshot"));
 
         // Dependency push (best effort, CivitAI-pinned models only).
         const models = Array.isArray(app.deps?.models) ? app.deps.models : [];
@@ -1773,17 +1860,21 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const unpinned = models.filter((m) => m && !m.civitaiVersionId);
         const custom = Array.isArray(app.deps?.customNodes) ? app.deps.customNodes : [];
         for (const m of pinned) {
-          status.textContent = `Pushing model to pod: ${m.name}…`;
-          const res = await callTool("download_civitai_model", {
+          status.textContent = tr("apps_ui.pushing_model_to_pod", "Pushing model to pod: {name}…", { name: m.name });
+          const res = await callTool("download_model", {
+            action: "download_civitai",
             model_version_id: m.civitaiVersionId,
             target_subfolder: m.targetSubfolder || "checkpoints",
           });
           const text = toolText(res);
-          if (res && res.ok === false) throw new Error(`model push failed (${m.name}): ${text}`);
+          if (res && res.ok === false) {
+            throw new Error(tr("apps_ui.model_push_failed", "model push failed ({name}): {detail}", { name: m.name, detail: text }));
+          }
         }
 
-        status.textContent = "Queueing on pod…";
+        status.textContent = tr("apps_ui.queueing_on_pod", "Queueing on pod…");
         const res = await callTool("enqueue_workflow", {
+          action: "enqueue",
           workflow: patched,
           // The app's inputs ARE the user's choices — never re-roll their seed.
           disable_random_seed: true,
@@ -1794,11 +1885,24 @@ export function createAppsContent(ctx, shell, opts = {}) {
           promptId = JSON.parse(text).prompt_id || null;
         } catch { /* tool returned prose */ }
         const notes = [];
-        if (promptId) notes.push(`queued on pod (prompt_id ${promptId})`);
-        else notes.push(text || "queued on pod");
-        if (unpinned.length) notes.push(`⚠ unpinned models the pod must already have: ${unpinned.map((m) => m.name).join(", ")}`);
-        if (custom.length) notes.push(`⚠ custom nodes the pod must already have: ${custom.join(", ")}`);
-        notes.push("Progress: watch ComfyUI's queue — pod history isn't mirrored back here.");
+        if (promptId) notes.push(tr("apps_ui.queued_on_pod_prompt_id", "queued on pod (prompt_id {id})", { id: promptId }));
+        else notes.push(text || tr("apps_ui.queued_on_pod", "queued on pod"));
+        // Model / pack names stay verbatim — they are filenames and pack ids.
+        if (unpinned.length) {
+          notes.push(
+            tr("apps_ui.unpinned_models_the_pod_must_already_have", "⚠ unpinned models the pod must already have: {names}", {
+              names: unpinned.map((m) => m.name).join(", "),
+            }),
+          );
+        }
+        if (custom.length) {
+          notes.push(
+            tr("apps_ui.custom_nodes_the_pod_must_already_have", "⚠ custom nodes the pod must already have: {names}", {
+              names: custom.join(", "),
+            }),
+          );
+        }
+        notes.push(tr("apps_ui.progress_watch_comfyui_s_queue_pod_history", "Progress: watch ComfyUI's queue — pod history isn't mirrored back here."));
         status.textContent = notes.join(" · ");
       } finally {
         runpodBtn.disabled = false;
@@ -1811,7 +1915,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
     if (closed) return;
     body.textContent = "";
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn("← My Apps");
+    const back = makeBtn(tr("apps_ui.my_apps_2", "← My Apps"));
     back.addEventListener("click", () => showGrid().catch(showError));
     bar.append(back);
     body.append(bar, el("div", "cmcp-apps-empty", e && e.message ? e.message : String(e)));
@@ -1834,9 +1938,9 @@ export function createAppsContent(ctx, shell, opts = {}) {
   }
 
   return {
-    key: "apps", label: "Apps", icon: "pi-th-large", driveKind: null,
+    key: "apps", label: tr("apps_ui.apps", "Apps"), icon: "pi-th-large", driveKind: null,
     hasSearch: () => _tab === "explore",
-    searchPlaceholder: "Search apps…",
+    searchPlaceholder: tr("apps_ui.search_apps", "Search apps…"),
     subnavExtras: () => [mineChip, exploreChip, filterBtn],
     reseed,
     // Escape peels an open filter (or other stacked) sheet before it can close the

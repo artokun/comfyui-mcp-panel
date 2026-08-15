@@ -23,6 +23,8 @@
  */
 import { test, expect } from './fixtures/panelTest'
 import type { Page } from '@playwright/test'
+import { claimFreshCanvas, settleCanvas } from './fixtures/canvasIdentity'
+import type { MockBridge } from './fixtures/MockBridge'
 
 interface SlotSpec {
   name: string
@@ -40,8 +42,17 @@ interface NodeSpec {
  * slot shapes a test wants. Returns the assigned node ids, one per spec (order
  * preserved). Runs entirely in the page against window.LiteGraph / app.graph.
  */
-async function buildGraph(page: Page, specs: NodeSpec[]): Promise<number[]> {
-  return page.evaluate((nodeSpecs: NodeSpec[]) => {
+async function buildGraph(
+  page: Page,
+  bridge: MockBridge,
+  specs: NodeSpec[]
+): Promise<number[]> {
+  // #793 — clear the canvas and let the PANEL claim it, so the graph these
+  // nodes land on carries a real identity stamp. Without it every mutation
+  // below is refused as dirty-mutation-binding-unproven, which is what made
+  // this file fail 6/6 while the code under test was fine.
+  await claimFreshCanvas(page, bridge)
+  const ids = await page.evaluate((nodeSpecs: NodeSpec[]) => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
     const LiteGraph = w.LiteGraph
@@ -54,7 +65,6 @@ async function buildGraph(page: Page, specs: NodeSpec[]): Promise<number[]> {
       LiteGraph.registerNodeType(TYPE, CmcpMatcherNode)
     }
 
-    graph.clear()
     const ids: number[] = []
     for (const spec of nodeSpecs) {
       const node = LiteGraph.createNode(TYPE)
@@ -74,6 +84,12 @@ async function buildGraph(page: Page, specs: NodeSpec[]): Promise<number[]> {
     }
     return ids
   }, specs)
+  // #793 — the tracker captures on the events the real UI emits, and
+  // graph.add() from the page fires none of them. Without this the workflow's
+  // own state still describes the canvas from BEFORE the build, and the
+  // binding guard correctly refuses the mismatch.
+  await settleCanvas(page)
+  return ids
 }
 
 /** Bring the panel up and connected to the MockBridge. */
@@ -95,7 +111,7 @@ const CHECKPOINT: NodeSpec = {
 
 test('1. omitted to_input auto-matches clip ← CLIP', async ({ panel, mockBridge }) => {
   await connectPanel(panel, mockBridge)
-  const [ckpt, enc] = await buildGraph(panel.page, [
+  const [ckpt, enc] = await buildGraph(panel.page, mockBridge, [
     CHECKPOINT,
     {
       title: 'CLIPTextEncode',
@@ -114,7 +130,7 @@ test('1. omitted to_input auto-matches clip ← CLIP', async ({ panel, mockBridg
     // to_input omitted → auto-match by type
   })
 
-  expect(reply.ok).toBe(true)
+  expect(reply.ok, JSON.stringify(reply).slice(0, 500)).toBe(true)
   expect(reply.result.connected.to.input).toBe('clip')
   expect(reply.result.connected.from.output).toBe('CLIP')
   expect(reply.result.connected.type).toBe('CLIP')
@@ -126,7 +142,7 @@ test('2. CONDITIONING ambiguity errors with both slot names + [connected] marker
   mockBridge
 }) => {
   await connectPanel(panel, mockBridge)
-  const [ckpt, enc, ksampler] = await buildGraph(panel.page, [
+  const [ckpt, enc, ksampler] = await buildGraph(panel.page, mockBridge, [
     CHECKPOINT,
     {
       title: 'CLIPTextEncode',
@@ -175,7 +191,7 @@ test('3. auto_match:false + omitted slots reproduces legacy index-0 behavior', a
   mockBridge
 }) => {
   await connectPanel(panel, mockBridge)
-  const [ckpt, ksampler] = await buildGraph(panel.page, [
+  const [ckpt, ksampler] = await buildGraph(panel.page, mockBridge, [
     CHECKPOINT,
     {
       title: 'KSampler',
@@ -193,7 +209,7 @@ test('3. auto_match:false + omitted slots reproduces legacy index-0 behavior', a
     // both slots omitted → legacy index 0 → MODEL(out 0) → model(in 0)
   })
 
-  expect(reply.ok).toBe(true)
+  expect(reply.ok, JSON.stringify(reply).slice(0, 500)).toBe(true)
   expect(reply.result.connected.from.output_index).toBe(0)
   expect(reply.result.connected.to.input_index).toBe(0)
   expect(reply.result.connected.from.output).toBe('MODEL')
@@ -206,7 +222,7 @@ test('4. explicit wrong name errors with the full slot listing', async ({
   mockBridge
 }) => {
   await connectPanel(panel, mockBridge)
-  const [ckpt, ksampler] = await buildGraph(panel.page, [
+  const [ckpt, ksampler] = await buildGraph(panel.page, mockBridge, [
     CHECKPOINT,
     {
       title: 'KSampler',
@@ -236,7 +252,7 @@ test('5. reconnect over a connected input reports replaced_link', async ({
   mockBridge
 }) => {
   await connectPanel(panel, mockBridge)
-  const [ckptA, ckptB, ksampler] = await buildGraph(panel.page, [
+  const [ckptA, ckptB, ksampler] = await buildGraph(panel.page, mockBridge, [
     CHECKPOINT,
     CHECKPOINT,
     {
@@ -273,7 +289,7 @@ test('6. wildcard ("*") connects but loses to an exact-type match', async ({
   // A reroute-style origin with BOTH a "*" wildcard output and an exact MODEL
   // output. Auto-match to a MODEL input must prefer the exact output (index 1),
   // proving wildcard is ranked below exact.
-  const [reroute, ksampler] = await buildGraph(panel.page, [
+  const [reroute, ksampler] = await buildGraph(panel.page, mockBridge, [
     {
       title: 'Reroute',
       outputs: [
@@ -293,14 +309,14 @@ test('6. wildcard ("*") connects but loses to an exact-type match', async ({
     // both omitted → exact MODEL→model must beat "*"→model
   })
 
-  expect(reply.ok).toBe(true)
+  expect(reply.ok, JSON.stringify(reply).slice(0, 500)).toBe(true)
   expect(reply.result.connected.from.output_index).toBe(1)
   expect(reply.result.connected.from.output).toBe('MODEL')
   expect(reply.result.connected.type).toBe('MODEL')
 
   // And a pure wildcard source still connects (wildcard is compatible, just
   // lower-ranked): a lone "*" output auto-matches the MODEL input.
-  const [rerouteOnly, ks2] = await buildGraph(panel.page, [
+  const [rerouteOnly, ks2] = await buildGraph(panel.page, mockBridge, [
     { title: 'Reroute', outputs: [{ name: 'wild', type: '*' }] },
     { title: 'KSampler', inputs: [{ name: 'model', type: 'MODEL' }] }
   ])

@@ -15,16 +15,31 @@ function nonBlank(value) {
  * an exclusive Web Locks lease held for this page's lifetime. If that cannot be
  * acquired, return undefined so the hello omits the identity and MCP readiness
  * fails closed. There is intentionally no timeout-as-proof fallback.
+ *
+ * A SUCCESS is cached for the life of the page. A FAILURE is retryable (#654):
+ * once `retryBackoffMs` has elapsed, the next resolve() runs a fresh lease
+ * attempt, so a tab that lost a transient contention window re-registers
+ * without a manual browser refresh once the lease becomes acquirable.
  */
 export function createRestartTabIdentity({
   storage = globalThis.sessionStorage,
   locks = globalThis.navigator?.locks,
   randomUUID = () => globalThis.crypto.randomUUID(),
+  now = () => Date.now(),
+  retryBackoffMs = 5000,
 } = {}) {
   let memoryFallback;
   let resolved;
   let resolving;
   let releaseLease;
+  // #654 — the timestamp of the last FAILED resolution. A failed resolve used to
+  // be cached for the LIFE of the page (the settled `resolving` promise was never
+  // cleared), so one contested lease window wedged the tab's registration until a
+  // manual browser refresh — even after the contending tab closed and the lease
+  // became acquirable. A failure is now retryable once per backoff window.
+  // `null` (not 0) is the never-failed sentinel: a failure recorded at timestamp
+  // 0 must still count as a failure (codex gate r2).
+  let lastFailureAt = null;
 
   const fallback = () => (memoryFallback ??= randomUUID());
   const read = () => {
@@ -74,6 +89,12 @@ export function createRestartTabIdentity({
   async function resolve() {
     if (resolved) return resolved;
     if (resolving) return resolving;
+    // #654 — a FAILED resolution is not a life sentence: the lease may become
+    // acquirable later (the contending duplicate tab closed), and nothing else
+    // re-runs this resolver, so refusing to retry here is what forced the manual
+    // browser refresh. Re-attempt at most once per backoff window; inside the
+    // window, fail closed with the same undefined the first failure returned.
+    if (lastFailureAt != null && now() - lastFailureAt < retryBackoffMs) return undefined;
     resolving = (async () => {
       let candidate = read() ?? fallback();
       write(candidate);
@@ -89,7 +110,24 @@ export function createRestartTabIdentity({
         write(candidate);
       }
       return undefined;
-    })();
+    })()
+      // A REJECTED attempt (a lock manager whose request promise rejects, a
+      // throwing randomUUID) must degrade to the same retryable failure as a
+      // refused lease — never a cached rejection every later caller re-throws
+      // (that was the page-lifetime wedge all over again, codex gate P1).
+      .catch(() => undefined)
+      // Stamp the failure INSIDE the chain, BEFORE the slot is cleared: a caller
+      // arriving between the clear and the stamp would otherwise see neither
+      // and start a fresh attempt, bypassing the backoff (codex gate r2).
+      .then((outcome) => {
+        if (outcome === undefined) lastFailureAt = now();
+        return outcome;
+      })
+      // Clear the in-flight slot so a LATER call may retry after a failure (a
+      // success is cached in `resolved`, which short-circuits above).
+      .finally(() => {
+        resolving = null;
+      });
     return resolving;
   }
 

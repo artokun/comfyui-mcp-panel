@@ -1,0 +1,206 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "GitHub'da yıldızlayın",
+    "tooltip": "ComfyUI Agent Panel işinize yarıyor mu? GitHub yıldızı gerçekten yardımcı oluyor. Depoyu yeni bir sekmede açar."
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "Yenilikler",
+    "tooltip": "Son değişiklikleri panel dökümünde gösterir — bu sürümde ve öncekilerde neler geldi. Panel, siz istemeden Comfy Registry üzerinden güncellenebilir, bu yüzden bir şey hatırladığınızdan farklı davranıyorsa buraya bakın."
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "Belgeler",
+    "tooltip": "Panel, araçlar, yerel LLM'ler ve sorun giderme rehberleri — comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "Topluluk",
+    "tooltip": "comfyui-mcp Discord'una katılın — duyurular, ipuçları ve yardım. Yeni bir sekmede açılır."
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "Yardım lazım mı?",
+    "tooltip": "Takıldınız mı? Bu, kısa bir tanılama özetini (panel sürümü, arka uç, ComfyUI, işletim sistemi) panonuza kopyalar ve Discord'u açar — hızlı yardım alabilmemiz için mesajınıza yapıştırın."
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "Varsayılan ajan arka ucu",
+    "tooltip": "Panelin varsayılan olarak hangi arka plan ajanına bağlanacağı. Claude, Claude aboneliğinizle çalışır; ChatGPT, Codex (ChatGPT) hesabınızla; Gemini, Google (Gemini) girişinizle. Panelin arka ucunu belirler (ve aşağıdaki hangi grubun çalışma zamanını belirleyeceğini); model seçiciden anlık olarak yine de geçiş yapabilirsiniz (anlık geçiş yalnızca o oturum içindir ve bu varsayılanı DEĞİŞTİRMEZ)."
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "Açılışta otomatik bağlan",
+    "tooltip": "Panel açıldığında ajanı (yerel orkestratörü başlatarak) Bağlan'a tıklamadan otomatik bağlar. Varsayılan olarak kapalı — aksi hâlde orkestratör yalnızca açık bir Bağlan tıklamasıyla başlatılır."
+  },
+  "comfyui-mcp_language": {
+    "name": "Panel dili",
+    "tooltip": "Panelin kendi metinlerinin dili. Algıla seçeneği ComfyUI'nin dil ayarını izler, yani ComfyUI'nin dilini değiştirmek paneli de değiştirir. Henüz çevrilmemiş her şey İngilizceye döner. Panel yeniden açıldığında ya da yenilendiğinde geçerli olur."
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "Mobil uygulamayla kontrol (beta)",
+    "tooltip": "Panel başlığındaki uzaktan kontrol eşleştirme düğmesini (QR) ve aşağıdaki beta uygulama indirme bağlantılarını gösterir. Mobil uygulama BETA aşamasında ve hızla değişiyor — pürüzler, sürümler arasında bozucu değişiklikler ve ara sıra yeniden eşleştirme bekleyin. Açıkça İnternet kipini seçmediğiniz sürece eşleştirme kendi makinenizde/ağınızda kalır."
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "Uygulamalar'ı göster",
+    "tooltip": "Araç çubuğunda Uygulamalar düğmesini gösterir — mikro uygulama katmanı (bir iş akışını tek tıkla çalışan uygulamaya dönüştürme, yerelde ya da podda çalıştırma, yayımlama/keşfetme). Varsayılan olarak kapalı; bu seçenek bağlı bir mobil uygulamaya da iletilir."
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "Eğitim'i göster",
+    "tooltip": "Araç çubuğunda Eğitim düğmesini gösterir — LoRA eğitim sihirbazı (veri kümesi toplama/etiketleme/başlatma/izleme). Varsayılan olarak kapalı; bu seçenek bağlı bir mobil uygulamaya da iletilir."
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "RunPod / Yerel'i göster",
+    "tooltip": "Araç çubuğunda RunPod / Yerel sunucu düğmesini gösterir — bulut GPU podu oluştur/başlat/durdur/bağlan ya da yerele geri dön. Varsayılan olarak kapalı; bu seçenek bağlı bir mobil uygulamaya da iletilir."
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "Beta uygulamayı edinin",
+    "tooltip": "ComfyUI MCP mobil uygulamasının test sürümü indirmeleri. iOS, Apple TestFlight üzerinden; Android, Firebase App Distribution üzerinden kurulur. İki kanal da beta: sürümler sık güncellenir ve bu panelle yeniden eşleştirme gerekebilir."
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "Panel arayüz ölçeği (%)",
+    "tooltip": "Ajan kenar çubuğunun tamamını ölçekler — metin, simgeler ve boşluklar birlikte. Panel yüksek DPI'lı ya da büyük bir ekranda zor okunuyorsa artırın. Varsayılan %100; aralık 100-250. Anında ve açık olan her panele uygulanır. Bir kullanıcı stil dosyasında `.cmcp-root { font-size }` değerini geçersiz kılmanın İŞE YARAMADIĞINI unutmayın: panelin iç ölçüleri `rem` cinsindendir ve panele değil sayfa köküne göre çözülür, bu yüzden metinlerin çoğu bunu yok sayar. Paneli ölçeklendirmenin desteklenen yolu bu ayardır."
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "İşleme takılma uyarısı (saniye)",
+    "tooltip": "Bir ComfyUI işlemesi, ajana işlemenin takılmış/kilitlenmiş göründüğü (örneğin bellek yetersizliğinde sıkışmış bir örnekleyici adımı) uyarısı verilmeden önce ne kadar süre HİÇ ilerlemeyebilir; bu durumda ajana yeni bir çalıştırma kuyruğa almak yerine iptal etmesi/yeniden başlatması söylenir. Video adımları doğası gereği yavaştır, bu yüzden bu değeri cömert tutun. Varsayılan 180 sn; aralık 15–3600. Orkestratör bir sonraki başlayışında geçerli olur — çalışan bir ajan için değiştirmek üzere Bağlantıyı kes, sonra Bağlan (ya da /restart)."
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "Uzak ComfyUI adresi (gelişmiş)",
+    "tooltip": "AJANI bu makine yerine uzak bir ComfyUI'ye yöneltir — örneğin https://xxxxxxxx-8188.proxy.runpod.net adresindeki bir RunPod podu. Yerel ComfyUI'yi sürmek için BOŞ bırakın (varsayılan). Ayarlandığında ajanın araçları (kuyruk, modeller, geçmiş, yüklemeler) uzak sunucuyu hedefler ve yalnızca yerelde çalışan araçlar (download_model / kurulum paketleri / model taramaları) devre dışı kalır. Orkestratör bir sonraki başlayışında geçerli olur — değiştirmek için Bağlantıyı kes, sonra Bağlan. Canlı tuvaliniz yine tarayıcıda açtığınız ComfyUI'yi izler."
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "Köprü adresi (gelişmiş)",
+    "tooltip": "Panel orkestratör köprüsünün WebSocket adresi — artık TEK bir köprü her sağlayıcıya hizmet ediyor (varsayılan ws://127.0.0.1:9180). Bunu yalnızca orkestratörü varsayılan olmayan bir bağlantı noktasında başlatıyorsanız değiştirin (COMFYUI_MCP_BRIDGE_PORT). Bir sonraki Bağlan işleminde geçerli olur."
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "Ajan düzenlemelerine yakınlaş",
+    "tooltip": "Ajan bir düğümün değerini değiştirdiğinde, değişikliğin gerçekleşmesini izleyebilmeniz için tuvali o düğüme yumuşakça yakınlaştırır (kenar boşluğuyla), düzenlemeler durulunca da tüm grafiği sığdıracak şekilde geri uzaklaştırır. Yalnızca değer düzenlemeleri için geçerlidir — kablolama ve düğüm yerleşimi görünümü oynatmaz. Varsayılan olarak açık; tuvalin sabit kalmasını istiyorsanız kapatın."
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "Tercih edilen modeller",
+    "tooltip": "Kendi favori modelleriniz, virgülle ayrılmış — Ollama etiketleri (artokun/gemma4-comfyui-mcp:e4b — bizim ComfyUI ince ayarımız, gemma4:12b, qwen3:4b) ve/veya OpenRouter kimlikleri (xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). Model seçicinin EN ÜSTÜNE sabitlenirler (keşfedilen kataloğa dahil değillerse ★ ile işaretlenir). Orkestratör tarafından saklanır, yani yeniden başlatmalardan sağ çıkar ve anında geçerli olur."
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "Uç nokta türü",
+    "tooltip": "Ollama arka ucunun uç noktasıyla nasıl konuşacağı. 'Ollama (yerel)', yerel Ollama'nızdaki yerleşik /api/chat adresini kullanır. 'OpenAI uyumlu' ise /chat/completions konuşur — OpenRouter, vLLM, LM Studio, DeepSeek vb. için bunu kullanın (temel adresi aşağıya yazın; API anahtarı orkestratörün ortam değişkenlerinden gelir, örneğin OPENROUTER_API_KEY). YENİ oturumlarda geçerli olur — değiştirdikten sonra Bağlantıyı kes, sonra Bağlan."
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "Uç nokta temel adresi",
+    "tooltip": "Yukarıdaki uç noktanın temel adresi. Yerel Ollama için BOŞ bırakın (http://127.0.0.1:11434). OpenAI uyumlu uç noktalarda /v1 kısmını da yazın (örneğin https://openrouter.ai/api/v1). YENİ oturumlarda geçerli olur — değiştirdikten sonra Bağlantıyı kes, sonra Bağlan."
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "Uç nokta temel adresi",
+    "tooltip": "OpenAI uyumlu herhangi bir uç nokta — vLLM, DeepSeek, Together, Azure OpenAI, başka bir makinedeki llama-server… /v1 kısmını da yazın (örneğin http://192.168.1.20:8000/v1). Orkestratör tarafından saklanır ve anında geçerli olur; sunucu bir anahtar istiyorsa aşağıdaki “API anahtarını ayarla…” seçeneğini kullanın. Bu sağlayıcıyı devre dışı bırakmak için boş bırakın."
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "Varsayılan model",
+    "tooltip": "Claude arka plan ajanı için varsayılan model; Claude için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Claude'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "Varsayılan model",
+    "tooltip": "ChatGPT arka plan ajanı için varsayılan model; ChatGPT için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. ChatGPT'ye bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "Varsayılan model",
+    "tooltip": "Gemini arka plan ajanı için varsayılan model; Gemini için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Gemini'ye bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "Varsayılan model",
+    "tooltip": "Antigravity arka plan ajanı için varsayılan model; Antigravity için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Antigravity'ye bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "Varsayılan model",
+    "tooltip": "Pi arka plan ajanı için varsayılan model; Pi için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Pi'ye bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "Varsayılan model",
+    "tooltip": "Grok arka plan ajanı için varsayılan model; Grok için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Grok'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "Varsayılan model",
+    "tooltip": "Kimi arka plan ajanı için varsayılan model; Kimi için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Kimi'ye bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "Varsayılan model",
+    "tooltip": "Kimi K3 arka plan ajanı için varsayılan model; Kimi K3 için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Kimi K3'e bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "Varsayılan model",
+    "tooltip": "GLM (z.ai) arka plan ajanı için varsayılan model; GLM (z.ai) için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. GLM (z.ai) bağlantısı kurulana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "Varsayılan model",
+    "tooltip": "MiniMax arka plan ajanı için varsayılan model; MiniMax için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. MiniMax'e bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "Varsayılan model",
+    "tooltip": "Ollama arka plan ajanı için varsayılan model; Ollama için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Ollama'ya bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "Varsayılan model",
+    "tooltip": "OpenRouter arka plan ajanı için varsayılan model; OpenRouter için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. OpenRouter'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "Varsayılan model",
+    "tooltip": "LM Studio arka plan ajanı için varsayılan model; LM Studio için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. LM Studio'ya bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "Varsayılan model",
+    "tooltip": "llama.cpp arka plan ajanı için varsayılan model; llama.cpp için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. llama.cpp bağlantısı kurulana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "Varsayılan model",
+    "tooltip": "Özel uç nokta arka plan ajanı için varsayılan model; Özel uç nokta için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Özel uç noktaya bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Claude ajanı için varsayılan akıl yürütme çabası, kendi ölçeğinden seçilir (low–max). 'Model varsayılanı' bunu ayarsız bırakır."
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "ChatGPT ajanı için varsayılan akıl yürütme çabası, kendi ölçeğinden seçilir (none–ultra). 'Model varsayılanı' bunu ayarsız bırakır."
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Gemini akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Antigravity akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Pi akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Grok akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Kimi akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Kimi K3 akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "GLM (z.ai) akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "MiniMax akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "OpenRouter API anahtarı",
+    "tooltip": "OpenRouter API anahtarınızı güvenle saklayın. Maskeli bir giriş alanı açar; değer doğrudan orkestratörün 0600 izinli deposuna (~/.comfyui-mcp) gider — ComfyUI ayarlarına, günlüklere, sohbet geçmişine ya da ajanın bağlamına ASLA yazılmaz. Yalnızca köprü gerekir (önce Bağlan'a tıklayın — hiçbir sağlayıcının hazır olması şart değil)."
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "Özel uç nokta API anahtarı",
+    "tooltip": "Özel uç nokta API anahtarınızı güvenle saklayın. Maskeli bir giriş alanı açar; değer doğrudan orkestratörün 0600 izinli deposuna (~/.comfyui-mcp) gider — ComfyUI ayarlarına, günlüklere, sohbet geçmişine ya da ajanın bağlamına ASLA yazılmaz. Yalnızca köprü gerekir (önce Bağlan'a tıklayın — hiçbir sağlayıcının hazır olması şart değil)."
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "CivitAI token",
+    "tooltip": "CivitAI API token'ınızı güvenle saklayın. Maskeli bir giriş alanı açar; değer doğrudan orkestratörün 0600 izinli deposuna (~/.comfyui-mcp) gider — ComfyUI ayarlarına, günlüklere, sohbet geçmişine ya da ajanın bağlamına ASLA yazılmaz. Yalnızca köprü gerekir (önce Bağlan'a tıklayın — hiçbir sağlayıcının hazır olması şart değil)."
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "HuggingFace token",
+    "tooltip": "HuggingFace API token'ınızı güvenle saklayın. Maskeli bir giriş alanı açar; değer doğrudan orkestratörün 0600 izinli deposuna (~/.comfyui-mcp) gider — ComfyUI ayarlarına, günlüklere, sohbet geçmişine ya da ajanın bağlamına ASLA yazılmaz. Yalnızca köprü gerekir (önce Bağlan'a tıklayın — hiçbir sağlayıcının hazır olması şart değil)."
+  }
+}

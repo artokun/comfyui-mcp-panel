@@ -1,0 +1,206 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "在 GitHub 上加星",
+    "tooltip": "喜欢 ComfyUI 智能体面板吗？一个 GitHub star 真的很有帮助。在新标签页打开代码仓库。"
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "更新内容",
+    "tooltip": "在面板对话记录中显示最近的变更 —— 本版本以及之前版本发布了什么。面板可能在你未主动要求的情况下从 Comfy Registry 更新，所以当某处行为与记忆不符时，来这里查看。"
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "文档",
+    "tooltip": "面板、工具、本地 LLM 与故障排查指南 —— comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "社区",
+    "tooltip": "加入 comfyui-mcp Discord —— 公告、技巧与帮助。在新标签页打开。"
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "需要帮助？",
+    "tooltip": "卡住了？这会把一段简短的诊断信息（面板版本、后端、ComfyUI、操作系统）复制到剪贴板并打开 Discord —— 把它粘贴到你的消息里，我们就能更快帮上忙。"
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "默认智能体后端",
+    "tooltip": "面板默认连接的后台智能体。Claude 使用你的 Claude 订阅；ChatGPT 使用你的 Codex（ChatGPT）账号；Gemini 使用你的 Google（Gemini）登录。它决定面板的后端，以及下面哪个分组用于初始化运行时；你仍可在模型选择器中实时切换，实时切换只对当前会话生效，不会更改此默认值。"
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "打开时自动连接",
+    "tooltip": "面板打开时自动连接智能体（并启动本地编排器），无需点击“连接”。默认关闭 —— 否则编排器只会在你明确点击“连接”时启动。"
+  },
+  "comfyui-mcp_language": {
+    "name": "面板语言",
+    "tooltip": "面板自身文本的语言。“Detect”会跟随 ComfyUI 的语言设置，因此更改 ComfyUI 的语言也会改变面板。尚未翻译的内容会回退为英文。重新打开或刷新面板后生效。"
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "通过手机应用控制（测试版）",
+    "tooltip": "在面板顶部显示远程控制配对按钮（二维码），并在下方显示测试版应用的下载链接。手机应用处于测试阶段且变化很快 —— 会有粗糙之处、版本之间的破坏性变更，以及偶尔需要重新配对。除非你明确选择互联网模式，配对始终留在你自己的机器和网络内。"
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "显示“应用”",
+    "tooltip": "在工具栏显示“应用”按钮 —— 微应用层（把工作流转成一键应用，在本地或 Pod 上运行，发布/浏览）。默认关闭；该开关也会发送给已连接的手机应用。"
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "显示“训练”",
+    "tooltip": "在工具栏显示“训练”按钮 —— LoRA 训练向导（数据集收集/打标/启动/监控）。默认关闭；该开关也会发送给已连接的手机应用。"
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "显示 RunPod / 本地",
+    "tooltip": "在工具栏显示 RunPod / 本地主机按钮 —— 部署/启动/停止/连接云端 GPU Pod，或切回本地。默认关闭；该开关也会发送给已连接的手机应用。"
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "获取测试版应用",
+    "tooltip": "ComfyUI MCP 手机应用的测试者下载。iOS 通过 Apple TestFlight 安装，Android 通过 Firebase App Distribution 安装。两个渠道都是测试版：版本更新频繁，可能需要与此面板重新配对。"
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "面板 UI 缩放（%）",
+    "tooltip": "整体缩放智能体侧边栏 —— 文字、图标与间距一起变化。在高 DPI 或大屏幕上看不清时可以调高。默认 100%，范围 100-250。立即对所有已打开的面板生效。请注意，在用户样式表中覆盖 `.cmcp-root { font-size }` 是无效的：面板内部尺寸使用 `rem`，它相对于页面根元素而非面板计算，因此大部分文字会忽略它。此设置才是缩放面板的受支持方式。"
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "渲染停滞警告（秒）",
+    "tooltip": "ComfyUI 渲染在毫无进展多久之后，才提醒智能体渲染看起来卡住了（例如因显存不足而卡在采样步骤），并让它取消/重启而不是再排一次队。视频步骤本来就慢，所以这个值请留得宽裕些。默认 180 秒，范围 15–3600。在编排器下次启动时生效 —— 要让运行中的智能体改用新值，请先断开再连接（或使用 /restart）。"
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "远程 ComfyUI 地址（高级）",
+    "tooltip": "让智能体面向远程 ComfyUI 而不是本机 —— 例如位于 https://xxxxxxxx-8188.proxy.runpod.net 的 RunPod Pod。留空则驱动本地 ComfyUI（默认）。设置后，智能体的工具（队列、模型、历史、上传）都会指向远程服务器，而仅限本地的工具（ download_model / 安装包 / 模型扫描）会被禁用。在编排器下次启动时生效 —— 要修改请先断开再连接。你眼前的画布仍然跟随你在浏览器里打开的那个 ComfyUI。"
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "桥接地址（高级）",
+    "tooltip": "面板编排器桥接的 WebSocket 地址 —— 现在一个桥接服务于所有服务商（默认 ws://127.0.0.1:9180）。只有当你在非默认端口（ COMFYUI_MCP_BRIDGE_PORT ）上启动编排器时才需要修改。下次连接时生效。"
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "缩放到智能体的改动",
+    "tooltip": "当智能体修改某个节点的值时，画布会平滑地缩放到该节点（留出边距），让你看着改动落地；编辑安静下来后再缩回到整张图。仅针对值的修改 —— 连线和节点摆放不会移动视图。默认开启；关闭后画布保持不动。"
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "常用模型",
+    "tooltip": "你自己常用的模型，用逗号分隔 —— 可以是 Ollama 标签（artokun/gemma4-comfyui-mcp:e4b —— 我们的 ComfyUI 微调模型、gemma4:12b、qwen3:4b），也可以是 OpenRouter 的 id（xiaomi/mimo-v2.5、moonshotai/kimi-k2.5）。它们会被固定在模型选择器最上方（不在已发现的目录中时标记为 ★）。由编排器保存，因此重启后依然保留并立即生效。"
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "端点类型",
+    "tooltip": "Ollama 后端与其端点通信的方式。“Ollama (local)”使用本地 Ollama 原生的 /api/chat。“OpenAI-compatible”使用 /chat/completions —— 适用于 OpenRouter、vLLM、LM Studio、DeepSeek 等（在下方设置基础地址；API 密钥来自编排器的环境变量，例如 OPENROUTER_API_KEY ）。对新会话生效 —— 修改后请先断开再连接。"
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "端点基础地址",
+    "tooltip": "上面所选端点的基础地址。使用本地 Ollama（http://127.0.0.1:11434）时请留空。OpenAI 兼容端点需要带上 /v1（例如 https://openrouter.ai/api/v1）。对新会话生效 —— 修改后请先断开再连接。"
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "端点基础地址",
+    "tooltip": "任何 OpenAI 兼容的端点都可以 —— vLLM、DeepSeek、Together、Azure OpenAI、另一台机器上的 llama-server……请带上 /v1（例如 http://192.168.1.20:8000/v1）。由编排器保存并立即生效；如果服务器需要密钥，请使用下面的“设置 API 密钥…”。留空则停用该服务商。"
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "默认模型",
+    "tooltip": "Claude 后台智能体的默认模型，从为 Claude 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Claude 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "默认模型",
+    "tooltip": "ChatGPT 后台智能体的默认模型，从为 ChatGPT 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 ChatGPT 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "默认模型",
+    "tooltip": "Gemini 后台智能体的默认模型，从为 Gemini 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Gemini 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "默认模型",
+    "tooltip": "Antigravity 后台智能体的默认模型，从为 Antigravity 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Antigravity 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "默认模型",
+    "tooltip": "Pi 后台智能体的默认模型，从为 Pi 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Pi 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "默认模型",
+    "tooltip": "Grok 后台智能体的默认模型，从为 Grok 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Grok 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "默认模型",
+    "tooltip": "Kimi 后台智能体的默认模型，从为 Kimi 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Kimi 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "默认模型",
+    "tooltip": "Kimi K3 后台智能体的默认模型，从为 Kimi K3 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Kimi K3 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "默认模型",
+    "tooltip": "GLM (z.ai) 后台智能体的默认模型，从为 GLM (z.ai) 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 GLM (z.ai) 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "默认模型",
+    "tooltip": "MiniMax 后台智能体的默认模型，从为 MiniMax 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 MiniMax 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "默认模型",
+    "tooltip": "Ollama 后台智能体的默认模型，从为 Ollama 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Ollama 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "默认模型",
+    "tooltip": "OpenRouter 后台智能体的默认模型，从为 OpenRouter 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 OpenRouter 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "默认模型",
+    "tooltip": "LM Studio 后台智能体的默认模型，从为 LM Studio 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 LM Studio 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "默认模型",
+    "tooltip": "llama.cpp 后台智能体的默认模型，从为 llama.cpp 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 llama.cpp 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "默认模型",
+    "tooltip": "Custom endpoint 后台智能体的默认模型，从为 Custom endpoint 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Custom endpoint 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "默认推理强度",
+    "tooltip": "Claude 智能体的默认推理强度，取自它的等级范围（low–max）。选择“Model default”则不设置。"
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "默认推理强度",
+    "tooltip": "ChatGPT 智能体的默认推理强度，取自它的等级范围（none–ultra）。选择“Model default”则不设置。"
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "默认推理强度",
+    "tooltip": "Gemini 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "默认推理强度",
+    "tooltip": "Antigravity 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "默认推理强度",
+    "tooltip": "Pi 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "默认推理强度",
+    "tooltip": "Grok 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "默认推理强度",
+    "tooltip": "Kimi 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "默认推理强度",
+    "tooltip": "Kimi K3 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "默认推理强度",
+    "tooltip": "GLM (z.ai) 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "默认推理强度",
+    "tooltip": "MiniMax 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "OpenRouter API 密钥",
+    "tooltip": "安全地保存你的 OpenRouter API 密钥。会打开一个带遮罩的输入框；该值直接进入编排器的 0600 存储（~/.comfyui-mcp）—— 绝不会写入 ComfyUI 设置、日志、聊天记录或智能体上下文。只需要桥接即可（请先点击“连接” —— 无需任何服务商已就绪）。"
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "自定义端点 API 密钥",
+    "tooltip": "安全地保存你的自定义端点 API 密钥。会打开一个带遮罩的输入框；该值直接进入编排器的 0600 存储（~/.comfyui-mcp）—— 绝不会写入 ComfyUI 设置、日志、聊天记录或智能体上下文。只需要桥接即可（请先点击“连接” —— 无需任何服务商已就绪）。"
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "CivitAI 令牌",
+    "tooltip": "安全地保存你的 CivitAI API 令牌。会打开一个带遮罩的输入框；该值直接进入编排器的 0600 存储（~/.comfyui-mcp）—— 绝不会写入 ComfyUI 设置、日志、聊天记录或智能体上下文。只需要桥接即可（请先点击“连接” —— 无需任何服务商已就绪）。"
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "HuggingFace 令牌",
+    "tooltip": "安全地保存你的 HuggingFace API 令牌。会打开一个带遮罩的输入框；该值直接进入编排器的 0600 存储（~/.comfyui-mcp）—— 绝不会写入 ComfyUI 设置、日志、聊天记录或智能体上下文。只需要桥接即可（请先点击“连接” —— 无需任何服务商已就绪）。"
+  }
+}

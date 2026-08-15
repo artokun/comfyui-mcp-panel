@@ -9,13 +9,13 @@ Two routes, same register() pattern as py/civitai_proxy.py:
     containment- and existence-checked.
 
 - GET /comfyui_mcp_panel/training/file?path=...
-    train_status reports sample images as ABSOLUTE paths under the training
+    train_start action:"status" reports sample images as ABSOLUTE paths under the training
     root (~/.comfyui-mcp/training/) — unreadable by the browser. This serves
     them back over the ComfyUI origin, restricted to that root.
 
 - GET /comfyui_mcp_panel/training/list-outputs?limit=..&pattern=..
     Structured (JSON) recent-output listing for the wizard's image picker — the
-    MCP list_output_images tool returns markdown for LLMs; the grid needs data.
+    MCP get_image action:"list_outputs" returns markdown for LLMs; the grid needs data.
 """
 
 import asyncio

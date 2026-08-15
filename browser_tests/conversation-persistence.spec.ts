@@ -8,6 +8,7 @@ import { PanelPage } from './fixtures/PanelPage'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
 import { routeWorktreeSource } from './fixtures/worktreeSource'
 
+
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
 const LOCAL_HISTORY_SNAPSHOT_KEY = 'comfyui-mcp.panel.historySnapshot'
@@ -19,13 +20,14 @@ test.beforeEach(async ({ context }) => {
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
   return page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const request = indexedDB.open('comfyui-mcp-panel-history')
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
     try {
       return await new Promise<number>((resolve, reject) => {
-        const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
+        if (!db.objectStoreNames.contains('snapshots')) { resolve(0); return }
+      const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
         request.onsuccess = () => resolve(Array.isArray(request.result?.threads) ? request.result.threads.length : 0)
         request.onerror = () => reject(request.error)
       })
@@ -38,13 +40,14 @@ async function indexedThreadCount(page: import('@playwright/test').Page): Promis
 async function indexedHasText(page: import('@playwright/test').Page, text: string): Promise<boolean> {
   return page.evaluate(async (needle) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const request = indexedDB.open('comfyui-mcp-panel-history')
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
     try {
       return await new Promise<boolean>((resolve, reject) => {
-        const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
+        if (!db.objectStoreNames.contains('snapshots')) { resolve(false); return }
+      const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
         request.onsuccess = () => resolve(Boolean(request.result?.threads?.some(
           (thread: any) => thread.msgs?.some((message: any) => message.text === needle)
         )))
@@ -62,13 +65,14 @@ async function indexedHasThread(
 ): Promise<boolean> {
   return page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const request = indexedDB.open('comfyui-mcp-panel-history')
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
     try {
       return await new Promise<boolean>((resolve, reject) => {
-        const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
+        if (!db.objectStoreNames.contains('snapshots')) { resolve(false); return }
+      const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
         request.onsuccess = () => resolve(Boolean(
           request.result?.threads?.some((thread: any) => thread.id === id)
         ))
@@ -86,13 +90,14 @@ async function indexedWorkflowAlias(
 ): Promise<string | null> {
   return page.evaluate(async (path) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const request = indexedDB.open('comfyui-mcp-panel-history')
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
     try {
       return await new Promise<string | null>((resolve, reject) => {
-        const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
+        if (!db.objectStoreNames.contains('snapshots')) { resolve(null); return }
+      const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
         request.onsuccess = () => resolve(request.result?.meta?.workflowAliases?.[path] || null)
         request.onerror = () => reject(request.error)
       })
@@ -155,7 +160,7 @@ async function seedReloadEvictionRace(
     localStorage.setItem('comfyui-mcp.panel.historyMeta', JSON.stringify(local.meta))
 
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const request = indexedDB.open('comfyui-mcp-panel-history')
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
@@ -618,7 +623,7 @@ test('workflow rename publishes alias tombstones and a stale tab cannot echo the
     }
     localStorage.setItem(snapshotKey, JSON.stringify(snapshot))
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      const request = indexedDB.open('comfyui-mcp-panel-history')
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
