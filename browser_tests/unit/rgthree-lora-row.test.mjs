@@ -477,6 +477,28 @@ test("#757 remove() never throws, whatever the node does", () => {
   assert.doesNotThrow(() => made.remove(), "an undo on an error path must not replace the refusal");
 });
 
+test("#757 the mismatch refusal CONFIRMS the rewind instead of assuming it", () => {
+  // ROUND-5 P2. `restoreRowCounter` reports whether it ran an assignment, not whether the
+  // assignment took. A counter that accepts `++` but silently ignores writes back — a
+  // getter-only property, a clamping pack, a proxy — made it return true while the number
+  // stayed spent, and the refusal then printed the remedy that only works if it came back:
+  // "Set lora_2 instead", when lora_2 is already gone too.
+  const n = loader({ nextRow: 1 });
+  let frozen = 0;
+  Object.defineProperty(n, "loraWidgetsCounter", {
+    get: () => frozen,
+    set: (v) => {
+      if (v > frozen) frozen = v; // accepts the mint, ignores the rewind
+    },
+    configurable: true,
+  });
+  assert.throws(
+    () => createRgthreeLoraRow(n, "lora_9", {}),
+    /could not be rewound, so "lora_1" is now used up/,
+    "an unrewound counter must not be advertised as rewound",
+  );
+});
+
 test("#757 remove() reports a rollback it completed as clean", () => {
   // The other side of the rule below — the honest "nothing is left over" must stay reachable,
   // or every refused write would start carrying a scary sentence it has not earned.
@@ -551,7 +573,7 @@ test("#757 NO AWAIT separates the creation from the write", () => {
   const body = SET_WIDGET_LIB_SRC.slice(start, end);
   assert.match(body, /prepareWriteTarget\(\)/, "the creation hook is invoked here");
   assert.match(body, /applyWidgetWrite\(/, "…and the write immediately follows it");
-  assert.match(body, /prepared\?\.undo\?\.\(\)/, "…and the undo is in the same stretch");
+  assert.match(body, /prepared\.undo\?\.\(\)/, "…and the undo is in the same stretch");
   // Comments in this block DISCUSS the await that used to be here, so judge the code only.
   const code = body.replace(/^\s*\/\/.*$/gm, "");
   assert.ok(!/\bawait\b/.test(code), `no await may appear between them:\n${code}`);
@@ -743,6 +765,46 @@ function historyProbe(node) {
   return probe;
 }
 
+test("#757 boundary: a value the CAPTURE rewrites is caught, exactly as on an existing row", async () => {
+  // ROUND-5 P1, and the rule the creating path now rests on: creation must report whatever an
+  // ordinary write reports for the same value.
+  //
+  // applyWidgetWrite verifies AFTER its own afterChange fires, deliberately, because that is
+  // when ComfyUI serializes the graph for the undo capture — and serialization runs each
+  // node's own `serializeValue`. An rgthree loader in Separate Model & Clip mode rewrites
+  // `strengthTwo: null` to 1 right there. Wrapping applyWidgetWrite in an OUTER envelope
+  // stops its close from reaching zero, so the capture (and that rewrite) happens after the
+  // last verification and the drift is never seen — the creating path reported plain success
+  // where an existing-row write reported a normalization.
+  //
+  // The probe mutates at DEPTH ZERO only, which is exactly where a capture happens.
+  const node = { id: 7, type: "KSampler", widgets: [] };
+  const target = { name: "made", type: "text", value: "" };
+  const probe = historyProbe(node);
+  const capturing = {
+    beforeChange: probe.beforeChange,
+    afterChange: () => {
+      probe.afterChange();
+      // The serialize step the capture performs, rewriting the value behind our back.
+      if (probe.depth === 0) target.value = "rewritten-by-serializeValue";
+    },
+  };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "hello", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        ...capturing,
+        prepareWriteTarget: () => {
+          node.widgets.push(target);
+          return { undo: () => { node.widgets = node.widgets.filter((w) => w !== target); } };
+        },
+      }),
+    /did not retain the requested value/,
+    "a rewrite during the capture must be caught on the creating path too, not silently accepted",
+  );
+});
+
 test("#757 boundary: a POST-ASSIGNMENT refusal captures no history with the row still in it", async () => {
   // ROUND-4 P2. applyWidgetWrite closes its own envelope BEFORE the #240 read-back verifies,
   // and rolls a bad value back in an envelope of its own — so a value the widget's setter
@@ -779,8 +841,74 @@ test("#757 boundary: a POST-ASSIGNMENT refusal captures no history with the row 
   );
   assert.equal(undone, 1, "the refusal rolled the preparation back");
   assert.equal(probe.depth, 0, "every envelope opened is closed — an unclosed one wedges the tracker");
-  assert.equal(probe.captures.length, 1, "exactly one capture, at the outermost close");
-  assert.deepEqual(probe.captures[0], [], "…and it holds the graph AFTER the cleanup, not the refused row");
+  // The NEWEST snapshot is what a Ctrl+Z steps back from, and it must describe the graph that
+  // actually exists. Earlier the cleanup ran with nothing open, so the newest snapshot still
+  // held the refused row.
+  assert.deepEqual(
+    probe.captures.at(-1),
+    [],
+    "the newest capture is the graph AFTER the cleanup, not a row-present snapshot of a refused command",
+  );
+  // NOT asserted: that this is the ONLY capture. applyWidgetWrite captures its write and then
+  // captures its rollback in a second envelope, so an ORDINARY refused write already leaves
+  // intermediate snapshots too. Demanding fewer here is what produced the round-5 P1: the only
+  // way to suppress them is to hold one envelope across the verification, which moves the
+  // capture — and every pack serializeValue it runs — past the last check.
+  assert.ok(probe.captures.length >= 1, "the write path keeps the captures it has always taken");
+});
+
+test("#757 boundary: a throwing history OPEN still gets the row back out", async () => {
+  // ROUND-5 P2. The cleanup's envelope is opened by the graph's own hook, and a pack or
+  // extension can make that throw. If it escapes, the cleanup never runs: the row AND the row
+  // name it spent are left behind while the caller is handed an error — mutate-then-refuse,
+  // caused by the bookkeeping rather than by the write.
+  const { node, seen, prepareWriteTarget } = boundaryFixture({
+    name: "made",
+    type: "combo",
+    options: { values: ["a"] },
+    value: "a",
+  });
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "nope", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        prepareWriteTarget,
+        beforeChange: () => {
+          throw new Error("onBeforeChange blew up");
+        },
+        afterChange: () => {},
+      }),
+    /panel_set_widget refused "made"/,
+    "the caller still hears why the WRITE was refused",
+  );
+  assert.equal(seen.undone, 1, "the cleanup ran anyway");
+  assert.deepEqual(node.widgets, [], "and the node is as it was found");
+});
+
+test("#757 boundary: a throwing history CLOSE does not replace the refusal", async () => {
+  const { node, seen, prepareWriteTarget } = boundaryFixture({
+    name: "made",
+    type: "combo",
+    options: { values: ["a"] },
+    value: "a",
+  });
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "nope", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        prepareWriteTarget,
+        beforeChange: () => {},
+        afterChange: () => {
+          throw new Error("onAfterChange blew up");
+        },
+      }),
+    /panel_set_widget refused "made"/,
+    "a failed history hook must never become the reason the caller is given",
+  );
+  assert.equal(seen.undone, 1);
+  assert.deepEqual(node.widgets, []);
 });
 
 test("#757 boundary: a SUCCESSFUL creating write is still one capture, with the row in it", async () => {

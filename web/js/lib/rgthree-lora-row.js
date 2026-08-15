@@ -355,8 +355,15 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     // would point the next mint at a duplicate. `removeCreatedRow` is best-effort, so ask
     // the node rather than assuming the call worked.
     const rowIsGone = !created || !(node.widgets ?? []).includes(created);
-    const rewound = rowIsGone && restoreRowCounter(node, counterBefore);
+    if (rowIsGone) restoreRowCounter(node, counterBefore);
     if (rowIsGone) restoreNodeSize(node, sizeBefore);
+    // ASK THE NODE, do not trust the attempt. `restoreRowCounter` reports whether it ran an
+    // assignment, not whether the assignment TOOK: a counter that accepts `++` but silently
+    // ignores writes back — a getter-only property, a pack that clamps, a proxy — returns
+    // true from it while the number stays spent. The remedy below is only truthful if the
+    // counter now READS BACK at the value this call started from, which is the same rule the
+    // two refusal branches above and `remove()` below all use.
+    const rewound = rowIsGone && counterBefore !== null && readRowCounter(node) === counterBefore;
     const real = appended.join(", ");
     // The remedy is only truthful if the counter went back. When it did not — an older pack
     // with no readable counter, or one that refuses the write — `real` is the name this
