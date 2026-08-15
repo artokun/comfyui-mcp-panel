@@ -500,20 +500,6 @@ test("#1095 codex R4: a frame built for a retired connection is never sent on it
   assert.deepEqual(order, [], "a frame built for a dead connection must never reach the live socket");
 });
 
-test("#1095 codex R4: a retired entry cannot ride out on the replacement's advertisement", () => {
-  // The generation check and the batch clear are not the same guard, and mutation testing is
-  // what showed it. They diverge when an entry from the OLD connection is still in the queue
-  // while the replacement advertises — which is what happens if anything ever queues without
-  // going through cancel's clear. Pinned directly so the fence is not merely redundant.
-  const order = [];
-  const gate = manualGate(() => Promise.resolve(true));
-  gate.holdForRoute(() => order.push("old"), "tmp:B");
-  gate.cancel();
-  gate.holdForRoute(() => order.push("new"), "tmp:B");
-  gate.noteAdvertised("tmp:B");
-  assert.deepEqual(order, ["new"], "only the live connection's frame goes out");
-});
-
 test("#1095 codex R4: the queue is usable again after the connection was replaced", () => {
   const order = [];
   const gate = manualGate(() => Promise.resolve(true));

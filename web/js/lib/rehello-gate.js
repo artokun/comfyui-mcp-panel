@@ -204,16 +204,23 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   // Frames that must not leave before the route has been re-advertised (see `routeIsStale`).
   // FIFO, and drained as one batch, because frames on a socket are ordered and holding some
   // while letting others past would reorder a conversation.
-  // Each entry is { send, route, bornAt } — see `holdForRoute` for why a bare callback was
-  // not enough: a frame must carry the route it was composed for, or a later advertisement
-  // for a DIFFERENT workflow delivers it to that one.
+  // Each entry is { send, route } — see `holdForRoute` for why a bare callback was not
+  // enough: a frame must carry the route it was composed for, or a later advertisement for
+  // a DIFFERENT workflow delivers it to that one.
+  //
+  // NO GENERATION STAMP, and that is a deliberate removal rather than an omission. An
+  // earlier cut carried one, because the drain was SCHEDULED on the advertisement's promise
+  // and could therefore outlive a `cancel()` that had already cleared the queue. The drain
+  // is now synchronous — `noteAdvertised` is called from the hello's landed path and reads
+  // the queue there and then — so `cancel()` clearing it synchronously is total: no callback
+  // survives to see a batch that is not its own. Mutation testing is what settled this:
+  // deleting the generation check failed no test, and the reason was that it had become
+  // unreachable, not that it was untested. An unreachable guard implying a protection nobody
+  // exercises is the same defect as a test asserting a property it cannot observe.
+  //
+  // IF THE DRAIN EVER BECOMES ASYNCHRONOUS AGAIN, the stamp has to come back with it.
   const held = [];
   let holdTimer = null;
-  // Which CONNECTION the state above belongs to. Bumped by `cancel()`, so anything already
-  // scheduled against the retired connection — a queued drain in particular — can tell that
-  // it no longer speaks for the live one. Same generation-scoping rule as the mark ids, one
-  // layer out: an async callback that outlives its connection must be able to say so.
-  let generation = 0;
 
   function disarmTimer() {
     if (timer === null) return;
@@ -391,7 +398,6 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       // the frame was built for a route that no longer exists, and the caller's delivery
       // timeout surfaces it. Clearing `held` also unwedges the queue — otherwise a stale
       // promise that never settles leaves every later frame stuck behind `held.length > 1`.
-      generation++;
       held.length = 0;
       if (holdTimer !== null) {
         try {
@@ -473,9 +479,7 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
      */
     holdForRoute(send, route) {
       if (typeof send !== "function") return false;
-      // GENERATION-FENCED, the same lesson as the marks one layer out: an entry must be able
-      // to say which CONNECTION it belongs to, so a cancel can retire it.
-      held.push({ send, route, bornAt: generation });
+      held.push({ send, route });
       // Bounded, so a route that is never advertised (the user switched away and never came
       // back, the poll is not running) cannot hold a frame forever. The bound is the human
       // budget because that is already the longest a legitimate advertisement can be
@@ -518,11 +522,10 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       }
       const batch = held.splice(0, held.length);
       for (const entry of batch) {
-        // A frame from a retired connection, or composed for a workflow the panel has since
-        // moved past, has no correct destination. Dropped, deliberately and silently at this
-        // layer — the caller that was told `true` learns about it through its own delivery
-        // timeout, which is the mechanism that already exists for "it never got there".
-        if (entry.bornAt !== generation) continue;
+        // A frame composed for a workflow the panel has since moved past has no correct
+        // destination. Dropped, deliberately and silently at this layer — the caller that was
+        // told `true` learns about it through its own delivery timeout, which is the
+        // mechanism that already exists for "it never got there".
         if (entry.route !== route) continue;
         try {
           entry.send();
