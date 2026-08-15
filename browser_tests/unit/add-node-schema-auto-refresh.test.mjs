@@ -73,6 +73,7 @@ import {
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
   WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+  addNodeCommandBudgetDeps,
   monotonicNow,
 } from "./_panel-constants.mjs";
 
@@ -231,6 +232,9 @@ function realGraphAddNode(comfy, overrides = {}) {
     monotonicNow,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     withTimeout,
+    // #1192 — the command budget's module bindings, shared across the three harnesses that
+    // rebuild this executor so a new binding is added in ONE place.
+    ...addNodeCommandBudgetDeps(),
     ...overrides,
   };
 

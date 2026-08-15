@@ -4,7 +4,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeRefreshCoalescer } from "../../web/js/lib/refresh-coalesce.js";
+import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+// #1192 — the REAL bounding primitive, so `opts.joinMs` is exercised rather than stubbed.
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
 // A tiny deferred so a test can hold a refresh "in flight" until it chooses.
 function deferred() {
@@ -15,7 +17,7 @@ function deferred() {
 
 // Build a coalescer over a module-like single slot, recording every payload that
 // runRegister actually registered.
-function makeHarness(runImpl) {
+function makeHarness(runImpl, { wireTimeout = true } = {}) {
   let inFlight = null;
   const registered = [];
   const coalescer = makeRefreshCoalescer({
@@ -27,6 +29,9 @@ function makeHarness(runImpl) {
       registered.push(defs);
       if (runImpl) await runImpl(defs);
     },
+    // #1192 — wired by default, because the panel wires it. `wireTimeout: false` is how the
+    // "an unwired coalescer waits unbounded" test drives the omission deliberately.
+    ...(wireTimeout ? { withTimeout } : {}),
   });
   return { coalescer, registered, getInFlight: () => inFlight };
 }
@@ -193,6 +198,219 @@ function makeHarnessReturning(verdictImpl) {
       const v = verdictImpl(defs);
       return v && typeof v.then === "function" ? await v : v;
     },
+    withTimeout,
   });
   return { coalescer };
 }
+
+// ── #1192: a caller may bound its own WAIT, and only that ────────────────────
+//
+// Every branch above begins with `await current` — a wait on a run that ALREADY STARTED
+// under someone else's deadline. `graph_add_node` meets that wait on the scenario it is
+// most likely to fail on (a ComfyUI restart, when a reconnect refresh is already running),
+// and a full run costs ~9s of bounded waiting plus ~4s of deliberately-unbounded local
+// work. Unbounded, that single term consumes most of the add's 25s command budget before
+// its own registration has begun, and the reply misses the 30s relay window entirely — so
+// the user gets `did not reply to "graph_add_node"`, which names nothing, instead of the
+// worded refusal every bound on that path exists to produce.
+
+test("#1192: a payload join that outlives joinMs is ABANDONED, not waited out", async () => {
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await gate.promise; // the in-flight reconnect refresh never lands
+  });
+
+  const older = coalescer(); // holds the slot, gated open
+  const NEW_DEFS = { NewNode: {} };
+  const started = Date.now();
+  const outcome = await coalescer(NEW_DEFS, { joinMs: 25 });
+
+  assert.equal(outcome, REFRESH_JOIN_ABANDONED, "the caller stopped waiting and said so");
+  assert.ok(Date.now() - started < 1000, "…at the bound, not when the in-flight run eventually settles");
+  // The load-bearing half: it must NOT have started a competing run. Two concurrent
+  // registerNodesFromDefs passes are the stampede this coordinator exists to prevent, and a
+  // caller that has just given up waiting for one is the last thing that should launch a
+  // second.
+  assert.deepEqual(registered, [undefined], "no second run was started alongside the one still going");
+
+  gate.resolve();
+  await older;
+});
+
+test("#1192: a join that lands INSIDE joinMs still registers the fresh payload (#289 P2 intact)", async () => {
+  // The bound must not become a way to drop payloads on a healthy machine. This is the case
+  // the reported scenario actually hits most of the time — the in-flight run finishes, and
+  // the add's own registration goes ahead exactly as before the bound existed.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await gate.promise;
+  });
+
+  const older = coalescer();
+  const NEW_DEFS = { NewNode: {} };
+  const withPayload = coalescer(NEW_DEFS, { joinMs: 5000 });
+  gate.resolve();
+  await older;
+  await withPayload;
+
+  assert.ok(registered.includes(NEW_DEFS), "the fresh payload was registered, bound or no bound");
+});
+
+test("#1192: an in-flight run that REJECTS is a SETTLED join, not an abandoned one", async () => {
+  // `withTimeout` degrades a rejection through onTimeout exactly as it does a timeout, so
+  // bounding `current` directly would report a run that FAILED as one that never answered —
+  // and this coordinator has always treated a failed in-flight run as settled, with the
+  // caller then running its own. Reifying before bounding is what keeps that true.
+  const gate = deferred();
+  let first = true;
+  const { coalescer, registered } = makeHarness(async () => {
+    if (first) {
+      first = false;
+      await gate.promise;
+      throw new Error("older refresh failed");
+    }
+  });
+
+  const older = coalescer();
+  const NEW_DEFS = { NewNode: {} };
+  const withPayload = coalescer(NEW_DEFS, { joinMs: 5000 });
+  gate.resolve();
+  await older.catch(() => {});
+  const outcome = await withPayload;
+
+  assert.notEqual(outcome, REFRESH_JOIN_ABANDONED, "a rejection is an ANSWER, not a stall");
+  assert.ok(registered.includes(NEW_DEFS), "…so the payload still ran, as it always has");
+});
+
+test("#1192: a joinMs of 0 or less abandons IMMEDIATELY — it never means 'no bound'", async () => {
+  // `withTimeout` reads a non-positive ms as NO BOUND. A budget expressed literally at the
+  // moment it ran out would therefore restore the unbounded wait — the hang arriving through
+  // the mechanism meant to prevent it. #1188 recorded this trap; it is checked here because
+  // graph_add_node computes joinMs by SUBTRACTION and can legitimately reach a negative.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await gate.promise; // never settles
+  });
+
+  const older = coalescer();
+  for (const joinMs of [0, -1, -7500]) {
+    assert.equal(
+      await coalescer({ NewNode: {} }, { joinMs }),
+      REFRESH_JOIN_ABANDONED,
+      `joinMs=${joinMs} must abandon at once, not wait forever`,
+    );
+  }
+  assert.deepEqual(registered, [undefined], "…and must not start a run either");
+
+  gate.resolve();
+  await older;
+});
+
+test("#1192: a coalescer with NO withTimeout wired waits unbounded, exactly as it always did", async () => {
+  // The safe direction for a wiring mistake to fail in: a panel that forgot to inject the
+  // primitive keeps today's behaviour instead of abandoning every join at once, which would
+  // break every add. Safe is not the same as noticed — the panel's CALL SITE is pinned
+  // separately in single-node-def.test.mjs, because this degradation is silent.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(
+    async (defs) => {
+      if (defs == null) await gate.promise;
+    },
+    { wireTimeout: false },
+  );
+
+  const older = coalescer();
+  const NEW_DEFS = { NewNode: {} };
+  const withPayload = coalescer(NEW_DEFS, { joinMs: 10 });
+
+  // Give the bound every chance to fire if it were armed.
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(registered, [undefined], "still waiting on the in-flight run — no bound was applied");
+
+  gate.resolve();
+  await older;
+  assert.notEqual(await withPayload, REFRESH_JOIN_ABANDONED, "an unwired join is a plain, unbounded join");
+  assert.ok(registered.includes(NEW_DEFS));
+});
+
+test("#1192: a non-finite joinMs is treated as NO bound, never as an armed one", async () => {
+  // A caller computing joinMs from an unset budget can produce Infinity or NaN, and both
+  // reach `withTimeout` as "no bound" anyway. Rejecting them at the door keeps that
+  // accidental behaviour from being load-bearing.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await gate.promise;
+  });
+
+  const older = coalescer();
+  const pending = [
+    coalescer({ A: {} }, { joinMs: Number.POSITIVE_INFINITY }),
+    coalescer({ B: {} }, { joinMs: Number.NaN }),
+  ];
+  await new Promise((r) => setTimeout(r, 40));
+  assert.deepEqual(registered, [undefined], "both are still waiting on the in-flight run");
+
+  gate.resolve();
+  await older;
+  for (const p of pending) assert.notEqual(await p, REFRESH_JOIN_ABANDONED);
+});
+
+test("#1192: a plain (payload-less) join can be bounded too, and reports it", async () => {
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async () => {
+    await gate.promise;
+  });
+
+  const older = coalescer();
+  assert.equal(await coalescer(undefined, { joinMs: 25 }), REFRESH_JOIN_ABANDONED);
+  assert.equal(registered.length, 1, "a bounded plain join still starts nothing of its own");
+
+  gate.resolve();
+  await older;
+});
+
+test("#1192: a bounded FORCED caller stops waiting but does not cancel #396's trailing run", async () => {
+  // The trailing run is a guarantee made to every forced caller, not to this one. A caller
+  // that gives up must not take it away from the others — so the run stays queued and still
+  // executes, and only this caller's wait ends.
+  const gate = deferred();
+  const registered = [];
+  let inFlight = null;
+  const coalescer = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (p) => {
+      inFlight = p;
+    },
+    runRegister: async (defs) => {
+      registered.push(defs);
+      if (registered.length === 1) await gate.promise; // hold ONLY the first run
+    },
+    withTimeout,
+  });
+
+  const held = coalescer(); // in flight, gated
+  const patient = coalescer(undefined, { force: true }); // no bound
+  assert.equal(await coalescer(undefined, { force: true, joinMs: 25 }), REFRESH_JOIN_ABANDONED);
+
+  gate.resolve();
+  await Promise.all([held, patient]);
+  assert.equal(registered.length, 2, "the trailing run still ran for the caller that kept waiting");
+});
+
+test("#1192: a bounded FORCED join that lands still forwards the trailing run's verdict (#608)", async () => {
+  // #608 reads the freshness verdict off a forced refresh. Bounding the WAIT must not turn a
+  // real verdict into a fabricated one — only an abandonment is new.
+  const gate = deferred();
+  let verdict = false;
+  const { coalescer } = makeHarnessReturning(async (defs) => {
+    if (defs == null) await gate.promise;
+    return verdict;
+  });
+
+  const inflight = coalescer();
+  const forced = coalescer(undefined, { force: true, joinMs: 5000 });
+  verdict = true;
+  gate.resolve();
+  await inflight;
+  assert.equal(await forced, true, "the trailing run's own verdict, not a stand-in");
+});

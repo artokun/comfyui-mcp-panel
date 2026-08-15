@@ -225,7 +225,7 @@ import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
-import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
+import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
 import {
   describeNodeDefRefresh,
   describeRefreshGraphLoss,
@@ -237,6 +237,11 @@ import {
   missingInventoryIds,
   nodeInventoryLabel,
 } from "./lib/graph-node-inventory.js";
+// #1192 — ONE deadline for a whole COMMAND, which every bounded step inside it draws from.
+// A module because the defect is a COMPOSITION property: each of graph_add_node's bounds
+// was individually correct and their sum was not, and a sum cannot be asserted against the
+// 1.7MB panel IIFE.
+import { makeCommandBudget } from "./lib/command-budget.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
@@ -1157,8 +1162,14 @@ const OBJECT_INFO_SEED_WAIT_MS = 8000;
 // must not start a replacement seed. If the baseline has not landed the history reports
 // PENDING and the guards refuse this ONE call with "retry in a moment"; the seed keeps
 // running and a late response still seeds, so the next call succeeds with no tab reload.
-const awaitObjectInfoHistorySeed = () =>
-  awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, OBJECT_INFO_SEED_WAIT_MS);
+//
+// #1192 — the wait is CAPPED by the caller when the caller has a command budget. 8000ms is
+// a patience limit sized on its own; on the add path it is the FIRST of five serialized
+// bounds, and a command that spends a third of its window before it has even asked what the
+// backend provides has already lost. A caller passing less gets less; passing nothing keeps
+// the standalone limit exactly as it was.
+const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
+  awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
 async function registerComfyNodeDefs(preloadedDefs) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once the
@@ -1674,6 +1685,13 @@ const refreshComfyNodeDefs = makeRefreshCoalescer({
     nodeDefRefreshInFlight = p;
   },
   runRegister: registerComfyNodeDefs,
+  // #1192 — the repo's ONE bounding primitive, injected so a caller can bound its own WAIT
+  // on a run someone else started (`opts.joinMs`). Without it the coalescer waits
+  // unbounded, exactly as it always did — the safe direction for a wiring mistake to fail
+  // in, since the alternative would abandon every join on a panel that forgot this line.
+  // Safe is not the same as noticed, though: dropping it silently restores #1192, so the
+  // CALL SITE is pinned by a test, not just the helper's behaviour.
+  withTimeout,
 });
 
 // #396: download ids already counted as done, so each COMPLETED model download
@@ -9840,6 +9858,81 @@ const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
 /**
+ * #1192 — ONE budget for the WHOLE `graph_add_node` command.
+ *
+ * PER-STEP BOUNDS DO NOT COMPOSE. #1180 learned that for the phases of one refresh RUN and
+ * fixed it there; this is the same defect one level up, and #1180's own PR filed it rather
+ * than pretending otherwise. Serialized on a single add, the steps cost:
+ *
+ *     awaitObjectInfoHistorySeed                              8,000 ms
+ *     the /object_info read (fast path, then the whole-schema
+ *       fallback a timed-out fast path falls through to)     10,000 ms + 10,000 ms
+ *     refresh(freshDefs) → the coalescer's join on a run
+ *       someone else started                                  9,000 ms + unbounded local
+ *     …then that call's OWN run                               9,000 ms + unbounded local
+ *     awaitRequiredCustomWidgetRegistration                    5,000 ms
+ *
+ * The two /object_info terms are alternatives to the refresh terms — a type already
+ * registered takes the fast path and never refreshes — so the worst SINGLE path is about
+ * 41,000 ms, not the sum of all of them. #1192's table says 33,000 ms because it omits the
+ * seed wait; either figure is past the relay window, which is the point.
+ *
+ * MEASURED, not assumed: `panel_add_node` relays `graph_add_node` with an explicit
+ * 30,000 ms reply timeout (comfyui-mcp `panel-tools.ts`, `OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS`
+ * at the `panel_add_node` call site) — NOT the 20,000 ms ui-bridge read default, which
+ * applies to neither this command nor `refresh_nodes` nor `graph_set_widget`, all three of
+ * which are relayed at 30,000 ms. Past that window the reply the bounds exist to produce
+ * never leaves the tab and the user gets `did not reply to "graph_add_node" within 30000 ms`,
+ * which names nothing and is not actionable.
+ *
+ * 25,000 ms, mirroring NODES_INSTALL_COMMAND_BUDGET_MS against the same 30,000 ms window
+ * for the same reason: 5,000 ms of slack for composing the reply, serialising it, and the
+ * websocket hop. Not derived from the relay constant, because that constant lives in the
+ * OTHER repo and a mirrored copy here would be a number this repo could not keep true.
+ *
+ * WHAT IT DOES NOT DO, stated so this is not read as a wall-clock guarantee. Two calls on
+ * this path are deliberately unbounded — `registerNodesFromDefs` (3,972 ms measured) and
+ * `reapplyDefsToLiveNodes` — and no budget can interrupt them. What the budget does is
+ * CHARGE them: the clock keeps running across them, so every later step gets less and the
+ * command still lands inside the window. See lib/command-budget.js for why that is the
+ * opposite of NODE_DEFS_RUN_BUDGET_MS's deliberate clock-stop.
+ */
+const ADD_NODE_COMMAND_BUDGET_MS = 25000;
+
+/**
+ * #1192 — what an add still has to do AFTER the node-def refresh, held back so the join
+ * cannot spend it.
+ *
+ * The coalescer's `await current` is the term that cannot be shrunk from here: it is a wait
+ * on a run that ALREADY STARTED under its own deadline. Given the whole remainder it can
+ * legitimately consume ~13,000 ms (a run's 9,000 ms of bounded waiting plus its unbounded
+ * local work) and then leave the widget-registration wait a few milliseconds — at which
+ * point the add refuses for the wrong reason, naming a widget that was never given time to
+ * appear instead of the refresh that ate the command.
+ *
+ * DERIVED from the step it protects, not picked, so the two cannot drift apart.
+ */
+const ADD_NODE_POST_REFRESH_RESERVE_MS = CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+
+/**
+ * #1192 — the refusal for an add whose budget went on a refresh SOMEONE ELSE started.
+ *
+ * RECOVERABLE BY CONSTRUCTION, and worded to say so. The in-flight run was not cancelled
+ * (nothing here can cancel it) and it is registering the very definitions this add needs, so
+ * the retry this text asks for is not a hope — it is the normal outcome once that run lands.
+ * That is what makes dropping the fresh payload acceptable: #289 P2 forbids dropping a
+ * payload while claiming success, not dropping one while refusing.
+ */
+const addNodeRefreshBusyMessage = (classType) =>
+  `Cannot add "${classType}" right now: a node-def refresh started by something else — a ` +
+  "ComfyUI reconnect, a finished install, or another tool call — was still running, and " +
+  `waiting for it would have used up this command's ${Math.round(ADD_NODE_COMMAND_BUDGET_MS / 1000)}s ` +
+  "budget before the node could be registered. NOTHING WAS ADDED and nothing was changed. " +
+  "That refresh is still running and is registering exactly the definitions this add needs, " +
+  "so RETRY in a few seconds — this normally succeeds on the next attempt. If it keeps " +
+  "happening, call panel_refresh_nodes once and wait for it to report, then retry the add.";
+
+/**
  * #1180 — the widen runs INSIDE the registration wait above, so its bound has to fit
  * there. The generic 10s node-defs bound is TWICE this function's whole 5s deadline: a
  * timed-out widen would consume the entire wait and leave the poll loop nothing, so the
@@ -9877,8 +9970,29 @@ const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
  * issue — the refusal is worded and clears on a retry, where the hang it replaced was
  * neither. What it is NOT is headroom, and the number to revisit when the add path's total
  * has room is this one.
+ *
+ * #1192 — the divisor is now NAMED and the widen's bound is computed from the deadline this
+ * wait is ACTUALLY running under, not from the standalone constant. Under a command budget
+ * the effective deadline can be a fraction of the 5000ms below, and a widen still taking
+ * 2500ms of a 400ms wait is this issue's own defect reproduced one level down: a bound
+ * sized against a number its caller no longer has.
  */
-const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 2);
+const WIDEN_SOCKET_PROOF_DIVISOR = 2;
+const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(
+  CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / WIDEN_SOCKET_PROOF_DIVISOR,
+);
+
+/** The widen's share of whatever deadline the registration wait actually got (#1192). */
+function widenSocketProofBudget(deadlineMs) {
+  const whole =
+    Number.isFinite(deadlineMs) && deadlineMs > 0
+      ? deadlineMs
+      : CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  // A 1ms floor, never 0: `withTimeout` reads a non-positive ms as NO BOUND, so a
+  // fully-spent budget expressed literally would hand the widen an unbounded whole-schema
+  // fetch inside a wait that has already run out.
+  return Math.max(1, Math.floor(whole / WIDEN_SOCKET_PROOF_DIVISOR));
+}
 
 async function awaitRequiredCustomWidgetRegistration(
   nodeData,
@@ -9888,6 +10002,7 @@ async function awaitRequiredCustomWidgetRegistration(
   classType,
   widenSocketProof,
   liveNodeOfClass,
+  budgetMs,
 ) {
   // MONOTONIC, like every other elapsed-time measurement in this panel. On the wall clock
   // an NTP correction, a DST change or a VM resume between these two reads either ends the
@@ -9895,7 +10010,17 @@ async function awaitRequiredCustomWidgetRegistration(
   // extends it far past the command budget. This deadline gates #580's protection, so it
   // is the wrong one to measure on a clock that can move.
   const startedAt = monotonicNow();
-  const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  // #1192 — the SMALLER of #580's own deadline and what the command has left. This wait is
+  // the LAST of graph_add_node's serialized bounds, so it is the one that reaches the relay
+  // window already late; taking its full 5000ms there converts a worded refusal into a bare
+  // `did not reply`. A caller with no budget passes nothing and keeps #580's deadline
+  // exactly. Never non-positive: a zero deadline would make `monotonicNow() < deadline`
+  // false on entry and report widgets unmaterialized without ever having polled.
+  const wait =
+    Number.isFinite(budgetMs) && budgetMs > 0
+      ? Math.max(1, Math.min(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS, budgetMs))
+      : CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  const deadline = startedAt + wait;
   let socketTypes = knownSocketTypes;
   const check = () =>
     unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, socketTypes, currentDef);
@@ -9910,7 +10035,9 @@ async function awaitRequiredCustomWidgetRegistration(
   if (unavailable.length && typeof widenSocketProof === "function") {
     let widened = null;
     try {
-      widened = await widenSocketProof();
+      // #1192 — the widen's bound is derived from THIS wait's effective deadline, which
+      // under a command budget is not the standalone constant.
+      widened = await widenSocketProof(widenSocketProofBudget(wait));
     } catch {
       widened = null;
     }
@@ -9953,8 +10080,24 @@ async function awaitRequiredCustomWidgetRegistration(
   // waived by the check rather than waited out — and whatever is left after the wait gets
   // a message that says which input is stuck and which of the two causes it is, instead of
   // asserting the single cause that sent #695's reporter to the wrong place.
+  //
+  // #1192 — and when the COMMAND BUDGET is what ended the wait, say so, because the message
+  // below otherwise sends the caller to the wrong recovery. It says to reload the tab and
+  // that "retrying alone will not fix it" — advice that is right for an extension which
+  // failed to load and exactly wrong for a wait that was cut short by a command already
+  // running late, where a retry gets the full window and very likely succeeds. Same class
+  // of defect as #663 and #852: a refusal naming a remedy that cannot work.
+  const cutShort = wait < CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   throw new Error(
-    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt),
+    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt) +
+      (cutShort
+        ? `\nNOTE: this wait was cut short — it got ${(wait / 1000).toFixed(1)}s of its normal ` +
+          `${(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 1000).toFixed(1)}s because THIS COMMAND had ` +
+          "already spent most of its time budget on earlier steps (a node-def refresh, or an " +
+          "/object_info fetch, that was slow or still running). So the widget may simply not have " +
+          "been given long enough to appear. RETRY FIRST — a retry starts with a full budget — and " +
+          "only treat the advice above as the diagnosis if it fails again with the full wait."
+        : ""),
   );
 }
 
@@ -11530,6 +11673,13 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
+    // #1192 — ONE deadline for the whole command, taken before the first step. Every
+    // bounded wait below asks it for a bound instead of naming its own constant, so the
+    // command's cost is this budget rather than the sum of five numbers that each looked
+    // reasonable alone. A step squeezed by it fails fast and truthfully, and the refusals
+    // below say WHICH step ran out — the property the whole issue is about, since the
+    // alternative was a bare "tab did not reply" that names nothing.
+    const budget = makeCommandBudget(ADD_NODE_COMMAND_BUDGET_MS, monotonicNow);
     // Resolve BEFORE creating so an unresolved type can never be added as a
     // fabricated placeholder (#458). The go/no-go is decided against the CURRENT
     // backend /object_info (fetched fresh) — NOT the LiteGraph registry, which
@@ -11546,7 +11696,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // write/add decide "never seen". If it has not landed the history reports PENDING and
     // this ONE call is refused with a retry-in-a-moment message — a late response still
     // seeds, so the next call succeeds without a reload.
-    await awaitObjectInfoHistorySeed();
+    // #1192 — capped by the command budget. Standalone this waits 8000ms, which is a third
+    // of the whole command spent before the backend has even been asked what it provides.
+    await awaitObjectInfoHistorySeed(budget.bounded(OBJECT_INFO_SEED_WAIT_MS));
     // Captured from the SAME fresh /object_info the resolvability assert just
     // fetched. The widget guards below scan THIS def — the backend's current
     // truth — not the possibly-stale registered nodeData: frontend-injected
@@ -11579,7 +11731,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // and the snapshot (already cleared by the reconnect) would stay empty, refusing the very
     // next render-time widget edit. The epoch has to be read where the request goes out.
     let addNodeObservedAtEpoch = null;
-    await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
+    // #1192 — set when this add stopped WAITING for a node-def refresh someone else had
+    // already started, because waiting longer would have spent the command's whole budget.
+    // A FLAG, not a parsed message: `assertAddNodeResolvableRefreshing` swallows a refresh
+    // throw by design (its post-refresh registry re-check is what decides go/no-go), so the
+    // reason never reaches the resolver's own wording, and matching on that wording to
+    // recover it would be exactly the prose-parsing this repo refuses to authorize on.
+    let refreshJoinAbandoned = false;
+    // A thunk rather than a bare `await`, so the call below can sit inside a try/catch
+    // without re-indenting seventy lines of load-bearing comments in this file.
+    const resolveAddNode = () =>
+      assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () => {
         // #767 — ask about ONE type instead of re-downloading the whole schema.
         // Measured on a 63-pack install: /object_info is 5,413,770 bytes / 167 ms,
@@ -11607,9 +11769,13 @@ const GRAPH_TOOL_EXECUTORS = {
           // response and its body, so the whole call is wrapped rather than the request
           // alone. A timeout resolves null, which is the same answer it already gives for
           // every other doubt and which sends the add to the full fetch — no new branch.
+          // #1192 — …and capped by what the COMMAND has left, because it is not the only
+          // bound on this path. On a timeout it falls through to the whole-schema fetch,
+          // so the two are additive: 10s + 10s of a 30s window on the branch that has not
+          // even reached the refresh yet.
           const one = await withTimeout(
             fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route)),
-            NODE_DEFS_FETCH_TIMEOUT_MS,
+            budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS),
             () => null,
           );
           if (one) {
@@ -11627,20 +11793,69 @@ const GRAPH_TOOL_EXECUTORS = {
         // than parking.
         // #1223 — read the epoch HERE, immediately before the whole request is issued.
         addNodeObservedAtEpoch = backendReconnectEpoch;
-        const whole = await boundedGetNodeDefs();
+        // #1192 — the same request `graph_set_widget`'s oracle allows 10,000 ms, allowed
+        // 10,000 ms here too, and BOTH now capped by their caller's remaining budget. The
+        // two paths agreeing about how long one /object_info may take is what stops a
+        // "set_widget works but add_node fails" asymmetry appearing on a slow install.
+        const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
         freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
       },
-      refresh: (defs) => refreshComfyNodeDefs(defs),
+      // #1192 — THE TERM THAT CANNOT BE SHRUNK FROM HERE, bounded at the only thing this
+      // caller owns: its own WAIT.
+      //
+      // `refreshComfyNodeDefs` is the coalescer. With a payload it waits for any in-flight
+      // run and then starts its own, so on the scenario this add is most likely to meet —
+      // a ComfyUI restart, which is exactly when a reconnect-triggered refresh is already
+      // running — it pays a full run (about 9,000 ms of bounded waiting plus unbounded
+      // local work) before its OWN registration begins. That first run started under
+      // someone else's deadline and no number passed from here can shorten it.
+      //
+      // So the wait is capped, and a cap needs a decision for when it fires. Proceeding
+      // would mean adding a node whose class may not be registered — #458's fabricated
+      // placeholder. Blocking is the reported bug. It REFUSES, in words, recoverably: see
+      // `addNodeRefreshBusyMessage`, and `REFRESH_JOIN_ABANDONED` in refresh-coalesce.js
+      // for why the abandoned caller must not start a competing run instead.
+      //
+      // The reserve is held back so the join cannot eat the steps that follow it. Without
+      // it a join finishing at the wire leaves the widget-registration wait milliseconds,
+      // and the add then refuses by naming a widget that was never given time to appear —
+      // a true statement about the wrong cause.
+      refresh: (defs) =>
+        refreshComfyNodeDefs(defs, {
+          joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
+        }).then((outcome) => {
+          if (outcome === REFRESH_JOIN_ABANDONED) refreshJoinAbandoned = true;
+          return outcome;
+        }),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
       // #775 — consulted ONLY when the type is about to be refused, so a healthy
       // add never pays for it. A pack that failed to import looks exactly like a
       // pack that is not installed, and the refusal used to name only the latter.
       readImportFailures: () => readPackImportFailures(api),
-    });
+      });
+    try {
+      await resolveAddNode();
+    } catch (err) {
+      // #1192 — a resolver failure caused by THIS command running out of budget on someone
+      // else's refresh must name that, not the resolver's generic "the node-def refresh
+      // failed — reload the ComfyUI tab". That advice is wrong here in the expensive
+      // direction: the refresh did not fail, it is still running and about to register the
+      // very class being asked for, so a retry works and a tab reload throws away the
+      // user's canvas state for nothing.
+      //
+      // Two STRUCTURED conditions, never the error's text. The flag says this add stopped
+      // waiting; the live registry says the class still is not there. Both are needed —
+      // the in-flight run may well have registered it while we gave up, and in that case
+      // the resolver returned successfully and this branch is not reached at all.
+      if (refreshJoinAbandoned && !isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
+        throw new Error(addNodeRefreshBusyMessage(class_type));
+      }
+      throw err;
+    }
     // #1223 — file the WHOLE map this resolver fetched, when it fetched one.
     //
     // AFTER the resolver, not inside it: when a type needs registering the resolver calls
@@ -11726,7 +11941,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // refuse: same idiom as #775's readImportFailures, so a healthy add still pays nothing
     // and #780's 1,667x saving is kept for every add that does not need it.
     const widenSocketProof = freshDefsAreSingleClass
-      ? async () => {
+      ? async (widenMs) => {
           // #1180 — BOUNDED, and the timeout lands on the SAFE side by construction. This
           // helper already answers null for every doubtful payload, and the caller keeps
           // the proof it holds when it gets null; a call that never answers is the most
@@ -11737,7 +11952,13 @@ const GRAPH_TOOL_EXECUTORS = {
           // below rejects it exactly as it rejects every other non-object payload, and
           // returns null — which is what "keep the proof already in hand" means. Mapping
           // it first was a second spelling of the same decision.
-          const whole = await boundedGetNodeDefs(WIDEN_SOCKET_PROOF_TIMEOUT_MS);
+          // #1192 — the bound comes from the wait this runs INSIDE, which under a command
+          // budget is not the standalone 5000ms constant. `widenSocketProofBudget` supplies
+          // the same fraction of whatever that wait actually got, and falls back to
+          // WIDEN_SOCKET_PROOF_TIMEOUT_MS when a caller passes nothing.
+          const whole = await boundedGetNodeDefs(
+            widenMs > 0 ? widenMs : WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+          );
           // "I did not find out" is not "nothing outputs anything", and the difference
           // matters because the caller REPLACES its proof with whatever comes back.
           // registeredSocketTypes maps a null/empty payload to an EMPTY set, which is
@@ -11775,6 +11996,12 @@ const GRAPH_TOOL_EXECUTORS = {
           return null;
         }
       },
+      // #1192 — the LAST of this command's serialized bounds, and therefore the one most
+      // likely to be running with the window already nearly gone. It takes the smaller of
+      // #580's 5000ms and what the command has left, and says in its refusal when the
+      // budget is what ended it — otherwise the message tells the user to reload the tab
+      // for a widget that was simply never given time to appear.
+      budget.bounded(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS),
     );
     const node = LG.createNode(class_type);
     if (!node) {

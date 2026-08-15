@@ -13,6 +13,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
+import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
   "utf8",
@@ -35,13 +38,26 @@ export const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = readPanelNumber(
   "the registration deadline",
 );
 
+/**
+ * #1192 — the divisor is a NAMED constant now, because the widen's bound is no longer a
+ * fixed number: it is that fraction of whatever deadline the registration wait actually
+ * received, which under a command budget can be far less than the 5000ms standalone one.
+ * Still read from source rather than restated, for the reason above.
+ */
+export const WIDEN_SOCKET_PROOF_DIVISOR = readPanelNumber(
+  /const WIDEN_SOCKET_PROOF_DIVISOR = (\d+);/,
+  "the widen divisor",
+);
+
 /** Derived exactly as the panel derives it, divisor included, so the two cannot drift. */
 export const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math.floor(
-  CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS /
-    readPanelNumber(
-      /WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/,
-      "the widen divisor",
-    ),
+  CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / WIDEN_SOCKET_PROOF_DIVISOR,
+);
+
+/** #1192 — the whole-command deadline `graph_add_node` takes on its first line. */
+export const ADD_NODE_COMMAND_BUDGET_MS = readPanelNumber(
+  /const ADD_NODE_COMMAND_BUDGET_MS = (\d+);/,
+  "the add_node command budget",
 );
 
 export const NODE_DEFS_FETCH_TIMEOUT_MS = readPanelNumber(
@@ -82,4 +98,54 @@ export const monotonicNow = () => performance.now();
 /** What is left of a run's budget, derived the way the panel derives it. */
 export function nodeDefsBudgetLeft(deadline, share = 1) {
   return Math.max(1, Math.floor((deadline - monotonicNow()) * share));
+}
+
+/**
+ * #1192 — the widen's share of whatever deadline the registration wait actually got,
+ * derived the way the panel derives it. Rebuilt harnesses name this in their scope because
+ * `awaitRequiredCustomWidgetRegistration` calls it.
+ */
+export function widenSocketProofBudget(deadlineMs) {
+  const whole =
+    Number.isFinite(deadlineMs) && deadlineMs > 0
+      ? deadlineMs
+      : CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  return Math.max(1, Math.floor(whole / WIDEN_SOCKET_PROOF_DIVISOR));
+}
+
+/** How long a graph tool waits for the startup baseline seed. */
+export const OBJECT_INFO_SEED_WAIT_MS = readPanelNumber(
+  /const OBJECT_INFO_SEED_WAIT_MS = (\d+);/,
+  "the baseline seed wait",
+);
+
+/**
+ * #1192 — every module binding the command budget added to `graph_add_node`, in ONE place.
+ *
+ * Three harnesses rebuild that executor in a synthetic scope, so a new free identifier in
+ * it throws `ReferenceError` in all three at once — which the resolver then catches and
+ * reports as "object_info is unavailable", i.e. a wrong-cause failure in every one of them.
+ * Collected here so the next binding is added once rather than three times, and so no
+ * harness can quietly acquire a stale copy of one.
+ *
+ * The REAL implementations wherever they exist: `makeCommandBudget` and
+ * `REFRESH_JOIN_ABANDONED` are imported, and the numbers are read from the panel source, so
+ * a harness cannot pass against a value the panel no longer holds.
+ */
+export function addNodeCommandBudgetDeps() {
+  return {
+    makeCommandBudget,
+    ADD_NODE_COMMAND_BUDGET_MS,
+    // Derived exactly as the panel derives it.
+    ADD_NODE_POST_REFRESH_RESERVE_MS: CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
+    OBJECT_INFO_SEED_WAIT_MS,
+    REFRESH_JOIN_ABANDONED,
+    widenSocketProofBudget,
+    // A STUB, and labelled as one. These three harnesses are about #821/#1223/#620, none of
+    // which reaches this branch. The shipped wording is pinned in single-node-def.test.mjs
+    // and the behaviour that produces it is exercised in add-node-command-budget.test.mjs;
+    // a hand-copied sentence here would just be a third place for it to drift.
+    addNodeRefreshBusyMessage: (classType) =>
+      `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
+  };
 }
