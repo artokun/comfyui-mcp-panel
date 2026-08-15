@@ -6102,27 +6102,63 @@ function boundedDelay(ms, deadline) {
  *  from it via queueDrained, so a null/malformed status is never a false drain
  *  (codex round 2 #1). `get` defaults to the dialect-routed managerGet; the
  *  install verifier passes a dialect-PINNED getter so a post-#485-fallback verify
- *  reads the SAME routes the install actually landed on (codex P1). */
-async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = managerGet } = {}) {
+ *  reads the SAME routes the install actually landed on (codex P1).
+ *
+ *  #1539 — when `ui_id` is passed, each poll ALSO reads the per-task history
+ *  record for THAT id, and a terminal FAILURE ends the wait immediately. The
+ *  aggregate status cannot express "this task errored" (a failed task still
+ *  counts toward done_count and the queue simply drains), so without this read
+ *  the only failure evidence install ever had was the pack's absence by name —
+ *  which is suppressed for exactly the reporting case (see classifyInstallOutcome
+ *  `renameProne`). Correlated by the ui_id THIS command submitted, so a
+ *  neighbouring task's failure can never be attributed to it.
+ *
+ *  Returns { status, taskFailure } — taskFailure is the Manager's own reason
+ *  string, or null when there is no positive failure record (absent, unreadable
+ *  or not-yet-terminal all stay null, never a verdict). */
+async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = managerGet, ui_id } = {}) {
   const deadline = Date.now() + timeoutMs;
   let status = null;
+  // Cap an individual fetch by whatever budget remains.
+  const perFetch = () => Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
+  // #1539 — OUR task's terminal record. Best-effort in BOTH directions: a
+  // missing route (legacy), a transient error, or an unrecognized shape all
+  // return null, so this can only ever ADD a positive failure verdict — it can
+  // never manufacture one, and never downgrades a success.
+  const readTaskFailure = async () => {
+    if (!ui_id) return null;
+    try {
+      const resp = await get(`manager/queue/history?ui_id=${encodeURIComponent(ui_id)}`, {
+        signal: AbortSignal.timeout(perFetch()),
+      });
+      return taskFailureReason(parseTaskHistoryItem(resp, ui_id));
+    } catch {
+      return null;
+    }
+  };
   // Give the queue a beat to register the task before the first poll, so we
   // don't read a stale is_processing=false from before queue/start.
   await boundedDelay(1000, deadline);
   while (Date.now() < deadline) {
-    // Cap this individual fetch by whatever budget remains.
-    const perFetch = Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
+    const failed = await readTaskFailure();
+    if (failed) return { status, taskFailure: failed };
     try {
       status = await get("manager/queue/status", {
-        signal: AbortSignal.timeout(perFetch),
+        signal: AbortSignal.timeout(perFetch()),
       });
     } catch {
-      return status; // unreadable/aborted — inconclusive (not drained)
+      return { status, taskFailure: null }; // unreadable/aborted — inconclusive (not drained)
     }
-    if (queueDrained(status)) return status;
+    if (queueDrained(status)) {
+      // The worker writes its terminal record and THEN the queue reports drained,
+      // so the failure can land between the two reads above. One last look before
+      // giving up on it — otherwise the very case this exists for (a fast registry
+      // rejection) races past and still reports pending.
+      return { status, taskFailure: await readTaskFailure() };
+    }
     await boundedDelay(intervalMs, deadline);
   }
-  return status; // deadline hit
+  return { status, taskFailure: null }; // deadline hit
 }
 
 /** Default budget for the post-enqueue install verification (#671), used only
@@ -6155,7 +6191,7 @@ const INSTALL_VERIFY_BUDGET_MS = 15000;
  * defaulting to INSTALL_VERIFY_BUDGET_MS), or the reply — success or honest
  * "pending" — never reaches the caller.
  */
-async function verifyInstalled(target, dialect, { batchFailed, renameProne, budgetMs } = {}) {
+async function verifyInstalled(target, dialect, { batchFailed, renameProne, budgetMs, ui_id } = {}) {
   // Pin the status/list reads to the dialect the install ACTUALLY landed on. In
   // the normal case this equals managerGet's cached detection; after the #485
   // legacy fallback the cache still holds the detected v2 dialect, so re-deriving
@@ -6166,19 +6202,42 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne, budg
     dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
   const budget = Math.max(0, budgetMs ?? INSTALL_VERIFY_BUDGET_MS);
   const deadline = Date.now() + budget;
-  const status = await waitForQueueDrain({ timeoutMs: budget, get });
+  // #1539 — the per-task terminal record is only reachable on the real pip
+  // Manager v4 (the "v2" dialect), whose /v2/manager/queue/history?ui_id=
+  // returns the task by id. This is the SAME dialect scoping #364 applies to the
+  // update path, and for the same reasons: released 3.x ("legacy") has no
+  // per-task history endpoint at all, and the bundled 3.x server used in
+  // --enable-manager-legacy-ui mode ("v2-batch") serves only BATCH history keyed
+  // by `id` and REJECTS a ui_id query — polling either would burn the command
+  // budget and still learn nothing. A v2-batch failure is already caught
+  // synchronously via its `failed[]` (→ batchFailed). Legacy's blind spot is
+  // artokun/comfyui-mcp#1606, a genuinely different problem: there is no record
+  // to read, whereas on v4 the record exists and we were simply not reading it.
+  const { status, taskFailure } = await waitForQueueDrain({
+    timeoutMs: budget,
+    get,
+    ui_id: dialect === "v2" ? ui_id : undefined,
+  });
   let installed = null;
   let listError = false;
-  try {
-    installed = await get("customnode/installed", {
-      signal: AbortSignal.timeout(
-        Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now())),
-      ),
-    });
-  } catch {
-    listError = true;
+  // A terminal failure record already settles the outcome, so skip the list read
+  // rather than spend budget on evidence that cannot change the verdict. Leaving
+  // `installed` null is the SAFE default if that verdict ever stops winning:
+  // an unreadable list classifies as "unverified", never as a false success.
+  if (!taskFailure) {
+    try {
+      installed = await get("customnode/installed", {
+        signal: AbortSignal.timeout(
+          Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now())),
+        ),
+      });
+    } catch {
+      listError = true;
+    }
   }
-  return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed, renameProne });
+  return classifyInstallOutcome({
+    target, dialect, status, installed, listError, batchFailed, renameProne, taskFailure,
+  });
 }
 
 /** Budget for the post-enqueue update verification (#364). Bounded well under
@@ -17355,7 +17414,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // success, never a false failure). #232 + codex rounds 1-2. The verify
       // draws on whatever the command budget has LEFT (#671).
       phase = "verify";
-      const outcome = await verifyInstalled(target, dialect, { batchFailed, renameProne, budgetMs: remaining() });
+      // #1539 — `ui_id` is what makes the Manager's own terminal verdict for THIS
+      // task readable. Without it the verifier is back to drain + name-presence,
+      // and a v4 registry rejection of a git URL reports queued/pending.
+      const outcome = await verifyInstalled(target, dialect, {
+        batchFailed, renameProne, budgetMs: remaining(), ui_id,
+      });
       if (outcome.state === "failed") throw new Error(outcome.message);
       if (outcome.state === "installed") {
         return {

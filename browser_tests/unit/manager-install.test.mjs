@@ -619,12 +619,34 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
     "MANAGER_FETCH_TIMEOUT_MS",
     "boundedDelay",
     "AbortSignal",
+    // #1539 — the per-task read closes over these two. This call passes no ui_id
+    // so they are never evaluated, but binding them keeps the extraction honest:
+    // without them a future ui_id case here would fail as a harness gap rather
+    // than as the product behaviour under test.
+    "taskFailureReason",
+    "parseTaskHistoryItem",
     `${fnMatch[0]}\nreturn waitForQueueDrain;`,
   );
-  const realWait = factory(queueDrained, managerGet, MANAGER_FETCH_TIMEOUT_MS, boundedDelay, AbortSignal);
+  const realWait = factory(
+    queueDrained,
+    managerGet,
+    MANAGER_FETCH_TIMEOUT_MS,
+    boundedDelay,
+    AbortSignal,
+    ManagerInstall.taskFailureReason,
+    ManagerInstall.parseTaskHistoryItem,
+  );
 
-  const status = await realWait({ timeoutMs: 5000, intervalMs: 10 });
+  // #1539 — the drain wait now reports { status, taskFailure } rather than a bare
+  // status: the aggregate status cannot express "this task errored", so the
+  // per-task verdict rides alongside it.
+  const { status, taskFailure } = await realWait({ timeoutMs: 5000, intervalMs: 10 });
   assert.equal(queueDrained(status), true, "should return a positively-drained status");
+  assert.equal(
+    taskFailure,
+    null,
+    "no ui_id was passed, so no per-task record was read — and none may be invented",
+  );
   assert.ok(polls >= 2, "should have polled until drained");
   // The delays are now observable rather than merely endured, so the loop's own
   // pacing is asserted instead of being taken on trust: a warm-up before the first
@@ -765,8 +787,13 @@ test("#671 nodes_install threads ONE sub-30s command budget through every phase 
   // fixed budget that could stack past the relay window on top of slow calls.
   assert.match(
     body,
-    /verifyInstalled\(target, dialect, \{\s*batchFailed, renameProne, budgetMs: remaining\(\)\s*\}\)/,
-    "verifyInstalled must receive the remaining command budget",
+    /verifyInstalled\(target, dialect, \{\s*batchFailed, renameProne, budgetMs: remaining\(\), ui_id,\s*\}\)/,
+    // #1539 added ui_id to this call. Pinned in the SAME assertion rather than a
+    // looser regex: budgetMs threading (#671) and ui_id threading (#1539) are
+    // both one-line properties of this one call, and both die silently if
+    // dropped — the budget by stacking past the relay window, the ui_id by
+    // reporting a rejected install as queued/pending.
+    "verifyInstalled must receive the remaining command budget AND the task ui_id",
   );
   // A budget-exhausted stall is reworded per phase, never reported raw.
   assert.match(body, /translateStall\(err, phase\)/, "stalls past the budget must be translated");
