@@ -205,6 +205,11 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   // FIFO, and drained as one batch, because frames on a socket are ordered and holding some
   // while letting others past would reorder a conversation.
   const held = [];
+  // Which CONNECTION the state above belongs to. Bumped by `cancel()`, so anything already
+  // scheduled against the retired connection — a queued drain in particular — can tell that
+  // it no longer speaks for the live one. Same generation-scoping rule as the mark ids, one
+  // layer out: an async callback that outlives its connection must be able to say so.
+  let generation = 0;
 
   function disarmTimer() {
     if (timer === null) return;
@@ -294,6 +299,27 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     }
   }
 
+  /** Re-advertise, waiting for the in-flight batch first if there is one.
+   *  Declared out here rather than only as a method because `sendAfterAdvertise` calls it:
+   *  a held frame waits for the hello the deferral will produce, and must not be able to
+   *  force one (see that method for the whole argument).
+   *  @returns {Promise<boolean>} whether the hello reached the wire. */
+  function request() {
+    if (live.size === 0) return flush();
+    const left = drainDeadline - clock();
+    // Budget already spent (a command that will not report back). Proceed — an unbounded
+    // wait here is the wedge described in the header.
+    if (!(left > 0)) return flush();
+    const promise = new Promise((resolve) => {
+      if (waiters) waiters.push(resolve);
+      else waiters = [resolve];
+    });
+    // Arm only for the FIRST waiter; a later join must not restart the clock, or a steady
+    // trickle of re-advertise requests would push the deadline forward forever.
+    if (timer === null) armFor(left);
+    return promise;
+  }
+
   return {
     /** A command frame has begun executing against this socket's tab mapping.
      *  @returns {number} the mark id to hand back to `ended()` when its reply goes out.
@@ -332,23 +358,7 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       return live.size;
     },
 
-    /** Re-advertise, waiting for the in-flight batch first if there is one.
-     *  @returns {Promise<boolean>} whether the hello reached the wire. */
-    request() {
-      if (live.size === 0) return flush();
-      const left = drainDeadline - clock();
-      // Budget already spent (a command that will not report back). Proceed — an unbounded
-      // wait here is the wedge described in the header.
-      if (!(left > 0)) return flush();
-      const promise = new Promise((resolve) => {
-        if (waiters) waiters.push(resolve);
-        else waiters = [resolve];
-      });
-      // Arm only for the FIRST waiter; a later join must not restart the clock, or a steady
-      // trickle of re-advertise requests would push the deadline forward forever.
-      if (timer === null) armFor(left);
-      return promise;
-    },
+    request,
 
     /** The connection this state belongs to is gone (setUrl / stop / destroy, and an
      *  ordinary close of the ACTIVE socket — a reconnect must not inherit any of it).
@@ -369,6 +379,16 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       disarmTimer();
       live.clear();
       drainDeadline = 0;
+      // Retire the held batch WITH the connection, and fence any drain already scheduled
+      // against it. Leaving these behind meant the retired advertisement would settle, the
+      // drain would run against the MUTABLE current `sock`, and a frame composed for the old
+      // connection would be written to the REPLACEMENT one — or silently dropped after
+      // `true` had already been returned to the caller. Dropping is the honest outcome here:
+      // the frame was built for a route that no longer exists, and the caller's delivery
+      // timeout surfaces it. Clearing `held` also unwedges the queue — otherwise a stale
+      // promise that never settles leaves every later frame stuck behind `held.length > 1`.
+      generation++;
+      held.length = 0;
       // The advertisement on its way belongs to the connection being retired. A frame held
       // on the REPLACEMENT socket must not join it and conclude the new route is published
       // because the old socket's hello landed.
@@ -384,23 +404,50 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
      * is queued behind a hello that is EXPEDITED — the parked re-advertise goes out now
      * rather than waiting out its budget.
      *
-     * That expedite is the deliberate trade. The user has done something that requires the
-     * new route (typed, switched session, hit stop), and their action necessarily outranks
-     * an in-flight command's reply: losing that reply reports OUTCOME UNKNOWN, which is
-     * honest and recoverable, while delivering their message to the previous workflow's
-     * agent is silent and is not. The #1095 case this PR is actually about — an agent
-     * running a batch of mutations while nobody types — never reaches here at all.
+     * IT WAITS FOR THE HELLO THE DEFERRAL WILL PRODUCE — it does NOT force one out.
+     *
+     * An earlier cut expedited: the hold called `flush()`, pushing the parked hello onto the
+     * wire immediately. That was argued as a trade — "a person is waiting, and their action
+     * outranks an in-flight command's reply" — and the argument was sound for the case it
+     * was written about and wrong for the traffic it actually covered. `rehelloForWorkflow`
+     * also runs AUTOMATICALLY: when workflow-scoped history supplies a session id it
+     * re-hellos and immediately sends `resume_session`. Nobody is waiting for that frame. It
+     * reached here, expedited the hello the gate had correctly parked, and let the backend
+     * drop the old mapping before an in-flight command's reply — the OUTCOME UNKNOWN race
+     * this whole PR exists to close, re-opened by the convenience added to protect against a
+     * different failure.
+     *
+     * The fix is not a user-vs-automatic flag. Nothing in the gate can know which is which,
+     * every call site that gets it wrong is another P1, and the flag would have to be
+     * threaded through `sendUserMessage` — which the restart-resume nudges also call without
+     * a person involved. So the expedite is GONE, and the rule is now uniform: a frame that
+     * needs the new route waits for it, and the deferral decides when that is.
+     *
+     * What that costs is bounded and visible: a frame can wait up to the deferral budget
+     * (4 s, or 30 s behind a human-paced command) before the hello goes out and it follows.
+     * The message sits in the pending tray meanwhile and its own delivery timeout still
+     * covers it. What it buys is that NO outbound frame can withdraw a route from a command
+     * that has not replied — by construction rather than by case analysis.
      *
      * Ordering is preserved two ways: the hold is FIFO, and the whole batch runs after the
-     * SAME advertise settles, so nothing overtakes anything. A rejected advertise still
-     * drains — a frame held forever is a mute panel, which is worse than a frame sent on a
-     * route we could not confirm (the caller's own delivery timeout still covers it).
+     * SAME advertisement settles, so nothing overtakes anything. A rejected advertisement
+     * still drains — a frame held forever is a mute panel, which is worse than a frame sent
+     * on a route we could not confirm.
      */
     sendAfterAdvertise(send) {
       if (typeof send !== "function") return false;
       held.push(send);
       if (held.length > 1) return true; // a drain is already scheduled for this batch
+      // GENERATION-FENCED, the same lesson as the marks one layer out. Without this,
+      // cancel() cleared `waiters` and `inFlight` but left `held` and this already-scheduled
+      // `then` intact: the retired connection's advertisement would settle, the drain would
+      // run against the MUTABLE current `sock`, and the old frame would either be written to
+      // the REPLACEMENT connection or silently dropped after `true` had been returned. And
+      // if that stale promise never settled, every later frame stayed wedged behind
+      // `held.length > 1`.
+      const bornAt = generation;
       const drain = () => {
+        if (bornAt !== generation) return; // the connection this batch belonged to is gone
         const batch = held.splice(0, held.length);
         for (const fn of batch) {
           try {
@@ -410,7 +457,10 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
           }
         }
       };
-      Promise.resolve(flush()).then(drain, drain);
+      // `request()`, not `flush()`: it advertises immediately when nothing is in flight, and
+      // otherwise JOINS the parked hello and resolves when that one actually goes out. Either
+      // way a hello is guaranteed to happen, so a held frame cannot wait forever.
+      Promise.resolve(request()).then(drain, drain);
       return true;
     },
 

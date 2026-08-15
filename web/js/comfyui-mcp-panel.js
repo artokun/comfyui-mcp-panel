@@ -19932,9 +19932,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // particular, because `pendingContext` is one-shot and has already been consumed).
       //
       // THE DISCLOSURE IS NOT. It is decided inside the closure, against the epoch that is
-      // current when the frame actually leaves, because the hold EXPEDITES a hello and a
-      // landed hello ADVANCES `agentSessionEpoch` — so a decision made out here is a
-      // decision about the agent generation this message will not reach.
+      // current when the frame actually leaves: a held frame goes out after the hello it was
+      // waiting for, and a landed hello ADVANCES `agentSessionEpoch` — so a decision made
+      // out here is a decision about the agent generation this message will not reach.
       //
       // The failure that causes is silent and total: if the outgoing generation had already
       // proven its canvas tools, `disclose` is false, the NEW generation is handed a message
@@ -19983,9 +19983,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // #1095 P1 — a `user_message` carries NO tab id, so the orchestrator routes it by the
       // binding this socket already has. Sent while a re-advertise is still parked, the
       // user's text, context and images for the workflow they are LOOKING AT are delivered
-      // to the agent for the previous one. Hold it behind the hello instead; the hold
-      // expedites that hello, so the wait is the hello's own round trip rather than the
-      // deferral budget. See routeIsStale in lib/rehello-gate.js.
+      // to the agent for the previous one. Hold it behind the hello instead — it waits for
+      // the one the deferral will produce and cannot force it out, so holding a message can
+      // never withdraw a route from a command that has not replied. Bounded by the deferral
+      // budget. See routeIsStale and sendAfterAdvertise in lib/rehello-gate.js.
       if (advertisedRouteIsStale()) return rehelloGate.sendAfterAdvertise(send);
       return send();
     },

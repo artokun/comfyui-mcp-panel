@@ -67,6 +67,26 @@ function harness({ landed = true, advertise } = {}) {
   return { gate, sends, advance, armed: () => timers.size };
 }
 
+/**
+ * A gate for the tests that drive it by hand (mark, cancel, settle) rather than by the
+ * clock, with a controllable `advertise`.
+ *
+ * THE TIMER STUBS ARE LOAD-BEARING, not tidiness. Built with `now: () => 0` and the REAL
+ * `setTimeout`, `request()` arms a 4-second timer that fires against a clock frozen at
+ * zero — so `fire()` finds itself still inside the budget and re-arms, forever. Nothing
+ * fails; the process simply never runs out of timers and `node --test` hangs, which is the
+ * failure mode this repo treats as red rather than as slow. A handle that never fires is
+ * what "the deadline has not arrived" actually means when the clock does not move.
+ */
+function manualGate(advertise) {
+  return createRehelloGate({
+    advertise,
+    now: () => 0,
+    setTimer: () => 1,
+    clearTimer: () => {},
+  });
+}
+
 // --- the defect itself ----------------------------------------------------
 
 test("#1095: a re-advertise does NOT withdraw the route while a command is in flight", async () => {
@@ -373,49 +393,128 @@ test("#1095 codex P1: a held frame does not leave before the re-advertise lands"
   // text, context and images delivered into another canvas's conversation.
   const order = [];
   let resolveHello;
-  const gate = createRehelloGate({
-    advertise: () => {
-      order.push("hello");
-      return new Promise((r) => {
-        resolveHello = r;
-      });
-    },
-    now: () => 0,
+  const gate = manualGate(() => {
+    order.push("hello");
+    return new Promise((r) => {
+      resolveHello = r;
+    });
   });
-  gate.began("ask_user"); // a human-paced command is holding the route
+  const mark = gate.began("ask_user"); // a human-paced command is holding the route
   const accepted = gate.sendAfterAdvertise(() => order.push("user_message"));
   assert.equal(accepted, true, "the frame is accepted, not refused — it is queued, not dropped");
-  assert.deepEqual(order, ["hello"], "the hello is EXPEDITED, and the frame has not gone out");
+  assert.deepEqual(order, [], "the frame must not go out, and must not force a hello either");
   assert.equal(gate.heldFrames(), 1);
 
+  gate.ended(mark); // the command replies, so the deferral releases the hello
+  assert.deepEqual(order, ["hello"], "the hello goes first");
   resolveHello(true);
   await new Promise((r) => setTimeout(r, 0));
   assert.deepEqual(order, ["hello", "user_message"], "the frame follows the hello, never precedes it");
   assert.equal(gate.heldFrames(), 0);
 });
 
-test("#1095 codex P1: holding EXPEDITES the parked hello rather than waiting out the budget", () => {
-  // The trade, stated: the user has done something that requires the new route, and their
-  // action outranks an in-flight command's reply. A lost reply is OUTCOME UNKNOWN, which is
-  // honest and recoverable; a message delivered to the previous workflow's agent is not.
-  const { gate, sends } = harness();
-  gate.began("ask_user"); // 30s budget — the worst case for the leak
+test("#1095 codex R4: holding must NOT force the parked hello out", async () => {
+  // An earlier cut expedited here, argued as "a person is waiting, and their action outranks
+  // an in-flight command's reply". The argument was sound for the case it was written about
+  // and wrong for the traffic it covered: rehelloForWorkflow ALSO runs automatically and
+  // sends `resume_session` with nobody waiting. That frame reached the hold, expedited the
+  // hello the gate had correctly parked, and let the backend drop the old mapping before an
+  // in-flight command's reply — the very race this PR closes, re-opened by the convenience.
+  const { gate, sends, advance } = harness();
+  const mark = gate.began("ask_user"); // 30s budget — the worst case
   gate.request();
   assert.deepEqual(sends, [], "parked, as the #1095 fix intends");
+
   gate.sendAfterAdvertise(() => {});
-  assert.equal(sends.length, 1, "a frame that needs the new route forces the hello out now");
+  assert.deepEqual(sends, [], "an outbound frame must not withdraw the route from a live command");
+  advance(REHELLO_DEFER_MS + 1);
+  assert.deepEqual(sends, [], "…not even past the MACHINE budget, since ask_user set the deadline");
+
+  // It goes out when the deferral says so — on drain here — and the frame follows.
+  gate.ended(mark);
+  assert.equal(sends.length, 1);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(gate.heldFrames(), 0, "the held frame follows the hello it waited for");
+});
+
+test("#1095 codex R4: a held frame still gets a hello when nothing is in flight", async () => {
+  // Waiting must not mean waiting forever. With no command marked, `request()` advertises
+  // immediately, so the ordinary case pays nothing.
+  const { gate, sends } = harness();
+  const order = [];
+  gate.sendAfterAdvertise(() => order.push("frame"));
+  assert.equal(sends.length, 1, "no deferral to respect ⇒ the hello goes now");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["frame"]);
+});
+
+test("#1095 codex R4: a held frame is bounded by the budget, not by the command", async () => {
+  // The cost of refusing to expedite, stated and pinned: a command that never replies delays
+  // the frame by the budget and no longer.
+  const { gate, sends, advance } = harness();
+  const order = [];
+  gate.began("graph_set_widget"); // never released
+  gate.sendAfterAdvertise(() => order.push("frame"));
+  assert.deepEqual(sends, [], "held while the command still has budget");
+  advance(REHELLO_DEFER_MS + 1);
+  assert.equal(sends.length, 1, "the budget expires and the hello goes out");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["frame"], "…and the frame follows it");
+});
+
+// --- a cancelled generation's drain (codex P2) ----------------------------
+
+test("#1095 codex R4: a cancelled generation's drain cannot send on the replacement connection", async () => {
+  // cancel() used to clear `waiters` and `inFlight` but leave `held` and its already-
+  // scheduled `then` intact. The retired advertisement would settle, the drain would run
+  // against the MUTABLE current socket, and a frame composed for the old connection would be
+  // written to the new one — or dropped after `true` had been returned. Same generation
+  // lesson as the marks, one layer out.
+  const order = [];
+  let resolveHello;
+  const gate = manualGate(() => new Promise((r) => { resolveHello = r; }));
+  const mark = gate.began("graph_set_widget");
+  gate.sendAfterAdvertise(() => order.push("frame-from-the-old-connection"));
+  assert.equal(gate.heldFrames(), 1);
+  gate.ended(mark); // the hello for the OLD connection is now on its way
+
+  gate.cancel(); // setUrl / stop / destroy / an active close, mid-hello
+  assert.equal(gate.heldFrames(), 0, "the batch is retired with the connection that built it");
+
+  resolveHello(true); // the retired advertisement settles late
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, [], "a frame built for a dead route must never reach the live socket");
+});
+
+test("#1095 codex R4: a stale never-settling advertisement cannot wedge later frames", async () => {
+  // The other half of the same defect: with `held` left populated behind a promise that
+  // never settles, every later frame queued behind `held.length > 1` and no drain was ever
+  // scheduled for it.
+  const order = [];
+  let hellos = 0;
+  const gate = manualGate(() => {
+    hellos++;
+    return hellos === 1 ? new Promise(() => {}) : Promise.resolve(true);
+  });
+  const mark = gate.began("graph_set_widget");
+  gate.sendAfterAdvertise(() => order.push("stranded"));
+  gate.ended(mark); // hello #1 starts, and never settles
+  gate.cancel();
+
+  // A new connection, a new frame — it must get its own advertisement and its own drain.
+  gate.sendAfterAdvertise(() => order.push("live"));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["live"], "the queue is usable again after the connection was replaced");
 });
 
 test("#1095 codex P1: held frames keep their order and drain as one batch", async () => {
   const order = [];
   let resolveHello;
-  const gate = createRehelloGate({
-    advertise: () => new Promise((r) => { resolveHello = r; }),
-    now: () => 0,
-  });
-  gate.began("graph_set_widget");
+  const gate = manualGate(() => new Promise((r) => { resolveHello = r; }));
+  const mark = gate.began("graph_set_widget");
   for (const n of [1, 2, 3]) gate.sendAfterAdvertise(() => order.push(n));
   assert.equal(gate.heldFrames(), 3, "one queue, not one per frame");
+  gate.ended(mark);
   resolveHello(true);
   await new Promise((r) => setTimeout(r, 0));
   assert.deepEqual(order, [1, 2, 3], "frames on one socket are ordered; the hold must not reorder them");
@@ -423,24 +522,23 @@ test("#1095 codex P1: held frames keep their order and drain as one batch", asyn
 
 test("#1095 codex P1: a FAILED re-advertise still drains the hold — a mute panel is worse", async () => {
   const order = [];
-  const gate = createRehelloGate({
-    advertise: () => Promise.reject(new Error("hello failed")),
-    now: () => 0,
-  });
-  gate.began("graph_set_widget");
+  const gate = manualGate(() => Promise.reject(new Error("hello failed")));
+  const mark = gate.began("graph_set_widget");
   gate.sendAfterAdvertise(() => order.push("sent"));
+  gate.ended(mark);
   await new Promise((r) => setTimeout(r, 0));
   assert.deepEqual(order, ["sent"], "a frame held forever would be a panel that silently stops talking");
 });
 
 test("#1095 codex P1: one frame's failure does not strand the rest of the batch", async () => {
   const order = [];
-  const gate = createRehelloGate({ advertise: () => Promise.resolve(true), now: () => 0 });
-  gate.began("graph_set_widget");
+  const gate = manualGate(() => Promise.resolve(true));
+  const mark = gate.began("graph_set_widget");
   gate.sendAfterAdvertise(() => {
     throw new Error("this frame blew up");
   });
   gate.sendAfterAdvertise(() => order.push("second"));
+  gate.ended(mark);
   await new Promise((r) => setTimeout(r, 0));
   assert.deepEqual(order, ["second"]);
 });
