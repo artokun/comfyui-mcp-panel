@@ -300,19 +300,31 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
   // previous call's verdict — which is the stale-evidence bug this exists to prevent,
   // reintroduced one level up.
   for (const [branch, pattern] of [
-    ["live vs cache", /setWidgetSchemaProvenance = observedAtEpoch !== null \? "live" : "cache"/],
+    [
+      "live / cache / reconnected",
+      /setWidgetSchemaProvenance =\s*observedAtEpoch === null\s*\?\s*"cache"\s*:\s*observedAtEpoch === backendReconnectEpoch\s*\?\s*"live"\s*:\s*"reconnected"/,
+    ],
     ["snapshot", /setWidgetSchemaProvenance = "snapshot"/],
     ["nothing established", /setWidgetSchemaProvenance = "none"/],
   ]) {
     assert.match(body, pattern, `the ${branch} branch must record its provenance`);
   }
-  // "live" is gated on the SAME fact `objectInfoSnapshot.record` is gated on — the epoch
-  // captured INSIDE the cache loader, which only a call that actually issued the request
-  // ever sets. A cache hit or a joined read leaves it null.
+  // "live" is gated on BOTH facts `objectInfoSnapshot.record` is gated on, or the two
+  // disagree about whether an answer is usable as backend evidence:
+  //   1. the epoch captured INSIDE the cache loader, which only a call that actually issued
+  //      the request ever sets (a cache hit or a joined read leaves it null), and
+  //   2. that epoch still matching, so a response the backend reconnected underneath — which
+  //      object-info-cache deliberately still returns to its original waiter, and which
+  //      `record` refuses to file — is not relabelled "live" merely because the loader ran.
   assert.match(
     body,
     /observedAtEpoch = backendReconnectEpoch;[\s\S]*fetchWholeObjectInfo/,
     "the epoch must be captured inside the cache loader, which runs only on a miss",
+  );
+  assert.match(
+    body,
+    /observedAtEpoch === backendReconnectEpoch/,
+    "a reconnect-spanning response must not be reported as live",
   );
   // …and the lib must be able to force a genuinely live re-read, or a cache hit could only
   // ever fail closed — refusing writes 2..N of an ordinary burst.

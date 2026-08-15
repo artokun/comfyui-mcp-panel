@@ -84,11 +84,20 @@ export async function runSetWidget(
     // from. Read as a FUNCTION, at the moment of decision, because the answer is only known
     // AFTER the oracle has run.
     //
-    //   "live"      this call issued the /object_info request and the server answered it
-    //   "cache"     #716's ≤1.5s burst cache answered, or this call joined another's
-    //               in-flight request — nobody asked the server just now
-    //   "snapshot"  #1223's last-observed schema stood in while both live probes were silent
-    //   "none"      nothing was established
+    //   "live"        this call issued the /object_info request, the server answered it, and
+    //                  the backend has not reconnected since it was issued
+    //   "cache"        #716's ≤1.5s burst cache answered, or this call joined another's
+    //                  in-flight request — nobody asked the server just now
+    //   "reconnected"  this call DID issue the request, but the backend reconnected before it
+    //                  resolved. The cache deliberately still returns a retired response to
+    //                  its original waiter, so the payload describes a ComfyUI process that
+    //                  has since been replaced — the same test `objectInfoSnapshot.record`
+    //                  applies before filing anything as evidence
+    //   "snapshot"     #1223's last-observed schema stood in while both live probes were
+    //                  silent. NOTE it is a detached map of TYPE NAMES ONLY — see the
+    //                  fallback below for why that makes it unable to answer this question
+    //                  at all, rather than merely answering it staleley
+    //   "none"         nothing was established
     //
     // Only the #1126 blind-write fallback consults it, and it must: that fallback's entire
     // justification is "the SERVER authoritatively declares this input's option list empty",
@@ -120,7 +129,9 @@ export async function runSetWidget(
     if (typeof schemaProvenance !== "function") return "live";
     try {
       const p = schemaProvenance();
-      return p === "live" || p === "cache" || p === "snapshot" || p === "none" ? p : "unknown";
+      return p === "live" || p === "cache" || p === "reconnected" || p === "snapshot" || p === "none"
+        ? p
+        : "unknown";
     } catch {
       return "unknown";
     }
@@ -724,67 +735,47 @@ export async function runSetWidget(
     //
     // It runs LAST, so a merely-transient callback failure has already been re-read by the
     // refresh and a server-confirmable upload asset already confirmed.
-    if (
-      latest?.unreadableOptions &&
-      serverDeclaresEmptyComboOptions(
-        freshDefs ?? undefined,
-        authTarget?.type,
-        concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
-      )
-    ) {
-      // #1126 — a NESTED promotion is refused rather than blind-written, and this is the
-      // deliberate choice between the two defensible options.
+    if (latest?.unreadableOptions) {
+      const comboDefInput = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
+      // #1223/#716 × #1126 — ESTABLISH THE EVIDENCE BEFORE TESTING IT, because condition 2
+      // says "the SERVER declares this input's list empty" and only a LIVE read establishes
+      // that. Three different layers can answer with something else, and the shape test alone
+      // cannot tell them apart:
       //
-      // The rejection being answered describes the IMMEDIATE promoted projection. On a
-      // nested chain the value is ultimately driven into a DEEPER concrete widget that this
-      // path never read — and that widget's own client-populated list may be perfectly
-      // readable, in which case the fallback's premise ("the valid set is not knowable from
-      // here") is simply false and a live list was available all along.
+      //   * "cache" — #716's ≤1.5s burst cache (or a joined in-flight read). It CAN answer the
+      //     question, but with the server's word from up to a TTL ago; nobody asked during
+      //     this call.
+      //   * "reconnected" — this call did issue the request, but the backend reconnected before
+      //     it resolved. object-info-cache deliberately still hands a retired response to its
+      //     original waiter, and objectInfoSnapshot.record refuses to file it as evidence for
+      //     exactly that reason. A schema describing the process that has been REPLACED must
+      //     not authorize a blind write against the replacement's option lists.
+      //   * "snapshot" — #1223's last-observed schema. This one cannot answer the question at
+      //     ALL: what it stores is a DETACHED MAP OF TYPE NAMES, every value the shared frozen
+      //     EMPTY_DEF with no `input` at all (the detachment is deliberate — retaining the
+      //     payload would let a beforeRegisterNodeDef hook launder frontend-mutated defs back
+      //     as backend evidence, and it would pin ~5.4MB per connection). So
+      //     serverDeclaresEmptyComboOptions is ALWAYS false against a snapshot. It can say
+      //     whether a TYPE exists; it can say nothing whatever about an input's option list.
       //
-      // Refusing beats validating the concrete widget here. Validating it would mean running
-      // membership at another level on a last-resort path, against a dynamic source with the
-      // same never-read-twice and stateful-callback hazards the sibling cross-check already
-      // documents — new blind-write surface in the one place least able to carry it. A
-      // refusal is recoverable and names the shape; a wrong blind write into a nested chain
-      // lands on a serializing rail. The direct and single-hop promoted cases, where the
-      // widget that was read IS the one the value drives, are unaffected.
+      // Options change without a reconnect and without a cache drop — a model downloaded while
+      // this node's own live callback keeps failing — so any of these would authorize an
+      // unvalidated write against a list that is no longer empty.
       //
-      // Decided FIRST, ahead of the provenance re-ask below: the shape of the promotion is
-      // already known, the answer cannot change, and re-fetching a whole /object_info to
-      // establish evidence for a write that is about to be refused anyway is pure cost.
-      if (nestedPromotion) {
-        throw new Error(
-          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
-            `${latest.message} This is a NESTED promotion — the value is driven through one ` +
-            `or more intermediate subgraphs to a deeper concrete widget — and the unreadable ` +
-            `list observed here belongs to the intermediate projection, not to that concrete ` +
-            `widget, whose own option list may be readable. The panel will not write a value ` +
-            `nothing validated through a chain it has not checked end to end (#1126). Set the ` +
-            `widget on the concrete node directly (panel_enter_subgraph to reach it), or fix ` +
-            `the node's option callback so the list can be read.`,
-        );
-      }
-      // #1223/#716 × #1126 — condition 2 above says "the SERVER declares this input's list
-      // empty", and only a LIVE read establishes that. Two different layers can answer with
-      // the server's PAST word instead, and both are the same defect:
-      //
-      //   * "snapshot" — #1223's last-observed schema, retained across exactly the window in
-      //     which nobody can re-fetch, because the backend went silent.
-      //   * "cache" — #716's ≤1.5s burst cache (or a joined in-flight read). Nobody asked the
-      //     server during this call at all; the payload can be a full TTL old.
-      //
-      // Options change without a reconnect AND without a cache drop — a model downloaded
-      // while this node's own live callback keeps failing — so either stale `[]` would
-      // authorize an unvalidated write against a list that is no longer empty.
-      //
-      // So: RE-ASK before refusing. This is the last resort on a rare path, and one request
-      // is a far better trade than either refusing a legitimate write (which is what a
-      // cache hit would cause for writes 2..N of an ordinary burst — the exact multi-widget
-      // case this fix exists to serve) or writing blind. The cache is dropped first so the
-      // re-ask cannot be answered by the very entry that made this uncertain, and it goes
-      // through the SAME oracle, so the provenance read afterwards describes that call.
+      // So: RE-ASK before deciding. This is the last resort on a rare path, and one request is
+      // a far better trade than either refusing a legitimate write (which is what a cache hit
+      // would cause for writes 2..N of an ordinary burst — the exact multi-widget case this
+      // fix exists to serve) or writing blind. The cache is dropped first so the re-ask cannot
+      // be answered by the very entry that made this uncertain, and it goes through the SAME
+      // oracle, so the provenance read afterwards describes that call.
       let provenance = readSchemaProvenance();
       let authDefs = freshDefs ?? undefined;
+      // What the STALE evidence claimed, captured before it is replaced — the difference
+      // between "the server publishes a list, as it always did" and "the stale schema said
+      // empty and the live one disagrees" is the whole point of re-asking, and it cannot be
+      // recovered after `authDefs` is overwritten.
+      const staleDeclaredEmpty = serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput);
+      let reAsked = false;
       if (
         provenance !== "live" &&
         typeof invalidateObjectInfoCache === "function" &&
@@ -793,49 +784,183 @@ export async function runSetWidget(
         try {
           invalidateObjectInfoCache();
           const reread = await getFreshObjectInfo();
-          if (reread) authDefs = reread;
+          if (reread) {
+            authDefs = reread;
+            reAsked = true;
+          }
         } catch {
-          /* the re-ask failed; provenance stays non-live and the refusal below fires */
+          /* the re-ask failed; provenance stays non-live and the refusals below fire */
         }
         provenance = readSchemaProvenance();
       }
-      // Fails closed: no live declaration, no blind write. The user is told WHICH fact is
-      // missing and which layer withheld it, because "refresh and retry" is only actionable
-      // if they know it is the schema — not their value — that could not be established.
-      if (provenance !== "live") {
+      if (serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput)) {
+        // #1126 — a NESTED promotion is refused rather than blind-written, and this is the
+        // deliberate choice between the two defensible options.
+        //
+        // The rejection being answered describes the IMMEDIATE promoted projection. On a
+        // nested chain the value is ultimately driven into a DEEPER concrete widget that this
+        // path never read — and that widget's own client-populated list may be perfectly
+        // readable, in which case the fallback's premise ("the valid set is not knowable from
+        // here") is simply false and a live list was available all along.
+        //
+        // Refusing beats validating the concrete widget here. Validating it would mean running
+        // membership at another level on a last-resort path, against a dynamic source with the
+        // same never-read-twice and stateful-callback hazards the sibling cross-check already
+        // documents — new blind-write surface in the one place least able to carry it. A
+        // refusal is recoverable and names the shape; a wrong blind write into a nested chain
+        // lands on a serializing rail. The direct and single-hop promoted cases, where the
+        // widget that was read IS the one the value drives, are unaffected.
+        //
+        if (nestedPromotion) {
+          throw new Error(
+            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+              `${latest.message} This is a NESTED promotion — the value is driven through one ` +
+              `or more intermediate subgraphs to a deeper concrete widget — and the unreadable ` +
+              `list observed here belongs to the intermediate projection, not to that concrete ` +
+              `widget, whose own option list may be readable. The panel will not write a value ` +
+              `nothing validated through a chain it has not checked end to end (#1126). Set the ` +
+              `widget on the concrete node directly (panel_enter_subgraph to reach it), or fix ` +
+              `the node's option callback so the list can be read.`,
+          );
+        }
+        // Fails closed: no live declaration, no blind write. The user is told WHICH fact is
+        // missing and which layer withheld it, because "refresh and retry" is only actionable
+        // if they know it is the schema — not their value — that could not be established.
+        //
+        // "snapshot" cannot reach here: its detached name-only map fails the shape test above,
+        // so it is answered by its own branch below, which says something true about it rather
+        // than calling a map that holds no lists "stale".
+        if (provenance !== "live") {
+          throw new Error(
+            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+              `${latest.message} The panel could have written it unvalidated — this widget's ` +
+              `option list could not be READ, and that is normally enough when /object_info ` +
+              `also declares the input's list empty — but that "empty" did not come from the ` +
+              `server answering now: ` +
+              (provenance === "cache"
+                ? `it came from the panel's short-lived /object_info burst cache (#716), and ` +
+                  `re-asking the server did not produce a live answer either. Retry in a moment.`
+                : provenance === "reconnected"
+                  ? `the backend RECONNECTED while that /object_info request was in flight, so ` +
+                    `the answer describes a ComfyUI process that has since been replaced — and ` +
+                    `a restart is the one event that changes what the server publishes. Retry.`
+                  : `the schema provenance could not be established at all, and nothing ` +
+                    `established must not read as the server answering. Reconnect to ComfyUI ` +
+                    `and retry.`) +
+              ` Options can change without a reconnect, so a stale empty list is not evidence ` +
+              `the valid set is unknowable.`,
+          );
+        }
+        let set;
+        try {
+          // BOTH acceptances, and the empty one is not incidental. `options.values` is a
+          // callback: a stateful one can throw on the initial read and on the refreshed read,
+          // then return `[]` on this final invocation. With only the unreadable acceptance
+          // enabled, coercion would fall through to the #507 empty-list branch, raise a
+          // RETRYABLE `emptyOptions` rejection, and refuse — telling the caller "the server's
+          // option list may simply be stale, refreshing it before deciding" at the end of a
+          // ladder that has already refreshed it, about the one transition that is unambiguously
+          // valid. By this line the LIVE server schema has ALREADY confirmed the list empty for
+          // this input, which is exactly #507's own precondition, so an empty final read is a
+          // weaker observation of the same fact — not a new doubt.
+          //
+          // Which acceptance actually admitted the value is still decided at COERCION time and
+          // reported from there, so the disclosure below names what happened rather than what
+          // this call hoped for: an empty final read discloses `empty_option_list` (and carries
+          // #507's rail label-adoption rule, correctly, because an empty list really does admit
+          // any scalar), an unreadable one discloses `option_list_unreadable`.
+          set = write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true });
+        } catch (unreadableErr) {
+          // A validation refusal from THIS attempt (a non-string value, a rail whose own
+          // list is real and lacks the value) must arrive framed like every other refusal:
+          // with the tool name, the widget, and the node. Unframed, the retry the caller was
+          // invited to make answers `Value 640 is not a valid option…` with nothing saying
+          // where it came from. Anything that is not a validation refusal — a partial or
+          // rolled-back write — propagates UNCHANGED rather than being reworded.
+          if (unreadableErr instanceof WidgetWriteError) {
+            throw new Error(
+              `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
+                `after finding the combo's option list unreadable: ${unreadableErr.message}`,
+            );
+          }
+          throw unreadableErr;
+        }
+        return withWarning({
+          set,
+          ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+          // A stateful callback that finally answered `[]` landed on #507's acceptance instead,
+          // and that is reported as #507 reports it — the same field the branch above returns,
+          // so one outcome has one name wherever it is reached from.
+          ...(set?.empty_option_list ? { empty_option_list: true } : {}),
+          // The COERCION-TIME verdict, never re-derived: a stateful options callback can
+          // succeed on the final attempt, and the value would then have been validated by
+          // ordinary membership — claiming an unchecked write there would be false.
+          ...(set?.option_list_unreadable
+            ? {
+                option_list_unreadable: true,
+                ...(set.promoted_rail_validated ? { promoted_rail_validated: true } : {}),
+                // Scoped to the widget the claim is actually about. A promoted write also
+                // mutates the parent rail, and when that rail's list IS readable the sibling
+                // cross-check compares the value against it and only proceeds on membership —
+                // so a flat "nothing checked it" was false in exactly the case where the most
+                // checking happened. The two sentences are chosen by DATA the write emitted,
+                // never by re-deriving what the cross-check did.
+                option_list_unreadable_note:
+                  `Written WITHOUT validation against THIS widget's own option list, because that ` +
+                  `list could NOT BE READ — not because the value was checked and passed. ` +
+                  `Observed on the widget: ` +
+                  `${set.option_list_unreadable_detail ?? "its option list could not be READ"}. ` +
+                  `The server's own /object_info declares this input's option list EMPTY, so the ` +
+                  `valid set is not knowable from the widget itself (#1126). ` +
+                  (set.promoted_rail_validated
+                    ? `It was NOT written entirely unchecked: this promoted write also mutates the ` +
+                      `parent subgraph's rail widget, whose option list WAS readable and DOES ` +
+                      `contain this value — the write proceeded only because that list vouched for ` +
+                      `it. The rail is what serializes at queue time, so the value is a real option ` +
+                      `there. `
+                    : `Nothing compared your value to anything. `) +
+                  `If the node rejects it at runtime that is the node's answer, not a panel ` +
+                  `refusal to retry around. The graph now holds a value this widget's own option ` +
+                  `list does not vouch for, so a later reader — including the ComfyUI dropdown ` +
+                  `itself — may show it as out-of-range.`,
+              }
+            : {}),
+        });
+      }
+      // The shape test said the server does NOT declare this input's list empty — but when the
+      // only schema available is #1223's snapshot, that "no" is not the server publishing a
+      // list. It is a map that holds TYPE NAMES ONLY answering a question about an INPUT, and
+      // it would answer "no" for every input on every node in existence.
+      //
+      // CHOSEN BEHAVIOUR: a snapshot can NEVER authorize this fallback. Not "sometimes, if it
+      // happens to say empty" — it structurally cannot say empty, so there is no case to gate.
+      // The alternative (teach the snapshot to retain option lists) was rejected outright: the
+      // detachment is #1223's defence against beforeRegisterNodeDef mutating defs in place, and
+      // re-attaching payloads to widen a last-resort blind write would trade a real integrity
+      // guarantee for a convenience on the rarest path in the ladder.
+      //
+      // What it gets instead is an honest refusal. Falling through to the generic end-of-ladder
+      // message would tell the caller only that their combo could not be read, sending them to
+      // look at their value while the actual cause is a silent backend — the exact
+      // misattribution this whole change exists to stop.
+      if (provenance === "snapshot") {
         throw new Error(
           `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
-            `${latest.message} The panel could have written it unvalidated — this widget's ` +
-            `option list could not be READ, and that is normally enough when /object_info ` +
-            `also declares the input's list empty — but that "empty" did not come from the ` +
-            `server answering now: ` +
-            (provenance === "snapshot"
-              ? `the live schema probe went silent, so it came from the LAST-OBSERVED schema ` +
-                `snapshot (#1223). Reconnect to ComfyUI (or wait for the backend to answer ` +
-                `/object_info again) and retry.`
-              : provenance === "cache"
-                ? `it came from the panel's short-lived /object_info burst cache (#716), and ` +
-                  `re-asking the server did not produce a live answer either. Retry in a ` +
-                  `moment.`
-                : `the schema provenance could not be established at all, and nothing ` +
-                  `established must not read as the server answering. Reconnect to ComfyUI ` +
-                  `and retry.`) +
-            ` Options can change without a reconnect, so a stale empty list is not evidence ` +
-            `the valid set is unknowable.`,
+            `${latest.message} The panel could have written it unvalidated if /object_info ` +
+            `declared this input's option list empty — but the live schema probe went silent, ` +
+            `so the only schema available is the LAST-OBSERVED one (#1223), which is stored as ` +
+            `a detached map of TYPE NAMES ONLY. It can say whether this node type still exists; ` +
+            `it holds no option lists at all, so it cannot establish that the valid set is ` +
+            `unknowable. Reconnect to ComfyUI (or wait for the backend to answer /object_info ` +
+            `again) and retry.`,
         );
       }
-      // The LIVE answer has to say the same thing the stale one did. If the re-ask produced
-      // a different schema that DOES publish a list for this input, the valid set is knowable
-      // after all — which is precisely the hole this re-ask exists to find, so it must not be
-      // written past just because the provenance is now good.
-      if (
-        authDefs !== (freshDefs ?? undefined) &&
-        !serverDeclaresEmptyComboOptions(
-          authDefs,
-          authTarget?.type,
-          concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
-        )
-      ) {
+      // The stale evidence said EMPTY and the live re-ask disagrees: the server does publish a
+      // list for this input after all. That is exactly the hole the re-ask exists to find, and
+      // it is worth its own message — the generic refusal below would report only that the
+      // widget's own callback failed, sending the caller to look at their value while the
+      // actionable fact is that a real list exists and they can pick from it.
+      if (reAsked && staleDeclaredEmpty) {
         throw new Error(
           `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
             `${latest.message} The schema that appeared to declare this input's option list ` +
@@ -845,81 +970,6 @@ export async function runSetWidget(
             `value the server's list contains.`,
         );
       }
-      let set;
-      try {
-        // BOTH acceptances, and the empty one is not incidental. `options.values` is a
-        // callback: a stateful one can throw on the initial read and on the refreshed read,
-        // then return `[]` on this final invocation. With only the unreadable acceptance
-        // enabled, coercion would fall through to the #507 empty-list branch, raise a
-        // RETRYABLE `emptyOptions` rejection, and refuse — telling the caller "the server's
-        // option list may simply be stale, refreshing it before deciding" at the end of a
-        // ladder that has already refreshed it, about the one transition that is unambiguously
-        // valid. By this line the LIVE server schema has ALREADY confirmed the list empty for
-        // this input, which is exactly #507's own precondition, so an empty final read is a
-        // weaker observation of the same fact — not a new doubt.
-        //
-        // Which acceptance actually admitted the value is still decided at COERCION time and
-        // reported from there, so the disclosure below names what happened rather than what
-        // this call hoped for: an empty final read discloses `empty_option_list` (and carries
-        // #507's rail label-adoption rule, correctly, because an empty list really does admit
-        // any scalar), an unreadable one discloses `option_list_unreadable`.
-        set = write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true });
-      } catch (unreadableErr) {
-        // A validation refusal from THIS attempt (a non-string value, a rail whose own
-        // list is real and lacks the value) must arrive framed like every other refusal:
-        // with the tool name, the widget, and the node. Unframed, the retry the caller was
-        // invited to make answers `Value 640 is not a valid option…` with nothing saying
-        // where it came from. Anything that is not a validation refusal — a partial or
-        // rolled-back write — propagates UNCHANGED rather than being reworded.
-        if (unreadableErr instanceof WidgetWriteError) {
-          throw new Error(
-            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
-              `after finding the combo's option list unreadable: ${unreadableErr.message}`,
-          );
-        }
-        throw unreadableErr;
-      }
-      return withWarning({
-        set,
-        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
-        // A stateful callback that finally answered `[]` landed on #507's acceptance instead,
-        // and that is reported as #507 reports it — the same field the branch above returns,
-        // so one outcome has one name wherever it is reached from.
-        ...(set?.empty_option_list ? { empty_option_list: true } : {}),
-        // The COERCION-TIME verdict, never re-derived: a stateful options callback can
-        // succeed on the final attempt, and the value would then have been validated by
-        // ordinary membership — claiming an unchecked write there would be false.
-        ...(set?.option_list_unreadable
-          ? {
-              option_list_unreadable: true,
-              ...(set.promoted_rail_validated ? { promoted_rail_validated: true } : {}),
-              // Scoped to the widget the claim is actually about. A promoted write also
-              // mutates the parent rail, and when that rail's list IS readable the sibling
-              // cross-check compares the value against it and only proceeds on membership —
-              // so a flat "nothing checked it" was false in exactly the case where the most
-              // checking happened. The two sentences are chosen by DATA the write emitted,
-              // never by re-deriving what the cross-check did.
-              option_list_unreadable_note:
-                `Written WITHOUT validation against THIS widget's own option list, because that ` +
-                `list could NOT BE READ — not because the value was checked and passed. ` +
-                `Observed on the widget: ` +
-                `${set.option_list_unreadable_detail ?? "its option list could not be READ"}. ` +
-                `The server's own /object_info declares this input's option list EMPTY, so the ` +
-                `valid set is not knowable from the widget itself (#1126). ` +
-                (set.promoted_rail_validated
-                  ? `It was NOT written entirely unchecked: this promoted write also mutates the ` +
-                    `parent subgraph's rail widget, whose option list WAS readable and DOES ` +
-                    `contain this value — the write proceeded only because that list vouched for ` +
-                    `it. The rail is what serializes at queue time, so the value is a real option ` +
-                    `there. `
-                  : `Nothing compared your value to anything. `) +
-                `If the node rejects it at runtime that is the node's answer, not a panel ` +
-                `refusal to retry around. The graph now holds a value this widget's own option ` +
-                `list does not vouch for, so a later reader — including the ComfyUI dropdown ` +
-                `itself — may show it as out-of-range.`,
-            }
-          : {}),
-      });
     }
 
     // No recovery succeeded — refuse honestly with the freshest rejection. The rejection's

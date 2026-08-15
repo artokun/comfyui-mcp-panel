@@ -40,6 +40,10 @@ import { runSetWidget } from "../../web/js/lib/set-widget.js";
 // oracle that gates #507's last-resort acceptance.
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
 import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
+// #1223 — the REAL snapshot, so the #1126 fallback is driven against the DETACHED name-only
+// map production actually hands back, never a hand-rolled full schema.
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -1961,24 +1965,93 @@ const snapshotOpts = (reg, extra = {}) => ({
   ...extra,
 });
 
-test("#1223 × #1126: a SNAPSHOT-sourced empty list does NOT authorize a blind write", async () => {
+/**
+ * The REAL map #1223's fallback hands back — built by driving `record` + `authorize`, never
+ * hand-rolled. This matters: the snapshot deliberately stores a DETACHED map of TYPE NAMES,
+ * every value the shared frozen EMPTY_DEF with no `input` at all (retaining the payload would
+ * let a beforeRegisterNodeDef hook launder frontend-mutated defs back as backend evidence).
+ * A test that supplies a full `starObjectInfo([])` here would be testing a shape production
+ * never produces — which is how the snapshot branch came to be dead code in the first place.
+ */
+function detachedSnapshotDefs(fullMap) {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(
+    snap.record(fullMap, { observedAtEpoch: 7, currentEpoch: 7, whole: true }),
+    true,
+    "fixture precondition: the snapshot accepted the whole map",
+  );
+  const { defs } = snap.authorize({
+    epoch: 7,
+    socketDown: false,
+    // Both transports contacted and silent — the only state that licenses the fallback.
+    outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }, { kind: TRANSPORT_OUTCOME.NOTHING_RETURNED }],
+  });
+  assert.ok(defs, "fixture precondition: the snapshot authorized");
+  return defs;
+}
+
+test("#1223 fixture: the real snapshot map holds NAMES ONLY — it cannot answer an option-list question", () => {
+  // Pins the premise the refusal below rests on, so a future change that re-attached payloads
+  // to the snapshot fails HERE with a clear reason rather than silently reviving a branch that
+  // was reasoned about as unreachable.
+  const defs = detachedSnapshotDefs(starObjectInfo([]));
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(defs, "StarOllamaPromptHelper"),
+    "membership survives — that is what the snapshot is for",
+  );
+  assert.equal(defs["StarOllamaPromptHelper"].input, undefined, "…but the def carries no input");
+  assert.equal(
+    serverDeclaresEmptyComboOptions(defs, "StarOllamaPromptHelper", "model"),
+    false,
+    "so the shape test is ALWAYS false against a snapshot, for every input on every node",
+  );
+});
+
+test("#1223 × #1126: a SNAPSHOT can never authorize the blind write, and says why", async () => {
+  // Driven against the REAL detached map, not a hand-built full one. The shape test cannot
+  // pass here — a name-only map answers "no" for every input in existence — so the honest
+  // outcome is a refusal that names the silent backend rather than the generic end-of-ladder
+  // message, which would send the caller to look at their value instead.
   const { reg, node, widget } = unreadableComboFixture(THROWS);
   await assert.rejects(
     runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
       ...snapshotOpts(reg),
-      // The oracle fell back: this schema is the last-observed one, not the server now.
-      // No cache to drop and no live answer to be had, so the re-ask cannot rescue it.
+      getFreshObjectInfo: async () => detachedSnapshotDefs(starObjectInfo([])),
       schemaProvenance: () => "snapshot",
     }),
     (err) =>
       /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\)/.test(err.message) &&
-      /LAST-OBSERVED schema snapshot/.test(err.message) &&
-      // It must name WHICH fact is missing. "Refresh and retry" is only actionable if the
+      /LAST-OBSERVED one \(#1223\)/.test(err.message) &&
+      /detached map of TYPE NAMES ONLY/.test(err.message) &&
+      // It must name WHICH fact is missing. "Reconnect and retry" is only actionable if the
       // caller knows it is the SCHEMA, not their value, that could not be established.
-      /did not come from the server answering now/.test(err.message) &&
-      /Reconnect to ComfyUI/.test(err.message),
+      /holds no option lists at all/.test(err.message) &&
+      /Reconnect to ComfyUI/.test(err.message) &&
+      // And it must NOT be the cache/stale wording: a map that holds no lists is not a map
+      // holding a stale one, and telling the user to "retry in a moment" would be wrong.
+      !/burst cache/.test(err.message),
   );
-  assert.equal(widget.value, "", "fails closed — no mutation on stale evidence");
+  assert.equal(widget.value, "", "fails closed — a name-only map establishes nothing");
+});
+
+test("#1126: a RECONNECT-SPANNING response is not live — the replaced process cannot authorize", async () => {
+  // object-info-cache deliberately still hands a retired response to its ORIGINAL waiter, and
+  // objectInfoSnapshot.record refuses to file it because observed !== current. The provenance
+  // must apply the same test: a schema describing the ComfyUI process that has been replaced
+  // must not authorize a blind write against the replacement's option lists — a restart is
+  // precisely the event that changes what the server publishes.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "reconnected",
+    }),
+    (err) =>
+      /backend RECONNECTED while that \/object_info request was in flight/.test(err.message) &&
+      /has since been replaced/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — the answer describes a process that is gone");
 });
 
 test("#716 × #1126: a CACHE-HIT empty list does NOT authorize a blind write either", async () => {

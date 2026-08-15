@@ -12115,12 +12115,25 @@ const GRAPH_TOOL_EXECUTORS = {
               whole: true,
             });
           }
-          // #1126 — the SAME fact `record` above is gated on, reported to the lib. A null
-          // epoch means this call did not issue the request: #716's burst cache answered, or
-          // it joined another call's in-flight read. Either way nobody asked the server
-          // during this call, so the payload can be a full TTL old and must not authorize a
-          // blind write against an "empty" option list that may have been filled since.
-          setWidgetSchemaProvenance = observedAtEpoch !== null ? "live" : "cache";
+          // #1126 — the SAME two facts `record` above is gated on, reported to the lib, so the
+          // two can never disagree about whether an answer is usable as backend evidence.
+          //
+          //   * a NULL epoch means this call did not issue the request: #716's burst cache
+          //     answered, or it joined another call's in-flight read. Nobody asked the server
+          //     during this call, so the payload can be a full TTL old.
+          //   * an epoch that NO LONGER MATCHES means the backend reconnected while the
+          //     request was in flight. object-info-cache deliberately still returns a retired
+          //     response to its original waiter, and `record` refuses to file it for exactly
+          //     this reason — it describes a ComfyUI process that has been replaced, and a
+          //     restart is the one event that changes what the server publishes. Calling that
+          //     "live" merely because the loader ran would let the old process's empty option
+          //     list authorize a blind write against the new one's real list.
+          setWidgetSchemaProvenance =
+            observedAtEpoch === null
+              ? "cache"
+              : observedAtEpoch === backendReconnectEpoch
+                ? "live"
+                : "reconnected";
           return recordObjectInfoTypes(defs);
         }
         // #1223 — the probe produced nothing. If it went SILENT (rather than answering
