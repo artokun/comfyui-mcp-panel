@@ -20,6 +20,15 @@
 // corruption shape (an input whose link id is absent from its own graph's link table) is
 // read out of ComfyUI_frontend 1.48.7's `ExecutableNodeDTO.resolveInput`, which throws
 // `InvalidLinkError` on precisely that and nothing else.
+//
+// ## Two claims, deliberately different in strength
+//
+// "These links are gone" is measured. "Therefore the workflow cannot run" is NOT, unless
+// the node is one `graphToPrompt` resolves unconditionally — muted, bypassed and virtual
+// nodes are skipped and reached only through a consumer chain that only ComfyUI's own
+// resolver can walk. Three review rounds killed three attempts to walk it from here, so
+// the module stopped claiming it. Both tiers are pinned below, including the direction
+// that matters most: an unproven finding must never refuse.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -29,9 +38,9 @@ import {
   readLinkIds,
   danglingInputLinks,
   fatalDanglingInputLinks,
-  bypassResolvedInputSlots,
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
+  brokenConversionWarning,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const src = () =>
@@ -76,7 +85,14 @@ const healthySubgraph = () => {
   return g;
 };
 
-// ── The fatal signal ────────────────────────────────────────────────────────────────
+/** A dangling input on an ORDINARY node — the provable tier. */
+const certainlyBrokenSubgraph = () => {
+  const g = healthySubgraph();
+  g._nodes = [ksampler(265, 997)]; // 997 is in no link table
+  return g;
+};
+
+// ── Detection ───────────────────────────────────────────────────────────────────────
 
 test("#1571 the reported corruption is detected, and names the node the run error hid", () => {
   const found = danglingInputLinks(brokenSubgraph());
@@ -89,122 +105,10 @@ test("#1571 the reported corruption is detected, and names the node the run erro
     link_id: 505,
     bypassed: true,
     muted: false,
-    fatal: true,
+    virtual: false,
+    // Bypassed ⇒ reached only through a consumer chain ⇒ not ours to call fatal.
+    certainly_reached: false,
   });
-});
-
-// ── WHICH dangling inputs the serializer actually reaches (codex gate, P1) ──────────
-//
-// `graphToPrompt` skips a node entirely before touching its inputs:
-//   if (node.isVirtualNode || node.mode === NEVER || node.mode === BYPASS) continue
-// and `resolveOutput` returns immediately for NEVER ("Muted nodes produce no output").
-// Refusing on an input nothing resolves would un-ship the tool for graphs that run.
-
-test("#1571 P1 a MUTED node's dangling input is reported but never fatal", () => {
-  const g = brokenSubgraph();
-  g._nodes = [rbg(505, 2)];
-  const [entry] = danglingInputLinks(g);
-  assert.equal(entry.muted, true);
-  assert.equal(entry.fatal, false, "a muted node is never asked for its inputs, so it still queues");
-  assert.deepEqual(fatalDanglingInputLinks(g), [], "and it must not reach the refusal");
-});
-
-test("#1571 P1 a VIRTUAL node's dangling input is reported but never fatal", () => {
-  const g = brokenSubgraph();
-  g._nodes = [{ id: 5, type: "Reroute", mode: 0, isVirtualNode: true, inputs: [{ name: "", link: 505 }] }];
-  const [entry] = danglingInputLinks(g);
-  assert.equal(entry.fatal, false);
-});
-
-test("#1571 P1 an ORDINARY node's dangling input is always fatal", () => {
-  // The mode the reported graph did NOT have, and the one with the widest blast radius:
-  // every input of a live node is resolved.
-  const g = brokenSubgraph();
-  g._nodes = [{ id: 9, type: "KSampler", mode: 0, inputs: [{ name: "positive", type: "CONDITIONING", link: 999 }] }];
-  assert.equal(danglingInputLinks(g)[0].fatal, true);
-  // …and a node with no `mode` at all is an ordinary node.
-  g._nodes = [{ id: 9, type: "KSampler", inputs: [{ name: "positive", link: 999 }] }];
-  assert.equal(danglingInputLinks(g)[0].fatal, true);
-});
-
-test("#1571 P1 a bypassed node's UNSELECTED input is not fatal", () => {
-  // `_getBypassSlotIndex` picks ONE input per output slot. A MASK input on a node whose
-  // only output is IMAGE is never resolved, so its dangling link cannot throw.
-  const g = brokenSubgraph();
-  g._nodes = [
-    {
-      id: 42,
-      type: "ImageBlend",
-      mode: 4,
-      inputs: [
-        { name: "image", type: "IMAGE", link: 473 },
-        { name: "mask", type: "MASK", link: 998 },
-      ],
-      outputs: [{ name: "IMAGE", type: "IMAGE", links: [474] }],
-    },
-  ];
-  const [entry] = danglingInputLinks(g);
-  assert.equal(entry.name, "mask");
-  assert.equal(entry.fatal, false, "no output type selects the MASK input");
-});
-
-test("#1571 P1 a bypassed node with NO connected output reaches nothing", () => {
-  // Bypass is only ever entered THROUGH a consumer. Nothing consumes an unlinked output.
-  const g = brokenSubgraph();
-  const node = rbg(505);
-  node.outputs = [{ name: "conditioning", type: "CONDITIONING", links: [] }];
-  g._nodes = [node];
-  assert.equal(danglingInputLinks(g)[0].fatal, false);
-});
-
-test("#1571 P1 the bypass slot selection mirrors _getBypassSlotIndex", () => {
-  const sel = (node) => [...bypassResolvedInputSlots(node)].sort((a, b) => a - b);
-  // Same-index input, compatible type → that slot.
-  assert.deepEqual(
-    sel({
-      inputs: [{ type: "IMAGE" }, { type: "MASK" }],
-      outputs: [{ type: "IMAGE", links: [1] }],
-    }),
-    [0],
-  );
-  // Same index incompatible → first exact type match.
-  assert.deepEqual(
-    sel({
-      inputs: [{ type: "MASK" }, { type: "IMAGE" }],
-      outputs: [{ type: "IMAGE", links: [1] }],
-    }),
-    [1],
-  );
-  // The same-slot preference BEATS the first exact match, and only a graph with two
-  // equally-typed inputs can tell the two rules apart. Getting this backwards marks the
-  // wrong input fatal in both directions — a false refusal on input 0 and silence on the
-  // one that actually breaks.
-  assert.deepEqual(
-    sel({
-      inputs: [{ type: "IMAGE" }, { type: "IMAGE" }],
-      outputs: [{ type: "LATENT", links: [] }, { type: "IMAGE", links: [1] }],
-    }),
-    [1],
-  );
-  // A wildcard output matches the same index, falling back to slot 0.
-  assert.deepEqual(sel({ inputs: [{ type: "MASK" }], outputs: [{ type: "*", links: [1] }] }), [0]);
-  // A wildcard INPUT is compatible with anything.
-  assert.deepEqual(sel({ inputs: [{ type: "*" }], outputs: [{ type: "LATENT", links: [1] }] }), [0]);
-  // Types are compared case-insensitively, as strings.
-  assert.deepEqual(sel({ inputs: [{ type: "image" }], outputs: [{ type: "IMAGE", links: [1] }] }), [0]);
-  // Unconnected outputs select nothing at all.
-  assert.deepEqual(sel({ inputs: [{ type: "IMAGE" }], outputs: [{ type: "IMAGE", links: [] }] }), []);
-  // Every connected output contributes its own selection.
-  assert.deepEqual(
-    sel({
-      inputs: [{ type: "IMAGE" }, { type: "MASK" }],
-      outputs: [{ type: "IMAGE", links: [1] }, { type: "MASK", links: [2] }],
-    }),
-    [0, 1],
-  );
-  // Junk is silent rather than throwing.
-  assert.deepEqual(sel({}), []);
-  assert.deepEqual(sel({ inputs: null, outputs: "nope" }), []);
 });
 
 test("#1571 a correctly converted subgraph yields nothing", () => {
@@ -279,7 +183,78 @@ test("#1571 the walk stays at ONE level", () => {
   assert.deepEqual(danglingInputLinks(g), []);
 });
 
-// ── The advisory signal ─────────────────────────────────────────────────────────────
+// ── WHICH findings may refuse (codex gate rounds 1–3) ───────────────────────────────
+//
+// `graphToPrompt` skips whole nodes before touching their inputs:
+//   if (node.isVirtualNode || node.mode === NEVER || node.mode === BYPASS) continue
+//   for (const [i, input] of node.inputs.entries()) node.resolveInput(i)   // ALL of them
+//
+// So a node it does NOT skip has every input resolved unconditionally — no type matching,
+// no consumer analysis, nothing to model. That, and only that, may refuse.
+
+test("#1571 an ORDINARY node's dangling input is provably reached", () => {
+  const g = certainlyBrokenSubgraph();
+  const [entry] = danglingInputLinks(g);
+  assert.equal(entry.certainly_reached, true);
+  assert.equal(fatalDanglingInputLinks(g).length, 1, "and it is what the refusal acts on");
+  // …and a node with no `mode` at all is an ordinary node: an unrecognised shape must err
+  // toward reporting a real break, not toward hiding one.
+  g._nodes = [{ id: 9, type: "KSampler", inputs: [{ name: "positive", link: 997 }] }];
+  assert.equal(danglingInputLinks(g)[0].certainly_reached, true);
+});
+
+test("#1571 a MUTED node's dangling input is reported but never refuses", () => {
+  // `resolveOutput` returns immediately for NEVER ("Muted nodes produce no output"), so
+  // neither the node nor its consumers reach the input. Refusing would un-ship the tool
+  // for a graph that queues perfectly well.
+  const g = brokenSubgraph();
+  g._nodes = [rbg(505, 2)];
+  const [entry] = danglingInputLinks(g);
+  assert.equal(entry.muted, true);
+  assert.equal(entry.certainly_reached, false);
+  assert.deepEqual(fatalDanglingInputLinks(g), [], "it must not reach the refusal");
+});
+
+test("#1571 a VIRTUAL node's dangling input is reported but never refuses", () => {
+  const g = brokenSubgraph();
+  g._nodes = [{ id: 5, type: "Reroute", mode: 0, isVirtualNode: true, inputs: [{ name: "", link: 505 }] }];
+  const [entry] = danglingInputLinks(g);
+  assert.equal(entry.virtual, true);
+  assert.equal(entry.certainly_reached, false);
+});
+
+test("#1571 a BYPASSED node's dangling input is reported but never refuses", () => {
+  // The reported case, and the whole point of round 3. Bypass reachability depends on the
+  // CONSUMER's type (`resolveOutput(link.origin_slot, type ?? input.type)`), on whether
+  // that consumer is itself skipped, and on LiteGraph's union-type matching. This module
+  // does not attempt to decide it, so it reports and does not refuse.
+  const g = brokenSubgraph();
+  assert.equal(danglingInputLinks(g)[0].bypassed, true);
+  assert.deepEqual(fatalDanglingInputLinks(g), []);
+});
+
+test("#1571 the refusal tier is decided by the SKIP LIST alone", () => {
+  // Pinned as a table so a future 'improvement' that reintroduces type or consumer
+  // reasoning has to change this test and explain itself.
+  const probe = (node) => {
+    const g = { links: new Map(), _nodes: [{ id: 1, inputs: [{ name: "in", link: 9 }], ...node }] };
+    return danglingInputLinks(g)[0].certainly_reached;
+  };
+  assert.equal(probe({ mode: 0 }), true, "ALWAYS");
+  assert.equal(probe({ mode: 1 }), true, "ON_EVENT");
+  assert.equal(probe({ mode: 3 }), true, "ON_TRIGGER");
+  assert.equal(probe({}), true, "no mode at all");
+  assert.equal(probe({ mode: 2 }), false, "NEVER");
+  assert.equal(probe({ mode: 4 }), false, "BYPASS");
+  assert.equal(probe({ mode: 0, isVirtualNode: true }), false, "virtual");
+  // Type and connectivity must make NO difference — the moment they do, the module is
+  // modelling the resolver again.
+  assert.equal(probe({ mode: 4, outputs: [{ type: "IMAGE", links: [1] }] }), false);
+  assert.equal(probe({ mode: 4, outputs: [] }), false);
+  assert.equal(probe({ mode: 0, outputs: [] }), true);
+});
+
+// ── The boundary signal ─────────────────────────────────────────────────────────────
 
 test("#1571 an unfed boundary input on the new node is reported", () => {
   // The reporter's own words: "avoid exposing a disconnected boundary input". Every slot
@@ -303,62 +278,88 @@ test("#1571 a fully fed subgraph node reports nothing, and junk is silent", () =
   }
 });
 
-// ── The refusal ─────────────────────────────────────────────────────────────────────
+// ── The two messages ────────────────────────────────────────────────────────────────
 
 const refusal = () =>
   brokenConversionRefusal({
+    what: "panel_subgraph_group",
+    subgraphNodeId: 302,
+    dangling: danglingInputLinks(certainlyBrokenSubgraph()),
+    disconnected: [{ slot: 0, name: "conditioning", type: "CONDITIONING" }],
+  });
+
+const warning = () =>
+  brokenConversionWarning({
     what: "panel_subgraph_group",
     subgraphNodeId: 302,
     dangling: danglingInputLinks(brokenSubgraph()),
     disconnected: [{ slot: 0, name: "conditioning", type: "CONDITIONING" }],
   });
 
-test("#1571 the refusal says the subgraph EXISTS — the opposite of its sibling", () => {
+test("#1571 both messages say the subgraph EXISTS — the opposite of their sibling", () => {
   // assertSubgraphNodeLanded's message says "nothing is being reported as created". Reusing
   // that wording here would send the caller to retry and wrap the same nodes a second time,
   // leaving two subgraph nodes on the canvas.
-  const msg = refusal();
-  assert.match(msg, /created subgraph node 302/);
-  assert.match(msg, /on the canvas/);
-  assert.match(msg, /Nothing has been undone/);
-  assert.doesNotMatch(msg, /Nothing is being reported as created/);
+  for (const msg of [refusal(), warning()]) {
+    assert.match(msg, /subgraph node 302/);
+    assert.match(msg, /Nothing has been undone/);
+    assert.doesNotMatch(msg, /Nothing is being reported as created/);
+  }
 });
 
-test("#1571 the refusal names the node, the slot and the link", () => {
-  const msg = refusal();
-  assert.match(msg, /RBG_Smart_Seed_Variance node 192/);
-  assert.match(msg, /input 0 "conditioning"/);
-  assert.match(msg, /link 505/);
-  assert.match(msg, /bypassed/, "the mode matters — a bypassed node is resolved THROUGH");
+test("#1571 both messages name the node, the slot and the link", () => {
+  assert.match(refusal(), /KSampler node 265 input 1 "positive" → link 997/);
+  const w = warning();
+  assert.match(w, /RBG_Smart_Seed_Variance node 192 \(bypassed\) input 0 "conditioning" → link 505/);
+  assert.match(w, /bypassed/, "the mode matters — it is why the verdict is withheld");
 });
 
-test("#1571 the refusal connects itself to the error the run would have shown", () => {
+test("#1571 both messages connect themselves to the error the run would show", () => {
   // The whole cost of the bug: `[302:192]` appeared for the first time at run time, with
   // nothing tying it to the conversion. Printing it here is what closes that gap.
-  assert.match(refusal(), /No link found in parent graph for id \[302:192\] slot \[0\]/);
+  assert.match(refusal(), /No link found in parent graph for id \[302:265\] slot \[1\]/);
+  assert.match(warning(), /No link found in parent graph for id \[302:192\] slot \[0\]/);
 });
 
-test("#1571 the refusal offers both recoveries and does not claim to have repaired anything", () => {
-  const msg = refusal();
-  assert.match(msg, /Ctrl\+Z|undo/i);
-  assert.match(msg, /panel_enter_subgraph/);
-  assert.match(msg, /panel_expose_subgraph_input/);
-  assert.doesNotMatch(msg, /has been (repaired|fixed|reconnected)/i);
+test("#1571 the REFUSAL asserts the workflow cannot run; the WARNING does not", () => {
+  // The distinction the third gate round was about. Overstating the warning is exactly the
+  // failure the refusal tier was narrowed to avoid.
+  assert.match(refusal(), /UNSERIALIZABLE/);
+  assert.match(refusal(), /cannot be run or queued/);
+  assert.match(refusal(), /resolves unconditionally/);
+
+  const w = warning();
+  assert.doesNotMatch(w, /cannot be run or queued/);
+  assert.doesNotMatch(w, /UNSERIALIZABLE/);
+  assert.match(w, /not something the panel can decide/);
+  assert.match(w, /a warning, not a refusal/);
+  assert.match(w, /reported as created/);
+  // And it names who CAN decide, plus the fact that answer is now visible (#1571's other
+  // half) rather than being swallowed.
+  assert.match(w, /Run the workflow to get the authoritative answer/);
+  assert.match(w, /passes that through verbatim/);
 });
 
-test("#1571 the refusal attributes the cause to the frontend, without hiding behind it", () => {
-  const msg = refusal();
-  assert.match(msg, /convertToSubgraph produced this/);
-  assert.match(msg, /comfyui-mcp#1571/);
+test("#1571 both messages offer the recoveries and claim no repair", () => {
+  for (const msg of [refusal(), warning()]) {
+    assert.match(msg, /Ctrl\+Z|undo/i);
+    assert.match(msg, /panel_enter_subgraph/);
+    assert.match(msg, /panel_expose_subgraph_input/);
+    assert.doesNotMatch(msg, /has been (repaired|fixed|reconnected)/i);
+    assert.match(msg, /convertToSubgraph produced this/);
+    assert.match(msg, /comfyui-mcp#1571/);
+  }
 });
 
-test("#1571 the unfed boundary slots ride along in the refusal", () => {
-  assert.match(refusal(), /input slot\(s\) that nothing in the parent graph feeds/);
+test("#1571 the unfed boundary slots ride along in both messages", () => {
+  for (const msg of [refusal(), warning()]) {
+    assert.match(msg, /input slot\(s\) that nothing in the parent graph feeds/);
+  }
   // …and are omitted entirely when there are none, rather than printed as "0".
   const none = brokenConversionRefusal({
     what: "panel_create_subgraph",
     subgraphNodeId: 9,
-    dangling: danglingInputLinks(brokenSubgraph()),
+    dangling: danglingInputLinks(certainlyBrokenSubgraph()),
     disconnected: [],
   });
   assert.doesNotMatch(none, /input slot\(s\) that nothing/);
@@ -371,70 +372,71 @@ test("#1571 a long list of broken inputs stays readable", () => {
     slot: 0,
     name: "in",
     link_id: 1000 + i,
-    bypassed: false,
+    certainly_reached: true,
   }));
-  const msg = brokenConversionRefusal({
-    what: "panel_subgraph_group",
-    subgraphNodeId: 302,
-    dangling: many,
-    disconnected: [],
-  });
-  assert.ok(msg.length < 2000, `refusal must stay readable, was ${msg.length} chars`);
-  assert.match(msg, /and 32 more/);
+  for (const compose of [brokenConversionRefusal, brokenConversionWarning]) {
+    const msg = compose({
+      what: "panel_subgraph_group",
+      subgraphNodeId: 302,
+      dangling: many,
+      disconnected: [],
+    });
+    assert.ok(msg.length < 2200, `message must stay readable, was ${msg.length} chars`);
+    assert.match(msg, /and 32 more/);
+  }
 });
 
-test("#1571 the refusal survives entries it cannot fully describe", () => {
-  // It is composed while explaining a failure; throwing here would replace a useful
-  // refusal with a second, unrelated error.
-  const msg = brokenConversionRefusal({
-    what: "panel_subgraph_group",
-    subgraphNodeId: undefined,
-    dangling: [{ node_id: null, node_type: null, slot: 2, name: null, link_id: 9, bypassed: false }],
-    disconnected: null,
-  });
-  assert.match(msg, /link 9/);
-  assert.match(msg, /input 2/);
+test("#1571 the messages survive entries they cannot fully describe", () => {
+  // They are composed while explaining a failure; throwing here would replace a useful
+  // report with a second, unrelated error.
+  for (const compose of [brokenConversionRefusal, brokenConversionWarning]) {
+    const msg = compose({
+      what: "panel_subgraph_group",
+      subgraphNodeId: undefined,
+      dangling: [{ node_id: null, node_type: null, slot: 2, name: null, link_id: 9 }],
+      disconnected: null,
+    });
+    assert.match(msg, /link 9/);
+    assert.match(msg, /input 2/);
+  }
 });
 
 // ── WIRING. The helpers above are inert unless both conversion tools consult them, and
-//    that is two lines inside a 30k-line file. Deleting either one leaves every test
+//    that is a few lines inside a 30k-line file. Deleting any of them leaves every test
 //    above green — which is exactly how #1571 shipped in the first place.
 
 test("#1571 BOTH conversion paths assert serializability, AFTER the node landed", () => {
   const s = src();
   for (const tool of ["panel_create_subgraph", "panel_subgraph_group"]) {
     const landed = s.indexOf(`assertSubgraphNodeLanded(res, graph, "${tool}")`);
-    const serializable = s.indexOf(`assertSubgraphConversionSerializable(res, `);
     assert.ok(landed > 0, `${tool} must still assert the node landed`);
-    const call = new RegExp(
-      `assertSubgraphConversionSerializable\\(res, \\w+, "${tool}"\\)`,
-    );
+    const call = new RegExp(`assertSubgraphConversionSerializable\\(res, \\w+, "${tool}"\\)`);
     assert.match(s, call, `${tool} must assert the conversion is serializable`);
-    assert.ok(serializable > 0);
     // ORDER: the serializability check reads the node the landing check returned, so a
     // conversion that produced nothing must fail with the sibling's clearer message.
-    assert.ok(
-      s.search(call) > landed,
-      `${tool} must check the node landed BEFORE checking it serializes`,
-    );
+    assert.ok(s.search(call) > landed, `${tool} must check it landed BEFORE checking it serializes`);
   }
+});
+
+test("#1571 only the PROVABLE tier refuses, and the rest becomes a warning", () => {
+  const s = src();
+  assert.match(s, /const certain = dangling\.filter\(\(entry\) => entry\.certainly_reached\);/);
+  assert.match(s, /const unproven = dangling\.filter\(\(entry\) => !entry\.certainly_reached\);/);
+  assert.match(s, /if \(certain\.length\) \{/);
+  assert.match(s, /brokenConversionWarning\(\{ what, subgraphNodeId: node\?\.id, dangling: unproven/);
 });
 
 test("#1571 the advisory findings reach the reported payload on both paths", () => {
   // A finding computed and then dropped on the floor is the same as no finding. This is a
   // one-line spread that no helper test can see.
-  const s = src();
-  const occurrences = s.match(/\.\.\.subgraphConversionAdvisories\(advisories\)/g) ?? [];
+  const occurrences = src().match(/\.\.\.subgraphConversionAdvisories\(advisories\)/g) ?? [];
   assert.equal(occurrences.length, 2, "both conversion tools must report the advisories");
-  // …and only the FATAL findings may refuse (codex gate P1).
-  assert.match(s, /const fatal = dangling\.filter\(\(entry\) => entry\.fatal\);/);
-  assert.match(s, /if \(fatal\.length\) \{/);
 });
 
 test("#1571 the guard is imported, not shadowed by a local stub", () => {
   assert.match(
     src(),
-    /import \{\s*danglingInputLinks,\s*disconnectedBoundaryInputs,\s*brokenConversionRefusal,\s*\} from "\.\/lib\/subgraph-conversion-integrity\.js";/,
+    /import \{\s*danglingInputLinks,\s*disconnectedBoundaryInputs,\s*brokenConversionRefusal,\s*brokenConversionWarning,\s*\} from "\.\/lib\/subgraph-conversion-integrity\.js";/,
   );
 });
 
@@ -454,9 +456,9 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
     /function assertSubgraphConversionSerializable\(res, node, what\) \{[\s\S]*?\r?\n\}/,
   );
   const advisories = s.match(
-    /function subgraphConversionAdvisories\(\{ disconnected, dormant \}\) \{[\s\S]*?\r?\n\}/,
+    /function subgraphConversionAdvisories\(\{ disconnected, dangling, warning \}\) \{[\s\S]*?\r?\n\}/,
   );
-  assert.ok(landed && serializable && advisories, "the conversion guards must be locatable in the source");
+  assert.ok(landed && serializable && advisories, "the conversion guards must be locatable");
   const graph = {
     _nodes: [wrapper],
     getNodeById: (id) => ({ id: Number(id) }),
@@ -487,8 +489,9 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
       "danglingInputLinks",
       "disconnectedBoundaryInputs",
       "brokenConversionRefusal",
+      "brokenConversionWarning",
       `return ${serializable[0]};`,
-    )(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal),
+    )(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal, brokenConversionWarning),
     new Function(`return ${advisories[0]};`)(),
   );
 }
@@ -500,101 +503,57 @@ const wrapperNode = (link) => ({
   inputs: [{ name: "conditioning", type: "CONDITIONING", link }],
 });
 
-test("#1571 BEHAVIOUR: panel_subgraph_group REFUSES the reported conversion", () => {
-  const wrapper = wrapperNode(null);
-  const group = realExecutor(
-    "graph_subgraph_group",
-    "\\{ group \\}",
-    () => ({ node: wrapper, subgraph: brokenSubgraph() }),
-    wrapper,
-  );
-  assert.throws(
-    () => group({ group: "COMBOS VARIANCE" }),
-    (err) => {
-      assert.match(err.message, /panel_subgraph_group created subgraph node 302/);
-      assert.match(err.message, /RBG_Smart_Seed_Variance node 192 \(bypassed\) input 0 "conditioning" → link 505/);
-      assert.match(err.message, /No link found in parent graph for id \[302:192\]/);
-      return true;
-    },
-    "the tool that reported success must now refuse",
-  );
-});
+const runGroup = (subgraph, wrapper) =>
+  realExecutor("graph_subgraph_group", "\\{ group \\}", () => ({ node: wrapper, subgraph }), wrapper)({
+    group: "COMBOS VARIANCE",
+  });
 
-test("#1571 BEHAVIOUR: a healthy conversion still reports success, with the unfed slot named", () => {
-  // The direction that would break the tool for everyone. Same executor, same wrapper —
-  // only the subgraph's link table differs.
+test("#1571 BEHAVIOUR: the reported conversion succeeds, carrying the finding it used to hide", () => {
+  // The reported node is bypassed, so the honest answer is a warning, not a refusal — and
+  // the caller learns the node, slot and link at the moment of the conversion, which is
+  // precisely what they lacked.
   const wrapper = wrapperNode(null);
-  const group = realExecutor(
-    "graph_subgraph_group",
-    "\\{ group \\}",
-    () => ({ node: wrapper, subgraph: healthySubgraph() }),
-    wrapper,
-  );
-  const out = group({ group: "COMBOS VARIANCE" });
+  const out = runGroup(brokenSubgraph(), wrapper);
   assert.equal(out.subgraph.node_id, 302);
   assert.deepEqual(out.subgraph.from_nodes, [192, 265, 273]);
-  // The advisory tier: reported, never fatal.
+  assert.equal(out.subgraph.dangling_inputs.length, 1);
+  assert.equal(out.subgraph.dangling_inputs[0].node_id, 192);
+  assert.equal(out.subgraph.dangling_inputs[0].link_id, 505);
+  assert.match(out.subgraph.warning, /RBG_Smart_Seed_Variance node 192/);
   assert.deepEqual(out.subgraph.unfed_boundary_inputs, [
     { slot: 0, name: "conditioning", type: "CONDITIONING" },
   ]);
 });
 
-test("#1571 BEHAVIOUR: a fully healthy conversion carries no advisory key at all", () => {
-  // An `unfed_boundary_inputs: []` on every clean conversion would read as a finding.
-  const wrapper = wrapperNode(505);
-  const group = realExecutor(
-    "graph_subgraph_group",
-    "\\{ group \\}",
-    () => ({ node: wrapper, subgraph: healthySubgraph() }),
-    wrapper,
+test("#1571 BEHAVIOUR: a PROVABLY broken conversion is refused", () => {
+  const wrapper = wrapperNode(null);
+  assert.throws(
+    () => runGroup(certainlyBrokenSubgraph(), wrapper),
+    (err) => {
+      assert.match(err.message, /panel_subgraph_group created subgraph node 302/);
+      assert.match(err.message, /UNSERIALIZABLE/);
+      assert.match(err.message, /KSampler node 265 input 1 "positive" → link 997/);
+      return true;
+    },
   );
-  const out = group({ group: "COMBOS VARIANCE" });
-  assert.ok(!("unfed_boundary_inputs" in out.subgraph), "a clean conversion reports no advisory");
 });
 
-test("#1571 P1 BEHAVIOUR: a conversion whose only breakage is MUTED still succeeds", () => {
-  // The over-refusal the gate caught, driven through the real executor. This graph queues
-  // today, so the tool must report it — with the finding attached, not swallowed.
-  const wrapper = wrapperNode(505);
-  const muted = brokenSubgraph();
-  muted._nodes = [rbg(505, 2)];
-  const group = realExecutor(
-    "graph_subgraph_group",
-    "\\{ group \\}",
-    () => ({ node: wrapper, subgraph: muted }),
-    wrapper,
-  );
-  const out = group({ group: "COMBOS VARIANCE" });
-  assert.equal(out.subgraph.node_id, 302, "a runnable graph must not be refused");
-  assert.equal(out.subgraph.dangling_inputs_not_reached.length, 1);
-  assert.equal(out.subgraph.dangling_inputs_not_reached[0].node_id, 192);
-  assert.ok(!("unfed_boundary_inputs" in out.subgraph));
+test("#1571 BEHAVIOUR: a healthy conversion carries no advisory key at all", () => {
+  // The direction that would break the tool for everyone. An `unfed_boundary_inputs: []`
+  // or a `warning: null` on every clean conversion reads as a finding.
+  const out = runGroup(healthySubgraph(), wrapperNode(505));
+  assert.equal(out.subgraph.node_id, 302);
+  for (const key of ["unfed_boundary_inputs", "dangling_inputs", "warning"]) {
+    assert.ok(!(key in out.subgraph), `a clean conversion must not report ${key}`);
+  }
 });
 
-test("#1571 P1 the refusal separates what is broken NOW from what is only latent", () => {
-  const g = brokenSubgraph();
-  g._nodes = [rbg(505), { id: 77, type: "Note", mode: 2, inputs: [{ name: "text", link: 997 }] }];
-  const all = danglingInputLinks(g);
-  const msg = brokenConversionRefusal({
-    what: "panel_subgraph_group",
-    subgraphNodeId: 302,
-    dangling: all.filter((e) => e.fatal),
-    dormant: all.filter((e) => !e.fatal),
-    disconnected: [],
-  });
-  assert.match(msg, /1 input inside the new subgraph still references/, "only the fatal one counts");
-  assert.doesNotMatch(msg, /2 inputs inside/, "the dormant one must not inflate the breakage");
-  assert.match(msg, /NOT reached by the serializer today/);
-  assert.match(msg, /Note node 77 \(muted\)/);
-  assert.match(msg, /re-enabled or rewired/);
-});
-
-test("#1571 BEHAVIOUR: panel_create_subgraph refuses the same corruption", () => {
+test("#1571 BEHAVIOUR: panel_create_subgraph refuses the same provable corruption", () => {
   const wrapper = wrapperNode(null);
   const create = realExecutor(
     "graph_create_subgraph",
     "\\{ node_ids \\}",
-    () => ({ node: wrapper, subgraph: brokenSubgraph() }),
+    () => ({ node: wrapper, subgraph: certainlyBrokenSubgraph() }),
     wrapper,
   );
   assert.throws(

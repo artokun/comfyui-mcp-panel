@@ -13,6 +13,7 @@ import {
   danglingInputLinks,
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
+  brokenConversionWarning,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -60,10 +61,11 @@ const assertSubgraphConversionSerializable = new Function(
   "danglingInputLinks",
   "disconnectedBoundaryInputs",
   "brokenConversionRefusal",
+  "brokenConversionWarning",
   `return ${serializableMatch[0]};`,
-)(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal);
+)(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal, brokenConversionWarning);
 const advisoriesMatch = panelSrc.match(
-  /function subgraphConversionAdvisories\(\{ disconnected, dormant \}\) \{[\s\S]*?\r?\n\}/,
+  /function subgraphConversionAdvisories\(\{ disconnected, dangling, warning \}\) \{[\s\S]*?\r?\n\}/,
 );
 assert.ok(advisoriesMatch, "could not locate subgraphConversionAdvisories in panel source");
 const subgraphConversionAdvisories = new Function(`return ${advisoriesMatch[0]};`)();

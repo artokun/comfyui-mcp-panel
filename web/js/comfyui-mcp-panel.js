@@ -286,6 +286,7 @@ import {
   danglingInputLinks,
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
+  brokenConversionWarning,
 } from "./lib/subgraph-conversion-integrity.js";
 import {
   classifyWorkflowRefresh,
@@ -8315,39 +8316,42 @@ function assertSubgraphNodeLanded(res, graph, what) {
  *  success; the workflow could not be run afterwards, and the run's error named a
  *  flattened id (`[302:192]`) with no visible connection to this call.
  *
- *  ONLY the dangling inputs the serializer actually reaches refuse (codex gate P1): a
- *  muted node is never asked for its inputs, and a bypassed node resolves only the one
- *  input its output type selects, so refusing on those would break conversions of graphs
- *  that queue perfectly well.
+ *  It REFUSES only where the break is provable with no modelling at all — a dangling
+ *  input on a node the serializer does not skip, whose every input it therefore resolves
+ *  unconditionally. Corruption on a muted, bypassed or virtual node is reached only
+ *  through a consumer chain that ComfyUI's resolver alone can walk (three review rounds
+ *  killed three attempts to walk it from here), so that tier is reported as a WARNING on
+ *  the success payload instead of refusing a workflow that may run perfectly well.
  *
- *  Returns the ADVISORY (never fatal) findings so the caller can report them on a
- *  conversion that is otherwise fine. See lib/subgraph-conversion-integrity.js for why
- *  the three signals have different weights. */
+ *  Returns the advisory findings so the caller can report them on a conversion that is
+ *  not refused. See lib/subgraph-conversion-integrity.js for the whole argument. */
 function assertSubgraphConversionSerializable(res, node, what) {
   const dangling = danglingInputLinks(res?.subgraph);
-  const fatal = dangling.filter((entry) => entry.fatal);
-  const dormant = dangling.filter((entry) => !entry.fatal);
+  const certain = dangling.filter((entry) => entry.certainly_reached);
+  const unproven = dangling.filter((entry) => !entry.certainly_reached);
   const disconnected = disconnectedBoundaryInputs(node);
-  if (fatal.length) {
+  if (certain.length) {
     throw new Error(
-      brokenConversionRefusal({
-        what,
-        subgraphNodeId: node?.id,
-        dangling: fatal,
-        disconnected,
-        dormant,
-      }),
+      brokenConversionRefusal({ what, subgraphNodeId: node?.id, dangling: certain, disconnected }),
     );
   }
-  return { disconnected, dormant };
+  const warning = unproven.length
+    ? brokenConversionWarning({ what, subgraphNodeId: node?.id, dangling: unproven, disconnected })
+    : null;
+  return { disconnected, dangling: unproven, warning };
 }
 
-/** The advisory keys a CLEAN conversion reports, omitted entirely when empty — an
- *  `unfed_boundary_inputs: []` on every healthy conversion reads as a finding. */
-function subgraphConversionAdvisories({ disconnected, dormant }) {
+/** The advisory keys a conversion reports, omitted entirely when empty — an
+ *  `unfed_boundary_inputs: []` on every healthy conversion reads as a finding.
+ *
+ *  `warning` carries the same findings as PROSE. A caller that reads only the message
+ *  and a caller that reads only the structured list must both learn about the
+ *  corruption; shipping it in one form alone is how a finding goes unnoticed. */
+function subgraphConversionAdvisories({ disconnected, dangling, warning }) {
   return {
     ...(disconnected.length ? { unfed_boundary_inputs: disconnected } : {}),
-    ...(dormant.length ? { dangling_inputs_not_reached: dormant } : {}),
+    ...(dangling.length ? { dangling_inputs: dangling } : {}),
+    ...(warning ? { warning } : {}),
   };
 }
 
