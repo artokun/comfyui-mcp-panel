@@ -2009,6 +2009,51 @@ test("#1223 × #1126: UNKNOWN provenance fails closed — a throwing probe is no
   assert.equal(widget.value, "", "no mutation when provenance could not be established");
 });
 
+test("#1126 e2e: the reply note does not claim 'nothing checked it' when the RAIL did", async () => {
+  // End-to-end through the real ladder: a SINGLE-HOP promotion (so the nested refusal below
+  // does not apply), inner list unreadable, parent rail's list readable and containing the
+  // value. The sibling cross-check compares against that rail and proceeds only on
+  // membership — so the reply must scope its "unvalidated" claim to the widget it is about.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const UUID = "33333333-3333-4333-8333-333333333333";
+  const innerWidget = { name: "model", type: "combo", options: { values: THROWS }, value: "" };
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [innerWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const rail = { name: "model_alias", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: UUID };
+  ctor.comfyClass = UUID;
+  reg[UUID] = ctor;
+  const outer = {
+    id: 320,
+    type: UUID,
+    constructor: ctor,
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [{ name: "model_alias", _widget: rail, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [rail],
+  };
+  const res = await runSetWidget(outer, "model_alias", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+    resolveSource: (_n, si) =>
+      si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null,
+    ...HOOKS,
+  });
+  assert.equal(rail.value, "qwen3-vl:8b");
+  assert.equal(innerWidget.value, "qwen3-vl:8b");
+  assert.equal(res.option_list_unreadable, true, "the inner widget's own list still went unread");
+  assert.equal(res.promoted_rail_validated, true, "…but the rail's list vouched for the value");
+  assert.match(res.option_list_unreadable_note, /NOT written entirely unchecked/);
+  assert.match(res.option_list_unreadable_note, /rail widget, whose option list WAS readable/);
+  assert.doesNotMatch(res.option_list_unreadable_note, /Nothing compared your value to anything/);
+});
+
 // ── #1126: a NESTED promotion is refused, not blind-written ──────────────────────────
 //
 // The rejection this fallback answers describes the IMMEDIATE promoted projection. On a
