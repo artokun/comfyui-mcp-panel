@@ -661,8 +661,8 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
   // race. Both command paths that reach deliverReply mark.
   const marks = (src.match(/^\s*(?:const \w+ = )?rehelloGate\.began\(/gm) || []).length;
   const releases = (src.match(/^\s*rehelloGate\.ended\(mark\);/gm) || []).length;
-  assert.equal(marks, 2, "both command paths that deliver a reply must mark it in flight");
-  assert.equal(releases, 1, "the mark is released in exactly one place — deliverReply");
+  assert.equal(marks, 3, "every command path that WAITS and then replies must mark it in flight");
+  assert.equal(releases, 1, "the deliverReply paths release in exactly one place");
 
   // codex P1 — the release must NAME the mark it is releasing. deliverReply is per-SOCKET
   // while marks are per-COMMAND, and the two lifetimes come apart the moment a connection is
@@ -749,6 +749,76 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
     /const refusalMark = rehelloGate\.began\(\);/,
     "the superseded refusal must balance the release its deliverReply performs",
   );
+});
+
+test("#1095 codex P1: the duplicate-replay wait is marked, and released in a finally", () => {
+  // The #517 replay AWAITS a ledger promise and then answers with a direct `thisSock.send`,
+  // so it holds the route exactly like an executing command — and it is easy to read as
+  // "the reply already exists, nothing to protect". That is wrong when the retry lands on a
+  // REPLACEMENT socket while the original is still running: cancel() invalidated the retired
+  // socket's mark, so without one here the client believes nothing is in flight, and a
+  // workflow switch during the await lets a re-hello withdraw the replacement's route before
+  // the reply is written — the OUTCOME UNKNOWN this whole change exists to prevent.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const sf = ts.createSourceFile(PANEL_JS, src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
+
+  let block = null;
+  (function walk(n) {
+    if (ts.isIfStatement(n) && n.expression.getText(sf) === "priorRidReply !== undefined") block = n;
+    ts.forEachChild(n, walk);
+  })(sf);
+  assert.ok(block, "could not locate the duplicate-replay branch");
+  const body = block.getText(sf);
+  assert.match(body, /const replayMark = rehelloGate\.began\(msg\.cmd\);/, "the wait must be marked");
+  assert.match(body, /await awaitDuplicateReply\(/, "…and the mark must cover the await");
+
+  // The release must be in a `finally`. This branch answers on two of its three exits with a
+  // direct thisSock.send and never reaches deliverReply, so a release placed before any one
+  // `return` is a release the next exit added will miss.
+  let tryStmt = null;
+  (function findTry(n) {
+    if (ts.isTryStatement(n) && !tryStmt && n.getText(sf).includes("rehelloGate.ended(replayMark)")) tryStmt = n;
+    ts.forEachChild(n, findTry);
+  })(block);
+  assert.ok(tryStmt, "the replay mark must be released from a try");
+  assert.ok(tryStmt.finallyBlock, "…specifically a finally, so no exit can skip it");
+  assert.match(
+    tryStmt.finallyBlock.getText(sf),
+    /rehelloGate\.ended\(replayMark\);/,
+    "the finally must release exactly the mark this branch took",
+  );
+  // The mark must be taken OUTSIDE that try — taken inside, a throw before the assignment
+  // would run a finally that releases `undefined` and silently leaks.
+  const markAt = body.indexOf("const replayMark = rehelloGate.began(msg.cmd);");
+  const tryAt = body.indexOf(tryStmt.getText(sf));
+  assert.ok(markAt !== -1 && tryAt !== -1 && markAt < tryAt, "the mark is taken before the try it is released from");
+});
+
+test("#1095 codex P1: the canvas-tool disclosure is decided when the frame LEAVES", () => {
+  // A held frame is sent after a hello the hold expedited, and a landed hello ADVANCES
+  // agentSessionEpoch. Deciding the disclosure at call time therefore decides it for the
+  // agent generation the message will not reach: if the outgoing generation had proven its
+  // tools, `disclose` is false, the NEW generation gets no disclosure, and
+  // canvasToolMessagedEpoch then marks it as prompted — so it never gets the paragraph at
+  // all. Silent, and total for that session.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = src.indexOf("    sendUserMessage(");
+  assert.notEqual(at, -1, "could not locate sendUserMessage");
+  const end = src.indexOf("\n    },", at);
+  const body = src.slice(at, end);
+  const closureAt = body.indexOf("const send = () => {");
+  const planAt = body.indexOf("planCanvasToolDisclosure({");
+  assert.ok(closureAt !== -1 && planAt !== -1, "both the closure and the plan must exist");
+  assert.ok(planAt > closureAt, "the disclosure must be planned INSIDE the deferred send");
+  // …and everything derived from it must live there too, or the recompute is decorative.
+  const outTextAt = body.indexOf("const outText =");
+  const disclosedAt = body.indexOf("const disclosed =");
+  assert.ok(disclosedAt > closureAt && outTextAt > closureAt, "the decision and the text ride with it");
+  // The one-shot context is the opposite case and must stay OUTSIDE: pendingContext is
+  // consumed when the user presses send, and re-reading it at drain time would either lose
+  // it or attach it to the wrong message.
+  const ctxAt = body.indexOf("const mergedContext =");
+  assert.ok(ctxAt !== -1 && ctxAt < closureAt, "the one-shot context is captured at call time");
 });
 
 test("#1095 codex P1: BOTH outbound send paths consult the advertised route first", () => {

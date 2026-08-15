@@ -217,12 +217,38 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     timer = null;
   }
 
-  /** Send now, and hand the SAME outcome to every coalesced caller. Never rejects: a caller
-   *  that cannot tell "did not land" from "threw" would spend a retry budget on neither. */
+  // The advertisement currently ON ITS WAY, or null between advertisements.
+  //
+  // A hello is ASYNCHRONOUS — it awaits the tab-identity lease before it can even build its
+  // payload — so "a hello is happening" is a state with real duration, not an instant. Two
+  // callers that both want the route advertised during that window want the SAME hello, and
+  // without this they got two.
+  //
+  // The path that exposed it is the most common one in this whole feature, not an edge case:
+  // an ordinary workflow switch with an existing session and nothing in flight.
+  // `rehelloForWorkflow` starts the hello and then immediately sends `resume_session`; that
+  // frame finds the route still stale (the hello has not published anything yet), asks to be
+  // held, and the hold's flush started a SECOND full registration — duplicate hello,
+  // duplicate "agent ready" greeting, and TWO agentSessionEpoch increments for one switch.
+  // The doubled epoch is not cosmetic: it feeds the canvas-tool disclosure, whose whole job
+  // is to run exactly once per generation.
+  let inFlight = null;
+
+  /** Send now — or JOIN the advertisement already on its way — and hand the SAME outcome to
+   *  every coalesced caller. Never rejects: a caller that cannot tell "did not land" from
+   *  "threw" would spend a retry budget on neither. */
   function flush() {
     const pending = waiters;
     waiters = null;
     disarmTimer();
+    // Joining is correct rather than merely cheaper: `makePayload` reads the tab identity
+    // AFTER the lease resolves, so an advertisement started a microtask ago has not yet
+    // decided what it carries and will carry whatever is live when it gets there — which is
+    // the identity a later caller is asking it to advertise.
+    if (inFlight) {
+      if (pending) for (const resolve of pending) inFlight.then(resolve);
+      return inFlight;
+    }
     let result;
     try {
       result = send();
@@ -233,6 +259,12 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       (v) => v === true,
       () => false,
     );
+    inFlight = settled;
+    // Cleared once it has SETTLED, so the next request starts a genuinely new advertisement
+    // rather than joining a finished one. `settled` never rejects, so this always runs.
+    void settled.then(() => {
+      if (inFlight === settled) inFlight = null;
+    });
     if (pending) for (const resolve of pending) settled.then(resolve);
     return settled;
   }
@@ -337,6 +369,10 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       disarmTimer();
       live.clear();
       drainDeadline = 0;
+      // The advertisement on its way belongs to the connection being retired. A frame held
+      // on the REPLACEMENT socket must not join it and conclude the new route is published
+      // because the old socket's hello landed.
+      inFlight = null;
       if (pending) for (const resolve of pending) resolve(false);
     },
 

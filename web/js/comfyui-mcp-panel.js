@@ -18852,24 +18852,44 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
         }
         if (priorRidReply !== undefined) {
-          let dupReply;
+          // #1095 — THIS PATH WAITS, AND THEN REPLIES, so it holds the route exactly like an
+          // executing command does and must be marked exactly like one.
+          //
+          // It is easy to read as "the reply already exists, so there is nothing to protect".
+          // That is wrong when the retry arrives on a REPLACEMENT socket while the original
+          // command is still running: the retired socket's mark was invalidated by cancel(),
+          // so without a mark here the client believes nothing is in flight. A workflow
+          // switch during this await then lets a re-hello withdraw the replacement socket's
+          // route before the line below writes the reply — the OUTCOME UNKNOWN this whole
+          // change exists to prevent, reached through the one command path that had no mark.
+          //
+          // Released in `finally` rather than before each `return`: this block has three
+          // exits (a defensive ledger catch, a superseded socket, and the normal reply) and
+          // answers on two of them with a direct `thisSock.send`, never deliverReply. A
+          // finally is the only placement that cannot be missed by a fourth exit added later.
+          const replayMark = rehelloGate.began(msg.cmd);
           try {
-            dupReply = await awaitDuplicateReply(priorRidReply, msg.rid, msg.timeout_ms);
-          } catch {
-            return; // ledger promises never reject — defensive only
+            let dupReply;
+            try {
+              dupReply = await awaitDuplicateReply(priorRidReply, msg.rid, msg.timeout_ms);
+            } catch {
+              return; // ledger promises never reject — defensive only
+            }
+            if (!isActive()) return; // superseded socket — ignore its late frames
+            // Rid REWRITE on a retry hit (#694): the ledger reply is correlated
+            // to the ORIGINAL rid, but the orchestrator's pending map is waiting
+            // on the retry's fresh rid — answer under THAT rid or the retry
+            // still times out.
+            const outReply = retryOfHit ? { ...dupReply, rid: msg.rid } : dupReply;
+            try {
+              if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(outReply));
+            } catch {
+              // Socket died between receive and reply — agent side times out.
+            }
+            return;
+          } finally {
+            rehelloGate.ended(replayMark);
           }
-          if (!isActive()) return; // superseded socket — ignore its late frames
-          // Rid REWRITE on a retry hit (#694): the ledger reply is correlated
-          // to the ORIGINAL rid, but the orchestrator's pending map is waiting
-          // on the retry's fresh rid — answer under THAT rid or the retry
-          // still times out.
-          const outReply = retryOfHit ? { ...dupReply, rid: msg.rid } : dupReply;
-          try {
-            if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(outReply));
-          } catch {
-            // Socket died between receive and reply — agent side times out.
-          }
-          return;
         }
         // #1095 — the command is now IN FLIGHT against this socket's tab mapping, and
         // stays so until deliverReply hands its reply over. That covers an executor that
@@ -19907,6 +19927,22 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       //
       // Prepended, so it reads before the message it rides on: a model with no
       // canvas tools must decide before it starts, not after it has improvised.
+      // #1095 — the frame is BUILT now and SENT possibly a moment later. What the user
+      // supplied is captured HERE, at the instant they pressed send (the merged context in
+      // particular, because `pendingContext` is one-shot and has already been consumed).
+      //
+      // THE DISCLOSURE IS NOT. It is decided inside the closure, against the epoch that is
+      // current when the frame actually leaves, because the hold EXPEDITES a hello and a
+      // landed hello ADVANCES `agentSessionEpoch` — so a decision made out here is a
+      // decision about the agent generation this message will not reach.
+      //
+      // The failure that causes is silent and total: if the outgoing generation had already
+      // proven its canvas tools, `disclose` is false, the NEW generation is handed a message
+      // with no disclosure, and `canvasToolMessagedEpoch` then marks it as prompted. That
+      // generation never gets the paragraph telling it what to do when the panel_* tools are
+      // missing — which is the entire reason #291 put this at the choke point rather than in
+      // the composer.
+      const send = () => {
       const disclosure = planCanvasToolDisclosure({
         agentEpoch: agentSessionEpoch,
         provenEpoch: canvasToolsProvenEpoch,
@@ -19914,11 +19950,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       });
       const disclosed = disclosure.disclose && typeof text === "string";
       const outText = disclosed ? CANVAS_TOOL_DISCLOSURE + text : text;
-      // #1095 — the frame is BUILT now and SENT possibly a moment later, so everything the
-      // send consumes (the merged context, the disclosure decision, the epoch stamps) is
-      // captured here, at the instant the user pressed send. A held frame is therefore
-      // byte-identical to the one that would have gone out immediately.
-      const send = () => {
       try {
         sock.send(
           JSON.stringify({

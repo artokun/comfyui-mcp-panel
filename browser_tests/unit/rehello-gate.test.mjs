@@ -218,16 +218,80 @@ test("#1095: a release that does not NAME its mark frees nothing — it fails cl
   assert.equal(sends.length, 1);
 });
 
-test("#1095: a leaked mark delays the hello but can never block it", () => {
+test("#1095: a leaked mark delays the hello but can never block it", async () => {
   const { gate, sends, advance } = harness();
   gate.began("graph_set_widget"); // never released
   gate.request();
   advance(REHELLO_DEFER_MS + 1);
   assert.equal(sends.length, 1);
-  // …and the tab is not permanently penalised: a later re-advertise is not made to wait out
-  // a budget that has already expired.
+  // A request made while that one is STILL ON ITS WAY joins it rather than starting a
+  // second registration (see the in-flight join below).
+  gate.request();
+  assert.equal(sends.length, 1);
+  // …and once it has settled the tab is not permanently penalised: a later re-advertise is
+  // not made to wait out a budget that has already expired.
+  await new Promise((r) => setTimeout(r, 0));
   gate.request();
   assert.equal(sends.length, 2);
+});
+
+// --- joining an advertisement already on its way (codex P2) ---------------
+
+test("#1095 codex P2: a hold JOINS the advertisement already on its way", async () => {
+  // The most common path in this whole feature, not an edge case: an ordinary workflow
+  // switch with an existing session and nothing in flight. rehelloForWorkflow starts the
+  // hello and immediately sends resume_session; that frame finds the route still stale
+  // (the hello has published nothing yet) and asks to be held. Without the join, the hold
+  // started a SECOND full registration — duplicate hello, duplicate "agent ready" greeting,
+  // and TWO agentSessionEpoch increments for one switch.
+  let hellos = 0;
+  let resolveHello;
+  const gate = createRehelloGate({
+    advertise: () => {
+      hellos++;
+      return new Promise((r) => {
+        resolveHello = r;
+      });
+    },
+    now: () => 0,
+  });
+  const first = gate.request(); // the switch's own hello — nothing in flight, so it goes now
+  assert.equal(hellos, 1);
+  gate.sendAfterAdvertise(() => {}); // resume_session, riding right behind it
+  assert.equal(hellos, 1, "one switch must produce exactly one registration");
+
+  resolveHello(true);
+  assert.equal(await first, true);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(gate.heldFrames(), 0, "the held frame still drains on the joined advertisement");
+});
+
+test("#1095 codex P2: the join ends when the advertisement does", async () => {
+  // Joining a FINISHED advertisement would mean a genuine later switch never gets announced.
+  const { gate, sends } = harness();
+  gate.request();
+  assert.equal(sends.length, 1);
+  await new Promise((r) => setTimeout(r, 0));
+  gate.request();
+  assert.equal(sends.length, 2, "a new switch after the previous hello landed needs its own");
+});
+
+test("#1095 codex P2: a torn-down connection's advertisement is not joined by its replacement", async () => {
+  // cancel() retires the connection. A frame held on the REPLACEMENT socket must not join
+  // the old socket's hello and conclude the new route is published because that one landed.
+  let hellos = 0;
+  const gate = createRehelloGate({
+    advertise: () => {
+      hellos++;
+      return new Promise(() => {}); // never settles — the socket died mid-hello
+    },
+    now: () => 0,
+  });
+  gate.request();
+  assert.equal(hellos, 1);
+  gate.cancel();
+  gate.request();
+  assert.equal(hellos, 2, "the replacement connection advertises for itself");
 });
 
 // --- generation scoping (codex P1) ---------------------------------------
