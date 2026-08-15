@@ -361,6 +361,35 @@ test("#1199 presentation: a recovered MEDIA-LESS run still reports the no-media 
   assert.equal(frame.metadata[0].reconciled, true);
 });
 
+test("#1199 presentation: a recovered STILLS run stamps the real finish in per-output metadata", async () => {
+  // The per-output metadata block is a SECOND consumer of the finish time,
+  // independent of the note. Without this, `finishedAt ?? composedAt` could
+  // decay to the compose clock on the stills path with the whole suite still
+  // green — the machine-readable record would then disagree with the banner
+  // sitting directly above it.
+  const { deps } = makeFrameDeps();
+  const finishedAt = NOW - 2 * DAY;
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-stills",
+      images: [{ filename: "final.png", type: "output" }],
+      videos: [],
+      durationMs: 20_000,
+      finishedAt,
+      reconciled: true,
+    },
+    deps,
+  );
+  assert.equal(
+    frame.metadata[0].finishedAt,
+    new Date(finishedAt).toISOString(),
+    "per-output metadata carries the REAL finish, not the compose clock",
+  );
+  // …and the human-readable bullet carries the full date, not a bare clock time.
+  assert.doesNotMatch(frame.note, /DELIVERY-CLOCK/);
+  assert.match(frame.note, /2 days ago/);
+});
+
 test("#1199 presentation: ages read at the right magnitude", async () => {
   const cases = [
     [30_000, /under a minute ago/],
