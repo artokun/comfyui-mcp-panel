@@ -24592,12 +24592,11 @@ function buildPanel() {
     // #381's turn-ownership rule, extended from usage frames to ALL agent-side
     // records (codex P0 on mcp#884/#897): a live turn's output belongs to the
     // conversation that OWNS the turn — pinned at user_message dispatch and
-    // again at turn:working, and read here through turnOutputFenced() rather
-    // than by naming the owner variable, because record() must never WRITE it
-    // (interactive-card-fence.test.mjs pins exactly that: a record() that
-    // retroactively adopted the minted thread as owner would silently redefine
-    // #381's semantics and turn the card fence's provenance rule into dead
-    // code). If the shown conversation changed mid-turn — a history
+    // again at turn:working, and READ here (through turnOutputFenced) but never
+    // written: interactive-card-fence.test.mjs pins that, because a record()
+    // that retroactively adopted the minted thread as owner would silently
+    // redefine #381's semantics and turn the card fence's provenance rule into
+    // dead code. If the shown conversation changed mid-turn — a history
     // switch in this tab, or this tab passively adopting another tab's shared
     // selection — agent output must not be filed under the conversation now on
     // screen. It is DROPPED, not re-routed to its owner: the turn was
@@ -27944,14 +27943,17 @@ function buildPanel() {
       // Fence FIRST: a card from a turn this tab no longer owns must not paint,
       // and must not revive the working indicator on its way past either.
       //
-      // This is lib/interactive-card-fence.js's classifier, NOT this file's
-      // turnOutputFenced(): the two answer different questions. turnOutputFenced
-      // asks "is the shown conversation the turn's owner", which is right for
-      // transcript output (a say/stream/todo has nowhere legitimate to go when
-      // the answer is no) but WRONG here — it refuses the legitimate card from a
-      // turn that began on an empty view and minted its own conversation, the
-      // null-owner case the fence module works through explicitly. Refusal here
-      // costs the agent a tool error, so it must be the precise test.
+      // mcp#884: this SUPERSEDES the plain `turnOutputFenced()` refusal this
+      // branch originally added here. `classifyInteractiveCard` decides the same
+      // question with strictly more evidence — it also weighs `agentWorking` and
+      // `lastMintedThreadId`, so an owner-less turn that minted its own thread is
+      // not mistaken for a turn painting into somebody else's conversation.
+      //
+      // The two fences are NOT interchangeable, which is why both survive:
+      // turnOutputFenced() asks only "is the shown conversation the turn's
+      // owner", which is right for transcript output (a say/stream/todo has
+      // nowhere legitimate to go when the answer is no) but WRONG here, where a
+      // refusal costs the agent a tool error and so must be the precise test.
       //
       // pinTurnOwnerAtDispatch() (mcp#884) narrows this fence's own documented
       // residual: ownership is now pinned at user_message dispatch, so a turn
@@ -28459,6 +28461,8 @@ function buildPanel() {
         const switched = connectedBackend !== null && connectedBackend !== backend;
         // The backend selection key can change on a real switch AND on a first
         // connect that lands on a different backend than the restored default.
+        // Captured BEFORE `connectedBackend` moves, because that is what the key
+        // is derived from.
         const previousScopeKey = currentHistoryScopeKey();
         if (switched) {
           appendSystem(

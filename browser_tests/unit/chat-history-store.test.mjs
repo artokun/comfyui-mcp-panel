@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 
 import {
   CHAT_HISTORY_LOCAL_SNAPSHOT_KEY,
@@ -2500,4 +2503,110 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
     }
     store.close()
   }
+})
+// ---------------------------------------------------------------------------
+// mcp#884 — THE INVARIANT, pinned as a gate rather than left to inspection.
+//
+// "Sessions are ORCHESTRATOR-scoped, never workflow-scoped or tab-scoped" is a
+// project invariant, and this branch is what makes the panel honour it. The
+// retired workflow/ask machinery is still PRESENT in the panel source as
+// deliberately unreachable defence-in-depth (see historyScopeFollowsPanel()),
+// which is a reasonable choice and also a standing hazard: the whole of it wakes
+// up again the moment chatScopeMode() stops being a constant. Reading the source
+// once proved it is unreachable today; these assertions are what keep it so.
+// ---------------------------------------------------------------------------
+
+const PANEL_SRC = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), '../../web/js/comfyui-mcp-panel.js'),
+  'utf8'
+).replace(/\r\n/g, '\n')
+
+/** The body of a top-level `function name() {` … column-0 `}`. */
+function topLevelFunction(name) {
+  const start = PANEL_SRC.indexOf(`\nfunction ${name}(`)
+  assert.notEqual(start, -1, `${name}() must exist as a top-level function`)
+  const end = PANEL_SRC.indexOf('\n}\n', start)
+  assert.ok(end > start, `${name}() must be closed`)
+  return PANEL_SRC.slice(start, end)
+}
+
+test('mcp#884 chatScopeMode is a CONSTANT — no setting can reintroduce workflow scope', () => {
+  const body = topLevelFunction('chatScopeMode')
+  // Exactly one return, and it is the literal. A `getSetting(...)` read here is
+  // the single edit that would revive every workflow-scoped path below it.
+  const returns = [...body.matchAll(/return\s+([^;]*);/g)].map((m) => m[1].trim())
+  assert.deepEqual(returns, ['"panel"'], 'chatScopeMode() returns the literal "panel" and nothing else')
+  assert.ok(!/getSetting|localStorage|sessionStorage/.test(body), 'it reads no stored value')
+})
+
+test('mcp#884 no chat-scope setting is registered any more', () => {
+  const start = PANEL_SRC.indexOf('function panelSettingsList() {')
+  assert.notEqual(start, -1)
+  const body = PANEL_SRC.slice(start, PANEL_SRC.indexOf('\n}\n', start))
+  // The combo is what wrote the value chatScopeMode() used to read. A row for it
+  // cannot come back without this failing.
+  assert.ok(!/SETTING_CHAT_SCOPE/.test(body), 'the "Chat conversation scope" row stays retired')
+  assert.ok(!/SETTING_SESSION_FOLLOWS_PANEL/.test(body), 'the legacy boolean stays retired')
+  assert.ok(!/applyChatScope/.test(PANEL_SRC.replace(/\/\/[^\n]*/g, '')), 'no live scope switcher hook')
+})
+
+test('mcp#884 currentHistoryScopeKey resolves to a backend axis for a panel-owned chat', () => {
+  const at = PANEL_SRC.indexOf('function currentHistoryScopeKey(')
+  assert.notEqual(at, -1)
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf('\n  }\n', at))
+  // The workflow branch is the unreachable one and must STAY behind the guard —
+  // if the guard is ever deleted, the remaining return must still be the backend
+  // key, never workflowStorageKey().
+  assert.match(
+    body,
+    /return `panel:backend:\$\{/,
+    'the panel-owned answer is keyed on the backend, the same axis as orchestrator::<backend>'
+  )
+  const wfReturn = /if \(!historyScopeFollowsPanel\(\)\) return workflowStorageKey/.test(body)
+  assert.ok(wfReturn, 'the workflow key is reachable ONLY through the historyScopeFollowsPanel() guard')
+})
+
+test('mcp#884 every selection-pointer WRITE uses the backend key, never a workflow key', () => {
+  // The pointer is the one piece of state that decides which conversation a tab
+  // renders and records into. If any writer can address it by a workflow key, the
+  // conversation is workflow-scoped again no matter what chatScopeMode() says.
+  const writes = [...PANEL_SRC.matchAll(/setActiveThread\(\s*([^,]+),/g)]
+    .map((m) => m[1].trim())
+    .filter((arg) => arg !== 'scopeKey' || false)
+  const allowed = new Set([
+    'currentHistoryScopeKey()', // the backend key
+    'scopeKey', // a local already assigned from currentHistoryScopeKey()
+    'key' // the delete sweep, iterating keys that already exist in metadata
+  ])
+  const offenders = writes.filter((arg) => !allowed.has(arg))
+  assert.deepEqual(offenders, [], `setActiveThread called with a non-backend scope key: ${offenders.join(', ')}`)
+
+  // …and the one `scopeKey` local really is the backend key, not a workflow one.
+  assert.match(
+    PANEL_SRC,
+    /const scopeKey = currentHistoryScopeKey\(\);/,
+    'the scopeKey local is assigned from currentHistoryScopeKey()'
+  )
+})
+
+test('mcp#884 the workflow-keyed session bind is unreachable while the chat is panel-owned', () => {
+  // `ssSet(SESSION_KEY, existing?.sessionId || null)` in onWorkflowMaybeChanged is
+  // the exact line that made a session belong to a WORKFLOW. It still exists, and
+  // it is only safe because the panel-owned branch returns before reaching it.
+  const at = PANEL_SRC.indexOf('function onWorkflowMaybeChanged() {')
+  assert.notEqual(at, -1)
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf('\n  }\n', at))
+  const guardAt = body.indexOf('if (followsPanel) {')
+  assert.ok(guardAt > -1, 'the panel-owned branch exists')
+  // The guard block must END in a return, so nothing below it can run.
+  const afterGuard = body.slice(guardAt)
+  const guardEnd = afterGuard.indexOf('\n    }\n')
+  assert.ok(guardEnd > -1, 'the panel-owned branch closes at its own 4-space brace')
+  assert.match(
+    afterGuard.slice(0, guardEnd),
+    /\n {6}return;$/,
+    'the panel-owned branch RETURNS — this is the only thing keeping the workflow-scoped tail dead'
+  )
+  const tail = body.slice(guardAt + guardEnd)
+  assert.match(tail, /ssSet\(SESSION_KEY, existing\?\.sessionId/, 'the workflow-keyed bind lives in the dead tail')
 })

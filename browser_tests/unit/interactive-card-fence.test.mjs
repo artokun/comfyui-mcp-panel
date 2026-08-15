@@ -341,7 +341,19 @@ test("the owner-less rule is PROVENANCE: record()'s mint is lastMintedThreadId's
   // record() must NOT retroactively adopt the minted thread as the turn OWNER —
   // if it did, #381's liveTurnThreadId semantics would change under it and this
   // rule would be dead code pretending to guard.
-  assert.ok(!record.includes("liveTurnThreadId"), "record() does not write the turn owner");
+  //
+  // Matched as an ASSIGNMENT rather than a mention (mcp#884). Reading the turn
+  // owner inside record() is legitimate and now happens: the abandoned-turn
+  // output fence consults it to drop a straggler that belongs to a conversation
+  // no longer on screen. A bare substring test also failed on the COMMENT that
+  // explains that fence, which is the prose-predicate trap — it would have been
+  // "fixed" by renaming a comment, leaving the real rule unguarded. The forms
+  // enumerated here are the same ones the write-enumeration above accepts, so a
+  // `liveTurnThreadId ||= thread.id` smuggled into record() still fails.
+  const ownerWrites = [
+    ...record.matchAll(/liveTurnThreadId\s*(?:\|\||\?\?|&&|[+\-*/%])?=(?!=)([^;]*);/g),
+  ].map((m) => m[1].trim());
+  assert.deepEqual(ownerWrites, [], "record() does not write the turn owner");
 });
 
 test("loadThread's BLOCKED cross-workflow branch is why the owner-less rule needs provenance", () => {
