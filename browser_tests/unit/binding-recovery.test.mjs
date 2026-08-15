@@ -705,3 +705,241 @@ test("#606 the binding refusal marks the reload remedy as REQUESTED, not confirm
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// #1209 — the fence is refreshed BEFORE the refusal, not only after it
+//
+// #607 made the recovery reachable. It is edge-triggered on an actual refusal, so
+// the first graph call after the panel's live identity moved still fails and the
+// reporter still spends a panel_set_workflow_target({mode:"current"}) round-trip on
+// a stale fence the panel could already see.
+//
+// It moves without a tab switch. The switch-path re-hello is gated on
+// workflowTabId() changing, and that id is the saved HANDLE (`wf:<path>`): a workflow
+// replaced IN PLACE under the same tab keeps it while workflowStableUuid() — the
+// per-instance fence identity — is re-minted. Two reporters hit exactly that, one
+// after a tab switch and one on the FIRST call of a brand-new session.
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the budget block, the #607 hook AND the #1209 drift hook together, so the
+ * delegation between them is the shipping one. Deleting the drift hook, or making it
+ * fire unconditionally, fails a test below.
+ */
+function buildDriftHook({ sendHello, stableUuid }) {
+  const declStart = SRC.indexOf("const MISMATCH_REHELLO_MAX_PER_IDENTITY");
+  assert.notEqual(declStart, -1, "the re-hello budget constants are missing");
+  const marker = "workflowIdentityDriftRehello = () => {";
+  const bodyStart = SRC.indexOf(marker);
+  assert.notEqual(bodyStart, -1, "the bridge client must register the drift re-hello hook");
+  // Same brace arithmetic as buildRehelloHook: the marker ENDS with the body's own
+  // "{", and the slice must end at that index plus the body length (using bodyStart
+  // silently lops the tail off and every assertion below becomes meaningless).
+  const bodyOpen = bodyStart + marker.length - 1;
+  const body = balancedFrom(SRC, marker, bodyOpen);
+  const slice = SRC.slice(declStart, bodyOpen + body.length);
+  assert.ok(
+    slice.includes("workflowInstanceMismatchRehello() === true"),
+    "the drift hook must reuse the bounded #607 send, and charge only a DISPATCHED one",
+  );
+  assert.ok(
+    slice.includes("driftRehelloUnconverged = 0;"),
+    "the extracted region is truncated — the drift bound's replenishment is missing",
+  );
+  assert.ok(
+    slice.includes("mismatchRehelloLandedCount += 1;"),
+    "the extracted region is truncated — the #607 landed bookkeeping is missing",
+  );
+  const factory = new Function(
+    "sendHello",
+    "workflowStableUuid",
+    `let workflowInstanceMismatchRehello = null;\n` +
+      `let workflowIdentityDriftRehello = null;\n${slice};\n` +
+      `return {\n` +
+      `  drift: workflowIdentityDriftRehello,\n` +
+      `  mismatch: workflowInstanceMismatchRehello,\n` +
+      `  advertise: (uuid) => { lastAdvertisedWorkflowUuid = uuid; },\n` +
+      `};`,
+  );
+  return factory(sendHello, stableUuid);
+}
+
+test("#1209 a fence that drifted under an unchanged route is re-advertised, unprompted", async () => {
+  // The reported shape: the orchestrator was told A at connect, the canvas is now B,
+  // and NOTHING has been refused yet. Before this fix the panel sat on that until a
+  // command failed; the reporter's next read-only panel_graph_outline was that command.
+  let live = "uuid-A";
+  const dbl = helloDouble(() => live);
+  const h = buildDriftHook({ sendHello: () => dbl.send(), stableUuid: () => live });
+  dbl.harness = h;
+  h.advertise("uuid-A");
+
+  h.drift();
+  await settle();
+  assert.equal(dbl.calls.length, 0, "a fence that still names the live canvas sends nothing");
+
+  live = "uuid-B"; // in-place replace: same wf:<path> route, fresh instance uuid
+  h.drift();
+  await settle();
+  assert.deepEqual(dbl.calls, ["uuid-B"], "the drifted fence is re-advertised without a refusal");
+
+  // …and it QUIESCES: once the advertisement lands, the panel and the orchestrator
+  // agree again, so the 600ms poll must stop sending. A re-hello per tick would be a
+  // greeting storm — the exact failure the tmp:-id churn produced.
+  for (let i = 0; i < 10; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 1, "an advertisement that landed ends the drift");
+});
+
+test("#1209 an idle panel spends none of the bound a later real drift needs", async () => {
+  // Equality is the common case — it runs on every poll tick. A hook that spent the
+  // bound on the no-drift path would leave a genuine later drift with nothing to
+  // spend, which is the wedge, not the fix.
+  let live = "uuid-A";
+  const dbl = helloDouble(() => live);
+  const h = buildDriftHook({ sendHello: () => dbl.send(), stableUuid: () => live });
+  dbl.harness = h;
+  h.advertise("uuid-A");
+  for (let i = 0; i < 50; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.started, 0, "an idle panel sends nothing");
+
+  // …and the drift it had been idling through is still advertised when it arrives.
+  live = "uuid-B";
+  h.drift();
+  await settle();
+  assert.deepEqual(dbl.calls, ["uuid-B"], "the budget was not spent while nothing had drifted");
+});
+
+test("#1209 nothing advertised yet is not a drift — the open hello carries the truth", async () => {
+  // A fresh or reconnecting socket has told the orchestrator nothing, so there is no
+  // stale cache to correct and firing here would only race the hello that is coming.
+  const dbl = helloDouble(() => "uuid-LIVE");
+  const h = buildDriftHook({ sendHello: () => dbl.send(), stableUuid: () => "uuid-LIVE" });
+  dbl.harness = h;
+  h.drift();
+  await settle();
+  assert.equal(dbl.started, 0, "an unadvertised socket must not re-hello");
+});
+
+test("#1209 an identity that cannot be READ is not an identity known to differ", async () => {
+  const dbl = helloDouble(() => "uuid-A");
+  const h = buildDriftHook({
+    sendHello: () => dbl.send(),
+    stableUuid: () => {
+      throw new Error("no workflow service");
+    },
+  });
+  dbl.harness = h;
+  h.advertise("uuid-A");
+  h.drift();
+  await settle();
+  assert.equal(dbl.started, 0, "an unreadable identity re-hellos nothing");
+});
+
+test("#1209 a drift that cannot be advertised is BOUNDED, like the refusal path", async () => {
+  // An orchestrator that takes the hello and keeps its old stamp (the harness never
+  // republishes) must not turn a 600ms poll into an unbounded re-hello loop — a churn
+  // is a new wedge, not a fix.
+  const dbl = helloDouble(() => "uuid-B");
+  const h = buildDriftHook({ sendHello: () => dbl.send(), stableUuid: () => "uuid-B" });
+  dbl.harness = { advertise: () => {} };
+  h.advertise("uuid-A");
+  for (let i = 0; i < 25; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "a drift that never clears stops churning");
+});
+
+test("#1209 convergence is what replenishes the bound — a switch after a stuck one still lands", async () => {
+  // The bound above must not be a one-way ratchet for the LIFE of the socket. Once an
+  // advertisement demonstrably reached the orchestrator (what it was told names the
+  // live canvas), re-advertising is proven to work here and the next genuine drift —
+  // hours and many workflow switches later — gets the full bound again.
+  let live = "uuid-B";
+  const dbl = helloDouble(() => live);
+  const h = buildDriftHook({ sendHello: () => dbl.send(), stableUuid: () => live });
+  // Phase 1: an orchestrator that takes the hellos and keeps its old stamp. Three
+  // tries, then quiet.
+  dbl.harness = { advertise: () => {} };
+  h.advertise("uuid-A");
+  for (let i = 0; i < 12; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "the stuck identity exhausted the bound");
+
+  // Phase 2: the panel and the orchestrator agree again (a reconnect's open hello, or
+  // the switch-path re-hello, landed). One converged observation, and the mechanism is
+  // live again.
+  dbl.harness = h;
+  h.advertise("uuid-B");
+  h.drift();
+  await settle();
+  assert.equal(dbl.calls.length, 3, "convergence itself sends nothing");
+  live = "uuid-C";
+  h.drift();
+  await settle();
+  assert.deepEqual(dbl.calls.slice(3), ["uuid-C"], "the next real drift is advertised again");
+});
+
+test("#1209 an attempt the #607 guards refused does not spend the drift bound", async () => {
+  // The bound counts re-hellos that were DISPATCHED. #607 refuses one while another is
+  // in flight, and charging the bound for those would burn it on sends that never
+  // happened — the same "recorded before it happened" defect the #607 budget itself
+  // exists to avoid, seen from the caller's side.
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  const dbl = helloDouble(() => "uuid-B", { defer: gate });
+  const h = buildDriftHook({ sendHello: () => dbl.send(), stableUuid: () => "uuid-B" });
+  dbl.harness = { advertise: () => {} };
+  h.advertise("uuid-A");
+
+  for (let i = 0; i < 8; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.started, 1, "the in-flight guard held the burst to one send");
+
+  release();
+  await settle();
+  await settle();
+  // Two dispatches remain, not zero: the seven refused ticks cost nothing.
+  for (let i = 0; i < 8; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.started, 3, "the refused ticks left the rest of the bound intact");
+});
+
+test("#1209 the workflow poll calls the drift check when the ROUTE did not change", () => {
+  // The whole fix is one call on the poll's early-return path, and a hook nobody
+  // invokes is invisible to every test above. This asserts the wiring itself: restore
+  // the bare `return` and this fails.
+  const marker = "if (wfid === currentWorkflowId) {";
+  assert.ok(SRC.includes(marker), "the no-route-change branch must still exist");
+  const branch = balancedFrom(SRC, marker, SRC.indexOf(marker) + marker.length - 1);
+  assert.match(
+    branch,
+    /noteWorkflowIdentityDrift\(\);/,
+    "an unchanged route must still re-check the workflow INSTANCE identity",
+  );
+});
+
+test("#1209 a throwing drift hook never breaks the workflow poll", () => {
+  const src = balancedFrom(SRC, "function noteWorkflowIdentityDrift()");
+  const fn = new Function(
+    "workflowIdentityDriftRehello",
+    `${src}\nreturn noteWorkflowIdentityDrift;`,
+  )(() => {
+    throw new Error("hook exploded");
+  });
+  assert.doesNotThrow(() => fn(), "the poll must survive a hook that throws");
+});

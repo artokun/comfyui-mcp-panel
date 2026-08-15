@@ -3088,6 +3088,38 @@ function noteWorkflowInstanceMismatch() {
     // best-effort — the refusal stands regardless
   }
 }
+// #1209 — the SAME re-advertisement, fired BEFORE the refusal instead of after it.
+//
+// #607 made the recovery reachable; it did not make it unnecessary. The re-hello is
+// edge-triggered on an actual refusal, so the FIRST graph call after the panel's live
+// identity moved still fails, and the reporter has to spend a
+// panel_set_workflow_target({mode:"current"}) round-trip on a fence the panel could
+// already see was stale.
+//
+// It moves without a tab switch, which is why the switch-path re-hello does not cover
+// it: the re-hello in the workflow poll is gated on workflowTabId() changing, and that
+// id is the saved HANDLE (`wf:<path>`) — it is UNCHANGED when a workflow is replaced
+// in place under the same tab (a load into the open canvas, a reopen of the same path,
+// ComfyUI restoring the tab at startup). workflowStableUuid() is per-INSTANCE and the
+// loadGraphData wrapper re-mints it on exactly those in-place replacements, so the
+// fence identity changes while the route the poll watches does not. Two reporters hit
+// that: one after a tab switch, one on the FIRST call of a brand-new session with no
+// switch and no mutation before it.
+//
+// The predicate is the panel's own record of what it TOLD the orchestrator
+// (`lastAdvertisedWorkflowUuid`, published only by a hello that reached the wire)
+// against what is live now. Those differing IS the stale fence, observed from the only
+// side that holds both halves. Nothing here weakens the fence: mutations stay
+// fail-closed against whatever stamp is current, and this only replaces a stamp the
+// panel can prove is out of date with the one it would have refused in favour of.
+let workflowIdentityDriftRehello = null;
+function noteWorkflowIdentityDrift() {
+  try {
+    workflowIdentityDriftRehello?.();
+  } catch {
+    // best-effort — a hook throw must never break the workflow poll
+  }
+}
 /** #750 — the ONE spelling of the fence refusal, reporting WHAT WAS COMPARED
  *  rather than inferring why the two differed.
  *
@@ -19604,19 +19636,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     } catch {
       liveUuid = null;
     }
-    if (!liveUuid) return;
+    if (!liveUuid) return false;
     if (liveUuid !== mismatchRehelloIdentity) {
       mismatchRehelloIdentity = liveUuid;
       mismatchRehelloLandedCount = 0;
       lastFailedMismatchRehelloAt = 0;
     }
-    if (mismatchRehelloLandedCount >= MISMATCH_REHELLO_MAX_PER_IDENTITY) return;
-    if (mismatchRehelloInFlight) return;
+    if (mismatchRehelloLandedCount >= MISMATCH_REHELLO_MAX_PER_IDENTITY) return false;
+    if (mismatchRehelloInFlight) return false;
     if (
       lastFailedMismatchRehelloAt &&
       Date.now() - lastFailedMismatchRehelloAt < MISMATCH_REHELLO_BACKOFF_MS
     )
-      return;
+      return false;
     mismatchRehelloInFlight = true;
     void Promise.resolve()
       .then(() => sendHello())
@@ -19638,6 +19670,60 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           lastFailedMismatchRehelloAt = Date.now();
         }
       });
+    // Whether a send was DISPATCHED — not whether it landed, which the bookkeeping
+    // above already tracks. #1209's proactive caller charges its own bound on this,
+    // and charging it for an attempt every guard above refused would spend the
+    // re-advertisements a real drift still needs (the "recorded before it happened"
+    // defect, from the other side).
+    return true;
+  };
+
+  // #1209 — proactive half of the same mechanism: re-advertise when the panel can
+  // already SEE that what the orchestrator was last told no longer names the live
+  // canvas, rather than waiting for a command to be refused for saying so.
+  //
+  // Delegates the send to the hook above rather than repeating it, so the per-identity
+  // budget, the backoff and the in-flight guard all apply unchanged.
+  //
+  // IT NEEDS A BOUND OF ITS OWN, and this is the whole reason the proactive path is
+  // not simply the #607 hook wired to the poll. #607 is EDGE-triggered on a refusal,
+  // which only happens when a command is dispatched; this runs on the 600ms workflow
+  // poll, so an identity that never settles would re-hello forever — a greeting storm,
+  // exactly what the churning tmp: id produced before it was keyed on the workflow
+  // OBJECT. #607's own budget cannot hold that: it is keyed on the LIVE identity and
+  // resets the moment that identity changes, which under churn is every tick.
+  //
+  // So: count consecutive attempts that did NOT converge, and let only convergence
+  // replenish them. Convergence — what the orchestrator was last told naming the live
+  // canvas — is the one observation that proves re-advertising works here, and it is
+  // the common case on a settled panel. An identity that never converges is one this
+  // mechanism cannot fix, and it goes quiet after three tries; the #607 refusal path
+  // is untouched and still recovers on demand, which is today's behaviour.
+  //
+  // The two early exits are refusals to act on an unknown, not optimisations:
+  //   - nothing advertised yet (a fresh or reconnecting socket) means there is no
+  //     stale cache to correct — the hello that is about to fire carries the truth,
+  //     and firing another one here would only race it.
+  //   - an identity that cannot be READ is not an identity known to differ, and it is
+  //     not convergence either, so it neither spends the bound nor replenishes it.
+  const DRIFT_REHELLO_MAX_UNCONVERGED = 3;
+  let driftRehelloUnconverged = 0;
+  workflowIdentityDriftRehello = () => {
+    if (typeof lastAdvertisedWorkflowUuid !== "string" || !lastAdvertisedWorkflowUuid) return;
+    let liveUuid = null;
+    try {
+      const read = workflowStableUuid();
+      liveUuid = typeof read === "string" && read ? read : null;
+    } catch {
+      liveUuid = null;
+    }
+    if (!liveUuid) return;
+    if (liveUuid === lastAdvertisedWorkflowUuid) {
+      driftRehelloUnconverged = 0;
+      return;
+    }
+    if (driftRehelloUnconverged >= DRIFT_REHELLO_MAX_UNCONVERGED) return;
+    if (workflowInstanceMismatchRehello() === true) driftRehelloUnconverged += 1;
   };
 
   // When the workflow title changes (rename / open a different file / progress
@@ -27003,7 +27089,21 @@ function buildPanel() {
     const wf = activeWorkflowRef();
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
-    if (wfid === currentWorkflowId) return; // case 1: no change
+    if (wfid === currentWorkflowId) {
+      // #1209 — the ROUTE is unchanged; the workflow INSTANCE identity under it may
+      // not be. `wfid` is the saved handle (`wf:<path>`), so a workflow replaced in
+      // place — loaded into the open canvas, reopened at the same path, restored at
+      // startup — lands here with a freshly minted fence uuid and, before this call,
+      // no re-advertisement at all. The orchestrator kept stamping graph commands
+      // with the identity it was told at connect, and the next one was refused as a
+      // `workflow instance mismatch`.
+      //
+      // The check itself is a string compare against what the last LANDED hello
+      // carried, so the settled case (the overwhelming majority of the 600ms ticks
+      // that reach this line) costs one comparison and sends nothing.
+      noteWorkflowIdentityDrift();
+      return; // case 1: no change
+    }
 
     const initial = currentWorkflowId == null;
     const followsPanel = historyScopeFollowsPanel();
