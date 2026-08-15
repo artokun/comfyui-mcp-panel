@@ -12,6 +12,7 @@ import {
   isThreadInScope,
   mergeHistorySnapshots,
   normalizeThread,
+  panelScopeKeyForBackend,
   resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
@@ -1213,10 +1214,13 @@ test('a stale panel pointer loses to a newer retired-mode selection, never to me
 // Gate P0-2: the selection pointer is BACKEND-scoped (one conversation per
 // backend, mirroring the orchestrator's orchestrator::<backend> session key).
 test('panel selection is backend-scoped with a one-way legacy fallback', () => {
+  // `provider` is the ownership stamp record() writes on mint and on every append.
+  // It is what forks the LEGACY route per backend (mcp#884) — see the dedicated
+  // upgrade test below.
   const threads = [
-    { id: 'claude-thread', updatedAt: 100, msgs: [] },
-    { id: 'codex-thread', updatedAt: 200, msgs: [] },
-    { id: 'legacy-thread', updatedAt: 50, msgs: [] }
+    { id: 'claude-thread', provider: 'claude', updatedAt: 100, msgs: [] },
+    { id: 'codex-thread', provider: 'codex', updatedAt: 200, msgs: [] },
+    { id: 'legacy-thread', provider: 'claude', updatedAt: 50, msgs: [] }
   ]
   let meta = updateMetadataEntry(
     {},
@@ -1271,10 +1275,111 @@ test('panel selection is backend-scoped with a one-way legacy fallback', () => {
   assert.equal(clearedPointer.activeId, null)
   assert.equal(clearedPointer.cleared, true)
   assert.equal(selectPanelThread(threads, cleared, { scopeKey: 'panel:backend:claude' }), null)
-  // The legacy pointer still serves OTHER backends that never migrated.
+  // The legacy pointer serves other backends only where it can — and it CANNOT here.
+  // `legacy-thread` is claude's (provider: 'claude'); handing it to codex as well is
+  // precisely the shared-transcript corruption the fork rule exists to stop. Codex
+  // resolves its OWN most recent conversation instead.
   assert.equal(
     selectPanelThread(threads, cleared, { scopeKey: 'panel:backend:codex' })?.id,
-    'legacy-thread'
+    'codex-thread'
+  )
+})
+
+test('mcp#884 UPGRADE: one legacy pointer never becomes TWO backends conversation', () => {
+  // THE UPGRADE PATH EVERY EXISTING USER TAKES. A pre-upgrade snapshot has a single
+  // shared `panel:global` pointer and no per-backend keys, so before the fork every
+  // backend key fell back to the SAME thread id. Claude and Codex both claimed it,
+  // `loadThread` scrubbed its foreign session, and `record()` rewrote its provider on
+  // every append — two providers sharing and corrupting one transcript.
+  const legacy = { id: 'the-one-conversation', provider: 'claude', updatedAt: 500, msgs: [] }
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'the-one-conversation',
+    { updatedAt: 500, writerId: 'pre-upgrade', sequence: 1 }
+  )
+
+  const forClaude = selectPanelThread([legacy], meta, { scopeKey: 'panel:backend:claude' })
+  const forCodex = selectPanelThread([legacy], meta, { scopeKey: 'panel:backend:codex' })
+
+  // The owner keeps it — the single-backend upgrade, which is the common case, is
+  // completely unaffected.
+  assert.equal(forClaude?.id, 'the-one-conversation', 'the owning backend still adopts it')
+  // …and nobody else does.
+  assert.equal(forCodex, null, 'a second backend must NOT resolve the same conversation')
+  assert.notEqual(
+    forClaude?.id,
+    forCodex?.id,
+    'two backends resolving one thread id is the corruption this rule exists to prevent'
+  )
+
+  // Stated for a third backend too: the rule is "only the owner", not "only the second
+  // one loses".
+  assert.equal(selectPanelThread([legacy], meta, { scopeKey: 'panel:backend:gemini' }), null)
+
+  // The legacy thread is NOT deleted — it stays in history and opens through the picker
+  // like any archived conversation, exactly as the retired per-workflow threads do.
+  assert.ok([legacy].includes(legacy))
+})
+
+test('mcp#884 UPGRADE: a provider-less legacy thread fails CLOSED rather than into every backend', () => {
+  // Very old snapshots can carry a thread with no provider stamp. There is no evidence
+  // of ownership, so no backend auto-adopts it: fail-open here is exactly the collision
+  // above, and the cost of failing closed is bounded and non-destructive (the
+  // conversation stays in history and opens through the picker).
+  const orphan = { id: 'no-provider', updatedAt: 500, msgs: [] }
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'no-provider',
+    { updatedAt: 500, writerId: 'pre-upgrade', sequence: 1 }
+  )
+  for (const backend of ['claude', 'codex', 'gemini']) {
+    assert.equal(
+      selectPanelThread([orphan], meta, { scopeKey: `panel:backend:${backend}` }),
+      null,
+      `${backend} must not claim a conversation nothing attributes to it`
+    )
+  }
+})
+
+test('mcp#884 UPGRADE: the no-pointer recency fallback is forked per backend too', () => {
+  // The OTHER door into the same collision, and the one a fix aimed only at the legacy
+  // POINTER would miss: a snapshot with no panel pointer at all fell through to
+  // "most recently updated thread", which is equally the same id for every backend.
+  const threads = [
+    { id: 'codex-newest', provider: 'codex', updatedAt: 900, msgs: [] },
+    { id: 'claude-older', provider: 'claude', updatedAt: 100, msgs: [] }
+  ]
+  assert.equal(
+    selectPanelThread(threads, {}, { scopeKey: 'panel:backend:claude' })?.id,
+    'claude-older',
+    'claude falls back to ITS most recent conversation, not the globally newest one'
+  )
+  assert.equal(
+    selectPanelThread(threads, {}, { scopeKey: 'panel:backend:codex' })?.id,
+    'codex-newest'
+  )
+})
+
+test('mcp#884 a backend pointer this backend WROTE is honoured whatever the provider stamp says', () => {
+  // The fork must not become a second, stricter gate on normal operation. A thread
+  // legitimately changes provider when the user switches backends while it is open, so
+  // a pointer the backend wrote for itself is its own evidence and outranks the stamp.
+  const threads = [{ id: 'mine', provider: 'claude', updatedAt: 100, msgs: [] }]
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:backend:codex',
+    'mine',
+    { updatedAt: 1_000, writerId: 'codex-tab', sequence: 1 }
+  )
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:codex' })?.id,
+    'mine',
+    'codex selected this conversation itself — the stale provider stamp must not veto that'
   )
 })
 
@@ -2557,11 +2662,16 @@ test('mcp#884 currentHistoryScopeKey resolves to a backend axis for a panel-owne
   // The workflow branch is the unreachable one and must STAY behind the guard —
   // if the guard is ever deleted, the remaining return must still be the backend
   // key, never workflowStorageKey().
+  // The key is built by the store's exported helper now (mcp#884), so the panel and the
+  // backend-switch path cannot interpolate two different shapes for the same axis.
   assert.match(
     body,
-    /return `panel:backend:\$\{/,
+    /return panelScopeKeyForBackend\(/,
     'the panel-owned answer is keyed on the backend, the same axis as orchestrator::<backend>'
   )
+  // …and the helper really does produce that axis, so this is not just a rename.
+  assert.equal(panelScopeKeyForBackend('codex'), 'panel:backend:codex')
+  assert.equal(panelScopeKeyForBackend(null), 'panel:backend:claude', 'the documented default')
   const wfReturn = /if \(!historyScopeFollowsPanel\(\)\) return workflowStorageKey/.test(body)
   assert.ok(wfReturn, 'the workflow key is reachable ONLY through the historyScopeFollowsPanel() guard')
 })

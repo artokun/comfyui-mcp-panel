@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { BACKEND_SWITCH, runBackendSwitch } from "../../web/js/lib/backend-switch.js";
+import { BACKEND_SWITCH, planBackendHandover, runBackendSwitch } from "../../web/js/lib/backend-switch.js";
 
 const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -29,13 +29,32 @@ const PANEL_SRC = readFileSync(
  * Every commit the panel performs is represented, because each is a distinct piece of
  * leaked state and asserting on a sampled subset is how five of six leaks stay invisible.
  */
-function recorder({ live = "claude", picked = "claude", invalidate = async () => true, replay = "prior chat" } = {}) {
+function recorder({
+  live = "claude",
+  picked = "claude",
+  invalidate = async () => true,
+  replay = "prior chat",
+  // mcp#884 — what the STORE says the incoming backend already has. Defaults to
+  // false ("no conversation yet"), which is the pre-mcp#884 world every test
+  // below was written against, so their meaning is unchanged.
+  incomingHasConversation = false,
+} = {}) {
   const log = [];
+  // Recorded OFF the ordered log on purpose. These two are queries, not commits;
+  // logging them would shift every positional assertion in this file and make a
+  // behavioural change look like an ordering regression.
+  const invalidateOpts = [];
+  const askedAbout = [];
   let liveBackend = live;
   const effects = {
     liveBackend: () => liveBackend,
     pickedBackend: () => picked,
-    invalidate: async () => {
+    incomingHasConversation: (b) => {
+      askedAbout.push(b);
+      return incomingHasConversation;
+    },
+    invalidate: async (opts) => {
+      invalidateOpts.push(opts);
       log.push("invalidate");
       return invalidate();
     },
@@ -49,11 +68,14 @@ function recorder({ live = "claude", picked = "claude", invalidate = async () =>
       log.push("buildReplay");
       return replay;
     },
-    armContext: () => log.push("armContext"),
+    // The ARGUMENT matters now: `armContext(null)` is the CLEAR (mcp#884), and a
+    // recorder that logged both as "armContext" would let arming the outgoing
+    // transcript into the incoming conversation pass as a clear.
+    armContext: (ctx) => log.push(ctx == null ? "clearContext" : "armContext"),
     teardownAndConnect: () => log.push("teardownAndConnect"),
     disclose: (reason) => log.push(`disclose:${reason}`),
   };
-  return { log, effects, setLive: (b) => { liveBackend = b; } };
+  return { log, effects, invalidateOpts, askedAbout, setLive: (b) => { liveBackend = b; } };
 }
 
 /**
@@ -204,6 +226,95 @@ test("#1184 the replay is built AFTER the turn ends, and only armed when non-emp
   assert.ok(!ran(empty.log, "armContext"), "…but arming an empty preamble would send a header with no chat");
 });
 
+// ---------------------------------------------------------------------------
+// mcp#884 — THE HANDOVER. Both consequences of one question.
+// ---------------------------------------------------------------------------
+
+test("mcp#884 the OUTGOING backend's thread keeps its session across a switch", async () => {
+  // The defect: `invalidate` cleared the outgoing THREAD's sessionId, so switching
+  // back later sent `new_session` instead of resuming — the per-backend persistence
+  // this branch adds, defeated by its own switch path. The tab pointer still goes;
+  // only the thread's own claim is preserved.
+  const rec = recorder({ live: "claude" });
+  await runBackendSwitch("codex", rec.effects);
+
+  assert.equal(rec.invalidateOpts.length, 1, "the invalidate still runs exactly once");
+  assert.equal(
+    rec.invalidateOpts[0]?.preserveThreadSession,
+    true,
+    "a backend SWITCH must not destroy the outgoing conversation's session id",
+  );
+});
+
+test("mcp#884 the incoming backend's OWN conversation is never handed the outgoing transcript", async () => {
+  // The other half. `loadThread` will resume the incoming backend's conversation and
+  // arm its own replay if it needs one; the outgoing transcript riding in as one-shot
+  // context would inject a different provider's chat into it.
+  const rec = recorder({ live: "claude", incomingHasConversation: true, replay: "User: hi" });
+  const result = await runBackendSwitch("codex", rec.effects);
+
+  assert.equal(result.switched, true, "it is still a switch");
+  assert.deepEqual(rec.askedAbout, ["codex"], "the STORE is asked about the INCOMING backend");
+  assert.ok(!ran(rec.log, "buildReplay"), "the outgoing transcript is not even built");
+  assert.ok(!ran(rec.log, "armContext"), "and nothing is armed against the incoming conversation");
+  assert.ok(
+    ran(rec.log, "clearContext"),
+    "a context armed earlier must be CLEARED, not merely skipped — it would ride the next message",
+  );
+});
+
+test("mcp#884 a backend with NO conversation still gets the fresh-chat replay", async () => {
+  // The long-standing, disclosed behaviour, deliberately preserved: switching to a
+  // provider you have never used starts a fresh chat carrying the prior transcript as
+  // one-shot context. Only the case where the incoming backend HAS a conversation changed.
+  const rec = recorder({ live: "claude", incomingHasConversation: false, replay: "User: hi" });
+  await runBackendSwitch("codex", rec.effects);
+
+  assert.deepEqual(rec.askedAbout, ["codex"]);
+  assert.ok(ran(rec.log, "buildReplay"), "the transcript is built");
+  assert.ok(ran(rec.log, "armContext"), "and armed into the fresh conversation");
+  assert.ok(!ran(rec.log, "clearContext"), "nothing is cleared on the fresh path");
+});
+
+test("mcp#884 planBackendHandover is ONE decision, so the two halves cannot drift", () => {
+  // Stated on the pure function as well as through the run, because the whole point of
+  // extracting it is that session preservation and replay disposal are consequences of a
+  // single question rather than two independent guards someone can fix by halves.
+  assert.deepEqual(
+    planBackendHandover({ switching: true, incomingHasConversation: true }),
+    { preserveOutgoingSession: true, replay: "clear" },
+  );
+  assert.deepEqual(
+    planBackendHandover({ switching: true, incomingHasConversation: false }),
+    { preserveOutgoingSession: true, replay: "arm" },
+  );
+  // A non-switch decides nothing: no session to hand over, no replay to dispose of.
+  for (const incoming of [true, false]) {
+    assert.deepEqual(
+      planBackendHandover({ switching: false, incomingHasConversation: incoming }),
+      { preserveOutgoingSession: false, replay: "leave" },
+    );
+  }
+  assert.deepEqual(
+    planBackendHandover(),
+    { preserveOutgoingSession: false, replay: "leave" },
+    "called with nothing it must decide nothing, not throw",
+  );
+});
+
+test("mcp#884 a NON-switch never asks the store about the incoming backend", async () => {
+  // Same rule as the invalidate: a first connect and a re-pick must stay fully
+  // synchronous and must not be gated on history-store state.
+  const firstConnect = recorder({ live: null, picked: "claude" });
+  await runBackendSwitch("codex", firstConnect.effects);
+  assert.deepEqual(firstConnect.askedAbout, [], "a first connect asks nothing");
+  assert.deepEqual(firstConnect.invalidateOpts, [], "and invalidates nothing");
+
+  const rePick = recorder({ live: "codex", picked: "codex" });
+  await runBackendSwitch("codex", rePick.effects);
+  assert.deepEqual(rePick.askedAbout, [], "a re-pick of the live backend asks nothing");
+});
+
 test("#1184 WIRING: the panel delegates, and keeps no commit above the guard", () => {
   // Without this the module can be correct and dead. The panel is 1.7MB of IIFE, so this is
   // a source assertion by necessity — but it is the specific one that matters: no write to
@@ -244,7 +355,15 @@ test("#1184 WIRING: the panel delegates, and keeps no commit above the guard", (
   // The commits may only appear as INJECTED effects, i.e. inside a callback the module
   // calls after the guard — never as statements the function runs on its own.
   assert.match(body, /commitSelection: \(next\) => \{/, "the selection writes must be an injected effect");
-  assert.match(body, /invalidate: \(\) => invalidateDurableAgentSession\(\)/, "the guard must be injected too");
+  // mcp#884 gave the guard an argument (`preserveThreadSession`), so match the injection
+  // rather than the exact old arity — and assert the options really are FORWARDED, because
+  // an `(opts) => invalidateDurableAgentSession()` that drops them silently reinstates the
+  // destroyed-outgoing-session defect while still looking injected.
+  assert.match(
+    body,
+    /invalidate: \(opts\) => invalidateDurableAgentSession\(opts\)/,
+    "the guard must be injected too, and must forward the handover options",
+  );
   // The old shape, stated exactly so a revert is caught by name.
   assert.doesNotMatch(
     body,

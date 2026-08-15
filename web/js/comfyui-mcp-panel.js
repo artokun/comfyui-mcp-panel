@@ -116,6 +116,7 @@ import {
   ChatHistoryStore,
   isThreadInScope,
   mergeHistorySnapshots,
+  panelScopeKeyForBackend,
   resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
@@ -24366,7 +24367,7 @@ function buildPanel() {
     // a Codex tab's conversation. The legacy shared "panel:global" key remains
     // a read fallback inside resolvePanelPointer until this backend's key is
     // first written.
-    return `panel:backend:${connectedBackend || selectedBackend || "claude"}`;
+    return panelScopeKeyForBackend(connectedBackend || selectedBackend);
   }
 
   function setActiveThread(scopeKey, threadId, updatedAt = nextHistoryRevision()) {
@@ -24423,9 +24424,18 @@ function buildPanel() {
     });
   }
 
-  async function invalidateDurableAgentSession() {
+  async function invalidateDurableAgentSession({ preserveThreadSession = false } = {}) {
+    // The TAB pointer always goes: it is backend-agnostic, so leaving it set would let
+    // the NEXT backend adopt a session id belonging to the previous one.
     ssSet(SESSION_KEY, null);
-    if (thread) historyStore.reviseThread(thread, { sessionId: null });
+    // The THREAD's sessionId is a different claim (mcp#884/#897). Sessions are keyed
+    // orchestrator::<backend>, so on a BACKEND SWITCH the outgoing backend's session
+    // outlives this call and its conversation must keep pointing at it — otherwise
+    // switching back sends `new_session` and the per-backend persistence this branch
+    // adds is defeated by its own switch path. A restart/disconnect invalidate is the
+    // opposite case: that session is genuinely gone, so the pointer must be cleared or
+    // the next resume would name a session the orchestrator no longer has.
+    if (thread && !preserveThreadSession) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
     // #1171 — DELIBERATELY UNBOUNDED, after a bound was added here and removed again.
     //
@@ -30609,10 +30619,18 @@ function buildPanel() {
     const { switched } = await runBackendSwitch(id, {
       liveBackend: () => connectedBackend,
       pickedBackend: () => selectedBackend,
-      // The old provider's session must be durably invalid before any reconnect can observe
-      // it. If the reconnect fails or the browser closes, a reload must start fresh rather
-      // than restore a foreign session.
-      invalidate: () => invalidateDurableAgentSession(),
+      // What the INCOMING backend already has, answered by the STORE under that backend's
+      // own scope key (mcp#884). This is the single question `planBackendHandover` turns
+      // into both the session-preservation and the replay decision, so they cannot drift.
+      incomingHasConversation: (next) =>
+        Boolean(selectPanelThread(threads, historyMeta, {
+          scopeKey: panelScopeKeyForBackend(next),
+        })),
+      // The old provider's TAB session pointer must be durably invalid before any reconnect
+      // can observe it. If the reconnect fails or the browser closes, a reload must start
+      // fresh rather than restore a foreign session. `preserveThreadSession` keeps the
+      // OUTGOING conversation's own sessionId so switching back can resume it.
+      invalidate: (opts) => invalidateDurableAgentSession(opts),
       // CENTRALIZED per-backend seeding: every switch path routes through here — the backend
       // chips, the model-popover provider row, AND the Settings backend combo
       // (panelHooks.applyBackend). Seeding from the NEW backend's group before connecting is

@@ -636,6 +636,50 @@ export function selectThreadForScope(threads, meta, scopeKey) {
  *  fallback. */
 export const LEGACY_PANEL_SCOPE = "panel:global";
 
+const PANEL_BACKEND_PREFIX = "panel:backend:";
+
+/** The selection-pointer key for ONE backend. The orchestrator keys its session
+ *  `orchestrator::<backend>` (mcp#897), so the panel pointer carries the same
+ *  axis. Exported so the panel and the backend-switch path build the key the
+ *  same way rather than each interpolating their own. */
+export function panelScopeKeyForBackend(backend) {
+  return `${PANEL_BACKEND_PREFIX}${backend || "claude"}`;
+}
+
+/** The backend a panel scope key names, or null when it is not a backend key
+ *  (the legacy shared key, or a retired workflow scope). */
+export function backendOfScopeKey(scopeKey) {
+  if (typeof scopeKey !== "string" || !scopeKey.startsWith(PANEL_BACKEND_PREFIX)) return null;
+  return scopeKey.slice(PANEL_BACKEND_PREFIX.length) || null;
+}
+
+/**
+ * Can `backend` claim this thread on the UPGRADE path?
+ *
+ * mcp#884 fork rule. A pre-upgrade snapshot has one shared `panel:global`
+ * pointer and no per-backend keys, so every backend's key falls back to the
+ * SAME thread id — Claude and Codex both resolve one thread, `loadThread`
+ * scrubs its foreign session, and `record()` rewrites its provider on every
+ * append. Two backends then share and corrupt one transcript. This hits every
+ * existing user on their first upgrade, so the legacy route is forked here
+ * instead: a thread is claimable only by the backend that actually owns it.
+ *
+ * `provider` is that ownership stamp — `record()` writes it on mint and on
+ * every append, so any thread carrying messages carries a provider.
+ *
+ * A thread with NO provider FAILS CLOSED (nobody auto-adopts it). Fail-open is
+ * exactly the collision above, and the cost of failing closed is bounded and
+ * non-destructive: nothing is deleted, the conversation stays in history and
+ * opens through the picker like any archived one. The common single-backend
+ * upgrade is unaffected — that user's thread carries their provider and is
+ * adopted normally.
+ */
+function threadClaimableByBackend(thread, backend) {
+  if (!backend) return true;
+  const provider = thread?.provider;
+  return typeof provider === "string" && provider ? provider === backend : false;
+}
+
 /** Resolve the panel-owned selection pointer for one backend scope.
  *
  *  Returns { key, activeId, revision, cleared }:
@@ -697,15 +741,32 @@ export function selectPanelThread(threads, meta, { scopeKey = LEGACY_PANEL_SCOPE
     .sort((a, b) => finiteTs(b?.updatedAt || b?.ts) - finiteTs(a?.updatedAt || a?.ts));
   const pointer = resolvePanelPointer(meta, scopeKey);
   if (pointer.cleared && pointer.activeId == null) return null;
-  const pointed = candidates.find((thread) => thread?.id === pointer.activeId) || null;
-  if (!pointed) return candidates[0] || null;
+  // THE UPGRADE FORK (see threadClaimableByBackend). Evidence written under THIS
+  // backend's own key is per-backend by construction and needs no gate. Every
+  // other route into a thread here is SHARED across backends and would hand the
+  // same id to all of them:
+  //   - the legacy `panel:global` pointer (pointer.key !== scopeKey),
+  //   - the no-pointer recency fallback below,
+  //   - the retired workflow-scoped selection ops, which were never per-backend.
+  const backend = backendOfScopeKey(scopeKey);
+  const claimable = (thread) => threadClaimableByBackend(thread, backend);
+  const pointerIsOwn = pointer.key === scopeKey;
+  const pointedRaw = candidates.find((thread) => thread?.id === pointer.activeId) || null;
+  // A pointer this backend wrote itself names its own conversation whatever the
+  // provider stamp says (a thread legitimately changes provider when the user
+  // switches backends while it is open); only the shared routes are forked.
+  const pointed = pointedRaw && (pointerIsOwn || claimable(pointedRaw)) ? pointedRaw : null;
+  // The recency fallback is ALWAYS forked for a backend scope — including when
+  // this backend's own pointer named a thread that has since been deleted, or
+  // it would grab whatever another backend most recently used.
+  if (!pointed) return candidates.find(claimable) || null;
   let latest = { revision: pointer.revision, threadId: pointed.id };
   for (const [key, operation] of Object.entries(meta?.activeOps || {})) {
     // Only RETIRED-mode (workflow/path/tmp scoped) selection ops compete; every
     // panel:* key is either this pointer or another backend's conversation.
     if (typeof key !== "string" || key.startsWith("panel:")) continue;
     if (!operation || operation.deleted === true || operation.value == null) continue;
-    const target = candidates.find((thread) => thread?.id === operation.value);
+    const target = candidates.find((thread) => thread?.id === operation.value && claimable(thread));
     if (!target) continue;
     const revision = operationRevision(operation);
     if (compareRevisions(revision, latest.revision) > 0) {
