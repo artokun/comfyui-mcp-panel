@@ -28,6 +28,8 @@ import { readFileSync } from "node:fs";
 import {
   readLinkIds,
   danglingInputLinks,
+  fatalDanglingInputLinks,
+  bypassResolvedInputSlots,
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
@@ -36,10 +38,10 @@ const src = () =>
   readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
 /** The reported node, as it appears in packs/krea2-combo/workflow.json. */
-const rbg = (link) => ({
+const rbg = (link, mode = 4) => ({
   id: 192,
   type: "RBG_Smart_Seed_Variance",
-  mode: 4,
+  mode,
   inputs: [{ name: "conditioning", type: "CONDITIONING", link }],
   outputs: [{ name: "conditioning", type: "CONDITIONING", links: [473, 474] }],
 });
@@ -86,7 +88,123 @@ test("#1571 the reported corruption is detected, and names the node the run erro
     name: "conditioning",
     link_id: 505,
     bypassed: true,
+    muted: false,
+    fatal: true,
   });
+});
+
+// ── WHICH dangling inputs the serializer actually reaches (codex gate, P1) ──────────
+//
+// `graphToPrompt` skips a node entirely before touching its inputs:
+//   if (node.isVirtualNode || node.mode === NEVER || node.mode === BYPASS) continue
+// and `resolveOutput` returns immediately for NEVER ("Muted nodes produce no output").
+// Refusing on an input nothing resolves would un-ship the tool for graphs that run.
+
+test("#1571 P1 a MUTED node's dangling input is reported but never fatal", () => {
+  const g = brokenSubgraph();
+  g._nodes = [rbg(505, 2)];
+  const [entry] = danglingInputLinks(g);
+  assert.equal(entry.muted, true);
+  assert.equal(entry.fatal, false, "a muted node is never asked for its inputs, so it still queues");
+  assert.deepEqual(fatalDanglingInputLinks(g), [], "and it must not reach the refusal");
+});
+
+test("#1571 P1 a VIRTUAL node's dangling input is reported but never fatal", () => {
+  const g = brokenSubgraph();
+  g._nodes = [{ id: 5, type: "Reroute", mode: 0, isVirtualNode: true, inputs: [{ name: "", link: 505 }] }];
+  const [entry] = danglingInputLinks(g);
+  assert.equal(entry.fatal, false);
+});
+
+test("#1571 P1 an ORDINARY node's dangling input is always fatal", () => {
+  // The mode the reported graph did NOT have, and the one with the widest blast radius:
+  // every input of a live node is resolved.
+  const g = brokenSubgraph();
+  g._nodes = [{ id: 9, type: "KSampler", mode: 0, inputs: [{ name: "positive", type: "CONDITIONING", link: 999 }] }];
+  assert.equal(danglingInputLinks(g)[0].fatal, true);
+  // …and a node with no `mode` at all is an ordinary node.
+  g._nodes = [{ id: 9, type: "KSampler", inputs: [{ name: "positive", link: 999 }] }];
+  assert.equal(danglingInputLinks(g)[0].fatal, true);
+});
+
+test("#1571 P1 a bypassed node's UNSELECTED input is not fatal", () => {
+  // `_getBypassSlotIndex` picks ONE input per output slot. A MASK input on a node whose
+  // only output is IMAGE is never resolved, so its dangling link cannot throw.
+  const g = brokenSubgraph();
+  g._nodes = [
+    {
+      id: 42,
+      type: "ImageBlend",
+      mode: 4,
+      inputs: [
+        { name: "image", type: "IMAGE", link: 473 },
+        { name: "mask", type: "MASK", link: 998 },
+      ],
+      outputs: [{ name: "IMAGE", type: "IMAGE", links: [474] }],
+    },
+  ];
+  const [entry] = danglingInputLinks(g);
+  assert.equal(entry.name, "mask");
+  assert.equal(entry.fatal, false, "no output type selects the MASK input");
+});
+
+test("#1571 P1 a bypassed node with NO connected output reaches nothing", () => {
+  // Bypass is only ever entered THROUGH a consumer. Nothing consumes an unlinked output.
+  const g = brokenSubgraph();
+  const node = rbg(505);
+  node.outputs = [{ name: "conditioning", type: "CONDITIONING", links: [] }];
+  g._nodes = [node];
+  assert.equal(danglingInputLinks(g)[0].fatal, false);
+});
+
+test("#1571 P1 the bypass slot selection mirrors _getBypassSlotIndex", () => {
+  const sel = (node) => [...bypassResolvedInputSlots(node)].sort((a, b) => a - b);
+  // Same-index input, compatible type → that slot.
+  assert.deepEqual(
+    sel({
+      inputs: [{ type: "IMAGE" }, { type: "MASK" }],
+      outputs: [{ type: "IMAGE", links: [1] }],
+    }),
+    [0],
+  );
+  // Same index incompatible → first exact type match.
+  assert.deepEqual(
+    sel({
+      inputs: [{ type: "MASK" }, { type: "IMAGE" }],
+      outputs: [{ type: "IMAGE", links: [1] }],
+    }),
+    [1],
+  );
+  // The same-slot preference BEATS the first exact match, and only a graph with two
+  // equally-typed inputs can tell the two rules apart. Getting this backwards marks the
+  // wrong input fatal in both directions — a false refusal on input 0 and silence on the
+  // one that actually breaks.
+  assert.deepEqual(
+    sel({
+      inputs: [{ type: "IMAGE" }, { type: "IMAGE" }],
+      outputs: [{ type: "LATENT", links: [] }, { type: "IMAGE", links: [1] }],
+    }),
+    [1],
+  );
+  // A wildcard output matches the same index, falling back to slot 0.
+  assert.deepEqual(sel({ inputs: [{ type: "MASK" }], outputs: [{ type: "*", links: [1] }] }), [0]);
+  // A wildcard INPUT is compatible with anything.
+  assert.deepEqual(sel({ inputs: [{ type: "*" }], outputs: [{ type: "LATENT", links: [1] }] }), [0]);
+  // Types are compared case-insensitively, as strings.
+  assert.deepEqual(sel({ inputs: [{ type: "image" }], outputs: [{ type: "IMAGE", links: [1] }] }), [0]);
+  // Unconnected outputs select nothing at all.
+  assert.deepEqual(sel({ inputs: [{ type: "IMAGE" }], outputs: [{ type: "IMAGE", links: [] }] }), []);
+  // Every connected output contributes its own selection.
+  assert.deepEqual(
+    sel({
+      inputs: [{ type: "IMAGE" }, { type: "MASK" }],
+      outputs: [{ type: "IMAGE", links: [1] }, { type: "MASK", links: [2] }],
+    }),
+    [0, 1],
+  );
+  // Junk is silent rather than throwing.
+  assert.deepEqual(sel({}), []);
+  assert.deepEqual(sel({ inputs: null, outputs: "nope" }), []);
 });
 
 test("#1571 a correctly converted subgraph yields nothing", () => {
@@ -302,12 +420,15 @@ test("#1571 BOTH conversion paths assert serializability, AFTER the node landed"
   }
 });
 
-test("#1571 the advisory slots reach the reported payload on both paths", () => {
+test("#1571 the advisory findings reach the reported payload on both paths", () => {
   // A finding computed and then dropped on the floor is the same as no finding. This is a
   // one-line spread that no helper test can see.
   const s = src();
-  const occurrences = s.match(/unfed_boundary_inputs: unfedInputs/g) ?? [];
-  assert.equal(occurrences.length, 2, "both conversion tools must report the unfed slots");
+  const occurrences = s.match(/\.\.\.subgraphConversionAdvisories\(advisories\)/g) ?? [];
+  assert.equal(occurrences.length, 2, "both conversion tools must report the advisories");
+  // …and only the FATAL findings may refuse (codex gate P1).
+  assert.match(s, /const fatal = dangling\.filter\(\(entry\) => entry\.fatal\);/);
+  assert.match(s, /if \(fatal\.length\) \{/);
 });
 
 test("#1571 the guard is imported, not shadowed by a local stub", () => {
@@ -332,7 +453,10 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
   const serializable = s.match(
     /function assertSubgraphConversionSerializable\(res, node, what\) \{[\s\S]*?\r?\n\}/,
   );
-  assert.ok(landed && serializable, "both conversion guards must be locatable in the source");
+  const advisories = s.match(
+    /function subgraphConversionAdvisories\(\{ disconnected, dormant \}\) \{[\s\S]*?\r?\n\}/,
+  );
+  assert.ok(landed && serializable && advisories, "the conversion guards must be locatable in the source");
   const graph = {
     _nodes: [wrapper],
     getNodeById: (id) => ({ id: Number(id) }),
@@ -350,6 +474,7 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
     "clearStaleRedFlagsAfterSubgraphConversion",
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
+    "subgraphConversionAdvisories",
     `const executors = { ${body[0]} }; return executors.${name.replace(/^async /, "")};`,
   )(
     () => ({ app: {}, graph, canvas, rootGraph: graph }),
@@ -364,6 +489,7 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
       "brokenConversionRefusal",
       `return ${serializable[0]};`,
     )(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal),
+    new Function(`return ${advisories[0]};`)(),
   );
 }
 
@@ -424,6 +550,43 @@ test("#1571 BEHAVIOUR: a fully healthy conversion carries no advisory key at all
   );
   const out = group({ group: "COMBOS VARIANCE" });
   assert.ok(!("unfed_boundary_inputs" in out.subgraph), "a clean conversion reports no advisory");
+});
+
+test("#1571 P1 BEHAVIOUR: a conversion whose only breakage is MUTED still succeeds", () => {
+  // The over-refusal the gate caught, driven through the real executor. This graph queues
+  // today, so the tool must report it — with the finding attached, not swallowed.
+  const wrapper = wrapperNode(505);
+  const muted = brokenSubgraph();
+  muted._nodes = [rbg(505, 2)];
+  const group = realExecutor(
+    "graph_subgraph_group",
+    "\\{ group \\}",
+    () => ({ node: wrapper, subgraph: muted }),
+    wrapper,
+  );
+  const out = group({ group: "COMBOS VARIANCE" });
+  assert.equal(out.subgraph.node_id, 302, "a runnable graph must not be refused");
+  assert.equal(out.subgraph.dangling_inputs_not_reached.length, 1);
+  assert.equal(out.subgraph.dangling_inputs_not_reached[0].node_id, 192);
+  assert.ok(!("unfed_boundary_inputs" in out.subgraph));
+});
+
+test("#1571 P1 the refusal separates what is broken NOW from what is only latent", () => {
+  const g = brokenSubgraph();
+  g._nodes = [rbg(505), { id: 77, type: "Note", mode: 2, inputs: [{ name: "text", link: 997 }] }];
+  const all = danglingInputLinks(g);
+  const msg = brokenConversionRefusal({
+    what: "panel_subgraph_group",
+    subgraphNodeId: 302,
+    dangling: all.filter((e) => e.fatal),
+    dormant: all.filter((e) => !e.fatal),
+    disconnected: [],
+  });
+  assert.match(msg, /1 input inside the new subgraph still references/, "only the fatal one counts");
+  assert.doesNotMatch(msg, /2 inputs inside/, "the dormant one must not inflate the breakage");
+  assert.match(msg, /NOT reached by the serializer today/);
+  assert.match(msg, /Note node 77 \(muted\)/);
+  assert.match(msg, /re-enabled or rewired/);
 });
 
 test("#1571 BEHAVIOUR: panel_create_subgraph refuses the same corruption", () => {

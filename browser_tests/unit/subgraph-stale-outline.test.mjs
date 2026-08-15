@@ -62,6 +62,11 @@ const assertSubgraphConversionSerializable = new Function(
   "brokenConversionRefusal",
   `return ${serializableMatch[0]};`,
 )(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal);
+const advisoriesMatch = panelSrc.match(
+  /function subgraphConversionAdvisories\(\{ disconnected, dormant \}\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(advisoriesMatch, "could not locate subgraphConversionAdvisories in panel source");
+const subgraphConversionAdvisories = new Function(`return ${advisoriesMatch[0]};`)();
 
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
@@ -69,12 +74,14 @@ function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
     "clearStaleRedFlagsAfterSubgraphConversion",
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
+    "subgraphConversionAdvisories",
     `const executors = { ${createSource} }; return executors.graph_create_subgraph;`,
   )(
     getGraphCtx,
     clearStaleRedFlagsAfterSubgraphConversion,
     assertSubgraphNodeLanded,
     assertSubgraphConversionSerializable,
+    subgraphConversionAdvisories,
   );
 }
 
@@ -93,6 +100,7 @@ function realGroup(
     "clearStaleRedFlagsAfterSubgraphConversion",
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
+    "subgraphConversionAdvisories",
     `const executors = { ${groupSource} }; return executors.graph_subgraph_group;`,
   )(
     getGraphCtx,
@@ -102,6 +110,7 @@ function realGroup(
     clearStaleRedFlagsAfterSubgraphConversion,
     assertSubgraphNodeLanded,
     assertSubgraphConversionSerializable,
+    subgraphConversionAdvisories,
   );
 }
 

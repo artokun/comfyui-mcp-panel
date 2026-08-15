@@ -8315,18 +8315,40 @@ function assertSubgraphNodeLanded(res, graph, what) {
  *  success; the workflow could not be run afterwards, and the run's error named a
  *  flattened id (`[302:192]`) with no visible connection to this call.
  *
- *  Returns the advisory (never fatal) list of unfed boundary input slots so the caller
- *  can report them on a conversion that is otherwise fine. See
- *  lib/subgraph-conversion-integrity.js for why the two signals have different weights. */
+ *  ONLY the dangling inputs the serializer actually reaches refuse (codex gate P1): a
+ *  muted node is never asked for its inputs, and a bypassed node resolves only the one
+ *  input its output type selects, so refusing on those would break conversions of graphs
+ *  that queue perfectly well.
+ *
+ *  Returns the ADVISORY (never fatal) findings so the caller can report them on a
+ *  conversion that is otherwise fine. See lib/subgraph-conversion-integrity.js for why
+ *  the three signals have different weights. */
 function assertSubgraphConversionSerializable(res, node, what) {
   const dangling = danglingInputLinks(res?.subgraph);
+  const fatal = dangling.filter((entry) => entry.fatal);
+  const dormant = dangling.filter((entry) => !entry.fatal);
   const disconnected = disconnectedBoundaryInputs(node);
-  if (dangling.length) {
+  if (fatal.length) {
     throw new Error(
-      brokenConversionRefusal({ what, subgraphNodeId: node?.id, dangling, disconnected }),
+      brokenConversionRefusal({
+        what,
+        subgraphNodeId: node?.id,
+        dangling: fatal,
+        disconnected,
+        dormant,
+      }),
     );
   }
-  return disconnected;
+  return { disconnected, dormant };
+}
+
+/** The advisory keys a CLEAN conversion reports, omitted entirely when empty — an
+ *  `unfed_boundary_inputs: []` on every healthy conversion reads as a finding. */
+function subgraphConversionAdvisories({ disconnected, dormant }) {
+  return {
+    ...(disconnected.length ? { unfed_boundary_inputs: disconnected } : {}),
+    ...(dormant.length ? { dangling_inputs_not_reached: dormant } : {}),
+  };
 }
 
 function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
@@ -15300,13 +15322,13 @@ const GRAPH_TOOL_EXECUTORS = {
     const created = assertSubgraphNodeLanded(res, graph, "panel_create_subgraph");
     // #1571: a node that LANDED can still be unserializable. Refuse rather than report a
     // success the next run will contradict — see assertSubgraphConversionSerializable.
-    const unfedInputs = assertSubgraphConversionSerializable(res, created, "panel_create_subgraph");
+    const advisories = assertSubgraphConversionSerializable(res, created, "panel_create_subgraph");
     return {
       subgraph: {
         node_id: created.id,
         name: res?.subgraph?.name ?? null,
         from_nodes: ns.map((n) => n.id),
-        ...(unfedInputs.length ? { unfed_boundary_inputs: unfedInputs } : {}),
+        ...subgraphConversionAdvisories(advisories),
       },
     };
   },
@@ -15349,14 +15371,14 @@ const GRAPH_TOOL_EXECUTORS = {
     const grouped = assertSubgraphNodeLanded(res, graph, "panel_subgraph_group");
     // #1571 was reported through THIS path: the group held a bypassed node whose input
     // link did not survive the conversion, and the tool said "subgraph created".
-    const unfedInputs = assertSubgraphConversionSerializable(res, grouped, "panel_subgraph_group");
+    const advisories = assertSubgraphConversionSerializable(res, grouped, "panel_subgraph_group");
     return {
       subgraph: {
         node_id: grouped.id,
         name: res?.subgraph?.name ?? null,
         from_group: g.title ?? null,
         from_nodes: ns.map((n) => n.id),
-        ...(unfedInputs.length ? { unfed_boundary_inputs: unfedInputs } : {}),
+        ...subgraphConversionAdvisories(advisories),
       },
     };
   },
