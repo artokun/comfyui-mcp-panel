@@ -138,7 +138,13 @@ test("#775 WIRING: the load asks only when something is MISSING", () => {
   assert.match(src, /import \{ readPackImportFailures \} from "\.\/lib\/pack-import-failures\.js"/);
   const i = src.indexOf("const shortfall = apiLoadShortfall(apiClone, landed);");
   assert.ok(i > 0);
-  const block = src.slice(i, i + 900);
+  // Bounded by the end of the API branch, not by a character count. A fixed 900-char window
+  // had roughly forty characters of headroom left, so the next line added anywhere in the
+  // reply — a comment included — silently pushed the last two assertions out of scope and
+  // failed a wiring test that was still perfectly satisfied. It measured prose, not code.
+  const end = src.indexOf('"graph is not a UI workflow', i);
+  assert.ok(end > i, "the non-API refusal that follows the branch must still be recognisable");
+  const block = src.slice(i, end);
   assert.match(block, /shortfall\.length[\s\S]{0,120}readPackImportFailures/);
   assert.match(block, /note: apiLoadNote\(shortfall, importFailures\)/);
   assert.match(block, /packs_failed_to_import: importFailures/);
