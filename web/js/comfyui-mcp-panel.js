@@ -93,7 +93,11 @@ import {
   classifyInstallOutcome,
   classifyUpdateOutcome,
   collectRecentTaskFailures,
+  createManagerTaskResultLog,
   dialectRetryTarget,
+  dialectServesTaskHistory,
+  looksLikeTaskHistory,
+  taskHistoryBlindNote,
   installGitUrl,
   installedListRoute,
   isManagerRouteMissing,
@@ -1465,6 +1469,11 @@ let seenDoneDownloads = new Set();
 function setupListeners() {
   if (!api) return;
   try {
+    // comfyui-mcp#1606 — subscribed HERE, at panel load, and not when an install
+    // is dispatched: the Manager broadcasts a task's result as the queue drains,
+    // and a fast failure drains before the install call has anything to attach a
+    // listener to.
+    subscribeManagerTaskResults();
     api.addEventListener("execution_error", (ev) => {
       lastExecFailure = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
     });
@@ -6094,6 +6103,41 @@ function boundedDelay(ms, deadline) {
   return new Promise((r) => setTimeout(r, budget));
 }
 
+/** comfyui-mcp#1606 — Manager task outcomes heard on the ComfyUI socket. On
+ *  released 3.x this is the ONLY place a task's result is ever stated: the
+ *  worker broadcasts the whole result map as the queue drains and deletes it on
+ *  the next line, which is what leaves a poll looking at an idle queue holding
+ *  nothing. See manager-install.js for the source it was read from. */
+const managerTaskResults = createManagerTaskResultLog();
+
+/** How long a captured failure stays reportable on a queue poll. A defeat from
+ *  hours ago is not what "is my install done?" is asking, and repeating it reads
+ *  as a fresh one. */
+const CAPTURED_FAILURE_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Subscribe to the Manager's task-completion broadcast (comfyui-mcp#1606).
+ *
+ * ComfyUI's api dispatches an unknown socket message type only to listeners that
+ * have REGISTERED for it (`_registered.has(type)` guards the default arm of its
+ * socket handler), so this call is what makes the frame observable at all —
+ * ComfyUI-Manager's own UI subscribes the same way. Registered once from
+ * setupListeners, at panel load, because the frame arrives when the queue
+ * drains: a listener attached at install time would already be too late for a
+ * task that failed fast.
+ *
+ * Parameterised for the unit harness, and defensive about `api` for the same
+ * reason setupListeners is — a panel loaded outside a live ComfyUI has none.
+ * Returns whether the subscription was actually made.
+ */
+function subscribeManagerTaskResults(target = api, log = managerTaskResults) {
+  if (!target || typeof target.addEventListener !== "function") return false;
+  target.addEventListener("cm-queue-status", (ev) => {
+    log.record(ev?.detail);
+  });
+  return true;
+}
+
 /** Poll the Manager queue/status until it POSITIVELY drains (queueDrained) or
  *  the deadline passes. Each status fetch is bounded by an AbortSignal so a
  *  stalled request cannot run past the deadline, and the initial settle-sleep
@@ -6113,10 +6157,17 @@ function boundedDelay(ms, deadline) {
  *  `renameProne`). Correlated by the ui_id THIS command submitted, so a
  *  neighbouring task's failure can never be attributed to it.
  *
+ *  comfyui-mcp#1606 — `capturedFailure` is the same verdict for the build that
+ *  serves no history at all: a SYNCHRONOUS read of what the Manager's own
+ *  `cm-queue-status` broadcast already said about this ui_id. Checked first at
+ *  every point the HTTP record is, because it costs no fetch and no budget, and
+ *  on released 3.x it is the only per-task verdict in existence (the worker
+ *  deletes the record as it drains — see manager-install.js).
+ *
  *  Returns { status, taskFailure } — taskFailure is the Manager's own reason
  *  string, or null when there is no positive failure record (absent, unreadable
  *  or not-yet-terminal all stay null, never a verdict). */
-async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = managerGet, ui_id } = {}) {
+async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = managerGet, ui_id, capturedFailure } = {}) {
   const deadline = Date.now() + timeoutMs;
   let status = null;
   // Cap an individual fetch by whatever budget remains.
@@ -6126,6 +6177,9 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = 
   // return null, so this can only ever ADD a positive failure verdict — it can
   // never manufacture one, and never downgrades a success.
   const readTaskFailure = async () => {
+    // #1606 — the broadcast we already heard, before any fetch.
+    const captured = typeof capturedFailure === "function" ? capturedFailure() : null;
+    if (captured) return captured;
     if (!ui_id) return null;
     try {
       const resp = await get(`manager/queue/history?ui_id=${encodeURIComponent(ui_id)}`, {
@@ -6210,13 +6264,20 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne, budg
   // --enable-manager-legacy-ui mode ("v2-batch") serves only BATCH history keyed
   // by `id` and REJECTS a ui_id query — polling either would burn the command
   // budget and still learn nothing. A v2-batch failure is already caught
-  // synchronously via its `failed[]` (→ batchFailed). Legacy's blind spot is
-  // artokun/comfyui-mcp#1606, a genuinely different problem: there is no record
-  // to read, whereas on v4 the record exists and we were simply not reading it.
+  // synchronously via its `failed[]` (→ batchFailed).
+  //
+  // comfyui-mcp#1606 — legacy's blind spot is closed from the OTHER side. There
+  // is no record to fetch there because the 3.x worker broadcasts each task's
+  // result and deletes it in the same breath; `capturedFailure` reads what that
+  // broadcast said, which this panel has been listening for since it loaded. It
+  // is passed on EVERY dialect, not just legacy: it is correlated by the ui_id
+  // this command submitted, so it cannot pick up a neighbour's failure, and on a
+  // build that never emits the frame there is simply nothing to read.
   const { status, taskFailure } = await waitForQueueDrain({
     timeoutMs: budget,
     get,
     ui_id: dialect === "v2" ? ui_id : undefined,
+    capturedFailure: ui_id ? () => managerTaskResults.failureFor(ui_id) : undefined,
   });
   let installed = null;
   let listError = false;
@@ -17409,6 +17470,11 @@ const GRAPH_TOOL_EXECUTORS = {
         { signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)) },
       );
       const { target, batchFailed } = submitted;
+      // comfyui-mcp#1606 — tie our ui_id to WHAT it installs before any result can
+      // arrive. The Manager's broadcast carries only ui_id → result, so this is
+      // what lets a captured failure name the pack on a later queue poll (and
+      // what lets a successful reinstall retire the earlier failure for it).
+      managerTaskResults.note(ui_id, { target, kind: "install" });
       // Resolve the true outcome. Throw ONLY on positive failure evidence; an
       // inconclusive result returns an honest unverified status (never a silent
       // success, never a false failure). #232 + codex rounds 1-2. The verify
@@ -17668,6 +17734,19 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async nodes_queue_status() {
+    // comfyui-mcp#1606 — resolve the dialect BEFORE the reads, never after. On
+    // the cached path this costs nothing (managerGet's first act is this same
+    // detection), but asking afterwards could cost the whole reply: a history
+    // read that fails invalidates the cached dialect (#605), so a later
+    // detection starts fresh probes against a backend that is already not
+    // answering and the reply misses the orchestrator's 20s window. A detection
+    // failure is swallowed — the read below raises the real error.
+    let dialect;
+    try {
+      dialect = await detectManagerDialect();
+    } catch {
+      /* unknown ⇒ treated as "cannot report", below */
+    }
     const status = await managerGet("manager/queue/status");
     // #364: the aggregate status cannot reveal a FAILED task — a crashed
     // do_update still counts toward done_count and looks "done". Surface the
@@ -17675,19 +17754,39 @@ const GRAPH_TOOL_EXECUTORS = {
     // of an idle queue does not read a silent "done" over a task that errored.
     // Best-effort: a legacy Manager without /v2 history (or a transient error)
     // just returns the status alone, exactly as before.
-    let recentFailures = [];
+    let history = null;
     try {
-      const hist = await managerGet("manager/queue/history?max_items=20", {
+      history = await managerGet("manager/queue/history?max_items=20", {
         signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
       });
-      recentFailures = collectRecentTaskFailures(hist);
     } catch {
-      /* history endpoint absent/transient — status alone */
+      /* history endpoint absent/transient — null is not readable, see below */
     }
+    const historyFailures = collectRecentTaskFailures(history);
+    // comfyui-mcp#1606 — and the failures this panel HEARD. On released 3.x the
+    // Manager deletes each task's result as the queue drains, so by the time
+    // anyone polls there is nothing left to fetch; the completion broadcast is
+    // the only statement of it, and this is where the poll finally gets to say
+    // what it said. Deduped by ui_id so a v4 that serves both never lists one
+    // failure twice.
+    const seen = new Set(historyFailures.map((f) => f?.ui_id).filter(Boolean));
+    const captured = managerTaskResults
+      .recentFailures({ maxAgeMs: CAPTURED_FAILURE_TTL_MS })
+      .filter((f) => !f.ui_id || !seen.has(f.ui_id));
+    const recentFailures = [...historyFailures, ...captured];
+    // Can an EMPTY list be read as "nothing failed"? Only when this build keeps
+    // a per-task history AND we positively read it. Anything else — no such
+    // record, a read that threw, a payload we do not recognise — means we did
+    // not look successfully, and silence is then not evidence. That equivalence
+    // is the reported bug: a legacy Manager returned a bare `{status}` that was
+    // byte-identical to a v4 with nothing to report.
+    const canReportFailures = dialectServesTaskHistory(dialect) && looksLikeTaskHistory(history);
+    const blindNote = canReportFailures ? "" : taskHistoryBlindNote(dialect);
     if (recentFailures.length) {
       return {
         status,
         recent_failures: recentFailures,
+        failure_reporting: canReportFailures ? "complete" : "partial",
         note:
           `${recentFailures.length} recent ComfyUI-Manager task(s) FAILED (see recent_failures). ` +
           `A drained queue that shows "done" does NOT mean every task succeeded — check these ` +
@@ -17695,10 +17794,17 @@ const GRAPH_TOOL_EXECUTORS = {
           // #920 — a registry-lookup miss reads like a lookup bug and sends people to
           // re-check spelling and channels. On a stock v4 an unlisted git URL is simply
           // not installable, and saying so beats echoing a name the caller never supplied.
-          unlistedGitUrlAdvice(recentFailures.map((f) => f?.result ?? "").join(" ")),
+          unlistedGitUrlAdvice(recentFailures.map((f) => f?.result ?? "").join(" ")) +
+          // A build we cannot fully read can still hand us a positively-failed
+          // record. Those are real, but the list is not exhaustive — say so,
+          // rather than let a partial list be taken for the whole story.
+          (blindNote ? `\n\n${blindNote}` : ""),
       };
     }
-    return { status };
+    if (!canReportFailures) {
+      return { status, failure_reporting: "unavailable", note: blindNote };
+    }
+    return { status, failure_reporting: "complete" };
   },
 
   // #851 — every branch below names the TARGET as well as the route, via

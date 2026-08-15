@@ -971,6 +971,10 @@ function nodesInstallDeps(overrides) {
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
     verifyInstalled: async () => ({ state: "installed", status: QUEUE_STATUS }),
+    // comfyui-mcp#1606 — the ui_id ↔ pack correlation the handler records so a
+    // captured Manager failure can name what it was installing. A REAL log, so
+    // a regression in that call surfaces here instead of hitting a no-op stub.
+    managerTaskResults: ManagerInstall.createManagerTaskResultLog(),
     ...overrides,
   };
 }
