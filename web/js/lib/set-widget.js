@@ -54,6 +54,34 @@ function coerceAdvisoryMessage(err) {
   }
 }
 
+/**
+ * #1126 — validate the RAW `allow_unlisted` tool argument before anything reads it.
+ *
+ * It lives here, exported, rather than inline in the panel's executor, because the executor
+ * sits in the 1.7MB bundle where the only available "test" is a source scan — and a source
+ * scan cannot tell a live check from a dead one (`if (false) …` still matches). This can be
+ * driven.
+ *
+ * A non-boolean is REFUSED, not coerced and not dropped. Dropping it was the first version's
+ * behaviour and it is the worst of the three: `allow_unlisted: "true"` was silently ignored,
+ * the write took the ordinary off-list refusal, and that refusal ADVERTISES allow_unlisted —
+ * so the agent is told to do the thing it just did, with nothing in the reply indicating the
+ * argument was thrown away. Coercing by truthiness is worse still: `"false"` and `"0"` are
+ * truthy strings, and this argument's whole job is to switch off a validation guard.
+ *
+ * @param {unknown} allowUnlisted the argument exactly as it arrived over the bridge
+ * @throws {Error} when present and not a boolean
+ */
+export function assertAllowUnlistedArg(allowUnlisted) {
+  if (allowUnlisted === undefined || typeof allowUnlisted === "boolean") return;
+  throw new Error(
+    `panel_set_widget: allow_unlisted must be a boolean, got ${typeof allowUnlisted} ` +
+      `(${JSON.stringify(allowUnlisted)}). It is an assertion that this node accepts values ` +
+      `its dropdown cannot enumerate, so it is never inferred from truthiness — send true or ` +
+      `false, not a string. No write was attempted.`,
+  );
+}
+
 export async function runSetWidget(
   node,
   widgetName,
@@ -82,9 +110,10 @@ export async function runSetWidget(
     confirmServerAsset,
     // #1126 — the caller's per-call assertion that this combo accepts values its dropdown
     // cannot enumerate (a custom node whose runtime handler takes an absolute path, whose
-    // enum is a convenience list or a bare placeholder). It ONLY converts a would-be
-    // off-list refusal into an unvalidated write, and only for a string; it can never
-    // pre-empt the authoritative recoveries above, and it is disclosed on the reply.
+    // enum is a convenience list or a bare placeholder, or one the node's own JS has not
+    // populated yet). It ONLY converts a would-be COMBO refusal into an unvalidated write,
+    // and only for a NON-EMPTY STRING; it can never pre-empt the authoritative recoveries
+    // above, and it is disclosed on the reply as `off_list_value_accepted`.
     allowUnlisted = false,
   } = {},
 ) {
@@ -665,8 +694,36 @@ export async function runSetWidget(
     // keying on "the server declares the list empty" broke three #507 invariants that are
     // correct, since that same condition covers the combo whose own JS populates REAL
     // options and where an off-list value is a typo worth refusing. See coerceWidgetValue.
-    if (latest?.offList && allowUnlisted) {
-      const set = write({ allowUnlistedComboValue: true });
+    //
+    // Gated on the COMBO rejection, not on `offList` alone. Both retryable combo shapes are
+    // the same statement — "the dropdown cannot enumerate what is valid" — and restricting
+    // the escape to the off-list one left the shape closest to the report unreachable: a
+    // dynamic combo whose JS has not populated the list yet rejects with `emptyOptions`,
+    // and when the server does not declare the list empty either, the #507 branch above
+    // declines and the caller's assertion was never consulted. Every other WidgetWriteError
+    // already failed closed at the top of this catch, so `latest.combo` is the full set of
+    // rejections an assertion is allowed to answer.
+    if (latest?.combo && allowUnlisted) {
+      // The write can still REFUSE — a non-string, an empty string (#347), a non-scalar, a
+      // promoted rail whose value was replaced after admission. Those arrive as a raw
+      // WidgetWriteError, and letting one escape from here loses the
+      // `panel_set_widget refused "<widget>" on node <id> (<type>)` frame that every other
+      // path in this function carries: the agent was TOLD to retry with the flag and got
+      // back a bare `Value 640 is not a valid option…` with no node, no type, no tool name.
+      let set;
+      try {
+        set = write({ allowUnlistedComboValue: true });
+      } catch (unlistedErr) {
+        if (!(unlistedErr instanceof WidgetWriteError)) throw unlistedErr;
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
+            `with allow_unlisted set: ${unlistedErr.message} allow_unlisted converts an ` +
+            `unenumerable-combo refusal for a NON-EMPTY STRING only — a number could be ` +
+            `reinterpreted as a dropdown INDEX (#240) and an empty string is a clear, which ` +
+            `a combo has no member to clear to (#347). Send the value as a string, or pick ` +
+            `an option from the list.`,
+        );
+      }
       return withWarning({
         set,
         ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
@@ -690,23 +747,27 @@ export async function runSetWidget(
 
     // No recovery succeeded — refuse honestly with the freshest rejection.
     //
-    // #1126 — an off-list refusal names `allow_unlisted`. Without this the escape is
+    // #1126 — a combo refusal names `allow_unlisted`. Without this the escape is
     // undiscoverable: the reporter's only visible options were the enumerated values, so
     // they copied the file into ComfyUI's input directory to work around a node that
-    // already accepted their path. It is offered ONLY on the off-list case, and only as a
-    // branch with its condition stated — a node that genuinely has a closed option set
-    // must not be handed a way to write nonsense into it, and the message must not read as
-    // "retry with this flag" when the real answer is usually a value from the list.
+    // already accepted their path. It is offered ONLY on a COMBO rejection — the same set
+    // the escape can actually answer, so the message never advertises a recovery that
+    // would then refuse — and only as a branch with its condition stated: a node that
+    // genuinely has a closed option set must not be handed a way to write nonsense into
+    // it, and this must not read as "retry with this flag" when the real answer is usually
+    // a value from the list.
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
         `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}` +
-        (latest?.offList && !allowUnlisted
+        (latest?.combo && !allowUnlisted
           ? ` If this node accepts values its dropdown cannot list — a file field whose enum is a ` +
             `placeholder, or one whose runtime handler takes an absolute path — and your client ` +
             `exposes an allow_unlisted option on panel_set_widget, set it to write this value ` +
-            `UNVALIDATED. Only do that when you know the node accepts it: nothing will check the ` +
-            `value, and for a combo with a genuinely closed option set the right fix is a value ` +
-            `from the list above. MEASURED: if your client answers "Unrecognized key: ` +
+            `UNVALIDATED (as a NON-EMPTY STRING; a number would be ambiguous with a dropdown ` +
+            `index and an empty string is a clear). Only do that when you know the node accepts ` +
+            `it: nothing will check the value, and for a combo with a genuinely closed option ` +
+            `set the right fix is one of the values it does list. MEASURED: if your client ` +
+            `answers "Unrecognized key: ` +
             `allow_unlisted" it predates the option and CANNOT reach it however you phrase the ` +
             `call — the orchestrator declares this tool with additionalProperties:false, so do ` +
             `not retry variants. Copy the file into ComfyUI's input directory instead, or update ` +

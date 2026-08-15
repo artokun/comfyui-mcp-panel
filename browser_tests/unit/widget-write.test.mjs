@@ -3318,17 +3318,65 @@ test("#1126: an exact member still wins, and the write is NOT marked unvalidated
   assert.equal(out.off_list_value_accepted, undefined, "a listed value was validated normally");
 });
 
-test("#1126: the unlisted acceptance sets the marker that GATES the rail cross-check", () => {
-  // The gap this closes was mine. The unlisted acceptance originally set only its own
-  // marker, so it skipped the #507 promoted-write cross-check entirely — and a promoted
-  // write assigns the value to the parent's authoritative RAIL widget and every display
-  // proxy, whose lists can be real and closed. An unlisted value would have landed there
-  // with nothing validating it. Refusing is recoverable; a corrupted rail in the
-  // serialized parent graph is not.
+test("#1126: an empty string is REFUSED even with the assertion (#347 stays shut)", () => {
+  // `typeof "" === "string"`, so a bare typeof test admitted the empty string and reopened
+  // #347 — "clearing a combo to \"\" is refused" — through a different door. `""` is never
+  // the value a node's runtime handler was waiting for; it is a clear, and a combo has no
+  // empty member to clear to. The assertion is about UNENUMERABLE values, not about
+  // suspending the combo's type rules.
+  const node = {
+    id: 7,
+    type: "FbxRenderer",
+    widgets: [{ name: "fbx_file", type: "combo", options: { values: ["empty"] }, value: "empty" }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "fbx_file", "", ALLOW_UNLISTED),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "empty", "no mutation");
+  // …and the same refusal on the EMPTY-list shape, which takes the other branch.
+  const dyn = {
+    id: 8,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }],
+  };
+  assert.throws(() => applyWidgetWrite(dyn, "model", "", ALLOW_UNLISTED), WidgetWriteError);
+  assert.equal(dyn.widgets[0].value, "", "no mutation");
+});
+
+test("#1126: the DYNAMIC-EMPTY-list family is reached by the same assertion", () => {
+  // Gating the escape on the off-list rejection alone left the shape CLOSEST to the report
+  // unreachable: a dynamic combo whose own JS has not populated the dropdown yet has a
+  // genuinely EMPTY live list, which takes the `emptyOptions` branch, not the off-list one.
+  // Without `acceptEmptyComboOptions` (that one needs the SERVER to declare the list empty,
+  // which is a claim about a different thing) the write terminated on the internal
+  // "refreshing it before deciding" retry message, naming no escape at all.
+  const node = {
+    id: 11,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }],
+  };
+  const out = applyWidgetWrite(node, "model", "llama3.2:3b", ALLOW_UNLISTED);
+  assert.equal(out.value, "llama3.2:3b");
+  assert.equal(node.widgets[0].value, "llama3.2:3b");
+  assert.equal(out.off_list_value_accepted, true, "disclosed as the CALLER's assertion…");
+  // …and NOT as the empty-list acceptance, which asserts the stronger "the server declared
+  // this list empty" and is what `empty_option_list` reports upstream.
+  assert.equal(out.empty_option_list, undefined);
+});
+
+test("#1126: the unlisted acceptance sets its OWN marker and must NOT arm the #507 empty-list gate", () => {
+  // This assertion is inverted from the one it replaces, and the inversion is the fix.
   //
-  // Asserted at coercion time because that marker is exactly what the cross-check keys
-  // on, mirroring #507's own confirmation-round test: a refactor that stops setting it
-  // silently disables the rail check, and must fail here.
+  // Arming `emptyAcceptanceUsed` was added as a SAFETY measure — it gates the #507
+  // promoted-write sibling cross-check, and the reasoning was that an unlisted value must
+  // not land unvalidated on a parent rail. What it actually did was route the admitted
+  // string through that check's #667 rail LABEL-ADOPTION, which REPLACES the value with the
+  // rail list's original: the string "4444" against a rail listing the NUMBER 4444 wrote the
+  // NUMBER. That is the #240 index-drift hazard this acceptance is only defensible because
+  // it excludes, so the safety measure introduced the very hazard it cited. Driven at
+  // coercion time because the marker is exactly what the downstream gate keys on: a refactor
+  // that re-arms it silently re-enables adoption, and must fail here.
   const placeholder = { name: "fbx_file", type: "combo", options: { values: ["empty"] }, value: "empty" };
   const out = {};
   assert.equal(
@@ -3336,7 +3384,7 @@ test("#1126: the unlisted acceptance sets the marker that GATES the rail cross-c
     String.raw`F:\Downloads\Scarlet1.0.fbx`,
   );
   assert.equal(out.offListAcceptanceUsed, true, "its own marker drives the disclosure");
-  assert.equal(out.emptyAcceptanceUsed, true, "…and it must ALSO arm the rail cross-check");
+  assert.equal(out.emptyAcceptanceUsed, undefined, "…and it must NOT arm the #507 adoption gate");
 
   // A value the list DOES contain is admitted by ordinary membership, so neither marker
   // is set and neither the disclosure nor the rail check is triggered.
@@ -3347,6 +3395,111 @@ test("#1126: the unlisted acceptance sets the marker that GATES the rail cross-c
   assert.equal(outReal.emptyAcceptanceUsed, undefined);
 });
 
-// The end-to-end rail refusal itself is covered by #507's existing cross-check tests:
-// this change routes into the SAME gate (emptyAcceptanceUsed), so a separate promoted
-// fixture here would re-test their machinery rather than anything new.
+// A PROMOTED #1126 fixture: the inner combo holds the reported PLACEHOLDER list (non-empty,
+// so it is the off-list branch — not #507's empty one), and the parent rail's options are
+// the caller's to choose. `makeEmptyInnerPromotedFixture` cannot serve: its inner list is
+// `[]`, which is a different branch with different markers.
+function makePlaceholderInnerPromotedFixture(railOptions, innerOptions = ["empty"]) {
+  const inner = {
+    id: 301,
+    type: "FbxRenderer",
+    widgets: [{ name: "fbx_file", type: "combo", options: { values: innerOptions }, value: "empty" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "fbx_alias", type: "combo", options: railOptions, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      { name: "fbx_alias", _widget: railWidget, widget: { name: "fbx_alias" }, _subgraphSlot: { name: "fbx_alias" } },
+    ],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "fbx_alias" ? { sourceNodeId: "301", sourceWidgetName: "fbx_file" } : null;
+  return { parent, inner, railWidget, resolveSource };
+}
+
+test("#1126 × #240: a promoted unlisted write lands the caller's STRING, never a rail's numeric label", () => {
+  // The confirmed regression, reproduced. The rail publishes the NUMBER 4444; the caller
+  // sends the STRING "4444" with the assertion. While the acceptance armed
+  // `emptyAcceptanceUsed`, the #667 sibling adoption matched by stringified label and
+  // replaced the value with the rail's ORIGINAL — writing the NUMBER 4444 to the rail AND
+  // to the inner widget, whose own live list is `["empty"]` and contains neither.
+  //
+  // A number on a combo is precisely what #240 forbids, because a later reader can take it
+  // for a dropdown INDEX. It also wrote a value the caller never sent while the reply's
+  // disclosure asserted "the graph now holds a value no option list vouches for" — false
+  // for a value adopted straight out of the rail's list.
+  const { parent, inner, railWidget, resolveSource } = makePlaceholderInnerPromotedFixture({ values: [4444] });
+  const set = applyWidgetWrite(parent, "fbx_alias", "4444", { ...ALLOW_UNLISTED, resolveSource });
+  assert.strictEqual(set.value, "4444", "the caller's STRING, not the rail's number");
+  assert.strictEqual(railWidget.value, "4444");
+  assert.strictEqual(inner.widgets[0].value, "4444");
+  assert.equal(typeof railWidget.value, "string", "#240: no number may reach a combo by this path");
+  assert.equal(typeof inner.widgets[0].value, "string");
+  assert.equal(set.off_list_value_accepted, true, "and it is still disclosed as unvalidated");
+});
+
+test("#1126: the PROMOTED placeholder case writes — a rail mirroring the placeholder must not refuse", () => {
+  // The other half of the same defect, and the one that made the flag useless for the
+  // actual report. The #1126 node is very plausibly inside a subgraph, and then the parent
+  // rail mirrors the inner placeholder list. Routed through #507's gate the write was
+  // refused — with a message asserting "the inner widget's option list is empty", which is
+  // untrue when that list is `["empty"]` — and the stated remedy ("address the rail
+  // directly") is not reachable, because the rail IS what this path addresses. The user was
+  // left with the copy-into-input-dir workaround this change exists to remove.
+  //
+  // The rule for this acceptance is instead: the caller's assertion is about THIS input, and
+  // a promoted rail is that same input surfaced on the parent, so the exact string lands on
+  // both. Nothing is adopted and nothing is re-typed — see the #240 test above.
+  const { parent, inner, railWidget, resolveSource } = makePlaceholderInnerPromotedFixture({ values: ["empty"] });
+  const set = applyWidgetWrite(parent, "fbx_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...ALLOW_UNLISTED,
+    resolveSource,
+  });
+  assert.equal(set.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(railWidget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`, "the rail serializes — it must hold it");
+  assert.equal(inner.widgets[0].value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(set.off_list_value_accepted, true);
+});
+
+test("#1126: WITHOUT the assertion the same promoted write is still refused (#507 untouched)", () => {
+  // The narrowing must not have widened anything by accident: with no opt-in, a value on
+  // neither the inner nor the rail list is refused exactly as before, mutating nothing.
+  const { parent, inner, railWidget, resolveSource } = makePlaceholderInnerPromotedFixture({ values: ["empty"] });
+  assert.throws(
+    () => applyWidgetWrite(parent, "fbx_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, { ...HOOKS, resolveSource }),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "empty", "inner untouched");
+  assert.equal(railWidget.value, "", "rail untouched");
+});
+
+test("#1126: the #507 empty-inner gate still adopts and still refuses — its own path is unchanged", () => {
+  // The regression risk of giving #1126 its own promoted rule is that it quietly disarms
+  // #507's. Both of #507's behaviours are re-asserted here on the EMPTY-inner fixture,
+  // driven through `acceptEmptyComboOptions` (its own opt-in), so a change that routed the
+  // empty-list acceptance through the new no-adoption rule fails here rather than silently
+  // dropping the only validator that path has.
+  const adopt = makeEmptyInnerPromotedFixture({ values: ["lt", "4444"] });
+  const set = applyWidgetWrite(adopt.parent, "model_alias", 4444, {
+    ...HOOKS,
+    resolveSource: adopt.resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "4444", "#667 adoption still fires on the empty-inner path");
+
+  const refuse = makeEmptyInnerPromotedFixture({ values: ["qwen3-vl:8b", "llama3.2:3b"] });
+  assert.throws(
+    () =>
+      applyWidgetWrite(refuse.parent, "model_alias", "off-list:70b", {
+        ...HOOKS,
+        resolveSource: refuse.resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /not a valid option for the parent subgraph/.test(err.message),
+  );
+  assert.equal(refuse.railWidget.value, "", "rail untouched");
+});

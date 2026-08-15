@@ -278,6 +278,19 @@ test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orche
   );
 });
 
+test("#1126: hello advertises that this build honours allow_unlisted on a widget write", () => {
+  // Without a signal the orchestrator cannot tell "this panel refused the value" from "this
+  // panel is too old to have been asked" — the two produce the same refusal, and telling
+  // them apart is the whole point of the escape. Unconditional, like the fences above: a
+  // capability gated behind an optional field is one an orchestrator would read as absent
+  // for a build that has it.
+  assert.equal(buildHelloPayload({ tabId: "t" }).honours_allow_unlisted_widget_value, true);
+  assert.equal(
+    buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).honours_allow_unlisted_widget_value,
+    true,
+  );
+});
+
 test("#709: hello carries the browser-tab identity separately from workflow routing", () => {
   const frame = buildHelloPayload({ tabId: "wf:shared.json", tabSessionId: "browser-tab-a" });
   assert.equal(frame.tab_id, "wf:shared.json");

@@ -35,7 +35,7 @@ import {
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { runSetWidget, assertAllowUnlistedArg } from "../../web/js/lib/set-widget.js";
 // The PRODUCTION combo refresh + the authoritative "server says this combo is empty"
 // oracle that gates #507's last-resort acceptance.
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
@@ -1895,4 +1895,99 @@ test("#1126 e2e: allow_unlisted does NOT let a typo through on a real refreshed 
     (err) => /not a valid option/.test(err.message),
   );
   assert.equal(widget2.value, "", "no mutation on the unasserted refusal");
+});
+
+// A combo whose live options are a FUNCTION returning [] while the SERVER publishes a real
+// list. The production combo refresh deliberately never clobbers a function source, so this
+// stays empty across the authoritative refresh — and because the server's list is NOT empty,
+// #507's server-declaration branch correctly declines. This is the dynamic-empty family: the
+// shape closest to #1126, and the one the first version of the escape could not reach.
+function dynamicEmptyFixture() {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: () => [] }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return { reg, node, widget };
+}
+
+test("#1126 e2e: the DYNAMIC-EMPTY family reaches the assertion — not just the off-list one", async () => {
+  const { reg, node, widget } = dynamicEmptyFixture();
+  const opts = {
+    registry: reg,
+    getRegistry: () => reg,
+    // The server publishes a REAL list, so serverDeclaresEmptyComboOptions is false and
+    // #507's automatic acceptance declines — correctly, since nothing there vouches for it.
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  };
+  // WITHOUT the assertion: refused, and the refusal must still NAME the escape. Gating the
+  // hint on the off-list rejection alone made this terminate on the internal "refreshing it
+  // before deciding" retry message, which reads as a transient panel state and names nothing
+  // the caller can do — on the family closest to the actual report.
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, opts),
+    (err) =>
+      /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\)/.test(err.message) &&
+      /exposes an allow_unlisted option/.test(err.message),
+  );
+  assert.equal(widget.value, "", "the refusal must not have mutated the widget");
+  // WITH it: written, and disclosed as the caller's assertion rather than as #507's
+  // (stronger) "the server declared this list empty".
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...opts,
+    allowUnlisted: true,
+  });
+  assert.equal(res.set.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.off_list_value_accepted, true);
+  assert.equal(res.empty_option_list, undefined);
+});
+
+test("#1126 e2e: a refusal ON the flagged retry keeps the panel_set_widget frame", async () => {
+  // The retry the refusal instructed can itself refuse — a non-string (#240) or an empty
+  // string (#347) is not admitted by the assertion. That rejection is a raw
+  // WidgetWriteError, and letting it escape unframed answered the agent's second attempt
+  // with a bare `Value 640 is not a valid option…`: no node id, no node type, no tool name,
+  // nothing to correlate with the call it made. Every other path in runSetWidget frames its
+  // refusal; this one must too, and must say what the assertion does and does not cover.
+  for (const bad of [640, ""]) {
+    const { reg, node, widget } = starNodesFixture(["empty"]);
+    await assert.rejects(
+      runSetWidget(node, "model", bad, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo(["empty"]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        allowUnlisted: true,
+        ...HOOKS,
+      }),
+      (err) =>
+        /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\) with allow_unlisted set/.test(
+          err.message,
+        ) && /NON-EMPTY STRING only/.test(err.message),
+      `unframed refusal for ${JSON.stringify(bad)}`,
+    );
+    assert.equal(widget.value, "", "no mutation on the refused retry");
+  }
+});
+
+test("#1126: a non-boolean allow_unlisted is DIAGNOSED, never dropped and never coerced", () => {
+  // Dropping it produced a loop with no exit: the write took the ordinary off-list refusal,
+  // and that refusal advertises allow_unlisted — so the agent was told to do the thing it
+  // had just done, with nothing saying the argument had been discarded. Coercing by
+  // truthiness is worse: "false" and "0" are truthy strings, and this argument exists to
+  // switch OFF a validation guard.
+  for (const bad of ["true", "false", "0", 1, 0, null, {}, []]) {
+    assert.throws(
+      () => assertAllowUnlistedArg(bad),
+      (err) => /allow_unlisted must be a boolean/.test(err.message) && /No write was attempted/.test(err.message),
+      `must diagnose ${JSON.stringify(bad)}`,
+    );
+  }
+  // Absent is the normal case and must stay silent; both booleans are legitimate.
+  assert.equal(assertAllowUnlistedArg(undefined), undefined);
+  assert.equal(assertAllowUnlistedArg(true), undefined);
+  assert.equal(assertAllowUnlistedArg(false), undefined);
 });

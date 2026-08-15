@@ -224,7 +224,7 @@ import {
   resolveRunToNodeTarget,
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
-import { runSetWidget } from "./lib/set-widget.js";
+import { runSetWidget, assertAllowUnlistedArg } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
@@ -11556,6 +11556,11 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_set_widget({ node_id, widget, value, allow_unlisted, workflow_uuid }) {
+    // #1126 — refuse a non-boolean `allow_unlisted` BEFORE any graph work, so a malformed
+    // argument cannot be silently dropped into an ordinary refusal that then advertises the
+    // very argument it discarded. The rule and its reasoning live in the lib, where they can
+    // be driven by a test rather than scanned for in this file.
+    assertAllowUnlistedArg(allow_unlisted);
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
@@ -11643,9 +11648,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // invalid value stays rejected against the FRESH list (#338/#317/#299/#288/
     // #284/#304, keeping #240 strictness).
     const result = await runSetWidget(node, widget, value, {
-      // #1126 — compared against `true` explicitly. This arrives over the bridge as
-      // caller JSON, and a truthy string ("false", "0") must never be read as the
-      // assertion that switches off a validation guard.
+      // #1126 — compared against `true` explicitly even though the type was already
+      // refused above: this is the value that reaches the guard, so it does not depend on
+      // a check twenty lines away staying correct. A truthy string must never be read as
+      // the assertion that switches off a validation guard.
       allowUnlisted: allow_unlisted === true,
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
@@ -20891,6 +20897,13 @@ function describeCommand(cmd, msg, reply) {
       // the callback programmatically and that alone can be why it threw.
       const writeDisclosed = typeof r.set?.write_warning === "string";
       const threwInNodeCallback = r.set?.write_warning_source === "widget_callback";
+      // #1126: a write admitted by the caller's `allow_unlisted` assertion was checked
+      // against NOTHING — no option list vouches for it. Rendering that as an ordinary
+      // "Set …" success is the same class of lie #366 and #639 are guarded against here:
+      // the user reads the activity summary, not the tool reply, and the one thing they
+      // cannot recover from is believing the panel validated a value it did not. Read from
+      // the lib's own field on `r.set` (like `write_warning` above), never re-derived.
+      const offListAccepted = r.set?.off_list_value_accepted === true;
       // One base clause for every variant, so a translated warning line can never drift
       // from the plain one — the disclosure is appended, exactly as the English did.
       const setLine = tr("panel.set_widget", "Set {widget} = {value} on node {node_id}", {
@@ -20901,6 +20914,15 @@ function describeCommand(cmd, msg, reply) {
       const wasPrevious = tr("panel.was_previous_value", "was {value}", {
         value: JSON.stringify(r.set?.previous),
       });
+      // Appended in BOTH branches. "the parent rail did not sync" and "nothing validated
+      // this value" are independent facts and one write can carry both; dropping either
+      // because the other fired would hide it in the case with the most to hide.
+      const offListLine = offListAccepted
+        ? tr(
+            "panel.set_widget_unvalidated",
+            " — UNVALIDATED: this value is in no option list; written because allow_unlisted asserted the node accepts values its dropdown cannot enumerate",
+          )
+        : "";
       return railStale
         ? {
             icon: "pi-exclamation-triangle",
@@ -20909,11 +20931,12 @@ function describeCommand(cmd, msg, reply) {
               tr(
                 "panel.set_widget_rail_not_synced",
                 " — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)",
-              ),
+              ) +
+              offListLine,
             detail: wasPrevious,
           }
         : {
-            icon: writeDisclosed ? "pi-exclamation-triangle" : "pi-sliders-h",
+            icon: writeDisclosed || offListAccepted ? "pi-exclamation-triangle" : "pi-sliders-h",
             text:
               setLine +
               (writeDisclosed
@@ -20926,7 +20949,8 @@ function describeCommand(cmd, msg, reply) {
                       "panel.set_widget_threw_while_applying",
                       " — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed",
                     )
-                : ""),
+                : "") +
+              offListLine,
             detail: wasPrevious,
           };
     }

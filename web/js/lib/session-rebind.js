@@ -527,6 +527,21 @@ export function buildHelloPayload({
     // no text at all, which is the worse failure. The orchestrator keeps using `say` when
     // this flag is absent.
     accepts_agent_notes: true,
+    // #1126 — this build honours `allow_unlisted` on graph_set_widget: a per-call assertion
+    // that the addressed combo accepts values its dropdown cannot enumerate, which converts
+    // a would-be combo refusal into an unvalidated (and disclosed) write.
+    //
+    // A capability rather than an assumption, for the same reason as the flags above and
+    // one more specific to this one. An OLDER panel does not merely ignore the argument: it
+    // refuses the write exactly as before, so an orchestrator that forwarded the flag
+    // unconditionally would report "the panel would not accept it" for a build that never
+    // saw the option — indistinguishable from the node genuinely rejecting the value, which
+    // is the confusion #1126 is about. With this flag the orchestrator can say which of the
+    // two happened, and can decline to advertise an escape the connected panel cannot take.
+    //
+    // Self-asserted, like every flag here: version-skew protection for an honest user, not
+    // an attestation.
+    honours_allow_unlisted_widget_value: true,
   };
   // #709 — a browser-tab-scoped identity, deliberately separate from the
   // workflow routing id. `tab_id` is normally a workflow path and can therefore

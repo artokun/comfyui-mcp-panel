@@ -437,6 +437,23 @@ export function coerceWidgetValue(
         if (out) out.emptyAcceptanceUsed = true;
         return value;
       }
+      // #1126 — the SAME caller assertion also reaches the empty-list family, and it must.
+      // #507's automatic acceptance above requires the SERVER to declare this input's list
+      // empty, because with no caller involved the server's declaration is the only thing
+      // vouching for the value. An explicit per-call assertion is different evidence and
+      // does not need it. Gating the escape on the off-list rejection ALONE left the shape
+      // CLOSEST to the report — a dynamic combo whose own JS has not populated the dropdown
+      // yet, so the live list is genuinely `[]` while the server publishes a real one —
+      // as the one shape the flag could not reach: it terminated on the retryable
+      // "refreshing it before deciding" message below, which names no escape at all.
+      //
+      // Marked as the OFF-LIST acceptance, never the empty-list one: `emptyAcceptanceUsed`
+      // asserts "the server declared this list empty", which is not what happened here, and
+      // the reply must disclose the caller's assertion rather than a server declaration.
+      if (allowUnlistedComboValue && typeof value === "string" && value !== "") {
+        if (out) out.offListAcceptanceUsed = true;
+        return value;
+      }
       throw new WidgetWriteError(
         `Combo widget "${name}" has an EMPTY option list; the server's option list may ` +
           `simply be stale — refreshing it before deciding.`,
@@ -479,29 +496,41 @@ export function coerceWidgetValue(
     // names (`None` is a real option on plenty of nodes), and not the server declaration.
     //
     // So the caller asserts it, per call, because the caller is the one who knows the node
-    // accepts values its dropdown cannot list. #240 stays intact by construction: STRING
-    // only, so a number can never be reinterpreted as an INDEX into the live list. And the
-    // reply says the value was written unvalidated — see `off_list_value_accepted`.
-    if (allowUnlistedComboValue && typeof value === "string") {
-      // TWO markers, and both matter.
+    // accepts values its dropdown cannot list. And the reply says the value was written
+    // unvalidated — see `off_list_value_accepted`.
+    //
+    // NON-EMPTY STRING, and both halves are load-bearing:
+    //
+    //   STRING — #240's reason for strict membership is that a NUMBER can be silently
+    //   reinterpreted as an INDEX into a real list, and a real list DOES exist here even
+    //   though it cannot enumerate what is valid. No path, no model name, no arbitrary
+    //   node-specific token is a number, so refusing non-strings costs the escape nothing
+    //   and keeps the whole of #240's argument rather than trading it away.
+    //
+    //   NON-EMPTY — `typeof "" === "string"`, so a bare `typeof` test admitted the empty
+    //   string and reopened #347 ("clearing a combo to `\"\"` is refused") through a
+    //   different door. `""` is never the value a node's runtime handler was waiting for;
+    //   it is a clear, and a combo has no empty member to clear to.
+    if (allowUnlistedComboValue && typeof value === "string" && value !== "") {
+      // ONE marker, and specifically NOT `emptyAcceptanceUsed`.
       //
-      // `offListAcceptanceUsed` is this path's own, and only it drives the reply's
-      // `off_list_value_accepted` — the empty-list acceptance is a different (stronger)
-      // statement and must not be reported as this one.
+      // Setting that one too was the worst defect of the first version, and it was added
+      // AS A SAFETY FIX: it gates the #507 promoted-write sibling cross-check, and the
+      // reasoning was that an unlisted value must not land unvalidated on a parent rail.
+      // What it actually did was route the admitted string into that check's #667 rail
+      // LABEL-ADOPTION, which REPLACES the value with the rail list's original — so a
+      // caller sending the string "4444" against a rail listing the NUMBER 4444 had the
+      // NUMBER written to both widgets. That is exactly the #240 index-drift hazard the
+      // comment above claims this path preserves, and the claim was false while the gate
+      // was shared. It also made the flag unusable on the promoted #1126 shape: the rail
+      // mirrors the placeholder list, so the value is off it and the write was refused
+      // outright — leaving the reporter with the copy-into-input-dir workaround this
+      // change exists to remove.
       //
-      // `emptyAcceptanceUsed` is set TOO, because it gates the promoted-write sibling
-      // cross-check below, and that check is needed here for exactly the reason it exists:
-      // a promoted write assigns this value to the parent's authoritative RAIL widget and
-      // every display proxy, whose own option lists can be real and closed. Without it an
-      // unlisted value would land there with nothing validating it, which is the #507
-      // hazard with a different trigger. My first version skipped it on the reasoning that
-      // a rail refusal would be "refusing on the caller's assertion about the INNER
-      // widget" — that has it backwards: refusing is recoverable and the caller can address
-      // the rail directly, whereas a corrupted rail in the serialized parent graph is not.
-      if (out) {
-        out.offListAcceptanceUsed = true;
-        out.emptyAcceptanceUsed = true;
-      }
+      // The promoted-write rule for THIS acceptance lives in applyWidgetWrite, keyed on
+      // this marker, and is a different rule (write the caller's exact string everywhere,
+      // adopt nothing). See the `offListAcceptanceUsed` block there.
+      if (out) out.offListAcceptanceUsed = true;
       return value;
     }
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
@@ -1185,6 +1214,37 @@ export function applyWidgetWrite(
         );
       }
     }
+  }
+
+  // #1126 — the unlisted acceptance's OWN promoted-write rule. Deliberately NOT the #507
+  // block above, and the difference is the whole point: sharing that gate replaced the
+  // caller's string with a rail's numeric label and refused the promoted case outright
+  // (see coerceWidgetValue's `offListAcceptanceUsed` note for both defects).
+  //
+  // The rule here is: write the caller's EXACT string to the rail and every display proxy,
+  // adopt nothing, and refuse nothing on sibling membership. A promoted rail is THIS SAME
+  // input surfaced on the parent — the caller's assertion ("this input accepts values its
+  // dropdown cannot list") therefore covers it, and refusing there would strand the user on
+  // precisely the reported shape, where the rail mirrors the inner placeholder list.
+  //
+  // #507's hazard does not transfer. That check exists because the EMPTY-list acceptance
+  // admits a value on the server's say-so about the INNER widget alone, so a rail with a
+  // real closed list could receive something nothing ever vouched for. Here the caller has
+  // vouched for it, for this input, by name — and what #240 actually requires is that no
+  // number is ever reinterpreted as a dropdown index, which holds far more strongly than
+  // under the shared gate: the value is a string and it is written verbatim.
+  //
+  // Asserted rather than assumed. Adoption exists ONLY in the block above, so this can fire
+  // only if a refactor re-routes this path back through it — which is exactly the regression
+  // that shipped once already. Fail closed then rather than land a value the caller never sent.
+  if (coerceOutcome.offListAcceptanceUsed && typeof coerced !== "string") {
+    throw new WidgetWriteError(
+      `Internal: the unlisted-value acceptance (#1126) admitted a string, but the value ` +
+        `about to be written is ${JSON.stringify(coerced)}. It was REPLACED after admission ` +
+        `— a sibling label adoption is the only thing that does that — so the write would ` +
+        `land a value the caller never sent, and a number on a combo is the #240 index-drift ` +
+        `hazard this acceptance is only safe because it excludes. Refusing to write.`,
+    );
   }
 
   // Snapshot the EXPECTED value BEFORE the callback runs. For a COMPOSITE object

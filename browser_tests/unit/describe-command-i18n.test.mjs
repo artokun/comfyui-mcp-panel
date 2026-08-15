@@ -198,3 +198,37 @@ test("user data in a summary is never mistaken for a placeholder", () => {
     'Set text = "a {node_id} b" on node 12',
   );
 });
+
+test("#1126: a write admitted by the caller's assertion is DISCLOSED as unvalidated", () => {
+  // The escape permits a write that NO option list vouches for. The activity card is what
+  // the user reads — not the tool reply — so rendering that as an ordinary "Set …" success
+  // is the same class of lie #366 and #639 are already guarded against here: the one thing
+  // the user cannot recover from is believing the panel validated a value it did not.
+  __setCatalogForTest("en", {});
+  const ordinary = say("graph_set_widget", { set: { widget: "fbx_file", value: "x.fbx", node_id: 4, previous: "" } });
+  assert.equal(ordinary, 'Set fbx_file = "x.fbx" on node 4', "an ordinary write is unchanged");
+  const unvalidated = say("graph_set_widget", {
+    set: { widget: "fbx_file", value: "F:/Downloads/Scarlet1.0.fbx", node_id: 4, previous: "empty", off_list_value_accepted: true },
+  });
+  assert.match(unvalidated, /^Set fbx_file = "F:\/Downloads\/Scarlet1\.0\.fbx" on node 4/);
+  assert.match(unvalidated, /UNVALIDATED/);
+  assert.match(unvalidated, /allow_unlisted/);
+});
+
+test("#1126: the unvalidated disclosure and the #366 rail warning are BOTH shown", () => {
+  // Independent facts, and one write can carry both. Appending only one because the other
+  // fired would drop a disclosure in the case that has the most to disclose.
+  __setCatalogForTest("en", {});
+  const both = say("graph_set_widget", {
+    set: {
+      widget: "fbx_alias",
+      value: "F:/x.fbx",
+      node_id: 320,
+      previous: "",
+      off_list_value_accepted: true,
+      promoted_from: { parent_widget_synced: false },
+    },
+  });
+  assert.match(both, /parent subgraph rail NOT synced/);
+  assert.match(both, /UNVALIDATED/);
+});
