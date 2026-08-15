@@ -9,6 +9,11 @@ import {
   collectMissingNodeTypeReasons,
   nodeRedFlagIsStale,
 } from "../../web/js/lib/asset-staleness.js";
+import {
+  danglingInputLinks,
+  disconnectedBoundaryInputs,
+  brokenConversionRefusal,
+} from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -42,13 +47,35 @@ const assertSubgraphNodeLanded = new Function(
   `return ${landedMatch[0]};`,
 )();
 
+// #1571 — and the same again for the serializability guard the two executors now run
+// after the landing check. Injected from the REAL source with the REAL lib helpers, for
+// the same reason: a stub here would hide a regression in the shipped guard. Both
+// helpers answer "no findings" for the deliberately minimal graphs below (no readable
+// link table, no inputs on the wrapper), which is the fail-silent property they promise.
+const serializableMatch = panelSrc.match(
+  /function assertSubgraphConversionSerializable\(res, node, what\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(serializableMatch, "could not locate assertSubgraphConversionSerializable in panel source");
+const assertSubgraphConversionSerializable = new Function(
+  "danglingInputLinks",
+  "disconnectedBoundaryInputs",
+  "brokenConversionRefusal",
+  `return ${serializableMatch[0]};`,
+)(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal);
+
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
     "getGraphCtx",
     "clearStaleRedFlagsAfterSubgraphConversion",
     "assertSubgraphNodeLanded",
+    "assertSubgraphConversionSerializable",
     `const executors = { ${createSource} }; return executors.graph_create_subgraph;`,
-  )(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion, assertSubgraphNodeLanded);
+  )(
+    getGraphCtx,
+    clearStaleRedFlagsAfterSubgraphConversion,
+    assertSubgraphNodeLanded,
+    assertSubgraphConversionSerializable,
+  );
 }
 
 function realGroup(
@@ -65,6 +92,7 @@ function realGroup(
     "groupMemberNodes",
     "clearStaleRedFlagsAfterSubgraphConversion",
     "assertSubgraphNodeLanded",
+    "assertSubgraphConversionSerializable",
     `const executors = { ${groupSource} }; return executors.graph_subgraph_group;`,
   )(
     getGraphCtx,
@@ -73,6 +101,7 @@ function realGroup(
     groupMemberNodes,
     clearStaleRedFlagsAfterSubgraphConversion,
     assertSubgraphNodeLanded,
+    assertSubgraphConversionSerializable,
   );
 }
 

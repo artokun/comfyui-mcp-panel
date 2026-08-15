@@ -316,3 +316,126 @@ test("#1571 the guard is imported, not shadowed by a local stub", () => {
     /import \{\s*danglingInputLinks,\s*disconnectedBoundaryInputs,\s*brokenConversionRefusal,\s*\} from "\.\/lib\/subgraph-conversion-integrity\.js";/,
   );
 });
+
+// ── BEHAVIOUR, through the REAL shipped executor. The wiring tests above prove the calls
+//    are written down; they cannot prove the tool actually refuses. This extracts
+//    `graph_subgraph_group` from the monolith and drives it with a convertToSubgraph that
+//    returns exactly what the reporter's did — the same real-source extraction pattern
+//    subgraph-stale-outline.test.mjs uses on these two executors.
+
+/** Build the shipped executor with injected deps, exactly as the panel wires them. */
+function realExecutor(name, args, convertToSubgraph, wrapper) {
+  const s = src();
+  const body = s.match(new RegExp(`${name}\\(${args}\\) \\{[\\s\\S]*?\\n  \\},`));
+  assert.ok(body, `could not locate ${name} in panel source`);
+  const landed = s.match(/function assertSubgraphNodeLanded\(res, graph, what\) \{[\s\S]*?\r?\n\}/);
+  const serializable = s.match(
+    /function assertSubgraphConversionSerializable\(res, node, what\) \{[\s\S]*?\r?\n\}/,
+  );
+  assert.ok(landed && serializable, "both conversion guards must be locatable in the source");
+  const graph = {
+    _nodes: [wrapper],
+    getNodeById: (id) => ({ id: Number(id) }),
+    beforeChange() {},
+    afterChange() {},
+    convertToSubgraph,
+    setDirtyCanvas() {},
+  };
+  const canvas = { selectedItems: [], selectItems(items) { canvas.selectedItems = items; } };
+  return new Function(
+    "getGraphCtx",
+    "resolveGroupRef",
+    "syncGraphNodeAreas",
+    "groupMemberNodes",
+    "clearStaleRedFlagsAfterSubgraphConversion",
+    "assertSubgraphNodeLanded",
+    "assertSubgraphConversionSerializable",
+    `const executors = { ${body[0]} }; return executors.${name.replace(/^async /, "")};`,
+  )(
+    () => ({ app: {}, graph, canvas, rootGraph: graph }),
+    () => ({ id: 22, title: "COMBOS VARIANCE" }),
+    () => {},
+    () => [{ id: 192 }, { id: 265 }, { id: 273 }],
+    () => {},
+    new Function(`return ${landed[0]};`)(),
+    new Function(
+      "danglingInputLinks",
+      "disconnectedBoundaryInputs",
+      "brokenConversionRefusal",
+      `return ${serializable[0]};`,
+    )(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal),
+  );
+}
+
+/** The subgraph node convertToSubgraph put on the canvas, boundary input unfed. */
+const wrapperNode = (link) => ({
+  id: 302,
+  type: "3be9b3b8-5e79-4bd1-acc6-015115c03be5",
+  inputs: [{ name: "conditioning", type: "CONDITIONING", link }],
+});
+
+test("#1571 BEHAVIOUR: panel_subgraph_group REFUSES the reported conversion", () => {
+  const wrapper = wrapperNode(null);
+  const group = realExecutor(
+    "graph_subgraph_group",
+    "\\{ group \\}",
+    () => ({ node: wrapper, subgraph: brokenSubgraph() }),
+    wrapper,
+  );
+  assert.throws(
+    () => group({ group: "COMBOS VARIANCE" }),
+    (err) => {
+      assert.match(err.message, /panel_subgraph_group created subgraph node 302/);
+      assert.match(err.message, /RBG_Smart_Seed_Variance node 192 \(bypassed\) input 0 "conditioning" → link 505/);
+      assert.match(err.message, /No link found in parent graph for id \[302:192\]/);
+      return true;
+    },
+    "the tool that reported success must now refuse",
+  );
+});
+
+test("#1571 BEHAVIOUR: a healthy conversion still reports success, with the unfed slot named", () => {
+  // The direction that would break the tool for everyone. Same executor, same wrapper —
+  // only the subgraph's link table differs.
+  const wrapper = wrapperNode(null);
+  const group = realExecutor(
+    "graph_subgraph_group",
+    "\\{ group \\}",
+    () => ({ node: wrapper, subgraph: healthySubgraph() }),
+    wrapper,
+  );
+  const out = group({ group: "COMBOS VARIANCE" });
+  assert.equal(out.subgraph.node_id, 302);
+  assert.deepEqual(out.subgraph.from_nodes, [192, 265, 273]);
+  // The advisory tier: reported, never fatal.
+  assert.deepEqual(out.subgraph.unfed_boundary_inputs, [
+    { slot: 0, name: "conditioning", type: "CONDITIONING" },
+  ]);
+});
+
+test("#1571 BEHAVIOUR: a fully healthy conversion carries no advisory key at all", () => {
+  // An `unfed_boundary_inputs: []` on every clean conversion would read as a finding.
+  const wrapper = wrapperNode(505);
+  const group = realExecutor(
+    "graph_subgraph_group",
+    "\\{ group \\}",
+    () => ({ node: wrapper, subgraph: healthySubgraph() }),
+    wrapper,
+  );
+  const out = group({ group: "COMBOS VARIANCE" });
+  assert.ok(!("unfed_boundary_inputs" in out.subgraph), "a clean conversion reports no advisory");
+});
+
+test("#1571 BEHAVIOUR: panel_create_subgraph refuses the same corruption", () => {
+  const wrapper = wrapperNode(null);
+  const create = realExecutor(
+    "graph_create_subgraph",
+    "\\{ node_ids \\}",
+    () => ({ node: wrapper, subgraph: brokenSubgraph() }),
+    wrapper,
+  );
+  assert.throws(
+    () => create({ node_ids: [192, 265, 273] }),
+    /panel_create_subgraph created subgraph node 302/,
+  );
+});
