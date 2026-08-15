@@ -459,7 +459,11 @@ test("#508 wiring: a SUPERSEDED socket still gets its reply — only the UI cont
   const supersededAt = src.indexOf("const superseded = !isActive();");
   assert.notEqual(supersededAt, -1, "the instance guard must be captured, not used as an early return");
   const block = src.slice(supersededAt, supersededAt + 1200);
-  const sendAt = block.indexOf("deliverReply(reply, msg.cmd, superseded)");
+  // #1095 — matched on the leading arguments, not the whole call. The claim here is about
+  // ORDER (the reply is written before the superseded early return), and pinning the exact
+  // arity made it fail when the in-flight mark became a fourth argument — a passing
+  // assertion breaking for a reason unrelated to what it checks.
+  const sendAt = block.search(/deliverReply\(reply, msg\.cmd, superseded[,)]/);
   const gateAt = block.indexOf("if (superseded) return;");
   assert.notEqual(sendAt, -1, "the reply must still be written to the socket it arrived on");
   assert.notEqual(gateAt, -1, "the UI continuation must still be gated on the instance guard");
@@ -607,10 +611,26 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
   // Every mark must be paired with the single release in deliverReply, or the count
   // drifts: too high delays a re-advertise until the budget runs out, too low reopens the
   // race. Both command paths that reach deliverReply mark.
-  const marks = (src.match(/^\s*rehelloGate\.began\(/gm) || []).length;
-  const releases = (src.match(/^\s*rehelloGate\.ended\(\);/gm) || []).length;
+  const marks = (src.match(/^\s*(?:const \w+ = )?rehelloGate\.began\(/gm) || []).length;
+  const releases = (src.match(/^\s*rehelloGate\.ended\(mark\);/gm) || []).length;
   assert.equal(marks, 2, "both command paths that deliver a reply must mark it in flight");
   assert.equal(releases, 1, "the mark is released in exactly one place — deliverReply");
+
+  // codex P1 — the release must NAME the mark it is releasing. deliverReply is per-SOCKET
+  // while marks are per-COMMAND, and the two lifetimes come apart the moment a connection is
+  // replaced: cancel() invalidates the retired socket's marks, but a command already
+  // executing there still finishes and still calls this. A release that named nothing would
+  // land on whatever the NEW socket is running. Both call sites must therefore pass one.
+  assert.equal(
+    (src.match(/^\s*const deliverReply = \(reply, cmd, superseded, mark\) => \{/gm) || []).length,
+    1,
+    "deliverReply must take the mark from its caller, not release blind",
+  );
+  assert.equal(
+    /rehelloGate\.ended\(\);/.test(src),
+    false,
+    "an unnamed release would discount a command belonging to another generation",
+  );
 
   // COUNTING THOSE IS NOT ENOUGH, and this test shipped believing it was. Review proved
   // it by execution: at the revision where the mark sat ABOVE the #517 dedupe region —
@@ -676,13 +696,13 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
   );
 
   // The release must live INSIDE deliverReply, which every command path reaches once.
-  const dStart = src.indexOf("const deliverReply = (reply, cmd, superseded) => {");
+  const dStart = src.indexOf("const deliverReply = (reply, cmd, superseded, mark) => {");
   assert.notEqual(dStart, -1, "could not locate deliverReply");
   const dEnd = src.indexOf("\n    };", dStart);
   assert.notEqual(dEnd, -1, "could not locate the end of deliverReply");
   assert.match(
     src.slice(dStart, dEnd),
-    /rehelloGate\.ended\(\);/,
+    /rehelloGate\.ended\(mark\);/,
     "the command is finished when its reply is handed over, whatever happens to it after",
   );
 
@@ -695,8 +715,37 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
   assert.ok(gStart !== -1 && gEnd !== -1, "could not bound the superseded guard");
   assert.match(
     src.slice(gStart, gEnd),
-    /rehelloGate\.began\(\);/,
+    /const refusalMark = rehelloGate\.began\(\);/,
     "the superseded refusal must balance the release its deliverReply performs",
+  );
+});
+
+test("#1095 codex P2: an ordinary socket close clears the gate, like every other teardown", () => {
+  // stop() / setUrl() / destroy() are the PANEL-DRIVEN teardowns; they null `sock`
+  // synchronously, so their late close fails the active guard and never reaches this
+  // handler. An ordinary drop (network, server restart) reaches recovery only through
+  // scheduleReconnect here — so this was the one path that let a replacement socket inherit
+  // the previous connection's gate state: a parked waiter or its timer could fire a hello
+  // against the NEW socket, and the dead socket's outstanding marks would delay the next
+  // legitimate re-advertise.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const closeAt = src.indexOf('thisSock.addEventListener("close", () => {');
+  assert.notEqual(closeAt, -1, "could not locate the close handler");
+  const closeEnd = src.indexOf("\n    });", closeAt);
+  assert.notEqual(closeEnd, -1, "could not locate the end of the close handler");
+  const body = src.slice(closeAt, closeEnd);
+
+  // It must be gated on the ACTIVE socket: a superseded socket's close must not clear the
+  // live connection's gate — that would withdraw the route from commands running on it.
+  const guardAt = body.indexOf("if (!isActive()) return;");
+  const cancelAt = body.indexOf("rehelloGate.cancel();");
+  assert.notEqual(guardAt, -1, "the handler must ignore a superseded socket's close");
+  assert.notEqual(cancelAt, -1, "an ordinary close must drop any parked re-advertise");
+  assert.ok(guardAt < cancelAt, "…and only for the socket that is actually current");
+  assert.match(
+    body,
+    /advertisedSock = null;/,
+    "the replacement socket has no mapping yet, so its first hello must not be gated",
   );
 });
 
@@ -768,18 +817,19 @@ test("#1095: EVERY re-advertise goes through the gate — no caller can bypass i
 
   // A parked hello belongs to the connection it was queued for. Every teardown path must
   // drop it: setUrl (pointing at a DIFFERENT bridge — firing there would register this tab
-  // somewhere nobody asked for, the corruption class #508 refuses to risk), stop, and
-  // destroy (a timer firing from a closure nothing owns any more). Three paths, three
-  // cancels — the same "setUrl/stop/destroy must all forget it" rule already asserted for
-  // `handshakenSock` above.
+  // somewhere nobody asked for, the corruption class #508 refuses to risk), stop, destroy
+  // (a timer firing from a closure nothing owns any more), and — codex P2 — the ordinary
+  // socket close, which is the only one of the four that recovers by RECONNECTING rather
+  // than by tearing the client down, and so was the one that let a replacement socket
+  // inherit its predecessor's gate state.
   assert.equal(
     (src.match(/^\s*rehelloGate\.cancel\(\);/gm) || []).length,
-    3,
-    "setUrl, stop and destroy must each drop a parked re-advertise",
+    4,
+    "setUrl, stop, destroy and an active close must each drop a parked re-advertise",
   );
   assert.equal(
     (src.match(/^\s*advertisedSock = null;/gm) || []).length,
-    3,
+    4,
     "…and each must forget the socket that had a mapping, so the next hello is a first one",
   );
 });

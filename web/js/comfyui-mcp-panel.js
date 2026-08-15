@@ -18648,13 +18648,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     /** #508 — write `reply` back on the socket the command ARRIVED on, and if that is
      *  impossible, journal the outcome (for replay) and run the bounded self-heal.
      *  Returns true only when the frame was actually handed to an open socket. */
-    const deliverReply = (reply, cmd, superseded) => {
+    const deliverReply = (reply, cmd, superseded, mark) => {
       // #1095 — the command is finished the moment its reply is handed over, whatever
       // happens to it after. Released here rather than at each `return` because every
-      // command path reaches this exactly once, and the gate floors the count at 0 so a
-      // double-delivery (a retry, a future refactor) can never drive it negative and
-      // permanently convince the gate that nothing is running.
-      rehelloGate.ended();
+      // command path reaches this exactly once.
+      //
+      // The MARK is threaded from the call site rather than released blind. deliverReply is
+      // per-SOCKET but marks are per-COMMAND, and the two lifetimes come apart the moment a
+      // connection is replaced: `cancel()` invalidates the retired socket's marks, but a
+      // command already executing there still finishes and still calls this. A blind
+      // release would then land on whatever the NEW socket is running and discount ITS
+      // mark, letting a parked hello flush mid-command — the exact race this gate exists to
+      // close, recreated by its own bookkeeping. An invalidated mark releases nothing.
+      rehelloGate.ended(mark);
       const socketOpen = thisSock.readyState === WebSocket.OPEN;
       let sendThrew = false;
       if (socketOpen) {
@@ -18733,7 +18739,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // budget is a MAX over the batch and only clears at drain, so over-declaring
           // once would pin the route for half a minute. Anonymous means the machine
           // budget, which for an instant refusal is already generous.
-          rehelloGate.began();
+          const refusalMark = rehelloGate.began();
           deliverReply(
             {
               rid: msg.rid,
@@ -18745,6 +18751,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             },
             msg.cmd,
             true,
+            refusalMark,
           );
         }
         return;
@@ -18864,7 +18871,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         //
         // From here to deliverReply there is no other exit: the executor's throws are
         // caught below and turned into a reply, so mark and release are exactly paired.
-        rehelloGate.began(msg.cmd);
+        //
+        // The id is KEPT and handed back at the reply. A release that does not name its own
+        // mark cannot be told apart from one belonging to a connection that has since been
+        // retired — see deliverReply.
+        const inFlightMark = rehelloGate.began(msg.cmd);
         const settleRid = commandRidLedger.begin(msg.rid, fingerprint, commandEpoch);
         let reply;
         // #581 — retain the tracker belonging to the command's completed edit.
@@ -19255,7 +19266,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // sender with no outcome at all — the "registered tab that never acknowledges
         // anything" wedge. So: always attempt the reply; gate only the UI continuation.
         const superseded = !isActive();
-        if (deliverReply(reply, msg.cmd, superseded)) {
+        if (deliverReply(reply, msg.cmd, superseded, inFlightMark)) {
           // #402 — the open receipt records that its answer was handed to a live socket.
           // ADVISORY only: a socket can still die before the bytes land, so this never
           // becomes a claim about what the caller received — only `applied` is that.
@@ -19454,6 +19465,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // #654 — a pending refused-hello retry belongs to the dead socket; the
       // reconnect loop's next open-hello takes over (and resets the budget).
       clearRouteRefusalRetry();
+      // #1095 — and so does a parked re-advertise, for exactly the same reason. This is the
+      // ORDINARY drop (network, server restart), which reaches recovery through
+      // scheduleReconnect below rather than through stop()/setUrl()/destroy() — so without
+      // this it was the one teardown that inherited the previous connection's gate state.
+      // Two ways that hurt: a waiter or its timer could fire `advertiseHello()` against the
+      // REPLACEMENT socket, re-registering the tab on a hello nobody asked for; and even
+      // with nothing parked, the dead socket's still-outstanding marks would make the next
+      // legitimate re-advertise wait out a budget for commands that can no longer reply.
+      // Clearing also invalidates those marks, so when the retired socket's commands do
+      // finish, their releases cannot discount the new connection's work.
+      rehelloGate.cancel();
+      // The replacement socket has no mapping yet, so its first hello CREATES one and must
+      // not be gated.
+      advertisedSock = null;
       // Fail any in-flight direct tool calls — the reply can never arrive now.
       for (const [, pend] of pendingCalls) {
         clearTimeout(pend.timer);

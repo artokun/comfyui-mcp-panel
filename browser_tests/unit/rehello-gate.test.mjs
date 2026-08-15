@@ -70,12 +70,12 @@ function harness({ landed = true, advertise } = {}) {
 
 test("#1095: a re-advertise does NOT withdraw the route while a command is in flight", async () => {
   const { gate, sends, advance } = harness();
-  gate.began("graph_set_widget");
+  const mark = gate.began("graph_set_widget");
   const landed = gate.request();
   assert.deepEqual(sends, [], "the hello must not go out while the command is still routed");
   advance(1);
   assert.deepEqual(sends, [], "…and not on the next tick either");
-  gate.ended();
+  gate.ended(mark);
   assert.equal(sends.length, 1, "it goes out the moment the batch drains");
   assert.equal(await landed, true, "and the caller learns it reached the wire");
 });
@@ -89,10 +89,10 @@ test("#1095: with nothing in flight the hello is immediate — the gate adds no 
 
 test("#1095: the drain releases it, not the timer — the budget is a CEILING, not a delay", () => {
   const { gate, sends, advance, armed } = harness();
-  gate.began("graph_set_widget");
+  const mark = gate.began("graph_set_widget");
   gate.request();
   advance(5);
-  gate.ended();
+  gate.ended(mark);
   assert.equal(sends.length, 1, "a 4-second budget must not mean a 4-second stall");
   assert.equal(armed(), 0, "and the pending timer must be disarmed, not left to fire again");
 });
@@ -119,11 +119,11 @@ test("#1095: a HUMAN-paced command is not abandoned on the machine budget", asyn
   // anyway — the user answers a question and the orchestrator reports OUTCOME UNKNOWN for
   // the answer they just gave. These are the commands that most need the cover.
   const { gate, sends, advance } = harness();
-  gate.began("ask_user");
+  const mark = gate.began("ask_user");
   const landed = gate.request();
   advance(REHELLO_DEFER_MS + 1);
   assert.deepEqual(sends, [], "the machine budget must not apply to a command paced by a person");
-  gate.ended();
+  gate.ended(mark);
   assert.equal(sends.length, 1, "the answer's reply is delivered first, then the re-advertise");
   assert.equal(await landed, true);
 });
@@ -155,14 +155,14 @@ test("#1095: a command that STARTS during the wait extends it — the timer cann
   // on the deadline that was current when the timer was armed would re-advertise while a
   // newer command is mid-flight: the exact race, reintroduced by the bound meant to end it.
   const { gate, sends, advance } = harness();
-  gate.began("graph_set_widget"); // deadline t=4000
+  const first = gate.began("graph_set_widget"); // deadline t=4000
   gate.request();
   advance(3000);
-  gate.began("ask_user"); // deadline t=33000
+  const second = gate.began("ask_user"); // deadline t=33000
   advance(1500); // t=4500 — past the ORIGINAL deadline
   assert.deepEqual(sends, [], "the wait must follow the newest command, not the first one");
-  gate.ended();
-  gate.ended();
+  gate.ended(first);
+  gate.ended(second);
   assert.equal(sends.length, 1);
 });
 
@@ -174,41 +174,50 @@ test("#1095: an already-spent budget does not restart the wait", () => {
   assert.equal(sends.length, 1, "a stuck command must not buy a fresh budget per request");
 });
 
-// --- coalescing and pairing ----------------------------------------------
+// --- coalescing and mark identity ----------------------------------------
 
 test("#1095: several deferred re-advertises coalesce into ONE hello, all told the same outcome", async () => {
   // A hello is a statement of current state, not an event log: two parked requests both want
   // the orchestrator to hold this tab's live identity, and one send says that.
   const { gate, sends } = harness();
-  gate.began("graph_set_widget");
+  const mark = gate.began("graph_set_widget");
   const a = gate.request();
   const b = gate.request();
   const c = gate.request();
-  gate.ended();
+  gate.ended(mark);
   assert.equal(sends.length, 1, "one send, not a queue of three");
   assert.deepEqual(await Promise.all([a, b, c]), [true, true, true]);
 });
 
-test("#1095: an over-release cannot convince the gate that nothing is running", () => {
+test("#1095: a DOUBLE release of one mark cannot discount another command", () => {
   // deliverReply releases the mark, and a double-delivery (a retry, a future refactor) must
-  // not drive the count negative — a negative count never returns to 0, so the gate would
-  // wave every later re-advertise straight through and the race would be back.
+  // not free work that is still running. A counter could not tell the two apart; an id can.
   const { gate, sends } = harness();
-  gate.began();
-  gate.ended();
-  gate.ended();
-  gate.ended();
-  assert.equal(gate.inFlight(), 0);
-  gate.began("graph_set_widget");
+  const mine = gate.began("graph_set_widget");
+  gate.began("graph_set_widget"); // a second, still-running command
   gate.request();
-  assert.deepEqual(sends, [], "a real command must still be covered after the over-release");
+  gate.ended(mine);
+  gate.ended(mine);
+  gate.ended(mine);
+  assert.equal(gate.inFlight(), 1, "the other command must still be marked");
+  assert.deepEqual(sends, [], "…and the hello must still be parked behind it");
+});
+
+test("#1095: a release that does not NAME its mark frees nothing — it fails closed", () => {
+  // The safe direction: an unnamed release can only DELAY a re-advertise (the budget still
+  // expires), never let one through while a command is mid-flight.
+  const { gate, sends } = harness();
+  const mark = gate.began("graph_set_widget");
+  gate.request();
   gate.ended();
+  gate.ended(undefined);
+  gate.ended(999999);
+  assert.deepEqual(sends, [], "an unknown mark must not release a real one");
+  gate.ended(mark);
   assert.equal(sends.length, 1);
 });
 
 test("#1095: a leaked mark delays the hello but can never block it", () => {
-  // The mark/release pair is checked structurally in command-liveness.test.mjs. This is the
-  // blast radius if one ever escapes anyway: the budget still expires.
   const { gate, sends, advance } = harness();
   gate.began("graph_set_widget"); // never released
   gate.request();
@@ -218,6 +227,43 @@ test("#1095: a leaked mark delays the hello but can never block it", () => {
   // a budget that has already expired.
   gate.request();
   assert.equal(sends.length, 2);
+});
+
+// --- generation scoping (codex P1) ---------------------------------------
+
+test("#1095 codex P1: a LATE release from a retired connection must not free the new one's mark", () => {
+  // cancel() runs when the connection is replaced (setUrl / stop / destroy / an ordinary
+  // close). A command already executing on the RETIRED socket still finishes and still calls
+  // its release. Against a shared counter that release lands on whatever the NEW socket is
+  // running and decrements ITS mark — so a parked hello flushes while a live command is
+  // mid-flight, recreating the exact route-loss race this module exists to close.
+  const { gate, sends } = harness();
+  const retired = gate.began("graph_set_widget"); // running on the old socket
+  gate.cancel(); // the connection is replaced
+  const current = gate.began("graph_set_widget"); // the new socket's command
+  const landed = gate.request();
+  assert.deepEqual(sends, [], "parked behind the NEW command");
+
+  gate.ended(retired); // the old socket's command finally finishes
+  assert.equal(gate.inFlight(), 1, "the retired mark is not accounted for, so nothing is freed");
+  assert.deepEqual(sends, [], "a stale release must not withdraw the route from a live command");
+
+  gate.ended(current);
+  assert.equal(sends.length, 1, "only the real release lets the hello go");
+  return landed;
+});
+
+test("#1095 codex P1: cancel() invalidates outstanding marks, so they cannot delay the next hello", () => {
+  // The other direction of the same defect: marks belonging to a dead socket must not make
+  // the replacement connection's legitimate re-advertise wait out a budget for commands that
+  // can never reply.
+  const { gate, sends } = harness();
+  gate.began("ask_user");
+  gate.began("graph_set_widget");
+  gate.cancel();
+  assert.equal(gate.inFlight(), 0, "a replaced connection carries none of its predecessor's marks");
+  gate.request();
+  assert.equal(sends.length, 1, "the new connection's hello is immediate");
 });
 
 // --- teardown -------------------------------------------------------------

@@ -129,18 +129,37 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   const disarm = typeof clearTimer === "function" ? clearTimer : (t) => clearTimeout(t);
   const send = typeof advertise === "function" ? advertise : () => Promise.resolve(false);
 
-  let inFlight = 0;
-  // The latest instant at which SOME in-flight command still has budget left. Zero means
+  // The marks currently outstanding, by id.
+  //
+  // A SET OF IDS RATHER THAN A COUNTER, because a counter cannot tell a release apart from
+  // the mark it belongs to, and three separate defects all come from that one gap:
+  //
+  //   * A LATE release from a RETIRED socket. `cancel()` runs when the connection is
+  //     replaced (setUrl/stop/destroy/close), but a command already executing on the old
+  //     socket still finishes and still calls its release. Against a counter that release
+  //     lands on whatever the NEW socket is running and decrements ITS mark — so a parked
+  //     hello can flush while a live command is mid-flight, which is precisely the
+  //     route-loss race this module exists to close, recreated by its own bookkeeping.
+  //     An id from a cleared generation is simply not in the set, so it releases nothing.
+  //   * A DOUBLE release (a retry, a future refactor). The second `ended` finds no id and
+  //     is a no-op, instead of discounting an unrelated command.
+  //   * Command identity in general. Keying on `rid` was considered and rejected: rids are
+  //     NOT unique here, because the #517 retry path re-delivers a previously-seen rid, so
+  //     a map keyed by rid would collapse two marks into one entry and release both on the
+  //     first reply.
+  //
+  // `ended` with a missing or unknown id releases NOTHING, which fails CLOSED — it can only
+  // delay a re-advertise (bounded below), never let one through early. That is the safe
+  // direction, and the only one of the two that can lose a reply is the other.
+  const live = new Set();
+  let nextMark = 1;
+  // The latest instant at which SOME outstanding mark still has budget left. Zero means
   // nothing is running.
   //
-  // Deliberately the MAX over the batch, cleared only when the count reaches zero, rather
-  // than a per-command deadline. A per-command deadline needs per-command identity, and rids
-  // are NOT unique here: the #517 retry path re-delivers a previously-seen rid, so a map
-  // keyed by rid would collapse two marks into one entry and release both on the first
-  // reply — an unpaired release, which reopens the very race this exists to close. The cost
-  // of the max is that a short command running alongside an `ask_user` inherits the human
-  // budget until the batch drains. That over-waits; it cannot under-wait, and only the
-  // under-wait direction loses a reply.
+  // Deliberately the MAX over the batch, cleared only when the set empties, rather than a
+  // per-mark deadline. The cost is that a short command running alongside an `ask_user`
+  // inherits the human budget until the batch drains. That over-waits; it cannot under-wait,
+  // and only the under-wait direction loses a reply.
   let drainDeadline = 0;
 
   // The parked re-advertise. ONE, because coalescing is correct (see the header): several
@@ -186,7 +205,7 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     // Re-check rather than trust the arming. A command that STARTED after the timer was
     // armed pushes `drainDeadline` out, and firing on the old deadline would advertise while
     // that command is mid-flight — the exact race, reintroduced by the bound meant to end it.
-    if (inFlight > 0 && clock() < drainDeadline) {
+    if (live.size > 0 && clock() < drainDeadline) {
       armFor(drainDeadline - clock());
       return;
     }
@@ -206,9 +225,12 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   }
 
   return {
-    /** A command frame has begun executing against this socket's tab mapping. */
+    /** A command frame has begun executing against this socket's tab mapping.
+     *  @returns {number} the mark id to hand back to `ended()` when its reply goes out.
+     *    Callers MUST keep it: a release without it is inert (see `live` above). */
     began(cmd) {
-      inFlight++;
+      const mark = nextMark++;
+      live.add(mark);
       const until = clock() + deferBudgetMs(cmd);
       if (until > drainDeadline) {
         drainDeadline = until;
@@ -217,12 +239,15 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
         // rather than relying on a re-check to paper over a wrong wake-up.)
         if (waiters) armFor(drainDeadline - clock());
       }
+      return mark;
     },
 
-    /** Its reply has been handed to the socket — whatever happens to it after. */
-    ended() {
-      if (inFlight > 0) inFlight--;
-      if (inFlight === 0) {
+    /** The reply for `mark` has been handed to the socket — whatever happens to it after.
+     *  A mark that was never taken, already released, or invalidated by `cancel()` releases
+     *  nothing: it belongs to a generation this gate no longer accounts for. */
+    ended(mark) {
+      if (!live.delete(mark)) return;
+      if (live.size === 0) {
         drainDeadline = 0;
         // The batch drained, which is the event the parked hello was waiting for. Send it
         // NOW rather than waiting out the remaining budget: the budget is a CEILING on the
@@ -234,13 +259,13 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     /** How many command frames are executing. Read-only: only the command path may move it,
      *  and a caller that could reset it could manufacture the race this closes. */
     inFlight() {
-      return inFlight;
+      return live.size;
     },
 
     /** Re-advertise, waiting for the in-flight batch first if there is one.
      *  @returns {Promise<boolean>} whether the hello reached the wire. */
     request() {
-      if (inFlight === 0) return flush();
+      if (live.size === 0) return flush();
       const left = drainDeadline - clock();
       // Budget already spent (a command that will not report back). Proceed — an unbounded
       // wait here is the wedge described in the header.
@@ -255,15 +280,24 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       return promise;
     },
 
-    /** Torn down (stop/destroy/setUrl). Drop the parked hello WITHOUT sending it: the socket
-     *  it was meant for is gone, and a hello fired into a replaced connection re-registers a
-     *  tab under a route the caller never asked for. Waiters are resolved false — "it did not
-     *  land" — because leaving them pending would hang the fence's own bookkeeping. */
+    /** The connection this state belongs to is gone (setUrl / stop / destroy, and an
+     *  ordinary close of the ACTIVE socket — a reconnect must not inherit any of it).
+     *
+     *  Drops the parked hello WITHOUT sending it: the socket it was meant for no longer
+     *  exists, and a hello fired into the REPLACEMENT connection re-registers this tab under
+     *  a route the caller never asked for — the corruption class #508 refuses to risk.
+     *  Waiters resolve false ("it did not land") rather than being left pending, which would
+     *  hang the #607 fence's own bookkeeping.
+     *
+     *  Clearing `live` also INVALIDATES every outstanding mark. Commands still executing on
+     *  the retired socket will finish and call their release; those releases now find no id
+     *  and are inert, so they cannot decrement a mark taken by a command on the NEW socket.
+     *  Zeroing a shared COUNTER here is exactly the bug that made this a Set. */
     cancel() {
       const pending = waiters;
       waiters = null;
       disarmTimer();
-      inFlight = 0;
+      live.clear();
       drainDeadline = 0;
       if (pending) for (const resolve of pending) resolve(false);
     },
