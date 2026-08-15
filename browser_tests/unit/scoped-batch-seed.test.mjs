@@ -21,6 +21,7 @@ import {
   scopedBatchSeedNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
+  rgthreeQueueTimeSeedInput,
 } from "../../web/js/lib/scoped-batch-seed.js";
 
 /** The real KSampler widget order: the control sits immediately after the value. */
@@ -333,4 +334,69 @@ test("#1339 — survives malformed nodes without taking down the run", () => {
   // A seed widget that is not a number establishes nothing, so it is not reported as fixed.
   assert.deepEqual(findRgthreeSeedNodes([rgthreeSeed(1, "not-a-number")]), []);
   assert.equal(rgthreeFixedSeedNote(null, 5), "");
+});
+
+// ---------------------------------------------------------------------------
+// #1124 — the same measured rgthree behaviour, read by the #556 drift guard.
+//
+// The guard stamps the graph before dispatch and compares it against the POSTED
+// body. rgthree substitutes the seed AFTER that stamp, inside its own
+// api.queuePrompt patch, and carries no `beforeQueued` hook for the guard to
+// notice — so every scoped run on a workflow with an armed Seed (rgthree) was
+// refused as "the graph CHANGED". This helper is what tells the guard which
+// single input to stop hashing.
+// ---------------------------------------------------------------------------
+
+test("#1124 — an ARMED rgthree seed names the input rgthree will rewrite", () => {
+  for (const sentinel of [-1, -2, -3]) {
+    assert.equal(rgthreeQueueTimeSeedInput(rgthreeSeed(47, sentinel)), "seed", `sentinel ${sentinel}`);
+  }
+});
+
+test("#1124 — a FIXED rgthree seed excludes NOTHING, so a mid-window edit to it is still drift", () => {
+  // The gate, in the same direction as collectVolatileInputs' `value === "fixed"`
+  // rule for the stock control_after_generate carrier. `getSeedToUse()` returns a
+  // non-sentinel `inputSeed` unchanged, so the body carries exactly what the stamp
+  // saw — nothing mutates, and dropping it from the hash would blind the guard to
+  // a real edit for no benefit.
+  assert.equal(rgthreeQueueTimeSeedInput(rgthreeSeed(47, 12345)), null);
+  assert.equal(rgthreeQueueTimeSeedInput(rgthreeSeed(47, 0)), null);
+});
+
+test("#1124 — ARMED is the gate, NOT `varies`: a degenerate random range still substitutes", () => {
+  // The distinction that a reviewer will reach for, so it is pinned here.
+  // findRgthreeSeedNodes reports `varies: false` for an armed node whose
+  // randomMin/randomMax admit one value — correct for the #1339 warning, wrong
+  // for the drift guard. Such a node still REPLACES the -1 sentinel in the body
+  // with that single value, so the input still differs between the two
+  // serializations and must still be excluded. Keying this on `varies` would have
+  // left exactly the degenerate-range workflows refused.
+  const degenerate = { ...rgthreeSeed(47, -1), properties: { randomMin: 5, randomMax: 5 } };
+  assert.equal(findRgthreeSeedNodes([degenerate])[0].varies, false, "the #1339 warning says it repeats");
+  assert.equal(rgthreeQueueTimeSeedInput(degenerate), "seed", "…and the drift guard still excludes it");
+});
+
+test("#1124 — a MUTED or BYPASSED node substitutes nothing, so it excludes nothing", () => {
+  // rgthree: `if (this.mode === LiteGraph.NEVER || this.mode === 4) return;`
+  for (const mode of [2, 4]) {
+    assert.equal(rgthreeQueueTimeSeedInput({ ...rgthreeSeed(47, -1), mode }), null, `mode ${mode}`);
+  }
+  assert.equal(rgthreeQueueTimeSeedInput({ ...rgthreeSeed(47, -1), mode: 0 }), "seed");
+});
+
+test("#1124 — foreign seed nodes and malformed nodes exclude NOTHING (fail toward detecting drift)", () => {
+  // The over-broad direction is the dangerous one here: a false exclusion silently
+  // drops an input from the drift check for every run on that graph. These are the
+  // same real /object_info types the #1339 scan is guarded against claiming.
+  for (const type of ["SeedNode", "LatentBatchSeedBehavior", "SeedVR2Conditioning"]) {
+    assert.equal(rgthreeQueueTimeSeedInput({ id: 1, type, widgets: [{ name: "seed", value: -1 }] }), null, type);
+  }
+  assert.equal(rgthreeQueueTimeSeedInput(ksampler(53, "randomize")), null);
+  assert.equal(rgthreeQueueTimeSeedInput(null), null);
+  assert.equal(rgthreeQueueTimeSeedInput({}), null);
+  assert.equal(rgthreeQueueTimeSeedInput({ type: "Seed (rgthree)" }), null, "no widgets ⇒ no exclusion");
+  assert.equal(rgthreeQueueTimeSeedInput(rgthreeSeed(47, "not-a-number")), null);
+  // A throwing accessor must not escape onto the dispatch path.
+  const hostile = { type: "Seed (rgthree)", get widgets() { throw new Error("boom"); } };
+  assert.equal(rgthreeQueueTimeSeedInput(hostile), null);
 });
