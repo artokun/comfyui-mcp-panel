@@ -27,6 +27,14 @@
     "name": "Conectar automáticamente al cargar",
     "tooltip": "Conecta el agente automáticamente (iniciando el orquestador local) cuando se abre el panel, sin pulsar Conectar. Desactivado por defecto: de lo contrario, el orquestador solo se inicia con un clic explícito en Conectar."
   },
+  "comfyui-mcp_chatScope": {
+    "name": "Ámbito de la conversación del chat",
+    "tooltip": "Panel: una sola conversación acompaña a todos los lienzos. Flujo de trabajo: cada flujo guardado tiene su propio conjunto persistente de chats, identificado por un UUID incrustado, de modo que renombrarlo conserva el historial y las copias se mantienen separadas. Preguntar: eliges si llevarte la conversación actual cada vez que cambias de flujo de trabajo. Todos los modos sobreviven a reinicios completos de ComfyUI/MCP."
+  },
+  "comfyui-mcp_autostartMcp": {
+    "name": "Iniciar MCP automáticamente",
+    "tooltip": "Al abrir este panel, pide al iniciador complementario instalado explícitamente que abra un terminal con MCP si aún no se está ejecutando."
+  },
   "comfyui-mcp_language": {
     "name": "Idioma del panel",
     "tooltip": "Idioma del texto propio del panel. “Detectar” sigue la configuración de idioma de ComfyUI, así que cambiar el idioma de ComfyUI cambia también el del panel. Todo lo que aún no esté traducido se muestra en inglés. Surte efecto al reabrir o recargar el panel."

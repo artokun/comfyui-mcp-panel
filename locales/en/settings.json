@@ -27,6 +27,14 @@
     "name": "Auto-connect on load",
     "tooltip": "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. Off by default — the orchestrator is otherwise only started by an explicit Connect click."
   },
+  "comfyui-mcp_chatScope": {
+    "name": "Chat conversation scope",
+    "tooltip": "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts."
+  },
+  "comfyui-mcp_autostartMcp": {
+    "name": "Autostart MCP",
+    "tooltip": "When this panel opens, ask the explicitly installed companion launcher to open a terminal running MCP if it is not already running."
+  },
   "comfyui-mcp_language": {
     "name": "Panel language",
     "tooltip": "Language for the panel's own text. Detect follows ComfyUI's language setting, so changing ComfyUI's language changes the panel too. Anything not yet translated falls back to English. Takes effect when the panel is reopened or reloaded."

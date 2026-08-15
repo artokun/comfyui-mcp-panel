@@ -27,6 +27,14 @@
     "name": "Connexion automatique au chargement",
     "tooltip": "Connecte automatiquement l'agent (en démarrant l'orchestrateur local) à l'ouverture du panneau, sans cliquer sur Connecter. Désactivé par défaut — sinon l'orchestrateur n'est démarré que par un clic explicite sur Connecter."
   },
+  "comfyui-mcp_chatScope": {
+    "name": "Portée des conversations",
+    "tooltip": "Panneau : une seule conversation suit tous les canevas. Workflow : chaque workflow enregistré possède son propre jeu persistant de conversations, identifié par un UUID intégré, de sorte que les renommages conservent l'historique et que les copies restent séparées. Demander : vous choisissez à chaque changement de workflow si la conversation en cours doit suivre. Tous les modes survivent à un redémarrage complet de ComfyUI/MCP."
+  },
+  "comfyui-mcp_autostartMcp": {
+    "name": "Démarrage automatique de MCP",
+    "tooltip": "À l'ouverture de ce panneau, demande au lanceur compagnon installé explicitement d'ouvrir un terminal exécutant MCP s'il n'est pas déjà lancé."
+  },
   "comfyui-mcp_language": {
     "name": "Langue du panneau",
     "tooltip": "Langue du texte propre au panneau. « Détecter » suit le réglage de langue de ComfyUI : changer la langue de ComfyUI change donc aussi celle du panneau. Tout ce qui n'est pas encore traduit retombe sur l'anglais. Prend effet à la réouverture ou au rechargement du panneau."

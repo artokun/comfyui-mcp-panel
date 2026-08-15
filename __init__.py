@@ -5,7 +5,7 @@ This pack ships **no Python nodes**. It does two things:
 1. Serve the sidebar panel JS (``web/js/comfyui-mcp-panel.js``) to the ComfyUI
    frontend via ``WEB_DIRECTORY``.
 
-2. Expose a tiny **read-only** local API the panel uses to discover whether the
+2. Expose a tiny local API the panel uses to discover whether the
    panel **orchestrator** is already running, which provider/backend is ready,
    and the ComfyUI URL to target — so the sidebar can show the right onboarding
    state and the exact one-command start line.
@@ -23,9 +23,9 @@ packages at runtime (https://docs.comfy.org/registry/standards). Auto-spawning
 ``npx … comfyui-mcp`` is exactly that pattern, and the static (Ruff/Bandit)
 scanner flags it (B404 import_subprocess / B603 subprocess call) regardless of
 runtime guards. So the pack stays a pure frontend extension: it never imports or
-calls ``subprocess``. Starting the orchestrator is an explicit, out-of-band user
-action (run the one-liner in a terminal) — the panel then connects to the bridge
-automatically and keeps retrying until it's up.
+calls ``subprocess``. An explicitly installed ``comfyui-mcp launcher`` companion
+may expose one authenticated loopback action that opens the fixed MCP command;
+this pack can proxy that action but never supplies a command or starts a process.
 
 Env knobs:
 - ``COMFYUI_MCP_BRIDGE_PORT`` — panel bridge port to probe (default 9180).
@@ -62,6 +62,8 @@ __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
 _BRIDGE_HOST = "127.0.0.1"
 _BRIDGE_PORT = int(environ.get("COMFYUI_MCP_BRIDGE_PORT", "9180"))
+_LAUNCHER_PROTOCOL = 1
+_LAUNCHER_INSTALL_COMMAND = "npx -y comfyui-mcp@latest launcher install"
 
 # Backend -> bridge port map. "claude" is the default (9180); "codex"/"gemini"
 # have their own ports so an orchestrator per provider can run side by side.
@@ -92,6 +94,99 @@ _ADVERTISED_BRIDGE_URL = None
 
 def _log(msg):
     print("[comfyui-mcp-panel] " + msg)
+
+
+def _launcher_config_path():
+    return os.path.join(os.path.expanduser("~"), ".comfyui-mcp", "launcher.json")
+
+
+def _read_launcher_config():
+    """Read the companion endpoint without exposing its token to the browser."""
+    try:
+        with open(_launcher_config_path(), "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    port = value.get("port")
+    token = value.get("token")
+    if (
+        value.get("protocol") != _LAUNCHER_PROTOCOL
+        or value.get("host") != _BRIDGE_HOST
+        or not isinstance(port, int)
+        or isinstance(port, bool)
+        or port < 1
+        or port > 65535
+        or not isinstance(token, str)
+        or len(token) < 32
+    ):
+        return None
+    return {"host": _BRIDGE_HOST, "port": port, "token": token}
+
+
+def _launcher_request_spec(action, config):
+    endpoints = {
+        "status": ("GET", "/v1/status"),
+        "start": ("POST", "/v1/ensure-running"),
+        "handshake": ("POST", "/v1/handshake-complete"),
+    }
+    if action not in endpoints:
+        raise ValueError("unknown launcher action")
+    method, path = endpoints[action]
+    return {
+        "method": method,
+        "url": "http://{}:{}{}".format(config["host"], config["port"], path),
+        "headers": {"Authorization": "Bearer {}".format(config["token"])},
+    }
+
+
+async def _launcher_request(action):
+    """Proxy one fixed launcher action. No request data becomes a command/arg."""
+    config = _read_launcher_config()
+    if not config:
+        return {
+            "ok": False,
+            "installed": os.path.isfile(_launcher_config_path()),
+            "running": False,
+            "error": "launcher_not_installed",
+            "install_command": _LAUNCHER_INSTALL_COMMAND,
+        }
+    spec = _launcher_request_spec(action, config)
+    try:
+        from aiohttp import ClientSession, ClientTimeout  # type: ignore
+
+        timeout = ClientTimeout(total=3.0, connect=1.0)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.request(
+                spec["method"], spec["url"], headers=spec["headers"]
+            ) as response:
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                # Never reflect the Authorization header/config/token.
+                payload.pop("token", None)
+                payload.update(
+                    {
+                        "installed": True,
+                        "running": response.status < 400,
+                        "status": response.status,
+                        "install_command": _LAUNCHER_INSTALL_COMMAND,
+                    }
+                )
+                return payload
+    except Exception as error:
+        return {
+            "ok": False,
+            "installed": True,
+            "running": False,
+            "error": "launcher_unreachable",
+            "message": str(error),
+            "install_command": _LAUNCHER_INSTALL_COMMAND,
+        }
 
 
 def _backend_port(backend):
@@ -599,6 +694,22 @@ def _register_routes():
                 "start_command": _start_command(detected),
             }
         )
+
+    @routes.get("/comfyui_mcp_panel/launcher/status")
+    async def _launcher_status(_request):
+        return web.json_response(await _launcher_request("status"))
+
+    @routes.post("/comfyui_mcp_panel/launcher/start")
+    async def _launcher_start(_request):
+        # The body is intentionally ignored. The companion owns one fixed command
+        # and this route cannot be used to pass executable text or arguments.
+        result = await _launcher_request("start")
+        return web.json_response(result, status=200 if result.get("ok") else 503)
+
+    @routes.post("/comfyui_mcp_panel/launcher/handshake")
+    async def _launcher_handshake(_request):
+        result = await _launcher_request("handshake")
+        return web.json_response(result, status=200 if result.get("ok") else 503)
 
     @routes.post("/comfyui_mcp_panel/advertise_bridge")
     async def _advertise_bridge(_request):

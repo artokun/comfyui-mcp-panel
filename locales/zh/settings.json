@@ -27,6 +27,14 @@
     "name": "打开时自动连接",
     "tooltip": "面板打开时自动连接智能体（并启动本地编排器），无需点击“连接”。默认关闭 —— 否则编排器只会在你明确点击“连接”时启动。"
   },
+  "comfyui-mcp_chatScope": {
+    "name": "聊天会话范围",
+    "tooltip": "Panel：一段对话跟随所有画布。Workflow：每个已保存的工作流拥有各自持久的对话集合，通过内嵌 UUID 识别，因此重命名会保留历史、复制则各自独立。Ask：每次切换工作流时询问是否带上当前对话。所有模式在 ComfyUI/MCP 完全重启后依然保留。"
+  },
+  "comfyui-mcp_autostartMcp": {
+    "name": "自动启动 MCP",
+    "tooltip": "打开此面板时，如果 MCP 尚未运行，则请求已明确安装的配套启动器打开一个运行 MCP 的终端。"
+  },
   "comfyui-mcp_language": {
     "name": "面板语言",
     "tooltip": "面板自身文本的语言。“Detect”会跟随 ComfyUI 的语言设置，因此更改 ComfyUI 的语言也会改变面板。尚未翻译的内容会回退为英文。重新打开或刷新面板后生效。"

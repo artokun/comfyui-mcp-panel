@@ -27,7 +27,7 @@ interface PanelOptions {
    * `test.use({ panelFlags: ['comfyui-mcp.featureFlag.apps'] })`.
    *
    * panel#793 — the settings strip below deletes EVERY `comfyui-mcp.` key for
-   * hermeticity. That is correct for `autoConnect`, and it also removed the
+   * hermeticity. That is correct for `autostartMcp`, and it also removed the
    * three feature flags, which are `defaultValue: false`. So the toolbar button
    * a flagged feature lives behind never rendered, and every spec for those
    * features failed the same way: a 30s timeout waiting to click a button that
@@ -38,11 +38,18 @@ interface PanelOptions {
    * is ABSENT by default must keep seeing it absent.
    */
   panelFlags: string[]
+  /** Enable panel-open MCP autostart and route it to this test's MockBridge. */
+  panelAutostartMcp: boolean
 }
 
 /** The stub set itself, kept in one place so the fixture and a spec's second page
  *  can never drift apart. */
-async function applyPanelRouteStubs(page: Page, panelFlags: string[]) {
+async function applyPanelRouteStubs(
+  page: Page,
+  panelFlags: string[],
+  panelAutostartMcp = false,
+  bridgeUrl: string | null = null,
+) {
   // Hermetic runs on a dev box with a REAL orchestrator listening on :9180:
   // the panel's mount probe (GET /comfyui_mcp_panel/status → { running: true })
   // would auto-connect it to the live agent before the spec's setBridgeUrl()
@@ -57,6 +64,9 @@ async function applyPanelRouteStubs(page: Page, panelFlags: string[]) {
   )
   await page.route('**/comfyui_mcp_panel/bridge_url*', (route) =>
     route.fulfill({ json: { url: null } })
+  )
+  await page.route('**/comfyui_mcp_panel/launcher/**', (route) =>
+    route.fulfill({ status: 503, json: { ok: false, installed: false, running: false } })
   )
   // Panel-setting WRITES must never reach the real server: Reconnect mirrors
   // the (per-test, throwaway) mock URL into `comfyui-mcp.bridgeUrl.single`,
@@ -87,6 +97,13 @@ async function applyPanelRouteStubs(page: Page, panelFlags: string[]) {
       }
       for (const key of Object.keys(body)) {
         if (key.startsWith('comfyui-mcp.')) delete body[key]
+      }
+      // Existing bridge-centric specs click Connect themselves and must never
+      // ask a real per-user launcher to open a terminal on the developer's box.
+      // Autostart behavior has its own focused route-driven coverage.
+      body['comfyui-mcp.autostartMcp'] = panelAutostartMcp
+      if (panelAutostartMcp && bridgeUrl) {
+        body['comfyui-mcp.bridgeUrl.single'] = bridgeUrl
       }
       // Put back only what this spec explicitly asked for, AFTER the strip, so
       // the flag value comes from the spec and never from the dev box.
@@ -237,14 +254,15 @@ async function cleanupRecordedWorkflowWrites(state: WriteRecord) {
 
 export const test = base.extend<PanelFixtures & PanelOptions>({
   panelFlags: [[], { option: true }],
+  panelAutostartMcp: [false, { option: true }],
   mockBridge: async ({}, use) => {
     const bridge = new MockBridge({ port: 0 })
     await bridge.start()
     await use(bridge)
     await bridge.close()
   },
-  panel: async ({ page, panelFlags }, use) => {
-    await applyPanelRouteStubs(page, panelFlags)
+  panel: async ({ page, panelFlags, panelAutostartMcp, mockBridge }, use) => {
+    await applyPanelRouteStubs(page, panelFlags, panelAutostartMcp, mockBridge.url)
     // #907 — record before anything loads, clean up after the test whatever it ends up
     // being. Runs on FAILURE too, which per-spec cleanup at the end of a test body never
     // did — and a failing test is exactly when a spec is most likely to have left a file.
