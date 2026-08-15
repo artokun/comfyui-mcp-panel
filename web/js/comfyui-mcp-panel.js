@@ -325,6 +325,10 @@ import {
   rgthreeFastGroupsRefusal,
 } from "./lib/rgthree-fast-groups.js";
 import {
+  classifyIdeogram4PromptBuilderWrite,
+  ideogram4PromptBuilderRefusal,
+} from "./lib/ideogram4-prompt-builder.js";
+import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
@@ -11702,6 +11706,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // why this refuses rather than driving the node's own toggle().
     if (classifyRgthreeFastGroupsWrite(node, widget) === "derived") {
       throw new Error(rgthreeFastGroupsRefusal(widget, node.id, node.type));
+    }
+    // comfyui-mcp#1569: KJNodes' Ideogram4PromptBuilderKJ holds its regions in the node's
+    // own in-browser editor and installs a `serializeValue()` on `elements_data` that builds
+    // the queued value from that state without ever reading the widget. ComfyUI queues
+    // `serializeValue()`, so a direct write showed a clean success AND showed up in
+    // panel_query_graph while the render kept using the old regions. Refused loudly, keyed to
+    // the node type, the widget name, AND the live presence of the serializer — so nothing
+    // else on the node is affected and the guard cannot outlive the pack behaviour that
+    // justifies it. See the lib for the four source facts and for why style_palette_data,
+    // which has no serializer of its own, is deliberately still writable.
+    if (classifyIdeogram4PromptBuilderWrite(node, widget) === "derived") {
+      throw new Error(ideogram4PromptBuilderRefusal(widget, node.id));
     }
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
     // write can never decide "never seen" against an un-seeded history — a pack present
