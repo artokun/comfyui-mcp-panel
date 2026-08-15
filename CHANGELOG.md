@@ -6,26 +6,148 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.40] - 2026-08-14
+
+### Fixed
+- a group whose members are COLLAPSED nodes now moves, instead of being refused after those members positions had already been written (#813)
+
+## [0.14.39] - 2026-08-14
+
+### Fixed
+- a widget edit is no longer refused just because the /object_info probe went silent while ComfyUI was busy rendering — it is authorized from the last whole schema observed on the same backend connection, which a restart always invalidates (#1223)
+
+## [0.14.38] - 2026-08-14
+
+### Fixed
+- translating the error disarmed every ComfyUI-Manager fallback (#1230)
+
+
+## [0.14.37] - 2026-08-14
+
+### Fixed
+- a run whose outcome could not be confirmed is reported as a neutral event instead of an urgent error, so cancelling a large batch no longer tells the agent every prompt ERRORED (#1226, comfyui-mcp#1489)
+
+
+## [0.14.36] - 2026-08-14
+
+### Fixed
+- panel_open_workflow now asks the SERVER whether the file exists before refusing, so a workflow staged into the workflows folder out-of-band is reported as a stale list rather than a missing file (#1222, comfyui-mcp#1448)
+
+
+## [0.14.35] - 2026-08-14
+
+### Fixed
+- a graph mutation refused during a reconnect now says so in a FIELD the caller can key on, instead of only in the sentence (#1216, comfyui-mcp#1529)
+
+
+## [0.14.34] - 2026-08-14
+
+### Fixed
+- every release since 0.14.31 writes two sections for one version (#1219)
+- rebuild combo options during the reapply sweep, and disclose an empty authoritative list (#1218)
+
+
+## [0.14.33] - 2026-08-14
+
+### Fixed
+- panel_get_errors is a READ, so the dirty-tab mutation fence no longer refuses it as "this mutation" (#1211, comfyui-mcp#1478)
+- bound the remaining unbounded network awaits (#1201)
+
+## [0.14.32] - 2026-08-14
+
+### Fixed
+- a faithful workflow_open no longer reports CONTENT_UNVERIFIED just because the frontend rebuilt each node's `inputs` from its definition (#1208, comfyui-mcp#1467)
+
+## [0.14.31] - 2026-08-14
+
+### Fixed
+- panel_open_workflow no longer claims the workflow list "WAS re-read from the server" when it cannot know that — the frontend's sync swallows its own errors (#1206, comfyui-mcp#1448)
+
+## [0.14.30] - 2026-08-14
+
+### Fixed
+- the video storyboard sampler now names WHICH failure it hit, instead of reporting six different causes as one silent nothing (comfyui-mcp#1493)
+
+## [0.14.29] - 2026-08-13
+
+### Fixed
+
+- **A backend switch that cannot complete no longer leaves the panel claiming the new one (#1184) (#1196).**
+  Picking a different provider committed the choice — in memory, to the chips, and to the
+  stored runtime pick — before checking whether the old provider's session could be safely
+  ended. When that check failed the switch stopped there, and because the stored pick
+  outlives the tab, a reload adopted a backend the panel had never actually connected to.
+  The conversation replay armed for the new provider was left armed too, so the next
+  message shipped the whole prior transcript back to the provider that already had it.
+  Nothing is committed now until the switch is known to be possible, and a switch that
+  stops says so instead of failing silently.
+
+## [0.14.28] - 2026-08-13
+
+### Fixed
+
+- **Adding a node no longer waits forever on a ComfyUI that stopped answering (#1180) (#1186).**
+  When the connection to ComfyUI goes half-open — the socket is up, the server never
+  replies — a request does not fail, it simply never returns. Five requests for the node
+  schema on the add-a-node and refresh-nodes paths had no time limit, so the panel parked
+  on the first one it reached and the add landed minutes later, after the reply it belonged
+  to had already been given up on. Each now gives up on its own and falls through to the
+  handling that was already written for a schema it could not read. The log read that runs
+  while *explaining* one of those failures is bounded too; it was inheriting the very stall
+  it was called to describe.
+  **No change on a healthy ComfyUI**, where these all answer in well under a second.
+
+## [0.14.27] - 2026-08-13
+
+### Fixed
+- bound the two drive waits on the CivitAI fetch, so a slow CivitAI no longer makes a healthy panel look dead (#1189)
+
+## [0.14.26] - 2026-08-13
+
+### Changed
+
+- **Restarting the agent holds its exclusion flag until the reconnect (#1171).**
+  The panel keeps one flag so that restarting the agent and reloading it cannot run at the
+  same time, but the restart released it as soon as the request came back — while it was
+  still ending the current turn, clearing the markers that say a turn is in flight,
+  invalidating the old session, and reconnecting. The flag is now held until the reconnect,
+  which is what the reload path already did, so the two agree.
+  **No visible change when the panel manages ComfyUI's agent the usual way**: this
+  distribution's restart route always answers "not restarted" (the orchestrator runs
+  out-of-band), so the work this now protects is skipped anyway. It matters for setups
+  whose restart route really does restart the agent, and it removes the window before one
+  of those hits it.
+
+### Fixed
+## [0.14.25] - 2026-08-13
+
 ### Fixed
 
 - **Setting a widget no longer hangs for 30 seconds after a ComfyUI restart (#1161).**
   Once ComfyUI had been restarted mid-session, setting any widget on any node timed out,
   every time, while every other panel command answered instantly — reading the graph,
   renaming a node, listing workflows, queueing a run. Setting a widget is the one action
-  that checks the backend's node definitions before it writes, and that check could wait
-  forever: a restart can leave the browser holding a connection that never answers and
-  never fails. It stayed broken rather than recovering because callers share one request,
-  so every later attempt waited on the same dead one.
-  The check now gives up after a few seconds and refuses that one call, saying that the
-  definitions could not be read in time and that the backend itself may be healthy —
-  rather than leaving the call to time out with no explanation. An answer that arrives
-  after the panel stopped waiting is still used, so a slow backend costs one refused call
-  rather than staying broken.
+  that reads the backend's node definitions before it writes, and a restart can leave the
+  browser holding a connection that never answers and never fails, so that read waited
+  forever.
+  The panel already had a second way to ask — a direct request that keeps working when
+  the first route does not — but it was never reached, because nothing gave up on the
+  first one. The lookup now has an overall time budget, so a route that stops answering falls
+  through to the one that does and the write simply succeeds. The budget covers the whole
+  lookup rather than being handed to each step in turn, so the wait cannot stack — but the
+  second route is also guaranteed a share of it, because a first route that stops answering
+  would otherwise use the budget up and leave nothing for the route that still works. A
+  route that answers quickly hands back the time it did not use, so a slow install still
+  gets the whole budget to finish in.
+  The budget is twenty seconds, which is generous rather than tight: fetching the whole
+  node-definition document was measured at well under a second even on a large install with
+  sixty-odd node packs. If nothing answers, the refusal names every attempt and says how
+  long each one was actually given, rather than quoting a wait it never spent.
 
+### Fixed
 ## [0.14.24] - 2026-08-12
 
 ### Fixed
-
 - **A successful agent restart no longer leaves the old turn's state armed against a
   fresh agent (#1166).** When a restart genuinely replaces the agent, the panel retires
   the markers that say a turn is in flight. Those clears all sat after a step that can
@@ -44,7 +166,6 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.14.23] - 2026-08-12
 
 ### Fixed
-
 - **The mid-task nudge no longer fires on a turn you just started (#1163).** A defect in
   the outage accounting added for #1145, found by review of that change rather than in
   the wild. A turn beginning while the bridge was still down zeroed the measured outage
@@ -62,13 +183,14 @@ All notable changes to this project are documented here. This project adheres to
   agent. Nudging either is the harm. The converse still holds and is covered by tests:
   an orchestrator that died has no turn to announce, so its nudge fires as before.
 
-- **The mid-task resume nudge now measures the outage instead of one backoff step, so a
-
 ## [0.14.22] - 2026-08-12
 
 ### Fixed
+- let a truncated provider hint be read on hover (#1165)
+- translate the "why can't I use this provider" hints in all 11 languages (#1162)
+- translate the 22 strings that answer "why can't I use this provider" (#1160)
 
-  ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
+- **A ComfyUI restart that comes back quickly keeps its nudge (#1145).** The nudge tells a
   resumed agent its connection dropped mid-task and to continue what it was doing, and it
   fires only for a REAL restart — judged by how long the bridge was gone. But the panel
   assigns its socket before the connection resolves, so a REFUSED reconnect attempt is
@@ -105,45 +227,20 @@ All notable changes to this project are documented here. This project adheres to
 - Brazilian Portuguese (pt-BR) panel catalog — 1107 keys + 52 settings (#1156)
 - Russian (ru) panel catalog — 1161 keys, all four plural forms (#1155)
 - complete the Simplified Chinese (zh) panel catalog — 353 → 999 keys (#1151)
+### Fixed
+- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
+## [0.14.20] - 2026-08-12
+
+### Added
 - Spanish (es) panel catalog (#1152)
 - add the Arabic (ar) panel catalog (#1143)
 - add the Traditional Chinese (zh-TW) panel catalog (#1153)
 - add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
 - add the Turkish (tr) panel catalog (#1148)
 - add the Persian (fa) panel catalog (#1147)
-- complete the Japanese panel translation (999 keys) (#1140)
-
-### Fixed
-- an empty baseline is not proof of a different graph, and say what actually recovers (#1158)
-- a definitions difference that is only link renumbering is not a content change (#1125)
-- the status pill froze because onStatus threw on every status frame (#1154)
-- name every uninstalled node type before queueing, not one rejection at a time (#1129)
-- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
-
-### Changed
-- 0.14.20 (#1157)
-- 0.14.19 (#1149)
-
-
-## [0.14.20] - 2026-08-12
-
-### Added
-- add the Traditional Chinese (zh-TW) panel catalog (#1153)
-- add the French (fr) panel catalog — 1107 keys, one/many/other plurals (#1150)
-- add the Turkish (tr) panel catalog (#1148)
-- add the Persian (fa) panel catalog (#1147)
-- complete the Japanese panel translation (999 keys) (#1140)
-
 ### Fixed
 - a definitions difference that is only link renumbering is not a content change (#1125)
 - the status pill froze because onStatus threw on every status frame (#1154)
-- name every uninstalled node type before queueing, not one rejection at a time (#1129)
-- decode string escapes when extracting, so \n is a line break and not two characters (#1144)
-
-### Changed
-- 0.14.19 (#1149)
-
-
 ## [0.14.19] - 2026-08-12
 
 ### Added

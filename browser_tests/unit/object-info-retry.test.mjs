@@ -114,3 +114,77 @@ test("#954: the wait is bounded and ordered", async () => {
   assert.ok(slept.reduce((a, b) => a + b, 0) <= 1000, "total backoff must stay under a second");
   assert.deepEqual([...slept].sort((a, b) => a - b), slept, "backoff, not a fixed interval");
 });
+
+// ---------------------------------------------------------------------------
+// #1180 — `shouldRetry`, and why this schedule needed one.
+//
+// #954 sized [200, 600] on attempts that fail INSTANTLY: a connection refused while the
+// backend restarts costs nothing, so three attempts spread over 800ms only widen the
+// window a blip can hide in. #1180 then introduced a failure that is NOT free — an attempt
+// abandoned by a timeout, which `withTimeout` does not cancel, so it keeps downloading the
+// whole document while the next attempt races it on the same link.
+//
+// The first attempt at reconciling those cut the schedule to a single 200ms delay for
+// everyone, which protected the expensive case by taking 600ms off the cheap one — the
+// exact window #954 was filed about. The decision belongs to the caller, per failure, and
+// these tests hold the module to honouring it.
+
+test("#1180: a failure the caller declines to retry stops the loop AT ONCE", async () => {
+  let calls = 0;
+  // COUNT the sleeps, do not sum their durations. Summing passed a mutation that slept
+  // `wait(0)` before giving up — zero milliseconds, but still a turn spent waiting on an
+  // attempt whose download is what the caller just declined to race.
+  let sleeps = 0;
+  await assert.rejects(
+    () =>
+      fetchNodeDefsWithRetry(
+        async () => {
+          calls += 1;
+          throw new Error("did not answer");
+        },
+        { sleep: async () => { sleeps += 1; }, shouldRetry: () => false },
+      ),
+    /did not answer/,
+    "the caller's own error must survive, not be replaced by a retry-shaped one",
+  );
+  assert.equal(calls, 1, "an un-retryable failure must not be attempted again");
+  assert.equal(sleeps, 0, "…and must not SLEEP first: the abandoned work is still running");
+});
+
+test("#1180: declining applies per failure, not to the whole call", async () => {
+  // The real predicate reads a flag the caller sets per attempt, so a run can retry a
+  // cheap failure and then stop on an expensive one. A module that evaluated `shouldRetry`
+  // once, or ignored it after the first true, would pass a cruder test than this.
+  const outcomes = ["cheap", "expensive"];
+  let calls = 0;
+  let last = "";
+  await assert.rejects(
+    () =>
+      fetchNodeDefsWithRetry(
+        async () => {
+          last = outcomes[calls] ?? "expensive";
+          calls += 1;
+          throw new Error(last);
+        },
+        { sleep: async () => {}, shouldRetry: () => last === "cheap" },
+      ),
+    /expensive/,
+  );
+  assert.equal(calls, 2, "it retried the cheap failure and stopped on the expensive one");
+});
+
+test("#1180: with no predicate, #954's behaviour is exactly unchanged", async () => {
+  // The default must not quietly become 'stop on first failure' for callers that never
+  // asked — #954's whole point is that one attempt is not a verdict.
+  let calls = 0;
+  const defs = await fetchNodeDefsWithRetry(
+    async () => {
+      calls += 1;
+      if (calls < 3) throw new Error("blip");
+      return { SomeNode: {} };
+    },
+    { sleep: async () => {} },
+  );
+  assert.deepEqual(defs, { SomeNode: {} });
+  assert.equal(calls, 3, "all three attempts remain available when the caller says nothing");
+});

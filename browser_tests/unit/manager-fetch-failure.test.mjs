@@ -123,9 +123,20 @@ test("#1472 WIRING: managerV2 translates a throw and passes an abort through", (
   assert.match(src, /import \{ managerFetchFailureMessage \} from "\.\/lib\/manager-fetch-failure\.js";/);
   const at = src.indexOf("async function managerV2(");
   assert.ok(at > 0, "managerV2 must exist");
-  const body = src.slice(at, at + 1600);
+  // Bound the window by the function's OWN catch block rather than a byte count: a
+  // fixed 1600 silently excluded the throw once #423 added a comment above it, which
+  // reads as "the wiring is gone" when the wiring is fine. Ending at `if (!res) {`
+  // keeps every assertion below scoped to the catch, which is the point of the window.
+  const endOfCatch = src.indexOf("if (!res) {", at);
+  assert.ok(endOfCatch > at, "managerV2's catch must be followed by the no-response check");
+  const body = src.slice(at, endOfCatch);
   assert.match(body, /try \{/, "the fetch is inside a try");
-  assert.match(body, /throw new Error\(managerFetchFailureMessage\(route, err\), \{ cause: err \}\)/);
+  // #423 wrapped this throw in markManagerUnreachable() so the Manager fallback ladder
+  // can see a transport failure without reading its wording. What #1472 guarantees is
+  // unchanged and still asserted: the message is built by managerFetchFailureMessage
+  // from the ROUTE, and the original error survives as `cause`. Only the wrapper is
+  // tolerated — a bare `throw err`, or a message built any other way, still fails.
+  assert.match(body, /new Error\(managerFetchFailureMessage\(route, err\), \{ cause: err \}\)/);
   // An abort is the CALLER's own doing — relabelling it as a transport failure would
   // tell them the server never saw a request they themselves cancelled.
   assert.match(body, /if \(err\?\.name === "AbortError"\) throw err;/);

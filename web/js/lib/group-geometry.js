@@ -529,7 +529,65 @@ export function moveGroupMembers(members, dx, dy) {
       // is whether the rect ends up LIVE, not whether the delta-write happened: a
       // rect that was already right needs no write and is not stuck.
       refreshNodeArea(n, [px, py]);
-      if (!nodeAreaIsLive(n)) landedExactly = false;
+      // panel#813 — A COLLAPSED MEMBER IS NOT A NODE THAT REFUSED TO MOVE.
+      //
+      // `nodeAreaIsLive` compares the cached rect against `wantedNodeArea`, which for a
+      // collapsed node is the panel's PILL (`w = _collapsed_width || 80`, `h = 0`). The
+      // engine's own `updateArea()` recompute — which `refreshNodeArea` above deliberately
+      // TRUSTS as soon as it sees the origin move — writes the engine's extents instead. On
+      // a collapsed node those two models disagree by construction, so the width comparison
+      // failed for every collapsed member and the group move was refused AFTER their
+      // positions had already been written. That is the report: four `size:[225,0]` nodes
+      // called stuck, on a graph the reporter then repositioned one-by-one without trouble.
+      //
+      // So give the rect ONE MORE CHANCE to be put on the panel's convention before ruling,
+      // using `syncNodeArea` — the very writer this move's own pre-flight
+      // (`syncGraphNodeAreas`) already ran over every node moments earlier. Nothing new is
+      // written that the pre-flight did not already write, and the forced value is the pill,
+      // never the full box, so the #416 area-overstatement guarantee is untouched.
+      //
+      // THE #408 GUARD IS NOT RELAXED. A rect that genuinely cannot be corrected — frozen,
+      // hostile accessor, disposed — makes `syncNodeArea` return false and the node is still
+      // stuck, still refusing the whole move. That is the property #408 needs: membership is
+      // rect-first, so a rect that cannot track its node would report it in a group it has
+      // left. The question changes from "does the rect already agree" to "can the rect be
+      // MADE to agree", which is the one the caller actually needs answered.
+      //
+      // TWO THINGS THE CORRECTION IS DELIBERATELY NOT (both found in review):
+      //
+      // 1. IT IS NOT UNGATED. Only a COLLAPSED node gets it. An expanded node's
+      //    `updateArea()` may authoritatively compute extents that legitimately differ from
+      //    the generic `[x, y-30, size0, size1+30]` model — visible bounds that reach past
+      //    `size`, on a custom node that draws outside its box. Forcing the generic
+      //    footprint there would overwrite the engine's own answer and then report success,
+      //    and rect-first membership would be wrong afterwards. The reported defect is
+      //    specifically the collapsed-PILL disagreement, so that is all this repairs; an
+      //    expanded node with an uncorrectable rect is still stuck, exactly as before.
+      //    A `flags` accessor that THROWS reads as not-collapsed, so it fails closed.
+      //
+      // 2. IT DOES NOT TRUST `syncNodeArea`'s OWN VERDICT ALONE. `boundingRect` can be an
+      //    accessor whose getter returns a FRESH array on every read — a shape this file
+      //    already documents for `pos` in `writePoint` ("a getter that returns a COPY, where
+      //    an in-place write is silently dropped"). Against such a node `syncNodeArea`
+      //    mutates and then verifies the throwaway copy it was handed, returns true, and the
+      //    node's real rect never changed: the move would report the node moved while the
+      //    next membership read still saw the old rect and dropped it from the group. So the
+      //    verdict is re-read through `nodeAreaIsLive`, which fetches the property again.
+      let isCollapsed = false;
+      try {
+        isCollapsed = !!n?.flags?.collapsed;
+      } catch {
+        // Unreadable flags ⇒ not eligible for the collapsed repair. Mutation reports
+        // flipping this to `true` as a SURVIVOR, and it is an equivalent mutant rather than
+        // a gap: `syncNodeArea` reads the same `flags` accessor through `wantedNodeArea`,
+        // so it throws, is caught there, and returns false — the node is stuck either way.
+        // Stated here so the next run does not re-chase it; the BEHAVIOUR is pinned by
+        // "a node whose flags accessor THROWS is stuck, not repaired".
+        isCollapsed = false;
+      }
+      if (!nodeAreaIsLive(n) && !(isCollapsed && syncNodeArea(n) && nodeAreaIsLive(n))) {
+        landedExactly = false;
+      }
     } catch {
       landedExactly = false;
     }

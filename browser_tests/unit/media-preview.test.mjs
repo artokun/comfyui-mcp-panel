@@ -271,6 +271,122 @@ test("a sampler that returns nothing degrades with a remedy and NO invented caus
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
 });
 
+// comfyui-mcp#1493 — the builder knew which of its six failures it hit and threw
+// that away, so the reply had to say "the panel is not told which". It can now
+// hand back `{reason}`, and only then may the reply name a cause.
+test("EVERY failure exit in the builder names itself — no bare `return null` survives", () => {
+  // The consumer tests below all STUB buildVideoStoryboard, so none of them can
+  // see the builder's own branches: mutation showed the duration branch could be
+  // reverted to a bare `null` with the whole suite still green. The real builder
+  // needs a DOM (video + canvas + seeking) that these node tests do not have, so
+  // the honest instrument for "this function contains no unnamed exit" is the
+  // source itself — bounded to the function body, not a fixed-size window that
+  // silently stops covering what it checks.
+  const body = functionBody("async function buildVideoStoryboard(");
+  const bare = body.match(/return null\s*;/g) ?? [];
+  assert.deepEqual(
+    bare,
+    [],
+    `every failure exit must name its cause; found ${bare.length} bare \`return null\``,
+  );
+  // …and the named exits are actually there (a body that returns nothing at all
+  // would trivially satisfy the assertion above).
+  const named = body.match(/return storyboardFailure\(/g) ?? [];
+  assert.ok(named.length >= 5, `expected the 5 failure branches to be named, saw ${named.length}`);
+});
+
+test("a NAMED sampler failure is passed through, not flattened to the generic note", async () => {
+  const h = harness({
+    buildVideoStoryboard: async () => ({
+      reason: "the browser reported no usable duration for it (its codec may not be decodable here — VP9/AV1 .webm is the usual case)",
+    }),
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(reply.previews.length, 0);
+  assert.match(reply.note, /no usable duration/);
+  assert.match(reply.note, /VP9\/AV1/);
+  // The generic "not told which" line must be GONE — we were told which.
+  assert.doesNotMatch(reply.note, /the panel is not told which/);
+  // Still actionable, and the user still got the player.
+  assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+  assert.equal(h.calls.paintedVideos.length, 1);
+});
+
+test("a named failure is never uploaded as if it were a sheet", async () => {
+  // `{reason}` is TRUTHY. A consumer that only checked `if (!blob)` would sail
+  // past it and hand the explanation to uploadBlobToInput as a PNG.
+  const h = harness({ buildVideoStoryboard: async () => ({ reason: "no usable duration" }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(h.calls.uploads.length, 0, "an explanation must never be uploaded");
+  assert.equal(reply.previews.length, 0);
+});
+
+test("a builder that returns a bare null STILL invents no cause", async () => {
+  // The rule the pre-existing test holds, restated against the new code path: a
+  // sampler that reports nothing tells us nothing, and naming a cause for it
+  // would be a diagnosis nothing made. Only a SUPPLIED reason is repeated.
+  const h = harness({ buildVideoStoryboard: async () => null });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.match(reply.note, /the panel is not told which/);
+  assert.doesNotMatch(reply.note, /could not be seeked/);
+  assert.doesNotMatch(reply.note, /VP9/);
+});
+
+test("nothing that is not sheet-shaped is ever uploaded", async () => {
+  // Success is recognised POSITIVELY (a numeric `size`, which is what a Blob has
+  // and what the doubles model). Two earlier versions inferred FAILURE instead
+  // and both leaked: keying on the reason's type uploaded `{reason:{…}}`, and
+  // keying on its presence uploaded every other truthy value (review finding).
+  for (const shape of [[], {}, "a string", 42, true, { paintedFrames: 3 }]) {
+    const h = harness({ buildVideoStoryboard: async () => shape });
+    const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+    assert.equal(
+      h.calls.uploads.length,
+      0,
+      `a ${JSON.stringify(shape)} must not reach uploadBlobToInput`,
+    );
+    assert.equal(reply.previews.length, 0);
+    assert.match(reply.note, /no sampled preview could be built/);
+  }
+});
+
+test("a sheet-shaped result that ALSO carries a reason is read as the failure", async () => {
+  // The ambiguous shape the code comments call out. It is not one the builder
+  // produces, so the question is only which way to be wrong: preferring the
+  // explanation over silently uploading something that announced its own
+  // failure. Documented behaviour deserves a test — mutation showed that
+  // dropping the guard changed nothing observable without one.
+  const h = harness({
+    buildVideoStoryboard: async () => ({ size: 4096, reason: "no usable duration" }),
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(h.calls.uploads.length, 0);
+  assert.match(reply.note, /no usable duration/);
+});
+
+test("a sheet-shaped result is still uploaded — the positive check did not break success", async () => {
+  // The other direction, and the one a stricter check is most likely to break.
+  const h = harness({ buildVideoStoryboard: async () => ({ size: 4096, paintedFrames: 20 }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(h.calls.uploads.length, 1);
+  assert.equal(reply.previews.length, 1);
+});
+
+test("a non-string reason is ignored rather than interpolated", async () => {
+  // A malformed object must degrade to the generic note, not print
+  // "[object Object]" at the agent — the serialization failure this repo keeps
+  // rediscovering.
+  const h = harness({ buildVideoStoryboard: async () => ({ reason: { nested: true } }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.doesNotMatch(reply.note, /\[object Object\]/);
+  assert.match(reply.note, /the panel is not told which/);
+});
+
 test("the 'ask the user' remedy is withheld when the user cannot see it either", async () => {
   // Telling the caller to ask a person who was never shown the video sends it
   // somewhere that does not work from where it is.
@@ -1077,6 +1193,58 @@ test("a mixed batch reports each kind's outcome separately (#710)", async () => 
 const panelSource = () =>
   readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
 
+/**
+ * The body of a named function, bounded by its OWN braces.
+ *
+ * Replaces the fixed-size `slice(i, i + N)` these source tests used to take. A
+ * fixed window has a cliff: #1493 grew the storyboard builder past 4000 chars
+ * and the assertion below silently stopped covering the line it checked. Raising
+ * the number only moves the cliff (review finding), so bound the real thing.
+ *
+ * Not a JS parser, and it does not need to be — but a brace counter that reads
+ * braces inside STRINGS and COMMENTS can mis-bound and then validate the wrong
+ * region entirely, which is worse than no check. So mask those first, preserving
+ * length so offsets still line up with the original.
+ *
+ * STRINGS ARE MASKED BEFORE COMMENTS, and the order is load-bearing: a `//` or
+ * `/*` inside a string literal would otherwise start a comment that runs to the
+ * end of the line (or to the next close) and blank out real code, moving the
+ * bound (review, round 3). Masking strings first removes those characters before
+ * anything can read them as a comment opener.
+ *
+ * ACCEPTED LIMITS, stated rather than implied: regex literals are NOT masked, so
+ * a regex containing an unbalanced brace inside this function would mis-bound
+ * it, and nested template literals are matched only to their first unescaped
+ * backtick. Both are absent from the function this is used on, and the
+ * assertions here fail loudly rather than silently passing if the bound moves —
+ * a body that no longer contains `storyboardFailure(` trips the >= 5 check. Buy
+ * a real parser if this helper ever gets pointed at arbitrary code.
+ */
+function functionBody(signature) {
+  const src = panelSource();
+  const start = src.indexOf(signature);
+  assert.ok(start > 0, `could not locate ${signature}`);
+
+  const blank = (m) => m.replace(/[^\n]/g, " "); // keep newlines, drop content
+  const masked = src
+    .replace(/"(?:\\.|[^"\\\n])*"/g, blank) // "…"  ─┐ strings FIRST, so a `//`
+    .replace(/'(?:\\.|[^'\\\n])*'/g, blank) // '…'   │ inside one cannot open a
+    .replace(/`(?:\\.|[^`\\])*`/g, blank) //  `…`   ─┘ comment that eats real code
+    .replace(/\/\*[\s\S]*?\*\//g, blank) // block comments
+    .replace(/\/\/[^\n]*/g, blank); // line comments
+
+  const open = masked.indexOf("{", start);
+  assert.ok(open > start, `could not find the opening brace of ${signature}`);
+  let depth = 0;
+  for (let i = open; i < masked.length; i++) {
+    if (masked[i] === "{") depth++;
+    else if (masked[i] === "}" && --depth === 0) {
+      return src.slice(open, i); // the ORIGINAL text, precisely bounded
+    }
+  }
+  assert.fail(`could not bound the body of ${signature}`);
+}
+
 test("the show_media dispatcher answers with the handler's reply, not a fixed acknowledgement", () => {
   const src = panelSource();
   assert.match(
@@ -1126,12 +1294,17 @@ test("the panel's storyboard builder carries the count it ACTUALLY drew", () => 
   // Without this, media-preview has only the grid capacity to go on and every
   // partially-sampled sheet is described as a full one — 19 blank cells
   // presented to the agent as 19 observations.
-  const src = panelSource();
-  const i = src.indexOf("async function buildVideoStoryboard(");
-  assert.ok(i > 0, "could not locate buildVideoStoryboard");
-  const fn = src.slice(i, i + 4000);
+  // Brace-bounded, not a fixed window. #1493 grew this function past the old
+  // 4000-char slice and the assertion below stopped covering the line it
+  // checks; bumping the number would only move that cliff.
+  const fn = functionBody("async function buildVideoStoryboard(");
   assert.match(fn, /blob\.paintedFrames = painted;/);
-  assert.match(fn, /if \(!blob\) return null;/);
+  // A sheet that will not encode must still not be reported as a sheet. This
+  // used to pin the literal `if (!blob) return null;`; comfyui-mcp#1493 replaced
+  // the bare null with a NAMED failure, so pin the property that matters — the
+  // encode branch does not fall through — rather than the exact wording, which
+  // was only ever incidental to this test's point.
+  assert.match(fn, /if \(!blob\) return storyboardFailure\(/);
 });
 
 test("onShowMedia routes through composeShowMediaReply with the storyboard pipeline wired", () => {
@@ -1418,4 +1591,28 @@ test("a late fulfilment after the bound fired does not overwrite the fallback", 
   fire();
   settle("too late");
   assert.equal(await p, "fallback");
+});
+
+test("#1161 withTimeout: a `timers` object that cannot be READ is treated as absent, never a rejection", async () => {
+  // bounded-step.js's own header argues that every injected guard is an operation that can
+  // fail, and wraps `onTimeout` and `clearTimer` accordingly — but READING the injected
+  // object was itself unguarded. A throwing getter, or a Proxy whose get trap throws, threw
+  // synchronously before the returned promise existed, so withTimeout REJECTED out of a
+  // function documented three lines above its signature as never rejecting. The
+  // /object_info oracle passes this object straight through, and two panel commands await
+  // that oracle with no catch of their own.
+  const hostile = [
+    { get setTimer() { throw new Error("hostile getter"); } },
+    new Proxy({}, { get() { throw new Error("proxy trap"); } }),
+    { setTimer: 5, clearTimer: "no" }, // present, but not callable
+  ];
+  for (const timers of hostile) {
+    const value = await withTimeout(Promise.resolve("answered"), 1000, () => "timed out", timers);
+    assert.equal(value, "answered", "an unreadable timers object must fall back to the real timer");
+  }
+  // …and the bound must still WORK through that fallback, not merely avoid throwing.
+  const timedOut = await withTimeout(new Promise(() => {}), 1, () => "timed out", {
+    get setTimer() { throw new Error("hostile getter"); },
+  });
+  assert.equal(timedOut, "timed out", "the real timer still bounds the step");
 });

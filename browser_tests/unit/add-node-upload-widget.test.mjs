@@ -35,6 +35,7 @@
 // grown a frontend-injected `upload` input, and #700's error comes back.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -62,8 +63,26 @@ import {
 import { isRegisteredNodeType } from "../../web/js/lib/node-resolve.js";
 import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
 
+// #1180 — READ from the panel, never restated here. Shared, because this block existed
+// verbatim in both widen harnesses, and the whole point of reading a constant instead of
+// copying it is that one copy cannot drift from another.
+import {
+  CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
+  NODE_DEFS_FETCH_TIMEOUT_MS,
+  NODE_DEFS_NO_ANSWER,
+  PANEL_SRC as widenSrcForConsts,
+  WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+  monotonicNow,
+} from "./_panel-constants.mjs";
+
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
+
+// #1180 — the SHIPPED bounded fetch, extracted rather than re-implemented. A hand-written
+// copy can drift from the real one, and then these tests prove nothing about what ships —
+// the same extraction technique this file already uses for the executor itself.
+const boundedMatch = panelSrc.match(/\nasync function boundedGetNodeDefs\([\s\S]*?\n\}/);
+assert.ok(boundedMatch, "could not locate boundedGetNodeDefs in panel source");
 
 const addNodeMatch = panelSrc.match(
   /\n {2}async graph_add_node\(\{ class_type, pos, title \}\) \{[\s\S]*?\n {2}\},/,
@@ -206,6 +225,11 @@ function realGraphAddNode(comfy, overrides = {}) {
     awaitObjectInfoHistorySeed: async () => {},
     recordObjectInfoTypes: (defs) => defs,
     objectInfoHistory: { wasTypeEverDefined: () => false },
+    // #1223 — module state in the real file; this rebuilt scope has to name it or the
+    // executor throws ReferenceError. See the #700 tests below for why THIS harness cares:
+    // the payload the add files is the same map registerNodesFromDefs mutates in place.
+    objectInfoSnapshot: { record: () => true, clear: () => {} },
+    backendReconnectEpoch: 0,
     api: { getNodeDefs: async () => backendObjectInfo() },
     refreshComfyNodeDefs: async (defs) => app.registerNodesFromDefs(defs ?? backendObjectInfo()),
     summarizeNode: (node) => ({
@@ -224,8 +248,32 @@ function realGraphAddNode(comfy, overrides = {}) {
     isRegisteredNodeType,
     fetchSingleNodeDef,
     describeUnmaterializedRequiredWidgets,
+    // #1180 — the panel's bounded api.getNodeDefs() and its sentinel. Module-scope in the
+    // real file; this harness rebuilds the executor in a synthetic scope, so they are
+    // injected. Real withTimeout, so the bound is exercised rather than stubbed away.
+    NODE_DEFS_NO_ANSWER,
+    WIDEN_SOCKET_PROOF_TIMEOUT_MS,
+    monotonicNow,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
+    withTimeout,
     ...overrides,
   };
+  // Resolved from `deps` at CALL time: tests pass their own `api` through overrides, and a
+  // helper closed over the default would call the wrong one.
+  if (!("boundedGetNodeDefs" in deps)) {
+    // Built from panel source, with this harness's api resolved at CALL time because
+    // tests pass their own through overrides.
+    const build = new Function(
+      "api",
+      "withTimeout",
+      "NODE_DEFS_NO_ANSWER",
+      "NODE_DEFS_FETCH_TIMEOUT_MS",
+      `${boundedMatch[0]}
+       return boundedGetNodeDefs;`,
+    );
+    deps.boundedGetNodeDefs = (timeoutMs) =>
+      build(deps.api, withTimeout, NODE_DEFS_NO_ANSWER, NODE_DEFS_FETCH_TIMEOUT_MS)(timeoutMs);
+  }
 
   const names = Object.keys(deps);
   const factory = new Function(

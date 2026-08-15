@@ -971,3 +971,142 @@ test("#1166: a successful restart retires every marker before the invalidate can
     );
   }
 });
+
+// ── #1171: the reload guard must span the work it protects ───────────────────
+//
+// `reloading` is the mutual-exclusion flag between softReload() and hardRestart().
+// hardRestart set it, then released it in a `finally` that closed right after the POST —
+// while the function kept going: retiring the turn and three markers, invalidating the
+// durable session, then reconnecting. From the moment the POST settled the flag was open,
+// so a second restart, or a soft reload sharing the flag, could interleave with that tail
+// and tear down the same session state twice.
+//
+// Structural for the same reason #1166's test is: WHERE the release sits relative to the
+// tail and the reconnect is the entire content of the fix.
+test("#1171: the reload guard is held across hardRestart's tail and released before the reconnect", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("async function hardRestart(");
+  assert.notEqual(start, -1, "could not locate hardRestart");
+  const end = src.indexOf("\n  }", start);
+  assert.notEqual(end, -1, "could not locate the end of hardRestart");
+  const body = src.slice(start, end);
+  const at = (re) => body.search(re);
+
+  // DERIVE the guard's name from its own prologue rather than hardcoding it. The first
+  // version matched `reloading = false` literally, so a harmless rename failed this test
+  // while proving nothing about the property — and a rename that ALSO reintroduced the
+  // defect would fail it for the same irrelevant reason. The prologue is the definition of
+  // a re-entrancy guard: bail if set, then set it.
+  const prologue = body.match(/if \((\w+)\) return;\s*[\r\n]+\s*\1 = true;/);
+  assert.ok(prologue, "hardRestart must open with a re-entrancy guard: `if (X) return; X = true;`");
+  const guard = prologue[1];
+
+  // …AND IT MUST BE THE FLAG softReload SHARES. Deriving the name from hardRestart alone is
+  // blind to the one change that silently removes the mutual exclusion entirely: giving
+  // hardRestart its own private flag. Every assertion below would still hold, while a soft
+  // reload and a hard restart could once again run at the same time — which is the whole
+  // point of the flag.
+  const softStart = src.indexOf("async function softReload(");
+  assert.notEqual(softStart, -1, "could not locate softReload");
+  const softBody = src.slice(softStart, src.indexOf("\n  }", softStart));
+  assert.match(
+    softBody,
+    new RegExp(`if \\(${guard}\\) return;`),
+    `softReload must gate on the SAME flag hardRestart holds (\`${guard}\`) — a private flag is no exclusion`,
+  );
+  const releaseRe = new RegExp(`^[ \\t]*${guard} = false;`, "m");
+
+  const release = at(releaseRe);
+  // Either shape — hardRestart takes a block (it repaints the UI before returning),
+  // connectBackend takes a bare return. Pinning one of them coupled this test to a
+  // detail of the other call site.
+  const invalidate = at(/^[ \t]*if \(!await invalidateDurableAgentSession\(\)\)/m);
+  const endTurn = at(/^[ \t]*endTurnLocally\(\);/m);
+  const reconnect = at(/^[ \t]*client\.start\(\);/m);
+
+  // EVERY probe gets a found-check. A `search` miss is -1, which silently satisfies
+  // "release > endTurn" and would let this test pass while asserting nothing about a
+  // statement that is no longer there.
+  assert.notEqual(release, -1, `the guard \`${guard}\` must still be released`);
+  assert.notEqual(reconnect, -1, "expected the reconnect");
+  assert.notEqual(invalidate, -1, "expected the durable invalidation in the tail");
+  assert.notEqual(endTurn, -1, "expected the turn to be ended in the tail");
+
+  // IN A `finally`, not merely before the reconnect. A plain assignment sitting between the
+  // tail and client.start() satisfies every positional check below while LATCHING the flag
+  // on the invalidate-failure early return and on any throw — the defect wearing the fix as
+  // a hat. That mutation passed this test until these three assertions were added.
+  const finallyAt = at(/^[ \t]*\} finally \{/m);
+  assert.notEqual(finallyAt, -1, "the release must sit in a `finally`, so every exit path takes it");
+  assert.equal(
+    (body.match(/^[ \t]*\} finally \{/gm) || []).length,
+    1,
+    "exactly one finally, so there is no doubt which one releases the guard",
+  );
+  assert.ok(release > finallyAt, "the release must be INSIDE that finally, not before it");
+  assert.ok(
+    endTurn < finallyAt,
+    "…and the tail must sit inside the guarded try — a finally opening before it guards nothing",
+  );
+
+  assert.ok(
+    release > endTurn,
+    "the guard must still be held while the turn and its markers are retired — releasing " +
+      "first is what let a second restart interleave with this teardown",
+  );
+  assert.ok(
+    release > invalidate,
+    "the guard must still be held across the durable invalidation, the tail's one await",
+  );
+  assert.ok(
+    release < reconnect,
+    "…and released BEFORE the reconnect, as softReload's beforeStart hook does: holding it " +
+      "across a connect that may never settle would block every later restart",
+  );
+  // Exactly one release site. Two would mean the early `finally` came back alongside the
+  // new one, which is the defect wearing the fix as a hat.
+  //
+  // NOT line-anchored: an inline re-release (`stopRebootWatch(); reloading = false;`) slips
+  // past an anchored count while reinstating exactly that defect.
+  assert.equal(
+    (body.match(new RegExp(`\\b${guard} = false;`, "g")) || []).length,
+    1,
+    "the guard must be released in exactly one place",
+  );
+});
+
+test("#1171: the durable invalidation is deliberately UNBOUNDED, and settles on its own", () => {
+  // A bound was added here and removed again, and the reversal is the interesting part.
+  //
+  // The argument for one: hardRestart now holds the reload guard across this call, so an
+  // await that never settled would latch the guard for the session. That shape is real —
+  // two earlier attempts at the sibling bug produced it — but it is not reachable through
+  // this store, and the bound cost more than the hazard.
+  //
+  // `flush()` awaits the serial `_writePromise`, and every write in that chain resolves on
+  // all three terminal transaction events; `openDb` is capped and resolves null past it. So
+  // the guard cannot latch here, and bounding merely gave the function a new way to answer
+  // false for a HEALTHY store — landing on two exits that cannot absorb it.
+  // The store's side of this contract is tested BEHAVIOURALLY, in
+  // chat-history-store.test.mjs: a hung open SETTLES on the store's own cap. What it then
+  // REPORTS depends on how much history there is — success inside the local shadow's limits,
+  // ok:false past them — which is pinned there at the boundary. An earlier
+  // version of this test asserted that file's SOURCE TEXT instead — matching `tx.oncomplete`
+  // and friends — which coupled a restart test to another module's internals and would
+  // break on a harmless refactor while proving nothing about behaviour.
+
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("async function invalidateDurableAgentSession(");
+  assert.notEqual(start, -1, "could not locate invalidateDurableAgentSession");
+  const end = src.indexOf("\n  }", start);
+  assert.notEqual(end, -1, "could not locate the end of invalidateDurableAgentSession");
+  const body = src.slice(start, end);
+  // If a bound is ever reinstated, it must come with a reason that survives the two
+  // problems that retired this one, so the removal is asserted rather than merely narrated.
+  assert.doesNotMatch(
+    body,
+    /withTimeout\(/,
+    "bounding flush() bounds the whole queued write chain, so a busy queue reads as a broken store",
+  );
+  assert.match(body, /await historyStore\.flush\(\)/, "the flush is awaited directly");
+});
