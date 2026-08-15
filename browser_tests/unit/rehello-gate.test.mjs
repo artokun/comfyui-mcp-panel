@@ -486,6 +486,36 @@ test("#1095 codex R4: a cancelled generation's drain cannot send on the replacem
   assert.deepEqual(order, [], "a frame built for a dead route must never reach the live socket");
 });
 
+test("#1095 codex R4: a retired advertisement must not drain the REPLACEMENT's queue", async () => {
+  // Clearing `held` on cancel is not sufficient on its own, and mutation testing is what
+  // showed it: with only the clear, removing the generation check broke nothing, because the
+  // stale drain found an empty batch. The two diverge exactly here — when a NEW frame has
+  // been queued on the replacement connection before the RETIRED advertisement settles. The
+  // stale drain would then splice a batch that is not its own and write it out before the new
+  // connection's own hello had landed, which is the stale-route send this all exists to stop.
+  const order = [];
+  let resolveRetired;
+  let hellos = 0;
+  const gate = manualGate(() => {
+    hellos++;
+    if (hellos === 1) return new Promise((r) => { resolveRetired = r; });
+    return new Promise(() => {}); // the replacement's own hello is still on its way
+  });
+
+  const mark = gate.began("graph_set_widget");
+  gate.sendAfterAdvertise(() => order.push("old-connection-frame"));
+  gate.ended(mark); // the retired connection's hello is now on its way
+  gate.cancel(); // …and the connection is replaced before it settles
+
+  gate.sendAfterAdvertise(() => order.push("replacement-frame"));
+  assert.equal(gate.heldFrames(), 1, "the replacement queued its own frame");
+
+  resolveRetired(true); // the RETIRED advertisement settles late
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, [], "a dead connection's advertisement may not release the live queue");
+  assert.equal(gate.heldFrames(), 1, "…the live frame still waits for its OWN hello");
+});
+
 test("#1095 codex R4: a stale never-settling advertisement cannot wedge later frames", async () => {
   // The other half of the same defect: with `held` left populated behind a promise that
   // never settles, every later frame queued behind `held.length > 1` and no drain was ever
