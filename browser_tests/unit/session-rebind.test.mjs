@@ -608,7 +608,7 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.ok(
     src.includes(
-      "if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs()",
+      "if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;",
     ),
     "the ready-ack mid-task branch must NEGATE the predicate and read the measured outage",
   );
@@ -633,6 +633,7 @@ test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
   // assert nothing.
   for (const [site, snippet] of [
     ["the socket close handler must open the outage", "bridgeOutage.noteBridgeClosed();"],
+    ["a concluded death must open one too (#1168)", "bridgeOutage.noteAgentGone();"],
     ["the models handshake must close it", "bridgeOutage.noteHandshake();"],
     ["a turn start must scope the evidence to that turn", "bridgeOutage.noteTurnStarted();"],
   ]) {
@@ -941,25 +942,27 @@ test("#1145: a second outage measures itself, not the gap since the first", () =
   assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
 });
 
-// ── #1168: a WEDGED orchestrator's death is recorded as a CONCLUSION ──────────
+// ── #1168: a WEDGED orchestrator's death OPENS an outage of its own ───────────
 //
 // The outage clock is started by the socket `close` listener, and a wedged orchestrator
-// never fires one: it holds the connection open and answers nothing. So the death that
-// killed the running turn goes unrecorded, and the clock only starts when that process
-// finally dies — measuring the user's restart instead of the wedge. The turn is never
-// resumed.
+// never fires one: it holds the connection open and answers nothing. So the outage the
+// death caused is not merely mismeasured, it is never opened at all — and when the wedged
+// process finally dies the clock starts from THAT moment, so a user who restarts it
+// promptly measures the restart. Minutes with no agent behind the socket are weighed as a
+// three-second blip and the turn is never resumed.
 //
-// Two earlier attempts recorded it as a DURATION, from the teardown side and from the
-// handshake redial, and both converted a missed nudge into a false one. What this pins
-// is the third shape: the panel records the CONCLUSION it actually reached ("nothing is
-// behind this socket"), the reader weighs it ahead of the clock, and a turn start still
-// stands it down — so an orchestrator that turns out to be alive is never nudged.
+// The fix opens the outage where the panel CONCLUDES the death. What it deliberately does
+// not do is exempt that death from the threshold — a first draft passed the conclusion to
+// the predicate and let it outrank the clock, and review showed that nudges a live agent
+// whenever the conclusion is wrong (a socket stale under a sleep / NAT idle-kill presents
+// identically). The interval remains the sole gate; #1168 only makes sure it is measured
+// from when the agent stopped answering rather than from when its process finally exited.
 
 test("#1168: a wedge that no close ever reported still resumes the turn", () => {
   // The reported sequence, to scale. A turn is in flight; the orchestrator wedges with
-  // its socket OPEN, so nothing closes and nothing opens an outage. The panel spends its
-  // full redial ladder (~60s) establishing that nothing answers, then concludes. The user
-  // restarts the orchestrator out-of-band and it is back in three seconds.
+  // its socket OPEN, so nothing closes. The panel spends its full redial ladder (~60s)
+  // establishing that nothing answers, then concludes. The user reads the hint, restarts
+  // the agent by hand, and the fresh one is up three seconds after the old port frees.
   const { clock, tracker } = trackerAt();
   tracker.noteTurnStarted();
   clock.t += 60_000; // the redial ladder — an open socket, no `models`, no close
@@ -969,120 +972,107 @@ test("#1168: a wedge that no close ever reported still resumes the turn", () => 
   clock.t += 3000; // the fresh orchestrator binds the port…
   tracker.noteHandshake(); // …and handshakes
 
-  // THE DEFECT, asserted rather than described: three minutes with no agent behind the
-  // socket are measured as the three-second RESTART, which the duration guard correctly
-  // reads as a blip. Weighing it alone is what loses the nudge, so this must stay true —
-  // it is the gap, not the thing being fixed.
+  assert.equal(
+    tracker.outageMs(),
+    123_000,
+    "the outage runs from the death the panel concluded, not from the process exit",
+  );
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    true,
+    "a turn a wedge interrupted must be resumed",
+  );
+});
+
+test("#1168: the counterfactual — measuring from the process exit loses the nudge", () => {
+  // What main does with the same sequence, asserted rather than described: with nothing
+  // recording the death, the first close is the wedged process finally exiting, and the
+  // interval is the three-second RESTART. Under the threshold, no nudge, turn stranded.
+  // If these two ever agree the fix has become invisible.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  clock.t += 60_000;
+  clock.t += 120_000; // …no noteAgentGone(): the wedge goes unrecorded
+  tracker.noteBridgeClosed();
+  clock.t += 3000;
+  tracker.noteHandshake();
   assert.equal(tracker.outageMs(), 3000);
   assert.equal(
     shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
     false,
-    "the clock alone cannot see a wedge — this is the gap, and it must stay visible here",
-  );
-  // The fix: the conclusion the panel actually reached is the evidence.
-  assert.equal(tracker.agentGone(), true, "the handshake must not erase the conclusion");
-  assert.equal(
-    shouldNudgeAfterMidTaskReconnect({
-      outageMs: tracker.outageMs(),
-      agentGone: tracker.agentGone(),
-    }),
-    true,
-    "a turn a concluded death interrupted must be resumed",
+    "this is the bug — three minutes with no agent read as a blip",
   );
 });
 
-test("#1168: the two evidence kinds DISAGREE, so the fix cannot be inert", () => {
-  // #1096's review proved by mutation that token-presence scans stay green under an
-  // inverted guard. This is the behavioural equivalent: for one and the same measured
-  // interval the answer must differ on the conclusion alone. If these ever agree, either
-  // the flag stopped being read or it stopped mattering, and the wedge is unfixed again.
-  const fast = 3000;
-  assert.notEqual(
-    shouldNudgeAfterMidTaskReconnect({ outageMs: fast, agentGone: true }),
-    shouldNudgeAfterMidTaskReconnect({ outageMs: fast, agentGone: false }),
-    "a concluded death must change the answer the clock alone would give",
-  );
-  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: fast, agentGone: true }), true);
-  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: fast, agentGone: false }), false);
-  // …and with NO outage at all, which is the wedge's own reading before any close.
-  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 0, agentGone: true }), true);
-  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 0 }), false);
-});
-
-test("#1168: an orchestrator that turns out to be ALIVE is never nudged", () => {
-  // The half that makes this shippable, and the one both previous attempts failed. The
-  // panel can conclude a death and be wrong — a very slow boot answers eventually. What
-  // makes that safe is the same guarantee #1163 rests on: a live turn re-announces, and
-  // that frame stands the conclusion down before the ready ack can act on it.
+test("#1168: a conclusion the panel got WRONG must not nudge a live agent", () => {
+  // The finding that rejected the first draft, kept as a regression test. The panel
+  // cannot tell "the orchestrator died" from "my own socket went stale while it kept
+  // working": a half-open TCP after a laptop sleep, a NAT idle-kill or a VPN flap all
+  // present as an open socket answering nothing, so the give-up ladder concludes a death
+  // that never happened. The orchestrator is alive and mid-turn, and answers again as
+  // soon as the stale socket is torn down.
+  //
+  // Nothing here relies on frame ORDERING. The earlier draft's safety argument did — it
+  // assumed a surviving turn's re-announce beats the `ready` ack — and this file already
+  // records (see the #1163 test above) that the panel guarantees no such thing. The
+  // elapsed interval is what makes this safe, which is why the conclusion opens an outage
+  // instead of bypassing the threshold.
   const { clock, tracker } = trackerAt();
   tracker.noteTurnStarted();
   clock.t += 60_000;
-  tracker.noteAgentGone(); // the panel gives up…
-  clock.t += 5000;
-  tracker.noteTurnStarted(); // …but the surviving turn re-announces on reconnect
-  assert.equal(tracker.agentGone(), false, "a live turn must retire the conclusion");
+  tracker.noteAgentGone(); // concluded — wrongly
+  clock.t += 1000;
+  tracker.noteBridgeClosed(); // the OS finally tears the stale TCP down
+  clock.t += 1500;
+  tracker.noteHandshake(); // the SAME, still-alive orchestrator answers
+  assert.equal(tracker.outageMs(), 2500);
   assert.equal(
-    shouldNudgeAfterMidTaskReconnect({
-      outageMs: tracker.outageMs(),
-      agentGone: tracker.agentGone(),
-    }),
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
     false,
-    "an agent that is working must never be told to start over",
+    "an agent that never stopped working must not be told to start over",
   );
 });
 
-test("#1168: a death concluded before this turn is not this turn's evidence", () => {
-  // The turn-scoping rule #1145/#1163 established for the duration, applied to the flag —
-  // without it a wedge settled two turns ago would nudge every later reconnect. Safe by
-  // construction at the call site too: the panel arms its mid-task marker in the same
-  // frame that starts the turn, so an armed marker implies this event has already run.
+test("#1168: a concluded death does not restart a clock already running", () => {
+  // The give-up ladder can be reached with an outage already open (the terminal
+  // `disconnected` caller gets there through its own failed retries). Re-stamping would
+  // discard everything before it — the #1145 backoff-step defect through a new door — so
+  // the first opener wins here exactly as it does for a close.
   const { clock, tracker } = trackerAt();
-  tracker.noteAgentGone(); // a wedge, concluded and long since recovered
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed(); // t=0, the drop
+  clock.t += 20_000; // reconnect patience runs out
+  tracker.noteAgentGone(); // the same latch, reached from the disconnected caller
+  clock.t += 2000;
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 22_000, "the outage keeps its original start");
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1168: a turn start still closes an outage a conclusion opened", () => {
+  // Turn-scoping must reach the new opener too, or a wedge concluded before this turn
+  // would be re-read as this turn's evidence — the #1145/#1163 defect one door along.
+  const { clock, tracker } = trackerAt();
+  tracker.noteAgentGone();
   clock.t += 600_000;
   tracker.noteTurnStarted(); // a brand-new turn the user just typed
-  assert.equal(tracker.agentGone(), false);
+  assert.equal(tracker.isDown(), false, "a turn start ends the outage, whoever opened it");
+  assert.equal(tracker.outageMs(), 0);
   assert.equal(
-    shouldNudgeAfterMidTaskReconnect({
-      outageMs: tracker.outageMs(),
-      agentGone: tracker.agentGone(),
-    }),
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
     false,
     "a settled wedge must not nudge a turn that started after it",
   );
 });
 
-test("#1168: nothing but an explicit conclusion sets the flag", () => {
-  // The agent-not-ready-YET case, which attempt 2 stamped and must not: a fresh mount,
-  // a close, a redial's reopen and a late handshake are all ordinary events, and none of
-  // them is a death. A tracker that reported one here would nudge every slow first
-  // connect that happened to follow a turn.
-  const { clock, tracker } = trackerAt();
-  assert.equal(tracker.agentGone(), false, "a fresh tracker has concluded nothing");
-  tracker.noteTurnStarted();
-  tracker.noteBridgeClosed();
-  clock.t += 45_000; // a genuinely slow cold start
-  tracker.noteHandshake();
-  assert.equal(tracker.agentGone(), false, "a slow boot is not a death");
-  // The outage it DID measure is still weighed normally — recording a conclusion must
-  // not disturb the duration path either way.
-  assert.equal(tracker.outageMs(), 45_000);
-});
-
-test("#1168: only the literal boolean opens the gate", () => {
-  // This branch BYPASSES the duration guard, so a caller that guessed the field name
-  // must not be able to nudge with a truthy string. Asserted because `=== true` reads
-  // like an accident next to the `typeof` checks around it, and a "simplification" to
-  // truthiness would silently widen the one path that can skip the whole guard.
-  for (const truthy of ["1", 1, {}, [], "true"]) {
-    assert.equal(
-      shouldNudgeAfterMidTaskReconnect({ outageMs: 0, agentGone: truthy }),
-      false,
-      "a non-boolean must fall through to the clock, not open the gate",
-    );
-  }
-  // And omitting it entirely leaves every pre-#1168 answer exactly as it was.
-  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 30_000 }), true);
-  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 5999 }), false);
+test("#1168: an unreadable clock cannot manufacture a death", () => {
+  // Same safe direction noteBridgeClosed takes: with no readable clock the outage is not
+  // opened at all, so the nudge is withheld rather than invented.
+  const broken = createBridgeOutageTracker({ now: () => NaN });
+  broken.noteAgentGone();
+  assert.equal(broken.isDown(), false);
+  assert.equal(broken.outageMs(), 0);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: broken.outageMs() }), false);
 });
 
 test("#1168 WIRING: the death is recorded where the panel EARNS the conclusion", () => {
@@ -1124,12 +1114,14 @@ test("#1168 WIRING: the death is recorded where the panel EARNS the conclusion",
     "the death is concluded exactly when the hint becomes true, not before",
   );
 
-  // The reader, pinned by exact substring like the three write sites above it: a flag
-  // nothing consults leaves the wedge unfixed while every test here still passes.
+  // And the conclusion must NOT be handed to the predicate as a second input. The first
+  // draft did exactly that and was rejected: it let a conclusion the panel cannot verify
+  // bypass the threshold, nudging a live agent whenever a stale socket looked like a
+  // death. The elapsed interval stays the sole gate.
   assert.ok(
     src.includes(
-      "if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs(), agentGone: bridgeOutage.agentGone() })) return;",
+      "if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;",
     ),
-    "the ready-ack mid-task branch must weigh the conclusion alongside the measured outage",
+    "the nudge must be decided on the measured outage alone, never on the raw conclusion",
   );
 });

@@ -28914,14 +28914,14 @@ function buildPanel() {
         // and #1096's review demonstrated by mutation that such a test stays green when
         // the guard is inverted — which is the one regression that matters here.
         //
-        // #1168 — and the measured outage is not the only evidence. A WEDGED
-        // orchestrator holds its socket open and answers nothing, so no close fires and
-        // no outage is opened at all; the clock starts only when the wedged process
-        // finally dies, and a user who restarts it promptly measures that restart rather
-        // than the wedge. The panel's own conclusion that nothing is behind the socket
-        // is the direct form of what the duration is a proxy for, so it is passed
-        // alongside and outranks it.
-        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs(), agentGone: bridgeOutage.agentGone() })) return;
+        // #1168 — unchanged here, deliberately. A wedged orchestrator's death now opens
+        // an outage of its own (bridgeOutage.noteAgentGone, from where the panel
+        // concludes it), so the gap this missed reaches the SAME threshold rather than
+        // being exempted from it. A first draft passed the conclusion in alongside the
+        // duration and let it outrank the guard; review showed that nudges a live agent
+        // whenever the panel's conclusion is wrong — a socket that went stale under a
+        // sleep or a NAT idle-kill is indistinguishable from a death here.
+        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         if (client.sendUserMessage(
@@ -30281,11 +30281,20 @@ function buildPanel() {
     // Both callers reach it having established that, not assumed it: the handshake
     // timeout (an OPEN socket that answered nothing for the full redial ladder — the
     // WEDGE this issue is about, where no close ever fires and nothing else records a
-    // death) and the terminal `disconnected` status (reconnect patience exhausted). The
-    // panel never kills anything here, which is the point — this distribution CANNOT
-    // respawn the orchestrator (externalOrchestratorMode is hardcoded true, and the
-    // pack's /connect ignores `force` entirely), so the death has to be concluded from
-    // the panel's own observation or not at all.
+    // death) and the terminal `disconnected` status (reconnect patience exhausted, whose
+    // own retries have already opened an outage, so this is a no-op there). The panel
+    // never kills anything here, which is the point — this distribution CANNOT respawn
+    // the orchestrator (externalOrchestratorMode is hardcoded true, and the pack's
+    // /connect ignores `force` entirely), so the death has to be concluded from the
+    // panel's own observation or not at all.
+    //
+    // This OPENS an outage; it does not assert one was long enough to matter. The
+    // threshold still decides, because a conclusion reached here can be wrong: a socket
+    // that went stale under a laptop sleep, a NAT idle-kill or a VPN flap presents
+    // exactly like a wedge, and the orchestrator behind it may be alive and mid-turn.
+    // When it is, it answers again within moments of this point and the short interval
+    // withholds the nudge; a genuine wedge takes the user reading the hint below and
+    // restarting the agent by hand, which never fits inside that window.
     bridgeOutage.noteAgentGone();
     appendSystem(
       tr(
