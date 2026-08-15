@@ -46,9 +46,14 @@ test("#581 wires the deferred snapshot after delivering a successful command rep
   const here = dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
   const capture = source.indexOf("changeTrackerToSnapshot =");
-  const deliver = source.indexOf("if (deliverReply(reply, msg.cmd, superseded))", capture);
-  const defer = source.indexOf("deferChangeTrackerSnapshot(changeTrackerToSnapshot)", deliver);
+  // #1095 — matched on the leading arguments, not the exact arity. The claim here is about
+  // ORDER (capture → deliver → defer the snapshot); pinning the full call made it fail when
+  // the in-flight mark became a fourth argument, which is a passing assertion breaking for a
+  // reason unrelated to what it checks.
+  const deliver = source.slice(capture).search(/if \(deliverReply\(reply, msg\.cmd, superseded[,)]/);
+  const deliverAt = deliver === -1 ? -1 : capture + deliver;
+  const defer = source.indexOf("deferChangeTrackerSnapshot(changeTrackerToSnapshot)", deliverAt);
   assert.ok(capture >= 0, "successful executor path captures its tracker");
-  assert.ok(deliver > capture, "reply delivery follows the successful executor");
-  assert.ok(defer > deliver, "snapshot is scheduled only after the reply is delivered");
+  assert.ok(deliverAt > capture, "reply delivery follows the successful executor");
+  assert.ok(defer > deliverAt, "snapshot is scheduled only after the reply is delivered");
 });
