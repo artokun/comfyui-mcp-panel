@@ -60,6 +60,19 @@ const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
  * `throw` outside a try (or inside a catch/finally, which the enclosing try does not cover)
  * escapes just the same.
  */
+/** The body of the bridge client's `sendUserMessage` / `sendFrame`, bounded by the method's
+ *  own closing `\n    },` rather than a character count. */
+function umBodyFor(src) {
+  const at = src.indexOf("    sendUserMessage(");
+  assert.notEqual(at, -1, "could not locate sendUserMessage");
+  return src.slice(at, src.indexOf("\n    },", at));
+}
+function sfBodyFor(src) {
+  const at = src.indexOf("    sendFrame(frame) {");
+  assert.notEqual(at, -1, "could not locate sendFrame");
+  return src.slice(at, src.indexOf("\n    },", at));
+}
+
 function escapingExits(sf, root, from, to) {
   const escapes = [];
   (function scan(node, caught) {
@@ -868,20 +881,49 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
     const end = src.indexOf("\n    },", at);
     assert.notEqual(end, -1, `could not bound ${name}`);
     const body = src.slice(at, end);
-    const guardAt = body.indexOf("if (advertisedRouteIsStale())");
+    // The CALL, not a literal `if (...)` form — sendFrame conjoins the frame-type check.
+    const guardAt = body.indexOf("advertisedRouteIsStale()");
     const plainAt = body.lastIndexOf("return send();");
     assert.ok(guardAt !== -1 && plainAt > guardAt, `${name} must only send directly AFTER the guard`);
-    // The frame must be built ONCE, before the branch, so a held frame is byte-identical to
-    // the one that would have gone out immediately — same context, same disclosure decision.
-    const buildAt = body.indexOf("const send = () => {");
-    assert.ok(buildAt !== -1 && buildAt < guardAt, `${name} must build the frame before deciding`);
   }
+
+  // The two paths want OPPOSITE orderings, and each ordering is load-bearing.
+  //
+  // sendFrame can QUEUE, so its frame must be built before the branch — a held frame has to
+  // be byte-identical to the one that would have gone out immediately.
+  const sfBuildAt = sfBodyFor(src).indexOf("const send = () => {");
+  const sfGuardAt = sfBodyFor(src).indexOf("advertisedRouteIsStale()");
+  assert.ok(sfBuildAt !== -1 && sfBuildAt < sfGuardAt, "sendFrame must build the frame before deciding");
+  // sendUserMessage REFUSES, so its guard must come first — building would consume the armed
+  // one-shot for a frame that never leaves (see the ordering assertions below).
+  const umBuildAt = umBodyFor(src).indexOf("const send = () => {");
+  const umGuardAt = umBodyFor(src).indexOf("advertisedRouteIsStale()");
+  assert.ok(umGuardAt !== -1 && umGuardAt < umBuildAt, "sendUserMessage must refuse before building");
 
   // sendUserMessage refuses outright; only sendFrame may queue, and only for the frames
   // whose senders ignore the answer.
   const umAt = src.indexOf("    sendUserMessage(");
   const umBody = src.slice(umAt, src.indexOf("\n    },", umAt));
   assert.match(umBody, /if \(advertisedRouteIsStale\(\)\) return false;/, "a user message is refused, never queued");
+
+  // …AND THE REFUSAL MUST PRECEDE EVERY ONE-SHOT CONSUMPTION. `pendingContext` is an armed
+  // transcript replay / workflow instruction that is merged into the frame and cleared. With
+  // the refusal below that merge, the one-shot was consumed by a frame that never left, and
+  // `trackSend` stores the payload it was GIVEN — so the retry went out without the armed
+  // replay, silently. Same class as reporting a discarded frame delivered: the user's intent
+  // evaporates with no signal. Ordering is asserted rather than a restore, because a restore
+  // has to be remembered by every future edit and an early return does not.
+  const umRefuseAt = umBody.indexOf("if (advertisedRouteIsStale()) return false;");
+  const umMergeAt = umBody.indexOf("const mergedContext =");
+  const umClearAt = umBody.indexOf("pendingContext = null;");
+  assert.ok(umMergeAt !== -1 && umClearAt !== -1, "the one-shot merge and clear must still be here");
+  assert.ok(umRefuseAt < umMergeAt, "the refusal must precede the one-shot merge");
+  assert.ok(umRefuseAt < umClearAt, "…and the clear that consumes it");
+  // `AGENT_BLIND` may still run before the refusal — it only nulls a local, consuming nothing.
+  assert.ok(
+    umBody.indexOf("if (AGENT_BLIND) images = undefined;") > umRefuseAt,
+    "nothing that mutates caller state may run before the refusal",
+  );
   // The CALL, not the word — the comment above it names holdForRoute to explain why this
   // path deliberately does not use it.
   assert.equal(
@@ -890,14 +932,25 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
     "…and it must not reach the queue at all",
   );
 
+  // THE SCOPE LINE. Only the session-ordered frames are held; every other control frame
+  // keeps its pre-#1095 behaviour. A brief cut refused them all, and that was worse rather
+  // than stricter: cancel_message, interrupt, rewind, set_options and the pairing frames all
+  // IGNORE this return, so a refusal did not stop them — it made them fail silently while
+  // their callers announced success and, in rewind's case, resubmitted. Refusing a frame
+  // nobody checks converts a routing problem into a lying UI.
   const sfAt = src.indexOf("    sendFrame(frame) {");
   const sfBody = src.slice(sfAt, src.indexOf("\n    },", sfAt));
   assert.match(
     sfBody,
-    /if \(!SESSION_ORDERED_FRAMES\.has\(frame\?\.type\)\) return false;/,
-    "every other control frame is refused, so runCompletion re-pends instead of retiring",
+    /if \(advertisedRouteIsStale\(\) && SESSION_ORDERED_FRAMES\.has\(frame\?\.type\)\) \{/,
+    "only the fire-and-forget session frames may be diverted from the ordinary send",
   );
   assert.match(sfBody, /return rehelloGate\.holdForRoute\(send, routeId\);/, "…and the queued one carries its route");
+  assert.equal(
+    /SESSION_ORDERED_FRAMES\.has\(frame\?\.type\)\) return false;/.test(sfBody),
+    false,
+    "a control frame whose caller ignores the answer must not be silently refused",
+  );
   // The set must stay exactly the fire-and-forget session frames. Adding a frame whose
   // sender reads the return would reintroduce "reported delivered, then discarded".
   assert.match(

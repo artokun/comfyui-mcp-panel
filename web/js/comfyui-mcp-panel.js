@@ -19905,6 +19905,22 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     },
     sendUserMessage(text, context, images, mid) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
+      // #1095 — REFUSED HERE, BEFORE ANYTHING ONE-SHOT IS CONSUMED.
+      //
+      // A `user_message` carries NO tab id, so the orchestrator routes it by the binding the
+      // socket already has. Sent before the new route is advertised it reaches the PREVIOUS
+      // workflow's agent — the user's text, context and images delivered into another
+      // canvas's conversation. That misdelivery is the harm #1095 is about, and it is the
+      // one this method refuses.
+      //
+      // The POSITION is the fix for a second defect. The refusal used to sit at the bottom,
+      // by which point `pendingContext` had already been merged into this frame and cleared.
+      // `trackSend` stores the payload it was given, so the retry went out WITHOUT the armed
+      // one-shot — a transcript replay or workflow instruction that evaporated with no
+      // signal, which is the same class as reporting a discarded frame delivered. Refusing
+      // before the merge means a refusal consumes nothing at all, structurally, rather than
+      // by remembering to put back everything a later edit might take.
+      if (advertisedRouteIsStale()) return false;
       // Blind mode withholds pixels from EVERY agent-facing path — including
       // images explicitly attached to a typed user message. The sendFrame() gate
       // below only covers agent_event, so without this a blind session still
@@ -19998,14 +20014,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // causes the advertisement (only the workflow poll may author one — it binds the
       // session first).
       //
-      // REFUSED, NOT QUEUED. Queueing a user message and answering `true` would report it
-      // delivered while it can still be discarded — and `trackSend` arms a delivery timeout
-      // on that answer, so the message would sit "sent" and then quietly never arrive.
-      // Queueing and answering `false` is worse: the tray shows it failed, the user presses
-      // Send now, and the queued copy goes out too. A plain refusal is the only answer that
-      // is true when it is given: nothing was written, the tray says so, and one retry
-      // sends exactly one message. See holdForRoute in lib/rehello-gate.js.
-      if (advertisedRouteIsStale()) return false;
+      // REFUSED, NOT QUEUED (see the guard at the top of this method). Queueing a user
+      // message and answering `true` would report it delivered while it can still be
+      // discarded — and `trackSend` arms a delivery timeout on that answer, so the message
+      // would sit "sent" and then quietly never arrive. Queueing and answering `false` is
+      // worse: the tray shows it failed, the user presses Send now, and the queued copy goes
+      // out too. A plain refusal is the only answer that is true when it is given: nothing
+      // was written, the tray says so, and one retry sends exactly one message.
       return send();
     },
     /** Send an arbitrary control frame (set_options, new_session, …). */
@@ -20054,25 +20069,32 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // cannot overtake each other — frames on one socket are ordered, and a hold that
       // reordered them would trade a routing bug for a conversation bug.
       //
-      // Only SESSION-ORDERED frames are queued; everything else is refused outright.
+      // ONLY the session-ordered frames are held. EVERYTHING ELSE KEEPS ITS PRE-#1095
+      // BEHAVIOUR, deliberately, and this is the scope line of the whole change.
       //
-      // The split is not a convenience. A queued frame cannot be reported as delivered (it
-      // may still be discarded) and cannot be reported as failed (the queued copy may still
-      // go out), so it may only be queued when NO caller reads the answer. `resume_session`
-      // and `new_session` are exactly that: fire-and-forget, and meaningless before the
-      // hello anyway — they hand the next turn to an agent on a route the orchestrator has
-      // not been told about yet.
+      // A brief cut refused every control frame on a stale route. That was more correct in
+      // the abstract and worse in practice: `cancel_message`, `interrupt`, `rewind`,
+      // `set_options` and the pairing frames all IGNORE this return value, so a refusal did
+      // not stop them — it made them fail silently while their callers announced success.
+      // Rewind in particular announces and resubmits immediately after, and a cancellation
+      // could disappear locally while still running remotely. Refusing a frame nobody
+      // checks converts a routing problem into a lying UI, which is strictly worse than the
+      // routing problem.
       //
-      // Everything else is refused, which every caller already handles correctly. It matters
-      // most for `agent_event`: runCompletion reads the answer and, on `true`, calls
-      // markDelivered — retiring the prompt from pending so it is NEVER recovered from
-      // /history. A refusal re-pends it instead, which is the behaviour that path was built
-      // for ("sendFrame returns false when the bridge socket is down").
+      // Making all ~50 sendFrame call sites handle refusal is a real and worthwhile change,
+      // but it is a different one: it is error-handling UX across many features, not a
+      // routing fix, and doing it here is what kept turning this PR into the next round's
+      // defect. So the guarantee is deliberately narrow — see the PR body, which names what
+      // is NOT protected rather than letting this read as a general one.
+      //
+      // What remains held is the pair that is both fire-and-forget AND meaningless before
+      // the hello: `resume_session` / `new_session` hand the next turn to an agent on a
+      // route the orchestrator has not been told about yet. Nobody reads their answer, so
+      // queueing them cannot lie to anyone.
       //
       // Stamped with `routeId`, which is the route this frame's own tab_id already names, so
       // the stamp and the payload can never disagree.
-      if (advertisedRouteIsStale()) {
-        if (!SESSION_ORDERED_FRAMES.has(frame?.type)) return false;
+      if (advertisedRouteIsStale() && SESSION_ORDERED_FRAMES.has(frame?.type)) {
         return rehelloGate.holdForRoute(send, routeId);
       }
       return send();
