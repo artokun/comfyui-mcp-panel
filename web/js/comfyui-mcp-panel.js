@@ -11956,6 +11956,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // #1223 — why the snapshot could not stand in, kept OFF the route list so the route
     // count stays honest. Per-request for the same reason the other two are.
     let snapshotIneligibility = "";
+    // #1126 — WHERE the schema the LAST getFreshObjectInfo call answered with came from:
+    // "live" (this call issued the request), "cache" (#716's ≤1.5s burst cache answered, or
+    // this call joined another's in-flight read), "snapshot" (#1223's last-observed schema
+    // stood in), or "none". Only "live" may authorize the #1126 blind combo write, because
+    // that fallback's whole justification is the SERVER declaring the option list empty and
+    // the other three are the server's past word. Reassigned on every read — unlike
+    // `setWidgetSchemaFromSnapshot`, which is STICKY on purpose: a write that consulted the
+    // snapshot at any point must keep disclosing that, even if a later re-ask came back live.
+    let setWidgetSchemaProvenance = "none";
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -12106,6 +12115,12 @@ const GRAPH_TOOL_EXECUTORS = {
               whole: true,
             });
           }
+          // #1126 — the SAME fact `record` above is gated on, reported to the lib. A null
+          // epoch means this call did not issue the request: #716's burst cache answered, or
+          // it joined another call's in-flight read. Either way nobody asked the server
+          // during this call, so the payload can be a full TTL old and must not authorize a
+          // blind write against an "empty" option list that may have been filled since.
+          setWidgetSchemaProvenance = observedAtEpoch !== null ? "live" : "cache";
           return recordObjectInfoTypes(defs);
         }
         // #1223 — the probe produced nothing. If it went SILENT (rather than answering
@@ -12125,6 +12140,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // and it was verified against a schema nobody could re-fetch — an agent that is
           // not told that cannot tell this apart from a fully live authorization.
           setWidgetSchemaFromSnapshot = objectInfoOracleFailureNote(oracleFailures);
+          setWidgetSchemaProvenance = "snapshot";
           // NOT recorded into the ever-seen history: it is not a new observation of the
           // backend, it is the old one being re-read. Recording it would let a snapshot
           // keep its own types "ever seen" after the backend stopped defining them.
@@ -12136,6 +12152,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // is #982's own defect (a refusal asserting something that did not happen) committed
         // by the code written to avoid it.
         snapshotIneligibility = fallback.reason;
+        setWidgetSchemaProvenance = "none";
         return recordObjectInfoTypes(defs);
       },
       // What the last oracle attempt observed, so a refusal can say which routes were
@@ -12150,12 +12167,17 @@ const GRAPH_TOOL_EXECUTORS = {
       // While the history is NOT reliably seeded, FAIL CLOSED (treat every absent type as
       // ever-seen) so a failed/empty baseline never opens a hole (codex round-10).
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
-      // #1223 × #1126 — hand the lib the PROVENANCE of the schema it is about to reason
+      // #1223/#716 × #1126 — hand the lib the PROVENANCE of the schema it is about to reason
       // from. A FUNCTION, because `getFreshObjectInfo` above has not run when this object is
-      // built: which branch answered is only known afterwards. Uses the same `!== null`
-      // convention as the `schema_source` disclosure at the end of this executor, so one
-      // variable stays the single source of truth for "authorized from the snapshot".
-      schemaFromSnapshot: () => setWidgetSchemaFromSnapshot !== null,
+      // built: which branch answered is only known afterwards, and the lib may re-ask.
+      schemaProvenance: () => setWidgetSchemaProvenance,
+      // #1126 — let the lib force a genuinely LIVE re-read on its last-resort blind-write
+      // path. Dropping the #716 burst cache is the only way to stop that cache answering the
+      // very question its own staleness put in doubt; the lib then re-calls
+      // `getFreshObjectInfo` above, which updates the provenance for that call. Safe to drop
+      // on suspicion — this cache's own contract says an invalidation costs a re-fetch and
+      // never correctness (a retired in-flight read still returns to whoever awaited it).
+      invalidateObjectInfoCache: () => objectInfoCache.invalidate(),
       resolveSource: sourceForSubgraphInput,
       canvas: app.canvas,
       beforeChange: () => graph.beforeChange(),

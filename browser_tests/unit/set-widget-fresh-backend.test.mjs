@@ -289,20 +289,46 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
   assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
   const body = src.slice(start, end);
   // A FUNCTION, not a value: `getFreshObjectInfo` has not run when the options object is
-  // built, so which branch answered is only knowable afterwards. A snapshotted boolean
-  // would always read "live".
+  // built, so which branch answered is only knowable afterwards — and the lib may re-ask,
+  // which changes the answer. A snapshotted value would always read as the first call's.
   assert.match(
     body,
-    /schemaFromSnapshot:\s*\(\)\s*=>\s*setWidgetSchemaFromSnapshot !== null/,
-    "the executor must thread the LIVE-vs-snapshot fact it holds, as a deferred read",
+    /schemaProvenance:\s*\(\)\s*=>\s*setWidgetSchemaProvenance/,
+    "the executor must thread the schema provenance it holds, as a deferred read",
   );
-  // …and it must be the SAME variable that drives the reply's own `schema_source`
-  // disclosure. Two independent sources for one fact can disagree, and then the reply says
-  // "last-observed" about a write the fallback authorized as live (or the reverse).
+  // Every branch of the oracle must SET it, or an unassigned path silently keeps the
+  // previous call's verdict — which is the stale-evidence bug this exists to prevent,
+  // reintroduced one level up.
+  for (const [branch, pattern] of [
+    ["live vs cache", /setWidgetSchemaProvenance = observedAtEpoch !== null \? "live" : "cache"/],
+    ["snapshot", /setWidgetSchemaProvenance = "snapshot"/],
+    ["nothing established", /setWidgetSchemaProvenance = "none"/],
+  ]) {
+    assert.match(body, pattern, `the ${branch} branch must record its provenance`);
+  }
+  // "live" is gated on the SAME fact `objectInfoSnapshot.record` is gated on — the epoch
+  // captured INSIDE the cache loader, which only a call that actually issued the request
+  // ever sets. A cache hit or a joined read leaves it null.
+  assert.match(
+    body,
+    /observedAtEpoch = backendReconnectEpoch;[\s\S]*fetchWholeObjectInfo/,
+    "the epoch must be captured inside the cache loader, which runs only on a miss",
+  );
+  // …and the lib must be able to force a genuinely live re-read, or a cache hit could only
+  // ever fail closed — refusing writes 2..N of an ordinary burst.
+  assert.match(
+    body,
+    /invalidateObjectInfoCache:\s*\(\)\s*=>\s*objectInfoCache\.invalidate\(\)/,
+    "the executor must let the lib drop the burst cache before re-asking",
+  );
+  // The snapshot disclosure keeps its own STICKY variable: a write that consulted the
+  // snapshot at any point must keep reporting `schema_source`, even if a later re-ask came
+  // back live. Provenance answers "may this authorize?"; the note answers "what did this
+  // call touch?" — they are different questions and must not be collapsed.
   assert.match(
     body,
     /if \(setWidgetSchemaFromSnapshot !== null[\s\S]*schema_source: "last-observed"/,
-    "one variable must be the single source of truth for 'authorized from the snapshot'",
+    "the reply's snapshot disclosure must stay driven by its own sticky variable",
   );
 });
 

@@ -1939,15 +1939,16 @@ test("#1126 e2e: the unreadable acceptance is the LAST resort — a refreshable 
   assert.equal(res.option_list_unreadable, undefined, "nothing went unvalidated");
 });
 
-// ── #1223 × #1126: the "server declares it empty" evidence must be LIVE ──────────────
+// ── #1223/#716 × #1126: the "server declares it empty" evidence must be LIVE ──────────
 //
-// A cross-feature hole, opened by two changes that are each correct alone. #1223 (shipped
-// as v0.14.39) lets `getFreshObjectInfo` answer from the LAST-OBSERVED schema snapshot when
-// both live probes go silent. This fallback's second condition reads that answer as "the
-// SERVER declares this input's option list empty" — but a snapshot is what the server said
-// BEFORE it went quiet, retained across exactly the window in which nobody can re-fetch.
-// Options change without a reconnect (a model downloaded while this node's own callback
-// keeps failing), so a stale `[]` would newly authorize an unvalidated write.
+// A cross-feature hole, opened by changes that are each correct alone. #1223 (v0.14.39) lets
+// `getFreshObjectInfo` answer from the LAST-OBSERVED schema snapshot when both live probes go
+// silent; #716's burst cache lets it answer from a payload up to 1.5s old. This fallback's
+// second condition reads either answer as "the SERVER declares this input's option list
+// empty" — but both are what the server said BEFORE, retained across a window in which nobody
+// re-asked. Options change without a reconnect AND without a cache drop (a model downloaded
+// while this node's own callback keeps failing), so either stale `[]` would authorize an
+// unvalidated write. Same defect, two layers.
 
 const snapshotOpts = (reg, extra = {}) => ({
   registry: reg,
@@ -1966,26 +1967,106 @@ test("#1223 × #1126: a SNAPSHOT-sourced empty list does NOT authorize a blind w
     runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
       ...snapshotOpts(reg),
       // The oracle fell back: this schema is the last-observed one, not the server now.
-      schemaFromSnapshot: () => true,
+      // No cache to drop and no live answer to be had, so the re-ask cannot rescue it.
+      schemaProvenance: () => "snapshot",
     }),
     (err) =>
       /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\)/.test(err.message) &&
       /LAST-OBSERVED schema snapshot/.test(err.message) &&
       // It must name WHICH fact is missing. "Refresh and retry" is only actionable if the
       // caller knows it is the SCHEMA, not their value, that could not be established.
-      /not from the server answering now/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message) &&
       /Reconnect to ComfyUI/.test(err.message),
   );
   assert.equal(widget.value, "", "fails closed — no mutation on stale evidence");
 });
 
+test("#716 × #1126: a CACHE-HIT empty list does NOT authorize a blind write either", async () => {
+  // The layer below the snapshot, and the one a healthy backend actually hits: #716's burst
+  // cache answers writes 2..N of a burst without asking the server at all. "Not from a
+  // snapshot" is NOT the same as "live". Here the re-ask is impossible (no invalidator
+  // wired), so the fallback must fail closed rather than trust a payload nobody refreshed.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "cache",
+    }),
+    (err) =>
+      /burst cache \(#716\)/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message) &&
+      // Never blamed on the snapshot: naming the wrong layer sends the user to reconnect
+      // when all they had to do was wait out a 1.5s TTL.
+      !/LAST-OBSERVED schema snapshot/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — a cached [] is not the server answering");
+});
+
+test("#716 × #1126: a cache hit is RE-ASKED, and a live empty answer authorizes the write", async () => {
+  // Failing closed on every cache hit would refuse writes 2..N of an ordinary burst — the
+  // exact multi-widget case this fix exists to serve. So the fallback drops the cache and
+  // re-asks ONCE. The re-ask is what must flip the provenance; the write follows from that.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let invalidated = 0;
+  let provenance = "cache";
+  let fetches = 0;
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    getFreshObjectInfo: async () => {
+      fetches += 1;
+      // Only a call made AFTER the cache was dropped can be a live one.
+      if (invalidated > 0) provenance = "live";
+      return starObjectInfo([]);
+    },
+    schemaProvenance: () => provenance,
+    invalidateObjectInfoCache: () => {
+      invalidated += 1;
+    },
+  });
+  assert.equal(invalidated, 1, "the cache is dropped before the re-ask, exactly once");
+  assert.ok(fetches >= 2, "the oracle is genuinely re-asked, not merely re-read");
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true);
+});
+
+test("#716 × #1126: a re-ask that finds a REAL list refuses instead of writing blind", async () => {
+  // The hole the re-ask exists to find: the cached `[]` was stale and the server does publish
+  // a list for this input. Good provenance must not become permission to write past the very
+  // answer that was just fetched to check it.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let invalidated = 0;
+  let provenance = "cache";
+  const res = runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    getFreshObjectInfo: async () => {
+      if (invalidated > 0) {
+        provenance = "live";
+        // The model finished downloading while the node's own callback kept failing.
+        return starObjectInfo(["qwen3-vl:8b"]);
+      }
+      return starObjectInfo([]);
+    },
+    schemaProvenance: () => provenance,
+    invalidateObjectInfoCache: () => {
+      invalidated += 1;
+    },
+  });
+  await assert.rejects(
+    res,
+    (err) =>
+      /re-asking the server produced one that DOES publish a list/.test(err.message) &&
+      /panel_set_widget refused "model"/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no blind write against a list that exists after all");
+});
+
 test("#1223 × #1126: the SAME call writes when the schema was fetched LIVE", async () => {
-  // The other half: this must fail closed on a snapshot WITHOUT disabling the fallback for
-  // the live case it exists to serve. Only the provenance differs between the two tests.
+  // The other half: this must fail closed on stale evidence WITHOUT disabling the fallback
+  // for the live case it exists to serve. Only the provenance differs between the two tests.
   const { reg, node, widget } = unreadableComboFixture(THROWS);
   const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
     ...snapshotOpts(reg),
-    schemaFromSnapshot: () => false,
+    schemaProvenance: () => "live",
   });
   assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
   assert.equal(res.option_list_unreadable, true);
@@ -1993,20 +2074,52 @@ test("#1223 × #1126: the SAME call writes when the schema was fetched LIVE", as
 
 test("#1223 × #1126: UNKNOWN provenance fails closed — a throwing probe is not a live one", async () => {
   // A provenance probe that throws has established nothing, and "nothing established" must
-  // not read as "live". The default (no probe wired at all) is the pre-#1223 world, where
-  // the oracle had no snapshot branch to take, so it stays permissive — that is the case
-  // every other test on this ladder exercises.
+  // not read as "live". The default (no probe wired at all) is the pre-#716/#1223 world,
+  // where the oracle had neither a cache nor a snapshot branch to take and could only ever
+  // have fetched, so it stays permissive — that is the case every other test here exercises.
   const { reg, node, widget } = unreadableComboFixture(THROWS);
   await assert.rejects(
     runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
       ...snapshotOpts(reg),
-      schemaFromSnapshot: () => {
+      schemaProvenance: () => {
         throw new Error("provenance unknown");
       },
     }),
-    (err) => /LAST-OBSERVED schema snapshot/.test(err.message),
+    (err) => /provenance could not be established at all/.test(err.message),
   );
   assert.equal(widget.value, "", "no mutation when provenance could not be established");
+});
+
+test("#1126: a stateful callback that finally answers [] takes #507's acceptance, not a refusal", async () => {
+  // `options.values` is a callback and can answer differently per call. If it throws on the
+  // initial read and on the refreshed read but returns [] on the FINAL one, only the
+  // unreadable acceptance was enabled — so coercion fell through to #507's empty-list branch,
+  // raised a RETRYABLE emptyOptions rejection, and refused with "the server's option list may
+  // simply be stale, refreshing it before deciding" at the end of a ladder that had already
+  // refreshed it. By that point the LIVE server schema has ALREADY confirmed the list empty,
+  // which is #507's own precondition, so this is a valid transition being rejected.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let reads = 0;
+  widget.options.values = () => {
+    reads += 1;
+    // Throws for every read the ladder makes before the final write attempt.
+    if (reads < 3) throw new Error("ollama not reachable");
+    return [];
+  };
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => "live",
+  });
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`, "the write lands");
+  // Pins the ladder shape this test depends on: the list is UNREADABLE for the initial read
+  // and for the post-refresh retry — so the #1126 branch is the one reached — and answers []
+  // only on the final write attempt. If the ladder ever reads a different number of times,
+  // this fails loudly instead of quietly covering the #507 branch instead.
+  assert.equal(reads, 3, "throws on the initial read and the post-refresh retry, [] on the final write");
+  // Reported as what ACTUALLY admitted it, decided at coercion time — an empty list really
+  // was read on the attempt that counted, so this is #507's outcome and says so.
+  assert.equal(res.empty_option_list, true, "#507's acceptance, named as #507's");
+  assert.equal(res.option_list_unreadable, undefined, "not claimed as an unreadable-list write");
 });
 
 test("#1126 e2e: the reply note does not claim 'nothing checked it' when the RAIL did", async () => {

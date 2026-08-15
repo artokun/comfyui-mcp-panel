@@ -1184,10 +1184,20 @@ export function applyWidgetWrite(
   const innerObservation = emptyAccepted
     ? "the inner widget's option list is empty"
     : "the inner widget's option list could not be READ";
-  // #1126 — set when a mutated sibling's readable, non-empty list CONTAINS the value. Only
-  // meaningful on the unreadable path, where it narrows an otherwise-unqualified
+  // #1126 — set when the AUTHORITATIVE PARENT RAIL's readable, non-empty list contains the
+  // value. Only meaningful on the unreadable path, where it narrows an otherwise-unqualified
   // "nothing validated this" down to the truth.
-  let siblingValidated = false;
+  //
+  // Deliberately NOT "any sibling". A promotion can mutate two kinds of widget: the parent
+  // subgraph's RAIL — the one that SERIALIZES at queue time — and #477's display proxies,
+  // which are read-only mirrors the outer node shows. On a dual-projection promotion a
+  // display proxy can hold a list the rail does not, so a match there would emit
+  // `promoted_rail_validated` and make the reply and the activity summary both claim the
+  // serializing rail vouched for a value it never listed. On a change whose whole value is
+  // telling the truth about what was and was not validated, an overstated disclosure is
+  // worse than a missing one — a proxy match therefore stays silent and the write is
+  // reported as fully unvalidated, which is what it is as far as the rail is concerned.
+  let railValidated = false;
   if (emptyAccepted || unreadableAccepted) {
     let adoptedOption = false;
     // Each sibling's option list AS READ during admission. A STATEFUL non-function
@@ -1231,14 +1241,15 @@ export function applyWidgetWrite(
       }
       siblingSnapshots.push({ name: other.name, options: snapshot });
       if (otherOptions.includes(coerced)) {
-        // #1126 — a POSITIVE validation, recorded. This sibling's list WAS readable and
-        // WAS non-empty and DOES contain the value, so on the unreadable path the claim
-        // "nothing checked the value" stops being true: the target widget's own list could
-        // not be read, but the rail this write also mutates — the one that serializes at
-        // queue time — vouched for it. Reported as data so the reply and the activity
-        // summary can scope their disclosure to what was actually unchecked instead of
-        // asserting a blanket "unvalidated" the code itself contradicts.
-        siblingValidated = true;
+        // #1126 — a POSITIVE validation, recorded, but ONLY from the authoritative rail.
+        // Its list WAS readable and WAS non-empty and DOES contain the value, so on the
+        // unreadable path the claim "nothing checked the value" stops being true: the target
+        // widget's own list could not be read, but the widget that SERIALIZES at queue time
+        // vouched for it. A #477 display proxy matching proves nothing about what gets
+        // queued, so it is not recorded — see the declaration above. Reported as data so the
+        // reply and the activity summary can scope their disclosure to what was actually
+        // unchecked instead of asserting a blanket "unvalidated" the code itself contradicts.
+        if (other === parentWidget) railValidated = true;
         continue;
       }
       // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
@@ -1901,13 +1912,18 @@ export function applyWidgetWrite(
           // WHICH observation, verbatim from the read that decided it — so the reply
           // states the reason instead of a plausible-sounding default.
           option_list_unreadable_detail: coerceOutcome.unreadableObservation,
-          // #1126 — and whether a mutated sibling's real list nonetheless vouched for the
-          // value. Emitted only when it is TRUE, so a reader that does not know the field
-          // sees exactly what it saw before, and the disclosure never claims a check that
-          // did not happen. The cross-check above is what establishes it.
-          ...(siblingValidated ? { promoted_rail_validated: true } : {}),
+          // #1126 — and whether the AUTHORITATIVE parent rail's real list nonetheless
+          // vouched for the value. Emitted only when it is TRUE, so a reader that does not
+          // know the field sees exactly what it saw before, and the disclosure never claims
+          // a check that did not happen. The cross-check above is what establishes it, and
+          // only a match on the serializing rail counts — never a #477 display proxy.
+          ...(railValidated ? { promoted_rail_validated: true } : {}),
         }
       : {}),
+    // #507/#1126 — the empty-list acceptance is what admitted the value. Reported here so a
+    // caller reaching that acceptance from EITHER ladder branch sees one field with one
+    // name, rather than the #507 branch alone naming it at the runSetWidget level.
+    ...(coerceOutcome.emptyAcceptanceUsed ? { empty_option_list: true } : {}),
     ...(writeWarning
       ? {
           write_warning: writeWarning,

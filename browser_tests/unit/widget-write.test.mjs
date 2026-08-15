@@ -3529,6 +3529,50 @@ test("#1126: a rail that VALIDATED the value is reported as having done so — t
   assert.equal(outC.promoted_rail_validated, undefined, "no rail exists, so none validated anything");
 });
 
+test("#1126: a DISPLAY PROXY match does not claim the serializing RAIL validated the value", () => {
+  // #477: one host input can reference TWO authenticated widgets — the AUTHORITATIVE rail
+  // (`_widget`, what serializes at queue time) and a parent-facing DISPLAY proxy
+  // (`input.widget`, a read-only mirror). The cross-check walks both. If it credited ANY
+  // sibling match, a promotion whose rail list is empty but whose proxy list holds the value
+  // would emit promoted_rail_validated — and the reply and the activity summary would both
+  // say the serializing rail vouched for a value it never listed. Nothing that gets QUEUED
+  // was checked, so the honest disclosure is the unqualified one.
+  const inner = unreadableCombo("threw");
+  inner.name = "model";
+  const innerNode = { id: 301, type: "FbxRenderer", widgets: [inner] };
+  // Rail: readable but EMPTY ⇒ the cross-check skips it, so it validated nothing.
+  const rail = { name: "model_alias", type: "combo", options: { values: [] }, value: "" };
+  // Display proxy: readable, non-empty, and it DOES contain the value.
+  const proxy = { name: "model_alias", type: "combo", options: { values: ["b.fbx"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph: { _nodes: [innerNode], getNodeById: (id) => (String(id) === "301" ? innerNode : null) },
+    inputs: [{ name: "model_alias", _widget: rail, widget: proxy, _subgraphSlot: { name: "model_alias" } }],
+    // BOTH must be live members of node.widgets, or identity authentication rejects them.
+    widgets: [rail, proxy],
+  };
+  const out = applyWidgetWrite(parent, "model_alias", "b.fbx", {
+    ...ACCEPT_UNREADABLE,
+    resolveSource: (_n, si) =>
+      si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null,
+  });
+  // The write still lands and still syncs both projections — only the CLAIM is narrowed.
+  assert.equal(
+    out.promoted_from.display_widgets_synced,
+    1,
+    "the proxy is a real display projection, and was synced",
+  );
+  assert.equal(proxy.value, "b.fbx");
+  assert.equal(rail.value, "b.fbx");
+  assert.equal(out.option_list_unreadable, true);
+  assert.equal(
+    out.promoted_rail_validated,
+    undefined,
+    "a proxy match proves nothing about what gets queued — the rail listed nothing",
+  );
+});
+
 test("#1126: readComboOptions reports WHICH observation, and comboOptions is unchanged", () => {
   // The verdict callers act on is data, not a prose match. `comboOptions` keeps its
   // null-means-unreadable contract so every pre-existing caller is untouched.
