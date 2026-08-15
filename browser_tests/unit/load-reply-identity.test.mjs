@@ -118,6 +118,26 @@ test("#1478 the identity is published only when it is PROVABLY this load's", () 
   assert.match(helper, /provablyOurs\s*\?/, "and the uuid is only read on that branch");
 });
 
+test("#1478 the check and the reply are in ONE synchronous turn — no await between them", () => {
+  // The object-identity gate only proves anything if nothing can run between the check and
+  // the reply that carries its verdict. Insert a single `await` in that window and the
+  // guarantee silently inverts: the comparison passes for A, the event loop lets the user
+  // switch to B, and the reply — already blessed — ships A's uuid for what is now B's
+  // canvas. That is the identity embed/swap race this codebase keeps re-learning, and it
+  // leaves no trace in behaviour a source-shape test would otherwise catch.
+  //
+  // The other tests here pin WHAT is compared. This one pins that the comparison is still
+  // true when the value leaves.
+  const body = graphLoadBody();
+  const checkAt = body.indexOf("const liveNow");
+  assert.notEqual(checkAt, -1, "the identity read must still be recognisable");
+  const replyAt = body.indexOf("return {", checkAt);
+  assert.ok(replyAt > checkAt, "the reply must still follow the identity read");
+  const window = body.slice(checkAt, replyAt);
+  assert.doesNotMatch(window, /\bawait\b/, "no await may separate the check from the reply");
+  assert.doesNotMatch(window, /\.then\s*\(/, "and no deferred continuation either");
+});
+
 test("#1478 an unprovable load publishes NOTHING rather than a guess", () => {
   // A blank-canvas load mints a workflow this code holds no reference to, so nothing here
   // can prove which one is ours. Publishing the active one anyway is worse than publishing
