@@ -1344,13 +1344,22 @@ export function dialectServesTaskHistory(dialect) {
  * that on this build silence is not evidence either way. The live capture is
  * named because it is the one thing that CAN answer here, and its limit stated:
  * it only sees tasks that finished while this browser tab was open.
+ *
+ * THREE causes, not two. An UNKNOWN dialect (detection failed) must not borrow
+ * 3.x's explanation: "this build keeps no history" is a claim about a build we
+ * did not identify, and asserting the mechanism we happen to have written about
+ * is how a plausible sentence becomes a false one. It gets its own arm.
  */
 export function taskHistoryBlindNote(dialect) {
-  const cause = dialectServesTaskHistory(dialect)
-    ? "this Manager's per-task history could not be read just now (a transient error, or a " +
-      "response this panel did not recognise)"
-    : "this ComfyUI-Manager build keeps NO readable per-task history (released 3.x deletes each " +
-      "task's result the moment the queue drains)";
+  const cause =
+    dialect === undefined || dialect === null || dialect === ""
+      ? "this panel could not determine which ComfyUI-Manager generation is running, so it " +
+        "cannot say whether a per-task record even exists here"
+      : dialectServesTaskHistory(dialect)
+        ? "this Manager's per-task history could not be read just now (a transient error, or a " +
+          "response this panel did not recognise)"
+        : "this ComfyUI-Manager build keeps NO readable per-task history (released 3.x deletes " +
+          "each task's result the moment the queue drains)";
   return (
     `NOTE — A FAILED TASK MAY NOT BE VISIBLE HERE: ${cause}. Any failure listed above was ` +
     `captured live from the Manager's completion broadcast, which this panel only hears for ` +

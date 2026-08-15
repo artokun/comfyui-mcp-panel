@@ -549,6 +549,10 @@ test("#1606: the blind note never asserts that anything failed", () => {
   }
   assert.match(taskHistoryBlindNote("legacy"), /deletes each task's result/);
   assert.match(taskHistoryBlindNote("v2"), /transient error/);
+  // An unknown dialect must not borrow 3.x's explanation — we did not identify
+  // the build, so we cannot state how it behaves.
+  assert.match(taskHistoryBlindNote(undefined), /could not determine which ComfyUI-Manager/);
+  assert.doesNotMatch(taskHistoryBlindNote(undefined), /deletes each task's result/);
   assert.equal(dialectServesTaskHistory("legacy"), false);
   assert.equal(dialectServesTaskHistory("v2-batch"), false);
   assert.equal(dialectServesTaskHistory("v2"), true);
