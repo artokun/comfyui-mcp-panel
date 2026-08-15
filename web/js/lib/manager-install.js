@@ -324,7 +324,39 @@ export function classifyInstallOutcome({
   listError = false,
   batchFailed,
   renameProne = false,
+  taskFailure = null,
 }) {
+  // #1539 — the Manager's OWN terminal verdict for the task we submitted (keyed
+  // by our ui_id) outranks every proxy below, and is checked before the
+  // not-drained early return: a terminal record is conclusive whether or not the
+  // queue has drained (a neighbouring task can keep it busy indefinitely).
+  //
+  // Everything below is a proxy — "the queue drained and the pack is not there".
+  // For a git URL those proxies can NEVER conclude failure, because renameProne
+  // suppresses the queueFailureSignal branch (a git pack may install under a
+  // directory the name-match cannot see, so absence is not proof). That is
+  // exactly the reported bug: v4 rejects an unlisted repo by REGISTRY LOOKUP —
+  // `Node '<name>@nightly' not found in [ManagerChannel.dev,
+  // ManagerDatabaseSource.cache]` — records the error, drains, and the install
+  // reported `queued: true, pending: true`. The record said "failed" the whole
+  // time; nothing read it.
+  if (taskFailure) {
+    return {
+      state: "failed",
+      status,
+      message:
+        `"${target}" install FAILED: the ComfyUI-Manager task terminated with an error` +
+        (dialect ? ` (dialect ${dialect})` : "") +
+        `: ${taskFailure}. The install did NOT complete — check the ComfyUI server log ` +
+        `for the full traceback.` +
+        // The registry-miss case has a specific, verified way forward (#920), and
+        // it is worth far more HERE than on a later poll: this is the reply to the
+        // install call itself, so the caller learns it without having to know to
+        // ask again. Empty for every other failure.
+        unlistedGitUrlAdvice(taskFailure),
+    };
+  }
+
   const drained = queueDrained(status);
   const listReadable = !listError && isReadableInstalledList(installed);
 
