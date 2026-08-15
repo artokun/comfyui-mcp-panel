@@ -229,7 +229,45 @@ test("#1126: an ISSUED request that nothing retired is live", async () => {
   const c = clock();
   const cache = createObjectInfoCache({ now: c.now });
   const got = await cache.readWithProvenance(async () => DEFS, { stamp: () => 3 });
-  assert.deepEqual(got, { value: DEFS, provenance: "live" });
+  assert.equal(got.value, DEFS);
+  assert.equal(got.provenance, "live");
+  assert.equal(got.provenanceNow(), "live", "and still live when re-asked, nothing having moved");
+});
+
+test("#1126: a verdict EXPIRES — provenanceNow re-answers, it does not replay", async () => {
+  // The round-5 defect, and a different species from the four before it. Those asked "what
+  // KIND of response is this"; this asks "is that still TRUE". set-widget reads /object_info,
+  // then awaits a combo refresh and an upload probe, and only then decides — so a
+  // classification computed at delivery can expire mid-ladder while the stored string keeps
+  // insisting the answer is live.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let epoch = 1;
+  const got = await cache.readWithProvenance(async () => DEFS, { stamp: () => epoch });
+  assert.equal(got.provenance, "live", "live at the moment it was delivered");
+
+  // …a refresh/install/download lands while the caller is awaiting something else.
+  cache.invalidate();
+  assert.equal(got.provenance, "live", "the DELIVERED verdict is a historical fact and does not mutate");
+  assert.equal(got.provenanceNow(), "retired", "but asking again tells the truth about now");
+
+  // …and a reconnect is likewise visible only by re-asking.
+  const c2 = clock();
+  const cache2 = createObjectInfoCache({ now: c2.now });
+  let epoch2 = 1;
+  const got2 = await cache2.readWithProvenance(async () => DEFS, { stamp: () => epoch2 });
+  assert.equal(got2.provenanceNow(), "live");
+  epoch2 = 2;
+  assert.equal(got2.provenanceNow(), "reconnected");
+});
+
+test("#1126: a SERVED or JOINED read cannot become live later either", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  await cache.read(async () => DEFS);
+  const served = await cache.readWithProvenance(async () => DEFS, { stamp: () => 1 });
+  assert.equal(served.provenance, "cache");
+  assert.equal(served.provenanceNow(), "cache", "no later moment turns a TTL hit into the server answering");
 });
 
 test("#1126: a SERVED cache hit and a JOINED read are both 'cache' — neither asked the server", async () => {
@@ -311,6 +349,93 @@ test("#1126: a THROWING stamp establishes nothing — 'unknown', never live", as
   });
   assert.equal(got.value, DEFS);
   assert.equal(got.provenance, "unknown", "nothing established must not read as the server answering");
+});
+
+test("#1126: two concurrent readFresh callers COALESCE and neither retires the other", async () => {
+  // The bug this replaces: `invalidate()` + `read()` per caller. Two writes reaching the
+  // last-resort path together each invalidated; the second bumped the generation and retired
+  // the FIRST one's just-issued request, so a valid write was handed "retired" and refused —
+  // one caller breaking another. And nothing coalesced, so a burst meant one multi-megabyte
+  // /object_info per caller, which is the symptom #716 exists to prevent.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  await cache.read(async () => ({ Stale: {} })); // something in the store to bypass
+  let fetches = 0;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const loader = async () => {
+    fetches += 1;
+    await gate;
+    return DEFS;
+  };
+  const a = cache.readFresh(loader, { stamp: () => 7 });
+  const b = cache.readFresh(loader, { stamp: () => 7 });
+  release();
+  const [ra, rb] = [await a, await b];
+  assert.equal(fetches, 1, "one request for both — the burst does not multiply downloads");
+  assert.equal(ra.value, DEFS);
+  assert.equal(rb.value, DEFS);
+  assert.equal(ra.provenance, "live", "the issuer gets a live answer");
+  assert.equal(rb.provenance, "live", "and so does the joiner — it rode a forced read, not the TTL");
+});
+
+test("#1126: readFresh BYPASSES the stored entry without retiring anything in flight", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  // An ordinary read is in flight and must survive a concurrent forced reread untouched.
+  let releaseOrdinary;
+  const ordinaryGate = new Promise((r) => (releaseOrdinary = r));
+  const ordinary = cache.readWithProvenance(
+    async () => {
+      await ordinaryGate;
+      return { Ordinary: {} };
+    },
+    { stamp: () => 1 },
+  );
+  const forced = await cache.readFresh(async () => DEFS, { stamp: () => 1 });
+  assert.equal(forced.provenance, "live");
+  releaseOrdinary();
+  const got = await ordinary;
+  assert.deepEqual(got.value, { Ordinary: {} }, "its own caller still gets its answer");
+  assert.equal(
+    got.provenance,
+    "live",
+    "and it is NOT reported as retired — a forced reread is not an invalidation",
+  );
+});
+
+test("#1126: readFresh actually re-fetches — the stored entry never satisfies it", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  await cache.read(async () => ({ Stale: {} }));
+  assert.deepEqual(await cache.read(async () => DEFS), { Stale: {} }, "an ordinary read is served");
+  const forced = await cache.readFresh(async () => DEFS, { stamp: () => 1 });
+  assert.equal(forced.value, DEFS, "the forced read goes to the server anyway");
+  // …and the fresher payload replaces the stored one, so later ordinary readers benefit.
+  assert.equal(await cache.read(async () => ({ MustNotBeFetched: {} })), DEFS);
+});
+
+test("#1126: an invalidate() retires a forced reread too — it must not be joined afterwards", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let fetches = 0;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const first = cache.readFresh(
+    async () => {
+      fetches += 1;
+      await gate;
+      return { Old: {} };
+    },
+    { stamp: () => 1 },
+  );
+  cache.invalidate();
+  // A caller arriving after the invalidation must NOT ride the retired request.
+  const second = cache.readFresh(async () => DEFS, { stamp: () => 1 });
+  release();
+  assert.equal((await first).provenance, "retired", "the retired issuer is told so");
+  assert.equal((await second).value, DEFS, "the later caller gets its own, current answer");
+  assert.equal(fetches, 1, "…and the retired request was not re-run");
 });
 
 test("#1126: read() keeps its old contract — the payload, nothing else", async () => {

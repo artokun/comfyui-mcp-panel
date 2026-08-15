@@ -310,15 +310,24 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
     /objectInfoCache\.readWithProvenance\(/,
     "the executor must ask the cache for its verdict rather than infer one",
   );
+  // …and hold the QUESTION, not the answer. A verdict is a statement about a moment, and
+  // this ladder awaits a combo refresh and an upload probe between reading the schema and
+  // deciding — so a stored string can be superseded during those awaits while still
+  // insisting the answer is live. `provenanceNow` re-answers on every call.
   assert.match(
     body,
-    /provenance: readProvenance \} = await objectInfoCache\.readWithProvenance\(/,
-    "…and take the verdict from that call",
+    /provenanceNow,\s*\} = await readThroughCache\(/,
+    "…and take the re-askable verdict from that call",
   );
   assert.match(
     body,
-    /setWidgetSchemaProvenance = readProvenance;/,
-    "the threaded provenance must BE the cache's verdict, not a re-derivation of it",
+    /setWidgetSchemaProvenance = provenanceNow;/,
+    "the threaded provenance must be the cache's re-askable question, not a snapshot of it",
+  );
+  assert.match(
+    body,
+    /schemaProvenance: \(\) => setWidgetSchemaProvenance\(\)/,
+    "…and the lib must INVOKE it, so its read happens after the recovery awaits",
   );
   // The reconnect epoch is the one fact the cache cannot know, handed in as an opaque stamp
   // it re-checks across the await. Drop this and a reconnect-spanning response reads as live.
@@ -337,9 +346,10 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
     "the executor must not keep a second, hand-rolled liveness signal",
   );
   // The other two branches are the panel's own to report: the cache never sees them.
+  // Also as functions, so every branch answers the same shape of question.
   for (const [branch, pattern] of [
-    ["snapshot", /setWidgetSchemaProvenance = "snapshot"/],
-    ["nothing established", /setWidgetSchemaProvenance = "none"/],
+    ["snapshot", /setWidgetSchemaProvenance = \(\) => "snapshot"/],
+    ["nothing established", /setWidgetSchemaProvenance = \(\) => "none"/],
   ]) {
     assert.match(body, pattern, `the ${branch} branch must record its provenance`);
   }
@@ -353,11 +363,31 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
     "only a live answer may be filed as the last-observed schema",
   );
   // …and the lib must be able to force a genuinely live re-read, or a cache hit could only
-  // ever fail closed — refusing writes 2..N of an ordinary burst.
+  // ever fail closed — refusing writes 2..N of an ordinary burst. Through `readFresh`, NOT a
+  // global `invalidate()`: two writes reaching this path together each invalidated, and the
+  // second retired the first's just-issued request, so one caller refused another's valid
+  // write. `readFresh` bypasses only the stored entry and coalesces concurrent rereads.
   assert.match(
     body,
-    /invalidateObjectInfoCache:\s*\(\)\s*=>\s*objectInfoCache\.invalidate\(\)/,
-    "the executor must let the lib drop the burst cache before re-asking",
+    /refetchObjectInfoLive:[\s\S]{0,240}objectInfoCache\.readFresh\(/,
+    "the executor must offer a coalescing, non-retiring forced reread",
+  );
+  assert.doesNotMatch(
+    body,
+    /objectInfoCache\.invalidate\(\)/,
+    "…and must NOT reach for the global invalidation on the recovery path",
+  );
+  // Both entry points must share ONE oracle body, or the snapshot fallback, the failure-route
+  // bookkeeping and the provenance handling drift between the ordinary and forced reads.
+  assert.match(
+    body,
+    /getFreshObjectInfo: async \(\) =>\s*setWidgetOpts\.readObjectInfo\(/,
+    "the ordinary read must go through the shared oracle body",
+  );
+  assert.match(
+    body,
+    /refetchObjectInfoLive: async \(\) =>\s*setWidgetOpts\.readObjectInfo\(/,
+    "and so must the forced one",
   );
   // The snapshot disclosure keeps its own STICKY variable: a write that consulted the
   // snapshot at any point must keep reporting `schema_source`, even if a later re-ask came

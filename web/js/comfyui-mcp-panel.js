@@ -11967,7 +11967,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // Reassigned on every read — unlike `setWidgetSchemaFromSnapshot`, which is STICKY on
     // purpose: a write that consulted the snapshot at any point must keep disclosing that,
     // even if a later re-ask came back live.
-    let setWidgetSchemaProvenance = "none";
+    //
+    // Holds the QUESTION, not the answer: the cache's `provenanceNow`, re-evaluated at every
+    // call. Storing the delivered string was the round-5 defect — this ladder awaits a combo
+    // refresh and an upload probe between reading the schema and deciding, and a
+    // classification computed before those awaits can be superseded during them.
+    let setWidgetSchemaProvenance = () => "none";
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -12051,14 +12056,21 @@ const GRAPH_TOOL_EXECUTORS = {
     // installed pack is accepted on a single revalidation, while a genuinely
     // invalid value stays rejected against the FRESH list (#338/#317/#299/#288/
     // #284/#304, keeping #240 strictness).
-    const result = await runSetWidget(node, widget, value, {
+    // #1126 round-5 — bound to a name so the two cache entry points below can share the one
+    // oracle body (`readObjectInfo`) instead of each keeping a copy that would drift.
+    const setWidgetOpts = {
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
       // the stale LiteGraph registry, which keeps a positive for an uninstalled pack
       // after a restart-without-reload. Mirrors graph_add_node.
       getRegistry: () => LG?.registered_node_types ?? {},
-      getFreshObjectInfo: async () => {
+      // #1126 round-5 — ONE oracle body, entered two ways. `getFreshObjectInfo` reads through
+      // the burst cache normally; `refetchObjectInfoLive` forces a bypass for the last-resort
+      // path. Sharing the body is what keeps the snapshot fallback, the failure-route
+      // bookkeeping and the provenance handling identical between them — a second hand-rolled
+      // copy of this for the recovery path is how the two would drift.
+      readObjectInfo: async (readThroughCache) => {
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
@@ -12075,7 +12087,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // that retires requests and decides which of the three ways a read is answered, so it
         // is the only thing that can answer it; the reconnect epoch is handed in as an opaque
         // `stamp` it re-checks across the await without needing to know what it means.
-        const { value: outcome, provenance: readProvenance } = await objectInfoCache.readWithProvenance(
+        // #1126 round-5 — `provenanceNow` rather than the delivered string. A verdict is a
+        // statement about a MOMENT and this ladder does not decide at that moment: it reads
+        // the schema, then AWAITS a combo refresh and an upload probe, and only then reaches
+        // the blind-write path. A refresh, install, download, or reconnect during those awaits
+        // supersedes the answer while a stored "live" keeps insisting otherwise. Holding the
+        // QUESTION instead of the answer means the lib's own `schemaProvenance()` call — which
+        // happens after those awaits — re-asks and gets the truth about then.
+        const {
+          value: outcome,
+          provenance: readProvenance,
+          provenanceNow,
+        } = await readThroughCache(
           async () => {
             // #982 — TWO TRANSPORTS for the same question. The reporter's fence refused
             // for "object_info is unavailable" while `/object_info/VAELoader` answered on
@@ -12101,7 +12124,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // whether the answer it just handed back is the server speaking NOW ("live") or a
           // payload that was served, joined, reconnected out from under, or retired by an
           // `invalidate()` mid-flight. This file no longer re-derives any of that.
-          setWidgetSchemaProvenance = readProvenance;
+          setWidgetSchemaProvenance = provenanceNow;
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
           // above), so it is one #1223's fallback may hold — but ONLY if it is live.
           //
@@ -12137,7 +12160,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // and it was verified against a schema nobody could re-fetch — an agent that is
           // not told that cannot tell this apart from a fully live authorization.
           setWidgetSchemaFromSnapshot = objectInfoOracleFailureNote(oracleFailures);
-          setWidgetSchemaProvenance = "snapshot";
+          setWidgetSchemaProvenance = () => "snapshot";
           // NOT recorded into the ever-seen history: it is not a new observation of the
           // backend, it is the old one being re-read. Recording it would let a snapshot
           // keep its own types "ever seen" after the backend stopped defining them.
@@ -12149,9 +12172,19 @@ const GRAPH_TOOL_EXECUTORS = {
         // is #982's own defect (a refusal asserting something that did not happen) committed
         // by the code written to avoid it.
         snapshotIneligibility = fallback.reason;
-        setWidgetSchemaProvenance = "none";
+        setWidgetSchemaProvenance = () => "none";
         return recordObjectInfoTypes(defs);
       },
+      // The ORDINARY entry: read through the #716 burst cache.
+      getFreshObjectInfo: async () =>
+        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts)),
+      // #1126 — the LAST-RESORT entry: force a genuinely fresh read when the provenance is not
+      // live. `readFresh` bypasses only the stored entry and coalesces concurrent rereads, so
+      // two writes reaching this path together share one request instead of each globally
+      // invalidating — which used to retire the other's just-issued request and refuse a write
+      // that was perfectly valid.
+      refetchObjectInfoLive: async () =>
+        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
       // What the last oracle attempt observed, so a refusal can say which routes were
       // tried and what each one did instead of asserting an unreachable backend — then,
       // separately, why the last-observed schema could not stand in for them either.
@@ -12167,14 +12200,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // #1223/#716 × #1126 — hand the lib the PROVENANCE of the schema it is about to reason
       // from. A FUNCTION, because `getFreshObjectInfo` above has not run when this object is
       // built: which branch answered is only known afterwards, and the lib may re-ask.
-      schemaProvenance: () => setWidgetSchemaProvenance,
-      // #1126 — let the lib force a genuinely LIVE re-read on its last-resort blind-write
-      // path. Dropping the #716 burst cache is the only way to stop that cache answering the
-      // very question its own staleness put in doubt; the lib then re-calls
-      // `getFreshObjectInfo` above, which updates the provenance for that call. Safe to drop
-      // on suspicion — this cache's own contract says an invalidation costs a re-fetch and
-      // never correctness (a retired in-flight read still returns to whoever awaited it).
-      invalidateObjectInfoCache: () => objectInfoCache.invalidate(),
+      schemaProvenance: () => setWidgetSchemaProvenance(),
       resolveSource: sourceForSubgraphInput,
       canvas: app.canvas,
       beforeChange: () => graph.beforeChange(),
@@ -12244,7 +12270,8 @@ const GRAPH_TOOL_EXECUTORS = {
           return false;
         }
       },
-    });
+    };
+    const result = await runSetWidget(node, widget, value, setWidgetOpts);
 
     // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
     // missing asset (or an invalid value) to a valid one drops the missing-asset

@@ -448,12 +448,21 @@ test("#1223 a successful write authorized this way DISCLOSES it", () => {
 
 const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
-/** Balanced-brace extraction of the set_widget oracle, by the marker above its body. */
+/**
+ * Balanced-brace extraction of the set_widget oracle, by the marker above its body.
+ *
+ * #1126 round-5 renamed this from `getFreshObjectInfo` to `readObjectInfo(readThroughCache)`,
+ * because the ordinary read and the last-resort forced reread now enter ONE body through
+ * different cache methods. The property name is asserted rather than searched loosely: when
+ * it moved, `lastIndexOf` silently matched graph_add_node's own `getFreshObjectInfo` further
+ * up the file and these tests ran a different executor's oracle — green on the wrong code
+ * until it happened to reference an undefined binding.
+ */
 function extractSetWidgetOracle() {
   const anchor = PANEL_SRC.indexOf("// #716 — READ THROUGH THE BURST CACHE.");
   assert.notEqual(anchor, -1, "the set_widget oracle's marker comment moved");
-  const start = PANEL_SRC.lastIndexOf("getFreshObjectInfo: async () => {", anchor);
-  assert.notEqual(start, -1, "getFreshObjectInfo not found above its own marker");
+  const start = PANEL_SRC.lastIndexOf("readObjectInfo: async (readThroughCache) => {", anchor);
+  assert.notEqual(start, -1, "readObjectInfo not found above its own marker");
   const open = PANEL_SRC.indexOf("{", start);
   let depth = 0;
   for (let i = open; i < PANEL_SRC.length; i += 1) {
@@ -517,7 +526,12 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
        if (epochDuringFetch !== null) backendReconnectEpoch = epochDuringFetch;
        return pending;
      };
-     const getFreshObjectInfo = async () => ${body};
+     // The shipped body now takes the cache entry point, so the ordinary read and the
+     // last-resort forced reread share it. Driving it the way graph_set_widget's own
+     // getFreshObjectInfo does keeps this exercising production wiring, not a paraphrase.
+     const readObjectInfo = async (readThroughCache) => ${body};
+     const getFreshObjectInfo = async () =>
+       readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts));
      return {
        getFreshObjectInfo,
        setEpoch: (n) => { backendReconnectEpoch = n; },

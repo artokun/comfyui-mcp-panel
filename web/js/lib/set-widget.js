@@ -121,11 +121,14 @@ export async function runSetWidget(
     // have fetched. The panel threads the fact rather than letting this infer it — only the
     // oracle knows which branch answered.
     schemaProvenance,
-    // #1126 — drop the #716 burst cache so the NEXT `getFreshObjectInfo` call has to issue a
-    // real request. Its own capability rather than a bundled "refetch" helper, so the
-    // re-ask goes through the SAME oracle this function already holds and the provenance
-    // read afterwards describes exactly that call.
-    invalidateObjectInfoCache,
+    // #1126 — force a genuinely LIVE re-read on the last-resort blind-write path, bypassing
+    // the #716 burst cache. Deliberately NOT "invalidate, then re-read": that spelling is
+    // global, so two writes reaching this path together each retired the other's just-issued
+    // request (one caller refusing another's valid write), and nothing coalesced, so a burst
+    // paid for one multi-megabyte /object_info per caller. The capability now names the
+    // OUTCOME the ladder needs — a fresh answer — and leaves the cache to decide how to get
+    // one without disturbing anybody else.
+    refetchObjectInfoLive,
   } = {},
 ) {
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
@@ -820,9 +823,14 @@ export async function runSetWidget(
       // So: RE-ASK before deciding. This is the last resort on a rare path, and one request is
       // a far better trade than either refusing a legitimate write (which is what a cache hit
       // would cause for writes 2..N of an ordinary burst — the exact multi-widget case this
-      // fix exists to serve) or writing blind. The cache is dropped first so the re-ask cannot
-      // be answered by the very entry that made this uncertain, and it goes through the SAME
-      // oracle, so the provenance read afterwards describes that call.
+      // fix exists to serve) or writing blind. `refetchObjectInfoLive` bypasses only the stored
+      // entry and coalesces concurrent rereads, so it cannot be answered by the very entry that
+      // made this uncertain AND cannot retire another writer's in-flight request.
+      //
+      // READ HERE, not earlier. The provenance was established before `refreshCombos` and the
+      // upload probe were awaited, and both of those can supersede it — a refresh, an install,
+      // a download completing, a reconnect. A verdict is a statement about a moment, so it is
+      // asked at the moment it is used, on the near side of every await that could expire it.
       let provenance = readSchemaProvenance();
       let authDefs = freshDefs ?? undefined;
       // What the STALE evidence claimed, captured before it is replaced — the difference
@@ -831,14 +839,9 @@ export async function runSetWidget(
       // recovered after `authDefs` is overwritten.
       const staleDeclaredEmpty = serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput);
       let reAsked = false;
-      if (
-        provenance !== "live" &&
-        typeof invalidateObjectInfoCache === "function" &&
-        typeof getFreshObjectInfo === "function"
-      ) {
+      if (provenance !== "live" && typeof refetchObjectInfoLive === "function") {
         try {
-          invalidateObjectInfoCache();
-          const reread = await getFreshObjectInfo();
+          const reread = await refetchObjectInfoLive();
           if (reread) {
             authDefs = reread;
             reAsked = true;
@@ -993,10 +996,19 @@ export async function runSetWidget(
         throw new Error(
           `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
             `${latest.message} The schema that appeared to declare this input's option list ` +
-            `empty was not fetched live, and re-asking the server produced one that DOES ` +
-            `publish a list for it — so the valid set is knowable and a blind write is not ` +
-            `justified. Fix the node's option callback so the list can be read, or set a ` +
-            `value the server's list contains.`,
+            `empty was not fetched live, and the live re-read NO LONGER declares it empty — ` +
+            // What was actually observed is a NEGATIVE: `serverDeclaresEmptyComboOptions`
+            // returned false. That is true when the server publishes a real list, and equally
+            // true when the re-read does not describe this input (or this type) at all. Saying
+            // "the server DOES publish a list" picked one of those and asserted it as fact,
+            // which is the same over-claim this change exists to remove, committed by the
+            // message written to explain it. So the refusal states the observation and names
+            // the possibilities rather than choosing one.
+            `either it now publishes a real option list for this input, or it no longer ` +
+            `describes this input at all. Either way the premise for an unvalidated write ` +
+            `("the server itself says the valid set is empty") no longer holds. Refresh the ` +
+            `node definitions and retry, fix the node's option callback so the list can be ` +
+            `read, or set a value the server's list contains.`,
         );
       }
     }

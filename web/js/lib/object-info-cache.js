@@ -78,6 +78,12 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
   // referring to a binding that may not be initialized yet.
   let inflightId = 0;
   let requestSeq = 0;
+  // #1126 — the FORCED-reread slot, separate from `inflight` on purpose. A forced read must
+  // not be satisfiable by the ordinary slot (which may be serving a pre-bypass request), and
+  // ordinary reads must not be able to join a forced one and mistake it for their own. Holds
+  // `{ promise, issuedAt, id }` so a joiner can be classified against the generation the
+  // request it rides was actually issued under.
+  let freshInflight = null;
   // Bumped by every invalidation. A request carries the generation it was issued under and
   // is discarded if that no longer matches — which is what retires an in-flight fetch
   // rather than merely forgetting the value it will produce.
@@ -111,7 +117,7 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
   async function readInternal(fetchDefs, stamp) {
     const readStamp = typeof stamp === "function" ? stamp : null;
     // SERVED from the stored payload: nobody asked the server during this call.
-    if (value !== null && now() - at < ttlMs) return { value, provenance: "cache" };
+    if (value !== null && now() - at < ttlMs) return { value, ...notLive("cache") };
     // Join a concurrent miss — but ONLY one issued under the current generation. Without
     // that check an invalidation could be overtaken by the very request it was meant to
     // retire. Coalescing matters: a burst arriving faster than the fetch completes would
@@ -119,7 +125,7 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
     //
     // A JOINED read is "cache" for the same reason a served one is: this call did not issue
     // the request, so it cannot vouch for when it was issued or for what has happened since.
-    if (inflight && inflightGeneration === generation) return { value: await inflight, provenance: "cache" };
+    if (inflight && inflightGeneration === generation) return { value: await inflight, ...notLive("cache") };
     const issuedAt = generation;
     // Captured AT ISSUANCE, exactly like `issuedAt` above and for exactly the same reason.
     // A stamp that THROWS establishes nothing, and nothing established must not be allowed
@@ -204,19 +210,51 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
         stampUnreadable = true;
       }
     }
-    // Order matters. A reconnect is the more specific and more actionable event — the
-    // backend PROCESS was replaced, which is the one thing that changes what the server
-    // publishes — and it can also have bumped the generation on its way through, so it is
-    // reported in preference to the generic retirement it may have caused.
-    const provenance = stampUnreadable
-      ? "unknown"
-      : readStamp && currentStamp !== issuedStamp
-        ? "reconnected"
-        : issuedAt !== generation
-          ? "retired"
-          : "live";
-    return { value: resolved, provenance };
+    return { value: resolved, ...verdict(issuedAt, issuedStamp, readStamp, stampUnreadable) };
   }
+
+  /**
+   * The verdict, and a way to ask for it AGAIN later.
+   *
+   * `provenance` is the classification at delivery. `provenanceNow()` recomputes it from
+   * scratch on every call, and that difference is the point: a verdict is a statement about a
+   * MOMENT, and it expires. A consumer that reads /object_info, then awaits a combo refresh
+   * and an upload probe, and only then decides something — as set-widget's recovery ladder
+   * does — is holding a classification that was true when computed and need not be by the
+   * time it is used. Definitions can be refreshed, installed, or reconnected during those
+   * awaits, and every one of those moves state this function reads.
+   *
+   * Same lesson #1223 records for its snapshot: provenance describes the CONNECTION, not the
+   * bytes, so it has to be re-asked rather than remembered.
+   */
+  function verdict(issuedAt, issuedStamp, readStamp, stampUnreadableAtIssue) {
+    const classify = () => {
+      let stampUnreadable = stampUnreadableAtIssue;
+      let currentStamp = null;
+      if (readStamp && !stampUnreadable) {
+        try {
+          currentStamp = readStamp();
+        } catch {
+          stampUnreadable = true;
+        }
+      }
+      // Order matters. A reconnect is the more specific and more actionable event — the
+      // backend PROCESS was replaced, which is the one thing that changes what the server
+      // publishes — and it can also have bumped the generation on its way through, so it is
+      // reported in preference to the generic retirement it may have caused.
+      return stampUnreadable
+        ? "unknown"
+        : readStamp && currentStamp !== issuedStamp
+          ? "reconnected"
+          : issuedAt !== generation
+            ? "retired"
+            : "live";
+    };
+    return { provenance: classify(), provenanceNow: classify };
+  }
+
+  /** A served or joined read: not live now, and no later moment can make it so. */
+  const notLive = (why) => ({ provenance: why, provenanceNow: () => why });
 
   return {
     /**
@@ -234,6 +272,71 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
     },
 
     /**
+     * Force a genuinely fresh read: bypass the STORED ENTRY only, and coalesce concurrent
+     * forced rereads onto one request.
+     *
+     * This exists because the obvious spelling — `invalidate()` then `read()` — is wrong in
+     * two ways when more than one caller needs it at once, and #1126 hit both:
+     *
+     *   1. `invalidate()` is GLOBAL and retires everything in flight. Two writes reaching the
+     *      last-resort path together would each invalidate; the second one retires the FIRST
+     *      one's freshly issued request, so a perfectly valid write is handed "retired" and
+     *      refuses. One caller breaking another is not a cache policy.
+     *   2. Nothing coalesces, so a burst issues one multi-megabyte /object_info per caller —
+     *      the exact symptom #716 exists to prevent, reintroduced on the recovery path.
+     *
+     * So this drops the stored value WITHOUT touching the generation or the ordinary in-flight
+     * slot, and keeps its own slot that concurrent forced readers join. A joiner gets "live"
+     * rather than "cache" because the request it rides was issued by a forced read — it
+     * bypassed the TTL by construction, which is the very thing a joiner normally cannot
+     * vouch for. Its own stamp is still captured at join and re-checked at delivery, so a
+     * reconnect landing on ONE joiner is reported to that joiner alone.
+     */
+    async readFresh(fetchDefs, { stamp } = {}) {
+      const readStamp = typeof stamp === "function" ? stamp : null;
+      let issuedStamp = null;
+      let stampUnreadable = false;
+      if (readStamp) {
+        try {
+          issuedStamp = readStamp();
+        } catch {
+          stampUnreadable = true;
+        }
+      }
+      // Join a forced reread already running under the CURRENT generation. One issued under
+      // an older generation is retired and must not be joined — that is what `invalidate()`
+      // means, and this method deliberately does not weaken it.
+      let record = freshInflight && freshInflight.issuedAt === generation ? freshInflight : null;
+      if (!record) {
+        const issuedAt = generation;
+        const requestId = ++requestSeq;
+        const promise = (async () => {
+          // Yield first, for the same reason the ordinary path does: a synchronously throwing
+          // fetchDefs must not run the finally before the slot below is assigned.
+          await null;
+          try {
+            const defs = await fetchDefs();
+            const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
+            // A forced read produces the freshest payload there is, so it is stored for
+            // everyone — under the same still-current-generation and usable-payload guards
+            // the ordinary path applies, and never caching a failure.
+            if (issuedAt === generation && payload && typeof payload === "object" && Object.keys(payload).length > 0) {
+              value = Object.freeze(defs);
+              at = now();
+            }
+            return defs;
+          } finally {
+            if (freshInflight && freshInflight.id === requestId) freshInflight = null;
+          }
+        })();
+        record = { promise, issuedAt, id: requestId };
+        freshInflight = record;
+      }
+      const resolved = await record.promise;
+      return { value: resolved, ...verdict(record.issuedAt, issuedStamp, readStamp, stampUnreadable) };
+    },
+
+    /**
      * Drop the entry AND retire anything in flight — for anything that knows, or merely
      * suspects, that the schema may have changed.
      */
@@ -246,6 +349,10 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
       inflight = null;
       inflightGeneration = -1;
       inflightId = 0;
+      // The forced slot is retired by the same bump — a reread issued before an invalidation
+      // is exactly as superseded as an ordinary one, and leaving it joinable would let the
+      // recovery path hand out an answer this invalidation was raised to discard.
+      freshInflight = null;
     },
 
     /** Test/diagnostic view. Never used to make a decision. */

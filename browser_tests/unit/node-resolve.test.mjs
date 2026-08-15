@@ -2105,7 +2105,7 @@ test("#1126: a NESTED promotion is refused BEFORE any re-fetch is paid for", asy
   const mid = container("11111111-1111-4111-8111-111111111111", 301, midWidget, concrete, "302");
   const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
   const outer = container("22222222-2222-4222-8222-222222222222", 320, outerWidget, mid, "301");
-  let invalidated = 0;
+  let refetched = 0;
   let fetches = 0;
   await assert.rejects(
     runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
@@ -2123,14 +2123,17 @@ test("#1126: a NESTED promotion is refused BEFORE any re-fetch is paid for", asy
       },
       // A provenance that WOULD trigger the re-ask if the nested check did not come first.
       schemaProvenance: () => "cache",
-      invalidateObjectInfoCache: () => {
-        invalidated += 1;
+      // Wired for real, so the assertion below measures something. Stubbing a capability the
+      // lib no longer reads would make "it was never called" true by construction.
+      refetchObjectInfoLive: async () => {
+        refetched += 1;
+        return starObjectInfo([]);
       },
       ...HOOKS,
     }),
     (err) => /NESTED promotion/.test(err.message),
   );
-  assert.equal(invalidated, 0, "the burst cache is not dropped for a write that cannot succeed");
+  assert.equal(refetched, 0, "no forced reread is paid for a write that cannot succeed");
   assert.equal(fetches, 1, "only the ladder's own authorization fetch — no last-resort re-ask");
 });
 
@@ -2160,26 +2163,58 @@ test("#716 × #1126: a cache hit is RE-ASKED, and a live empty answer authorizes
   // exact multi-widget case this fix exists to serve. So the fallback drops the cache and
   // re-asks ONCE. The re-ask is what must flip the provenance; the write follows from that.
   const { reg, node, widget } = unreadableComboFixture(THROWS);
-  let invalidated = 0;
+  let refetched = 0;
   let provenance = "cache";
-  let fetches = 0;
   const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
     ...snapshotOpts(reg),
-    getFreshObjectInfo: async () => {
-      fetches += 1;
-      // Only a call made AFTER the cache was dropped can be a live one.
-      if (invalidated > 0) provenance = "live";
+    schemaProvenance: () => provenance,
+    // ONE capability naming the outcome the ladder needs, so the cache decides how to get a
+    // fresh answer without a global invalidation that would disturb concurrent writers.
+    refetchObjectInfoLive: async () => {
+      refetched += 1;
+      provenance = "live";
       return starObjectInfo([]);
     },
-    schemaProvenance: () => provenance,
-    invalidateObjectInfoCache: () => {
-      invalidated += 1;
-    },
   });
-  assert.equal(invalidated, 1, "the cache is dropped before the re-ask, exactly once");
-  assert.ok(fetches >= 2, "the oracle is genuinely re-asked, not merely re-read");
+  assert.equal(refetched, 1, "the forced reread happens exactly once");
   assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
   assert.equal(res.option_list_unreadable, true);
+});
+
+test("#1126: a verdict that EXPIRES during the recovery awaits does not authorize the write", async () => {
+  // Round-5's defect, and a different species from rounds 1-4. Those asked "what KIND of
+  // response is this"; this asks "is that still TRUE". The initial /object_info read is
+  // genuinely live — and then definitions change while `refreshCombos` and the upload probe
+  // are AWAITED. A stored "live" string keeps insisting otherwise, so the blind write is
+  // authorized from a schema that has since been superseded, bypassing a list that may have
+  // become non-empty in exactly that window.
+  //
+  // The panel therefore threads `provenanceNow`, a QUESTION rather than an answer, and the
+  // lib asks it after those awaits. Modelled here by a provenance that is live at the first
+  // read and retired by the time the ladder decides.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let refreshed = false;
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      // The refresh is what supersedes the schema — exactly what registerComfyNodeDefs does
+      // on an install, a download completing, or an explicit refresh.
+      refreshCombos: async (...args) => {
+        const out = refreshFromServer(...args);
+        refreshed = true;
+        return out;
+      },
+      // LIVE at delivery; RETIRED once the refresh above has run. Re-asked, this tells the
+      // truth; remembered, it does not.
+      schemaProvenance: () => (refreshed ? "retired" : "live"),
+      // No re-ask capability wired, so the ladder must fail closed rather than paper over it.
+    }),
+    (err) =>
+      /panel REFRESHED the node definitions while that \/object_info request was in flight/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(refreshed, true, "the recovery await really did run before the decision");
+  assert.equal(widget.value, "", "fails closed — the verdict had expired by the time it was used");
 });
 
 test("#716 × #1126: a re-ask that finds a REAL list refuses instead of writing blind", async () => {
@@ -2187,30 +2222,29 @@ test("#716 × #1126: a re-ask that finds a REAL list refuses instead of writing 
   // a list for this input. Good provenance must not become permission to write past the very
   // answer that was just fetched to check it.
   const { reg, node, widget } = unreadableComboFixture(THROWS);
-  let invalidated = 0;
   let provenance = "cache";
   const res = runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
     ...snapshotOpts(reg),
-    getFreshObjectInfo: async () => {
-      if (invalidated > 0) {
-        provenance = "live";
-        // The model finished downloading while the node's own callback kept failing.
-        return starObjectInfo(["qwen3-vl:8b"]);
-      }
-      return starObjectInfo([]);
-    },
     schemaProvenance: () => provenance,
-    invalidateObjectInfoCache: () => {
-      invalidated += 1;
+    refetchObjectInfoLive: async () => {
+      provenance = "live";
+      // The model finished downloading while the node's own callback kept failing.
+      return starObjectInfo(["qwen3-vl:8b"]);
     },
   });
   await assert.rejects(
     res,
     (err) =>
-      /re-asking the server produced one that DOES publish a list/.test(err.message) &&
+      /the live re-read NO LONGER declares it empty/.test(err.message) &&
+      // The refusal must state the OBSERVATION and name the possibilities, not pick one.
+      // `serverDeclaresEmptyComboOptions` returning false is equally true when the server
+      // publishes a real list and when it stops describing this input at all — asserting
+      // the first as fact is the same over-claim this PR exists to remove.
+      /either it now publishes a real option list for this input, or it no longer/.test(err.message) &&
+      !/produced one that DOES publish a list/.test(err.message) &&
       /panel_set_widget refused "model"/.test(err.message),
   );
-  assert.equal(widget.value, "", "no blind write against a list that exists after all");
+  assert.equal(widget.value, "", "no blind write once the premise no longer holds");
 });
 
 test("#1223 × #1126: the SAME call writes when the schema was fetched LIVE", async () => {
