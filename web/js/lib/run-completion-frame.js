@@ -30,12 +30,25 @@ import { withTimeout } from "./bounded-step.js";
  * prompt. Resolves to the frame that was sent (for tests), or null when the
  * batch was empty (no frame emitted).
  *
- * @param {{promptId:(string|null), images?:any[], videos?:any[], durationMs:(number|null)}} payload
+ * @param {{promptId:(string|null), images?:any[], videos?:any[], durationMs:(number|null),
+ *   finishedAt?:(number|null), reconciled?:boolean}} payload
+ *   `finishedAt` is epoch ms of the run's REAL finish; `reconciled` marks a
+ *   completion recovered from /history rather than observed live (#1199).
  * @param {object} deps  Injected presentation helpers (see call site).
  * @returns {Promise<object|null>}
  */
 export async function composeRunCompletionFrame(
-  { promptId, images = [], videos = [], durationMs, noMedia = false, duplicateOf = null, looksCached = false },
+  {
+    promptId,
+    images = [],
+    videos = [],
+    durationMs,
+    noMedia = false,
+    duplicateOf = null,
+    looksCached = false,
+    finishedAt: finishedAtMs = null,
+    reconciled = false,
+  },
   deps,
 ) {
   const {
@@ -76,16 +89,58 @@ export async function composeRunCompletionFrame(
 
   // One clock read for the whole run so stills and videos report the SAME
   // finished time (they're one completion).
-  const finishedAt = now();
-  const finishedClock = formatClock(finishedAt);
+  const composedAt = now();
+  // #1199 — report when the run REALLY finished whenever the tracker knows it.
+  // A reconciled completion is delivered minutes-to-DAYS after it rendered, so
+  // stamping the compose clock presented seven two-day-old videos as "finished
+  // 7:45:29 AM" — the same second, all of them. Only a plausible epoch is
+  // honoured (the tracker's live paths pass Date.now(); a relative test counter
+  // is not a wall clock), otherwise the compose clock still stands.
+  const realFinishedAt = epochToDate(finishedAtMs);
+  const finishedAt = realFinishedAt ?? composedAt;
+  // A bare time-of-day is half of why the #1199 burst read as fresh: every
+  // metaSuffix line ends "finished 7:45:29 AM", which for a render from two days
+  // earlier looks like this morning. When the completion is a RECOVERY, the
+  // bullets carry the full local date and time so the file's real age is legible
+  // on the line that names the file.
+  const finishedClock =
+    reconciled && realFinishedAt ? formatStamp(realFinishedAt) : formatClock(finishedAt);
   const duration = durationMs != null ? formatDuration(durationMs) : null;
+  // Age of the completion at the moment we present it. Known ONLY when the real
+  // finish time is — with an unknown finish time the age is unknown too, and is
+  // said to be rather than computed as zero (which would read as "just now", the
+  // very claim this fix exists to stop making).
+  const recoveredAgeMs = realFinishedAt ? msBetween(realFinishedAt, composedAt) : null;
+  // Machine-readable twin of the banner below, so a consumer can key the wording
+  // on a FIELD instead of matching prose (#1199 asked for the flag to reach the
+  // agent notification). The note states the same facts, because the note is the
+  // part guaranteed to reach the agent whatever the orchestrator does with
+  // metadata — the flag is the durable seam, the prose is the delivery.
+  const recoveryMetadata = () =>
+    reconciled
+      ? {
+          reconciled: true,
+          finishedAt: realFinishedAt ? realFinishedAt.toISOString() : null,
+          recoveredAgeMs,
+        }
+      : {};
 
   const outImages = []; // consolidated images for the single frame
   const noteSections = []; // note segments joined into the single note
-  // #986 — FIRST section, because it changes how everything after it should be read:
-  // this exact output has already been delivered under another prompt id. It is never
-  // a reason to withhold the completion (see completion-dedupe.js), only to say so.
+  // #1199 — FIRST section, ahead of even the duplicate notice, because it reframes
+  // the entire completion: this run did NOT just finish. Everything below (including
+  // "tell the user it's ready") has to be read as a late recovery, or the agent
+  // announces files that may have been moved, renamed or overwritten days ago.
+  if (reconciled) noteSections.push(recoveredCompletionNote(realFinishedAt, recoveredAgeMs));
+  // #986 — this exact output has already been delivered under another prompt id. It is
+  // never a reason to withhold the completion (see completion-dedupe.js), only to say so.
   if (duplicateOf) noteSections.push(duplicateCompletionNote(duplicateOf, looksCached));
+  // Sections pushed ABOVE are framing, not content: they say how to read a
+  // completion, never that one happened. The media-less check below must measure
+  // only what the segments contribute, or a banner alone would count as "something
+  // to say" and swallow the #356 no-media report — reachable for real, since the
+  // reconcile path sets `noMedia` and `reconciled` on the SAME payload.
+  const leadingSectionCount = noteSections.length;
   let metadata = [];
 
   // ── Stills segment ─────────────────────────────────────────────────────
@@ -163,20 +218,24 @@ export async function composeRunCompletionFrame(
   // arriving any other way still returns null, so the call site's existing
   // "empty batch ⇒ treat as delivered" contract is unchanged for every path that
   // relied on it.
-  if (!outImages.length && !noteSections.length) {
+  if (!outImages.length && noteSections.length <= leadingSectionCount) {
     if (!noMedia) return null;
     const took = durationMs != null ? ` in ${formatDuration(durationMs)}` : "";
     const frame = {
       type: "agent_event",
       kind: "executed",
       images: [],
-      note:
+      // Keep the framing banners (recovery / duplicate) ahead of the report —
+      // a recovered media-less run is still a recovered run.
+      note: [
+        ...noteSections,
         `The run you queued finished successfully${took}, and produced no image or ` +
-        "video output. This IS the completion you were told to wait for — nothing " +
-        "further is coming, so do not keep waiting for media. If this workflow was " +
-        "meant to save a file, no output node produced one; if its results are text " +
-        "or other non-media outputs, read them from the run's history entry.",
-      metadata: [{ outputs: "none", reason: "no_media" }],
+          "video output. This IS the completion you were told to wait for — nothing " +
+          "further is coming, so do not keep waiting for media. If this workflow was " +
+          "meant to save a file, no output node produced one; if its results are text " +
+          "or other non-media outputs, read them from the run's history entry.",
+      ].join("\n\n"),
+      metadata: [{ outputs: "none", reason: "no_media", ...recoveryMetadata() }],
       ...(promptId != null ? { prompt_id: promptId } : {}),
     };
     sendFrame(frame);
@@ -192,9 +251,95 @@ export async function composeRunCompletionFrame(
     // Machine-readable attribution: which prompt this completion belongs to, so
     // a delayed prior-run flush can never be mistaken for the current run (#224).
     ...(promptId != null ? { prompt_id: promptId } : {}),
+    // #1199 — top level, not only inside `metadata`: a video-only run produces NO
+    // per-output metadata entries (those are built from stills), and that is
+    // exactly the shape the reported burst arrived in. A marker that vanishes on
+    // the one path the bug was reported from is not a marker.
+    ...recoveryMetadata(),
   };
   sendFrame(frame);
   return frame;
+}
+
+// An epoch below this is not a wall clock — it is a relative counter (a test
+// harness clock, a duration, 0). Sep 2001; every real Date.now() clears it.
+const MIN_PLAUSIBLE_EPOCH_MS = 1_000_000_000_000;
+
+/** Epoch ms → Date, or null when the value isn't a plausible wall clock (#1199). */
+function epochToDate(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < MIN_PLAUSIBLE_EPOCH_MS) return null;
+  const date = new Date(ms);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+/** Non-negative ms between two Dates, or null if either can't be read. */
+function msBetween(from, to) {
+  const a = from?.getTime?.();
+  const b = to?.getTime?.();
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return Math.max(0, b - a);
+}
+
+/**
+ * Coarse age of a recovered completion, e.g. "2 days", "6 hours", "under a minute".
+ * Deliberately coarse: the point is the ORDER OF MAGNITUDE (is this minutes old or
+ * days old), and false precision on a recovered run would invite the agent to
+ * reason about a delay it cannot actually resolve that finely.
+ */
+function humanizeAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "under a minute";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+/** Absolute local date AND time — a bare time-of-day is what let a two-day-old
+ *  render read as "this morning" (#1199). */
+function formatStamp(date) {
+  try {
+    return date.toLocaleString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The leading note for a completion recovered from /history rather than observed
+ * live (#1199).
+ *
+ * The panel's "never lose a completion" reconcile is by design: a run whose
+ * terminal event was missed (tab asleep, bridge down, WS dropped) is replayed
+ * from ComfyUI's `/history` on the next reconcile edge. What was NOT by design is
+ * that the replay was indistinguishable from a fresh render — so a sweep that
+ * found seven prompts still pending from two nights earlier woke the agent seven
+ * times, each announcing a video "ready" whose file the user had long since moved
+ * out of the output directory.
+ *
+ * The note therefore leads with the recovery, states the real age, and explicitly
+ * withdraws the freshness claim the rest of the completion text still makes.
+ */
+function recoveredCompletionNote(realFinishedAt, ageMs) {
+  const age = humanizeAge(ageMs);
+  const stamp = realFinishedAt ? formatStamp(realFinishedAt) : null;
+  const when =
+    age && stamp
+      ? `It finished about ${age} ago (${stamp})`
+      : stamp
+        ? `It finished at ${stamp}`
+        : `The panel could not recover when it finished, so treat its age as unknown — possibly days`;
+  return (
+    `⏳ RECOVERED FROM HISTORY — this run did NOT just finish. ${when}, and the ` +
+    `completion is only reaching you now because the panel could not deliver it at ` +
+    `the time (tab asleep, bridge down, or the connection dropped). Do not announce ` +
+    `it as a fresh render: the output below may since have been moved, renamed, or ` +
+    `overwritten, and a file that no longer exists will still be named here. Say ` +
+    `plainly that this is a late completion for an earlier run, and confirm the file ` +
+    `is still there before telling the user it is ready.`
+  );
 }
 
 /**

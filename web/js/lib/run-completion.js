@@ -52,7 +52,11 @@ export const NO_PROMPT_KEY = "__no_prompt__";
 
 /**
  * @param {object} opts
- * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:number}) => void} opts.onFlush
+ * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:(number|null), reconciled?:boolean}) => void} opts.onFlush
+ *   `finishedAt` is epoch ms. On the LIVE paths it is the flush clock; on the
+ *   RECONCILED path (`reconciled:true`) it is the run's real execution_success
+ *   time recovered from /history, or **null** when that entry records none —
+ *   never the delivery time, which would present a stale replay as fresh (#1199).
  *   Called exactly once per completed prompt that buffered ≥1 image or video,
  *   with the FULL batch for that prompt_id, the correct start→finish duration,
  *   and the prompt_id (`key`/`promptId`) so the delivery can be attributed.
@@ -483,7 +487,9 @@ export function createRunCompletionTracker({
     if (delivered.has(k) || !pending.has(k)) return null;
 
     // parseHistoryEntry returns null for null/undefined/non-object entries.
-    const parsed = fetchThrew ? null : parseHistoryEntry(entry, { isVideo });
+    // `now` is threaded through so the future-skew rejection on the entry's own
+    // timestamps is measured against the SAME clock the tracker uses (#1199).
+    const parsed = fetchThrew ? null : parseHistoryEntry(entry, { isVideo, now });
 
     // ── NON-terminal outcomes (never deliver here; decide retry vs give-up) ──
     if (!parsed || !parsed.terminal) {
@@ -569,7 +575,28 @@ export function createRunCompletionTracker({
     // promise, so only that one is worth waking the agent for when it finished empty.
     const mediaLessQueued = !hasBatch && wasPanelQueued;
     if (hasBatch || mediaLessQueued) {
-      const durationMs = startTs != null ? now() - startTs : null;
+      // #1199 — a completion recovered from /history must report when the run
+      // REALLY finished, not when the recovery happened. `now()` here is the
+      // DELIVERY time: a reconcile edge (tab wake / reconnect) that swept seven
+      // days-old prompts stamped every one of them with the same second, so the
+      // agent announced long-since-moved files as "finished 7:45:29 AM". The
+      // entry's own execution_success message carries the truthful moment; null
+      // when this ComfyUI build records none, which the composer states as an
+      // unknown rather than papering over with its own clock.
+      const historyFinishedAt = parsed.finishedAt ?? null;
+      // Duration is derived ONLY from two truthful wall-clock endpoints. The old
+      // `now() - startTs` measured the RECONCILE GAP, not the render — for the
+      // #1199 burst it reads "rendered in 2 days". Prefer the entry's own
+      // start→success span; fall back to the start we OBSERVED only when a real
+      // finish time bounds it. With neither, the duration is genuinely unknown
+      // and is reported as unknown rather than invented (the #986 discipline:
+      // a duration the tracker made up is not evidence of anything).
+      const span = (from, to) =>
+        from != null && to != null && Number.isFinite(from) && Number.isFinite(to) && to >= from
+          ? to - from
+          : null;
+      const durationMs =
+        span(parsed.startedAt ?? null, historyFinishedAt) ?? span(startTs, historyFinishedAt);
       // Same async-delivery hold as flush(): the reconciled batch is composed and
       // sent by the caller, so it is not "delivered" until the caller says so.
       markDispatched(k);
@@ -586,7 +613,8 @@ export function createRunCompletionTracker({
         images: parsed.images,
         videos: parsed.videos,
         durationMs,
-        finishedAt: now(),
+        // Epoch ms of the REAL finish, or null when history records none (#1199).
+        finishedAt: historyFinishedAt,
         reconciled: true,
         ...(mediaLessQueued ? { noMedia: true } : {}),
       });
