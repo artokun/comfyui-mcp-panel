@@ -271,7 +271,8 @@ export function createBridgeOutageTracker({ now = () => Date.now() } = {}) {
     agentGone: () => agentGone,
     /** True while the bridge is down — the outage has begun but not yet ended.
      *  Read by the tests that pin the open/closed transitions; the panel decides on
-     *  outageMs() alone, so this stays a state ACCESSOR and never a second predicate. */
+     *  outageMs() and agentGone() (#1168), so this stays a state ACCESSOR and never a
+     *  predicate of its own. */
     isDown: () => startedAt !== null,
   };
 }
