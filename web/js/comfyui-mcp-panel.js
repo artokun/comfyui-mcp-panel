@@ -12066,7 +12066,31 @@ const GRAPH_TOOL_EXECUTORS = {
     // The classifier is keyed on node TYPE + the `lora_<n>` name shape + a lora-slot-shaped
     // VALUE, all three. That is what keeps it away from the deliberate refusal to auto-press
     // a control on an ordinary typo — see lib/rgthree-lora-row.js.
+    //
+    // ONE UNDO STEP, AND NO ROW LEFT BEHIND BY A REFUSED WRITE. Two review defects, both of
+    // them about the fact that creation must run BEFORE the write but is not the write:
+    //   - creation opened and closed its OWN beforeChange/afterChange, so a successful
+    //     command took TWO Ctrl+Z to undo and the first one left behind a default row that
+    //     had not existed before the command;
+    //   - `runSetWidget` can still refuse after the row exists (fresh /object_info says the
+    //     pack was removed, the slot's own fields fail validation, the workflow switched
+    //     during an await, the #240 read-back rolls the value back). The command then
+    //     reported failure over a CHANGED graph — the mutate-then-refuse contract the rest
+    //     of this file works to avoid, and each retry would add another row.
+    // So the transaction is opened HERE and closed once below, and a refused write takes the
+    // row back out inside it.
     let createdLoraRow = null;
+    let undoLoraRow = null;
+    // TRUE between OUR graph.beforeChange() and the single afterChange() that closes it. A
+    // separate flag rather than `createdLoraRow !== null` on purpose: a refused write CLEARS
+    // that name (the command created nothing, as far as any reader is concerned) while the
+    // transaction it opened is still open and must still be closed — exactly once. ComfyUI's
+    // ChangeTracker counts the pairs (`beforeChange(){this.changeCount++}` /
+    // `afterChange(){--this.changeCount||this.captureCanvasState()}`), so nesting is safe and
+    // collapses to one undo entry, but an EXTRA close drives the count to -1, which is
+    // TRUTHY: the capture never fires and the whole command disappears from undo history
+    // rather than merely splitting in two.
+    let loraRowTxnOpen = false;
     if (isRgthreeLoraRowCreation(node, widget, value)) {
       // The uuid fence brackets the mutation, as graph_remove_widget does: the user can
       // switch workflows during the awaits above, and a row must never be grown on a canvas
@@ -12075,11 +12099,23 @@ const GRAPH_TOOL_EXECUTORS = {
         cmd: "graph_set_widget",
         [WORKFLOW_UUID_FIELD]: workflow_uuid,
       });
-      createdLoraRow = createRgthreeLoraRow(node, widget, {
-        beforeChange: () => graph.beforeChange(),
-        afterChange: () => graph.afterChange(),
-        setDirty: () => graph.setDirtyCanvas(true, true),
-      }).created;
+      graph.beforeChange();
+      loraRowTxnOpen = true;
+      try {
+        const made = createRgthreeLoraRow(node, widget, {
+          // No brackets of its own: the envelope lives here now, and the write below has to
+          // land inside the same one. runSetWidget's own pair nests within it.
+          setDirty: () => graph.setDirtyCanvas(true, true),
+        });
+        createdLoraRow = made.created;
+        undoLoraRow = made.remove;
+      } catch (err) {
+        // Never leave the history transaction open on a refusal — and clear the flag FIRST,
+        // so nothing downstream can close it a second time.
+        loraRowTxnOpen = false;
+        graph.afterChange();
+        throw err;
+      }
     }
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
@@ -12095,7 +12131,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // #284/#304, keeping #240 strictness).
     // #1126 round-5 — bound to a name so the two cache entry points below can share the one
     // oracle body (`readObjectInfo`) instead of each keeping a copy that would drift.
-    const setWidgetOpts = {
+    //
+    // The options are HOISTED into a const so the call itself can sit inside the
+    // try/catch/finally below without re-indenting ~180 lines of unrelated option literal,
+    // and so the #757 transaction bookkeeping is readable AT the call rather than stranded
+    // past the end of a very long argument.
+    const setWidgetOptions = {
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
@@ -12214,14 +12255,14 @@ const GRAPH_TOOL_EXECUTORS = {
       },
       // The ORDINARY entry: read through the #716 burst cache.
       getFreshObjectInfo: async () =>
-        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts)),
+        setWidgetOptions.readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts)),
       // #1126 — the LAST-RESORT entry: force a genuinely fresh read when the provenance is not
       // live. `readFresh` bypasses only the stored entry and coalesces concurrent rereads, so
       // two writes reaching this path together share one request instead of each globally
       // invalidating — which used to retire the other's just-issued request and refuse a write
       // that was perfectly valid.
       refetchObjectInfoLive: async () =>
-        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
+        setWidgetOptions.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
       // What the last oracle attempt observed, so a refusal can say which routes were
       // tried and what each one did instead of asserting an unreachable backend — then,
       // separately, why the last-observed schema could not stand in for them either.
@@ -12308,7 +12349,46 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       },
     };
-    const result = await runSetWidget(node, widget, value, setWidgetOpts);
+    let result;
+    try {
+      result = await runSetWidget(node, widget, value, setWidgetOptions);
+    } catch (err) {
+      // #757 — A REFUSED WRITE MUST NOT LEAVE THE ROW BEHIND.
+      //
+      // The row had to be created before the write (the widget must exist for the ordinary
+      // path to resolve it), but the write can still refuse afterwards. Undoing it here is
+      // what keeps this command all-or-nothing.
+      //
+      // Removed INSIDE the still-open transaction — a catch runs before its finally — so the
+      // state ChangeTracker captures when the transaction closes is the state the command
+      // started from, and the failed attempt leaves no undo entry to step through either.
+      // `remove` also rewinds rgthree's row counter, so a refused write does not silently
+      // spend a row name (see lib/rgthree-lora-row.js: addNewLoraWidget increments BEFORE it
+      // names, and dropping the widget does not undo that).
+      if (undoLoraRow) {
+        try {
+          undoLoraRow();
+          graph.setDirtyCanvas(true, true);
+        } catch {
+          /* best-effort: never replace the refusal with an error about undoing it */
+        }
+        undoLoraRow = null;
+        // The caller is about to receive an exception, but clear the name anyway so no later
+        // reader can attribute a created row to a command that ended up creating none.
+        createdLoraRow = null;
+      }
+      throw err;
+    } finally {
+      // ONE UNDO STEP. The create and the assign both live in the transaction opened above,
+      // and it is closed here EXACTLY once — on success, on refusal, and not at all on the
+      // path where creation never ran (runSetWidget owns its own pair in that case). Its
+      // injected beforeChange/afterChange nest inside this one; ChangeTracker counts the
+      // pairs, so only this outermost close captures state.
+      if (loraRowTxnOpen) {
+        loraRowTxnOpen = false;
+        graph.afterChange();
+      }
+    }
 
     // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
     // missing asset (or an invalid value) to a valid one drops the missing-asset

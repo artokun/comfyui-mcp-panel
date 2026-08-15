@@ -24,7 +24,8 @@
  *
  *   1. the node TYPE is Power Lora Loader (rgthree);
  *   2. the requested name is `lora_<n>` and is ABSENT from the node;
- *   3. the VALUE is a lora-slot object the existing writer already accepts.
+ *   3. the VALUE is a lora-slot object the existing writer already accepts — read through
+ *      `slotValue`, because in production it arrives as a JSON STRING.
  *
  * A typo cannot satisfy all three, and `pressableWidgetHint` stays the answer for every
  * other node and every other missing name.
@@ -74,6 +75,34 @@ function widgetNames(node) {
 }
 
 /**
+ * The slot object a caller actually sent, or null.
+ *
+ * A LORA ROW ARRIVES AS A JSON STRING IN PRODUCTION, and missing that made the first version
+ * of this file DEAD CODE. `panel_set_widget` carries scalar values, and `coerceWidgetValue`
+ * is what turns the string into an object — at `widget-write.js:508-512`, well AFTER this
+ * classifier runs. So testing the raw argument with `isLoraSlotObject` answered "not a slot"
+ * for every real request: the route never fired and the reported refusal stood, while the
+ * unit tests passed because they handed in objects. That is the shape the tests chose, not
+ * the shape the tool sends.
+ *
+ * Parsed with the same tolerance the writer uses: a string that is not valid JSON, or that
+ * parses to something which is not a slot, is simply not a creation request. Nothing here
+ * widens what counts as a slot — `isLoraSlotObject` remains the only judge, and it is asked
+ * about the parsed value rather than about a string it would always reject.
+ */
+function slotValue(value) {
+  if (isLoraSlotObject(value)) return value;
+  if (typeof value !== "string") return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  return isLoraSlotObject(parsed) ? parsed : null;
+}
+
+/**
  * Should this write MINT a row first?
  *
  * Pure and total — it never throws and never mutates, so a caller can ask before it has
@@ -87,7 +116,7 @@ export function isRgthreeLoraRowCreation(node, widgetName, value) {
     // ABSENT only. An existing row is written by the ordinary path, which already handles
     // the composite merge — minting over it would duplicate the row.
     if (widgetNames(node).includes(widgetName)) return false;
-    return isLoraSlotObject(value);
+    return slotValue(value) !== null;
   } catch {
     return false; // an unreadable node is not one this route may mutate
   }
@@ -140,6 +169,9 @@ function restoreRowCounter(node, previous) {
 /** Drop a widget the node grew but that we are not keeping. Best-effort, never throws. */
 function removeCreatedRow(node, widget) {
   try {
+    // Nothing to remove is a successful no-op, not a call with a missing argument: a node's
+    // `removeWidget(undefined)` is pack code this file does not control.
+    if (!widget) return;
     if (typeof node.removeWidget === "function") node.removeWidget(widget);
     else {
       const i = (node.widgets ?? []).indexOf(widget);
@@ -153,9 +185,10 @@ function removeCreatedRow(node, widget) {
 /**
  * Create the requested `lora_N` row on an rgthree Power Lora Loader.
  *
- * Call ONLY when `isRgthreeLoraRowCreation` is true. Returns `{ created }` naming the row
- * that now exists; throws with an actionable message otherwise, having left the node as it
- * found it.
+ * Call ONLY when `isRgthreeLoraRowCreation` is true. Returns `{ created, remove }` — the name
+ * of the row that now exists, and the undo for it, which the caller MUST run if the write it
+ * made room for goes on to refuse. Throws with an actionable message otherwise, having left
+ * the node as it found it.
  */
 export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChange, setDirty } = {}) {
   // FEATURE-DETECT, and refuse loudly. A pack that renamed or dropped this method must
@@ -245,5 +278,42 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
   }
 
   setDirty?.();
-  return { created: widgetName };
+  // The row OBJECT, captured now — see `remove` below.
+  const createdWidget = (() => {
+    try {
+      return (node.widgets ?? []).find((w) => w?.name === widgetName) ?? null;
+    } catch {
+      return null;
+    }
+  })();
+  return {
+    created: widgetName,
+    /**
+     * Take this creation back out again.
+     *
+     * The caller needs it because creation has to happen BEFORE the value write (the widget
+     * must exist for the ordinary path to resolve it) while the write can still refuse
+     * afterwards. Reporting that refusal over a node this command had already GROWN is the
+     * mutate-then-refuse shape the panel works to avoid, and every retry would add a row.
+     *
+     * BY IDENTITY, not by name. Re-finding `lora_N` at undo time would remove whatever
+     * answers to that name then, which after an intervening `configure()` — rgthree re-mints
+     * rows from serialized order — is not necessarily the widget this call grew.
+     *
+     * BOTH HALVES, for the reason `restoreRowCounter` exists: `addNewLoraWidget` increments
+     * before it names, so dropping only the widget leaves the number spent and the next mint
+     * lands further along. Rewound only once the row is confirmed gone, never while the name
+     * is still held. Never throws — an undo running on an error path must not replace the
+     * refusal with an error about the undo.
+     */
+    remove: () => {
+      try {
+        removeCreatedRow(node, createdWidget);
+        const rowIsGone = !createdWidget || !(node.widgets ?? []).includes(createdWidget);
+        if (rowIsGone) restoreRowCounter(node, counterBefore);
+      } catch {
+        /* best-effort: the refusal this is undoing is the message that reaches the caller */
+      }
+    },
+  };
 }
