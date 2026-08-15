@@ -80,12 +80,6 @@ export async function runSetWidget(
     assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
-    // #1126 — the caller's per-call assertion that this combo accepts values its dropdown
-    // cannot enumerate (a custom node whose runtime handler takes an absolute path, whose
-    // enum is a convenience list or a bare placeholder). It ONLY converts a would-be
-    // off-list refusal into an unvalidated write, and only for a string; it can never
-    // pre-empt the authoritative recoveries above, and it is disclosed on the reply.
-    allowUnlisted = false,
   } = {},
 ) {
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
@@ -656,62 +650,88 @@ export async function runSetWidget(
       });
     }
 
-    // #1126 — the caller EXPLICITLY asserted this combo accepts values its dropdown
-    // cannot enumerate. Last, after every authoritative mechanism above, so the assertion
-    // can never pre-empt a refresh, an upload confirmation, or the server's own empty
-    // declaration — it only decides what would otherwise be a flat refusal.
+    // #1126 UNREADABLE OPTION LIST — the sibling of the #507 branch above, and decided
+    // the same way: from what the panel OBSERVED, never from a caller's assertion or a
+    // guess about the node.
     //
-    // It is an assertion and not an inference because inference was tried and was wrong:
-    // keying on "the server declares the list empty" broke three #507 invariants that are
-    // correct, since that same condition covers the combo whose own JS populates REAL
-    // options and where an off-list value is a typo worth refusing. See coerceWidgetValue.
-    if (latest?.offList && allowUnlisted) {
-      const set = write({ allowUnlistedComboValue: true });
+    // A dynamic combo's options come from `options.values(widget)`, which is the node's
+    // OWN callback: it can mutate the widget and it can fail. When it fails, nothing was
+    // ever compared to anything — yet the write was refused, and after the ladder gave up
+    // that refusal reached the user as a statement about their VALUE. A node whose runtime
+    // handler takes an absolute path had the path refused as though the path were wrong,
+    // and the only workaround left was copying the file into ComfyUI's input directory.
+    //
+    // The two conditions mirror #507's exactly, and both are observations:
+    //
+    //   1. The rejection really WAS the unreadable case (`err.unreadableOptions`, set
+    //      solely by that branch) — never a "not a valid option" miss against a list that
+    //      WAS read, which stays refused so a typo'd model name is still caught (#240).
+    //   2. The freshly-fetched /object_info does not publish a list for this input either
+    //      (serverDeclaresEmptyComboOptions). If the server DOES publish one, the valid
+    //      set is knowable after all and a blind write would be unjustified — the live
+    //      callback failing is not licence to ignore an authoritative list. Keyed on the
+    //      ULTIMATE CONCRETE type + concrete input name, exactly like the probes above.
+    //
+    // It runs LAST, so a merely-transient callback failure has already been re-read by the
+    // refresh and a server-confirmable upload asset already confirmed.
+    if (
+      latest?.unreadableOptions &&
+      serverDeclaresEmptyComboOptions(
+        freshDefs ?? undefined,
+        authTarget?.type,
+        concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+      )
+    ) {
+      let set;
+      try {
+        set = write({ acceptUnreadableComboOptions: true });
+      } catch (unreadableErr) {
+        // A validation refusal from THIS attempt (a non-string value, a rail whose own
+        // list is real and lacks the value) must arrive framed like every other refusal:
+        // with the tool name, the widget, and the node. Unframed, the retry the caller was
+        // invited to make answers `Value 640 is not a valid option…` with nothing saying
+        // where it came from. Anything that is not a validation refusal — a partial or
+        // rolled-back write — propagates UNCHANGED rather than being reworded.
+        if (unreadableErr instanceof WidgetWriteError) {
+          throw new Error(
+            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
+              `after finding the combo's option list unreadable: ${unreadableErr.message}`,
+          );
+        }
+        throw unreadableErr;
+      }
       return withWarning({
         set,
         ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
-        // The coercion-time verdict, never re-derived: with a stateful options function
-        // the retry can be admitted by ordinary membership after a list change, and
-        // claiming an unvalidated write then would be false.
-        ...(set?.off_list_value_accepted
+        // The COERCION-TIME verdict, never re-derived: a stateful options callback can
+        // succeed on the final attempt, and the value would then have been validated by
+        // ordinary membership — claiming an unchecked write there would be false.
+        ...(set?.option_list_unreadable
           ? {
-              off_list_value_accepted: true,
-              off_list_note:
-                `Written UNVALIDATED at your request: this value is not in the widget's dropdown, ` +
-                `and allow_unlisted told the panel the node accepts values the dropdown cannot ` +
-                `list (#1126). Nothing checked it — if the node rejects it at runtime that is the ` +
-                `node's answer, not a panel refusal to retry around. The graph now holds a value ` +
-                `no option list vouches for, so a later reader (including the ComfyUI dropdown ` +
-                `itself) may show it as out-of-range.`,
+              option_list_unreadable: true,
+              option_list_unreadable_note:
+                `Written WITHOUT validation because the option list could NOT BE READ — not ` +
+                `because the value was checked and passed. Observed on the widget: ` +
+                `${set.option_list_unreadable_detail ?? "its option list could not be READ"}. ` +
+                `The server's own /object_info declares this input's option list EMPTY, so the ` +
+                `valid set is not knowable from the panel and nothing compared your value to ` +
+                `anything (#1126). If the node rejects it at runtime that is the node's answer, ` +
+                `not a panel refusal to retry around. The graph now holds a value no option list ` +
+                `vouches for, so a later reader — including the ComfyUI dropdown itself — may ` +
+                `show it as out-of-range.`,
             }
           : {}),
       });
     }
 
-    // No recovery succeeded — refuse honestly with the freshest rejection.
-    //
-    // #1126 — an off-list refusal names `allow_unlisted`. Without this the escape is
-    // undiscoverable: the reporter's only visible options were the enumerated values, so
-    // they copied the file into ComfyUI's input directory to work around a node that
-    // already accepted their path. It is offered ONLY on the off-list case, and only as a
-    // branch with its condition stated — a node that genuinely has a closed option set
-    // must not be handed a way to write nonsense into it, and the message must not read as
-    // "retry with this flag" when the real answer is usually a value from the list.
+    // No recovery succeeded — refuse honestly with the freshest rejection. The rejection's
+    // own message says WHICH observation it rests on: a list that was read and does not
+    // contain the value, or a list that could not be read at all. Nothing is appended
+    // here suggesting a retry, because at this point there is no argument the caller can
+    // add that changes the answer — the decision is the panel's observation, not theirs.
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
-        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}` +
-        (latest?.offList && !allowUnlisted
-          ? ` If this node accepts values its dropdown cannot list — a file field whose enum is a ` +
-            `placeholder, or one whose runtime handler takes an absolute path — and your client ` +
-            `exposes an allow_unlisted option on panel_set_widget, set it to write this value ` +
-            `UNVALIDATED. Only do that when you know the node accepts it: nothing will check the ` +
-            `value, and for a combo with a genuinely closed option set the right fix is a value ` +
-            `from the list above. MEASURED: if your client answers "Unrecognized key: ` +
-            `allow_unlisted" it predates the option and CANNOT reach it however you phrase the ` +
-            `call — the orchestrator declares this tool with additionalProperties:false, so do ` +
-            `not retry variants. Copy the file into ComfyUI's input directory instead, or update ` +
-            `comfyui-mcp (#1126).`
-          : ""),
+        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}`,
     );
   }
 }

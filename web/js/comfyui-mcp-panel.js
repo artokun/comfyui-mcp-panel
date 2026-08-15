@@ -11940,7 +11940,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async graph_set_widget({ node_id, widget, value, allow_unlisted, workflow_uuid }) {
+  async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
@@ -12040,10 +12040,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // invalid value stays rejected against the FRESH list (#338/#317/#299/#288/
     // #284/#304, keeping #240 strictness).
     const result = await runSetWidget(node, widget, value, {
-      // #1126 — compared against `true` explicitly. This arrives over the bridge as
-      // caller JSON, and a truthy string ("false", "0") must never be read as the
-      // assertion that switches off a validation guard.
-      allowUnlisted: allow_unlisted === true,
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
@@ -21753,6 +21749,12 @@ function describeCommand(cmd, msg, reply) {
       // the callback programmatically and that alone can be why it threw.
       const writeDisclosed = typeof r.set?.write_warning === "string";
       const threwInNodeCallback = r.set?.write_warning_source === "widget_callback";
+      // #1126: the write landed because the combo's option list could NOT BE READ, so
+      // nothing validated it. The lib discloses that on the result, and the summary must
+      // carry it: rendered as a plain "Set …" success, the one line a user actually reads
+      // would say the panel checked a value it never compared to anything. Read as DATA
+      // (the field the lib sets on exactly that path), never pattern-matched from prose.
+      const unvalidatedUnreadable = r.option_list_unreadable === true;
       // One base clause for every variant, so a translated warning line can never drift
       // from the plain one — the disclosure is appended, exactly as the English did.
       const setLine = tr("panel.set_widget", "Set {widget} = {value} on node {node_id}", {
@@ -21775,9 +21777,15 @@ function describeCommand(cmd, msg, reply) {
             detail: wasPrevious,
           }
         : {
-            icon: writeDisclosed ? "pi-exclamation-triangle" : "pi-sliders-h",
+            icon: writeDisclosed || unvalidatedUnreadable ? "pi-exclamation-triangle" : "pi-sliders-h",
             text:
               setLine +
+              (unvalidatedUnreadable
+                ? tr(
+                    "panel.set_widget_option_list_unreadable",
+                    " — NOT validated: this combo's option list could not be read, so nothing checked the value",
+                  )
+                : "") +
               (writeDisclosed
                 ? threwInNodeCallback
                   ? tr(

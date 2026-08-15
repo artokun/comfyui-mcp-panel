@@ -1787,112 +1787,154 @@ test("#512: the flag does not authorize a provenance-bearing NON-container leaf"
   );
 });
 
-// ── #1126 e2e: the placeholder-only combo, through the real recovery ladder ──
+// ── #1126 e2e: a combo whose options CANNOT BE ENUMERATED, through the real ladder ──
+//
+// `options.values` is the node's own callback. When it throws, the panel has compared the
+// value to nothing — yet the ladder refused, and the refusal reached the user as a verdict
+// about their value. The decision below is made from the panel's OWN observation (the read
+// failed) confirmed against the server (it publishes no list for this input either), never
+// from an assertion the caller makes about the node.
 
-test("#1126 e2e: a placeholder-only combo refuses, and the refusal NAMES the escape", async () => {
-  // The reported shape: the live dropdown holds one option, "empty", and the SERVER
-  // publishes it too — so `serverDeclaresEmptyComboOptions` is FALSE and none of the
-  // authoritative recoveries can help. Without a named escape the reporter's only move
-  // was copying the file into ComfyUI's input dir, which is what #1126 is about.
-  const { reg, node, widget } = starNodesFixture(["empty"]);
-  await assert.rejects(
-    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
-      registry: reg,
-      getRegistry: () => reg,
-      getFreshObjectInfo: async () => starObjectInfo(["empty"]),
-      wasTypeEverDefined: () => true,
-      refreshCombos: refreshFromServer,
-      ...HOOKS,
-    }),
-    (err) =>
-      /not a valid option/.test(err.message) &&
-      /exposes an allow_unlisted option/.test(err.message) &&
-      // …and it must not read as "just retry with this": the condition is stated.
-      /Only do that when you know the node accepts it/.test(err.message) &&
-      // MEASURED against the live orchestrator (0.51.16): the tool is declared with
-      // additionalProperties:false, so a client that predates the option answers
-      // `-32602 Unrecognized key: allow_unlisted`. The refusal must say that outright,
-      // or it sends an agent into a retry loop against a schema that can never accept
-      // the argument — the #932 circularity in a new form.
-      /Unrecognized key/.test(err.message) &&
-      /do \r?\n?\s*not retry variants|do not retry variants/.test(err.message),
-  );
-  assert.equal(widget.value, "", "the refusal must not have mutated the widget");
-});
+/** The reported shape: a dynamic file combo whose populate callback fails. */
+function unreadableComboFixture(values) {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return { reg, node, widget };
+}
+const THROWS = () => {
+  throw new Error("the node's own populate() failed");
+};
 
-test("#1126 e2e: with allow_unlisted the path is written, and disclosed as unvalidated", async () => {
-  const { reg, node, widget } = starNodesFixture(["empty"]);
+test("#1126 e2e: an UNREADABLE option list writes the path and discloses that nothing checked it", async () => {
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
   const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
     registry: reg,
     getRegistry: () => reg,
-    getFreshObjectInfo: async () => starObjectInfo(["empty"]),
+    // The server publishes no list for this input either — so the valid set is not
+    // knowable from anywhere the panel can see.
+    getFreshObjectInfo: async () => starObjectInfo([]),
     wasTypeEverDefined: () => true,
     refreshCombos: refreshFromServer,
-    allowUnlisted: true,
     ...HOOKS,
   });
   assert.equal(res.set.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
   assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
-  assert.equal(res.off_list_value_accepted, true, "the caller must be told nothing checked it");
-  assert.match(res.off_list_note, /Written UNVALIDATED at your request/);
-  // It must NOT claim the empty-list path: that one means the server declared no options,
-  // which is a different (and stronger) statement than "the caller asserted it".
+  assert.equal(res.option_list_unreadable, true, "the caller must be told nothing validated it");
+  assert.match(res.option_list_unreadable_note, /could NOT BE READ/);
+  assert.match(res.option_list_unreadable_note, /not because the value was checked and passed/);
+  // The note states the OBSERVED reason rather than a plausible default: there are three
+  // distinct ones and only the read that decided it knows which.
+  assert.match(res.option_list_unreadable_note, /options\.values callback threw/);
+  assert.match(res.option_list_unreadable_note, /the node's own populate\(\) failed/);
+  assert.match(res.set.option_list_unreadable_detail, /callback threw/);
+  // It must NOT claim the empty-list path: "the server declared zero options" is a
+  // different observation, and reporting one as the other misdescribes the write.
   assert.equal(res.empty_option_list, undefined);
 });
 
-test("#1126 e2e: allow_unlisted never pre-empts the REFRESH — a stale list is fixed first", async () => {
-  // The assertion sits LAST in the ladder. A live list that is merely stale must still be
-  // refreshed and validated strictly, or the flag would quietly become "skip the refresh"
-  // and write an off-list value for a combo the server can perfectly well enumerate.
-  const { reg, node, widget } = starNodesFixture(["empty"]);
-  const res = await runSetWidget(node, "model", "llama3.2:3b", {
-    registry: reg,
-    getRegistry: () => reg,
-    // The server DOES publish a real list — the live "empty" was stale.
-    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
-    wasTypeEverDefined: () => true,
-    refreshCombos: refreshFromServer,
-    allowUnlisted: true,
-    ...HOOKS,
-  });
-  assert.equal(res.set.value, "llama3.2:3b");
-  assert.equal(widget.value, "llama3.2:3b");
-  assert.equal(
-    res.off_list_value_accepted,
-    undefined,
-    "the refreshed list validated it, so the assertion was never needed and must not be claimed",
-  );
+test("#1126 e2e: a failed live read is NOT licence to ignore a list the SERVER publishes", async () => {
+  // The second condition, and the one that keeps this from becoming "skip validation
+  // whenever the callback is flaky". /object_info publishes a real list for this input,
+  // so the valid set IS knowable from somewhere — and the panel does not get to write
+  // blindly just because the node's own callback failed.
+  //
+  // The refresh cannot repair this shape (refreshComboOptionsFromDefs deliberately never
+  // clobbers a FUNCTION option source — a dynamic list computes its own), so the write
+  // stays refused, exactly as it was before this change. That is the deliberate
+  // conservative edge: the panel refuses rather than validating against a server list the
+  // widget itself has not adopted. The refusal still says which observation it rests on.
+  for (const value of ["llama3.2:3b", "not-installed:70b"]) {
+    const { reg, node, widget } = unreadableComboFixture(THROWS);
+    await assert.rejects(
+      runSetWidget(node, "model", value, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+      (err) =>
+        /panel_set_widget refused "model" on node 9/.test(err.message) &&
+        /option list could not be READ/.test(err.message) &&
+        // Never a claim about the value: nothing was compared to anything.
+        !/is not a valid option/.test(err.message),
+      `a server-published list withholds the acceptance for ${value}`,
+    );
+    assert.equal(widget.value, "", "no mutation on the refusal");
+  }
 });
 
-test("#1126 e2e: allow_unlisted does NOT let a typo through on a real refreshed list", async () => {
-  // The other half of the same guarantee: the flag is the caller's claim about the NODE,
-  // not a licence to write anything. Here the server publishes a real list and the value
-  // is in neither it nor the live one — but the write is still permitted, because the
-  // caller asserted this node accepts unlisted values. What must be true is that it is
-  // DISCLOSED, so the success cannot be mistaken for a validated one.
-  const { reg, node } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
-  const res = await runSetWidget(node, "model", "not-installed:70b", {
-    registry: reg,
-    getRegistry: () => reg,
-    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
-    wasTypeEverDefined: () => true,
-    refreshCombos: refreshFromServer,
-    allowUnlisted: true,
-    ...HOOKS,
-  });
-  assert.equal(res.off_list_value_accepted, true, "an unvalidated write is always disclosed");
-  // …and without the flag the very same call is refused, which is #507's invariant.
-  const { reg: reg2, node: node2, widget: widget2 } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
+test("#1126 e2e: a list that WAS read still refuses an off-list value, framed and self-describing", async () => {
+  // The other direction, end to end. Nothing about the escape reaches a combo the panel
+  // could enumerate: the value is simply not one of the choices.
+  const { reg, node, widget } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
   await assert.rejects(
-    runSetWidget(node2, "model", "not-installed:70b", {
-      registry: reg2,
-      getRegistry: () => reg2,
+    runSetWidget(node, "model", "not-installed:70b", {
+      registry: reg,
+      getRegistry: () => reg,
       getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
       wasTypeEverDefined: () => true,
       refreshCombos: refreshFromServer,
       ...HOOKS,
     }),
-    (err) => /not a valid option/.test(err.message),
+    (err) =>
+      // The frame survives — tool, widget, node — so the refusal is attributable.
+      /panel_set_widget refused "model" on node 9/.test(err.message) &&
+      /is not a valid option/.test(err.message) &&
+      // …and it says WHICH of the two happened, so an agent does not read a rejected
+      // value as an unreadable list (or keep retrying a value that will never be valid).
+      /option list WAS read successfully/.test(err.message) &&
+      /rejected VALUE, not an unreadable list/.test(err.message),
   );
-  assert.equal(widget2.value, "", "no mutation on the unasserted refusal");
+  assert.equal(widget.value, "", "no mutation on the refusal");
+});
+
+test("#1126 e2e: an unreadable list REFUSES a non-string, and the refusal keeps its frame", async () => {
+  // The last-resort attempt can itself refuse (#240 keeps a number out of a combo whose
+  // real list exists but cannot be read). That refusal is raised inside the final write,
+  // outside the ladder's try/catch — so without explicit framing it would surface as a
+  // bare `Combo widget "model": …` with no tool, node, or widget attached.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", 640, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo([]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) =>
+      /panel_set_widget refused "model" on node 9/.test(err.message) &&
+      /option list unreadable/.test(err.message) &&
+      /NON-EMPTY STRING/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation");
+});
+
+test("#1126 e2e: the unreadable acceptance is the LAST resort — a refreshable list is fixed first", async () => {
+  // Ordering matters: if the acceptance ran before the authoritative refresh it would
+  // quietly become "skip validation whenever the callback is flaky", and a transient
+  // failure would write an off-list value into a combo the server can enumerate perfectly
+  // well. Here the callback fails once and the refresh replaces it with the server's list.
+  let calls = 0;
+  const flaky = () => {
+    calls += 1;
+    if (calls === 1) throw new Error("transient");
+    return ["qwen3-vl:8b", "llama3.2:3b"];
+  };
+  const { reg, node, widget } = unreadableComboFixture(flaky);
+  const res = await runSetWidget(node, "model", "llama3.2:3b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(widget.value, "llama3.2:3b");
+  assert.equal(res.refreshed, true, "the authoritative retry is what accepted it");
+  assert.equal(res.option_list_unreadable, undefined, "nothing went unvalidated");
 });

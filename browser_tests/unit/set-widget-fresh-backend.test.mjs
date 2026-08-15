@@ -222,9 +222,10 @@ for (const commandUuid of [undefined, "   "]) {
 
 test("#718 wiring: graph_set_widget passes the execution-time workflow fence into runSetWidget", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  // Located loosely, then the stamp is asserted separately below: pinning the exact
-  // destructuring made this fail on every added argument (#1126 added `allow_unlisted`),
-  // reporting "must accept the bridge-owned stamp" for a signature that still accepts it.
+  // Located loosely, then the stamp is asserted separately below. Pinning the exact
+  // destructuring made this fail on ANY added or removed argument and report "must accept
+  // the bridge-owned stamp" about a signature that still accepts it — a locator failure
+  // dressed up as a fence failure. The stamp itself is asserted, so nothing is lost.
   const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
   const end = src.indexOf("\n  graph_set_node_property(", start);
   assert.notEqual(start, -1, "graph_set_widget executor must exist");
@@ -240,6 +241,36 @@ test("#718 wiring: graph_set_widget passes the execution-time workflow fence int
     /assertTargetStillCurrent:\s*\(\)\s*=>\s*assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
     "the post-await write boundary must recheck the exact command stamp",
   );
+});
+
+test("#1126 wiring: the activity summary DISCLOSES a write nothing validated", () => {
+  // The lib sets `option_list_unreadable` when the combo's option list could not be read
+  // and the value was taken as written. If the summary ignores it, the one line a user
+  // actually reads renders an admittedly-unchecked write as an ordinary "Set … " success
+  // — which is the same class of lie #366 and #639 each had to fix here. Asserted against
+  // the SOURCE because this is a one-expression install in the renderer: deleting it would
+  // leave every behavioural test in this repo green.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf('case "graph_set_widget": {');
+  assert.notEqual(start, -1, "the graph_set_widget summary branch must exist");
+  const end = src.indexOf('case "graph_get_subgraph":', start);
+  assert.notEqual(end, -1, "the summary branch boundary must exist");
+  const branch = src.slice(start, end);
+  // Read as DATA off the result — never pattern-matched out of the disclosure prose,
+  // which is translated and would disarm a text predicate in 11 of 12 locales.
+  assert.match(
+    branch,
+    /r\.option_list_unreadable === true/,
+    "the summary must read the lib's field, not the note's wording",
+  );
+  // …and it must actually reach the rendered text, not merely be computed.
+  assert.match(
+    branch,
+    /unvalidatedUnreadable[\s\S]*tr\(\s*"panel\.set_widget_option_list_unreadable"/,
+    "the disclosure must be appended to the summary line",
+  );
+  // The warning icon, so it does not read as a clean success at a glance.
+  assert.match(branch, /writeDisclosed \|\| unvalidatedUnreadable \? "pi-exclamation-triangle"/);
 });
 
 test("#458 set_widget: REMOVED type (stale registry positive, absent from fresh object_info) ⇒ FAIL CLOSED, no mutation", async () => {

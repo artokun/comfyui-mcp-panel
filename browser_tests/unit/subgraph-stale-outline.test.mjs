@@ -28,8 +28,8 @@ function methodSource(name, args) {
 const createSource = methodSource("graph_create_subgraph", "\\{ node_ids \\}");
 const groupSource = methodSource("graph_subgraph_group", "\\{ group \\}");
 // Param list matched loosely on purpose: pinning the exact destructuring made this
-// locator fail on every added argument (#1126 added `allow_unlisted`), which reads as a
-// broken subgraph-staleness test and says nothing about staleness.
+// locator fail on any added or removed argument, which reads as a broken
+// subgraph-staleness test and says nothing about staleness.
 const setWidgetSource = methodSource("async graph_set_widget", "\\{[^}]*\\}");
 // Extract the actual helper through its unindented closing brace. Do not depend on
 // the following doc comment or on checkout line endings: Windows worktrees retain
