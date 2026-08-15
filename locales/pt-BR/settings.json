@@ -23,14 +23,6 @@
     "name": "Backend padrão do agente",
     "tooltip": "A qual agente em segundo plano o painel se conecta por padrão. O Claude roda na sua assinatura do Claude; o ChatGPT roda na sua conta do Codex (ChatGPT); o Gemini roda no seu login do Google (Gemini). Define o backend inicial do painel (e qual grupo abaixo alimenta o runtime); você ainda pode trocar ao vivo no seletor de modelos (a troca ao vivo vale só para a sessão e NÃO muda este padrão)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Conectar automaticamente ao carregar",
-    "tooltip": "Conecta o agente automaticamente (iniciando o orquestrador local) quando o painel abre, sem você clicar em Conectar. Desligado por padrão — fora isso, o orquestrador só é iniciado por um clique explícito em Conectar."
-  },
-  "comfyui-mcp_chatScope": {
-    "name": "Escopo das conversas",
-    "tooltip": "Painel: uma conversa acompanha todos os canvas. Workflow: cada workflow salvo tem o seu próprio conjunto persistente de conversas, identificado por um UUID embutido, então renomear preserva o histórico e as cópias ficam separadas. Perguntar: você escolhe se leva a conversa atual sempre que troca de workflow. Todos os modos sobrevivem a reinícios completos do ComfyUI/MCP."
-  },
   "comfyui-mcp_autostartMcp": {
     "name": "Iniciar MCP automaticamente",
     "tooltip": "Ao abrir este painel, pede ao inicializador auxiliar instalado explicitamente que abra um terminal executando o MCP caso ele ainda não esteja em execução."

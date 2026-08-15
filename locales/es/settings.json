@@ -23,14 +23,6 @@
     "name": "Backend del agente por defecto",
     "tooltip": "A qué agente en segundo plano se conecta el panel por defecto. Claude funciona con tu suscripción de Claude; ChatGPT, con tu cuenta de Codex (ChatGPT); Gemini, con tu inicio de sesión de Google (Gemini). Define el backend inicial del panel (y qué grupo de los de abajo alimenta el entorno de ejecución); aún puedes cambiarlo en caliente desde el selector de modelos (ese cambio dura solo la sesión y NO modifica este valor por defecto)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Conectar automáticamente al cargar",
-    "tooltip": "Conecta el agente automáticamente (iniciando el orquestador local) cuando se abre el panel, sin pulsar Conectar. Desactivado por defecto: de lo contrario, el orquestador solo se inicia con un clic explícito en Conectar."
-  },
-  "comfyui-mcp_chatScope": {
-    "name": "Ámbito de la conversación del chat",
-    "tooltip": "Panel: una sola conversación acompaña a todos los lienzos. Flujo de trabajo: cada flujo guardado tiene su propio conjunto persistente de chats, identificado por un UUID incrustado, de modo que renombrarlo conserva el historial y las copias se mantienen separadas. Preguntar: eliges si llevarte la conversación actual cada vez que cambias de flujo de trabajo. Todos los modos sobreviven a reinicios completos de ComfyUI/MCP."
-  },
   "comfyui-mcp_autostartMcp": {
     "name": "Iniciar MCP automáticamente",
     "tooltip": "Al abrir este panel, pide al iniciador complementario instalado explícitamente que abra un terminal con MCP si aún no se está ejecutando."

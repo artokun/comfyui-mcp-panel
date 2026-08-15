@@ -23,14 +23,6 @@
     "name": "Varsayılan ajan arka ucu",
     "tooltip": "Panelin varsayılan olarak hangi arka plan ajanına bağlanacağı. Claude, Claude aboneliğinizle çalışır; ChatGPT, Codex (ChatGPT) hesabınızla; Gemini, Google (Gemini) girişinizle. Panelin arka ucunu belirler (ve aşağıdaki hangi grubun çalışma zamanını belirleyeceğini); model seçiciden anlık olarak yine de geçiş yapabilirsiniz (anlık geçiş yalnızca o oturum içindir ve bu varsayılanı DEĞİŞTİRMEZ)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Açılışta otomatik bağlan",
-    "tooltip": "Panel açıldığında ajanı (yerel orkestratörü başlatarak) Bağlan'a tıklamadan otomatik bağlar. Varsayılan olarak kapalı — aksi hâlde orkestratör yalnızca açık bir Bağlan tıklamasıyla başlatılır."
-  },
-  "comfyui-mcp_chatScope": {
-    "name": "Sohbet konuşma kapsamı",
-    "tooltip": "Panel: tek bir konuşma her tuvali izler. İş akışı: kaydedilmiş her iş akışının kendi kalıcı sohbet kümesi olur; gömülü bir UUID ile tanındığı için yeniden adlandırmalar geçmişi korur, kopyalar ayrı kalır. Sor: iş akışı değiştirdiğinizde mevcut konuşmayı taşıyıp taşımayacağınızı her seferinde seçin. Tüm kipler ComfyUI/MCP yeniden başlatmalarından sağ çıkar."
-  },
   "comfyui-mcp_autostartMcp": {
     "name": "MCP'yi otomatik başlat",
     "tooltip": "Bu panel açıldığında MCP çalışmıyorsa, açıkça kurulmuş yardımcı başlatıcıdan MCP'yi çalıştıran bir terminal açmasını ister."

@@ -23,14 +23,6 @@
     "name": "Default agent backend",
     "tooltip": "Which background agent the panel connects to by default. Claude runs on your Claude subscription; ChatGPT runs on your Codex (ChatGPT) account; Gemini runs on your Google (Gemini) login. Seeds the panel's backend (and which group below seeds the runtime); you can still switch live in the model picker (a live switch is session-only and does NOT change this default)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Auto-connect on load",
-    "tooltip": "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. Off by default — the orchestrator is otherwise only started by an explicit Connect click."
-  },
-  "comfyui-mcp_chatScope": {
-    "name": "Chat conversation scope",
-    "tooltip": "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts."
-  },
   "comfyui-mcp_autostartMcp": {
     "name": "Autostart MCP",
     "tooltip": "When this panel opens, ask the explicitly installed companion launcher to open a terminal running MCP if it is not already running."
