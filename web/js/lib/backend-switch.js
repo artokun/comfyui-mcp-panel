@@ -25,6 +25,50 @@
 // 1.7MB panel IIFE is not possible, and an outcome-only test passes against the buggy order
 // just as happily as against the fixed one.
 
+// ---------------------------------------------------------------------------
+// mcp#884 — THE HANDOVER.
+//
+// The order above was built when a provider switch ALWAYS meant a fresh session:
+// destroy the outgoing session, replay the outgoing transcript into the incoming
+// provider, done. mcp#884/#897 changed the premise — each backend now keeps its
+// OWN durable conversation and its own orchestrator-keyed session — and the two
+// halves disagreed:
+//
+//   - the invalidate cleared the OUTGOING THREAD's sessionId, so switching back
+//     later sent `new_session` instead of resuming: the per-backend persistence
+//     this PR exists to add, defeated by its own switch path;
+//   - the replay armed the OUTGOING conversation's transcript before connecting,
+//     so it could be replayed into the INCOMING backend's own existing thread.
+//
+// Both are consequences of ONE question the switch never asked: what does the
+// incoming backend already have? `planBackendHandover` asks it once and derives
+// both, so the two can no longer drift apart.
+// ---------------------------------------------------------------------------
+
+/** What the outgoing session and the armed replay must do on a handover.
+ *
+ *  `replay`:
+ *   - "arm"   — the incoming backend has no conversation, so this really is a
+ *               fresh chat and the outgoing transcript rides in as one-shot
+ *               context (the long-standing, disclosed behaviour);
+ *   - "clear" — the incoming backend HAS its own conversation, which `loadThread`
+ *               will resume. The outgoing transcript must not ride into it, and
+ *               anything already armed must be dropped rather than left to be
+ *               consumed by the next message in the wrong conversation;
+ *   - "leave" — not a switch; nothing to decide.
+ *
+ *  `preserveOutgoingSession`: the outgoing THREAD keeps its sessionId so the
+ *  backend can be resumed when the user switches back. The TAB pointer is still
+ *  cleared either way — that is the thing that must not leak across backends.
+ */
+export function planBackendHandover({ switching, incomingHasConversation } = {}) {
+  if (!switching) return { preserveOutgoingSession: false, replay: "leave" };
+  return {
+    preserveOutgoingSession: true,
+    replay: incomingHasConversation ? "clear" : "arm",
+  };
+}
+
 /** What a switch did, for the caller's disclosure and for tests. */
 export const BACKEND_SWITCH = Object.freeze({
   SWITCHED: "switched",
@@ -46,7 +90,8 @@ export const BACKEND_SWITCH = Object.freeze({
  * @param {{
  *   liveBackend: () => string|null,   // `connectedBackend`, READ LATE (see below)
  *   pickedBackend: () => string|null, // `selectedBackend`
- *   invalidate: () => Promise<boolean>,
+ *   incomingHasConversation: (id: string) => boolean, // ask the STORE, not panel state
+ *   invalidate: (opts: {preserveThreadSession: boolean}) => Promise<boolean>,
  *   seedPrefs: (id: string) => void,
  *   commitSelection: (id: string) => void,
  *   endTurn: () => void,
@@ -61,6 +106,7 @@ export async function runBackendSwitch(id, effects) {
   const {
     liveBackend,
     pickedBackend,
+    incomingHasConversation,
     invalidate,
     seedPrefs,
     commitSelection,
@@ -80,11 +126,25 @@ export async function runBackendSwitch(id, effects) {
   // handshake landed underneath us.
   let landedOn = startedOn;
 
+  // Asked BEFORE anything is committed, and answered from the store rather than from
+  // panel state, so it is independent of `selectedBackend` moving underneath us.
+  const handover = planBackendHandover({
+    switching,
+    incomingHasConversation: switching ? incomingHasConversation(id) === true : false,
+  });
+
   if (switching) {
     // THE ONLY AWAIT BEFORE A COMMIT, and the non-switching path must never reach it: a
     // first connect and a re-pick of the live backend stay fully synchronous, so neither is
     // ever gated on the history store's health.
-    const invalidated = await invalidate();
+    //
+    // `preserveThreadSession` (mcp#884): the outgoing THREAD keeps its sessionId. The old
+    // unconditional clear was correct when a switch meant the session was gone; now the
+    // orchestrator keys sessions per backend, so the outgoing backend's session outlives
+    // this switch and its thread must keep pointing at it. The TAB pointer is still cleared.
+    const invalidated = await invalidate({
+      preserveThreadSession: handover.preserveOutgoingSession,
+    });
 
     // THE INVALIDATE IS DESTRUCTIVE BEFORE IT REPORTS, and an earlier version of this file
     // claimed the opposite. `invalidateDurableAgentSession` clears the session key, nulls
@@ -148,8 +208,17 @@ export async function runBackendSwitch(id, effects) {
     // there. Only the replay belongs here, and only when this is really still a switch:
     // arming a fresh-session preamble against a provider that already holds the
     // conversation is what shipped the whole transcript back to the backend that had it.
-    const replay = buildReplay();
-    if (replay) armContext(replay);
+    if (handover.replay === "arm") {
+      const replay = buildReplay();
+      if (replay) armContext(replay);
+    } else {
+      // The incoming backend HAS its own conversation; `loadThread` will resume it and
+      // arm its OWN replay if it needs one. Cleared rather than merely skipped: a context
+      // armed earlier in this tab would otherwise be consumed by the next user message,
+      // inside a conversation it does not belong to. `armContext(null)` is the clear —
+      // the client stores only a non-empty string.
+      armContext(null);
+    }
   }
 
   teardownAndConnect(id);

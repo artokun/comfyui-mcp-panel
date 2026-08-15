@@ -116,7 +116,10 @@ import {
   ChatHistoryStore,
   isThreadInScope,
   mergeHistorySnapshots,
+  panelScopeKeyForBackend,
+  resolvePanelPointer,
   retainBoundedThreads,
+  selectPanelThread,
   selectRestoreThread,
   selectThreadForScope,
   updateMetadataEntry,
@@ -3448,6 +3451,13 @@ const RELOAD_POST_TIMEOUT_MS = 10000;
 // resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
 // (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
 const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
+// A session reset (new_session) this tab OWED but could not dispatch — the user
+// deleted the active conversation while disconnected (gate round-3 finding 2:
+// the tombstone + pointer clear must propagate, but the backend would otherwise
+// stay in the deleted session). Stores the backend scope key the reset applies
+// to; fired on the next ready ack, and ONLY while the shared pointer is still
+// in the cleared state this tab left — any newer act supersedes and drops it.
+const PENDING_SESSION_RESET_KEY = "comfyui-mcp.panel.pendingSessionReset";
 // The OUTAGE the mid-task nudge weighs. A FAST reconnect (panel swap / WS blip;
 // orchestrator alive) vs a SLOW one (real ComfyUI restart; orchestrator died +
 // respawned) is how we tell a spurious bounce from a real one — only the slow case
@@ -3818,13 +3828,10 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 const SETTING_FLAG_APPS = "comfyui-mcp.featureFlag.apps";
 const SETTING_FLAG_TRAINING = "comfyui-mcp.featureFlag.training";
 const SETTING_FLAG_RUNPOD = "comfyui-mcp.featureFlag.runpod";
-// Session ownership: when TRUE (default), the conversation belongs to the PANEL
-// — switching/saving/renaming/creating workflows never swaps or resets the chat;
-// the agent just gets told (mechanically, on the next message) which canvas it's
-// now operating on. When FALSE, the legacy per-workflow behavior: each workflow
-// keeps its own thread + agent session and switching tabs switches conversations.
-const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
-const SETTING_CHAT_SCOPE = "comfyui-mcp.chatScope";
+// RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
+// boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
+// conversation is always panel-owned now; stored values under these ids are
+// ignored and must never be re-minted for anything else.
 const MOBILE_IOS_TESTFLIGHT_URL = "https://testflight.apple.com/join/ws65s4a2"; // beta-testers external group
 const MOBILE_ANDROID_FIREBASE_URL = "https://appdistribution.firebase.dev/i/27a5cccde72ffb42"; // beta testers group
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
@@ -3919,7 +3926,6 @@ const TOKEN_BUTTON_LABEL = {
 // (no-ops when the value already matches) so a setSetting→onChange echo can't loop.
 const panelHooks = {
   applyBackend: null, // (id)
-  applyChatScope: null, // ("panel"|"workflow"|"ask")
   applyModel: null, // (id)
   applyEffort: null, // (id|"")
   applyBridgeUrl: null, // (url)
@@ -4111,12 +4117,16 @@ async function applyPanelLocale(explicit) {
     return null;
   }
 }
-/** Conversation ownership. The legacy boolean remains a read-only migration
- *  source so existing users keep their chosen behavior. */
+/** Conversation ownership (mcp#884 — owner-stated invariant): the conversation
+ *  ALWAYS belongs to the panel. One agent session spans every workflow and every
+ *  tab; the orchestrator keys and persists it (in ~/.comfyui-mcp/sessions, since
+ *  mcp#897), so a workflow-scoped chat is a bug, never a mode. The old
+ *  "workflow"/"ask" scopes are retired — their stored setting values are ignored
+ *  (not migrated), and per-workflow threads created under them remain in
+ *  history, reachable through the history picker like any archived
+ *  conversation. */
 function chatScopeMode() {
-  const mode = getSetting(SETTING_CHAT_SCOPE);
-  if (mode === "panel" || mode === "workflow" || mode === "ask") return mode;
-  return getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel";
+  return "panel";
 }
 function setSetting(id, value) {
   try {
@@ -4696,29 +4706,10 @@ function panelSettingsList() {
         panelHooks.applyBackend?.(v);
       },
     },
-    {
-      id: SETTING_CHAT_SCOPE,
-      name: "Chat conversation scope",
-      get category() { return cat(tr("panel.general", "General"), "Chat conversation scope"); },
-      sortOrder: 146,
-      tooltip:
-        "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, " +
-        "identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the " +
-        "current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts.",
-      type: "combo",
-      get options() {
-        return [
-          { value: "panel", text: tr("panel.one_chat_across_workflows", "Panel — one chat across workflows") },
-          { value: "workflow", text: tr("panel.workflow_separate_chat_histories", "Workflow — separate chat histories") },
-          { value: "ask", text: tr("panel.ask_whenever_the_workflow_changes", "Ask whenever the workflow changes") },
-        ];
-      },
-      defaultValue: getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel",
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyChatScope?.(v);
-      },
-    },
+    // mcp#884 — the "Chat conversation scope" combo is retired: the conversation
+    // is ALWAYS panel-owned (one session across every workflow and tab, keyed and
+    // persisted by the orchestrator). chatScopeMode() is hard-wired to "panel";
+    // a stored "workflow"/"ask" value from an older build is simply ignored.
     {
       id: SETTING_AUTOCONNECT,
       name: "Auto-connect on load",
@@ -22489,6 +22480,7 @@ function buildPanel() {
       `Walk me through it for my OS: install the CLI (\`${meta.install}\`), sign in (\`${meta.login}\`), ` +
       `then in this panel pick ${meta.label} in the provider picker and click Connect. Give exact terminal commands.`;
     if (client.isConnected() && client.sendUserMessage(prompt)) {
+      pinTurnOwnerAtDispatch();
       appendSystem(tr("panel.asked_the_agent_to_help_you_set_up", "Asked the agent to help you set up {label}.", { label: meta.label }));
     } else {
       input.value = prompt;
@@ -24346,9 +24338,6 @@ function buildPanel() {
   let threads = localHistory.threads;
   let historyMeta = localHistory.meta;
   let thread = null; // created lazily on first recorded message
-  // In "ask" mode this is chosen at each workflow switch. The initial canvas
-  // behaves as per-workflow until there is actually a switch to ask about.
-  let askModeFollowsPanel = false;
 
   function nextHistoryRevision() {
     return historyStore.nextRevision(Math.max(Date.now(), Number(historyMeta?.updatedAt) + 1 || 0));
@@ -24372,12 +24361,21 @@ function buildPanel() {
   applyWorkflowAliasesFromHistory();
 
   function historyScopeFollowsPanel() {
-    const mode = chatScopeMode();
-    return mode === "panel" || (mode === "ask" && askModeFollowsPanel);
+    // Constant since mcp#884 (chatScopeMode() is hard-wired to "panel"). Kept as
+    // the named seam the remaining scope guards read, so they stay honest
+    // defense-in-depth instead of silently deleted invariants.
+    return chatScopeMode() === "panel";
   }
 
   function currentHistoryScopeKey({ embed = false } = {}) {
-    return historyScopeFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
+    if (!historyScopeFollowsPanel()) return workflowStorageKey({ embed });
+    // One conversation PER BACKEND (gate P0-2): the orchestrator keys its
+    // session orchestrator::<backend> (mcp#897), so the shared selection
+    // pointer carries the same axis — a Claude tab's selection must never move
+    // a Codex tab's conversation. The legacy shared "panel:global" key remains
+    // a read fallback inside resolvePanelPointer until this backend's key is
+    // first written.
+    return panelScopeKeyForBackend(connectedBackend || selectedBackend);
   }
 
   function setActiveThread(scopeKey, threadId, updatedAt = nextHistoryRevision()) {
@@ -24434,9 +24432,18 @@ function buildPanel() {
     });
   }
 
-  async function invalidateDurableAgentSession() {
+  async function invalidateDurableAgentSession({ preserveThreadSession = false } = {}) {
+    // The TAB pointer always goes: it is backend-agnostic, so leaving it set would let
+    // the NEXT backend adopt a session id belonging to the previous one.
     ssSet(SESSION_KEY, null);
-    if (thread) historyStore.reviseThread(thread, { sessionId: null });
+    // The THREAD's sessionId is a different claim (mcp#884/#897). Sessions are keyed
+    // orchestrator::<backend>, so on a BACKEND SWITCH the outgoing backend's session
+    // outlives this call and its conversation must keep pointing at it — otherwise
+    // switching back sends `new_session` and the per-backend persistence this branch
+    // adds is defeated by its own switch path. A restart/disconnect invalidate is the
+    // opposite case: that session is genuinely gone, so the pointer must be cleared or
+    // the next resume would name a session the orchestrator no longer has.
+    if (thread && !preserveThreadSession) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
     // #1171 — DELIBERATELY UNBOUNDED, after a bound was added here and removed again.
     //
@@ -24545,6 +24552,87 @@ function buildPanel() {
     return true;
   }
 
+  /** True when a live (or just-abandoned) turn belongs to a conversation other
+   *  than the one on screen. Every user-visible transcript output — says,
+   *  stream deltas, todo/plan updates, question cards, media, A2UI cards,
+   *  command activity — must consult this before painting or recording (gate
+   *  P0-4): an abandoned turn's card left interactive in the adopted
+   *  conversation is not "transient", it is a control the user can act on in
+   *  the wrong session. */
+  function turnOutputFenced() {
+    return Boolean(liveTurnThreadId) && (thread?.id ?? null) !== liveTurnThreadId;
+  }
+
+  /** Did another tab's write change what THIS tab has painted for the same
+   *  conversation? Length + tail id is deliberately coarse: it catches appended
+   *  turns (the cross-tab case that matters) without repainting on pure
+   *  metadata edits (rename/pin/todo). */
+  function transcriptChangedRemotely(before, after) {
+    const beforeMsgs = Array.isArray(before?.msgs) ? before.msgs : [];
+    const afterMsgs = Array.isArray(after?.msgs) ? after.msgs : [];
+    if (beforeMsgs.length !== afterMsgs.length) return true;
+    if (!beforeMsgs.length) return false;
+    return beforeMsgs[beforeMsgs.length - 1]?.id !== afterMsgs[afterMsgs.length - 1]?.id;
+  }
+
+  /** mcp#884/#897 — the agent session is orchestrator-global, so which
+   *  conversation a tab renders and records into is SHARED state, resolved by
+   *  selectPanelThread from the synced snapshot. A tab that kept its own thread
+   *  after the shared selection moved would file the user's next message under
+   *  a transcript the agent is no longer in (wrong-conversation rendering +
+   *  transcript mis-attribution). Adoption is deliberately PASSIVE: the tab the
+   *  user acted in already told the orchestrator (resume_session/new_session),
+   *  so a passive tab never sends session frames — N tabs echoing new_session
+   *  after one delete would reset (and could race) the single global session. */
+  function adoptSharedPanelSelection(currentThreadId) {
+    // Same dangling-pointer rule as selectRestoreThread: a pointer naming a
+    // thread that no longer exists says nothing about where the backend's
+    // session is, so a tab that still has its conversation keeps it instead of
+    // jumping to whatever merge recency would guess. The pointer is resolved
+    // under THIS tab's backend key (gate P0-2) — another backend's selection
+    // is that backend's conversation and never moves this tab.
+    const scopeKey = currentHistoryScopeKey();
+    const pointer = resolvePanelPointer(historyMeta, scopeKey);
+    const current = currentThreadId
+      ? threads.find((candidate) => candidate.id === currentThreadId)
+      : null;
+    const pointerDangling = pointer.activeId != null &&
+      !threads.some((candidate) => candidate.id === pointer.activeId);
+    const target = pointerDangling && current
+      ? current
+      : selectPanelThread(threads, historyMeta, { scopeKey });
+    if (target && target.id === currentThreadId) {
+      const before = thread;
+      rebindCurrentThreadRecord(target);
+      // Mirror remotely appended turns onto this tab's idle view. Never mid
+      // paint: a live local turn (streaming bubbles) or an unresolved live A2UI
+      // card would be orphaned by resetFeed, so those keep the rebind only.
+      if (!agentWorking && liveA2uiCards.size === 0 && transcriptChangedRemotely(before, target)) {
+        paintThread(target);
+        refreshContextRingForScope();
+      }
+      return;
+    }
+    if (!target && !currentThreadId) return; // nothing rendered, nothing selected
+    // The shared selection moved (or was cleared) in another tab — follow it.
+    endTurnLocally();
+    if (target) {
+      ssSet(CURRENT_THREAD_KEY, target.id);
+      // Provider-local ids only: never stage another provider's session for a
+      // later reload-resume (same rule as loadThread).
+      ssSet(SESSION_KEY, resumableSessionId(target));
+      paintThread(target);
+    } else {
+      thread = null;
+      ssSet(CURRENT_THREAD_KEY, null);
+      ssSet(SESSION_KEY, null);
+      turnAnchors = []; // fresh conversation view → no rewind anchors
+      resetFeed();
+      renderTodo([], { persist: false });
+    }
+    refreshContextRingForScope();
+  }
+
   const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
     const currentThreadId = thread?.id;
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
@@ -24553,16 +24641,7 @@ function buildPanel() {
     // any local-diff pass so a received tombstone cannot be echoed as a new set.
     applyWorkflowAliasesFromHistory();
     threads = capHistoryThreads(merged.threads, currentThreadId);
-    if (currentThreadId) {
-      const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
-      const followsPanel = historyScopeFollowsPanel();
-      if (refreshed && (followsPanel || isThreadInScope(refreshed, currentHistoryScopeKey()))) {
-        rebindCurrentThreadRecord(refreshed);
-      } else {
-        const scopeKey = followsPanel ? null : currentHistoryScopeKey();
-        detachInvalidCurrentThread({ scopeKey, rebind: !followsPanel });
-      }
-    }
+    adoptSharedPanelSelection(currentThreadId);
     if (!histPop.hidden) renderHistory();
   });
 
@@ -24618,6 +24697,25 @@ function buildPanel() {
   }
 
   function record(entry) {
+    // #381's turn-ownership rule, extended from usage frames to ALL agent-side
+    // records (codex P0 on mcp#884/#897): a live turn's output belongs to the
+    // conversation that OWNS the turn — pinned at user_message dispatch and
+    // again at turn:working, and READ here (through turnOutputFenced) but never
+    // written: interactive-card-fence.test.mjs pins that, because a record()
+    // that retroactively adopted the minted thread as owner would silently
+    // redefine #381's semantics and turn the card fence's provenance rule into
+    // dead code. If the shown conversation changed mid-turn — a history
+    // switch in this tab, or this tab passively adopting another tab's shared
+    // selection — agent output must not be filed under the conversation now on
+    // screen. It is DROPPED, not re-routed to its owner: the turn was
+    // abandoned exactly like an interrupt, and stamping its output into the
+    // owner thread NOW would hand that thread the newest conversation
+    // activity and yank the shared selection straight back (selectPanelThread
+    // recency). User-authored entries are exempt — they belong to the view
+    // the user typed into, by definition.
+    if (entry?.role !== "user" && turnOutputFenced()) {
+      return entry;
+    }
     const followsPanel = historyScopeFollowsPanel();
     // Panel-owned continuity uses a global active-thread pointer, but the thread
     // keeps the stable workflow UUID as provenance for archive grouping. Panel
@@ -24665,7 +24763,7 @@ function buildPanel() {
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = capHistoryThreads(threads, thread.id);
       ssSet(CURRENT_THREAD_KEY, thread.id);
-      setActiveThread(followsPanel ? "panel:global" : workflowKey, thread.id);
+      setActiveThread(currentHistoryScopeKey(), thread.id);
       // THIS is the only place a conversation is created. Record it so the
       // interactive-card fence can recognise the conversation an owner-less turn
       // minted for itself, and only that one (see lastMintedThreadId).
@@ -25524,7 +25622,8 @@ function buildPanel() {
     const reply = coerceMessageText(text);
     appendUser(reply, {});
     const ok = client?.sendUserMessage?.(reply);
-    if (!ok) appendSystem(tr("panel.card_reply_couldn_t_be_sent_agent", "Card reply couldn't be sent — agent disconnected."));
+    if (ok) pinTurnOwnerAtDispatch();
+    else appendSystem(tr("panel.card_reply_couldn_t_be_sent_agent", "Card reply couldn't be sent — agent disconnected."));
   }
 
   /**
@@ -26170,6 +26269,17 @@ function buildPanel() {
     }, DELIVERY_TIMEOUT_MS);
   }
 
+  /** Pin the coming turn's owner at DISPATCH time (gate P0-4). Waiting for
+   *  turn:working leaves a hole: an adoption's endTurnLocally() discards a
+   *  working frame that lands inside the stale-working window, so ownership
+   *  would stay null exactly when the transcript fences need it — and the
+   *  abandoned turn's output would flow into the adopted conversation. Any
+   *  successful user_message starts (or continues) a turn whose output belongs
+   *  to the conversation on screen at the moment of dispatch. */
+  function pinTurnOwnerAtDispatch() {
+    liveTurnThreadId = thread?.id ?? null;
+  }
+
   function trackSend(mid, statusEl, payload, raw, materialize) {
     // A `materialize` fn means this is a QUEUED send: nothing is painted inline yet;
     // it waits in the pending tray and `materialize()` paints it at the END of the
@@ -26185,7 +26295,12 @@ function buildPanel() {
     });
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
-    else armDeliveryTimeout(mid);
+    else {
+      armDeliveryTimeout(mid);
+      // A queued send joins the turn that already owns the pin; only an idle
+      // send opens the next turn.
+      if (!materialize) pinTurnOwnerAtDispatch();
+    }
     renderTray(); // surface it in the pending tray (not inline)
   }
 
@@ -26198,7 +26313,10 @@ function buildPanel() {
       setMsgStatus(mid, "queued");
       const ok = client.sendUserMessage(entry.payload.text, entry.payload.context, entry.payload.images, mid);
       if (!ok) setMsgStatus(mid, "failed");
-      else armDeliveryTimeout(mid);
+      else {
+        armDeliveryTimeout(mid);
+        if (!entry.materialize) pinTurnOwnerAtDispatch();
+      }
     } else {
       // requeue:true — this is SEND NOW, not a plain Stop: re-queue the turn the
       // agent was interrupted on so BOTH it and this queued message get answered.
@@ -26646,7 +26764,24 @@ function buildPanel() {
     // tab's point of view — clear agentWorking first so resetFeed() below won't
     // rebuild a working indicator onto the fresh, empty chat.
     endTurnLocally();
-    setActiveThread(currentHistoryScopeKey(), null);
+    // THE COMMIT IS THE TRANSITION (gate P0-1, same rule as loadThread): tell
+    // the orchestrator to forget the session FIRST, and publish the shared
+    // pointer clear only when that frame actually left. A disconnected tab
+    // still gets its fresh local view, but the backend's conversation — and
+    // therefore every other tab's — is unchanged until a transition really
+    // happens (the next recorded message republishes the selection).
+    const dispatched = notifyBackend
+      ? client?.sendFrame?.({ type: "new_session" }) === true
+      : false;
+    if (dispatched) ssSet(PENDING_SESSION_RESET_KEY, null); // transition delivered
+    else if (notifyBackend) {
+      // Couldn't reach the orchestrator: this tab still OWES the reset (it may
+      // have just deleted the active conversation — the tombstone and pointer
+      // clear propagate regardless). Queue it for the next ready ack; the
+      // pointer-state guard there drops it if anything newer happened first.
+      ssSet(PENDING_SESSION_RESET_KEY, currentHistoryScopeKey());
+    }
+    if (dispatched || !notifyBackend) setActiveThread(currentHistoryScopeKey(), null);
     thread = null;
     turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
@@ -26660,9 +26795,6 @@ function buildPanel() {
     setContextPct(0);
     ctxLabel.textContent = "—";
     persistThreads();
-    // Tell the orchestrator to forget this tab's session so the NEXT message
-    // starts a genuinely fresh agent (no memory of the prior conversation).
-    if (notifyBackend) client?.sendFrame?.({ type: "new_session" });
   }
 
   function paintThread(t) {
@@ -26733,23 +26865,37 @@ function buildPanel() {
       // with a bounded visible-transcript replay below.
       historyStore.reviseThread(t, { sessionId: null });
     }
+    // THE COMMIT IS THE TRANSITION (gate P0-1): dispatch the session frame
+    // FIRST, and publish the shared selection only when the frame actually
+    // left this socket. A disconnected tab still switches its OWN view —
+    // reading an archive offline is legitimate — but it must not move every
+    // other tab onto a conversation the backend never entered. (Two connected
+    // actors can still interleave: pointer revisions and socket delivery are
+    // ordered independently, and reconciling that needs the orchestrator to
+    // confirm transitions — mcp#897's side. This closes every panel-local
+    // failure mode: closed socket, missing route, send throw.)
+    const dispatched = sessionId
+      ? client?.sendFrame?.({ type: "resume_session", session_id: sessionId }) === true
+      : client?.sendFrame?.({ type: "new_session" }) === true;
+    // A delivered transition supersedes any reset this tab still owed.
+    if (dispatched) ssSet(PENDING_SESSION_RESET_KEY, null);
     ssSet(CURRENT_THREAD_KEY, t.id);
-    setActiveThread(followsPanel ? "panel:global" : (t.workflowKey || scopeKey), t.id);
+    // Resume this conversation's agent session (or start fresh if it has none),
+    // so typing continues THIS chat rather than whatever was last active.
+    ssSet(SESSION_KEY, sessionId);
+    if (dispatched) setActiveThread(currentHistoryScopeKey(), t.id);
     persistThreads();
     paintThread(t);
     // #381/codex-P2: `thread` is now `t`, so repaint the ring from THIS
     // conversation's own last-known fill (blank if none) — selecting an older
     // history entry in the same workflow must not keep the prior chat's usage.
     refreshContextRingForScope();
-    // Resume this conversation's agent session (or start fresh if it has none),
-    // so typing continues THIS chat rather than whatever was last active.
-    ssSet(SESSION_KEY, sessionId);
-    if (sessionId) client?.sendFrame?.({ type: "resume_session", session_id: sessionId });
-    else {
-      client?.sendFrame?.({ type: "new_session" });
+    if (!sessionId) {
       // Provider sessions can expire or be intentionally removed. A new backend
       // session receives a compact replay once, so continuing an archived chat
       // still has useful memory instead of only repainting bubbles locally.
+      // Armed even when the frame could not be sent: the replay context rides
+      // the next user message on whatever socket delivers it.
       armVisibleTranscriptReplay();
     }
     return true;
@@ -26779,22 +26925,6 @@ function buildPanel() {
     if (wfid === currentWorkflowId) return; // case 1: no change
 
     const initial = currentWorkflowId == null;
-    if (!initial && chatScopeMode() === "ask") {
-      const name = wf?.filename || wfkey || wfid;
-      // Two keys, not one: the OK/Cancel body is the same in both branches of every
-      // future scope prompt, and splitting it keeps the question (which interpolates a
-      // filename) apart from the fixed explanation of the two buttons.
-      askModeFollowsPanel = window.confirm(
-        tr("panel.continue_the_current_agent_panel_conversation_on", 'Continue the current Agent Panel conversation on "{name}"?', {
-          name,
-        }) +
-          "\n\n" +
-          tr(
-            "panel.ok_carry_this_chat_to_the_new",
-            "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
-          ),
-      );
-    }
     const followsPanel = historyScopeFollowsPanel();
 
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
@@ -26899,7 +27029,7 @@ function buildPanel() {
           workflowKey: workflowStorageKey(),
           workflowTitle: getWorkflowTitle(),
         }); // archive provenance
-        setActiveThread("panel:global", thread.id);
+        setActiveThread(currentHistoryScopeKey(), thread.id);
         persistThreads();
       }
       currentWorkflowId = wfid;
@@ -27882,6 +28012,12 @@ function buildPanel() {
       // can't out-race the session resume.)
     },
     onSay(text, meta) {
+      // A committed reply belongs to the turn's owning conversation. After a
+      // mid-turn switch (history switch here, or passive adoption of another
+      // tab's shared selection — mcp#884/#897) the straggler must neither
+      // paint into nor be recorded under the conversation now on screen
+      // (record() enforces the recording half at its choke point).
+      if (turnOutputFenced()) return;
       // Message COMMIT time — the one place fenced ```a2ui blocks are detected
       // (backends without panel tools, e.g. Ollama family, can only emit cards
       // this way). Malformed JSON is left in `stripped` as a normal code block.
@@ -27903,6 +28039,9 @@ function buildPanel() {
     },
     // Live streaming deltas (thinking + reply text) before the committed say.
     onStream(msg) {
+      // Same ownership fence as onSay: a delta from an abandoned turn must not
+      // open a fresh preview bubble inside the newly adopted conversation.
+      if (turnOutputFenced()) return;
       onStreamDelta(msg);
       noteActivity(); // streaming output is real turn activity → reset the clock
     },
@@ -27911,6 +28050,23 @@ function buildPanel() {
     onAsk(msg, socketId) {
       // Fence FIRST: a card from a turn this tab no longer owns must not paint,
       // and must not revive the working indicator on its way past either.
+      //
+      // mcp#884: this SUPERSEDES the plain `turnOutputFenced()` refusal this
+      // branch originally added here. `classifyInteractiveCard` decides the same
+      // question with strictly more evidence — it also weighs `agentWorking` and
+      // `lastMintedThreadId`, so an owner-less turn that minted its own thread is
+      // not mistaken for a turn painting into somebody else's conversation.
+      //
+      // The two fences are NOT interchangeable, which is why both survive:
+      // turnOutputFenced() asks only "is the shown conversation the turn's
+      // owner", which is right for transcript output (a say/stream/todo has
+      // nowhere legitimate to go when the answer is no) but WRONG here, where a
+      // refusal costs the agent a tool error and so must be the precise test.
+      //
+      // pinTurnOwnerAtDispatch() (mcp#884) narrows this fence's own documented
+      // residual: ownership is now pinned at user_message dispatch, so a turn
+      // whose `turn:working` is discarded by the stale-working guard no longer
+      // reaches the classifier with a null owner.
       fenceInteractiveCard("ask_user");
       const p = paintQuestion(msg, socketId);
       bumpThinking();
@@ -27919,6 +28075,9 @@ function buildPanel() {
     },
     // The agent called panel_set_todo — render/update the live plan tray.
     onTodo(items) {
+      // Ownership fence (same rule as onSay): an abandoned turn's plan update
+      // must not repaint the tray or persist todos into the adopted thread.
+      if (turnOutputFenced()) return;
       renderTodo(items);
     },
     // The agent called panel_show_media — render images/videos/audio directly in
@@ -27935,6 +28094,12 @@ function buildPanel() {
     // an unpresentable kind gets a link), and an item the panel cannot present
     // is reported apart from `painted` instead of counted as a success.
     onShowMedia(items) {
+      // Ownership fence: media from an abandoned turn must not paint into the
+      // adopted conversation. Refuse honestly (tool error) — the record choke
+      // point would drop the persistence half anyway.
+      if (turnOutputFenced()) {
+        throw new Error("The conversation changed while this media was in flight — it was not shown.");
+      }
       return composeShowMediaReply(items, {
         paintImage,
         paintVideo,
@@ -28001,6 +28166,11 @@ function buildPanel() {
     },
     // The agent called panel_ui_render / panel_ui_update — A2UI cards in the chat.
     onUiRender(msg) {
+      // Ownership fence: an A2UI card from an abandoned turn would sit
+      // interactive in the adopted conversation. Refuse honestly (tool error).
+      if (turnOutputFenced()) {
+        throw new Error("The conversation changed while this card was in flight — it was not rendered.");
+      }
       const v = validateA2UISpec(msg.spec);
       if (!v.ok) {
         // Client-side wall (fence path has no server check; tool path double-checks).
@@ -28201,7 +28371,11 @@ function buildPanel() {
         canvasToolsProvenEpoch = agentSessionEpoch;
     },
     onCommand(cmd, msg, reply) {
-      appendActivity(cmd, msg, reply);
+      // Ownership fence for the transcript half only: the command already
+      // executed against the canvas (canvas targeting is governed by the
+      // workflow-UUID fences), but its activity card belongs to the turn's
+      // owning conversation, not the one now on screen.
+      if (!turnOutputFenced()) appendActivity(cmd, msg, reply);
       bumpThinking();
       // After an edit, follow the action: dart to the edited NODE (25% pad) so
       // the user watches the change land, then zoom back out to a full fit once
@@ -28393,6 +28567,11 @@ function buildPanel() {
         // A real provider switch = the connected backend changed AND we were
         // already connected to something (not the first connect, not a re-pick).
         const switched = connectedBackend !== null && connectedBackend !== backend;
+        // The backend selection key can change on a real switch AND on a first
+        // connect that lands on a different backend than the restored default.
+        // Captured BEFORE `connectedBackend` moves, because that is what the key
+        // is derived from.
+        const previousScopeKey = currentHistoryScopeKey();
         if (switched) {
           appendSystem(
             tr(
@@ -28418,6 +28597,37 @@ function buildPanel() {
             running: el.dataset.running === "1",
           })),
         );
+        // ONE CONVERSATION PER BACKEND (gate round-3 finding 1): entering a
+        // backend adopts THAT backend's own conversation — the session the
+        // orchestrator runs for it is keyed orchestrator::<backend>, so keeping
+        // the previous backend's thread on screen would run the new session
+        // against a conversation this backend does not own, while reloads and
+        // other tabs resolve its real one. loadThread is the normal actor path
+        // (dispatch + publish under the NEW key); with no conversation yet,
+        // newChat gives the fresh view. A reconnect to the SAME backend leaves
+        // the view untouched (keys equal).
+        const nextScopeKey = currentHistoryScopeKey();
+        if (previousScopeKey !== nextScopeKey) {
+          const target = selectPanelThread(threads, historyMeta, { scopeKey: nextScopeKey });
+          if (switched) {
+            appendSystem(target
+              ? `Switched to ${BACKEND_LABELS[backend]} — continuing its own conversation (sessions aren't shared across providers).`
+              : `Switched to ${BACKEND_LABELS[backend]} — it has no conversation yet, so this starts a fresh chat.`);
+          }
+          // Run the transition even when the target is the thread ALREADY on
+          // screen (codex round-4: first connect can land on a different
+          // backend than the restored default while the new scope resolves the
+          // same legacy thread) — the new backend's session still needs the
+          // resume/new_session + replay alignment and the publish under ITS
+          // key, all of which loadThread owns (its provider check scrubs a
+          // foreign session id and arms the transcript replay).
+          if (target) loadThread(target);
+          else if (thread) newChat();
+        } else if (switched) {
+          appendSystem(
+            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
+          );
+        }
       }
       // Apply the catalog AFTER the backend is known so effort mapping is correct.
       applyModelCatalog(list);
@@ -28543,6 +28753,27 @@ function buildPanel() {
           renderBackendChips(knownBackends);
         }
       }
+      // Gate round-3 finding 2: fire a session reset this tab still OWES from
+      // deleting the active conversation while disconnected. The tombstone and
+      // pointer clear already propagated; without this the backend would keep
+      // the deleted conversation's session alive. Guarded three ways: same
+      // backend scope as when it was queued, the shared pointer is still in
+      // the cleared state this tab left (any newer act — here or in another
+      // tab — supersedes and drops the reset), and the frame actually sends.
+      if (ack?.kind === "ready") {
+        const owedScope = ssGet(PENDING_SESSION_RESET_KEY);
+        if (owedScope) {
+          ssSet(PENDING_SESSION_RESET_KEY, null);
+          const pointer = resolvePanelPointer(historyMeta, owedScope);
+          if (
+            owedScope === currentHistoryScopeKey() &&
+            pointer.activeId == null &&
+            pointer.cleared
+          ) {
+            client?.sendFrame?.({ type: "new_session" });
+          }
+        }
+      }
       // Post-restart auto-resume (#3): the "ready" ack is sent after the
       // orchestrator armed hello.resume, so resuming the agent is safe now.
       // #585 routes this through the correlated restart-resume flow below, which
@@ -28560,9 +28791,9 @@ function buildPanel() {
         appendSystem(tr("panel.agent_reloaded_session_resumed", "Agent reloaded — session resumed."));
         if (origin === "agent") {
           showThinking();
-          client.sendUserMessage(
+          if (client.sendUserMessage(
             "✅ You were just soft-reloaded to pick up code changes (no ComfyUI restart) — your tools and system prompt are now the latest build. Continue exactly what you were doing before the reload.",
-          );
+          )) pinTurnOwnerAtDispatch();
         }
         return;
       }
@@ -28604,9 +28835,9 @@ function buildPanel() {
         if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
-        client.sendUserMessage(
+        if (client.sendUserMessage(
           "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
-        );
+        )) pinTurnOwnerAtDispatch();
       }
     },
     getResume: () => ssGet(SESSION_KEY),
@@ -29371,6 +29602,7 @@ function buildPanel() {
         : "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.");
     const mid = newMid();
     const sent = client.sendUserMessage(text, undefined, undefined, mid);
+    if (sent) pinTurnOwnerAtDispatch();
     if (!sent) {
       // Nothing left the panel, so give the budget its attempt back — but only when
       // we know the increment persisted. If it didn't, the count is already whatever
@@ -30395,10 +30627,18 @@ function buildPanel() {
     const { switched } = await runBackendSwitch(id, {
       liveBackend: () => connectedBackend,
       pickedBackend: () => selectedBackend,
-      // The old provider's session must be durably invalid before any reconnect can observe
-      // it. If the reconnect fails or the browser closes, a reload must start fresh rather
-      // than restore a foreign session.
-      invalidate: () => invalidateDurableAgentSession(),
+      // What the INCOMING backend already has, answered by the STORE under that backend's
+      // own scope key (mcp#884). This is the single question `planBackendHandover` turns
+      // into both the session-preservation and the replay decision, so they cannot drift.
+      incomingHasConversation: (next) =>
+        Boolean(selectPanelThread(threads, historyMeta, {
+          scopeKey: panelScopeKeyForBackend(next),
+        })),
+      // The old provider's TAB session pointer must be durably invalid before any reconnect
+      // can observe it. If the reconnect fails or the browser closes, a reload must start
+      // fresh rather than restore a foreign session. `preserveThreadSession` keeps the
+      // OUTGOING conversation's own sessionId so switching back can resume it.
+      invalidate: (opts) => invalidateDurableAgentSession(opts),
       // CENTRALIZED per-backend seeding: every switch path routes through here — the backend
       // chips, the model-popover provider row, AND the Settings backend combo
       // (panelHooks.applyBackend). Seeding from the NEW backend's group before connecting is
@@ -32259,7 +32499,12 @@ function buildPanel() {
           ? { id: a.id, content: full.slice(0, PASTED_DISPLAY_CAP), truncated: true }
           : { id: a.id, content: full };
       });
-    const painted = isQueued ? null : appendUser(text, { mid, attachments: pastedTexts });
+    let painted = isQueued ? null : appendUser(text, { mid, attachments: pastedTexts });
+    // The conversation the optimistic record above was filed under. The awaits
+    // below (attachment uploads, grounding, validation) can span a cross-tab
+    // adoption, and the DISPATCH decides which conversation consumes the
+    // prompt — re-checked just before trackSend (gate P0-5).
+    const recordedThreadId = thread?.id ?? null;
     // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
     captureGraphSnapshot(mid, text);
     showThinking();
@@ -32365,6 +32610,32 @@ function buildPanel() {
     // graph until it independently re-runs. Conditional + deduped (event-driven).
     const valBanner = await validationBanner();
     if (valBanner) sendText = valBanner + sendText;
+    // The target conversation is decided at DISPATCH, not at type time (gate
+    // P0-5): if the shared selection moved while we awaited above, relocate the
+    // optimistically recorded prompt into the conversation the backend will
+    // actually consume it in — remove + tombstone the old copy (so a merge
+    // cannot resurrect it), then re-record and repaint in the current view.
+    // Queued sends are exempt: they record at MATERIALIZE time (dequeue),
+    // which is already dispatch-side of any adoption.
+    if (!isQueued && (thread?.id ?? null) !== recordedThreadId) {
+      const source = threads.find((candidate) => candidate.id === recordedThreadId);
+      const msgs = source?.msgs;
+      if (msgs) {
+        const i = msgs.findIndex((m) => m.role === "user" && m.mid === mid);
+        if (i >= 0) {
+          const [removed] = msgs.splice(i, 1);
+          const now = Math.max(Date.now(), Number(source.updatedAt) + 1 || 0);
+          if (removed?.id) {
+            source.deletedMessages = source.deletedMessages || {};
+            source.deletedMessages[removed.id] = now;
+          }
+          source.updatedAt = now;
+          source.ts = now;
+        }
+      }
+      painted = appendUser(text, { mid, attachments: pastedTexts });
+      paintMedia();
+    }
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.
@@ -32767,34 +33038,11 @@ function buildPanel() {
     // push carries the new backend's values. No set_options is sent here.
     connectBackend(id);
   };
-  panelHooks.applyChatScope = (mode) => {
-    if (!['panel', 'workflow', 'ask'].includes(mode)) return;
-    askModeFollowsPanel = mode === "panel";
-    const targetKey = mode === "panel" ? "panel:global" : workflowStorageKey();
-    const panelTargetId = mode === "panel" ? historyMeta.activeByScope?.[targetKey] : null;
-    let target = mode === "panel"
-      ? threads.find((candidate) => candidate.id === panelTargetId)
-      : threadForWorkflow(targetKey);
-    if (!target && mode === "panel" && thread) {
-      // First switch to panel-owned mode: carry the visible conversation into
-      // the global selection slot without discarding its workflow provenance.
-      target = thread;
-      setActiveThread(targetKey, target.id);
-      persistThreads();
-    }
-    if (target) loadThread(target);
-    else newChat({ notifyBackend: false });
-    currentWorkflowId = null;
-    onWorkflowMaybeChanged();
-    refreshContextRingForScope(); // #381: the scope mode changed — reflect the target scope's fill
-    appendSystem(
-      mode === "panel"
-        ? tr("panel.chat_scope_panel_wide_conversation", "Chat scope → panel-wide conversation.")
-        : mode === "workflow"
-          ? tr("panel.chat_scope_separate_histories_for_each_workflow", "Chat scope → separate histories for each workflow.")
-          : tr("panel.chat_scope_ask_whenever_the_workflow_changes", "Chat scope → ask whenever the workflow changes."),
-    );
-  };
+  // mcp#884 — panelHooks.applyChatScope is gone with the retired scope setting:
+  // its only caller was the removed combo's onChange, and keeping a live scope
+  // switcher around would be a ready-made way to reintroduce per-workflow
+  // sessions behind the orchestrator's back (the invariant is ONE conversation
+  // per backend across every tab and workflow).
   panelHooks.applyModel = (id) => {
     const next = (id || "").trim();
     // Blank = "Auto (let the agent pick)" → CLEAR the forced model live: un-pin so a
@@ -33020,7 +33268,6 @@ function buildPanel() {
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;
-      panelHooks.applyChatScope = null;
       panelHooks.applyModel = null;
       panelHooks.applyEffort = null;
       panelHooks.applyBridgeUrl = null;
