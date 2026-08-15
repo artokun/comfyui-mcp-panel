@@ -324,16 +324,30 @@ export function findRgthreeSeedNodes(nodes) {
 }
 
 /**
+ * Node types whose queue-time prompt rewrite has actually been MEASURED — the
+ * capability claim behind the #1124 drift exclusion, stated as data.
+ *
+ * EXACT registered type, not a substring test, and the set holds exactly what has
+ * been verified. `Seed (rgthree)` is the type on the live instance this repo's
+ * fixtures were taken from; nothing else has been observed rewriting the prompt in
+ * an `api.queuePrompt` patch, so nothing else is listed. Adding a type here is a
+ * claim that THAT node substitutes at queue time — it must be measured first, not
+ * guessed from a plausible-looking name.
+ */
+const RGTHREE_QUEUE_REWRITING_SEED_TYPES = new Set(["Seed (rgthree)"]);
+
+/**
  * #1124 — the input rgthree will REWRITE in the outgoing prompt, or null when it
  * rewrites nothing. Returns the input NAME so the caller can build a per-node
  * exclusion pair; the drift guard (run-scope-guard.js) is the only consumer.
  *
- * WHY IT LIVES IN THIS MODULE rather than in the guard. Everything it needs is
- * already measured and written down HERE — the sentinel set, the node predicate,
- * the mute/bypass early-return, and the quoted handler line that says WHICH input
- * gets overwritten. Restating any of that next to the guard would create a second
- * copy of a measured fact about someone else's pack, and the two would drift the
- * first time rgthree changed. The guard imports; nothing is duplicated.
+ * WHY IT LIVES IN THIS MODULE rather than in the guard. Almost everything it needs
+ * is already measured and written down HERE — the sentinel set, the mute/bypass
+ * early-return, and the quoted handler line that says WHICH input gets overwritten.
+ * Restating any of that next to the guard would create a second copy of a measured
+ * fact about someone else's pack, and the two would drift the first time rgthree
+ * changed. The guard imports; nothing is duplicated. (The node-type match is the
+ * one thing this function does NOT share with the #1339 scan — see below.)
  *
  * WHAT IT IS FOR. The #556 drift guard stamps the graph before dispatch and
  * compares that stamp against the POSTED body. Its only volatility signal was
@@ -363,12 +377,35 @@ export function findRgthreeSeedNodes(nodes) {
  * refused. Same for a MUTED or BYPASSED node: rgthree's handler returns early for
  * both, so it substitutes nothing.
  *
+ * IT DOES NOT SHARE `isRgthreeSeedNode` WITH THE #1339 WARNING, and that is a
+ * deliberate split rather than an oversight (codex r1 P2). That predicate is two
+ * substring tests — `/rgthree/i && /seed/i` — so a foreign custom node whose type
+ * happens to contain both words, carrying a `seed` widget holding -1/-2/-3, would
+ * have had its seed dropped from BOTH hashes despite installing no queue-time
+ * rewrite at all. A real deferred edit to that node would then sail past the #556
+ * guard. The two callers want OPPOSITE failure directions, so one predicate cannot
+ * serve both:
+ *
+ *   #1339 (warning)      a false positive is NOISE — one extra sentence about a
+ *                        node that may not repeat. A false NEGATIVE is the bug
+ *                        that issue was filed for (a missed warning), so a loose,
+ *                        generous match is the right trade there and is left
+ *                        exactly as it was.
+ *   #1124 (drift guard)  a false positive SILENTLY REMOVES drift coverage for the
+ *                        life of every scoped run on that graph. Fail-closed is
+ *                        the only acceptable direction, so the match is an exact
+ *                        registered type from a measured set.
+ *
+ * Tightening the shared predicate would have traded a real #1339 regression (a
+ * genuinely-rgthree seed node with a variant type going unwarned) for a cosmetic
+ * saving of one constant. So the warning heuristic stays; the exclusion is strict.
+ *
  * Defensive like the rest of this module: an unreadable node yields null (no
  * exclusion), which fails TOWARD detecting drift.
  */
 export function rgthreeQueueTimeSeedInput(node) {
   try {
-    if (!isRgthreeSeedNode(node)) return null;
+    if (!RGTHREE_QUEUE_REWRITING_SEED_TYPES.has(node?.type)) return null;
     // rgthree: `if (this.mode === LiteGraph.NEVER || this.mode === 4) return;`
     if (node?.mode === 2 || node?.mode === 4) return null;
     const widgets = Array.isArray(node?.widgets) ? node.widgets : [];

@@ -2094,18 +2094,24 @@ const RGTHREE_DRAWS = [1028465986822020, 98533269447704, 557498712106716];
  * `alsoEdit` mutates the outgoing prompt further, standing in for a REAL user
  * edit landing in the same window — the case that must still be refused.
  */
-function makeRgthreeFrontend({ apiTarget, seedWidgetValue = -1, alsoEdit = null }) {
+function makeRgthreeFrontend({ apiTarget, seedWidgetValue = -1, alsoEdit = null, nodeType = "Seed (rgthree)" }) {
   let draw = 0;
   const stamp = () => {
     const out = structuredClone(RGTHREE_STAMP);
     out["47"].inputs.seed = seedWidgetValue;
+    out["47"].class_type = nodeType;
     return out;
   };
   const app = {
     queueItems: [],
     posted: [],
     // The panel's live root (production shape, r8) — no beforeQueued anywhere.
-    graph: { _nodes: [rgthreeSeedNode(47, seedWidgetValue), { id: 3, widgets: [{ name: "steps", value: 20 }] }] },
+    graph: {
+      _nodes: [
+        { ...rgthreeSeedNode(47, seedWidgetValue), type: nodeType },
+        { id: 3, widgets: [{ name: "steps", value: 20 }] },
+      ],
+    },
     graphToPrompt: async () => ({ output: stamp(), workflow: {} }),
     queuePrompt: async (number, batch, arg) => {
       const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
@@ -2170,6 +2176,35 @@ test("#1124 integration: a FIXED rgthree Seed keeps full drift coverage — a bo
     assert.match(result.error, /47 seed/, "and the refusal still names what differed");
     assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
     assert.deepEqual(result.volatileInputs, [], "a fixed node excludes nothing");
+  } finally {
+    stop();
+  }
+});
+
+test("#1124 integration: a LOOK-ALIKE node type does NOT buy a drift exemption — its seed edit is still refused", async () => {
+  const stop = keepAlive();
+  try {
+    // codex r1 P2, at the level that matters: the exclusion is keyed on the exact
+    // registered type, so a foreign node whose type merely contains "rgthree" and
+    // "seed" keeps FULL drift coverage. If this ever passes as "dispatched", the
+    // guard has been silently disarmed for every graph containing such a node.
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeRgthreeFrontend({
+      apiTarget,
+      nodeType: "Seed Generator (rgthree-style)",
+      // Armed sentinel + a changed seed in the body: the exact shape the real
+      // rgthree node gets forgiven for. This node must NOT be forgiven.
+      alsoEdit: (output) => { output["47"].inputs.seed = 4242; },
+    });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["122"], batch: 1, toNodeId: 122, verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "refused", "a look-alike type is NOT exempt from drift detection");
+    assert.match(result.error, /graph CHANGED/i);
+    assert.match(result.error, /47 seed/);
+    assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
+    assert.deepEqual(result.volatileInputs, [], "and nothing was excluded for it");
   } finally {
     stop();
   }

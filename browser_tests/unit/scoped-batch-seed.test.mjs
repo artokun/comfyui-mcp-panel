@@ -384,6 +384,41 @@ test("#1124 — a MUTED or BYPASSED node substitutes nothing, so it excludes not
   assert.equal(rgthreeQueueTimeSeedInput({ ...rgthreeSeed(47, -1), mode: 0 }), "seed");
 });
 
+test("#1124 — a LOOK-ALIKE foreign node whose type merely CONTAINS 'rgthree' and 'seed' is NOT excluded", () => {
+  // The defect this exact-type match exists to prevent (codex r1 P2). The #1339
+  // scan's predicate is two substring tests, so all of these satisfy it — and each
+  // carries a `seed` widget armed with a real rgthree sentinel, so every other gate
+  // in the function passes too. If the exclusion used that predicate, these nodes'
+  // seeds would be dropped from BOTH hashes despite installing no queue-time
+  // rewrite, and a genuine deferred edit to one would bypass the #556 guard
+  // silently, for every scoped run on that graph.
+  const lookAlikes = [
+    "Seed Generator (rgthree-style)",
+    "rgthree Seed Helper",
+    "Advanced Seed (rgthree compatible)",
+    "seed (rgthree)", // lowercase — not the registered type
+    "Seed (rgthree) ", // trailing space — not the registered type
+  ];
+  for (const type of lookAlikes) {
+    const node = { id: 47, type, mode: 0, widgets: [{ name: "seed", value: -1 }] };
+    // It DOES satisfy the loose #1339 predicate — that is what makes it dangerous…
+    assert.equal(findRgthreeSeedNodes([node]).length, 1, `${type} matches the loose #1339 scan`);
+    // …and it must STILL be fully drift-covered.
+    assert.equal(rgthreeQueueTimeSeedInput(node), null, `${type} must NOT be excluded`);
+  }
+  // The registered type, unchanged, still is.
+  assert.equal(rgthreeQueueTimeSeedInput(rgthreeSeed(47, -1)), "seed");
+});
+
+test("#1124 — the #1339 warning predicate is deliberately NOT tightened along with the exclusion", () => {
+  // The two callers want opposite failure directions, so the split is the point:
+  // over-warning is noise, over-excluding is lost drift coverage. Pinned so a
+  // later "consolidate these two predicates" cleanup has to read the reason first.
+  const variant = { id: 47, type: "Seed Generator (rgthree-style)", mode: 0, widgets: [{ name: "seed", value: 12345 }] };
+  assert.equal(findRgthreeSeedNodes([variant]).length, 1, "#1339 still warns generously");
+  assert.equal(rgthreeQueueTimeSeedInput(variant), null, "#1124 still excludes strictly");
+});
+
 test("#1124 — foreign seed nodes and malformed nodes exclude NOTHING (fail toward detecting drift)", () => {
   // The over-broad direction is the dangerous one here: a false exclusion silently
   // drops an input from the drift check for every run on that graph. These are the
