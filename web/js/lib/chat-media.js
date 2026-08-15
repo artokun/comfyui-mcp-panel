@@ -1,6 +1,7 @@
 // Media-card persistence helpers (issue #177).
 //
-// Image/video cards are persisted as role:"media" messages so they survive a
+// Media cards (image/video, plus audio and the unpresentable-file link card
+// added by #710) are persisted as role:"media" messages so they survive a
 // reload / thread switch. Only DURABLE, re-servable urls may be stored: a
 // ComfyUI `/view` link or an absolute http(s) URL. Everything else is rejected
 // on a POSITIVE-admission basis:
@@ -29,13 +30,21 @@ export function isDurableMediaUrl(url) {
   return false;
 }
 
+/** The kinds a stored card can replay as. Each one has its own painter in the
+ *  panel; a card stored under the WRONG kind replays through the wrong painter,
+ *  which is how an audio file came back as a broken <img> one reload after it
+ *  was fixed live (#710). "file" is the link card for a kind the panel cannot
+ *  present at all. Anything unrecognized stays "image" — that is what every
+ *  record written before this list existed actually is. */
+const MEDIA_KINDS = new Set(["image", "video", "audio", "file"]);
+
 /** Build the role:"media" record for a painted card, or null when it must not
  *  be persisted (currently replaying stored history, or a non-durable url).
  *  Kept pure so the admission + replay-guard logic is unit-testable. */
 export function mediaRecordFor(mkind, url, caption, { replaying = false } = {}) {
   if (replaying) return null; // replay repaints; it must never re-record (would dupe every reload)
   if (!isDurableMediaUrl(url)) return null;
-  const kind = mkind === "video" ? "video" : "image";
+  const kind = MEDIA_KINDS.has(mkind) ? mkind : "image";
   return {
     role: "media",
     mkind: kind,

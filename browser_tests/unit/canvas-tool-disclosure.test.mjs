@@ -240,6 +240,68 @@ test("the remedies are actionable from where the user already is, and are distin
   assert.match(CANVAS_TOOL_DISCLOSURE, /switch this chat to the Claude backend/);
 });
 
+// ── #857: a deferred tool is not an absent one ─────────────────────────────
+
+test("it tells the model to search the DEFERRED registry, not just what it was handed", () => {
+  // The reporter's Codex session found no panel_graph_outline in its initial tool
+  // description, found mcp__panel__panel_graph_outline in the lazy registry,
+  // called it, and got the live 41-node graph. The old text had no true branch for
+  // that: it asked "IS it in your toolset / IS IT NOT", and a deferred entry
+  // answers neither.
+  assert.match(CANVAS_TOOL_DISCLOSURE, /lazy\/deferred registry/);
+  assert.match(CANVAS_TOOL_DISCLOSURE, /search the deferred registry too before concluding anything is missing/);
+});
+
+test("it names the DEFERRED form of the tool, not only the bare name", () => {
+  // "Check your lazy registry" is the same unfalsifiable advice as "check your
+  // tools" — the model has to know what string it is looking for, and the deferred
+  // entry is namespaced by the server.
+  assert.match(CANVAS_TOOL_DISCLOSURE, /mcp__panel__panel_graph_outline/);
+});
+
+test("the two-surface lookup comes BEFORE either branch", () => {
+  // Order is the fix. A model that reaches "IF IT IS NOT in your toolset" before it
+  // has been told a second surface exists has already answered the question wrong,
+  // and nothing downstream retracts it.
+  const lookup = CANVAS_TOOL_DISCLOSURE.indexOf("LOOK IN BOTH SURFACES");
+  const present = CANVAS_TOOL_DISCLOSURE.indexOf("IS available in EITHER surface");
+  const absent = CANVAS_TOOL_DISCLOSURE.indexOf("IF IT IS IN NEITHER");
+  assert.ok(lookup > 0, "the lookup instruction must exist");
+  assert.ok(lookup < present && lookup < absent, "it must precede both branches");
+});
+
+test("BOTH branches are stated over both surfaces, not over the advertised list", () => {
+  // Fixing only the absence branch would leave the presence branch reading as a
+  // claim about the eager list, which is the same false negative one step later.
+  assert.match(CANVAS_TOOL_DISCLOSURE, /available in EITHER surface/);
+  assert.match(CANVAS_TOOL_DISCLOSURE, /IF IT IS IN NEITHER/);
+  // The old absolute wording must be gone — it is what produced the false negative.
+  assert.doesNotMatch(CANVAS_TOOL_DISCLOSURE, /IF IT IS NOT in your toolset/);
+  assert.doesNotMatch(CANVAS_TOOL_DISCLOSURE, /IF panel_graph_outline IS in your toolset/);
+});
+
+test("callable in either surface counts as present", () => {
+  // The panel cannot see the toolset, so the criterion handed to the model has to
+  // be one the model can actually apply: can you call it?
+  assert.match(CANVAS_TOOL_DISCLOSURE, /A tool you can CALL is present no matter which surface it came from/);
+});
+
+test("the search is BOUNDED — it has a stopping rule", () => {
+  // Without one, a genuinely tool-less session (the #291 session this module was
+  // written for) is told to keep looking for something that is not there. Failing
+  // to give the user a straight answer slowly is not better than doing it quickly.
+  assert.match(CANVAS_TOOL_DISCLOSURE, /Check each once, then answer/);
+  assert.match(CANVAS_TOOL_DISCLOSURE, /do not keep hunting/);
+});
+
+test("the absence branch still reaches its remedies after the extra step", () => {
+  // The new paragraph sits upstream of the thing that actually helps the user. If
+  // it had displaced the remedies, #857 would have been traded for #291.
+  const absent = CANVAS_TOOL_DISCLOSURE.indexOf("IF IT IS IN NEITHER");
+  const remedies = CANVAS_TOOL_DISCLOSURE.indexOf("update comfyui-mcp");
+  assert.ok(absent > 0 && remedies > absent, "the remedies must still follow the absence branch");
+});
+
 test("the text ends with a blank line so it cannot run into the user's message", () => {
   // It is PREPENDED to the turn text. Without the separator the user's first words
   // continue the disclosure's last sentence.

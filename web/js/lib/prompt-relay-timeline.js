@@ -22,7 +22,7 @@
 // That is exactly #506: "timeline_data contains the new prompt while local_prompts still
 // contains the prior prompt", and the executed prompt is the stale one.
 //
-// WHY RECONCILE (regenerate) RATHER THAN REJECT. The derived widgets are a TOTAL, PURE
+// WHY RECONCILE (re-derive) RATHER THAN REJECT. The derived widgets are a TOTAL, PURE
 // function of `timeline.segments` — the node itself defines them that way. And since
 // execute() never looks at `timeline_data`, rejecting a `timeline_data` write outright would
 // leave NO way to drive this node at all. So a `timeline_data` write regenerates

@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  classifyShowMediaItem,
   composeShowMediaReply,
   dataUrlByteLength,
   isVideoShowMediaItem,
@@ -41,6 +42,8 @@ function harness(over = {}) {
   const calls = {
     paintedImages: [],
     paintedVideos: [],
+    paintedAudio: [],
+    paintedLinks: [],
     storyboardsFor: [],
     uploads: [],
     warnings: [],
@@ -49,6 +52,8 @@ function harness(over = {}) {
   const deps = {
     paintImage: (url, caption) => calls.paintedImages.push({ url, caption }),
     paintVideo: (url, caption) => calls.paintedVideos.push({ url, caption }),
+    paintAudio: (url, caption) => calls.paintedAudio.push({ url, caption }),
+    paintFileLink: (url, caption) => calls.paintedLinks.push({ url, caption }),
     imageViewUrl: (ref) =>
       `/view?filename=${ref.filename}&subfolder=${ref.subfolder ?? ""}&type=${ref.type ?? "output"}`,
     coerceMessageText: (v) => (typeof v === "string" ? v : v == null ? "" : String(v)),
@@ -264,6 +269,122 @@ test("a sampler that returns nothing degrades with a remedy and NO invented caus
   assert.doesNotMatch(reply.note, /could not be seeked/);
   assert.doesNotMatch(reply.note, /not one of its frames/);
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+});
+
+// comfyui-mcp#1493 — the builder knew which of its six failures it hit and threw
+// that away, so the reply had to say "the panel is not told which". It can now
+// hand back `{reason}`, and only then may the reply name a cause.
+test("EVERY failure exit in the builder names itself — no bare `return null` survives", () => {
+  // The consumer tests below all STUB buildVideoStoryboard, so none of them can
+  // see the builder's own branches: mutation showed the duration branch could be
+  // reverted to a bare `null` with the whole suite still green. The real builder
+  // needs a DOM (video + canvas + seeking) that these node tests do not have, so
+  // the honest instrument for "this function contains no unnamed exit" is the
+  // source itself — bounded to the function body, not a fixed-size window that
+  // silently stops covering what it checks.
+  const body = functionBody("async function buildVideoStoryboard(");
+  const bare = body.match(/return null\s*;/g) ?? [];
+  assert.deepEqual(
+    bare,
+    [],
+    `every failure exit must name its cause; found ${bare.length} bare \`return null\``,
+  );
+  // …and the named exits are actually there (a body that returns nothing at all
+  // would trivially satisfy the assertion above).
+  const named = body.match(/return storyboardFailure\(/g) ?? [];
+  assert.ok(named.length >= 5, `expected the 5 failure branches to be named, saw ${named.length}`);
+});
+
+test("a NAMED sampler failure is passed through, not flattened to the generic note", async () => {
+  const h = harness({
+    buildVideoStoryboard: async () => ({
+      reason: "the browser reported no usable duration for it (its codec may not be decodable here — VP9/AV1 .webm is the usual case)",
+    }),
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(reply.previews.length, 0);
+  assert.match(reply.note, /no usable duration/);
+  assert.match(reply.note, /VP9\/AV1/);
+  // The generic "not told which" line must be GONE — we were told which.
+  assert.doesNotMatch(reply.note, /the panel is not told which/);
+  // Still actionable, and the user still got the player.
+  assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+  assert.equal(h.calls.paintedVideos.length, 1);
+});
+
+test("a named failure is never uploaded as if it were a sheet", async () => {
+  // `{reason}` is TRUTHY. A consumer that only checked `if (!blob)` would sail
+  // past it and hand the explanation to uploadBlobToInput as a PNG.
+  const h = harness({ buildVideoStoryboard: async () => ({ reason: "no usable duration" }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(h.calls.uploads.length, 0, "an explanation must never be uploaded");
+  assert.equal(reply.previews.length, 0);
+});
+
+test("a builder that returns a bare null STILL invents no cause", async () => {
+  // The rule the pre-existing test holds, restated against the new code path: a
+  // sampler that reports nothing tells us nothing, and naming a cause for it
+  // would be a diagnosis nothing made. Only a SUPPLIED reason is repeated.
+  const h = harness({ buildVideoStoryboard: async () => null });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.match(reply.note, /the panel is not told which/);
+  assert.doesNotMatch(reply.note, /could not be seeked/);
+  assert.doesNotMatch(reply.note, /VP9/);
+});
+
+test("nothing that is not sheet-shaped is ever uploaded", async () => {
+  // Success is recognised POSITIVELY (a numeric `size`, which is what a Blob has
+  // and what the doubles model). Two earlier versions inferred FAILURE instead
+  // and both leaked: keying on the reason's type uploaded `{reason:{…}}`, and
+  // keying on its presence uploaded every other truthy value (review finding).
+  for (const shape of [[], {}, "a string", 42, true, { paintedFrames: 3 }]) {
+    const h = harness({ buildVideoStoryboard: async () => shape });
+    const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+    assert.equal(
+      h.calls.uploads.length,
+      0,
+      `a ${JSON.stringify(shape)} must not reach uploadBlobToInput`,
+    );
+    assert.equal(reply.previews.length, 0);
+    assert.match(reply.note, /no sampled preview could be built/);
+  }
+});
+
+test("a sheet-shaped result that ALSO carries a reason is read as the failure", async () => {
+  // The ambiguous shape the code comments call out. It is not one the builder
+  // produces, so the question is only which way to be wrong: preferring the
+  // explanation over silently uploading something that announced its own
+  // failure. Documented behaviour deserves a test — mutation showed that
+  // dropping the guard changed nothing observable without one.
+  const h = harness({
+    buildVideoStoryboard: async () => ({ size: 4096, reason: "no usable duration" }),
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.equal(h.calls.uploads.length, 0);
+  assert.match(reply.note, /no usable duration/);
+});
+
+test("a sheet-shaped result is still uploaded — the positive check did not break success", async () => {
+  // The other direction, and the one a stricter check is most likely to break.
+  const h = harness({ buildVideoStoryboard: async () => ({ size: 4096, paintedFrames: 20 }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(h.calls.uploads.length, 1);
+  assert.equal(reply.previews.length, 1);
+});
+
+test("a non-string reason is ignored rather than interpolated", async () => {
+  // A malformed object must degrade to the generic note, not print
+  // "[object Object]" at the agent — the serialization failure this repo keeps
+  // rediscovering.
+  const h = harness({ buildVideoStoryboard: async () => ({ reason: { nested: true } }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+
+  assert.doesNotMatch(reply.note, /\[object Object\]/);
+  assert.match(reply.note, /the panel is not told which/);
 });
 
 test("the 'ask the user' remedy is withheld when the user cannot see it either", async () => {
@@ -609,7 +730,7 @@ test("a painter whose returned object has a THROWING then getter still yields a 
   );
   assert.equal(reply.ok, true);
   assert.equal(reply.unconfirmed, 1);
-  assert.match(reply.note, /whether the user can see it is UNKNOWN/);
+  assert.match(reply.note, /whether the user can see or hear it is UNKNOWN/);
 });
 
 test("a painter that returns a thenable whose then() THROWS still yields a reply", async () => {
@@ -627,7 +748,7 @@ test("a painter that returns a thenable whose then() THROWS still yields a reply
   assert.equal(reply.ok, true);
   assert.equal(reply.painted, 0);
   assert.equal(reply.unconfirmed, 1);
-  assert.match(reply.note, /whether the user can see it is UNKNOWN/);
+  assert.match(reply.note, /whether the user can see or hear it is UNKNOWN/);
 });
 
 test("a throwing text coercer does not cost the agent its reply", async () => {
@@ -666,7 +787,7 @@ test("a painter that settles LATER is reported unconfirmed, not counted as shown
   );
   assert.equal(reply.painted, 0, "an unconfirmed paint is not a paint");
   assert.equal(reply.unconfirmed, 1);
-  assert.match(reply.note, /whether the user can see it is UNKNOWN/);
+  assert.match(reply.note, /whether the user can see or hear it is UNKNOWN/);
   await new Promise((r) => setImmediate(r));
 });
 
@@ -851,6 +972,216 @@ test("a video whose inline payload is malformed reports its size UNKNOWN, never 
   assert.equal(reply.previews[0].sourceBytes, null);
 });
 
+// ── #710 — audio, and kinds the panel cannot present ───────────────────────
+//
+// The panel used to know exactly two media kinds. An AUDIO ref (a ComfyUI /view
+// ref can name anything on disk) fell through to the image branch, so the user
+// got a broken <img> icon — and the reply still said `painted:N, unconfirmed:0`,
+// a full success. The agent then told the user to listen to something nobody
+// could hear. Both halves are tested here: audio must PLAY, and anything the
+// panel cannot present must never be counted as painted.
+
+const AUDIO_REF = {
+  kind: "viewRef",
+  viewRef: { filename: "vo_sophie_00001.mp3", subfolder: "synlara", type: "output" },
+  filename: "vo_sophie_00001.mp3",
+  caption: "Sophie, line 1",
+};
+
+test("an audio ref is PLAYED, never painted as an image (#710)", async () => {
+  const h = harness();
+  const reply = await composeShowMediaReply([AUDIO_REF], h.deps);
+
+  assert.equal(
+    h.calls.paintedImages.length,
+    0,
+    "audio painted through the image branch is the broken-<img> icon the user saw",
+  );
+  assert.equal(h.calls.paintedVideos.length, 0);
+  assert.equal(h.calls.paintedAudio.length, 1, "audio must reach the audio painter");
+  assert.match(h.calls.paintedAudio[0].url, /filename=vo_sophie_00001\.mp3/);
+  assert.equal(h.calls.paintedAudio[0].caption, "Sophie, line 1");
+  assert.equal(h.calls.storyboardsFor.length, 0, "audio has no frames to sample");
+  assert.equal(reply.previews.length, 0);
+});
+
+test("an audio item's reply says the user can HEAR it and that the agent cannot (#710)", async () => {
+  const h = harness();
+  const reply = await composeShowMediaReply([AUDIO_REF], h.deps);
+
+  assert.equal(reply.painted, 1, "a played audio file IS presented to the user");
+  assert.deepEqual(reply.unrenderable, []);
+  // The headline must not claim the audio was DISPLAYED — a player is not a picture.
+  assert.match(reply.note, /audio player/i);
+  // …and it must disarm the fabrication an audio card invites: the agent has
+  // heard nothing, so it must not describe how the file sounds.
+  assert.match(reply.note, /do not describe how it sounds/i);
+  assert.match(reply.note, /vo_sophie_00001\.mp3/);
+  // A real next step, and one that actually works: get_image saves audio to disk.
+  assert.match(
+    reply.note,
+    /call get_image with filename "vo_sophie_00001\.mp3", type "output", subfolder "synlara"/,
+  );
+  // …and `painted` must not be oversold. The painter is synchronous: it returns
+  // before a byte is fetched, so a player in the chat is not evidence the file
+  // decoded. Claiming "the user can play it" full stop is the same overclaim as
+  // the success this fix removes, one layer down.
+  assert.match(reply.note, /NOT proof the browser could decode the file/);
+  assert.match(reply.note, /ask the user whether it actually plays/);
+});
+
+test("an audio file whose player could not be painted is not counted as painted (#710)", async () => {
+  const h = harness({
+    paintAudio: () => {
+      throw new Error("DOM exploded");
+    },
+  });
+  const reply = await composeShowMediaReply([AUDIO_REF], h.deps);
+  assert.equal(reply.painted, 0);
+  assert.match(reply.note, /were NOT displayed/);
+  assert.match(reply.note, /vo_sophie_00001\.mp3/);
+});
+
+test("a kind the panel cannot present is NOT counted as painted (#710)", async () => {
+  // The honesty half in one assertion: the agent must be able to tell "the user
+  // can perceive this" from "I was handed something I could not present".
+  const h = harness();
+  const reply = await composeShowMediaReply(
+    [
+      { kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "a.png" },
+      {
+        kind: "viewRef",
+        viewRef: { filename: "notes.txt", subfolder: "", type: "output" },
+        filename: "notes.txt",
+      },
+    ],
+    h.deps,
+  );
+
+  assert.equal(reply.count, 2);
+  assert.equal(reply.painted, 1, "only the image was presented; the .txt was not");
+  assert.equal(reply.unconfirmed, 0);
+  assert.equal(reply.unrenderable.length, 1);
+  assert.equal(reply.unrenderable[0].name, "notes.txt");
+  assert.equal(reply.unrenderable[0].ext, ".txt");
+  assert.equal(h.calls.paintedImages.length, 1, "the .txt must not go to the image painter");
+  assert.match(reply.note, /the panel cannot present/i);
+  assert.match(reply.note, /notes\.txt/);
+  // get_image only returns image/video/audio and REFUSES anything else, so
+  // pointing the agent at it here would be a remedy that cannot be followed.
+  assert.doesNotMatch(reply.note, /call get_image with filename "notes\.txt"/);
+});
+
+test("an unpresentable item still gives the USER something to act on — a link (#710)", async () => {
+  const h = harness();
+  const reply = await composeShowMediaReply(
+    [
+      {
+        kind: "viewRef",
+        viewRef: { filename: "scene.blend", subfolder: "", type: "output" },
+        filename: "scene.blend",
+      },
+    ],
+    h.deps,
+  );
+  assert.equal(h.calls.paintedLinks.length, 1);
+  assert.match(h.calls.paintedLinks[0].url, /filename=scene\.blend/);
+  assert.equal(reply.unrenderable[0].shown, "link");
+  assert.match(reply.note, /LINK/);
+});
+
+test("an unpresentable item whose link ALSO failed says the user got nothing at all (#710)", async () => {
+  const h = harness({
+    paintFileLink: () => {
+      throw new Error("DOM exploded");
+    },
+  });
+  const reply = await composeShowMediaReply(
+    [{ kind: "viewRef", viewRef: { filename: "scene.blend", type: "output" }, filename: "scene.blend" }],
+    h.deps,
+  );
+  assert.equal(reply.painted, 0);
+  assert.equal(reply.unrenderable[0].shown, "nothing");
+  assert.match(reply.note, /nothing at all/i);
+});
+
+test("audio in a panel with no audio painter degrades to a link and is NOT painted (#710)", async () => {
+  // A dep the panel forgot to wire must fail honest, not fail silent.
+  const h = harness({ paintAudio: undefined });
+  const reply = await composeShowMediaReply([AUDIO_REF], h.deps);
+  assert.equal(h.calls.paintedImages.length, 0, "never fall back to the image painter");
+  assert.equal(reply.painted, 0);
+  assert.equal(reply.unrenderable.length, 1);
+  assert.equal(h.calls.paintedLinks.length, 1);
+});
+
+test("classifyShowMediaItem decides by explicit kind, then the ref's filename, then the data URL", () => {
+  const ref = (filename) => ({ kind: "viewRef", viewRef: { filename }, filename });
+  // The orchestrator's own kind wins — it built the MIME from the extension.
+  assert.equal(classifyShowMediaItem({ kind: "image", dataUrl: "data:image/png;base64,AA==" }).kind, "image");
+  assert.equal(classifyShowMediaItem({ kind: "video", dataUrl: "data:video/mp4;base64,AA==" }).kind, "video");
+  assert.equal(classifyShowMediaItem({ kind: "audio", dataUrl: "data:audio/mpeg;base64,AA==" }).kind, "audio");
+  // A /view ref carries no kind, so the filename decides.
+  assert.equal(classifyShowMediaItem(ref("a.png")).kind, "image");
+  assert.equal(classifyShowMediaItem(ref("a.WEBP")).kind, "image");
+  assert.equal(classifyShowMediaItem(ref("a.gif")).kind, "image", "animated gifs render in <img>");
+  assert.equal(classifyShowMediaItem(ref("a.mp4")).kind, "video");
+  assert.equal(classifyShowMediaItem(ref("a.MP3")).kind, "audio");
+  assert.equal(classifyShowMediaItem(ref("a.wav")).kind, "audio");
+  assert.equal(classifyShowMediaItem(ref("a.flac")).kind, "audio");
+  assert.equal(classifyShowMediaItem(ref("a.ogg")).kind, "audio");
+  assert.equal(classifyShowMediaItem(ref("a.m4a")).kind, "audio");
+  assert.equal(classifyShowMediaItem(ref("a.aac")).kind, "audio");
+  // Query strings and fragments must not demote a kind (the #648 dot bug's twin).
+  assert.equal(classifyShowMediaItem(ref("a.mp3?download=1")).kind, "audio");
+  assert.equal(classifyShowMediaItem(ref("a.mp3#t=3")).kind, "audio");
+  // An unescaped dot would make "xmp3" audio, exactly as it once made "xmp4" video.
+  assert.equal(classifyShowMediaItem(ref("xmp3")).kind, "unknown");
+  // UNKNOWN is a decision, not a fallback to <img>.
+  assert.equal(classifyShowMediaItem(ref("notes.txt")).kind, "unknown");
+  assert.equal(classifyShowMediaItem(ref("notes.txt")).ext, ".txt");
+  assert.equal(classifyShowMediaItem(ref("noextension")).kind, "unknown");
+  assert.equal(classifyShowMediaItem(ref("noextension")).ext, "");
+  // A data URL with no declared kind is classified by its MIME.
+  assert.equal(classifyShowMediaItem({ dataUrl: "data:audio/wav;base64,AA==" }).kind, "audio");
+  assert.equal(classifyShowMediaItem({ dataUrl: "data:application/pdf;base64,AA==" }).kind, "unknown");
+  assert.equal(classifyShowMediaItem(null).kind, "unknown");
+});
+
+test("the audio branch does not change how images and videos are classified (#710)", () => {
+  // The common path is the one a regression here would cost, so it is asserted
+  // against the SAME classifier the paint pass uses.
+  const ref = (filename) => ({ kind: "viewRef", viewRef: { filename }, filename });
+  for (const name of ["out.png", "out.jpg", "out.jpeg", "out.webp", "out.gif", "out.bmp", "out.avif"]) {
+    assert.equal(classifyShowMediaItem(ref(name)).kind, "image", name);
+    assert.equal(isVideoShowMediaItem(ref(name)), false, name);
+  }
+  for (const name of ["clip.mp4", "clip.webm", "clip.mov", "clip.m4v", "clip.mkv", "clip.avi"]) {
+    assert.equal(classifyShowMediaItem(ref(name)).kind, "video", name);
+    assert.equal(isVideoShowMediaItem(ref(name)), true, name);
+  }
+});
+
+test("a mixed batch reports each kind's outcome separately (#710)", async () => {
+  const h = harness();
+  const reply = await composeShowMediaReply(
+    [
+      { kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "a.png" },
+      AUDIO_REF,
+      { kind: "viewRef", viewRef: { filename: "notes.txt", type: "output" }, filename: "notes.txt" },
+    ],
+    h.deps,
+  );
+  assert.equal(h.calls.paintedImages.length, 1);
+  assert.equal(h.calls.paintedAudio.length, 1);
+  assert.equal(h.calls.paintedLinks.length, 1);
+  assert.equal(reply.count, 3);
+  assert.equal(reply.painted, 2, "the image and the audio — not the .txt");
+  assert.equal(reply.unrenderable.length, 1);
+  assert.match(reply.note, /1 item was displayed/);
+  assert.match(reply.note, /1 audio player/);
+});
+
 // ── the SHIPPED panel is actually wired to this module ─────────────────────
 //
 // Everything above tests a module the panel could simply stop calling. Deleting
@@ -861,6 +1192,58 @@ test("a video whose inline payload is malformed reports its size UNKNOWN, never 
 
 const panelSource = () =>
   readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
+
+/**
+ * The body of a named function, bounded by its OWN braces.
+ *
+ * Replaces the fixed-size `slice(i, i + N)` these source tests used to take. A
+ * fixed window has a cliff: #1493 grew the storyboard builder past 4000 chars
+ * and the assertion below silently stopped covering the line it checked. Raising
+ * the number only moves the cliff (review finding), so bound the real thing.
+ *
+ * Not a JS parser, and it does not need to be — but a brace counter that reads
+ * braces inside STRINGS and COMMENTS can mis-bound and then validate the wrong
+ * region entirely, which is worse than no check. So mask those first, preserving
+ * length so offsets still line up with the original.
+ *
+ * STRINGS ARE MASKED BEFORE COMMENTS, and the order is load-bearing: a `//` or
+ * `/*` inside a string literal would otherwise start a comment that runs to the
+ * end of the line (or to the next close) and blank out real code, moving the
+ * bound (review, round 3). Masking strings first removes those characters before
+ * anything can read them as a comment opener.
+ *
+ * ACCEPTED LIMITS, stated rather than implied: regex literals are NOT masked, so
+ * a regex containing an unbalanced brace inside this function would mis-bound
+ * it, and nested template literals are matched only to their first unescaped
+ * backtick. Both are absent from the function this is used on, and the
+ * assertions here fail loudly rather than silently passing if the bound moves —
+ * a body that no longer contains `storyboardFailure(` trips the >= 5 check. Buy
+ * a real parser if this helper ever gets pointed at arbitrary code.
+ */
+function functionBody(signature) {
+  const src = panelSource();
+  const start = src.indexOf(signature);
+  assert.ok(start > 0, `could not locate ${signature}`);
+
+  const blank = (m) => m.replace(/[^\n]/g, " "); // keep newlines, drop content
+  const masked = src
+    .replace(/"(?:\\.|[^"\\\n])*"/g, blank) // "…"  ─┐ strings FIRST, so a `//`
+    .replace(/'(?:\\.|[^'\\\n])*'/g, blank) // '…'   │ inside one cannot open a
+    .replace(/`(?:\\.|[^`\\])*`/g, blank) //  `…`   ─┘ comment that eats real code
+    .replace(/\/\*[\s\S]*?\*\//g, blank) // block comments
+    .replace(/\/\/[^\n]*/g, blank); // line comments
+
+  const open = masked.indexOf("{", start);
+  assert.ok(open > start, `could not find the opening brace of ${signature}`);
+  let depth = 0;
+  for (let i = open; i < masked.length; i++) {
+    if (masked[i] === "{") depth++;
+    else if (masked[i] === "}" && --depth === 0) {
+      return src.slice(open, i); // the ORIGINAL text, precisely bounded
+    }
+  }
+  assert.fail(`could not bound the body of ${signature}`);
+}
 
 test("the show_media dispatcher answers with the handler's reply, not a fixed acknowledgement", () => {
   const src = panelSource();
@@ -911,12 +1294,17 @@ test("the panel's storyboard builder carries the count it ACTUALLY drew", () => 
   // Without this, media-preview has only the grid capacity to go on and every
   // partially-sampled sheet is described as a full one — 19 blank cells
   // presented to the agent as 19 observations.
-  const src = panelSource();
-  const i = src.indexOf("async function buildVideoStoryboard(");
-  assert.ok(i > 0, "could not locate buildVideoStoryboard");
-  const fn = src.slice(i, i + 4000);
+  // Brace-bounded, not a fixed window. #1493 grew this function past the old
+  // 4000-char slice and the assertion below stopped covering the line it
+  // checks; bumping the number would only move that cliff.
+  const fn = functionBody("async function buildVideoStoryboard(");
   assert.match(fn, /blob\.paintedFrames = painted;/);
-  assert.match(fn, /if \(!blob\) return null;/);
+  // A sheet that will not encode must still not be reported as a sheet. This
+  // used to pin the literal `if (!blob) return null;`; comfyui-mcp#1493 replaced
+  // the bare null with a NAMED failure, so pin the property that matters — the
+  // encode branch does not fall through — rather than the exact wording, which
+  // was only ever incidental to this test's point.
+  assert.match(fn, /if \(!blob\) return storyboardFailure\(/);
 });
 
 test("onShowMedia routes through composeShowMediaReply with the storyboard pipeline wired", () => {
@@ -942,6 +1330,139 @@ test("onShowMedia routes through composeShowMediaReply with the storyboard pipel
     /paintVideo\(url, caption\)/,
     "the handler must not keep its own painting loop — that is the drift this fix removes",
   );
+  // #710 — a painter the panel never passes leaves this module with nothing to
+  // dispatch to, and the composer degrades every audio file to a link card. The
+  // module's audio branch is only real if the panel actually wires it.
+  for (const dep of ["paintAudio", "paintFileLink"]) {
+    assert.ok(handler[0].includes(dep), `onShowMedia must pass ${dep} through (#710)`);
+  }
+});
+
+/** One `function name(...) { … }` at the panel closure's 2-space indent, sliced
+ *  at its OWN closing brace — a fixed window (or one bounded by the next
+ *  function) runs into the following declaration's comment block and asserts
+ *  against prose rather than code. */
+function panelFunctionBody(src, decl) {
+  const i = src.indexOf(decl);
+  assert.ok(i > 0, `could not locate ${decl}`);
+  const end = src.slice(i).search(/\n {2}\}/);
+  assert.ok(end > 0, `could not find the end of ${decl}`);
+  return src.slice(i, i + end + 4);
+}
+
+test("paintAudio builds a real <audio> player, not an <img> (#710)", () => {
+  const src = panelSource();
+  const fn = panelFunctionBody(src, "function paintAudio(");
+  assert.match(fn, /createElement\("audio"\)/);
+  assert.match(fn, /\.controls = true/, "a player with no controls is not playable");
+  assert.doesNotMatch(fn, /createElement\("img"\)/);
+  // The chat lightbox gathers `.cmcp-imgcard` and renders every member as an
+  // image or a video. An audio card in that gallery is the broken <img> back by
+  // another route, so it must carry its own class and no _cmcpMedia descriptor.
+  assert.doesNotMatch(fn, /cmcp-imgcard/);
+  assert.doesNotMatch(fn, /_cmcpMedia/);
+  assert.match(fn, /recordMedia\("audio", url, name\)/, "audio must survive a reload as audio");
+});
+
+test("paintFileLink gives the user an openable link for a kind the panel cannot present (#710)", () => {
+  const src = panelSource();
+  const fn = panelFunctionBody(src, "function paintFileLink(");
+  assert.match(fn, /createElement\("a"\)/);
+  assert.match(fn, /\.href = url/);
+  assert.doesNotMatch(fn, /createElement\("img"\)/);
+  assert.doesNotMatch(fn, /cmcp-imgcard/);
+});
+
+test("chat audio is STOPPED at every teardown — a detached <audio> keeps playing (#710)", () => {
+  // Removing a playing <audio> from the DOM does not pause it, and once the card
+  // is gone there are no controls left to stop it with. Videos are covered by
+  // their IntersectionObserver; audio needs an explicit stop.
+  const src = panelSource();
+  const fn = panelFunctionBody(src, "function stopChatAudio(");
+  assert.match(fn, /querySelectorAll\("audio"\)/);
+  assert.match(fn, /\.pause\(\)/);
+  // A permanent teardown drops the source too; a keep-alive detach must NOT —
+  // the same element is re-attached, and a player with no src is a new bug.
+  assert.match(fn, /if \(release\)[\s\S]{0,120}removeAttribute\("src"\)/);
+  const reset = panelFunctionBody(src, "function resetFeed(");
+  assert.match(reset, /releaseChatAudio\(\);/, "a thread/workflow switch must not leave sound playing");
+  assert.ok(
+    reset.indexOf("releaseChatAudio()") < reset.indexOf("el.remove()"),
+    "release BEFORE detaching — a detached element is no longer reachable from `log`",
+  );
+  // The panel's own unmount is the other teardown: after it there is no card at
+  // all, so nothing else could ever stop the sound. Several objects in this file
+  // have a destroy(); the panel's is the one that unsubscribes history sync.
+  const destroys = [...src.matchAll(/\n {4}destroy\(\) \{/g)]
+    .map((m) => src.slice(m.index, m.index + 4000))
+    .filter((body) => body.includes("unsubscribeHistorySync()"));
+  assert.equal(destroys.length, 1, "could not locate the panel's own destroy()");
+  assert.match(destroys[0], /releaseChatAudio\(\);/);
+});
+
+test("a KEEP-ALIVE sidebar detach pauses chat audio without destroying the player (#710)", () => {
+  // A sidebar-tab switch does not tear the panel down — it detaches the root and
+  // re-attaches the same DOM on re-entry. The audio still has to stop (its
+  // controls just left with the root, and the chat's videos are already paused
+  // here by their IntersectionObserver), but only by PAUSING: dropping `src`
+  // would hand the returning user a dead player.
+  const src = panelSource();
+  const onHide = src.match(/onHide\(\) \{[\s\S]*?\n {4}\},/);
+  assert.ok(onHide, "the panel handle must expose onHide for the keep-alive detach");
+  assert.match(onHide[0], /stopChatAudio\(\);/);
+  assert.doesNotMatch(onHide[0], /release/, "a keep-alive detach must not drop the source");
+  // BOTH detach paths must call it: the tab's own destroy(), and the
+  // sidebar-overlap guard that removes a stray root when another tab is active.
+  const tabDestroy = src.match(/destroy: \(\) => \{[\s\S]*?\n {8}\},/);
+  assert.ok(tabDestroy, "could not locate the sidebar tab's destroy()");
+  assert.match(tabDestroy[0], /mounted\?\.onHide\?\.\(\);/);
+  assert.ok(
+    tabDestroy[0].indexOf("onHide") < tabDestroy[0].indexOf("root?.remove()"),
+    "pause BEFORE the root is detached",
+  );
+  const guard = src.match(/function installSidebarTabGuard\([\s\S]*?\n {2}const start =/);
+  assert.ok(guard, "could not locate installSidebarTabGuard");
+  assert.match(guard[0], /onDetach\?\.\(\)/);
+  assert.match(
+    src,
+    /installSidebarTabGuard\(\s*tabId,[\s\S]{0,160}mounted\?\.onHide\?\.\(\)/,
+    "the guard must actually be given the panel's onHide",
+  );
+});
+
+test("run completion PLAYS an audio output instead of painting it as an image (#710)", () => {
+  // The second copy of the kind decision. The completion path knew only
+  // image-vs-video, so an audio descriptor arriving there was painted as an
+  // <img> AND handed to the agent as an inline image — a picture nobody has.
+  const src = panelSource();
+  const fn = panelFunctionBody(src, "function isAudioOutput(");
+  assert.match(fn, /fmt\.startsWith\("audio\/"\)/);
+  assert.match(fn, /mp3\|wav\|flac/);
+  const onExecuted = panelFunctionBody(src, "function onExecuted(");
+  // The exact branch, not merely a mention of the predicate: `false &&
+  // isAudioOutput(m)` still "mentions" it while routing every audio file back
+  // through paintImage, and a test that passes on that is testing nothing.
+  assert.match(onExecuted, /\} else if \(isAudioOutput\(m\)\) \{/);
+  assert.match(onExecuted, /isAudioOutput\(m\)\) \{[\s\S]{0,600}paintAudio\(url, m\.filename\)/);
+  const audioBranch = onExecuted.slice(onExecuted.indexOf("isAudioOutput(m)"));
+  const branchEnd = audioBranch.indexOf("} else {");
+  assert.ok(branchEnd > 0);
+  assert.doesNotMatch(
+    audioBranch.slice(0, branchEnd),
+    /inlineImages\.push/,
+    "audio must never join the agent's inline-IMAGE delivery",
+  );
+});
+
+test("a persisted audio card REPLAYS as audio, not as a broken image (#710)", () => {
+  // The reload path is a second copy of the kind decision. Leaving it behind
+  // reproduces the exact defect one refresh later.
+  const src = panelSource();
+  const i = src.indexOf('if (m.mkind === "video") paintVideo(m.url, m.caption);');
+  assert.ok(i > 0, "could not locate the media replay branch");
+  const branch = src.slice(i, i + 400);
+  assert.match(branch, /m\.mkind === "audio"[\s\S]{0,40}paintAudio\(m\.url, m\.caption\)/);
+  assert.match(branch, /m\.mkind === "file"[\s\S]{0,40}paintFileLink\(m\.url, m\.caption\)/);
 });
 
 // ── the shared bound is itself a guard that can fail ───────────────────────
@@ -1070,4 +1591,28 @@ test("a late fulfilment after the bound fired does not overwrite the fallback", 
   fire();
   settle("too late");
   assert.equal(await p, "fallback");
+});
+
+test("#1161 withTimeout: a `timers` object that cannot be READ is treated as absent, never a rejection", async () => {
+  // bounded-step.js's own header argues that every injected guard is an operation that can
+  // fail, and wraps `onTimeout` and `clearTimer` accordingly — but READING the injected
+  // object was itself unguarded. A throwing getter, or a Proxy whose get trap throws, threw
+  // synchronously before the returned promise existed, so withTimeout REJECTED out of a
+  // function documented three lines above its signature as never rejecting. The
+  // /object_info oracle passes this object straight through, and two panel commands await
+  // that oracle with no catch of their own.
+  const hostile = [
+    { get setTimer() { throw new Error("hostile getter"); } },
+    new Proxy({}, { get() { throw new Error("proxy trap"); } }),
+    { setTimer: 5, clearTimer: "no" }, // present, but not callable
+  ];
+  for (const timers of hostile) {
+    const value = await withTimeout(Promise.resolve("answered"), 1000, () => "timed out", timers);
+    assert.equal(value, "answered", "an unreadable timers object must fall back to the real timer");
+  }
+  // …and the bound must still WORK through that fallback, not merely avoid throwing.
+  const timedOut = await withTimeout(new Promise(() => {}), 1, () => "timed out", {
+    get setTimer() { throw new Error("hostile getter"); },
+  });
+  assert.equal(timedOut, "timed out", "the real timer still bounds the step");
 });

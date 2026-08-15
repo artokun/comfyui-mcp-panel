@@ -48,3 +48,32 @@ try {
 } catch (err) {
   console.warn(`changelog generation skipped: ${err instanceof Error ? err.message : String(err)}`);
 }
+
+// #758 — the panel-readable copy, OUTSIDE that catch on purpose.
+//
+// The narrative changelog may be skipped; this one may not. It has to run AFTER
+// gen-changelog, or it captures the file as it was before this version was stamped — and
+// then the release ships notes that stop one version short of itself, the panel records
+// that version as already announced, and those notes are lost for good.
+//
+// Not best-effort, and not inside the try: a generator that throws, or a file that cannot
+// be read back, must fail the release rather than warn and continue.
+execFileSync("node", [join(root, "scripts", "gen-changelog-json.mjs")], { stdio: "inherit" });
+{
+  let newest;
+  try {
+    newest = JSON.parse(readFileSync(join(root, "web", "changelog.json"), "utf-8"))?.releases?.[0]?.version;
+  } catch (err) {
+    console.error(
+      `set-version: web/changelog.json is unreadable — ${err instanceof Error ? err.message : String(err)}`,
+    );
+    process.exit(1);
+  }
+  if (newest !== version) {
+    console.error(
+      `set-version: web/changelog.json is STALE — newest entry is ${newest ?? "(none)"}, expected ${version}. ` +
+        "Refusing to leave a release that would announce the wrong notes.",
+    );
+    process.exit(1);
+  }
+}

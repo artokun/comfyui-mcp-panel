@@ -46,6 +46,44 @@ _CDN_KEY = "xG1nkqKTMzGDvpLrqFT7WA"
 # so the aiohttp-level integration test can point it at a local mock server.
 _DOWNLOAD_BASE = "https://civitai.red/api/download/models/"
 
+# Upper bound on a single proxied JSON body (/api). /media and /download were
+# both capped and /api was not, so an accidental or hostile multi-hundred-MB
+# upstream body was buffered whole inside the ComfyUI process and then shipped to
+# the browser. Generous for anything CivitAI really returns — a 100-item
+# /v1/models page is a few hundred KB.
+#
+# An over-cap body is REFUSED, never truncated: half a JSON document would reach
+# the panel as an unparseable body, i.e. a brand-new misleading error substituted
+# for the one #705 removed. Module-level (like _DOWNLOAD_BASE) so the
+# aiohttp-level test can shrink it instead of moving 16 MB through the loopback.
+_API_CAP = 16 * 1024 * 1024
+
+# Marker stamped on error bodies THIS MODULE generates, so the panel can tell
+# them apart from a body CivitAI produced (#705). Without it the browser sees
+# only "some JSON with an error field" and would quote our own guard rails back
+# at the user as "CivitAI said: redirect target not allowed" — the same class of
+# misattribution the issue is about, just pointed the other way. Bodies forwarded
+# from upstream are NEVER stamped: an absent marker means CivitAI spoke.
+_PROXY_SOURCE = "comfyui-mcp-panel"
+
+
+def _proxy_error(web, message, status, retryable=False):
+    """A JSON error THIS proxy authored, tagged so the panel attributes it to the
+    panel rather than to CivitAI.
+
+    ``retryable`` is declared here rather than inferred from the status, because
+    the status belongs to US and says nothing about whether trying again helps: a
+    502 from the "could not reach CivitAI" path is worth retrying, and a 502 from
+    the redirect allow-list guard is a deterministic refusal that will fail
+    identically forever. Guessing from the number would tell the user to retry a
+    request that cannot succeed — the wrong-advice half of #705.
+    """
+    return web.json_response(
+        {"error": message, "source": _PROXY_SOURCE, "retryable": bool(retryable)},
+        status=status,
+    )
+
+
 # Only these hosts may be proxied (SSRF guard).
 _ALLOWED_HOSTS = frozenset(
     {
@@ -256,10 +294,10 @@ def register(routes, web):
         try:
             spec = await request.json()
         except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+            return _proxy_error(web, "the panel sent an invalid JSON request spec", 400)
         url = spec.get("url")
         if not isinstance(url, str) or not _host_ok(url):
-            return web.json_response({"error": "url host not allowed"}, status=400)
+            return _proxy_error(web, "that URL host is not on the CivitAI allow-list", 400)
         method = (spec.get("method") or "GET").upper()
         extra = spec.get("headers") if isinstance(spec.get("headers"), dict) else {}
         body = spec.get("body")
@@ -281,7 +319,36 @@ def register(routes, web):
 
                             await asyncio.sleep(0.35 * (2**attempt))
                             continue
-                        text = await resp.text()
+                        # Read in bounded chunks rather than resp.text(): the
+                        # body is untrusted and, on an error, is exactly what
+                        # the panel now quotes back to the user (#705), so it
+                        # must not be able to grow without limit on the way.
+                        buf = bytearray()
+                        over = False
+                        async for chunk in resp.content.iter_chunked(1 << 16):
+                            buf += chunk
+                            if len(buf) > _API_CAP:
+                                over = True
+                                break
+                        if over:
+                            return _proxy_error(
+                                web,
+                                "CivitAI's response exceeded the {} MB proxy limit and was "
+                                "discarded rather than truncated".format(_API_CAP // (1024 * 1024)),
+                                502,
+                            )
+                        try:
+                            text = buf.decode(resp.charset or "utf-8", errors="replace")
+                        except LookupError:
+                            # Upstream named a charset this Python doesn't know;
+                            # decode permissively rather than 500 on the panel.
+                            text = buf.decode("utf-8", errors="replace")
+                        # NOTE: the body is forwarded VERBATIM with the upstream
+                        # status — the panel's client is what turns it into a
+                        # user-facing sentence (bounded, credential-redacted,
+                        # attributed; see describeUpstreamFailure). content_type
+                        # is stamped json even when CivitAI answered with HTML,
+                        # so the client sniffs the body and never trusts this.
                         return web.Response(
                             body=text,
                             status=resp.status,
@@ -289,8 +356,8 @@ def register(routes, web):
                         )
                 except Exception as e:  # network flake
                     if attempt == 2:
-                        return web.json_response({"error": str(e)}, status=502)
-        return web.json_response({"error": "unreachable"}, status=502)
+                        return _proxy_error(web, "could not reach CivitAI: " + str(e), 502, retryable=True)
+        return _proxy_error(web, "could not reach CivitAI", 502, retryable=True)
 
     # Upper bound on a single proxied media body (thumbs + full images). Generous
     # for any real CivitAI asset; caps memory for a hostile/oversize upstream.
@@ -347,7 +414,7 @@ def register(routes, web):
     async def _civitai_download(request):
         version_id = request.query.get("versionId", "")
         if not version_id.isdigit():
-            return web.Response(status=400, text="numeric versionId required")
+            return _proxy_error(web, "a numeric versionId is required", 400)
         q = {k: request.query[k] for k in ("type", "format") if request.query.get(k)}
         url = _DOWNLOAD_BASE + version_id
         if q:
@@ -364,7 +431,7 @@ def register(routes, web):
                         if resp.status in _REDIRECTS:
                             loc = resp.headers.get("Location")
                             if not loc:
-                                return web.Response(status=502, text="redirect without Location")
+                                return _proxy_error(web, "CivitAI sent a redirect with no Location header", 502, retryable=True)
                             u = resp.url.join(URL(loc))
                             # A redirect to civitai's own /login (live: 307 →
                             # /login?returnUrl=…&reason=download-auth) means the
@@ -374,18 +441,15 @@ def register(routes, web):
                             # hint deterministically, instead of chasing the
                             # login page and handing back its HTML as the file.
                             if _is_auth_redirect(u.path, u.query_string):
-                                return web.json_response(
-                                    {"error": "sign-in required to download this file"},
-                                    status=401,
-                                )
+                                return _proxy_error(web, "sign-in required to download this file", 401)
                             # SSRF guard: only follow to https on a civitai/B2
                             # host, and only when EVERY address it resolves to
                             # is public — never loopback/RFC1918/link-local/
                             # metadata, even via a rebinding DNS answer.
                             if u.scheme != "https" or not _redirect_host_ok(u.host):
-                                return web.Response(status=502, text="redirect target not allowed")
+                                return _proxy_error(web, "CivitAI redirected the download to a host this proxy will not follow", 502)
                             if not await _resolves_public(u.host):
-                                return web.Response(status=502, text="redirect target not allowed")
+                                return _proxy_error(web, "CivitAI redirected the download to a host this proxy will not follow", 502)
                             url = str(u)
                             headers = dict(_API_HEADERS)  # drop Authorization on the hop
                             continue
@@ -396,12 +460,9 @@ def register(routes, web):
                         # than handing the panel an HTML "workflow" to choke on.
                         ctype = (resp.headers.get("Content-Type") or "").lower()
                         if ctype.startswith("text/html"):
-                            return web.json_response(
-                                {"error": "sign-in required to download this file"},
-                                status=401,
-                            )
+                            return _proxy_error(web, "sign-in required to download this file", 401)
                         if (resp.content_length or 0) > _DL_CAP:
-                            return web.Response(status=413, text="file too large")
+                            return _proxy_error(web, "the file is larger than the {} MB download limit".format(_DL_CAP // (1024 * 1024)), 413)
                         # Stream through — no 100MB buffer. Past the cap the
                         # headers are already gone, so abort the connection:
                         # the browser sees a failed fetch, never a silently
@@ -422,7 +483,7 @@ def register(routes, web):
                             await out.write(chunk)
                         await out.write_eof()
                         return out
-                return web.Response(status=502, text="too many redirects")
+                return _proxy_error(web, "CivitAI redirected the download too many times", 502, retryable=True)
             except Exception as e:
                 # Surface the traceback to ComfyUI's log — a swallowed handler
                 # exception here reads as an opaque 502 to the panel.
@@ -433,13 +494,13 @@ def register(routes, web):
                     if request.transport is not None:
                         request.transport.close()
                     raise
-                return web.Response(status=502, text="download error: " + str(e))
+                return _proxy_error(web, "the download failed: " + str(e), 502, retryable=True)
 
     @routes.get("/comfyui_mcp_panel/civitai/oauth/start")
     async def _oauth_start(request):
         origin = request.query.get("origin", "")
         if not origin.startswith("http"):
-            return web.json_response({"error": "origin required"}, status=400)
+            return _proxy_error(web, "origin required", 400)
         verifier, challenge = _pkce_pair()
         state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode("ascii")
         redirect = origin.rstrip("/") + _CALLBACK_PATH

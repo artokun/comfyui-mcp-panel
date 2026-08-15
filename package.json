@@ -4,11 +4,16 @@
   "private": true,
   "description": "Dev-only Playwright e2e harness for the ComfyUI Agent Panel. NOT shipped with the pack (see .comfyignore).",
   "scripts": {
-    "test:unit": "node --test browser_tests/unit/*.test.mjs",
+    "test:unit": "node scripts/i18n-check.mjs && node scripts/i18n-render-check.mjs && node scripts/check-tool-vocabulary.mjs && node scripts/check-panel-scope.mjs && node --test browser_tests/unit/*.test.mjs",
+    "check:scope": "node scripts/check-panel-scope.mjs",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:list": "playwright test --list",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "i18n:extract": "node scripts/i18n-extract.mjs",
+    "i18n:build": "node scripts/i18n-build-en.mjs",
+    "i18n:apply": "node scripts/i18n-apply.mjs",
+    "i18n:check": "node scripts/i18n-check.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",
@@ -16,5 +21,8 @@
     "@types/ws": "^8.5.13",
     "typescript": "^5.7.2",
     "ws": "^8.18.0"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
   }
 }

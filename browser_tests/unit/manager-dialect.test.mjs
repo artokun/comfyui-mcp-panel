@@ -10,6 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { classifyManager404 } from "../../web/js/lib/manager-404.js";
 
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
 const {
@@ -82,21 +83,92 @@ test("isManagerRouteMissing: ONLY the proven-404 marker qualifies a mutation ret
   assert.equal(isManagerUnreachable(new Error(UNREACHABLE)), true);
 });
 
+/** #423 (review P1) — build managerV2/managerCall over a fetchApi that REJECTS. */
+function buildTransportsOverRejectingFetch(thrown) {
+  const src = readPanelSource();
+  const factory = new Function(
+    "api",
+    "classifyManager404",
+    "markManagerUnreachable",
+    "managerFetchFailureMessage",
+    `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
+${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
+return { managerV2, managerCall };`,
+  );
+  return factory(
+    {
+      fetchApi: async () => {
+        throw thrown;
+      },
+    },
+    classifyManager404,
+    ManagerInstall.markManagerUnreachable,
+    (route, err) => `Manager ${route} could not be delivered: ${err?.message}`,
+  );
+}
+
+// #423, second blind spot (review P1). A REJECTED fetch — as opposed to a null response —
+// escaped the ladder twice over: managerV2 wrapped it untagged, and managerCall had no
+// catch at all, so "Failed to fetch" propagated raw. Neither wording has ever matched the
+// gate, so a transport failure skipped the legacy retry AND the /object_info fallback that
+// exists for exactly this case.
+test("managerV2/managerCall tag a REJECTED fetch — but never as route-missing", async () => {
+  const { managerV2: mv2, managerCall: mcall } = buildTransportsOverRejectingFetch(
+    new TypeError("Failed to fetch"),
+  );
+  for (const call of [mv2, mcall]) {
+    const err = await call("customnode/installed").then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err instanceof Error, "must reject with an Error");
+    assert.ok(isManagerUnreachable(err), "the idempotent-GET fallback ladder must see it");
+    // The safety boundary, and the reason tagging this is allowed at all: a rejection
+    // proves nothing about delivery, so it must never authorize re-sending a MUTATION.
+    assert.equal(isManagerRouteMissing(err), false, "a rejection is not a proven 404");
+  }
+});
+
+test("an aborted Manager fetch is still the caller's own — never an unreachable verdict", async () => {
+  const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
+  const { managerV2: mv2, managerCall: mcall } = buildTransportsOverRejectingFetch(abort);
+  for (const call of [mv2, mcall]) {
+    const err = await call("customnode/installed").then(
+      () => null,
+      (e) => e,
+    );
+    assert.equal(err, abort, "passes through unchanged");
+    assert.notEqual(err.managerTransportUnreachable, true, "and is never tagged");
+  }
+});
+
 // The marker itself is minted by the REAL transports — extract them and prove:
 // a 404 response tags the error; a no-response (null) failure does NOT.
 test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-response case", async () => {
   const src = readPanelSource();
+  // #706 — the extracted functions now depend on the classifyManager404 helper,
+  // so it is injected the same way `api` is. Injecting the REAL implementation
+  // (not a stub) keeps this a real-source harness.
   const factory = new Function(
     "api",
+    "classifyManager404",
+    // #423 — the transports now TAG their no-response throw so the fallback ladder
+    // recognises it without reading the (translated) message. Real implementation,
+    // same as classifyManager404.
+    "markManagerUnreachable",
     `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
 ${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
 return { managerV2, managerCall };`,
   );
   for (const res of [
-    { status: 404, ok: false }, // route not registered → proven rejection
+    { status: 404, ok: false, text: async () => "" }, // route not registered → proven rejection
     null, // no response → ambiguous
   ]) {
-    const { managerV2: mv2, managerCall: mcall } = factory({ fetchApi: async () => res });
+    const { managerV2: mv2, managerCall: mcall } = factory(
+      { fetchApi: async () => res },
+      classifyManager404,
+      ManagerInstall.markManagerUnreachable,
+    );
     for (const call of [mv2, mcall]) {
       const err = await call("manager/queue/status").then(
         () => null,
@@ -109,7 +181,60 @@ return { managerV2, managerCall };`,
         res !== null && res.status === 404,
         `marker only for the proven 404 (res=${JSON.stringify(res)})`,
       );
+      // #423 — whichever way it failed, the fallback ladder must be able to SEE it
+      // without reading the sentence. The 404 branch carries managerRouteMissing;
+      // the no-response branch is tagged by the transport itself. A translated
+      // message disarmed every rung of the ladder for 11 of 12 shipped locales.
+      assert.ok(
+        isManagerRouteMissing(err) || err.managerTransportUnreachable === true,
+        `structurally recognisable (res=${JSON.stringify(res)})`,
+      );
     }
+  }
+
+  // #706 — the ONE 404 that must NOT carry the marker: legacy Manager 3.x
+  // answers a security-gated operation with 404 + a refusal body. A handler ran
+  // and said no, so authorizing a #605 mutation re-send would re-submit an
+  // install the Manager already rejected.
+  {
+    const secRes = {
+      status: 404,
+      ok: false,
+      text: async () => "A security error has occurred. Please check the terminal logs",
+    };
+    const { managerV2: mv2, managerCall: mcall } = factory(
+      { fetchApi: async () => secRes },
+      classifyManager404,
+    );
+    for (const call of [mv2, mcall]) {
+      const err = await call("manager/queue/install").then(
+        () => null,
+        (e) => e,
+      );
+      assert.ok(err, "must throw");
+      assert.equal(isManagerRouteMissing(err), false, "a security refusal must not authorize a re-send");
+      assert.ok(!/not reachable/i.test(err.message), "must not claim the Manager is unreachable");
+      assert.match(err.message, /security gate/i);
+    }
+  }
+
+  // A 404 whose body cannot be read stays route-missing (pre-#706 behaviour) —
+  // we may not claim a refusal we cannot evidence.
+  {
+    const brokenBody = {
+      status: 404,
+      ok: false,
+      text: async () => {
+        throw new Error("stream already consumed");
+      },
+    };
+    const { managerV2: mv2 } = factory({ fetchApi: async () => brokenBody }, classifyManager404);
+    const err = await mv2("manager/queue/status").then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err, "must throw");
+    assert.equal(isManagerRouteMissing(err), true, "unreadable body falls back to route-missing");
   }
 });
 
@@ -124,6 +249,7 @@ function buildDialectHarness({ fetchApi, managerCall, managerV2, AbortSignalImpl
     "managerCall",
     "managerV2",
     "isManagerUnreachable",
+    "markManagerUnreachable",
     "dialectRetryTarget",
     "MANAGER_FETCH_TIMEOUT_MS",
     "AbortSignal",
@@ -142,6 +268,7 @@ return { managerGet, getDialectCache: () => managerDialectCache };`,
     managerCall,
     managerV2,
     isManagerUnreachable,
+    ManagerInstall.markManagerUnreachable,
     dialectRetryTarget,
     15000,
     AbortSignalImpl,
@@ -473,6 +600,9 @@ function graphUpdateDeps(overrides) {
     isManagerUnreachable,
     isManagerRouteMissing,
     dialectRetryTarget,
+    // #367 — the panel records a dialect the LIVE backend demonstrated by completing an
+    // enqueue on it. Harmless here; asserted directly in its own test below.
+    noteManagerDialectDowngrade: () => {},
     reProbeManagerDialect: async () => "v2",
     waitForUpdateResult: async () => ({
       item: { ui_id: "u-1", status: { status_str: "success", completed: true, messages: [] } },
@@ -611,6 +741,11 @@ test("#605: graph_update_node legacy-on-legacy unreachable surfaces the original
 });
 
 test("#424: a 405 on the /v2 envelope still lands on the legacy self-update route (via marker)", async () => {
+  // #367 reordered the ladder to v2 → v2-batch → legacy. The legacy landing this test
+  // exists for is unchanged; it is now reached after the batch route is TRIED, because a
+  // 405 on `queue/task` makes v2-batch the candidate worth one POST on a backend whose
+  // /v2 routes answer. It is only a candidate: here managerV2 405s every route, so the
+  // batch rung is refused too, legacy wins, and nothing is cached.
   const calls = [];
   const update = buildGraphUpdateNode(
     graphUpdateDeps({
@@ -633,6 +768,7 @@ test("#424: a 405 on the /v2 envelope still lands on the legacy self-update rout
     calls,
     [
       ["v2", "manager/queue/task"], // method-rejected — nothing landed
+      ["v2", "manager/queue/batch"], // #367 rung: also method-rejected here
       ["legacy", "manager/queue/update"],
       ["legacy", "manager/queue/start"],
     ],
@@ -668,12 +804,129 @@ test("codex r2: a route-404 from the 405-fallback's legacy POST heals through th
     calls,
     [
       ["v2", "manager/queue/task"], // 405 — nothing landed
+      ["v2", "manager/queue/batch"], // #367 rung — 405 too on this build
       ["legacy", "manager/queue/update"], // 404 after the restart — nothing landed
       ["v2", "manager/queue/task"], // healed re-enqueue on the live v4
       ["v2", "manager/queue/start"],
     ],
     "exactly one update lands, on the live dialect",
   );
+});
+
+test("#367: a v4 that 405s queue/task updates through BATCH, not legacy", async () => {
+  // The reported backend: built-in Manager v4 whose /v2 GETs (installed/list/status)
+  // all answer, but POST /v2/manager/queue/task returns 405. Detection reads
+  // /v2/manager/is_legacy_manager_ui to split v2 from v2-batch, and this build does not
+  // report a legacy UI — so it is classified "v2" and every attempt re-POSTs the one
+  // route it refuses. Update was unusable with a working batch route sitting unused.
+  const calls = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        return {}; // batch and start are served
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        throw routeMissing(); // a pip v4 does not serve the un-prefixed 3.x routes
+      },
+    }),
+  );
+  const res = await update({ id: "ComfyUI-LTXVideo", version: "nightly" });
+  assert.equal(res.queued, true, "the update must be queued instead of erroring");
+  assert.equal(res.dialect, "v2-batch", "and name the dialect it actually used");
+  assert.equal(res.via, undefined, "this is not a legacy self-update");
+  // Honest, and unchanged by this fix: the batch dialect exposes no per-task result,
+  // so the outcome cannot be auto-verified. Queued-and-pending is the correct answer
+  // for this backend — the bug was that it returned HTTP 405 instead of an answer.
+  assert.equal(res.pending, true, "a batch update reports honest pending");
+  assert.equal(res.verified, false);
+  assert.deepEqual(
+    calls,
+    [
+      ["v2", "manager/queue/task"], // 405 — method-rejected, nothing landed
+      ["v2", "manager/queue/batch"], // the rung #367 adds
+      ["v2", "manager/queue/start"],
+    ],
+    "it must never reach the legacy routes a pip v4 does not serve",
+  );
+});
+
+test("#367: a dialect that WORKED is recorded so the refused route is not re-POSTed", async () => {
+  // Detection got it wrong from the probe. What corrects it is not the 405 — that is
+  // only a candidate — but the batch enqueue LANDING, which is what this fixture does.
+  // Without recording that, every later call pays the refused POST again, which is what
+  // "the tool immediately errors" looked like.
+  const noted = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        return {};
+      },
+    }),
+  );
+  await update({ id: "ComfyUI-LTXVideo" });
+  assert.deepEqual(noted, ["v2-batch"], "a batch enqueue that LANDED must update the cached dialect");
+});
+
+test("#367: a build that refuses BOTH /v2 mutations caches nothing and lands on legacy", async () => {
+  // The case that makes the cache write dangerous (codex): `queue/task` 405s, and so
+  // does `batch`. Recording v2-batch on the first 405 would leave this backend — which
+  // updates FINE on legacy — permanently cached at a route it refuses, re-paying that
+  // POST on every later call. The heal only runs on a route-MISSING verdict, not a 405,
+  // so nothing would clear it.
+  const noted = [];
+  const calls = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        throw new Error(`Manager ${route}: HTTP 405`);
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        return {};
+      },
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.dialect, "legacy", "legacy is where this backend actually works");
+  assert.deepEqual(noted, [], "a dialect that never worked must not be cached");
+  assert.deepEqual(calls, [
+    ["v2", "manager/queue/task"],
+    ["v2", "manager/queue/batch"],
+    ["legacy", "manager/queue/update"],
+    ["legacy", "manager/queue/start"],
+  ]);
+});
+
+test("#367: task 405 then batch 404 heals through the ladder rather than caching", async () => {
+  // A 404 on batch is a route-level rejection, not a method one, so it takes the
+  // existing re-probe ladder instead of the legacy rung. Either way nothing is cached
+  // from a route that never ran an enqueue.
+  const noted = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      reProbeManagerDialect: async () => "legacy",
+      noteManagerDialectDowngrade: (d) => noted.push(d),
+      managerV2: async (route) => {
+        if (route === "manager/queue/task") throw new Error(`Manager ${route}: HTTP 405`);
+        throw routeMissing();
+      },
+      managerCall: async () => ({}),
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.dialect, "legacy");
+  assert.deepEqual(noted, [], "an enqueue that never landed must not be cached");
 });
 
 // ---------------------------------------------------------------------------
@@ -704,6 +957,17 @@ function nodesInstallDeps(overrides) {
     isManagerUnreachable,
     isManagerRouteMissing,
     dialectRetryTarget,
+    // #671: the command budget + stall classifier the extracted nodes_install
+    // now closes over. A generous budget keeps these tests on their original
+    // code paths (no stall translation); the budget behavior itself is covered
+    // in manager-install.test.mjs. The classifier mirrors the production
+    // isStallError: abort-primitive names + detect's own mid-probe abort ONLY —
+    // never a message-regex that would swallow a real Manager verdict.
+    NODES_INSTALL_COMMAND_BUDGET_MS: 25000,
+    isStallError: (err) =>
+      err?.name === "AbortError" ||
+      err?.name === "TimeoutError" ||
+      String(err?.message ?? "").startsWith("ComfyUI-Manager dialect detection was aborted mid-probe"),
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
     verifyInstalled: async () => ({ state: "installed", status: QUEUE_STATUS }),
@@ -809,4 +1073,49 @@ test("#605: nodes_install legacy-on-legacy unreachable surfaces the original err
     },
   );
   assert.deepEqual(calls, ["manager/queue/install"], "the rejected submit is not repeated");
+});
+
+// ── #920: a repository URL must reach Manager, not be reduced to an id ──────
+//
+// buildInstallRequest's v2 git branch sent `id: gitRepoName(url)` and dropped the URL, so
+// a from-source install became a registry lookup and Manager answered:
+//
+//   Node 'ComfyUI-SolAttn_triton@nightly' not found in
+//     [ManagerChannel.dev, ManagerDatabaseSource.cache]
+//
+// both sources being that branch's own channel:"dev" and mode:"cache" defaults.
+//
+// The field is read from Manager's installed model, not inferred:
+//
+//   class InstallPackParams(ManagerPackInfo):
+//     repository: Optional[str] = Field(
+//       None, description="GitHub repository URL (required if selected_version is nightly)")
+
+const GIT_URL = "https://github.com/kijai/ComfyUI-SolAttn_triton.git";
+
+test("#920: a repository-only nightly install carries the URL", () => {
+  const req = ManagerInstall.buildInstallRequest("v2", { repository: GIT_URL, version: "nightly" }, "u-1");
+  assert.equal(req.params.repository, GIT_URL, "the URL must reach Manager");
+  assert.equal(req.params.selected_version, "nightly", "and nightly is what makes it required");
+});
+
+test("#920: the id stays the derived NAME, not the URL", () => {
+  // Sending a URL as `id` made v4 silently mark the install done while doing nothing,
+  // which is why it was derived. That behaviour is preserved — this only stops the URL
+  // being discarded.
+  const req = ManagerInstall.buildInstallRequest("v2", { repository: GIT_URL, version: "nightly" }, "u-1");
+  assert.equal(req.params.id, "ComfyUI-SolAttn_triton");
+  assert.notEqual(req.params.id, GIT_URL);
+});
+
+test("#920: a URL passed as `id` is carried too — same routing, either field", () => {
+  const req = ManagerInstall.buildInstallRequest("v2", { id: GIT_URL, version: "nightly" }, "u-1");
+  assert.equal(req.params.repository, GIT_URL);
+  assert.equal(req.params.id, "ComfyUI-SolAttn_triton");
+});
+
+test("#920: a REGISTRY install is untouched — no repository field invented", () => {
+  const req = ManagerInstall.buildInstallRequest("v2", { id: "comfyui-impact-pack", version: "1.2.3" }, "u-1");
+  assert.equal(req.params.repository, undefined, "a non-git install must not carry one");
+  assert.equal(req.params.id, "comfyui-impact-pack");
 });

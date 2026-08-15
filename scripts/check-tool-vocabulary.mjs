@@ -75,6 +75,66 @@ const vocab = JSON.parse(readFileSync(join(root, "vendor", "tool-vocabulary.json
     process.exit(1);
   }
 }
+// #236 — the BAKED copy of the hash must still match the artefact.
+//
+// web/js/lib/vocabulary-hash.js duplicates `vocabularyHash` because `vendor/` is not
+// served to the browser (WEB_DIRECTORY is ./web), so the panel cannot read the artefact
+// at runtime. A duplicated constant is only honest with a gate on it: without this, a
+// re-vendor would leave the panel advertising the PREVIOUS vocabulary, and the
+// orchestrator would report a mismatch that is not real — worse than no handshake at
+// all, and indistinguishable from a genuine skew.
+{
+  // Read defensively (codex review, P2). A packaging or re-vendor change that drops
+  // this file must produce the checker's own FAIL — an uncaught ENOENT reads as the
+  // gate crashing, which is exactly the state where someone shrugs and reruns CI
+  // rather than noticing the pack is incomplete.
+  const bakedPath = join(root, "web", "js", "lib", "vocabulary-hash.js");
+  let baked;
+  try {
+    baked = readFileSync(bakedPath, "utf8");
+  } catch (err) {
+    console.error(
+      `
+[check-tool-vocabulary] FAIL
+
+` +
+        `Could not read web/js/lib/vocabulary-hash.js (${err?.code ?? err?.message ?? err}).
+
+` +
+        `The panel advertises this hash in its hello so the orchestrator can detect a
+` +
+        `tool-surface skew at connect (#236). Without the file the panel advertises
+` +
+        `nothing and every connection reads "unverified". Restore it with:
+
+` +
+        `  export const VENDORED_VOCABULARY_HASH = "${vocab.vocabularyHash}";
+`,
+    );
+    process.exit(1);
+  }
+  const m = baked.match(/VENDORED_VOCABULARY_HASH\s*=\s*"([0-9a-f]{64})"/);
+  if (!m) {
+    console.error(
+      `\n[check-tool-vocabulary] FAIL\n\n` +
+        `web/js/lib/vocabulary-hash.js does not declare a readable VENDORED_VOCABULARY_HASH.\n` +
+        `Expected a 64-character hex literal — the panel advertises it in its hello (#236).\n`,
+    );
+    process.exit(1);
+  }
+  if (m[1] !== vocab.vocabularyHash) {
+    console.error(
+      `\n[check-tool-vocabulary] FAIL\n\n` +
+        `The vocabulary hash the panel ADVERTISES is stale.\n\n` +
+        `  web/js/lib/vocabulary-hash.js  ${m[1]}\n` +
+        `  vendor/tool-vocabulary.json    ${vocab.vocabularyHash}\n\n` +
+        `Left as is, every connection reports a vocabulary mismatch that is not real\n` +
+        `(#236). Fix by replacing the constant with:\n\n` +
+        `  export const VENDORED_VOCABULARY_HASH = "${vocab.vocabularyHash}";\n`,
+    );
+    process.exit(1);
+  }
+}
 const CORE = new Set(vocab.core);
 const PANEL = new Set(vocab.panel);
 const DEAD = new Map(vocab.dead.map((d) => [d.name, d]));
@@ -84,7 +144,16 @@ const DEAD = new Map(vocab.dead.map((d) => [d.name, d]));
  * Narrow on purpose: README is NOT here, because a tool table is a claim about
  * what exists now, and that is precisely where panel_get_graph was a lie.
  */
-const HISTORICAL = [/^CHANGELOG\.md$/, /^docs\/changelog\//];
+const HISTORICAL = [
+  /^CHANGELOG\.md$/,
+  /^docs\/changelog\//,
+  // #758 — generated VERBATIM from CHANGELOG.md so the panel can show release notes in
+  // product. It is the same historical record in another encoding: exempting the source
+  // while flagging the copy would just mean the copy can never be regenerated. Safe to
+  // widen here specifically because it is generated and never hand-edited, so it cannot
+  // become a place where someone writes a fresh claim about what exists now.
+  /^web\/changelog\.json$/,
+];
 
 /**
  * Specific OCCURRENCES where naming a removed tool is correct.
@@ -250,11 +319,6 @@ const KNOWN_INDIRECTIONS = [
     why: "documentation comment describing the bridge",
   },
   {
-    file: "web/js/cmcp-runpod-ui.js",
-    match: "// runpod_* tools over the bridge's callTool (no agent turn needed):",
-    why: "prose. The callee pattern allows whitespace before '(' so that `callTool /* c */ (\"x\")` and `callTool?.(\"x\")` are matched; that also matches English after the word. Registering the line beats teaching the scanner to skip comments, which would lose real findings inside them.",
-  },
-  {
     file: "web/js/comfyui-mcp-panel.js",
     match: "// Reply to a direct callTool() request (cid-correlated).",
     why: "prose. Empty-argument callTool() is not a call site, but it IS invocation-shaped, so the coverage check below sees it.",
@@ -387,7 +451,15 @@ for (const path of codeFiles) {
         const line = lines[i] ?? "";
         const lit = PLAIN_LITERAL.exec(arg);
         if (lit) {
-          coreHits.push({ path, line: i + 1, name: lit[2], what });
+          // `after` is the source from the end of the captured name onward — the
+          // comma and the args expression. Section 1b reads the action out of it.
+          coreHits.push({
+            path,
+            line: i + 1,
+            name: lit[2],
+            what,
+            after: content.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 400),
+          });
           continue;
         }
         // Not a plain literal: a template with ${}, a concatenation, or an
@@ -445,6 +517,180 @@ if (unverifiable.length > 0) {
       `Registering is not a rubber stamp: a wrapper's OWN call sites must then be`,
       `scanned by a CALL_SITES pattern, or its names go unchecked — which is exactly`,
       `how callJson() hid nine core tool names.`,
+    ].join("\n"),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 1b. A LIVE name is not enough: every core call must pass an `action`.
+//
+// THE BLIND SPOT THIS CLOSES. Everything above hunts names, and a name-hunting
+// gate is structurally incapable of seeing the 0.50.0 migration's other half.
+// The consolidation folded 160 tools into 37 by moving the old tool's identity
+// into a REQUIRED `action` argument — and it did that on names that SURVIVED.
+// `install_custom_node`, `download_model`, `train_start`, `train_prepare_dataset`,
+// `list_local_models`, `save_workflow` and `enqueue_workflow` are all still real
+// tools, so `callTool("download_model", { url })` passes section 1 unchallenged
+// and then fails core's schema validation at the moment the user clicks. 33 of
+// the 37 core tools require an action; a call that omits one is dead code that
+// every gate in this file certifies as healthy.
+//
+// THE RULE: `action` is the FIRST key of the args object literal. Not "appears
+// somewhere in the args" — locating a key at the object's top level means
+// tracking brace, bracket, paren, string and template nesting, and a scanner
+// that gets that wrong reports a phantom or, far worse, accepts an `action:`
+// buried inside a nested object where it means nothing. First-key is decidable
+// by looking at the characters immediately after `{`, so there is no nesting to
+// get wrong, and it reads at a glance in review — which is the same reason the
+// call sites were written that way.
+//
+// The cost is a real constraint on how args are written: an args expression that
+// is not a brace literal (a ternary, a spread of a variable, a prebuilt object)
+// cannot be checked and is reported, not waved through. `{ action: "list",
+// ...(dir ? { model_type: dir } : {}) }` is the shape that satisfies it; hoisting
+// the ternary outside the braces does not.
+//
+// WHAT THIS DELIBERATELY DOES NOT CHECK, so it is not over-trusted:
+//
+//   The action's VALUE. `{ action: "delete" }` where "cancel" was meant passes
+//   here — and on `train_start` that is the difference between stopping a run
+//   and destroying its record. Checking it needs the per-tool action ENUM, and
+//   the vendored artefact does not carry one: it is a flat list of names plus a
+//   dead-name ledger. Hardcoding the enums HERE would rebuild, by hand, exactly
+//   the drifting copy of an upstream vocabulary that vendoring exists to
+//   prevent — and it would rot silently, which is worse than not having it.
+//   Until the exporter emits actions, VALUES are proven behaviourally, by tests
+//   that drive the real handlers and read the frame:
+//   browser_tests/unit/training-tool-actions.test.mjs and
+//   browser_tests/unit/runpod-tool-actions.test.mjs.
+//
+//   A LATER override — a duplicate `action:` key, or a spread after the first
+//   key that carries its own action. Detecting either means the nesting
+//   analysis first-key was chosen to avoid, and a naive "any spread is
+//   suspicious" rule would flag the two legitimate `...(cond ? {…} : {})` call
+//   sites in this repo. Recorded rather than half-solved.
+// ---------------------------------------------------------------------------
+/**
+ * Core tools that take NO `action` — exempt from the rule above.
+ *
+ * EMPTY, and that is the finding rather than an oversight: the four action-less
+ * core tools (apply_manifest, calculate, clear_vram, report_issue) are not called
+ * from this panel. They are deliberately NOT pre-listed — a name sitting here
+ * before anything calls it is a standing pre-approval nobody would re-review, the
+ * same defect KNOWN_INDIRECTIONS' staleness check exists to prevent. Add one with
+ * a reason WHEN a call site needs it.
+ */
+const NO_ACTION_CORE_TOOLS = new Set([]);
+
+/** Skip whitespace and block comments from `i`; returns the next code offset. */
+const skipWs = (s, i) => {
+  for (;;) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (s.startsWith("/*", i)) {
+      const end = s.indexOf("*/", i + 2);
+      if (end === -1) return s.length;
+      i = end + 2;
+      continue;
+    }
+    if (s.startsWith("//", i)) {
+      const end = s.indexOf("\n", i);
+      if (end === -1) return s.length;
+      i = end + 1;
+      continue;
+    }
+    return i;
+  }
+};
+
+/** First line only — an args expression spanning lines would otherwise drag the
+ *  rest of the statement into the error message. */
+const firstLine = (s) => s.split("\n")[0].trim();
+
+/**
+ * Read the action out of the source that FOLLOWS a tool-name literal.
+ *
+ * Returns one of:
+ *   { kind: "action", value }   the args object literal opens with `action:"…"`
+ *   { kind: "empty" }           it opens with `action:""` — a key, not an action
+ *   { kind: "missing" }         args are a brace literal that does not
+ *   { kind: "no-args" }         the call ends after the name
+ *   { kind: "opaque", text }    the args are not a brace literal at all
+ *   { kind: "expr", text }      the action's VALUE is not a bare string literal
+ */
+function readAction(after) {
+  let i = skipWs(after, 0);
+  if (after[i] === ")") return { kind: "no-args" };
+  if (after[i] !== ",") return { kind: "opaque", text: firstLine(after.slice(0, 60)) };
+  i = skipWs(after, i + 1);
+  if (after[i] !== "{") return { kind: "opaque", text: firstLine(after.slice(i, i + 60)) };
+  i = skipWs(after, i + 1);
+  const rest = after.slice(i);
+  const m = /^(?:"action"|'action'|action)\s*:\s*(?:"([^"]*)"|'([^']*)')/.exec(rest);
+  if (!m) return { kind: "missing" };
+  // The literal must be the WHOLE value expression, not a prefix of one.
+  // `{ action: "enqueue" && undefined, … }` and `{ action: "enq" + suffix }`
+  // both START with a matching string and both send something else — the first
+  // sends `undefined`. Requiring the property to END here is what makes the
+  // read a fact about the value rather than about its first token.
+  const end = skipWs(rest, m[0].length);
+  if (rest[end] !== "," && rest[end] !== "}") {
+    return { kind: "expr", text: firstLine(rest.slice(0, 60)) };
+  }
+  const value = m[1] ?? m[2];
+  // `{ action: "" }` satisfies "the key is present" and dispatches to nothing.
+  // Reported separately because the fix is different: the key is already there,
+  // so "add an action" would read as already done.
+  if (value === "") return { kind: "empty" };
+  return { kind: "action", value };
+}
+
+const actionFindings = [];
+for (const h of coreHits) {
+  if (!CORE.has(h.name)) continue; // section 1 already failed this one
+  if (NO_ACTION_CORE_TOOLS.has(h.name)) continue;
+  // `.bind` produces a NEW callee whose eventual call sites this scanner cannot
+  // follow, so the args — and the action in them — may be supplied anywhere.
+  // Reported rather than skipped: an earlier version of this loop `continue`d
+  // here, which meant a bind whose name argument DID parse as a live core tool
+  // landed in coreHits, passed section 1, and was then excluded from this check
+  // — the one direction a gate must not fail in. Nothing binds a tool name
+  // today, so failing closed costs nothing and the exemption would have been a
+  // standing pre-approval for a shape nobody has reviewed.
+  if (h.what === "callTool.bind") {
+    actionFindings.push({ ...h, read: { kind: "bind" } });
+    continue;
+  }
+  const read = readAction(h.after ?? "");
+  if (read.kind === "action") continue;
+  actionFindings.push({ ...h, read });
+}
+if (actionFindings.length > 0) {
+  errors.push(
+    [
+      `${actionFindings.length} core tool call(s) do not pass an \`action\` as the first argument key:`,
+      "",
+      ...actionFindings.map((h) => {
+        const why =
+          h.read.kind === "no-args"
+            ? "no arguments at all"
+            : h.read.kind === "missing"
+              ? "args object does not open with `action:`"
+              : h.read.kind === "empty"
+                ? "the action is the empty string — a key, but not a dispatchable action"
+                : h.read.kind === "bind"
+                  ? "bound with .bind(), so the action is supplied at a call site this gate cannot follow"
+                  : h.read.kind === "expr"
+                    ? `the action's value is an expression, not a bare string literal — ${JSON.stringify(h.read.text)}`
+                    : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
+        return `  ${h.path}:${h.line}  ${h.name}  (${why})`;
+      }),
+      "",
+      `33 of the ${vocab.counts.core} core tools REQUIRE an action: the 0.50.0 consolidation moved the`,
+      `retired tool's identity into that argument. The NAME staying valid is exactly why`,
+      `this needs its own check — sections 1-3 hunt dead names and see nothing wrong here,`,
+      `while the call fails schema validation the moment a user clicks.`,
+      `Write it as \`{ action: "…", …rest }\`. If the tool genuinely takes no action, add it`,
+      `to NO_ACTION_CORE_TOOLS with the reason.`,
     ].join("\n"),
   );
 }

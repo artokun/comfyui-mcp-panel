@@ -29,32 +29,72 @@ function createMemoryStorage({ throwOnSet = null } = {}) {
   }
 }
 
-function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false } = {}) {
-  let state = initialState == null ? null : structuredClone(initialState)
+function createFakeIndexedDb(
+  initialState = null,
+  { blockedThenSuccess = false, stores = ['snapshots'] } = {}
+) {
+  // KEYED, like the real thing. This used to be a single slot: get() ignored the key
+  // and put() replaced everything, so a SECOND key in a store silently destroyed the
+  // canonical snapshot. That is exactly how #861's pending-delete marker behaved when
+  // it was first tried here, and the failure looked like a bug in the change rather
+  // than in the fake. A fake that cannot tell two keys apart cannot test two keys.
+  const data = new Map()
+  const at = (store, key) => store + ' :: ' + String(key)
+  if (initialState != null) data.set(at('snapshots', 'state'), structuredClone(initialState))
   let closeCount = 0
 
   const createDb = () => ({
-    objectStoreNames: { contains: (name) => name === 'snapshots' },
+    objectStoreNames: { contains: (name) => stores.includes(name) },
     createObjectStore() {},
     close: () => { closeCount += 1 },
-    transaction: (_name, mode) => {
+    transaction: (names, mode) => {
+      const wanted = Array.isArray(names) ? names : [names]
+      for (const name of wanted) {
+        if (!stores.includes(name)) throw new Error('no object store ' + name)
+      }
       const tx = {
         oncomplete: null,
         onerror: null,
         onabort: null,
-        objectStore: () => ({
-          get: () => {
+        objectStore: (name = wanted[0]) => ({
+          get: (key) => {
             const request = { result: undefined, onsuccess: null, onerror: null }
             queueMicrotask(() => {
-              request.result = state == null ? undefined : structuredClone(state)
+              const held = data.get(at(name, key))
+              request.result = held === undefined ? undefined : structuredClone(held)
               request.onsuccess?.()
             })
             return request
           },
-          put: (value) => {
+          getAll: () => {
+            const request = { result: [], onsuccess: null, onerror: null }
+            queueMicrotask(() => {
+              request.result = [...data.entries()]
+                .filter(([held]) => held.startsWith(name + ' :: '))
+                .map(([, value]) => structuredClone(value))
+              request.onsuccess?.()
+            })
+            return request
+          },
+          put: (value, key) => {
             assert.equal(mode, 'readwrite')
-            state = structuredClone(value)
+            data.set(at(name, key === undefined ? 'state' : key), structuredClone(value))
             queueMicrotask(() => tx.oncomplete?.())
+            return { onsuccess: null, onerror: null }
+          },
+          delete: (key) => {
+            assert.equal(mode, 'readwrite')
+            data.delete(at(name, key))
+            queueMicrotask(() => tx.oncomplete?.())
+            return { onsuccess: null, onerror: null }
+          },
+          clear: () => {
+            assert.equal(mode, 'readwrite')
+            for (const held of [...data.keys()]) {
+              if (held.startsWith(name + ' :: ')) data.delete(held)
+            }
+            queueMicrotask(() => tx.oncomplete?.())
+            return { onsuccess: null, onerror: null }
           }
         })
       }
@@ -80,7 +120,17 @@ function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false }
       })
       return request
     },
-    readState: () => state == null ? null : structuredClone(state),
+    // Still the CANONICAL snapshot specifically, which is what every caller means
+    // by readState — now addressed by its key rather than by being the only thing
+    // the fake could hold.
+    readState: () => {
+      const held = data.get(at('snapshots', 'state'))
+      return held === undefined ? null : structuredClone(held)
+    },
+    readAt: (store, key) => {
+      const held = data.get(at(store, key))
+      return held === undefined ? null : structuredClone(held)
+    },
     closeCount: () => closeCount
   }
 }
@@ -2131,4 +2181,95 @@ test('a canonical commit cannot hide failure to save a legacyShadow only-copy tr
     'the schema fence must still exclude the legacy-only transcript from canonical IndexedDB',
   )
   store.close()
+})
+
+test('#1171 flush() SETTLES even when IndexedDB never answers', async () => {
+  // Relied on by the panel: hardRestart holds the reload re-entrancy guard across
+  // `invalidateDurableAgentSession()`, which awaits this. If flush() could hang, that guard
+  // would latch for the rest of the session. A bound was added in the panel for that fear
+  // and removed again once this property was established, so it is pinned here.
+  //
+  // The worst slow store there is: an `open` request that fires NO handler at all.
+  const hungIndexedDb = {
+    open: () => ({
+      set onsuccess(_) {},
+      set onerror(_) {},
+      set onblocked(_) {},
+      set onupgradeneeded(_) {}
+    })
+  }
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: hungIndexedDb,
+    broadcastFactory: null
+  })
+  store.persist([{ id: 't1', ts: 1, title: 'hung', msgs: [] }], {}, { maxThreads: 10, maxMessages: 10 })
+  const started = Date.now()
+  const result = await store.flush()
+  const elapsed = Date.now() - started
+  // Settles on the store's OWN open cap (IDB_OPEN_TIMEOUT_MS, 2000) rather than waiting
+  // forever. The slack is for CI scheduling, not for a second cap hiding behind this one.
+  assert.ok(elapsed < 4000, `flush() took ${elapsed}ms — it must settle on the open cap, not hang`)
+  // For a history INSIDE the local shadow's limits it also reports success — and via
+  // `result.ok === true`, because the shadow write is complete. (An earlier comment here
+  // claimed flush() got there by mapping a null result to true; that is a different branch
+  // and not the one this case takes.)
+  //
+  // WORTH BEING PRECISE ABOUT WHAT THAT TRUE MEANS: the CANONICAL IndexedDB write did not
+  // happen — the open was capped — so success here rests on the local shadow alone. The
+  // panel's caller is named `invalidateDurableAgentSession`, and on this path it reports
+  // durable invalidation when only the shadow carries it. That is the store's existing
+  // contract rather than anything this branch changes, but it is the reason the word
+  // "durable" is doing less work than it looks like it is.
+  assert.equal(result, true, 'a capped open must not read as a failed write for a small history')
+  store.close()
+})
+
+test('#1171 a capped open reports failure exactly past the local shadow boundary', async () => {
+  // The other half, and the one a first probe missed by testing a five-message thread and
+  // generalising. A capped open makes idbMergeWrite yield null, so persist() falls back to
+  // the LOCAL SHADOW's completeness — and the shadow is deliberately partial past
+  // LOCAL_SHADOW_THREADS (20) and LOCAL_SHADOW_MESSAGES (200).
+  //
+  // Pinned AT the boundary rather than at some comfortably-past size, so this test says
+  // where the behaviour actually changes instead of merely that it changes somewhere.
+  //
+  // Why the panel cares: invalidateDurableAgentSession() maps a non-true flush to "could
+  // not invalidate durably", so for any user past these limits a two-second disk hiccup
+  // answers false — which its callers must treat as "could not CONFIRM" rather than "the
+  // store is broken" (#1184).
+  // FAILS immediately rather than hanging. What this test needs is "the canonical write did
+  // not happen", and openDb() resolves null on onerror exactly as it does on its 2s cap —
+  // same downstream path, no wall-clock wait. Hanging here cost four seconds of suite time
+  // per case to prove something the settle test above already proves once.
+  const failingIndexedDb = {
+    open: () => {
+      const req = {}
+      queueMicrotask(() => req.onerror?.())
+      return req
+    }
+  }
+  const thread = (id, n) => ({ id, ts: 1, title: id, msgs: Array.from({ length: n }, (_, i) => ({ id: id + i, role: 'user', text: 'x' })) })
+  const cases = [
+    ['200 messages — at the limit', [thread('t', 200)], true],
+    ['201 messages — one past it', [thread('t', 201)], false],
+    ['20 threads — at the limit', Array.from({ length: 20 }, (_, t) => thread('t' + t, 1)), true],
+    ['21 threads — one past it', Array.from({ length: 21 }, (_, t) => thread('t' + t, 1)), false]
+  ]
+  for (const [label, threads, expectOk] of cases) {
+    const store = new ChatHistoryStore({
+      storage: createMemoryStorage(),
+      indexedDb: failingIndexedDb,
+      broadcastFactory: null
+    })
+    store.persist(threads, {}, { maxThreads: 500, maxMessages: 1000 })
+    const result = await store.flush()
+    if (expectOk) {
+      assert.equal(result, true, `${label}: a complete shadow still confirms`)
+    } else {
+      assert.notEqual(result, true, `${label}: a partial shadow must not claim a durable write`)
+      assert.equal(result?.ok, false, `${label}: and it reports why`)
+    }
+    store.close()
+  }
 })

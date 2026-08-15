@@ -1,3 +1,42 @@
+import { pressableWidgetHint } from "./pressable-widget.js";
+import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
+
+// #976: captured at module load so invoking a widget's callback cannot read any
+// property off the callback itself (a poisoned `.call` getter or a Proxy trap would
+// throw INSIDE the span that attributes the throw to the callback body) and cannot
+// depend on globals a page could later redefine.
+const reflectApply = Reflect.apply;
+// A module-load capture cannot defend against a `Reflect.apply` that was already
+// replaced BEFORE this module evaluated (codex round 2). Nothing here can: at that
+// point the page owns the intrinsics the whole panel runs on. Written down rather
+// than defended, so the limit is known instead of assumed away.
+
+/**
+ * #976: describe a thrown value for a disclosure message.
+ *
+ * Renders what `${threw?.message ?? threw}` rendered before — `new Error("")` still
+ * yields an empty detail, a thrown string still yields itself, `{ message: 0 }` still
+ * yields `0` — and adds only what was missing: nullish throws (which the old
+ * truthiness test never reached) and totality. `throw` accepts any value, so
+ * `.message` may be a getter that throws and `toString` may throw, and a disclosure
+ * that exists to REPORT a throw must not itself throw (codex round 3).
+ *
+ * Not equivalent in the cases where the OLD form threw: a Symbol (or a Symbol-valued
+ * `message`) cannot be implicitly coerced, so template interpolation threw where
+ * `String()` returns `Symbol(x)`. Deliberate — those are exactly the throws that used
+ * to escape the reporting path (codex round 4).
+ */
+function describeThrown(err) {
+  // The one case where a label is warranted: there is nothing else to print, and
+  // "(undefined)" alone reads like a bug in the reporting rather than the thrown value.
+  if (err === null || err === undefined) return `a non-Error value was thrown: ${String(err)}`;
+  try {
+    return String(err.message ?? err);
+  } catch {
+    return "a thrown value that could not be described";
+  }
+}
+
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
 // RIGHT value and can be unit-tested by driving the SAME code path the handler
@@ -71,6 +110,25 @@ export function isComboWidget(widget) {
     return true;
   }
   return String(widget?.type ?? "").toLowerCase() === "combo";
+}
+
+/**
+ * #667: the index of the option whose stringified LABEL equals the stringified
+ * scalar `value`, or -1. Scalars only (string/number/boolean) on both sides.
+ * Used by the combo coercion fallback AND by the #507 empty-list sibling rail
+ * cross-check, so both apply the SAME matching rule; callers always write back
+ * the list's ORIGINAL option, never the incoming scalar, so no number is ever
+ * reinterpreted as an index and no mistyped value lands (#240 intact).
+ */
+function optionLabelIndex(options, value) {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    return -1;
+  }
+  return options.findIndex(
+    (o) =>
+      (typeof o === "string" || typeof o === "number" || typeof o === "boolean") &&
+      String(o) === String(value),
+  );
 }
 
 // litegraph "number"/"slider" and Comfy "INT"/"FLOAT" all render numeric.
@@ -378,10 +436,20 @@ export function coerceWidgetValue(
         { combo: true, emptyOptions: true },
       );
     }
-    // STRICT typed membership: no numeric<->string coercion. Numeric options
-    // [0,1,2] accept numeric 1; string options ["0","1","2"] require "1", never
-    // the number 1 (which would otherwise behave like an index).
+    // STRICT typed membership first: an exact-typed option is always writable.
     if (options.includes(value)) return value;
+    // #667: NUMERIC-LABELLED options (VHS ProRes profile ["lt",…,"4444",…], ffv1
+    // level ["0","1","3"]). The tool's `value` param is string|number|boolean, so a
+    // numeric-looking label can arrive as the NUMBER 4444 after upstream JSON
+    // coercion, and strict membership then refused it even though the label sits in
+    // the list — the option was unreachable via the panel. Fall back to matching the
+    // option's LABEL stringified, and on a match return the option's ORIGINAL value
+    // from the list — NEVER the incoming scalar — so no mistyped value lands on the
+    // widget and no number is ever reinterpreted as an INDEX: the #240 concern was
+    // a number silently read as a dropdown position, and that stays refused below
+    // (options ["alpha","beta","gamma"] with value 1 matches no label).
+    const labelIdx = optionLabelIndex(options, value);
+    if (labelIdx >= 0) return options[labelIdx];
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
@@ -855,7 +923,11 @@ export function resolveWidgetWrite(
   if (!widget) {
     const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
     throw new WidgetWriteError(
-      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).`,
+      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).` +
+        // #757 — the available list may already contain the answer without saying
+        // so: a button that CREATES the missing slot. Empty for a node with no
+        // pressable widget, which is the ordinary typo case.
+        pressableWidgetHint(targetNode, widgetName),
     );
   }
 
@@ -909,7 +981,11 @@ export function applyWidgetWrite(
   // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
   // the AUTHORITATIVE parent rail widget can't be identified (#366).
   const coerceOutcome = {};
-  const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
+  // `coerced` is mutable: the #507 empty-list sibling cross-check below may ADOPT a
+  // rail option's original value when the numeric-labelled fallback matches there
+  // (#667 codex round-3) — the write then lands the list's own value, not the
+  // caller's coerced scalar.
+  let { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
       // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
@@ -957,6 +1033,14 @@ export function applyWidgetWrite(
   // source can disagree with the first, which would turn the narrowing into an escape
   // hatch around this very check (codex confirmation round).
   if (coerceOutcome.emptyAcceptanceUsed) {
+    let adoptedOption = false;
+    // Each sibling's option list AS READ during admission. A STATEFUL non-function
+    // source (an accessor/proxy answering differently per read) must not be read a
+    // second time: the post-adoption re-validation below checks the SAME snapshots
+    // admission was decided against — a fresh read could produce a false DISAGREE
+    // or pass against a list that has since changed (codex delta-gate 2), the same
+    // never-read-twice rule `emptyAcceptanceUsed` itself follows (above).
+    const siblingSnapshots = [];
     for (const other of [parentWidget, ...displayWidgets]) {
       if (!other || !isComboWidget(other)) continue;
       // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it
@@ -974,13 +1058,69 @@ export function applyWidgetWrite(
       }
       const otherOptions = comboOptions(other);
       if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
+      // Snapshot the list AS READ (a stateful non-function source can answer
+      // differently per read — the re-validation below must check the SAME list
+      // admission was decided against, codex delta-gate 2). The copy itself can
+      // throw: a buggy-but-in-scope array with a THROWING later-index getter must
+      // not crash a write `includes()` would admit from an early member (codex
+      // final gate) — so a failed copy records a NULL snapshot and admission
+      // proceeds exactly as before. Only if an adoption later REPLACES the value
+      // does the missing snapshot matter, and then the write fails closed (below)
+      // rather than skip re-validation.
+      let snapshot = null;
+      try {
+        snapshot = otherOptions.slice();
+      } catch {
+        snapshot = null;
+      }
+      siblingSnapshots.push({ name: other.name, options: snapshot });
       if (otherOptions.includes(coerced)) continue;
+      // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
+      // a numeric request (4444) against a rail list holding the string "4444" must
+      // not refuse an option the rail itself publishes. On a label match ADOPT the
+      // rail list's ORIGINAL value for the whole write (the inner's empty list
+      // accepted any scalar, so writing the rail's own option there is at least as
+      // valid), never the incoming scalar — the #240 no-index guarantee holds.
+      const siblingLabelIdx = optionLabelIndex(otherOptions, coerced);
+      if (siblingLabelIdx >= 0) {
+        adoptedOption = true;
+        coerced = otherOptions[siblingLabelIdx];
+        continue;
+      }
       throw new WidgetWriteError(
         `Value ${JSON.stringify(coerced)} is not a valid option for the parent subgraph's ` +
           `combo widget "${other.name}" (${otherOptions.length} options), which this promoted ` +
           `write also mutates — the inner widget's option list is empty, but this one is not. ` +
           `Refusing to write.`,
       );
+    }
+    // Codex delta-gate: an adoption REPLACES the value mid-loop, and a later sibling
+    // can adopt a DIFFERENTLY-TYPED original of the same label (rail lists "4444",
+    // a display proxy lists 4444) — the final write would then land a value an
+    // earlier-validated sibling's list does not contain. When any adoption
+    // happened, re-validate the FINAL value against every sibling's SNAPSHOT: a
+    // sibling that does not strictly contain it conflicts (same label, different
+    // type — or the value absent there), so no single value satisfies every list;
+    // fail closed.
+    if (adoptedOption) {
+      for (const snap of siblingSnapshots) {
+        // A NULL snapshot (the list could not be fully copied — a member access
+        // threw) means the adopted value cannot be re-validated against this
+        // sibling at all: fail closed rather than skip the check. A snapshot's
+        // elements are plain copies, so `includes` here cannot throw.
+        if (snap.options && snap.options.includes(coerced)) continue;
+        throw new WidgetWriteError(
+          snap.options
+            ? `The sibling combo widgets this promoted write mutates DISAGREE about option ` +
+              `${JSON.stringify(coerced)}: after matching it by label, "${snap.name}"'s list ` +
+              `(${snap.options.length} options) does not contain the resulting value — the lists ` +
+              `hold the same label with different types (or not at all), so no single value ` +
+              `satisfies every list. Refusing to write.`
+            : `The sibling combo widget "${snap.name}"'s option list could not be fully read ` +
+              `(a member access threw), so the label-adopted value ${JSON.stringify(coerced)} ` +
+              `cannot be re-validated against it. Refusing to write.`,
+        );
+      }
     }
   }
 
@@ -1072,6 +1212,26 @@ export function applyWidgetWrite(
   // fired its hooks: an afterChange hook can itself re-stale a widget or change the
   // promotion topology, and that must be caught too (not just callback-time drift).
   let threw = null;
+  // #976 (codex NO-SHIP round 2): a captured throw cannot be detected by testing
+  // `threw` for truthiness — `throw undefined`, `throw null`, `throw 0`, `throw ""`
+  // are all legal, and a callback that did any of them produced NO disclosure at all:
+  // the write reported clean while its side effects had not run. Pre-existing, and it
+  // silently defeats the whole attribution, so it is fixed here.
+  let didThrow = false;
+  // #976: TRUE when the throw arose from this write's INVOCATION of the widget's own
+  // callback — including a callback that could not be invoked at all. It is the one
+  // step in this envelope whose throw the mechanism can attribute, and only because
+  // the lookup and the argument evaluation are hoisted out of it below (see the note
+  // there). Everything else stays unattributed, exactly as #639 requires.
+  //
+  // It does NOT establish that the callback's BODY ran: a non-callable value, a class
+  // constructor, a revoked Proxy and a throwing `apply` trap all throw at the
+  // invocation without entering any body (codex NO-SHIP round 2). The wording below is
+  // written to be true of all of them, and never says the callback executed.
+  let threwFromCallback = false;
+  // Captured at lookup so the disclosure can describe it WITHOUT reading `w.callback`
+  // a second time (it may be an accessor with side effects, or a throwing one).
+  let widgetCallback = null;
   safeBefore();
   try {
     // Assign BOTH values first. The parent's projected promoted widget is a VIEW of
@@ -1088,31 +1248,93 @@ export function applyWidgetWrite(
     for (const dw of displayWidgets) dw.value = coerced;
     // Fire the inner widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
-    w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
+    //
+    // #976: the flagged span contains the INVOCATION and nothing else, because the
+    // flag is an attribution and an attribution that can be raised by anything but
+    // the callback body is a lie. Hoisted out of it, in order:
+    //   - the `w.callback` LOOKUP: it may be a throwing accessor, which is not the
+    //     callback failing (it never ran)
+    //   - the ARGUMENTS, including `targetNode.pos`, which may be a throwing getter
+    //   - and they are built INSIDE the nullish guard, because the original
+    //     `w.callback?.(…)` short-circuited: with no callback, `pos` was never read,
+    //     and a node with a throwing `pos` getter and no callback must keep the clean
+    //     verified write it had (codex NO-SHIP round 1)
+    //
+    // `Reflect.apply` rather than `widgetCallback.call(…)`: `.call` is a property read
+    // ON the callback, so a poisoned getter or a Proxy `get` trap could throw INSIDE
+    // the flagged span without the callback running — and, worse, a non-callable
+    // `{ call() {} }` would have been INVOKED through its own `.call` method and
+    // reported as a clean write, where the optional-call form correctly threw
+    // (codex NO-SHIP round 1). Reflect.apply checks callability first, so a
+    // non-callable callback still throws a TypeError exactly as before, and it takes
+    // the argument list without spreading — no `Symbol.iterator` to poison either.
+    // `reflectApply` is captured at module load for the same reason.
+    widgetCallback = w.callback;
+    if (widgetCallback !== null && widgetCallback !== undefined) {
+      const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
+      threwFromCallback = true;
+      reflectApply(widgetCallback, w, callbackArgs);
+      threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+    }
   } catch (err) {
+    // #639 (codex round-3 + delta-gate): WHICH construct threw is not recorded for
+    // anything but the callback invocation — a value setter can invoke the callback
+    // itself, `w.callback` can be a throwing accessor, a setter can throw before OR
+    // after applying, a rail/proxy setter or a `targetNode.pos` getter can throw,
+    // and a write to a frozen widget throws with no user code at all. For every one
+    // of those `threwFromCallback` is FALSE and the disclosure names no construct,
+    // unchanged. #976 adds the single case the mechanism CAN establish: the throw
+    // arose from this write's invocation of the widget's own callback.
+    didThrow = true;
     threw = err;
   } finally {
     safeAfter();
   }
 
   // VERIFY AFTER afterChange. Compute the failure reason (if any) WITHOUT mutating,
-  // so rollback happens in its own envelope below. Order: a thrown callback; then a
-  // value that did not stick on the inner (#240) or the authoritative rail (#366);
-  // then a promotion-relationship change (re-resolved from the LIVE graph, catching
-  // an outer link, a replaced/detached host input, or a re-pointed slot→widget map).
+  // so rollback happens in its own envelope below. Order: a value that did not stick
+  // on the inner (#240) or the authoritative rail (#366); then a promotion-
+  // relationship change (re-resolved from the LIVE graph, catching an outer link, a
+  // replaced/detached host input, or a re-pointed slot→widget map).
+  //
+  // #639: a THROWN callback is deliberately NOT a verdict in this chain. The value
+  // assignments above run BEFORE the callback fires, so when the callback throws the
+  // write may ALREADY be in effect (MiniMaxH3Director's `duration`: the extension's
+  // own callback throws on `options` of undefined on ANY programmatic invocation,
+  // which made the widget permanently unwritable when any throw forced a refusal).
+  // Rolling a VERIFIED write back and refusing would report failure for work that
+  // succeeded and invite a destructive retry — so the structural checks below
+  // decide. A throw on a verified write is DISCLOSED on the success result
+  // (`write_warning`); only a write that ALSO fails verification fails + rolls
+  // back, with the throw named as the likely cause.
   let failure = null;
   let originalErr = null;
   let driftFailure = false;
-  if (threw) {
-    originalErr = threw instanceof WidgetWriteError ? threw : null;
-    failure =
-      threw instanceof WidgetWriteError
-        ? threw.message
-        : `a widget callback threw (${threw?.message ?? threw})`;
-  } else if (!matchesExpected(w.value)) {
+  let writeWarning = null;
+  // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
+  // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
+  // exactly its job (min 1 / step 2 snaps 4096 -> 4097) was reported as "did not
+  // retain the requested value" for a mutation that had APPLIED. Worse than merely
+  // wrong: the natural response to "did not retain" is a retry, and the retry
+  // normalizes identically forever.
+  //
+  // Only an EXACTLY reproducible snap counts. If the config does not explain the
+  // observed value, this stays the failure it was — no tolerance, because a
+  // tolerance would eventually swallow a real revert that landed nearby.
+  const normalization = matchesExpected(w.value)
+    ? null
+    : explainNumericNormalization(expected, w.value, w);
+  if (!matchesExpected(w.value) && !normalization) {
     failure =
       `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
-      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.`;
+      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.` +
+      // #698 — "did not retain" reads as a transient failure worth retrying. For a
+      // non-value-bearing DOM widget it is STRUCTURAL: the widget is a view, its
+      // real state lives on the node, and no number of retries will change that.
+      // Appended ONLY here, in the branch where the revert has already been
+      // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
+      // that would have worked. Diagnosis, never a gate.
+      describeNonValueBearingWidget(w, targetNode);
   } else if (parentWidget && !matchesExpected(parentWidget.value)) {
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
@@ -1176,6 +1398,104 @@ export function applyWidgetWrite(
           recheckThrew ? "; re-resolving the promotion threw" : ""
         }), so the rail that was synced is no longer the value that serializes at queue time. Rolled ` +
         `back to avoid a silently-stale render (#366).`;
+    }
+  }
+
+  // #639: reconcile a captured throw with the verification verdict. The write
+  // VERIFIED (value + rail + proxies retained, promotion topology intact) — the
+  // throw came from applying the write: DISCLOSE it on the success result, never
+  // report a clean failure for an applied write. The write did NOT verify — the
+  // throw is the likely cause: compose BOTH causes into the failure (codex
+  // round-1: a thrown WidgetWriteError saved un-composed discarded the structural
+  // detail), keeping the error's retry flags (combo/emptyOptions) through the
+  // composition.
+  //
+  // Attribution (codex rounds 2-3 + delta-gates): only what the mechanism can
+  // ESTABLISH is claimed. The write envelope evaluates value setters on the inner,
+  // rail, and display proxies, property reads (`w.callback` may be a throwing
+  // accessor, `targetNode.pos` a getter), and the callback invocation — and a
+  // plain write to a frozen widget throws with NO user code involved. So for all of
+  // those the message names NO construct: only that an exception was thrown while
+  // applying the write. And read-back verifies only that the requested value IS
+  // present — not that THIS write put it there (a frozen widget may already have
+  // held it), so the disclosure claims "IS in effect", never "DID take effect".
+  // What IS established and claimed: the requested value is present by read-back,
+  // and the write's side effects may not have run or completed.
+  //
+  // #976: the callback INVOCATION is the one construct that is establishable, once
+  // its lookup and arguments are hoisted out of it (see the envelope above) — and
+  // naming it matters, because the unattributed wording leads with "an exception was
+  // thrown while applying the write", which reads as THE PANEL FAILED TO APPLY YOUR
+  // WRITE. That is the opposite of what happened, and #976 was filed here as a panel
+  // defect because of it.
+  //
+  // The attributed wording says exactly what the mechanism observed — the exception
+  // arose from the INVOCATION step, not from the assignment — and stops there. Three
+  // things it deliberately does NOT claim, each a codex NO-SHIP finding on an earlier
+  // draft of this text, each right:
+  //   * whose code the callback is. A pack, an extension, a prototype or the frontend
+  //     itself may have installed it.
+  //   * that anyone is at FAULT. This write invokes the callback PROGRAMMATICALLY, and
+  //     a callback written for a click can throw for that reason alone (measured on
+  //     #757), which would make the throw ours as much as anyone's.
+  //   * that the callback's BODY ran. A non-callable value, a class constructor, a
+  //     revoked Proxy and a throwing `apply` trap all throw at the invocation without
+  //     entering a body. "came from this write's invocation of" is true of every one
+  //     of them; "the callback threw" would not be.
+  // An attribution that overshoots just relocates the wrong blame.
+  if (didThrow) {
+    const threwDetail = describeThrown(threw);
+    // "ATTEMPT to invoke", uniformly (codex round 3). A class constructor and a
+    // revoked Proxy both satisfy `typeof === "function"` and then throw before any
+    // body runs, so any wording that says the callback RAN is false for them — and
+    // the mechanism cannot tell them from a body that threw. The weaker claim is true
+    // of every case, so it is the only one made.
+    const threwLabel = threwFromCallback
+      ? `an exception came from attempting to invoke the widget's OWN callback while applying the write`
+      : `an exception was thrown while applying the write`;
+    // Establishable and worth saying when it holds: a value that is not a function
+    // cannot have been entered at all. Reads the value CAPTURED at lookup time —
+    // never `w.callback` again, which would invoke a throwing accessor a second time.
+    const notCallable = threwFromCallback && typeof widgetCallback !== "function";
+    if (!failure) {
+      writeWarning = threwFromCallback
+        ? `the write itself SUCCEEDED: the requested value IS in effect — verified present by ` +
+          `read-back — and was NOT rolled back. The exception (${threwDetail}) came from this ` +
+          `write's attempt to invoke the widget's own callback, which happens AFTER the value ` +
+          `is assigned — the assignment itself did not throw.` +
+          (notCallable
+            ? // No indefinite article: `typeof` yields "object", where "a object" reads
+              // as a bug in the panel — which is the exact impression this whole fix
+              // exists to stop giving. Caught in the browser, not by a unit test.
+              ` The widget's callback is of type "${typeof widgetCallback}", not a function, so it ` +
+              `could not be invoked at all and none of its side effects ran.`
+            : ` Side effects that callback would normally perform (refreshing dependent widgets, ` +
+              `previews, thumbnails) may not have run or completed; inspect the node if dependents ` +
+              `look stale. Note that this write invokes callbacks programmatically, which is by ` +
+              `itself enough to make a callback written for a click throw.`)
+        : `${threwLabel} (${threwDetail}); the requested value IS in effect — ` +
+          `verified present by read-back — and was NOT rolled back. Side effects the write ` +
+          `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +
+          `not have run or completed; inspect the node if dependents look stale.`;
+    } else {
+      failure = `${threwLabel} (${threwDetail}); ${failure}`;
+      // #976 round 3: CLASSIFYING the thrown value can itself throw — a Proxy with a
+      // hostile `getPrototypeOf` trap breaks `instanceof`, and hostile `combo` /
+      // `emptyOptions` getters break the property reads that follow a successful one.
+      // That would escape from the branch whose whole job is to report a failure we
+      // ALREADY know, losing it. A thrown value gets to be described and, if it
+      // cooperates, classified — never to decide whether we report at all.
+      try {
+        if (threw instanceof WidgetWriteError) {
+          originalErr = new WidgetWriteError(failure, {
+            combo: threw.combo,
+            emptyOptions: threw.emptyOptions,
+          });
+        }
+      } catch {
+        // Composed message stands on its own; the retry flags are simply unavailable.
+        originalErr = null;
+      }
     }
   }
 
@@ -1386,11 +1706,37 @@ export function applyWidgetWrite(
   // parent_widget_synced is reported for observability / defense-in-depth in the
   // panel summary. display_widgets_synced counts the additional parent-facing display
   // proxies also synced so the outer node no longer shows a stale value (#477).
+  // #639: write_warning discloses a widget callback that threw AFTER the verified
+  // write landed — the value IS in effect, its side effects are uncertain.
+  // #976: `write_warning_source` carries the attribution as DATA, so a caller does not
+  // have to pattern-match prose to render it. Present ONLY for the establishable case;
+  // its absence means "not attributable", never "the panel's fault".
   return {
     node_id: targetNode.id,
     widget: w.name,
     previous: parentWidget ? previousParent : previous,
     value: w.value,
+    ...(writeWarning
+      ? {
+          write_warning: writeWarning,
+          ...(threwFromCallback ? { write_warning_source: "widget_callback" } : {}),
+        }
+      : {}),
+    // #805 — the write applied and the node quantized it. Report BOTH values so the
+    // caller can carry the stored one forward instead of retrying the request.
+    ...(normalization
+      ? {
+          normalized: true,
+          requested_value: expected,
+          normalization_rule: normalization.rule,
+          normalization_note: normalizationNote({
+            name: w.name,
+            requested: expected,
+            actual: w.value,
+            rule: normalization.rule,
+          }),
+        }
+      : {}),
     ...(promotedFrom
       ? {
           inner_previous: previous,
@@ -1402,4 +1748,81 @@ export function applyWidgetWrite(
         }
       : {}),
   };
+}
+
+/**
+ * #698 — explain a write that reverted, when the widget structurally cannot hold
+ * a value.
+ *
+ * Custom packs register DOM widgets that are pure VIEWS: ComfyUI's `addDOMWidget`
+ * gives them an `element`, and the pack supplies `getValue`/`setValue` that read
+ * and write the node's own state instead of the widget's `.value`. Pixaroma's
+ * `PixaromaPrompt` is the reported case — `pix_prompt_ui` returns null from
+ * `getValue`, `setValue` is a no-op, and the prompt actually lives in
+ * `node.properties.promptState.text`.
+ *
+ * Assigning `.value` on one of those appears to work and then reverts, so the
+ * caller was told the widget "did not retain the requested value" — indistinguishable
+ * from a transient failure, and the reporter reasonably retried before working
+ * around it. This makes the structural case say so.
+ *
+ * DELIBERATELY DIAGNOSIS-ONLY. It is called from the failure branch, after the
+ * revert has been observed, and never decides whether a write may proceed. A
+ * pre-emptive version would have to guess "this widget cannot hold a value" from
+ * `serialize === false` — and #715 established that `serialize:false` is normal
+ * for perfectly healthy widgets (LoadImage's `upload` button is one), so gating on
+ * it would manufacture exactly the kind of false refusal this file exists to avoid.
+ */
+export function describeNonValueBearingWidget(w, node) {
+  if (!w || typeof w !== "object") return "";
+  const hasElement = !!w.element;
+  const opts = w.options && typeof w.options === "object" ? w.options : null;
+  const hasAccessors = !!(opts && (typeof opts.getValue === "function" || typeof opts.setValue === "function"));
+  if (!hasElement && !hasAccessors) return "";
+  const where = hasAccessors
+    ? "its owning node's own state (commonly `node.properties`), reached through the widget's getValue/setValue"
+    : "its owning node's own state (commonly `node.properties`)";
+  return (
+    ` This looks like a DOM-backed display widget rather than a value widget` +
+    `${hasElement ? " (it owns a DOM element" : " (it defines getValue/setValue"}` +
+    `${hasElement && hasAccessors ? " and defines getValue/setValue" : ""}), so its` +
+    ` real value is held in ${where} — assigning the widget does not reach it.` +
+    ` Retrying will not help.` +
+    describeNodeStateProperties(node) +
+    ` Otherwise drive the node another way (an equivalent serialized input, or a node` +
+    ` whose value is a plain widget), or ask the pack's author to expose a settable value.`
+  );
+}
+
+
+/** Cap the enumeration so a property-heavy node cannot turn one refusal into a wall
+ *  of text. The count is exact, so a truncated list still says how much it hid. */
+const MAX_STATE_KEYS = 12;
+
+/**
+ * #698 — name the properties this node actually carries, so the refusal above is a
+ * ROUTE rather than a dead end. The reporter was told the value did not stick and had
+ * nothing to try; PixaromaPrompt keeps its prompt in `properties.promptState.text`,
+ * which is reachable with panel_set_property.
+ *
+ * NAMES ONLY, NO PAIRING. Which property backs a given DOM widget is not something
+ * this can determine, and a heuristic guess (name similarity, "looks texty") would
+ * eventually point an agent at an unrelated property and have it overwrite real node
+ * state — a destructive wrong answer in place of an honest dead end. So it lists what
+ * exists and says to verify after writing.
+ */
+function describeNodeStateProperties(node) {
+  const props = node?.properties;
+  if (!props || typeof props !== "object" || Array.isArray(props)) return "";
+  const keys = Object.keys(props);
+  if (!keys.length) return "";
+  const shown = keys.slice(0, MAX_STATE_KEYS).map((k) => `"${k}"`).join(", ");
+  const more = keys.length > MAX_STATE_KEYS ? ` … and ${keys.length - MAX_STATE_KEYS} more` : "";
+  return (
+    ` This node carries ${keys.length} propert${keys.length === 1 ? "y" : "ies"}` +
+    ` (${shown}${more}) — for this kind of widget the live value is commonly one of them.` +
+    ` Read them with panel_query_graph and write with panel_set_property. WHICH property` +
+    ` backs this widget cannot be determined from here, so verify against the canvas` +
+    ` (panel_screenshot) after writing instead of assuming.`
+  );
 }

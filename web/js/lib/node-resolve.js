@@ -28,6 +28,8 @@ export const COMFY_CORE_SENTINEL_TYPES = [
   "SaveImage",
 ];
 
+import { importFailureNote } from "./pack-import-failures.js";
+
 /** True when `type` is registered in the live LiteGraph registry object
  *  (LG.registered_node_types). */
 export function isRegisteredNodeType(registry, type) {
@@ -398,9 +400,10 @@ export function assertAddNodeResolvable(registry, class_type) {
     );
   }
   throw new Error(
-    // get_node_info queries the live /object_info (node CLASSES); panel_search_nodes
-    // searches installable Manager PACKS and can never answer this (#741).
-    `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
+    // create_workflow (action:"node_info") queries the live /object_info (node
+    // CLASSES); panel_search_nodes searches installable Manager PACKS and can
+    // never answer this (#741).
+    `Unknown node type "${class_type}" — check the exact class_type via create_workflow (action:"node_info")`,
   );
 }
 
@@ -447,7 +450,9 @@ export function assertAddNodeResolvable(registry, class_type) {
  *                        exempted (fail closed, pre-#496 behaviour).
  */
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
-  const { getFreshObjectInfo, refresh, wasTypeEverDefined } = opts;
+  // #775 — `readImportFailures` is injected and awaited ONLY on the refusal path,
+  // so a healthy add pays nothing for it.
+  const { getFreshObjectInfo, refresh, wasTypeEverDefined, readImportFailures } = opts;
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
 
@@ -517,12 +522,29 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
-      // #741: the pointer must be a tool that searches node CLASSES (get_node_info,
-      // the live /object_info) — panel_search_nodes searches Manager PACKS, which
-      // structurally cannot resolve an exact class_type.
+      // #741: the pointer must be a tool that searches node CLASSES
+      // (create_workflow action:"node_info", the live /object_info) —
+      // panel_search_nodes searches Manager PACKS, which structurally cannot
+      // resolve an exact class_type.
+      // #775 — "not installed, or its pack was removed" is not the whole list, and
+      // the missing entry is the one that makes the advice useless: a pack that IS
+      // installed and FAILED TO IMPORT registers none of its nodes, so its types
+      // are absent from /object_info exactly as if it were gone. Installing it
+      // again cannot help. I walked into that dead end myself and filed a wrong
+      // diagnosis from it (ComfyUI-LTXVideo, ImportError on a core rename).
+      let failedNote = "";
+      if (typeof readImportFailures === "function") {
+        try {
+          failedNote = importFailureNote(await readImportFailures());
+        } catch {
+          // A diagnostic that throws must not replace the refusal it explains.
+        }
+      }
       throw new Error(
         `Unknown node type "${class_type}" — the ComfyUI backend does not provide it ` +
-          `(not installed, or its pack was removed). Check the exact class_type via get_node_info`,
+          `(not installed, its pack was removed, or its pack failed to import). ` +
+          `Check the exact class_type via create_workflow (action:"node_info")` +
+          failedNote,
       );
     }
     // Backend HAS it. Make sure LiteGraph can construct it — refresh to register the
@@ -583,14 +605,28 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * backend-only behaviour.
  */
 export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)", opts = {}) {
-  const { registry, node, wasTypeEverDefined } = opts;
+  const { registry, node, wasTypeEverDefined, describeObjectInfoFailure } = opts;
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
+    // #982 — SAY WHAT HAPPENED, not a disjunction. "the backend is unreachable or the
+    // fetch failed" names two causes and establishes neither, and the reporter went
+    // checking a backend that was answering `/object_info/VAELoader` perfectly well while
+    // reading this. When the oracle recorded what each route actually did, that is
+    // appended; when it recorded nothing, the sentence stays as it was.
+    let observed = "";
+    try {
+      observed = typeof describeObjectInfoFailure === "function" ? describeObjectInfoFailure() || "" : "";
+    } catch {
+      observed = ""; // a diagnostic must never replace the refusal it is describing
+    }
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
-        `ComfyUI backend (object_info is unavailable — the backend is unreachable or the fetch ` +
-        `failed). Refusing to write rather than trust a possibly-stale node cache (#458). ` +
-        `Reconnect ComfyUI and retry.`,
+        `ComfyUI backend — no usable /object_info schema was obtained.${observed} ` +
+        `Refusing to write rather than trust a possibly-stale node cache (#458). ` +
+        `Reconnect ComfyUI and retry. If /object_info answers when you run it by hand, ` +
+        `compare it with what each route above reported — one of them may have answered ` +
+        `without returning a usable schema, which is a different fault from an ` +
+        `unreachable backend (#982).`,
     );
   }
   if (!freshBackendDefinesType(freshDefs, type)) {
@@ -625,7 +661,7 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
         `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +
-        `the live backend no longer defines (#458). Check the exact class_type via get_node_info.`,
+        `the live backend no longer defines (#458). Check the exact class_type via create_workflow (action:"node_info").`,
     );
   }
 }
