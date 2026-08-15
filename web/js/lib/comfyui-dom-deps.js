@@ -30,14 +30,14 @@ export const VERIFIED_FRONTENDS = ["1.47.12", "1.50.3"];
 export const COMFYUI_DOM_DEPS = [
   {
     selector: ".side-bar-button-selected",
-    why: "Which sidebar tab is currently selected — the guard that detaches our root when another tab is active.",
-    fallback: "None. An unreadable selection is treated as UNKNOWN and changes nothing (#784).",
+    why: "Which sidebar tab is currently selected — read by the guard that detaches our root when another tab is active, and by the render watchdog that reports a selected-but-never-painted tab.",
+    fallback: "None. An unreadable selection is treated as UNKNOWN and changes nothing (#784); the watchdog likewise never speaks on UNKNOWN.",
     verified: ["1.47.12", "1.50.3"],
   },
   {
     selector: ".side-tool-bar-container",
-    why: "The sidebar rail, observed for tab-selection changes.",
-    fallback: "Retried for ~10s while the frontend boots; absent means the guard never arms.",
+    why: "The sidebar rail. The guard observes it for tab-selection changes; the render watchdog only waits for it to EXIST (proof this page has a sidebar we understand) and then observes the document instead.",
+    fallback: "Retried while the frontend boots; absent means the guard never arms and the watchdog stays silent (no rail, no evidence). NOTE 1: the rail's CONTENTS are not evidence — ComfyUI's LinearView renders it filtered via `visible-tab-ids`, so our button being missing from it means nothing. NOTE 2: this element is NOT STABLE — it is `v-if`-gated in GraphCanvas.vue, so focus/linear/builder mode destroy and recreate it (verified 1.47.12/1.48.7/1.50.3/1.51.5). Anything holding a reference to it goes deaf on the first toggle.",
     verified: ["1.47.12", "1.50.3"],
   },
   {
