@@ -1364,6 +1364,51 @@ test('mcp#884 UPGRADE: the no-pointer recency fallback is forked per backend too
   )
 })
 
+test("mcp#884 another backend's selection never competes — even for a thread THIS backend could claim", () => {
+  // REGRESSION GUARD FOR THE GUARD. The `panel:` skip in the compete loop was
+  // previously pinned by a fixture whose threads had no provider. Adding the upgrade
+  // fork MASKED that: another backend's op now usually resolves to a thread this
+  // backend cannot claim anyway, so deleting the skip stopped failing anything.
+  //
+  // The two rules are NOT the same rule. The fork asks "could this backend own the
+  // thread"; the skip asks "is another backend's selection evidence for mine". A
+  // thread whose provider matches BOTH questions separates them — which is exactly
+  // reachable, because a thread's provider changes when the user switches backends
+  // while it is open.
+  const threads = [
+    { id: 'mine', provider: 'codex', updatedAt: 100, msgs: [] },
+    // Same provider, so the fork happily allows it. Only the `panel:` skip stops it.
+    { id: 'claudes-pick', provider: 'codex', updatedAt: 900, msgs: [] }
+  ]
+  let meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:backend:codex',
+    'mine',
+    { updatedAt: 1_000, writerId: 'codex-tab', sequence: 1 }
+  )
+  // Written LATER, under ANOTHER backend's key. If it were allowed to compete it would
+  // win on revision and move codex onto claude's conversation.
+  meta = updateMetadataEntry(
+    meta,
+    'activeByScope',
+    'panel:backend:claude',
+    'claudes-pick',
+    { updatedAt: 9_000, writerId: 'claude-tab', sequence: 2 }
+  )
+
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:codex' })?.id,
+    'mine',
+    "a Claude tab's newer selection must not move the Codex conversation"
+  )
+  // And the mirror, so the rule is not "codex always wins".
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:claude' })?.id,
+    'claudes-pick'
+  )
+})
+
 test('mcp#884 a backend pointer this backend WROTE is honoured whatever the provider stamp says', () => {
   // The fork must not become a second, stricter gate on normal operation. A thread
   // legitimately changes provider when the user switches backends while it is open, so

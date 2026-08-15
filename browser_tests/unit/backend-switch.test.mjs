@@ -315,6 +315,95 @@ test("mcp#884 a NON-switch never asks the store about the incoming backend", asy
   assert.deepEqual(rePick.askedAbout, [], "a re-pick of the live backend asks nothing");
 });
 
+// ---------------------------------------------------------------------------
+// mcp#884 — the panel side of the handover, RUN rather than inspected.
+//
+// The tests above prove `runBackendSwitch` PASSES `preserveThreadSession`. That is
+// only half a proof: an `invalidateDurableAgentSession` that ignores the option
+// destroys the outgoing session exactly as before while every assertion above stays
+// green. (Verified by mutation — it survived the whole suite.) So drive the shipped
+// body over stubs, the same "real panel source" convention used elsewhere.
+// ---------------------------------------------------------------------------
+
+// Normalised: this checkout is CRLF and the anchor spans lines.
+const PANEL_LF = PANEL_SRC.replace(/\r\n/g, "\n");
+const invalidateSrc = (() => {
+  const re = /\n {2}async function invalidateDurableAgentSession\([\s\S]*?\n {2}\}/g;
+  const all = [...PANEL_LF.matchAll(re)];
+  assert.equal(all.length, 1, `expected exactly 1 invalidateDurableAgentSession, got ${all.length}`);
+  return all[0][0];
+})();
+
+test("mcp#884 the extracted invalidate really is the shipped body", () => {
+  assert.match(invalidateSrc, /ssSet\(SESSION_KEY, null\)/, "slice covers the tab-pointer clear");
+  assert.match(invalidateSrc, /historyStore\.flush\(\)/, "slice reaches the durability check");
+});
+
+/** The REAL invalidateDurableAgentSession over one conversation and stub effects. */
+function buildInvalidate({ threadSessionId = "sess-claude-1" } = {}) {
+  const thread = { id: "t-outgoing", provider: "claude", sessionId: threadSessionId, msgs: [] };
+  const session = new Map([["comfyui-mcp.panel.sessionId", threadSessionId]]);
+  let persists = 0;
+  const factory = new Function(
+    "deps",
+    `
+    const { ssSet, SESSION_KEY, thread, historyStore, persistThreads } = deps;
+    ${invalidateSrc}
+    return invalidateDurableAgentSession;
+    `,
+  );
+  const invalidate = factory({
+    ssSet: (key, value) => { session.set(key, value); },
+    SESSION_KEY: "comfyui-mcp.panel.sessionId",
+    thread,
+    // Only the two methods the body reaches. `reviseThread` deletes a field when the
+    // value is null, which is exactly what the real store does for a cleared session.
+    historyStore: {
+      reviseThread: (t, values) => {
+        for (const [k, v] of Object.entries(values)) {
+          if (v == null) delete t[k];
+          else t[k] = v;
+        }
+        return t;
+      },
+      flush: async () => true,
+    },
+    persistThreads: () => { persists += 1; },
+  });
+  return { invalidate, thread, session, persists: () => persists };
+}
+
+test("mcp#884 a SWITCH preserves the outgoing conversation's session id", async () => {
+  const h = buildInvalidate();
+  assert.equal(await h.invalidate({ preserveThreadSession: true }), true);
+
+  assert.equal(
+    h.thread.sessionId,
+    "sess-claude-1",
+    "the outgoing backend's session outlives the switch — switching back must RESUME, not new_session",
+  );
+  // …while the backend-agnostic TAB pointer still goes, or the incoming backend would
+  // adopt a session id belonging to the previous one.
+  assert.equal(h.session.get("comfyui-mcp.panel.sessionId"), null, "the tab pointer is still cleared");
+  assert.ok(h.persists() > 0, "and the change is persisted");
+});
+
+test("mcp#884 a RESTART/disconnect still destroys the session id", async () => {
+  // The opposite case, and why this is an option rather than a removal: that session is
+  // genuinely gone, so a preserved pointer would make the next resume name a session the
+  // orchestrator no longer has.
+  const h = buildInvalidate();
+  assert.equal(await h.invalidate(), true);
+  assert.equal(h.thread.sessionId, undefined, "the default is still to destroy it");
+  assert.equal(h.session.get("comfyui-mcp.panel.sessionId"), null);
+});
+
+test("mcp#884 preserveThreadSession:false is explicitly the destroying case", async () => {
+  const h = buildInvalidate();
+  await h.invalidate({ preserveThreadSession: false });
+  assert.equal(h.thread.sessionId, undefined);
+});
+
 test("#1184 WIRING: the panel delegates, and keeps no commit above the guard", () => {
   // Without this the module can be correct and dead. The panel is 1.7MB of IIFE, so this is
   // a source assertion by necessity — but it is the specific one that matters: no write to
