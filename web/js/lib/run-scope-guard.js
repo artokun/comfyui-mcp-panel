@@ -1,4 +1,10 @@
 import { tr } from "./i18n.js";
+// #1124 — rgthree's Seed node mutates the outgoing prompt WITHOUT a beforeQueued
+// hook, so collectVolatileInputs needs a second volatility signal. The measured
+// facts about that pack (sentinels, node predicate, mute/bypass early-return, the
+// input its handler overwrites) already live in scoped-batch-seed.js; this file
+// imports the verdict rather than restating them.
+import { rgthreeQueueTimeSeedInput } from "./scoped-batch-seed.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -66,9 +72,11 @@ import { tr } from "./i18n.js";
 //
 //  - The prompt CONTENT HASH (r7) must be computable BEFORE dispatch: a
 //    stable hash of the full queued prompt — node ids, class types, links,
-//    every input/widget value — excluding ONLY (a) the inputs that self-mutate
+//    every input/widget value — excluding ONLY (a) the inputs that mutate
 //    at queue time (beforeQueued hooks: seed widgets re-rolled by their linked
-//    control_after_generate, and the hook widgets themselves), which change
+//    control_after_generate, and the hook widgets themselves; plus prompts
+//    rewritten by an extension's own api.queuePrompt patch, which carry no hook
+//    at all — rgthree's armed Seed node, #1124), which change
 //    between any two serializations of the SAME graph by design (#572: the
 //    exclusion must reach the hook's serialized TARGET, not just the
 //    unserialized control the hook hangs on), and (b) inputs whose value the
@@ -206,9 +214,11 @@ const fnv1aHex = (s) =>
  * the in-memory `graphToPrompt().output` object (pre-dispatch) and the parsed
  * POST /prompt body (post-time serialization after a JSON round-trip):
  *
- *  1. VOLATILE INPUTS — inputs that self-mutate at queue time (a
- *     `beforeQueued` hook — stock seed widgets re-rolled by their linked
- *     control_after_generate, third-party hook widgets, etc.): those change
+ *  1. VOLATILE INPUTS — inputs that mutate at queue time, by either mechanism
+ *     collectVolatileInputs knows about: a `beforeQueued` hook (stock seed
+ *     widgets re-rolled by their linked control_after_generate, third-party hook
+ *     widgets), or an extension rewriting the outgoing prompt in its own
+ *     `api.queuePrompt` patch (rgthree's armed Seed node, #1124). Those change
  *     between any two serializations of the SAME graph by design, so hashing
  *     them would refuse our own dispatch. Exclusions are PER-NODE pairs
  *     (prompt node id + input name, r8): an edit to a NON-hook node's
@@ -386,9 +396,14 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
 }
 
 /**
- * The "execId inputName" pairs whose owning widgets SELF-MUTATE at queue time
- * (a `beforeQueued` hook), collected from the live root graph and every nested
- * subgraph. execId is the flattened prompt id: String(node.id) at root, the
+ * The "execId inputName" pairs whose values MUTATE AT QUEUE TIME — after our
+ * pre-dispatch stamp and before the POST body is built — collected from the live
+ * root graph and every nested subgraph. TWO signals, because there are two
+ * mechanisms (#1124): a widget-level `beforeQueued` hook, and an extension that
+ * patches `api.queuePrompt` and rewrites the outgoing prompt directly. The
+ * second is invisible to any widget scan, so it is matched by node identity
+ * instead (rgthree's armed Seed node — see rgthreeQueueTimeSeedInput).
+ * execId is the flattened prompt id: String(node.id) at root, the
  * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
  * the API prompt. These are the ONLY values the content hash excludes —
@@ -454,6 +469,26 @@ export function collectVolatileInputs(rootGraph) {
           }
         }
       }
+      // #1124 — THE SECOND VOLATILITY SIGNAL. `beforeQueued` is not the only way
+      // an input mutates between our stamp and the POST: a pack can patch
+      // `api.queuePrompt` itself and rewrite the serialized prompt on its way out,
+      // which happens AFTER graphToPrompt and is invisible to any widget-hook
+      // scan. rgthree's Seed node does exactly that — and it SPLICES OUT the
+      // control_after_generate widget the stock hook would have ridden on, so the
+      // loop above finds nothing on it. Every scoped run on a workflow containing
+      // an armed Seed (rgthree) was therefore refused as "the graph CHANGED",
+      // naming the seed input, with nothing queued and the retry failing
+      // identically (the widget stays armed, so each attempt draws a new number).
+      //
+      // NARROW BY CONSTRUCTION, and it must stay that way: this excludes exactly
+      // ONE input on nodes that self-identify as rgthree seed nodes AND are armed
+      // with one of rgthree's sentinels. A fixed seed, a muted or bypassed node,
+      // and every other node in the graph keep full drift coverage —
+      // rgthreeQueueTimeSeedInput returns null for all of them. #556 still catches
+      // a graph that genuinely changed under a stamped run; what it no longer does
+      // is call another extension's documented queue-time substitution a user edit.
+      const rgthreeSeedInput = rgthreeQueueTimeSeedInput(node);
+      if (rgthreeSeedInput != null) addPair(execId, rgthreeSeedInput);
       if (node.subgraph) walk(node.subgraph, execId);
     }
   };
@@ -754,17 +789,27 @@ export function scopeDroppedError({ toNodeId, verdict }) {
     // WHAT rewrote the value, or even that a "rewrite" happened at all (a
     // nondeterministic widget serializer — a serializeValue emitting a
     // timestamp — produces this same refusal on an untouched graph).
+    // #1124 added the FOURTH candidate, and it is the one that had been missing:
+    // an extension that patches `api.queuePrompt` and rewrites the serialized
+    // prompt on its way out. That happens after graphToPrompt and carries no
+    // widget hook, so no scan of the live graph can see it coming. rgthree's Seed
+    // node is the measured instance and is now excluded by name
+    // (collectVolatileInputs); it stays listed here because the NEXT pack doing
+    // the same thing will land on this message, and naming the shape is what lets
+    // a reporter recognise it.
     const causeText = drift
       ? `If you did not edit ${drift.length === 1 ? "it" : "these"} between queueing and ` +
         `dispatch, the two serializations differ for a reason the panel cannot identify from ` +
-        `here — candidates: a queue-time widget hook (e.g. control_after_generate), a ` +
+        `here — candidates: a queue-time widget hook (e.g. control_after_generate), an ` +
+        `extension that rewrites the prompt inside its own api.queuePrompt patch, a ` +
         `dynamic-input node reshaping its slots, or a nondeterministic widget serializer. ` +
         `Please report this with the differing list above. `
       : `If this recurs without any edit in between, the two serializations differ for a ` +
         `reason the panel cannot identify from here — candidates: a queue-time widget hook ` +
         `mutating values between serialization and dispatch (e.g. a control_after_generate ` +
         `widget with WidgetControlMode "before" — switch it to "after" or fix the target ` +
-        `widget's value), or a nondeterministic widget serializer. `;
+        `widget's value), an extension that rewrites the prompt inside its own ` +
+        `api.queuePrompt patch, or a nondeterministic widget serializer. `;
     return (
       `run-to-node scope for node ${toNodeId} was NOT applied: the workflow graph ` +
       `CHANGED after the run was queued — the deferred dispatch would render a ` +
@@ -1426,8 +1471,10 @@ export async function dispatchScopedRun({
   }
   // The CONTENT HASH that (with the queue mark) attributes a POST /prompt
   // body to THIS run: the full prompt we are about to queue — ids, class
-  // types, links, widget values — minus only the self-mutating (beforeQueued)
-  // inputs that change between any two serializations by design, and the
+  // types, links, widget values — minus only the queue-time-mutating inputs
+  // (beforeQueued hooks, and prompts an extension rewrites in its own
+  // api.queuePrompt patch — #1124) that change between any two
+  // serializations by design, and the
   // JSON-invisible values that cannot survive the POST body at all (#659).
   // No hash ⇒ no attribution ⇒ fail closed BEFORE dispatch. The canonical
   // form is RETAINED (contentCanon) so a graph_changed refusal can say WHAT
@@ -1450,8 +1497,9 @@ export async function dispatchScopedRun({
   if (!contentHash) {
     return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
   }
-  // #572 — the inputs this run does NOT drift-cover (queue-time hook inputs:
-  // hook carriers plus their linked, serialized targets). Surfaced on every
+  // #572/#1124 — the inputs this run does NOT drift-cover (queue-time hook
+  // carriers plus their linked, serialized targets; and an armed rgthree Seed
+  // node's own seed input). Surfaced on every
   // post-hash outcome so the caller can report the coverage gap truthfully
   // instead of implying full-graph drift proof (see collectVolatileInputs'
   // ACCEPTED RESIDUAL note).

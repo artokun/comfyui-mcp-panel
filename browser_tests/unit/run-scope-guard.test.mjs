@@ -345,6 +345,78 @@ test("#572 collectVolatileInputs: the linked-target exclusion reaches nested sub
   assert.ok(pairs.has("10:15 noise_seed"), "nested target pairs line up with the flattened prompt keys");
 });
 
+// ---------------------------------------------------------------------------
+// #1124 — the SECOND volatility mechanism: an extension that rewrites the
+// outgoing prompt in its own api.queuePrompt patch, with no widget hook at all.
+//
+// The widget shape below is the repo's measured `Seed (rgthree)` instance
+// (scoped-batch-seed.test.mjs): rgthree SPLICES OUT control_after_generate and
+// leaves `seed` plus three buttons. Note what is absent — there is no
+// `beforeQueued` anywhere on it, which is exactly why the hook scan found
+// nothing and every scoped run on such a graph was refused as "graph CHANGED".
+// ---------------------------------------------------------------------------
+
+const rgthreeSeedNode = (id, seedValue, extra = {}) => ({
+  id,
+  type: "Seed (rgthree)",
+  mode: 0,
+  widgets: [
+    { name: "seed", value: seedValue },
+    { name: "🎲 Randomize Each Time", value: "" },
+    { name: "🎲 New Fixed Random", value: "" },
+    { name: "USE_LAST_SEED", value: "okay" },
+  ],
+  ...extra,
+});
+
+test("#1124 collectVolatileInputs: an ARMED rgthree Seed node is volatile despite carrying NO beforeQueued hook", () => {
+  const root = {
+    _nodes: [
+      rgthreeSeedNode(47, -1),
+      { id: 3, widgets: [{ name: "steps", value: 20 }] },
+    ],
+  };
+  // Proof the OLD signal could not have found it: nothing on this node is a hook.
+  for (const w of root._nodes[0].widgets) {
+    assert.equal(typeof w.beforeQueued, "undefined", `${w.name} carries no beforeQueued`);
+  }
+  assert.deepEqual([...collectVolatileInputs(root)].sort(), ["47 seed"]);
+});
+
+test("#1124 collectVolatileInputs: a FIXED rgthree Seed excludes nothing — the graph stays fully drift-covered", () => {
+  const root = { _nodes: [rgthreeSeedNode(47, 12345)] };
+  assert.equal(collectVolatileInputs(root).size, 0);
+});
+
+test("#1124 collectVolatileInputs: the rgthree exclusion reaches nested subgraphs with the colon-path execId", () => {
+  const root = {
+    _nodes: [{ id: 10, widgets: [], subgraph: { _nodes: [rgthreeSeedNode(15, -1)] } }],
+  };
+  assert.ok(collectVolatileInputs(root).has("10:15 seed"), "nested pairs line up with the flattened prompt keys");
+});
+
+test("#1124 promptContentHash: rgthree's substitution is not drift, but an edit to ANY other input of the SAME node still is", () => {
+  // The narrowness check. Only the one input rgthree rewrites is dropped; the
+  // node's other inputs, and every other node, keep full coverage.
+  const graph = { _nodes: [rgthreeSeedNode(47, -1)] };
+  const volatileInputs = collectVolatileInputs(graph);
+  const stamped = { "47": { class_type: "Seed (rgthree)", inputs: { seed: -1, extra: 7 } } };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const body = (inputs) => JSON.stringify({ prompt: { "47": { class_type: "Seed (rgthree)", inputs } } });
+  // rgthree's own measured draw, substituted at queue time ⇒ still OUR dispatch.
+  assert.equal(
+    promptContentHashFromBody(body({ seed: 1028465986822020, extra: 7 }), volatileInputs),
+    atHash,
+    "the queue-time substitution is the exclusion's purpose",
+  );
+  // A sibling input on the SAME node ⇒ real drift, still refused.
+  assert.notEqual(
+    promptContentHashFromBody(body({ seed: 1028465986822020, extra: 8 }), volatileInputs),
+    atHash,
+    "a sibling input of the seed node is NOT covered by the exclusion",
+  );
+});
+
 test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's own input — a seed edit is the documented residual, an edit to any OTHER input of the same node refuses", () => {
   const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
   const seed = { name: "seed", value: 111, linkedWidgets: [control] };
@@ -1988,6 +2060,181 @@ test("#556 r8 integration: an edit to a NON-hook node's same-named input is STIL
     assert.equal(result.outcome, "refused");
     assert.match(result.error, /graph CHANGED/i);
     assert.equal(server.calls.length, 0, "the edited workflow never left the tab");
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #1124 integration — the reporter's exact sequence, driven through the REAL
+// dispatchScopedRun.
+//
+// A `Seed (rgthree)` node (id 47) armed with the -1 sentinel feeds two KSampler
+// seed inputs; the run is scoped to a downstream SaveImage (122). rgthree's
+// `comfy-api-queue-prompt-before` handler fires INSIDE api.queuePrompt — after
+// our pre-dispatch stamp, before the fetch — and overwrites the node's own seed
+// input in the outgoing prompt. The widget itself stays at -1 (measured, see
+// scoped-batch-seed.js), which is why the panel's single retry drew a DIFFERENT
+// number and failed identically: the refusal was permanent, not racy.
+// ---------------------------------------------------------------------------
+
+/** The reporter's graph as graphToPrompt serializes it. */
+const RGTHREE_STAMP = {
+  "47": { class_type: "Seed (rgthree)", inputs: { seed: -1 } },
+  "3": { class_type: "KSampler", inputs: { seed: ["47", 0], steps: 20 } },
+  "5": { class_type: "KSampler", inputs: { seed: ["47", 0], steps: 25 } },
+  "122": { class_type: "SaveImage", inputs: { images: ["3", 0] } },
+};
+
+/** rgthree's own measured draws (recorded in scoped-batch-seed.js). */
+const RGTHREE_DRAWS = [1028465986822020, 98533269447704, 557498712106716];
+
+/**
+ * A frontend whose api.queuePrompt substitutes like rgthree's patch does.
+ * `alsoEdit` mutates the outgoing prompt further, standing in for a REAL user
+ * edit landing in the same window — the case that must still be refused.
+ */
+function makeRgthreeFrontend({ apiTarget, seedWidgetValue = -1, alsoEdit = null, nodeType = "Seed (rgthree)" }) {
+  let draw = 0;
+  const stamp = () => {
+    const out = structuredClone(RGTHREE_STAMP);
+    out["47"].inputs.seed = seedWidgetValue;
+    out["47"].class_type = nodeType;
+    return out;
+  };
+  const app = {
+    queueItems: [],
+    posted: [],
+    // The panel's live root (production shape, r8) — no beforeQueued anywhere.
+    graph: {
+      _nodes: [
+        { ...rgthreeSeedNode(47, seedWidgetValue), type: nodeType },
+        { id: 3, widgets: [{ name: "steps", value: 20 }] },
+      ],
+    },
+    graphToPrompt: async () => ({ output: stamp(), workflow: {} }),
+    queuePrompt: async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const output = stamp();
+      // rgthree: `outputInputs[this.seedWidget.name || "seed"] = seedToUse;`
+      // — only when the widget holds a sentinel, which is what arms the node.
+      if ([-1, -2, -3].includes(seedWidgetValue)) {
+        output["47"].inputs.seed = RGTHREE_DRAWS[draw++ % RGTHREE_DRAWS.length];
+      }
+      if (alsoEdit) alsoEdit(output);
+      const body = frontendBody({ output, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi(...promptPost(body));
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#1124 integration: an ARMED rgthree Seed substituting its own seed at queue time is OUR dispatch — the scoped run reaches ComfyUI instead of being permanently refused", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeRgthreeFrontend({ apiTarget });
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["122"], batch: 1, toNodeId: 122,
+      verifyTimeoutMs: 500,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched", "the reported refusal is gone");
+    assert.equal(result.verified, 1);
+    assert.deepEqual(ids, ["srv-1"]);
+    assert.equal(server.calls.length, 1, "the scoped prompt actually reached ComfyUI");
+    // The scope is still delivered — this fix must not cost the guarantee #556 exists for.
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["122"]);
+    // The gap is DISCLOSED, never silent: graph_run turns this into drift_coverage.
+    assert.deepEqual(result.volatileInputs, ["47 seed"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1124 integration: a FIXED rgthree Seed keeps full drift coverage — a body whose seed differs is STILL refused", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    // Not armed ⇒ rgthree substitutes nothing ⇒ nothing is excluded. Something
+    // ELSE changed that seed, and that is exactly the drift #556 must catch.
+    const app = makeRgthreeFrontend({
+      apiTarget,
+      seedWidgetValue: 12345,
+      alsoEdit: (output) => { output["47"].inputs.seed = 999; },
+    });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["122"], batch: 1, toNodeId: 122, verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "refused", "a fixed seed node is NOT drift-blind");
+    assert.match(result.error, /graph CHANGED/i);
+    assert.match(result.error, /47 seed/, "and the refusal still names what differed");
+    assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
+    assert.deepEqual(result.volatileInputs, [], "a fixed node excludes nothing");
+  } finally {
+    stop();
+  }
+});
+
+test("#1124 integration: a LOOK-ALIKE node type does NOT buy a drift exemption — its seed edit is still refused", async () => {
+  const stop = keepAlive();
+  try {
+    // codex r1 P2, at the level that matters: the exclusion is keyed on the exact
+    // registered type, so a foreign node whose type merely contains "rgthree" and
+    // "seed" keeps FULL drift coverage. If this ever passes as "dispatched", the
+    // guard has been silently disarmed for every graph containing such a node.
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeRgthreeFrontend({
+      apiTarget,
+      nodeType: "Seed Generator (rgthree-style)",
+      // Armed sentinel + a changed seed in the body: the exact shape the real
+      // rgthree node gets forgiven for. This node must NOT be forgiven.
+      alsoEdit: (output) => { output["47"].inputs.seed = 4242; },
+    });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["122"], batch: 1, toNodeId: 122, verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "refused", "a look-alike type is NOT exempt from drift detection");
+    assert.match(result.error, /graph CHANGED/i);
+    assert.match(result.error, /47 seed/);
+    assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
+    assert.deepEqual(result.volatileInputs, [], "and nothing was excluded for it");
+  } finally {
+    stop();
+  }
+});
+
+test("#1124 integration: the exclusion is ONE input — an armed rgthree Seed does NOT let a real edit elsewhere ride along", async () => {
+  const stop = keepAlive();
+  try {
+    // The guard-relaxation check, and the reason this fix is not a widening of
+    // #556 into uselessness: rgthree substitutes AND the user rewires/edits
+    // something in the same window. The run must still be refused.
+    for (const [label, edit] of [
+      ["a widget value elsewhere", (o) => { o["3"].inputs.steps = 25; }],
+      ["a link rewired", (o) => { o["122"].inputs.images = ["5", 0]; }],
+      ["a node added", (o) => { o["77"] = { class_type: "SaveImage", inputs: {} }; }],
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeRgthreeFrontend({ apiTarget, alsoEdit: edit });
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["122"], batch: 1, toNodeId: 122, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", `${label} is still drift`);
+      assert.match(result.error, /graph CHANGED/i, label);
+      assert.equal(server.calls.length, 0, `${label}: the edited workflow never left the tab`);
+      // The seed itself must NOT appear in the drift list — it was excluded — so
+      // the refusal names the REAL change instead of the red herring the reporter
+      // was handed.
+      assert.doesNotMatch(result.error, /47 seed/, `${label}: the substituted seed is no longer blamed`);
+    }
   } finally {
     stop();
   }

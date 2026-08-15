@@ -324,6 +324,107 @@ export function findRgthreeSeedNodes(nodes) {
 }
 
 /**
+ * Node types whose queue-time prompt rewrite has actually been MEASURED — the
+ * capability claim behind the #1124 drift exclusion, stated as data.
+ *
+ * EXACT registered type, not a substring test, and the set holds exactly what has
+ * been verified. `Seed (rgthree)` is the type on the live instance this repo's
+ * fixtures were taken from; nothing else has been observed rewriting the prompt in
+ * an `api.queuePrompt` patch, so nothing else is listed. Adding a type here is a
+ * claim that THAT node substitutes at queue time — it must be measured first, not
+ * guessed from a plausible-looking name.
+ */
+const RGTHREE_QUEUE_REWRITING_SEED_TYPES = new Set(["Seed (rgthree)"]);
+
+/**
+ * #1124 — the input rgthree will REWRITE in the outgoing prompt, or null when it
+ * rewrites nothing. Returns the input NAME so the caller can build a per-node
+ * exclusion pair; the drift guard (run-scope-guard.js) is the only consumer.
+ *
+ * WHY IT LIVES IN THIS MODULE rather than in the guard. Almost everything it needs
+ * is already measured and written down HERE — the sentinel set, the mute/bypass
+ * early-return, and the quoted handler line that says WHICH input gets overwritten.
+ * Restating any of that next to the guard would create a second copy of a measured
+ * fact about someone else's pack, and the two would drift the first time rgthree
+ * changed. The guard imports; nothing is duplicated. (The node-type match is the
+ * one thing this function does NOT share with the #1339 scan — see below.)
+ *
+ * WHAT IT IS FOR. The #556 drift guard stamps the graph before dispatch and
+ * compares that stamp against the POSTED body. Its only volatility signal was
+ * `typeof w.beforeQueued === "function"` — and rgthree does not use that hook at
+ * all. It SPLICES OUT the `control_after_generate` widget the frontend would have
+ * hung the hook on (see the #1339 block above) and substitutes the seed inside its
+ * own `api.queuePrompt` patch instead, after our stamp and before the fetch. So the
+ * stamp recorded `-1`, the body carried a fresh random, and every scoped run on a
+ * workflow containing an armed Seed (rgthree) was refused as "the workflow graph
+ * CHANGED" with `47 seed` named as the differing entry — permanently, because the
+ * widget stays armed at `-1` and each retry draws a different number (#1124).
+ *
+ * ARMED IS THE GATE, AND `varies` IS DELIBERATELY NOT.
+ * `findRgthreeSeedNodes` reports `varies: false` for an armed node whose
+ * randomMin/randomMax admit a single value — the right answer for the #1339
+ * warning, and the WRONG one here. Such a node still SUBSTITUTES: it replaces the
+ * `-1` sentinel in the body with that single value (or with 0, when the degenerate
+ * draw lands on a sentinel). The input therefore still changes between the two
+ * serializations, so it is still volatile. Keying this on `varies` would have left
+ * exactly the degenerate-range workflows refused, which is the bug.
+ *
+ * A NON-ARMED NODE EXCLUDES NOTHING, mirroring the `value === "fixed"` gate the
+ * stock control_after_generate carrier already uses in collectVolatileInputs. A
+ * concrete seed is submitted verbatim (`getSeedToUse` returns `inputSeed` when it
+ * is not a sentinel), so the input does not mutate at queue time and MUST stay
+ * drift-covered — a mid-window user edit to a fixed seed is real drift and is still
+ * refused. Same for a MUTED or BYPASSED node: rgthree's handler returns early for
+ * both, so it substitutes nothing.
+ *
+ * IT DOES NOT SHARE `isRgthreeSeedNode` WITH THE #1339 WARNING, and that is a
+ * deliberate split rather than an oversight (codex r1 P2). That predicate is two
+ * substring tests — `/rgthree/i && /seed/i` — so a foreign custom node whose type
+ * happens to contain both words, carrying a `seed` widget holding -1/-2/-3, would
+ * have had its seed dropped from BOTH hashes despite installing no queue-time
+ * rewrite at all. A real deferred edit to that node would then sail past the #556
+ * guard. The two callers want OPPOSITE failure directions, so one predicate cannot
+ * serve both:
+ *
+ *   #1339 (warning)      a false positive is NOISE — one extra sentence about a
+ *                        node that may not repeat. A false NEGATIVE is the bug
+ *                        that issue was filed for (a missed warning), so a loose,
+ *                        generous match is the right trade there and is left
+ *                        exactly as it was.
+ *   #1124 (drift guard)  a false positive SILENTLY REMOVES drift coverage for the
+ *                        life of every scoped run on that graph. Fail-closed is
+ *                        the only acceptable direction, so the match is an exact
+ *                        registered type from a measured set.
+ *
+ * Tightening the shared predicate would have traded a real #1339 regression (a
+ * genuinely-rgthree seed node with a variant type going unwarned) for a cosmetic
+ * saving of one constant. So the warning heuristic stays; the exclusion is strict.
+ *
+ * Defensive like the rest of this module: an unreadable node yields null (no
+ * exclusion), which fails TOWARD detecting drift.
+ */
+export function rgthreeQueueTimeSeedInput(node) {
+  try {
+    if (!RGTHREE_QUEUE_REWRITING_SEED_TYPES.has(node?.type)) return null;
+    // rgthree: `if (this.mode === LiteGraph.NEVER || this.mode === 4) return;`
+    if (node?.mode === 2 || node?.mode === 4) return null;
+    const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+    const seedWidget = widgets.find((w) => w?.name === "seed");
+    if (!seedWidget) return null;
+    const raw = Number(seedWidget.value);
+    if (!Number.isFinite(raw)) return null;
+    // Only a sentinel makes `getSeedToUse()` draw a NEW number; anything else is
+    // returned unchanged and lands in the body exactly as the stamp saw it.
+    if (!RGTHREE_SPECIAL_SEEDS.has(raw)) return null;
+    // The handler writes `outputInputs[this.seedWidget.name || "seed"]`, and the
+    // widget was found BY that name, so the rewritten input is this one.
+    return seedWidget.name;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The disclosure for a batch whose rgthree seed is FIXED.
  *
  * Silent when the node is armed, because then it genuinely varies per item and there is

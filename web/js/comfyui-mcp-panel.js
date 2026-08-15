@@ -13133,23 +13133,31 @@ const GRAPH_TOOL_EXECUTORS = {
       accept.fixed_seed_nodes = rgthreeSeeds.filter((s) => s && s.armed === false);
       accept.fixed_seed_note = fixedSeedNote;
     }
-    // #572 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
-    // excluded queue-time hook inputs (beforeQueued carriers + their linked,
-    // serialized targets — e.g. a control_after_generate seed reroll). A user
-    // edit to exactly THOSE inputs during the queue window is indistinguishable
-    // from the hook's own mutation (accepted residual), so the result names the
-    // uncovered inputs instead of implying full-graph drift proof. Every other
-    // input was covered.
+    // #572/#1124 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
+    // excluded the inputs that mutate at queue time by either known mechanism —
+    // beforeQueued carriers + their linked, serialized targets (e.g. a
+    // control_after_generate seed reroll), and the seed of an ARMED rgthree Seed
+    // node, which carries no hook at all because rgthree substitutes it inside
+    // its own api.queuePrompt patch. A user edit to exactly THOSE inputs during
+    // the queue window is indistinguishable from the queue-time mutation
+    // (accepted residual), so the result names the uncovered inputs instead of
+    // implying full-graph drift proof. Every other input was covered.
+    //
+    // The note does not say WHICH mechanism excluded which input: the panel
+    // knows, but the reader's question is "what was not checked", and a
+    // per-input attribution would be a second claim to keep true.
     const uncovered = runScopeResult?.volatileInputs;
     if (partialTargets && Array.isArray(uncovered) && uncovered.length) {
       accept.drift_coverage = {
         covered: "partial",
         uncovered_inputs: uncovered,
         note:
-          "These queue-time hook inputs (beforeQueued, e.g. a control_after_generate seed " +
-          "reroll) were excluded from this run's graph-drift check: a user edit to exactly " +
-          "these inputs during the queue window is indistinguishable from the hook's own " +
-          "mutation and would NOT have been caught. Every other input was drift-covered.",
+          "These inputs mutate at queue time — a beforeQueued hook (e.g. a " +
+          "control_after_generate seed reroll), or an extension that rewrites the prompt in " +
+          "its own api.queuePrompt patch (an armed Seed (rgthree) node) — so they were " +
+          "excluded from this run's graph-drift check: a user edit to exactly these inputs " +
+          "during the queue window is indistinguishable from that mutation and would NOT " +
+          "have been caught. Every other input was drift-covered.",
       };
     }
     // #556 — DISCLOSE how the scope actually reached ComfyUI. When both
