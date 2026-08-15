@@ -128,14 +128,36 @@ test("#1478 the check and the reply are in ONE synchronous turn — no await bet
   //
   // The other tests here pin WHAT is compared. This one pins that the comparison is still
   // true when the value leaves.
+  //
+  // The gate now lives in ONE shared reader called from both return paths, so this is two
+  // properties: the reader itself must be synchronous (it holds the comparison), and
+  // neither call site may await between asking it and returning its verdict.
+  //
+  // The API path is the reason this is not theoretical. Its reply needs an import-failure
+  // fetch, so a read placed at the natural spot — right after the load — put a live
+  // `await readPackImportFailures(api)` between the check and the reply. This test is what
+  // caught it; the read now happens last.
+  const helper = helperBody();
+  assert.doesNotMatch(helper, /\bawait\b/, "the shared identity reader must be synchronous");
+  assert.doesNotMatch(helper, /\.then\s*\(/, "and must not defer");
+
   const body = graphLoadBody();
-  const checkAt = body.indexOf("const liveNow");
-  assert.notEqual(checkAt, -1, "the identity read must still be recognisable");
-  const replyAt = body.indexOf("return {", checkAt);
-  assert.ok(replyAt > checkAt, "the reply must still follow the identity read");
-  const window = body.slice(checkAt, replyAt);
-  assert.doesNotMatch(window, /\bawait\b/, "no await may separate the check from the reply");
-  assert.doesNotMatch(window, /\.then\s*\(/, "and no deferred continuation either");
+  for (const [label, read] of [
+    ["API-format path", "const apiLoadedWorkflowUuid"],
+    ["UI-format path", "const loadedWorkflowUuid"],
+  ]) {
+    const checkAt = body.indexOf(read);
+    assert.notEqual(checkAt, -1, `${label}: the identity read must still be recognisable`);
+    const replyAt = body.indexOf("return {", checkAt);
+    assert.ok(replyAt > checkAt, `${label}: the reply must still follow the identity read`);
+    const window = body.slice(checkAt, replyAt);
+    assert.doesNotMatch(
+      window,
+      /\bawait\b/,
+      `${label}: no await may separate the check from the reply`,
+    );
+    assert.doesNotMatch(window, /\.then\s*\(/, `${label}: and no deferred continuation either`);
+  }
 });
 
 test("#1478 an unprovable load publishes NOTHING rather than a guess", () => {

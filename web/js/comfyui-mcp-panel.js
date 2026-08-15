@@ -11205,11 +11205,6 @@ const GRAPH_TOOL_EXECUTORS = {
         // canvas too, and must be as undoable as any other graph edit this turn.
         captureGraphSnapshot(null, "before loading an API-format workflow");
         await app.loadApiJson(apiClone, "graph_load.json");
-        // Read the identity the load landed on, gated on that captured object still being
-        // the live one. If `loadApiJson` spawned a new tab instead of replacing in place,
-        // or the user switched during the await, nothing here can prove which workflow is
-        // ours and the field is omitted rather than guessed.
-        const apiLoadedWorkflowUuid = loadLandedWorkflowUuid(app, apiTargetWorkflow);
         // COMPARE WHAT ARRIVED. A missing node type is an uninstalled pack, and a
         // load that quietly drops nodes and reports success is the exact failure
         // this codebase keeps fixing — the graph then fails at QUEUE time, with a
@@ -11222,6 +11217,17 @@ const GRAPH_TOOL_EXECUTORS = {
         const importFailures = shortfall.length
           ? await readPackImportFailures(api)
           : [];
+        // Read the identity the load landed on, gated on that captured object still being
+        // the live one. If `loadApiJson` spawned a new tab instead of replacing in place,
+        // or the user switched during the await, nothing here can prove which workflow is
+        // ours and the field is omitted rather than guessed.
+        //
+        // LAST, immediately before the reply, and deliberately AFTER the import-failure
+        // fetch. Read any earlier and that `await` sits between the check and the reply:
+        // the comparison passes for A, the event loop lets the user switch to B, and the
+        // reply — already blessed — ships A's uuid for what is now B's canvas. The gate is
+        // only worth anything if it is still true when the value leaves.
+        const apiLoadedWorkflowUuid = loadLandedWorkflowUuid(app, apiTargetWorkflow);
         return {
           loaded: true,
           format: "api",
