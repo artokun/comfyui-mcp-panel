@@ -423,24 +423,57 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
      * are lora_1 and a DUPLICATE lora_2. A burnt number is recoverable; two rows with the
      * same name are not.
      *
-     * Returns true when the row was actually taken back out. Never throws — an undo running
-     * on an error path must not replace the refusal with an error about the undo.
+     * Returns `{ removed, incomplete }`. `removed` says whether the row itself went;
+     * `incomplete` is a sentence for the caller to disclose when the rollback could NOT put
+     * everything back, or null when it could. Never throws — an undo running on an error path
+     * must not replace the refusal with an error about the undo.
+     *
+     * WHY AN UNRESTORED COUNTER IS A REPORTABLE OUTCOME AND NOT A SHRUG. A pack that exposes
+     * `addNewLoraWidget` but hides or freezes `loraWidgetsCounter` lets this call mint a row,
+     * lets the write refuse it (a slot with an invalid field type), and then takes the row
+     * back out — but the NAME stays spent. Returning a bare success there told the caller
+     * only that its value was invalid, so the obvious retry (same `lora_N`, corrected value)
+     * mints a LATER row and refuses again on the name, which is the same unfollowable advice
+     * the mismatch refusal already had to stop giving.
      */
     remove: () => {
       try {
-        if (!createdWidget) return false;
+        if (!createdWidget) return { removed: false, incomplete: null };
         removeCreatedRow(node, createdWidget);
         const rowIsGone = !(node.widgets ?? []).includes(createdWidget);
-        if (!rowIsGone) return false;
+        if (!rowIsGone) {
+          return {
+            removed: false,
+            incomplete:
+              `The row "${widgetName}" this call had added could not be removed again and is ` +
+              `still on the node — inspect the node before retrying.`,
+          };
+        }
         // Only when the counter is still exactly this call's increment.
         if (counterAfter !== null && readRowCounter(node) === counterAfter) {
           restoreRowCounter(node, counterBefore);
         }
         restoreNodeSize(node, sizeBefore);
-        return true;
+        // DID IT COME BACK? Asked of the NODE, not of the attempt — the same rule the two
+        // refusal branches above use. `restoreRowCounter` reports false both when it could
+        // not write and when there was nothing to undo, so its return cannot tell those
+        // apart; reading the counter can. A counter that never moved is clean, an unreadable
+        // or unwritable one is not, and a counter another row has since advanced is not ours
+        // to wind back and leaves this name spent all the same.
+        const counterBack = counterBefore !== null && readRowCounter(node) === counterBefore;
+        return {
+          removed: true,
+          incomplete: counterBack
+            ? null
+            : `The row "${widgetName}" it had created was removed again, but this node's row ` +
+              `counter could not be ${counterBefore === null ? "read" : "rewound"}, so that name ` +
+              `is used up: the next row will be numbered later than you expect. Read the node ` +
+              `with panel_query_graph before retrying — asking for "${widgetName}" again will ` +
+              `create a differently-named row and refuse a second time.`,
+        };
       } catch {
         /* best-effort: the refusal this is undoing is the message that reaches the caller */
-        return false;
+        return { removed: false, incomplete: null };
       }
     },
   };

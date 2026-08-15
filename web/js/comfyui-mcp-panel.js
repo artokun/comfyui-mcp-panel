@@ -12269,9 +12269,15 @@ const GRAPH_TOOL_EXECUTORS = {
         });
         createdLoraRow = made.created;
         return {
+          // Returns the row-creation's own disclosure when the rollback was INCOMPLETE (the
+          // pack hides or freezes its counter, so the row name stayed spent), which
+          // runSetWidget appends to the refusal. A caller told only "that value is invalid"
+          // would retry the same `lora_N` and hit a differently-named row.
           undo: () => {
-            if (made.remove() !== false) createdLoraRow = null;
+            const undone = made.remove();
+            if (undone.removed) createdLoraRow = null;
             graph.setDirtyCanvas(true, true);
+            return undone.incomplete;
           },
         };
       },

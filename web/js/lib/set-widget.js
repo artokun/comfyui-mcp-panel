@@ -487,9 +487,38 @@ export async function runSetWidget(
     // AFTER the fence, so a workflow switch during the fetch refuses before the mutation.
     // Called once per attempt and expected to be idempotent: the stale-combo and upload
     // retries re-enter `write`, and by then the target it created already exists.
+    //
+    // ONE HISTORY TRANSACTION AROUND THE WHOLE TRIPLE. applyWidgetWrite opens and CLOSES its
+    // own undo envelope — two of them on the failure path, since it rolls a bad value back in
+    // an envelope of its own — and a close that reaches zero is what makes ComfyUI's
+    // ChangeTracker CAPTURE. So a post-assignment refusal (the #240 read-back rejecting a
+    // value the widget's setter normalized) captured a snapshot with the created target and
+    // the rejected value still in it, and the cleanup below then removed that target with no
+    // envelope open and nothing captured. The tracker's newest snapshot was a graph that no
+    // longer existed, so the next Ctrl+Z restored the refused command instead of stepping
+    // over it — the refusal was supposed to be a no-op.
+    //
+    // An OUTER envelope keeps the inner closes from ever reaching zero, so exactly one
+    // capture happens: at the end, over the graph as it really finished, cleanup included.
+    //
+    // THIS IS NOT THE ROUND-2 DEFECT COMING BACK. That one held a transaction across an
+    // AWAIT, where a workflow switch could detach the canvas before the close and wedge the
+    // tracker at changeCount 1 for the session. Everything between these two calls is
+    // synchronous and cannot yield — which is exactly the property that moving the creation
+    // here established. Keep it that way: no await may be introduced inside this bracket.
+    //
+    // OPENED THE MOMENT THERE IS SOMETHING TO PROTECT, AND NOT BEFORE. The envelope wraps the
+    // write and the cleanup; the preparation itself sits just outside it, deliberately.
+    // Opening first would mean bracketing a graph that never changed whenever the preparation
+    // REFUSES (a pack with no addNewLoraWidget), and whether an unchanged capture becomes a
+    // no-op undo entry is ComfyUI's business, not something this file can verify — so a
+    // refusal that changed nothing keeps doing no bookkeeping at all, as it does today.
+    // Nothing is lost by that: the capture is a WHOLE-GRAPH snapshot taken at the close, so
+    // it contains the created target regardless of which side of the open it was minted on,
+    // and no capture can occur in between because only a close that reaches zero captures.
     const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
-    try {
-      return applyWidgetWrite(node, widgetName, value, {
+    const doWrite = () =>
+      applyWidgetWrite(node, widgetName, value, {
         resolveSource,
         canvas,
         beforeChange,
@@ -499,17 +528,39 @@ export async function runSetWidget(
         promotedResolution,
         ...extra,
       });
-    } catch (err) {
-      // The write refused over a target this attempt had just created. Undo it in the same
-      // synchronous stretch, so the graph the refusal is reported over is the graph the
-      // command started from — and so a retry below starts from a clean node rather than
-      // finding a row it would then decline to create again.
+    // Nothing was grown, so there is no cleanup to keep company: leave the bookkeeping
+    // exactly as applyWidgetWrite has always owned it.
+    if (!prepared) return doWrite();
+    beforeChange?.();
+    try {
       try {
-        prepared?.undo?.();
-      } catch {
-        /* an undo that fails must never replace the refusal that caused it */
+        return doWrite();
+      } catch (err) {
+        // The write refused over a target this attempt had just created. Undo it in the same
+        // synchronous stretch, so the graph the refusal is reported over is the graph the
+        // command started from — and so a retry below starts from a clean node rather than
+        // finding a row it would then decline to create again.
+        try {
+          // An undo that could NOT put everything back RETURNS A STRING SAYING SO, and the
+          // refusal carries it. Without this the caller hears only why the value was
+          // rejected, while a resource the preparation consumed stays consumed — and the
+          // obvious next move, retrying the corrected value under the same name, fails a
+          // second time for a reason the first message never mentioned.
+          //
+          // Annotated IN PLACE rather than rethrown as a new error: the recovery paths below
+          // dispatch on `instanceof WidgetWriteError` and on `.combo` / `.emptyOptions`, and
+          // wrapping would strip all three and turn a retryable combo miss into a hard fail.
+          const note = prepared?.undo?.();
+          if (typeof note === "string" && note && typeof err?.message === "string") {
+            err.message = `${err.message} ${note}`;
+          }
+        } catch {
+          /* an undo that fails must never replace the refusal that caused it */
+        }
+        throw err;
       }
-      throw err;
+    } finally {
+      afterChange?.();
     }
   };
 

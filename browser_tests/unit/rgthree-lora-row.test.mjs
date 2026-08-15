@@ -477,6 +477,59 @@ test("#757 remove() never throws, whatever the node does", () => {
   assert.doesNotThrow(() => made.remove(), "an undo on an error path must not replace the refusal");
 });
 
+test("#757 remove() reports a rollback it completed as clean", () => {
+  // The other side of the rule below — the honest "nothing is left over" must stay reachable,
+  // or every refused write would start carrying a scary sentence it has not earned.
+  const n = loader({ nextRow: 1 });
+  const undone = createRgthreeLoraRow(n, "lora_1", {}).remove();
+  assert.equal(undone.removed, true);
+  assert.equal(undone.incomplete, null, "row gone and counter back — there is nothing to disclose");
+});
+
+test("#757 remove() DISCLOSES a row name it could not give back", () => {
+  // A pack that exposes addNewLoraWidget but hides its counter. The row goes back out, but
+  // the NAME stays spent — and a caller told only that its value was invalid will retry the
+  // same lora_1, mint a later row and be refused a second time on the name instead.
+  const n = loader({ nextRow: 1, trackCounter: false });
+  const undone = createRgthreeLoraRow(n, "lora_1", {}).remove();
+  assert.equal(undone.removed, true, "the row itself did go");
+  assert.match(undone.incomplete, /row counter could not be read, so that name is used up/);
+  assert.match(undone.incomplete, /asking for "lora_1" again will create a differently-named row/);
+});
+
+test("#757 remove() discloses a FROZEN counter too, not just an unreadable one", () => {
+  // Readable but unwritable — the assignment is swallowed, so the rewind silently did not
+  // happen. Asking the NODE afterwards is what tells the two apart from a real rewind.
+  const n = loader({ nextRow: 1 });
+  const made = createRgthreeLoraRow(n, "lora_1", {});
+  let frozen = n.loraWidgetsCounter;
+  Object.defineProperty(n, "loraWidgetsCounter", { get: () => frozen, set: () => {}, configurable: true });
+  const undone = made.remove();
+  assert.equal(undone.removed, true);
+  assert.match(undone.incomplete, /could not be rewound, so that name is used up/);
+});
+
+test("#757 remove() discloses a name spent because SOMEBODY ELSE advanced the counter", () => {
+  // The round-2 rule stands — winding back past another row's increment would re-issue names
+  // that are taken — but declining to rewind still leaves this call's name spent, and the
+  // caller has to hear that rather than be told the rollback was clean.
+  const n = loader({ nextRow: 1 });
+  const made = createRgthreeLoraRow(n, "lora_1", {});
+  n.addNewLoraWidget(); // an unrelated addition while our write was in flight
+  const undone = made.remove();
+  assert.equal(n.loraWidgetsCounter, 2, "still not rewound past the row that is not ours");
+  assert.match(undone.incomplete, /could not be rewound, so that name is used up/);
+});
+
+test("#757 remove() reports a row it could not take back out", () => {
+  const n = loader({ nextRow: 1 });
+  const made = createRgthreeLoraRow(n, "lora_1", {});
+  n.removeWidget = () => {}; // a node that refuses to give the row up
+  const undone = made.remove();
+  assert.equal(undone.removed, false);
+  assert.match(undone.incomplete, /could not be removed again and is still on the node/);
+});
+
 // ---------------------------------------------------------------------------
 // The panel wiring
 // ---------------------------------------------------------------------------
@@ -663,6 +716,150 @@ test("#757 boundary: an undo that THROWS never replaces the refusal that caused 
     /panel_set_widget refused "made"/,
     "the caller hears why the WRITE was refused, not why the cleanup failed",
   );
+});
+
+/**
+ * ChangeTracker's counting rule, which is the whole reason the outer envelope matters:
+ *
+ *   `beforeChange(){ this.changeCount++ }`
+ *   `afterChange(){ --this.changeCount || this.captureCanvasState() }`
+ *
+ * A close that reaches ZERO captures. So nested envelopes yield ONE capture, at the outermost
+ * close — and whatever the graph looks like at that moment is what the undo history gets.
+ */
+function historyProbe(node) {
+  const probe = {
+    depth: 0,
+    captures: [],
+    beforeChange: () => {
+      probe.depth += 1;
+    },
+    afterChange: () => {
+      probe.depth -= 1;
+      if (probe.depth < 0) throw new Error("afterChange() without a matching beforeChange()");
+      if (probe.depth === 0) probe.captures.push(node.widgets.map((w) => w.name));
+    },
+  };
+  return probe;
+}
+
+test("#757 boundary: a POST-ASSIGNMENT refusal captures no history with the row still in it", async () => {
+  // ROUND-4 P2. applyWidgetWrite closes its own envelope BEFORE the #240 read-back verifies,
+  // and rolls a bad value back in an envelope of its own — so a value the widget's setter
+  // normalizes away is refused only after up to two captures have already been taken. Without
+  // an outer envelope those captures hold the created row and the rejected value, and the
+  // cleanup then removes the row with nothing open and nothing captured: the tracker's newest
+  // snapshot is a graph that no longer exists, and the next Ctrl+Z restores the very command
+  // that was refused. A refusal has to be a no-op in the undo history too.
+  const node = { id: 7, type: "KSampler", widgets: [] };
+  // A widget that ACCEPTS the assignment and keeps its old value — the read-back rejects it
+  // after the write envelope has already closed.
+  const swallowing = { name: "made", type: "text", get value() { return ""; }, set value(_v) {} };
+  const probe = historyProbe(node);
+  let undone = 0;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "hello", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        beforeChange: probe.beforeChange,
+        afterChange: probe.afterChange,
+        prepareWriteTarget: () => {
+          node.widgets.push(swallowing);
+          return {
+            undo: () => {
+              undone += 1;
+              node.widgets = node.widgets.filter((w) => w !== swallowing);
+              return null;
+            },
+          };
+        },
+      }),
+    /did not retain the requested value/,
+  );
+  assert.equal(undone, 1, "the refusal rolled the preparation back");
+  assert.equal(probe.depth, 0, "every envelope opened is closed — an unclosed one wedges the tracker");
+  assert.equal(probe.captures.length, 1, "exactly one capture, at the outermost close");
+  assert.deepEqual(probe.captures[0], [], "…and it holds the graph AFTER the cleanup, not the refused row");
+});
+
+test("#757 boundary: a SUCCESSFUL creating write is still one capture, with the row in it", async () => {
+  // The same envelope on the success path: one undo step, and it covers create + assign.
+  const { node, seen, prepareWriteTarget } = boundaryFixture();
+  const probe = historyProbe(node);
+  await runSetWidget(node, "made", "hello", {
+    registry: BOUNDARY_REGISTRY,
+    ...boundaryOracle,
+    beforeChange: probe.beforeChange,
+    afterChange: probe.afterChange,
+    prepareWriteTarget,
+  });
+  assert.equal(seen.prepared, 1);
+  assert.equal(probe.depth, 0);
+  assert.equal(probe.captures.length, 1, "one undo step for the whole command");
+  assert.deepEqual(probe.captures[0], ["made"], "and it covers the creation and the assign together");
+});
+
+test("#757 boundary: an INCOMPLETE rollback is disclosed on the refusal the caller sees", async () => {
+  // ROUND-4 P2, the other half. The undo may report that it could not put everything back —
+  // a consumed row name that the pack's hidden counter will not give up. That has to reach
+  // the caller ATTACHED TO THE REFUSAL, because the refusal is all it gets.
+  const { node, prepareWriteTarget: mint } = boundaryFixture({
+    name: "made",
+    type: "combo",
+    options: { values: ["a"] },
+    value: "a",
+  });
+  const prepareWriteTarget = () => {
+    const prepared = mint();
+    if (!prepared) return null;
+    return {
+      undo: () => {
+        prepared.undo();
+        return "The name it used up could not be given back.";
+      },
+    };
+  };
+  await assert.rejects(
+    () => runSetWidget(node, "made", "nope", { registry: BOUNDARY_REGISTRY, ...boundaryOracle, prepareWriteTarget }),
+    (err) => {
+      assert.match(err.message, /is not a valid option/, "the reason the write was refused");
+      assert.match(err.message, /could not be given back/, "…and what the rollback could not undo");
+      return true;
+    },
+  );
+});
+
+test("#757 boundary: the disclosure does not cost a combo miss its retry", async () => {
+  // The annotation is applied IN PLACE precisely so the error keeps its type and its `combo`
+  // flag. Rethrowing a wrapped error here would turn every recoverable stale-combo miss into
+  // a hard refusal — a far bigger regression than the disclosure is worth.
+  const { node, widget, prepareWriteTarget: mint } = boundaryFixture({
+    name: "made",
+    type: "combo",
+    options: { values: ["a"] },
+    value: "a",
+  });
+  const prepareWriteTarget = () => {
+    const prepared = mint();
+    if (!prepared) return null;
+    return {
+      undo: () => {
+        prepared.undo();
+        return "a note that must not break the recovery";
+      },
+    };
+  };
+  const res = await runSetWidget(node, "made", "b", {
+    registry: BOUNDARY_REGISTRY,
+    ...boundaryOracle,
+    prepareWriteTarget,
+    refreshCombos: async () => {
+      widget.options.values.push("b");
+    },
+  });
+  assert.equal(res.set.value, "b", "the stale-combo recovery still ran and the write landed");
+  assert.equal(res.refreshed, true);
 });
 
 test("#757 boundary: nothing the hook made survives ACROSS the retry await", async () => {
@@ -859,15 +1056,29 @@ function stubRunSetWidget({ fail = null, result = { ok: true } } = {}) {
     // exactly as it does in the real one (the hook is called before applyWidgetWrite's try).
     const prepared = opts.prepareWriteTarget?.() ?? null;
     fn.writes += 1;
-    // The real one brackets its write and fires afterChange BEFORE the #240 read-back
-    // verification that can still reject — so a refusal arrives with its own pair closed.
-    opts.beforeChange?.();
-    opts.afterChange?.();
-    if (fail) {
-      prepared?.undo?.();
-      throw fail;
+    // A grown target puts the write AND its cleanup inside ONE OUTER envelope, so the tracker
+    // captures once — at the end, over the graph as it really finished. Opened only when
+    // something was actually prepared, exactly as the real one does.
+    if (prepared) opts.beforeChange?.();
+    try {
+      // The real one brackets its write and fires afterChange BEFORE the #240 read-back
+      // verification that can still reject — so a refusal arrives with its own pair closed.
+      opts.beforeChange?.();
+      opts.afterChange?.();
+      if (fail) {
+        // The real one ANNOTATES the refusal in place with whatever the undo could not put
+        // back, so the caller is not told only why its value was rejected while a resource
+        // the preparation consumed stays consumed.
+        const note = prepared?.undo?.();
+        if (typeof note === "string" && note && typeof fail?.message === "string") {
+          fail.message = `${fail.message} ${note}`;
+        }
+        throw fail;
+      }
+      return result;
+    } finally {
+      if (prepared) opts.afterChange?.();
     }
-    return result;
   };
   fn.calls = [];
   /** Write ATTEMPTS — the calls that got past `prepareWriteTarget`, not merely into the body. */
@@ -1000,6 +1211,43 @@ test("#757 executor: a REFUSED write takes the row back out", async () => {
     "the refusal reaches the caller unchanged",
   );
   assert.deepEqual(node.widgets.map((w) => w.name), before, "and the node is back to what it was");
+});
+
+test("#757 executor: a refused write over a HIDDEN counter says the row name is spent", async () => {
+  // ROUND-4 P2, end to end through the shipped wiring: the pack exposes addNewLoraWidget but
+  // keeps its counter private, so the row goes back out and the NAME does not. The caller
+  // gets one message and it has to carry both facts — otherwise the obvious next move,
+  // retrying the corrected value under the same lora_1, mints a later row and is refused a
+  // second time for a reason the first refusal never mentioned.
+  const node = loader({ nextRow: 1, trackCounter: false });
+  const { run } = executor(node, {
+    runSetWidget: stubRunSetWidget({ fail: new Error('"strength" must be a number') }),
+  });
+  await assert.rejects(
+    () => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }),
+    (err) => {
+      assert.match(err.message, /"strength" must be a number/, "why the write was refused");
+      assert.match(err.message, /row counter could not be read, so that name is used up/, "…and what it cost");
+      return true;
+    },
+  );
+  assert.ok(!node.widgets.some((w) => w.name === "lora_1"), "the row itself did go back out");
+});
+
+test("#757 executor: a refused write that rolled back CLEANLY says nothing extra", async () => {
+  // The counterpart: a readable counter that came back leaves nothing to confess, and the
+  // refusal must not start carrying a warning it has not earned.
+  const node = loader({ nextRow: 1 });
+  const { run } = executor(node, {
+    runSetWidget: stubRunSetWidget({ fail: new Error('"strength" must be a number') }),
+  });
+  await assert.rejects(
+    () => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }),
+    (err) => {
+      assert.equal(err.message, '"strength" must be a number', "the refusal is exactly what the write said");
+      return true;
+    },
+  );
 });
 
 test("#757 executor: a refused write rewinds the row counter too", async () => {
