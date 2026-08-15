@@ -206,43 +206,6 @@ function restoreNodeSize(node, previous) {
   }
 }
 
-/**
- * Rows this module created and that NOBODY ELSE has written to yet.
- *
- * WHY A CLAIM IS NEEDED AT ALL. Websocket command frames run concurrently, so two
- * `panel_set_widget` calls for the same missing `lora_1` interleave like this: A classifies
- * it as a creation, mints the row and parks inside the value write; B arrives, sees a row
- * that now EXISTS, writes it through the ordinary path and reports success; A's write then
- * fails validation and rolls back. An unconditional rollback deletes the very row B just
- * wrote and reported — B's success no longer matches the graph, which is a worse outcome
- * than the stray row the rollback exists to prevent.
- *
- * So the rollback is CONDITIONAL: it removes the row only while this call's claim on it is
- * still standing. Any successful write to the row drops the claim (`noteRgthreeLoraRowWritten`
- * below), and from that moment the row belongs to the graph, not to this call.
- *
- * Keyed on the widget OBJECT and held weakly, so a node that goes away takes its entries
- * with it and nothing here can keep a widget alive.
- */
-const rowClaims = new WeakMap();
-
-/**
- * Record that a write LANDED on `widgetName`, so a concurrent creation will not roll it back.
- *
- * Called by `graph_set_widget` after any successful write, not just a creating one — the
- * whole point is that the write which saves the row is usually somebody ELSE'S request.
- * Total and silent: a node it cannot read simply has no claims to drop.
- */
-export function noteRgthreeLoraRowWritten(node, widgetName) {
-  try {
-    for (const w of node?.widgets ?? []) {
-      if (w?.name === widgetName) rowClaims.delete(w);
-    }
-  } catch {
-    /* nothing to drop */
-  }
-}
-
 /** Drop a widget the node grew but that we are not keeping. Best-effort, never throws. */
 function removeCreatedRow(node, widget) {
   try {
@@ -330,17 +293,29 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
       if (w) removeCreatedRow(node, w);
     }
     const rowsGone = appendedSince().length === 0;
-    const rewound = rowsGone && restoreRowCounter(node, counterBefore);
+    restoreRowCounter(node, counterBefore);
     if (rowsGone) restoreNodeSize(node, sizeBefore);
-    const cleaned = rowsGone && (rewound || counterBefore === null || readRowCounter(node) === counterBefore);
+    // AN UNKNOWN COUNTER IS AN INCOMPLETE ROLLBACK, not a clean one. When the pack exposes
+    // no readable `loraWidgetsCounter` we cannot see whether the throw happened after the
+    // private increment — and it happens FIRST in the shipped method, so it probably did.
+    // Treating `counterBefore === null` as "nothing changed" told the caller a retry was
+    // safe when a row name had in fact been consumed, which is the same unfollowable advice
+    // the mismatch refusal already had to stop giving. Only a counter we can READ and that
+    // now READS BACK unchanged counts as restored.
+    const counterRestored = counterBefore !== null && readRowCounter(node) === counterBefore;
     throw new Error(
       `Cannot create "${widgetName}" on node ${node?.id}: the rgthree pack's own ` +
         `addNewLoraWidget() threw (${detail}). ` +
-        (cleaned
+        (rowsGone && counterRestored
           ? `Anything it had already added was removed again, so nothing was changed.`
-          : `It had already changed the node before it threw, and that could not be fully ` +
-            `undone${stranded.length ? ` (${stranded.join(", ")})` : ""} — inspect the node ` +
-            `before retrying.`),
+          : !rowsGone
+            ? `It had already changed the node before it threw, and that could not be fully ` +
+              `undone (${stranded.join(", ")} is still on the node) — inspect the node before ` +
+              `retrying.`
+            : `The row it had started to add was removed again, but this node's row counter ` +
+              `could not be ${counterBefore === null ? "read" : "rewound"}, so it may have ` +
+              `consumed a row name before it threw — the next row could be numbered later ` +
+              `than you expect. Read the node before retrying.`),
     );
   } finally {
     afterChange?.();
@@ -355,9 +330,19 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     // wrong. Put it back, or this failed attempt silently costs the node a row name.
     restoreRowCounter(node, counterBefore);
     restoreNodeSize(node, sizeBefore);
+    // Same rule as the throw path above: only a counter we can read, and that reads back
+    // unchanged, licenses "nothing was changed". A pack that hides its counter may well have
+    // advanced it — the increment comes first in the shipped method — and a caller told
+    // nothing changed will retry into a row name that has already moved.
+    const counterRestored = counterBefore !== null && readRowCounter(node) === counterBefore;
     throw new Error(
       `Cannot create "${widgetName}" on node ${node?.id}: addNewLoraWidget() ran but added ` +
-        `no widget. Nothing was changed.`,
+        `no widget. ` +
+        (counterRestored
+          ? `Nothing was changed.`
+          : `This node's row counter could not be ${counterBefore === null ? "read" : "rewound"}, ` +
+            `so the call may still have consumed a row name — the next row could be numbered ` +
+            `later than you expect. Read the node before retrying.`),
     );
   }
 
@@ -405,15 +390,6 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
   // rewind unless it still reads exactly this, because anything else means the number it
   // would rewind past is not only ours. See the note on the rollback below.
   const counterAfter = readRowCounter(node);
-  // Claim the row until somebody's write lands on it. See `rowClaims`.
-  const claim = {};
-  if (createdWidget) {
-    try {
-      rowClaims.set(createdWidget, claim);
-    } catch {
-      /* an unclaimable widget simply cannot be rolled back — checked in `remove` */
-    }
-  }
   return {
     created: widgetName,
     /**
@@ -428,11 +404,13 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
      * answers to that name then, which after an intervening `configure()` — rgthree re-mints
      * rows from serialized order — is not necessarily the widget this call grew.
      *
-     * ONLY WHILE THE CLAIM STANDS. Command frames run concurrently: another request can see
-     * the row this call created, write it, and report success while this call is still
-     * awaiting. Deleting it then would contradict a success somebody has already been told
-     * about — worse than the stray row this rollback exists to prevent. So a row that has
-     * been written by anyone is left alone, and the refusal simply says so. See `rowClaims`.
+     * CALLED IN THE SAME SYNCHRONOUS STRETCH AS THE CREATION, from runSetWidget's write
+     * boundary. That is what makes it safe to remove the row unconditionally: no other
+     * command frame, user gesture or undo capture can run between the two, so the row can
+     * only be the one this call grew and untouched since. An earlier version created the row
+     * before an awaited /object_info fetch and needed a claim to avoid deleting a row a
+     * concurrent request had written; moving the creation past the await removed the window
+     * instead, and the claim with it.
      *
      * BOTH HALVES, for the reason `restoreRowCounter` exists: `addNewLoraWidget` increments
      * before it names, so dropping only the widget leaves the number spent and the next mint
@@ -451,9 +429,6 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     remove: () => {
       try {
         if (!createdWidget) return false;
-        // Somebody else's write landed here first; the row is the graph's now, not ours.
-        if (rowClaims.get(createdWidget) !== claim) return false;
-        rowClaims.delete(createdWidget);
         removeCreatedRow(node, createdWidget);
         const rowIsGone = !(node.widgets ?? []).includes(createdWidget);
         if (!rowIsGone) return false;

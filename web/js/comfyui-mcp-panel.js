@@ -215,7 +215,7 @@ import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/objec
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
-import { isRgthreeLoraRowCreation, createRgthreeLoraRow, noteRgthreeLoraRowWritten } from "./lib/rgthree-lora-row.js";
+import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
@@ -12057,56 +12057,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // refused for a widget no tool could bring into existence. Writing an EXISTING row
     // already worked; this is the creation half.
     //
-    // AFTER the history seed and BEFORE runSetWidget, deliberately. The seed is what makes
-    // the #458 authorization meaningful, and creating a row is a mutation — it must not
-    // happen on a call that authorization is about to refuse. runSetWidget then resolves the
-    // now-present widget through the ordinary path, so the composite merge and the #240
-    // verify are unchanged.
-    //
     // The classifier is keyed on node TYPE + the `lora_<n>` name shape + a lora-slot-shaped
     // VALUE, all three. That is what keeps it away from the deliberate refusal to auto-press
     // a control on an ordinary typo — see lib/rgthree-lora-row.js.
     //
-    // NO ROW LEFT BEHIND BY A REFUSED WRITE, AND STILL ONE UNDO STEP. `runSetWidget` can
-    // refuse after the row exists (fresh /object_info says the pack was removed, the slot's
-    // own fields fail validation, the workflow switched during an await, the #240 read-back
-    // rolls the value back). Reporting failure over a CHANGED graph is the mutate-then-refuse
-    // contract the rest of this file works to avoid, and each retry would add another row —
-    // so a refused write undoes the creation below.
+    // NOT CREATED HERE. The row is minted by the `prepareWriteTarget` hook below, which
+    // runSetWidget invokes at its synchronous write boundary — after the history seed that
+    // makes the #458 authorization meaningful, after the fresh-/object_info await, after the
+    // workflow fence, immediately before applyWidgetWrite, with no await between the
+    // creation, the write and the undo. The now-present widget then resolves through the
+    // ordinary path, so the composite merge and the #240 verify are unchanged.
     //
-    // THE CREATION IS DELIBERATELY NOT BRACKETED, and no transaction is held across the
-    // await. An earlier version opened graph.beforeChange() here and closed it after the
-    // write, which was wrong in a way far worse than the bug it fixed. LiteGraph delivers
-    // these hooks through ATTACHED canvases — `canvasAction(cb){for (const c of
-    // this.list_of_graphcanvas) cb(c)}` — so if the user switches workflow tabs or leaves the
-    // subgraph while runSetWidget awaits /object_info, the graph we opened on has no canvas
-    // left and the close reaches nobody. ComfyUI's ChangeTracker then sits at changeCount 1
-    // for the rest of the session (`afterChange(){--this.changeCount||this.captureCanvasState()}`
-    // never reaches zero again), so NO further edit in that workflow is ever captured for
-    // undo. A session-wide dead undo history is not a trade worth one Ctrl+Z.
+    // Creating it at THIS point instead — before runSetWidget is even entered — is what
+    // produced every serious defect this feature has had, because it left a live graph
+    // mutation sitting across a network request: an undo transaction that could never be
+    // closed if the user switched tabs, a concurrent frame whose write got rolled back
+    // under it, and a user's own hand-edit exposed to a rollback that had nothing to do
+    // with them. Moving the mutation past the await removes the window rather than
+    // guarding it, so the guards those defects each needed are gone.
     //
-    // Leaving the creation unbracketed still yields ONE undo step, because ChangeTracker
-    // captures whole-graph SNAPSHOTS rather than deltas: nothing is captured while the row is
-    // minted, and the pair runSetWidget opens for the write itself closes with the row
-    // already present — so the single entry it records covers the creation and the assign
-    // together. It also means every transaction in this command is opened and closed inside
-    // one synchronous stretch, which is the rule the rest of this file already follows.
+    // It is still ONE undo step: ChangeTracker captures whole-graph SNAPSHOTS rather than
+    // deltas, and the pair runSetWidget opens for the write now closes with the row already
+    // present, so the single entry it records covers the creation and the assign together.
     let createdLoraRow = null;
-    let undoLoraRow = null;
-    if (isRgthreeLoraRowCreation(node, widget, value)) {
-      // The uuid fence brackets the mutation, as graph_remove_widget does: the user can
-      // switch workflows during the awaits above, and a row must never be grown on a canvas
-      // the caller did not address (#570/#718).
-      assertActiveWorkflowCommandTarget({
-        cmd: "graph_set_widget",
-        [WORKFLOW_UUID_FIELD]: workflow_uuid,
-      });
-      const made = createRgthreeLoraRow(node, widget, {
-        setDirty: () => graph.setDirtyCanvas(true, true),
-      });
-      createdLoraRow = made.created;
-      undoLoraRow = made.remove;
-    }
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
@@ -12274,6 +12247,34 @@ const GRAPH_TOOL_EXECUTORS = {
       beforeChange: () => graph.beforeChange(),
       afterChange: () => graph.afterChange(),
       setDirty: () => graph.setDirtyCanvas(true, true),
+      // #757 — MINT a missing rgthree `lora_N` row, at the write boundary and nowhere else.
+      // runSetWidget calls this synchronously after its workflow fence and immediately
+      // before applyWidgetWrite, and calls the returned `undo` if the write refuses — so
+      // the creation, the write and its rollback are one uninterruptible stretch.
+      //
+      // Idempotent by construction, and RE-ENTERED PER ATTEMPT: runSetWidget's stale-combo
+      // and upload-asset recoveries undo this preparation before their await and call it
+      // again on the retry, so the classifier's requirement that the row be ABSENT is
+      // satisfied each time and no second row is ever minted.
+      //
+      // `createdLoraRow` therefore tracks the LAST attempt: set when the row really exists,
+      // cleared when an undo really removed it. The clearing is belt-and-braces today —
+      // every refusal in this command throws, so the disclosure below is only reached after
+      // an attempt that SUCCEEDED — and it is what keeps the field in step with the graph if
+      // a future path ever returns a result over an undone creation instead.
+      prepareWriteTarget: () => {
+        if (!isRgthreeLoraRowCreation(node, widget, value)) return null;
+        const made = createRgthreeLoraRow(node, widget, {
+          setDirty: () => graph.setDirtyCanvas(true, true),
+        });
+        createdLoraRow = made.created;
+        return {
+          undo: () => {
+            if (made.remove() !== false) createdLoraRow = null;
+            graph.setDirtyCanvas(true, true);
+          },
+        };
+      },
       // #718: the first command-handler fence ran before awaitObjectInfoHistorySeed()
       // and the fresh /object_info request. A user can switch workflows while either
       // promise is pending, so re-read the ACTIVE uuid at the exact shared write
@@ -12339,45 +12340,9 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       },
     };
-    let result;
-    try {
-      result = await runSetWidget(node, widget, value, setWidgetOptions);
-    } catch (err) {
-      // #757 — A REFUSED WRITE MUST NOT LEAVE THE ROW BEHIND.
-      //
-      // The row had to be created before the write (the widget must exist for the ordinary
-      // path to resolve it), but the write can still refuse afterwards. Undoing it here is
-      // what keeps this command all-or-nothing.
-      //
-      // `remove` rewinds rgthree's row counter and the node's height along with the row, and
-      // it declines when another concurrent request has already written the row — a success
-      // somebody has been told about outranks this refusal's tidiness. It reports whether the
-      // row actually went, so the disclosure below can stay honest either way.
-      if (undoLoraRow) {
-        let undone = false;
-        try {
-          undone = undoLoraRow() !== false;
-          graph.setDirtyCanvas(true, true);
-        } catch {
-          /* best-effort: never replace the refusal with an error about undoing it */
-        }
-        undoLoraRow = null;
-        // Only claim nothing was created when nothing is left. A row that survived because
-        // another request wrote it is still on the node, and saying otherwise would be the
-        // same fabrication this route exists to avoid.
-        if (undone) createdLoraRow = null;
-      }
-      throw err;
-    }
-    // #757 — the row now belongs to the graph, not to whichever call minted it. A concurrent
-    // creation that goes on to refuse must NOT roll back a row this write has landed on.
-    // Called for EVERY successful write, not just a creating one: the request that saves the
-    // row is usually somebody else's.
-    try {
-      noteRgthreeLoraRowWritten(node, widget);
-    } catch {
-      /* bookkeeping only — never fail a completed write over it */
-    }
+    // The creation and its rollback both live inside this call now, at the synchronous write
+    // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
+    const result = await runSetWidget(node, widget, value, setWidgetOptions);
 
     // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
     // missing asset (or an invalid value) to a valid one drops the missing-asset

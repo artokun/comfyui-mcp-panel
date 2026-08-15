@@ -129,6 +129,12 @@ export async function runSetWidget(
     // OUTCOME the ladder needs — a fresh answer — and leaves the cache to decide how to get
     // one without disturbing anybody else.
     refetchObjectInfoLive,
+    // #757 — SYNCHRONOUS target preparation. Some write targets do not exist until
+    // something creates them (an rgthree Power Lora Loader `lora_N` row is minted only by
+    // the node's own method), and the creation is a graph MUTATION. Injected here, rather
+    // than done by the caller before this function, so the mutation lands at the write
+    // boundary below where NO await follows it — see the note at `write`.
+    prepareWriteTarget,
   } = {},
 ) {
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
@@ -459,16 +465,52 @@ export async function runSetWidget(
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
     assertTargetStillCurrentNow();
-    return applyWidgetWrite(node, widgetName, value, {
-      resolveSource,
-      canvas,
-      beforeChange,
-      afterChange,
-      setDirty,
-      assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
-      promotedResolution,
-      ...extra,
-    });
+    // #757 — CREATE A MISSING TARGET HERE, INSIDE THE SAME SYNCHRONOUS STRETCH.
+    //
+    // A target that must be minted before it can be written (an rgthree `lora_N` row) used
+    // to be created by the CALLER, before `runSetWidget` was even entered. That put a live
+    // graph mutation on the far side of `await getFreshObjectInfo()`, and everything that
+    // went wrong with this feature came from that one gap:
+    //   - the row sat in the graph across a network request, so any ChangeTracker capture
+    //     in that window recorded a transient row and split the command's undo in two;
+    //   - a user hand-editing the node during the window could have their edit rolled back
+    //     by a failure that had nothing to do with them — losing a manual edit is worse
+    //     than the missing-widget refusal this feature exists to remove;
+    //   - a concurrent command frame could write the row and be told it succeeded, only
+    //     for the original call's rollback to delete it.
+    // Placed here, none of those windows exist: `applyWidgetWrite` is synchronous, so
+    // nothing — no other command frame, no user gesture, no capture — can run between the
+    // creation, the write and the undo below. The guards those three defects each needed
+    // are removed rather than kept, because the interleaving they defended against is now
+    // unreachable.
+    //
+    // AFTER the fence, so a workflow switch during the fetch refuses before the mutation.
+    // Called once per attempt and expected to be idempotent: the stale-combo and upload
+    // retries re-enter `write`, and by then the target it created already exists.
+    const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
+    try {
+      return applyWidgetWrite(node, widgetName, value, {
+        resolveSource,
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+        assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
+        promotedResolution,
+        ...extra,
+      });
+    } catch (err) {
+      // The write refused over a target this attempt had just created. Undo it in the same
+      // synchronous stretch, so the graph the refusal is reported over is the graph the
+      // command started from — and so a retry below starts from a clean node rather than
+      // finding a row it would then decline to create again.
+      try {
+        prepared?.undo?.();
+      } catch {
+        /* an undo that fails must never replace the refusal that caused it */
+      }
+      throw err;
+    }
   };
 
   // #558: the value widget being written may be governed by a non-`fixed`

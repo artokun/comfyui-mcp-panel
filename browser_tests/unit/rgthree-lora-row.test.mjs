@@ -17,9 +17,9 @@ import assert from "node:assert/strict";
 import {
   isRgthreeLoraRowCreation,
   createRgthreeLoraRow,
-  noteRgthreeLoraRowWritten,
   POWER_LORA_LOADER_TYPE,
 } from "../../web/js/lib/rgthree-lora-row.js";
+import { runSetWidget } from "../../web/js/lib/set-widget.js";
 
 const SLOT = { on: true, lora: "x.safetensors", strength: 0.5, strengthTwo: null };
 
@@ -420,6 +420,40 @@ test("#757 a pack method that throws PART-WAY is cleaned up, not just reported",
   assert.equal(n.loraWidgetsCounter, 0, "and the number it had already spent was returned");
 });
 
+test("#757 an UNKNOWN counter is reported as an incomplete rollback, not a clean one", () => {
+  // A pack that exposes no readable counter still has one, and the shipped method increments
+  // it BEFORE it constructs — so a throw has probably already spent a row name. Saying
+  // "nothing was changed" there tells the caller a retry is safe when it is not, which is
+  // exactly the unfollowable advice the mismatch refusal already had to stop giving.
+  const n = loader({ nextRow: 1, trackCounter: false });
+  n.addNewLoraWidget = () => {
+    throw new Error("boom"); // a private counter may already have moved
+  };
+  assert.throws(
+    () => createRgthreeLoraRow(n, "lora_1", {}),
+    /row counter could not be read, so it may have consumed a row name before it threw/,
+  );
+});
+
+test("#757 an UNKNOWN counter also makes 'added no widget' an incomplete rollback", () => {
+  const n = loader({ nextRow: 1, trackCounter: false });
+  n.addNewLoraWidget = () => {}; // accepted the call, added nothing, counter unknowable
+  assert.throws(
+    () => createRgthreeLoraRow(n, "lora_1", {}),
+    /ran but added no widget[\s\S]*could not be read, so the call may still have consumed a row name/,
+  );
+});
+
+test("#757 a KNOWN counter that came back really does report a clean rollback", () => {
+  // The other side of the same rule — the honest "nothing was changed" must still be reachable.
+  const n = loader({ nextRow: 1 });
+  n.addNewLoraWidget = () => {
+    n.loraWidgetsCounter += 1; // spent, but we can see it and put it back
+  };
+  assert.throws(() => createRgthreeLoraRow(n, "lora_1", {}), /ran but added no widget\. Nothing was changed\./);
+  assert.equal(n.loraWidgetsCounter, 0);
+});
+
 test("#757 a pack throw whose damage could NOT be undone says so", () => {
   const n = loader({ nextRow: 1 });
   n.addNewLoraWidget = () => {
@@ -430,7 +464,7 @@ test("#757 a pack throw whose damage could NOT be undone says so", () => {
   n.removeWidget = () => {}; // and the node will not give the row up
   assert.throws(
     () => createRgthreeLoraRow(n, "lora_1", {}),
-    /had already changed the node before it threw, and that could not be fully undone \(lora_1\)/,
+    /had already changed the node before it threw, and that could not be fully undone \(lora_1 is still on the node\)/,
   );
 });
 
@@ -450,23 +484,243 @@ test("#757 remove() never throws, whatever the node does", () => {
 import { readFileSync } from "node:fs";
 const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
-test("#757 creation runs AFTER the history seed and BEFORE runSetWidget", () => {
-  // The seed is what makes the #458 authorization meaningful, and growing a node is a
-  // mutation: it must not happen on a call authorization is about to refuse.
-  const seed = PANEL_SRC.indexOf("await awaitObjectInfoHistorySeed();", PANEL_SRC.indexOf("async graph_set_widget("));
-  const create = PANEL_SRC.indexOf("createRgthreeLoraRow(node, widget, {");
-  const run = PANEL_SRC.indexOf("await runSetWidget(");
-  assert.ok(seed > 0 && create > seed, "creation is after the history seed");
-  assert.ok(run > create, "…and before the write");
+const SET_WIDGET_LIB_SRC = readFileSync(new URL("../../web/js/lib/set-widget.js", import.meta.url), "utf8");
+
+test("#757 NO AWAIT separates the creation from the write", () => {
+  // The rule the whole feature now rests on. `write()` is runSetWidget's synchronous
+  // boundary: fence, then prepareWriteTarget, then applyWidgetWrite, then the undo on
+  // failure — with nothing awaited in between. An `await` anywhere in that stretch reopens
+  // every window this design closes: a transient row visible to an undo capture, to a
+  // concurrent command frame, and to the user's own hands.
+  const start = SET_WIDGET_LIB_SRC.indexOf("const write = (extra = {}) => {");
+  assert.notEqual(start, -1, "could not locate the write boundary");
+  const end = SET_WIDGET_LIB_SRC.indexOf("\n  };", start);
+  const body = SET_WIDGET_LIB_SRC.slice(start, end);
+  assert.match(body, /prepareWriteTarget\(\)/, "the creation hook is invoked here");
+  assert.match(body, /applyWidgetWrite\(/, "…and the write immediately follows it");
+  assert.match(body, /prepared\?\.undo\?\.\(\)/, "…and the undo is in the same stretch");
+  // Comments in this block DISCUSS the await that used to be here, so judge the code only.
+  const code = body.replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(!/\bawait\b/.test(code), `no await may appear between them:\n${code}`);
 });
 
-test("#757 the uuid fence brackets the creation", () => {
-  // The user can switch workflows during the awaits above; a row must never be grown on a
-  // canvas the caller did not address (#570/#718).
-  const at = PANEL_SRC.indexOf("if (isRgthreeLoraRowCreation(node, widget, value)) {");
-  assert.notEqual(at, -1);
-  const block = PANEL_SRC.slice(at, PANEL_SRC.indexOf("createRgthreeLoraRow(node, widget, {", at));
-  assert.match(block, /assertActiveWorkflowCommandTarget\(\{/, "the fence runs before the mutation");
+test("#757 the creation runs AFTER the workflow fence", () => {
+  // A row must never be grown on a canvas the caller did not address (#570/#718). The fence
+  // is runSetWidget's own, re-checked at the write boundary, so the creation is now behind
+  // the SAME check the write is.
+  const start = SET_WIDGET_LIB_SRC.indexOf("const write = (extra = {}) => {");
+  const body = SET_WIDGET_LIB_SRC.slice(start, SET_WIDGET_LIB_SRC.indexOf("\n  };", start));
+  const fence = body.indexOf("assertTargetStillCurrentNow()");
+  const mint = body.indexOf("prepareWriteTarget()");
+  // Both anchors must EXIST before their order means anything: `indexOf` returns -1 for a
+  // line that was deleted, and -1 < anything reads exactly like a pass. A fence that is gone
+  // is a worse failure than a fence in the wrong place.
+  assert.notEqual(fence, -1, "the write boundary still re-checks the workflow fence");
+  assert.notEqual(mint, -1, "the write boundary still invokes the creation hook");
+  assert.ok(fence < mint, "the fence runs before the mutation");
+});
+
+// ---------------------------------------------------------------------------
+// The write boundary itself — the REAL runSetWidget, driven
+// ---------------------------------------------------------------------------
+//
+// The executor tests above stub runSetWidget, so they verify the panel's HALF of the
+// contract against a model of the other half. That model could agree with a set-widget.js
+// that no longer honours it. These drive the shipped runSetWidget directly, the way
+// set-widget-refresh.test.mjs does, so the hook's actual ordering, its rollback and its
+// behaviour across the retry await are verified rather than assumed.
+
+const BOUNDARY_REGISTRY = { KSampler: {} };
+const boundaryOracle = { getFreshObjectInfo: async () => ({ KSampler: {} }) };
+
+/**
+ * A node whose write target DOES NOT EXIST until the hook mints it — the shape #757 needs.
+ * `prepareWriteTarget` is the only thing that can bring "made" into existence, so any write
+ * that lands proves the hook ran first, and any surviving widget proves it was not undone.
+ */
+function boundaryFixture(widget = { name: "made", type: "text", value: "" }) {
+  const node = { id: 7, type: "KSampler", widgets: [] };
+  const seen = { prepared: 0, undone: 0 };
+  const prepareWriteTarget = () => {
+    // Idempotent exactly as the panel's hook is: the classifier there requires the row to be
+    // ABSENT, and a retry re-enters this after the first attempt undid its work.
+    if (node.widgets.includes(widget)) return null;
+    seen.prepared += 1;
+    node.widgets.push(widget);
+    return {
+      undo: () => {
+        seen.undone += 1;
+        node.widgets = node.widgets.filter((w) => w !== widget);
+      },
+    };
+  };
+  return { node, widget, seen, prepareWriteTarget };
+}
+
+test("#757 boundary: the hook mints the target and the write lands on it", async () => {
+  const { node, seen, prepareWriteTarget } = boundaryFixture();
+  const res = await runSetWidget(node, "made", "hello", {
+    registry: BOUNDARY_REGISTRY,
+    ...boundaryOracle,
+    prepareWriteTarget,
+  });
+  assert.equal(seen.prepared, 1);
+  assert.equal(seen.undone, 0, "a write that succeeded is never rolled back");
+  assert.equal(res.set.value, "hello");
+  assert.equal(node.widgets[0].value, "hello", "the write landed on the widget the hook created");
+});
+
+test("#757 boundary: the fence refuses BEFORE the hook can mint anything", async () => {
+  // The user switched workflow tabs while /object_info was in flight. The refusal must
+  // arrive over a node this command never touched. End-to-end, and therefore satisfied by
+  // whichever fence fires first — the isolating version is the next test.
+  const { node, seen, prepareWriteTarget } = boundaryFixture();
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "hello", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        prepareWriteTarget,
+        assertTargetStillCurrent: () => {
+          throw new Error("the workflow changed while this write was in flight");
+        },
+      }),
+    /the workflow changed/,
+  );
+  assert.equal(seen.prepared, 0, "nothing was minted on the stale canvas");
+  assert.deepEqual(node.widgets, [], "and the node is exactly as it was found");
+});
+
+test("#757 boundary: the write boundary re-checks the fence on its OWN account", async () => {
+  // WHY THE TEST ABOVE IS NOT ENOUGH. A direct node ALWAYS reconciles
+  // (preflightSetWidgetTarget returns `{reconcile: true}` for any node without a `subgraph`),
+  // and reconcile runs a fence check of its own well before the write boundary. A fence that
+  // throws on sight is therefore caught by that earlier check, and deleting the boundary's
+  // own re-check would leave the previous test green while reopening the exact #718 window
+  // the re-check exists for.
+  //
+  // So the user is still on the right canvas when reconcile asks, and has switched tabs by
+  // the time the write boundary asks. Only a fence AT the boundary refuses this.
+  const { node, seen, prepareWriteTarget } = boundaryFixture();
+  let fenceCalls = 0;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "hello", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        prepareWriteTarget,
+        assertTargetStillCurrent: () => {
+          fenceCalls += 1;
+          if (fenceCalls > 1) throw new Error("the workflow changed while this write was in flight");
+        },
+      }),
+    /the workflow changed/,
+  );
+  assert.equal(fenceCalls, 2, "the write boundary asked again, on its own account");
+  assert.equal(seen.prepared, 0, "and nothing was minted on the canvas the user had left");
+  assert.deepEqual(node.widgets, [], "…so the refusal arrives over an untouched node");
+});
+
+test("#757 boundary: a REFUSED write undoes what the hook prepared", async () => {
+  // A combo value the list does not contain, with no refresh wired: applyWidgetWrite refuses,
+  // and the refusal must be reported over the node the command started from.
+  const { node, seen, prepareWriteTarget } = boundaryFixture({
+    name: "made",
+    type: "combo",
+    options: { values: ["a"] },
+    value: "a",
+  });
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "nope", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        prepareWriteTarget,
+      }),
+    /panel_set_widget refused "made"/,
+  );
+  assert.equal(seen.prepared, 1);
+  assert.equal(seen.undone, 1, "the refusal took the prepared target back out");
+  assert.deepEqual(node.widgets, [], "and left the node as it found it");
+});
+
+test("#757 boundary: an undo that THROWS never replaces the refusal that caused it", async () => {
+  const node = { id: 7, type: "KSampler", widgets: [] };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "made", "nope", {
+        registry: BOUNDARY_REGISTRY,
+        ...boundaryOracle,
+        prepareWriteTarget: () => {
+          node.widgets.push({ name: "made", type: "combo", options: { values: ["a"] }, value: "a" });
+          return {
+            undo: () => {
+              throw new Error("the undo itself blew up");
+            },
+          };
+        },
+      }),
+    /panel_set_widget refused "made"/,
+    "the caller hears why the WRITE was refused, not why the cleanup failed",
+  );
+});
+
+test("#757 boundary: nothing the hook made survives ACROSS the retry await", async () => {
+  // THE RULE, stated where it can actually be broken. The stale-combo recovery awaits
+  // `refreshCombos` between two write attempts. If the first attempt's creation were not
+  // undone before that await, a transient widget would sit in the live graph across a network
+  // request — the exact window that produced every P1 this feature has had. So the first
+  // attempt must roll back, the node must be EMPTY while the refresh is in flight, and the
+  // retry must mint it again from scratch.
+  const { node, widget, seen, prepareWriteTarget } = boundaryFixture({
+    name: "made",
+    type: "combo",
+    options: { values: ["a"] },
+    value: "a",
+  });
+  let widgetsDuringRefresh = null;
+  const res = await runSetWidget(node, "made", "b", {
+    registry: BOUNDARY_REGISTRY,
+    ...boundaryOracle,
+    prepareWriteTarget,
+    // The authoritative list now carries "b". Written through the captured widget rather than
+    // by looking it up on the node, BECAUSE the node no longer has it — the first attempt's
+    // rollback is exactly what this test is asserting.
+    refreshCombos: async () => {
+      widgetsDuringRefresh = node.widgets.map((w) => w.name);
+      await Promise.resolve();
+      widget.options.values.push("b");
+    },
+  });
+  assert.deepEqual(widgetsDuringRefresh, [], "no half-made target may sit in the graph across the await");
+  assert.equal(seen.undone, 1, "the first attempt rolled its creation back");
+  assert.equal(seen.prepared, 2, "and the retry minted it again inside its own synchronous stretch");
+  assert.equal(res.set.value, "b");
+  assert.equal(res.refreshed, true);
+});
+
+test("#757 the panel mints the row ONLY inside the write-boundary hook", () => {
+  // The regression that produced three separate P1s. A creation reached from the executor's
+  // OWN statements runs before `await runSetWidget(...)` and therefore before
+  // `await getFreshObjectInfo()` — a live graph mutation left sitting across a network
+  // request. Textual order cannot express that (the options object is written above the call
+  // it is passed to), so the rule is stated structurally instead: the single creation site
+  // lives inside `prepareWriteTarget`, which only runSetWidget's synchronous write boundary
+  // ever calls. Anything outside that hook is the old shape coming back.
+  const sw = PANEL_SRC.slice(PANEL_SRC.indexOf("async graph_set_widget("));
+  const body = sw.slice(0, sw.indexOf("async graph_remove_widget("));
+  assert.equal(body.split("createRgthreeLoraRow(").length - 1, 1, "exactly one creation site in the command");
+  const hookStart = body.indexOf("      prepareWriteTarget: () => {");
+  assert.notEqual(hookStart, -1, "could not locate the write-boundary hook");
+  const hookEnd = body.indexOf("\n      },", hookStart);
+  assert.ok(hookEnd > hookStart, "could not locate the end of the hook");
+  const hook = body.slice(hookStart, hookEnd);
+  assert.match(hook, /createRgthreeLoraRow\(node, widget, \{/, "the creation is inside the hook");
+  const outsideTheHook = body.slice(0, hookStart) + body.slice(hookEnd);
+  assert.ok(
+    !outsideTheHook.includes("createRgthreeLoraRow("),
+    "createRgthreeLoraRow may only be reached from prepareWriteTarget, never from the command's own flow",
+  );
 });
 
 test("#757 the created row is disclosed on its own field, not in `warning`", () => {
@@ -507,7 +761,6 @@ const EXECUTOR_DEPS = [
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
-  "noteRgthreeLoraRowWritten",
   "assertActiveWorkflowCommandTarget",
   "WORKFLOW_UUID_FIELD",
   "runSetWidget",
@@ -592,18 +845,33 @@ function trackedGraph(node) {
   return g;
 }
 
-/** Stands in for runSetWidget, including the beforeChange/afterChange pair it opens itself. */
+/**
+ * Stands in for runSetWidget, modelling the shape that matters: an AWAITED authorization
+ * phase, then a synchronous write boundary where `prepareWriteTarget` mints a missing target,
+ * the write runs inside its own beforeChange/afterChange pair, and a refusal undoes the
+ * preparation before it propagates.
+ */
 function stubRunSetWidget({ fail = null, result = { ok: true } } = {}) {
   const fn = async (n, widgetName, v, opts) => {
     fn.calls.push({ node: n, widget: widgetName, value: v });
+    await Promise.resolve(); // the /object_info fetch
+    // A preparation that REFUSES propagates from here without the write ever being attempted,
+    // exactly as it does in the real one (the hook is called before applyWidgetWrite's try).
+    const prepared = opts.prepareWriteTarget?.() ?? null;
+    fn.writes += 1;
     // The real one brackets its write and fires afterChange BEFORE the #240 read-back
     // verification that can still reject — so a refusal arrives with its own pair closed.
     opts.beforeChange?.();
     opts.afterChange?.();
-    if (fail) throw fail;
+    if (fail) {
+      prepared?.undo?.();
+      throw fail;
+    }
     return result;
   };
   fn.calls = [];
+  /** Write ATTEMPTS — the calls that got past `prepareWriteTarget`, not merely into the body. */
+  fn.writes = 0;
   return fn;
 }
 
@@ -616,11 +884,10 @@ function executor(node, overrides = {}) {
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,
     awaitObjectInfoHistorySeed: async () => {},
-    // The REAL classifier, creator and claim-release: a double here would let the executor
-    // pass against a route that never fires, which is precisely the defect under test.
+    // The REAL classifier and creator: a double here would let the executor pass against a
+    // route that never fires, which is precisely the defect under test.
     isRgthreeLoraRowCreation,
     createRgthreeLoraRow,
-    noteRgthreeLoraRowWritten,
     assertActiveWorkflowCommandTarget: () => {},
     WORKFLOW_UUID_FIELD: "workflow_uuid",
     runSetWidget: overrides.runSetWidget ?? stubRunSetWidget(),
@@ -657,19 +924,43 @@ test("#757 executor: create + assign is ONE undo step", async () => {
   assert.ok(graph.tracker.captures[0].includes("lora_1"), "and the one undo step covers the created row");
 });
 
+test("#757 executor: the row does not exist while the write is still awaiting", async () => {
+  // THE RULE THE WHOLE DESIGN RESTS ON. Creating the row before runSetWidget left a live
+  // graph mutation sitting across a network request, and all three of this feature's P1s
+  // came out of that one window: an undo transaction that could never be closed if the user
+  // switched tabs, a concurrent frame whose write got rolled back under it, and a user's own
+  // hand-edit exposed to an unrelated rollback. A row visible HERE is that window reopening.
+  const node = loader();
+  let rowDuringAwait = null;
+  const runSetWidget = async (n, w, v, opts) => {
+    rowDuringAwait = node.widgets.some((x) => x.name === "lora_1");
+    await Promise.resolve(); // the /object_info fetch
+    const prepared = opts.prepareWriteTarget?.() ?? null;
+    opts.beforeChange?.();
+    opts.afterChange?.();
+    assert.ok(prepared, "the creation happens at the write boundary, not before the call");
+    return { ok: true };
+  };
+  const { run } = executor(node, { runSetWidget });
+  const reply = await run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" });
+  assert.equal(rowDuringAwait, false, "no transient row may sit in the graph across the await");
+  assert.equal(reply.created_widget, "lora_1", "and it is created by the time the write runs");
+});
+
 test("#757 executor: a workflow switch during the await cannot wedge the undo history", async () => {
-  // THE REGRESSION THIS GUARDS IS WORSE THAN #757 ITSELF. LiteGraph delivers beforeChange /
-  // afterChange through ATTACHED canvases. Holding a transaction across the /object_info
-  // await means that if the user switches workflow tabs mid-flight, the close reaches no
-  // canvas at all and the tracker sits at 1 forever — `--this.changeCount || capture()` never
-  // returns to zero, so NO further edit in that workflow is ever captured for undo, for the
-  // rest of the session. Nothing in this command may open a transaction it then awaits across.
+  // LiteGraph delivers beforeChange / afterChange through ATTACHED canvases, so a
+  // transaction opened before the /object_info await and closed after it reaches no canvas
+  // at all once the user switches tabs — and the tracker then sits at 1 forever, so NO
+  // further edit in that workflow is ever captured for undo, for the rest of the session.
+  // Nothing in this command may open a transaction it awaits across.
   const node = loader();
   const graph = trackedGraph(node);
   const runSetWidget = async (n, w, v, opts) => {
     graph.detachCanvas(); // the user switched tabs while /object_info was in flight
+    const prepared = opts.prepareWriteTarget?.() ?? null;
     opts.beforeChange?.();
     opts.afterChange?.();
+    prepared?.undo?.();
     throw new Error("the workflow changed while this write was in flight");
   };
   const { run } = executor(node, { graph, runSetWidget });
@@ -679,6 +970,20 @@ test("#757 executor: a workflow switch during the await cannot wedge the undo hi
     0,
     "a tracker left above zero stops capturing undo snapshots for the whole session",
   );
+});
+
+test("#757 executor: a fence that refuses at the write boundary creates nothing", async () => {
+  // The creation sits behind runSetWidget's own workflow fence. If the user switched tabs
+  // during the fetch, the refusal must arrive over an untouched node.
+  const node = loader();
+  const before = node.widgets.map((w) => w.name);
+  const runSetWidget = async (n, w, v, opts) => {
+    await Promise.resolve();
+    throw new Error("the workflow changed"); // the fence fires before prepareWriteTarget
+  };
+  const { run } = executor(node, { runSetWidget });
+  await assert.rejects(() => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }));
+  assert.deepEqual(node.widgets.map((w) => w.name), before, "nothing was grown on the stale canvas");
 });
 
 test("#757 executor: a REFUSED write takes the row back out", async () => {
@@ -742,65 +1047,50 @@ test("#757 executor: creation that REFUSES opens no transaction, and never reach
   );
   assert.equal(graph.tracker.changeCount, 0, "an unclosed transaction would swallow the next command's undo entry");
   assert.deepEqual(graph.log, [], "a refusal that changed nothing has no bookkeeping to do");
-  assert.equal(runSetWidget.calls.length, 0, "the write is never attempted for a row that does not exist");
+  // runSetWidget IS entered now — the creation lives at its write boundary, so a refusal to
+  // create can only be raised from inside it. What must not happen is the WRITE: the refusal
+  // has to arrive before applyWidgetWrite, over a node nothing touched.
+  assert.equal(runSetWidget.calls.length, 1, "the refusal is raised from inside the call, at the write boundary");
+  assert.equal(runSetWidget.writes, 0, "the write is never attempted for a row that does not exist");
 });
 
-test("#757 executor: a CONCURRENT write's row is never rolled back under it", async () => {
-  // Command frames run concurrently. Request A mints lora_1 and parks in its write; request B
-  // arrives, sees a row that now exists, writes it and reports SUCCESS; A then fails. An
-  // unconditional rollback would delete the row B was just told it had written — a reported
-  // success that no longer matches the graph, which is worse than the stray row the rollback
-  // exists to prevent.
+test("#757 executor: two overlapping requests for the same missing row both come out right", async () => {
+  // Command frames run concurrently, and this used to be a P1: A minted the row and parked
+  // in its write, B saw a row that now existed and wrote it, and A's rollback then deleted
+  // the row B had been told it wrote. With both the creation and the write behind the same
+  // synchronous boundary, the interleaving that made that possible cannot occur — each
+  // request's create-and-write is uninterruptible, so exactly one of them creates.
   const node = loader();
-  let releaseA;
-  const parked = new Promise((_, reject) => {
-    releaseA = reject;
-  });
   const graph = trackedGraph(node);
-  const a = executor(node, {
-    graph,
-    runSetWidget: async (n, w, v, opts) => {
-      opts.beforeChange?.();
-      opts.afterChange?.();
-      return parked; // A is still in flight
-    },
-  });
-  const aDone = assert.rejects(
-    () => a.run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }),
-    /A lost its race/,
-  );
-  await Promise.resolve(); // let A get as far as its await, with the row created
-
-  assert.ok(node.widgets.some((w) => w.name === "lora_1"), "A created the row");
-  // B: an ordinary write to a row that already exists. It must report success and keep it.
-  const b = executor(node, { graph });
-  const bReply = await b.run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" });
-  assert.equal(bReply.created_widget, undefined, "B did not create anything — the row was there");
-
-  releaseA(new Error("A lost its race"));
-  await aDone;
-  assert.ok(
-    node.widgets.some((w) => w.name === "lora_1"),
-    "B was told the write succeeded; A's rollback must not delete the row out from under it",
+  const request = () =>
+    executor(node, { graph }).run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" });
+  const [a, b] = await Promise.all([request(), request()]);
+  const created = [a, b].filter((r) => r.created_widget === "lora_1");
+  assert.equal(created.length, 1, "exactly one of the two created the row; the other wrote the existing one");
+  assert.equal(
+    node.widgets.filter((w) => w.name === "lora_1").length,
+    1,
+    "and the node carries exactly one lora_1, not a duplicate",
   );
 });
 
-test("#757 executor: a refused write that could NOT roll back still says the row exists", async () => {
-  // The other half of the concurrency rule: when the row survives because somebody else wrote
-  // it, the reply must not go on claiming nothing was created.
+test("#757 executor: a failing request cannot roll back a row the OTHER request wrote", async () => {
+  // The same interleaving, with the loser failing. Because the winner's create-and-write is
+  // synchronous and complete before the loser's boundary runs, the loser never created
+  // anything and so has nothing to undo — the surviving row belongs to the request that was
+  // told it succeeded.
   const node = loader();
   const graph = trackedGraph(node);
-  const { run } = executor(node, {
-    graph,
-    runSetWidget: async (n, w, v, opts) => {
-      opts.beforeChange?.();
-      opts.afterChange?.();
-      noteRgthreeLoraRowWritten(node, "lora_1"); // somebody else's write landed
-      throw new Error("this one still failed");
-    },
+  const ok = await executor(node, { graph }).run({
+    node_id: 153,
+    widget: "lora_1",
+    value: SLOT_JSON,
+    workflow_uuid: "u",
   });
-  await assert.rejects(() => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }));
-  assert.ok(node.widgets.some((w) => w.name === "lora_1"), "the claimed-by-someone-else row stays");
+  assert.equal(ok.created_widget, "lora_1");
+  const loser = executor(node, { graph, runSetWidget: stubRunSetWidget({ fail: new Error("too late") }) });
+  await assert.rejects(() => loser.run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }));
+  assert.ok(node.widgets.some((w) => w.name === "lora_1"), "the successful request's row is still there");
 });
 
 test("#757 executor: the write is handed the row that was just created", async () => {
