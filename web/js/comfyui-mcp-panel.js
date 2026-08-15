@@ -1526,7 +1526,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.14.40";
+const PANEL_VERSION = "0.14.41";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -3242,6 +3242,55 @@ function isCanonicalWorkflowInstanceUuid(value) {
     typeof value === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
   );
+}
+
+/**
+ * comfyui-mcp#1478 (defect 1) — the workflow identity a graph-REPLACING load landed on,
+ * or nothing at all.
+ *
+ * A load can move the per-instance uuid out from under the session's command fence, and
+ * the reply used to carry nothing that said whether it had. The orchestrator could only
+ * answer with a CONDITIONAL note ("a load CAN re-mint the instance…"). This is the field
+ * its own docblock asks for, as #762/#800 gave `workflow_new` / `workflow_save`, so
+ * `refreshFenceFromOwnReply` can consume a value instead of guessing.
+ *
+ * TIED TO THE LOAD BY OBJECT IDENTITY, never by "what is active now" (review, P1).
+ * Reading the live active workflow after the await is the SAME wrong-graph hazard the
+ * orchestrator-side attempt was rejected for, moved one layer down: the load starts for A,
+ * the user switches to B while it awaits, the continuation reads B's uuid, and an
+ * orchestrator that CLAIMS the fence from this reply points the session at B — so the next
+ * agent edit lands on the wrong graph. Publishing a uuid that might name another canvas is
+ * worse than publishing none, precisely because the field is trusted enough to claim from.
+ *
+ * So `targetedWorkflow` is the object captured BEFORE the load, and the identity is read
+ * only when that very OBJECT is still the active one — a comparison of references, immune
+ * to a rename or a tab switch. When it cannot be proven (the user moved, or a blank-canvas
+ * load minted something this code holds no reference to), the caller omits the field and
+ * the orchestrator keeps its existing fallback.
+ *
+ * SHAPE-GATED (#716's rule): only a canonical instance uuid is ever published, never a
+ * routing handle or a half-established value. An absent field costs the orchestrator a
+ * round trip through a fallback it already has; a malformed one gets adopted as an
+ * instance identity and fences later commands against something that is not one.
+ */
+function loadLandedWorkflowUuid(appRef, targetedWorkflow) {
+  try {
+    const liveNow = appRef?.extensionManager?.workflow?.activeWorkflow || null;
+    const provablyOurs =
+      !!targetedWorkflow &&
+      !!liveNow &&
+      rawWorkflowObject(liveNow) === rawWorkflowObject(targetedWorkflow);
+    const uuid = provablyOurs
+      ? workflowObjectUuid(liveNow) || workflowStableUuid(liveNow)
+      : undefined;
+    return isCanonicalWorkflowInstanceUuid(uuid) ? uuid : undefined;
+  } catch {
+    // Reading the identity is itself an operation that can fail, and this runs AFTER the
+    // graph has already landed — a throw here would turn a successful load into a failed
+    // one, which is strictly worse than the stale fence it is reporting. An omitted field
+    // is the fail-closed answer the orchestrator already handles.
+    return undefined;
+  }
 }
 
 // A reply is an observation, never an identity-initialization point. In
@@ -11137,6 +11186,21 @@ const GRAPH_TOOL_EXECUTORS = {
           );
         }
         const apiClone = JSON.parse(JSON.stringify(data));
+        // #1478 (defect 1) — CAPTURE THE TARGET BEFORE THE LOAD. This is the path the
+        // reporter was on (`{loaded:true, format:"api", node_count:59}`) and it is the
+        // path where the fence provably goes stale, so the identity has to be reported
+        // here too. It cannot reuse the UI path's capture: that one is taken further
+        // down, after this branch has already returned.
+        //
+        // WHY THIS PATH RE-MINTS, where the in-place UI path does not: `loadApiJson`
+        // reaches the creation-boundary wrapper WITHOUT `__cmcpKeepInstance`, so the KEEP
+        // branch is unreachable and `shouldForkInPlaceReload({cachedUuid, incomingUuid})`
+        // decides. API/prompt JSON carries no `extra`, so `incomingUuid` is undefined and
+        // differs from the fenced `cachedUuid` — the wrapper deletes the object's cached
+        // uuid and mints a fresh one ONTO THE SAME OBJECT. The workflow object is
+        // preserved while its identity moves, which is why the mismatch is deterministic
+        // and why "the object is unchanged" does not mean the fence survived.
+        const apiTargetWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
         // Snapshot first, exactly like the UI path — an API import replaces the
         // canvas too, and must be as undoable as any other graph edit this turn.
         captureGraphSnapshot(null, "before loading an API-format workflow");
@@ -11153,6 +11217,17 @@ const GRAPH_TOOL_EXECUTORS = {
         const importFailures = shortfall.length
           ? await readPackImportFailures(api)
           : [];
+        // Read the identity the load landed on, gated on that captured object still being
+        // the live one. If `loadApiJson` spawned a new tab instead of replacing in place,
+        // or the user switched during the await, nothing here can prove which workflow is
+        // ours and the field is omitted rather than guessed.
+        //
+        // LAST, immediately before the reply, and deliberately AFTER the import-failure
+        // fetch. Read any earlier and that `await` sits between the check and the reply:
+        // the comparison passes for A, the event loop lets the user switch to B, and the
+        // reply — already blessed — ships A's uuid for what is now B's canvas. The gate is
+        // only worth anything if it is still true when the value leaves.
+        const apiLoadedWorkflowUuid = loadLandedWorkflowUuid(app, apiTargetWorkflow);
         return {
           loaded: true,
           format: "api",
@@ -11160,6 +11235,7 @@ const GRAPH_TOOL_EXECUTORS = {
           entries_in: Object.keys(apiClone).length,
           ...(shortfall.length ? { missing_node_types: shortfall } : {}),
           ...(importFailures.length ? { packs_failed_to_import: importFailures } : {}),
+          ...(apiLoadedWorkflowUuid ? { workflow_uuid: apiLoadedWorkflowUuid } : {}),
           note: apiLoadNote(shortfall, importFailures),
         };
       }
@@ -11220,10 +11296,24 @@ const GRAPH_TOOL_EXECUTORS = {
     } else {
       await app.loadGraphData(...loadArgs);
     }
+    // comfyui-mcp#1478 (defect 1) — REPORT THE IDENTITY THIS LOAD LANDED ON.
+    //
+    // `activeWorkflow` was captured before the load and passed to loadGraphData as the
+    // target, so it is the object this command wrote into; the helper publishes an
+    // identity only while that very object is still the live one.
+    //
+    // Unlike the API branch above, THIS path passes `__cmcpKeepInstance` whenever there is
+    // an active workflow, so the instance is deliberately preserved (#570 P0b) and the
+    // reported uuid will MATCH the fence — the value here is proof that nothing moved, so
+    // the orchestrator can drop its conditional note rather than re-derive. The
+    // blank-canvas branch below mints a workflow this code holds no reference to, so the
+    // field is omitted there and the existing fallback still applies.
+    const loadedWorkflowUuid = loadLandedWorkflowUuid(app, activeWorkflow);
     return {
       loaded: true,
       node_count: clone.nodes.length,
       ...(auxSanitized ? { aux_id_sanitized: auxSanitized } : {}),
+      ...(loadedWorkflowUuid ? { workflow_uuid: loadedWorkflowUuid } : {}),
     };
   },
 

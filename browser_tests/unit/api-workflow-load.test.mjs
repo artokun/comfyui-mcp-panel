@@ -159,7 +159,13 @@ test("#775 WIRING: graph_load delegates to loadApiJson instead of refusing", () 
   );
   const i = src.indexOf("if (looksLikeApiWorkflow(data))");
   assert.ok(i > 0, "graph_load must branch on the API shape");
-  const branch = src.slice(i, i + 2200);
+  // Bounded by the branch's own end, not by a character count. This read a fixed 2200-char
+  // window, so adding a comment inside the branch silently pushed the LAST assertion out of
+  // scope and failed a wiring test that was still perfectly satisfied — the window measured
+  // prose, not code. The refusal below is the first thing after the branch closes.
+  const end = src.indexOf('"graph is not a UI workflow', i);
+  assert.ok(end > i, "the non-API refusal that follows the branch must still be recognisable");
+  const branch = src.slice(i, end);
   assert.match(branch, /app\.loadApiJson\(apiClone, "graph_load\.json"\)/, "it imports rather than refusing");
   // The label avoids naming the internal bridge command on purpose: the
   // vocabulary gate reads any such name in a string as advice a model could try
