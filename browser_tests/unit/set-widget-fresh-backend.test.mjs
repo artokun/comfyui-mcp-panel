@@ -274,14 +274,15 @@ test("#1126 wiring: the activity summary DISCLOSES a write nothing validated", (
 });
 
 test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into runSetWidget", () => {
-  // The lib's blind-write fallback fails closed on a SNAPSHOT-sourced empty list, and
-  // node-resolve.test.mjs proves that behaviour by passing `schemaFromSnapshot` directly.
+  // The lib's blind-write fallback fails closed on any schema that is not LIVE, and
+  // node-resolve.test.mjs proves that behaviour by passing `schemaProvenance` directly.
   // But the lib can only know the provenance if the executor hands it over: which branch
-  // of `getFreshObjectInfo` answered is a fact ONLY the panel holds. Stub the wiring to a
-  // constant `false` and every behavioural test in this repo stays green while production
-  // authorizes blind writes from stale schemas again — a dead-code fix of exactly the kind
-  // this PR's own body warns about (#1223 v1, #757 v1). So it is asserted at the source,
-  // like the #718 fence above.
+  // of `getFreshObjectInfo` answered — and whether a reconnect landed while it was in
+  // flight — are facts ONLY the panel holds. Stub the wiring to a constant `"live"` and
+  // every behavioural test in this repo stays green while production authorizes blind
+  // writes from stale schemas again — a dead-code fix of exactly the kind this PR's own
+  // body warns about (#1223 v1, #757 v1). So it is asserted at the source, like the #718
+  // fence above.
   const src = readFileSync(PANEL_JS, "utf8");
   const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
   assert.notEqual(start, -1, "graph_set_widget executor must exist");
