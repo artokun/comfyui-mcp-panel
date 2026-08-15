@@ -166,6 +166,83 @@ function restoreRowCounter(node, previous) {
   return false;
 }
 
+/**
+ * Grow the node to fit a row that was just added.
+ *
+ * `addNewLoraWidget` only mints, appends and reorders — it does NOT resize. rgthree's own
+ * "➕ Add Lora" button does the resize itself, right after calling it:
+ *
+ *     this.addNewLoraWidget(value);
+ *     const computed = this.computeSize();
+ *     const tempHeight = this._tempHeight ?? 15;
+ *     this.size[1] = Math.max(tempHeight, computed[1]);
+ *     this.setDirtyCanvas(true, true);
+ *
+ * (rgthree-comfy/web/comfyui/power_lora_loader.js, `addNonLoraWidgets`.) Marking the canvas
+ * dirty is not the same thing: a fresh loader keeps its old height, so the new row can be
+ * clipped or drawn over the button until some unrelated edit resizes the node. Only the
+ * HEIGHT is touched, exactly as the pack does — widening a node the user sized is not ours
+ * to do. Best-effort: a stand-in without `computeSize` simply keeps its size.
+ */
+function fitNodeToRows(node) {
+  try {
+    if (typeof node?.computeSize !== "function" || !Array.isArray(node.size)) return;
+    const computed = node.computeSize();
+    const tempHeight = node._tempHeight ?? 15;
+    node.size[1] = Math.max(tempHeight, computed[1]);
+  } catch {
+    /* a node that cannot measure itself keeps the size it had */
+  }
+}
+
+/** Put a node's size back after a creation is rolled back. Best-effort, never throws. */
+function restoreNodeSize(node, previous) {
+  try {
+    if (!previous || !Array.isArray(node?.size)) return;
+    node.size[0] = previous[0];
+    node.size[1] = previous[1];
+  } catch {
+    /* the row removal is what matters; a stale height is cosmetic */
+  }
+}
+
+/**
+ * Rows this module created and that NOBODY ELSE has written to yet.
+ *
+ * WHY A CLAIM IS NEEDED AT ALL. Websocket command frames run concurrently, so two
+ * `panel_set_widget` calls for the same missing `lora_1` interleave like this: A classifies
+ * it as a creation, mints the row and parks inside the value write; B arrives, sees a row
+ * that now EXISTS, writes it through the ordinary path and reports success; A's write then
+ * fails validation and rolls back. An unconditional rollback deletes the very row B just
+ * wrote and reported — B's success no longer matches the graph, which is a worse outcome
+ * than the stray row the rollback exists to prevent.
+ *
+ * So the rollback is CONDITIONAL: it removes the row only while this call's claim on it is
+ * still standing. Any successful write to the row drops the claim (`noteRgthreeLoraRowWritten`
+ * below), and from that moment the row belongs to the graph, not to this call.
+ *
+ * Keyed on the widget OBJECT and held weakly, so a node that goes away takes its entries
+ * with it and nothing here can keep a widget alive.
+ */
+const rowClaims = new WeakMap();
+
+/**
+ * Record that a write LANDED on `widgetName`, so a concurrent creation will not roll it back.
+ *
+ * Called by `graph_set_widget` after any successful write, not just a creating one — the
+ * whole point is that the write which saves the row is usually somebody ELSE'S request.
+ * Total and silent: a node it cannot read simply has no claims to drop.
+ */
+export function noteRgthreeLoraRowWritten(node, widgetName) {
+  try {
+    for (const w of node?.widgets ?? []) {
+      if (w?.name === widgetName) rowClaims.delete(w);
+    }
+  } catch {
+    /* nothing to drop */
+  }
+}
+
 /** Drop a widget the node grew but that we are not keeping. Best-effort, never throws. */
 function removeCreatedRow(node, widget) {
   try {
@@ -206,6 +283,26 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
   // Snapshot the counter BEFORE the mint, so either refusal below can put it back and mean
   // it when it says nothing was changed. See `restoreRowCounter`.
   const counterBefore = readRowCounter(node);
+  // …and the size, so a rollback puts back the height the creation grew. See `fitNodeToRows`.
+  const sizeBefore = (() => {
+    try {
+      return Array.isArray(node?.size) ? [node.size[0], node.size[1]] : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  /** Rows on the node now that were not there before this call. */
+  const appendedSince = () => {
+    const grown = [];
+    const seen = [...before];
+    for (const name of widgetNames(node)) {
+      const at = seen.indexOf(name);
+      if (at >= 0) seen.splice(at, 1);
+      else grown.push(name);
+    }
+    return grown;
+  };
 
   beforeChange?.();
   try {
@@ -220,29 +317,44 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
         return "the reason could not be rendered";
       }
     })();
+    // A THROW IS NOT A NO-OP. The shipped method is
+    //   `this.loraWidgetsCounter++; const w = this.addCustomWidget(new PowerLoraLoaderWidget(...));
+    //    if (lora) w.setLora(lora); moveArrayItem(this.widgets, w, ...)`
+    // so the counter is spent FIRST and the widget is appended SECOND. A throw in any later
+    // step leaves the number burnt and can leave the row on the node — reporting "nothing was
+    // added" without looking would be asserting something we never checked. Clean up whatever
+    // did land, and say which of the two it was.
+    const stranded = appendedSince();
+    for (const name of stranded) {
+      const w = (node.widgets ?? []).find((x) => x?.name === name);
+      if (w) removeCreatedRow(node, w);
+    }
+    const rowsGone = appendedSince().length === 0;
+    const rewound = rowsGone && restoreRowCounter(node, counterBefore);
+    if (rowsGone) restoreNodeSize(node, sizeBefore);
+    const cleaned = rowsGone && (rewound || counterBefore === null || readRowCounter(node) === counterBefore);
     throw new Error(
       `Cannot create "${widgetName}" on node ${node?.id}: the rgthree pack's own ` +
-        `addNewLoraWidget() threw (${detail}). Nothing was added.`,
+        `addNewLoraWidget() threw (${detail}). ` +
+        (cleaned
+          ? `Anything it had already added was removed again, so nothing was changed.`
+          : `It had already changed the node before it threw, and that could not be fully ` +
+            `undone${stranded.length ? ` (${stranded.join(", ")})` : ""} — inspect the node ` +
+            `before retrying.`),
     );
   } finally {
     afterChange?.();
   }
 
-  const after = widgetNames(node);
   // THE EFFECT, NOT THE CALL. The probe that motivated this file found pack callbacks that
   // accept a call and create nothing; only comparing the list catches that.
-  const appended = [];
-  const seen = [...before];
-  for (const name of after) {
-    const at = seen.indexOf(name);
-    if (at >= 0) seen.splice(at, 1);
-    else appended.push(name);
-  }
+  const appended = appendedSince();
 
   if (appended.length === 0) {
     // No row appeared, but the counter may still have been bumped before whatever went
     // wrong. Put it back, or this failed attempt silently costs the node a row name.
     restoreRowCounter(node, counterBefore);
+    restoreNodeSize(node, sizeBefore);
     throw new Error(
       `Cannot create "${widgetName}" on node ${node?.id}: addNewLoraWidget() ran but added ` +
         `no widget. Nothing was changed.`,
@@ -259,6 +371,7 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     // the node rather than assuming the call worked.
     const rowIsGone = !created || !(node.widgets ?? []).includes(created);
     const rewound = rowIsGone && restoreRowCounter(node, counterBefore);
+    if (rowIsGone) restoreNodeSize(node, sizeBefore);
     const real = appended.join(", ");
     // The remedy is only truthful if the counter went back. When it did not — an older pack
     // with no readable counter, or one that refuses the write — `real` is the name this
@@ -277,6 +390,8 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     );
   }
 
+  // GROW THE NODE, as the pack's own button does. Marking the canvas dirty only repaints.
+  fitNodeToRows(node);
   setDirty?.();
   // The row OBJECT, captured now — see `remove` below.
   const createdWidget = (() => {
@@ -286,6 +401,19 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
       return null;
     }
   })();
+  // The counter as it stands with THIS row's increment and no other. `remove` refuses to
+  // rewind unless it still reads exactly this, because anything else means the number it
+  // would rewind past is not only ours. See the note on the rollback below.
+  const counterAfter = readRowCounter(node);
+  // Claim the row until somebody's write lands on it. See `rowClaims`.
+  const claim = {};
+  if (createdWidget) {
+    try {
+      rowClaims.set(createdWidget, claim);
+    } catch {
+      /* an unclaimable widget simply cannot be rolled back — checked in `remove` */
+    }
+  }
   return {
     created: widgetName,
     /**
@@ -300,19 +428,44 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
      * answers to that name then, which after an intervening `configure()` — rgthree re-mints
      * rows from serialized order — is not necessarily the widget this call grew.
      *
+     * ONLY WHILE THE CLAIM STANDS. Command frames run concurrently: another request can see
+     * the row this call created, write it, and report success while this call is still
+     * awaiting. Deleting it then would contradict a success somebody has already been told
+     * about — worse than the stray row this rollback exists to prevent. So a row that has
+     * been written by anyone is left alone, and the refusal simply says so. See `rowClaims`.
+     *
      * BOTH HALVES, for the reason `restoreRowCounter` exists: `addNewLoraWidget` increments
      * before it names, so dropping only the widget leaves the number spent and the next mint
-     * lands further along. Rewound only once the row is confirmed gone, never while the name
-     * is still held. Never throws — an undo running on an error path must not replace the
-     * refusal with an error about the undo.
+     * lands further along.
+     *
+     * BUT NEVER PAST SOMEBODY ELSE'S INCREMENT. The counter is rewound only when it still
+     * reads exactly what this call left it at. If another row was added in the meantime the
+     * counter includes that one too, and winding back to `counterBefore` would re-issue names
+     * that are already taken — create lora_1, add lora_2, roll back, and the next two mints
+     * are lora_1 and a DUPLICATE lora_2. A burnt number is recoverable; two rows with the
+     * same name are not.
+     *
+     * Returns true when the row was actually taken back out. Never throws — an undo running
+     * on an error path must not replace the refusal with an error about the undo.
      */
     remove: () => {
       try {
+        if (!createdWidget) return false;
+        // Somebody else's write landed here first; the row is the graph's now, not ours.
+        if (rowClaims.get(createdWidget) !== claim) return false;
+        rowClaims.delete(createdWidget);
         removeCreatedRow(node, createdWidget);
-        const rowIsGone = !createdWidget || !(node.widgets ?? []).includes(createdWidget);
-        if (rowIsGone) restoreRowCounter(node, counterBefore);
+        const rowIsGone = !(node.widgets ?? []).includes(createdWidget);
+        if (!rowIsGone) return false;
+        // Only when the counter is still exactly this call's increment.
+        if (counterAfter !== null && readRowCounter(node) === counterAfter) {
+          restoreRowCounter(node, counterBefore);
+        }
+        restoreNodeSize(node, sizeBefore);
+        return true;
       } catch {
         /* best-effort: the refusal this is undoing is the message that reaches the caller */
+        return false;
       }
     },
   };

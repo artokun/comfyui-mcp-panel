@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import {
   isRgthreeLoraRowCreation,
   createRgthreeLoraRow,
+  noteRgthreeLoraRowWritten,
   POWER_LORA_LOADER_TYPE,
 } from "../../web/js/lib/rgthree-lora-row.js";
 
@@ -45,6 +46,13 @@ function loader({ nextRow = 1, addNew = true, widgets = null, trackCounter = tru
     removeWidget(w) {
       const i = node.widgets.indexOf(w);
       if (i >= 0) node.widgets.splice(i, 1);
+    },
+    // The pack sizes its node from the row count, and `addNewLoraWidget` does NOT resize —
+    // rgthree's own button recomputes the height right after calling it. Modelled so the
+    // resize step (and its rollback) can be asserted rather than assumed.
+    size: [200, 60],
+    computeSize() {
+      return [200, 60 + 20 * node.widgets.filter((w) => /^lora_\d+$/.test(w?.name ?? "")).length];
     },
   };
   let shadow = nextRow - 1; // used when the node exposes no readable counter
@@ -358,6 +366,74 @@ test("#757 remove() targets the row BY IDENTITY, not by name", () => {
   assert.ok(n.widgets.includes(impostor), "the row that answers to the name now is not ours to remove");
 });
 
+test("#757 the node GROWS to fit the row, as the pack's own button does", () => {
+  // `addNewLoraWidget` only mints, appends and reorders. rgthree's ➕ Add Lora callback
+  // recomputes the height itself right afterwards; marking the canvas dirty just repaints, so
+  // without this the new row is clipped or drawn over the button until some later edit.
+  const n = loader();
+  const heightBefore = n.size[1];
+  createRgthreeLoraRow(n, "lora_1", {});
+  assert.ok(n.size[1] > heightBefore, `the node grew (${heightBefore} -> ${n.size[1]})`);
+  assert.equal(n.size[1], n.computeSize()[1], "to exactly what the pack would compute");
+});
+
+test("#757 the node's size is put back when the creation is rolled back", () => {
+  const n = loader();
+  const sizeBefore = [...n.size];
+  createRgthreeLoraRow(n, "lora_1", {}).remove();
+  assert.deepEqual([...n.size], sizeBefore, "a rolled-back creation leaves no stretched node behind");
+});
+
+test("#757 a node that cannot measure itself is still created on", () => {
+  const n = loader();
+  delete n.computeSize;
+  assert.equal(createRgthreeLoraRow(n, "lora_1", {}).created, "lora_1", "the resize is best-effort, not a gate");
+});
+
+test("#757 remove() will not rewind past a counter somebody else advanced", () => {
+  // Create lora_1, let another edit add lora_2, then roll back. Rewinding to `counterBefore`
+  // would re-issue lora_1 AND lora_2 — the second a DUPLICATE of a row still on the node.
+  const n = loader({ nextRow: 1 });
+  const made = createRgthreeLoraRow(n, "lora_1", {});
+  n.addNewLoraWidget(); // an unrelated addition while our write was in flight
+  assert.equal(n.loraWidgetsCounter, 2);
+  made.remove();
+  assert.equal(n.loraWidgetsCounter, 2, "the counter now covers a row that is not ours to un-name");
+  n.addNewLoraWidget();
+  const names = n.widgets.map((w) => w.name).filter((x) => /^lora_/.test(x));
+  assert.equal(new Set(names).size, names.length, `no duplicate row names: ${names.join(", ")}`);
+});
+
+test("#757 a pack method that throws PART-WAY is cleaned up, not just reported", () => {
+  // The shipped method is `loraWidgetsCounter++` FIRST, then construct, append and move. A
+  // throw in any later step can burn the number and leave the row. Saying "nothing was added"
+  // without looking would be asserting something never checked.
+  const n = loader({ nextRow: 1 });
+  n.addNewLoraWidget = () => {
+    n.loraWidgetsCounter += 1;
+    n.widgets.push({ name: `lora_${n.loraWidgetsCounter}`, value: { on: true, lora: null, strength: 1 } });
+    throw new Error("moveArrayItem blew up");
+  };
+  const namesBefore = n.widgets.map((w) => w.name);
+  assert.throws(() => createRgthreeLoraRow(n, "lora_1", {}), /addNewLoraWidget\(\) threw \(moveArrayItem blew up\)/);
+  assert.deepEqual(n.widgets.map((w) => w.name), namesBefore, "the half-added row was taken back out");
+  assert.equal(n.loraWidgetsCounter, 0, "and the number it had already spent was returned");
+});
+
+test("#757 a pack throw whose damage could NOT be undone says so", () => {
+  const n = loader({ nextRow: 1 });
+  n.addNewLoraWidget = () => {
+    n.loraWidgetsCounter += 1;
+    n.widgets.push({ name: `lora_${n.loraWidgetsCounter}`, value: { on: true, lora: null, strength: 1 } });
+    throw new Error("boom");
+  };
+  n.removeWidget = () => {}; // and the node will not give the row up
+  assert.throws(
+    () => createRgthreeLoraRow(n, "lora_1", {}),
+    /had already changed the node before it threw, and that could not be fully undone \(lora_1\)/,
+  );
+});
+
 test("#757 remove() never throws, whatever the node does", () => {
   const n = loader();
   const made = createRgthreeLoraRow(n, "lora_1", {});
@@ -431,6 +507,7 @@ const EXECUTOR_DEPS = [
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
+  "noteRgthreeLoraRowWritten",
   "assertActiveWorkflowCommandTarget",
   "WORKFLOW_UUID_FIELD",
   "runSetWidget",
@@ -452,36 +529,64 @@ const EXECUTOR_DEPS = [
 ];
 
 /**
- * A graph that keeps score the way ComfyUI's ChangeTracker does.
+ * A graph that delivers undo bookkeeping the way LiteGraph and ChangeTracker really do.
  *
- * Verified against the shipped frontend bundle: `beforeChange(){this.changeCount++}` and
- * `afterChange(){--this.changeCount||this.captureCanvasState()}`, reached from
- * `LGraph.beforeChange` via `canvasAction(c => c.onBeforeChange?.(this))`. So nested pairs
- * collapse into ONE captured state — and an unmatched close drives the count to -1, which is
- * truthy, so the capture never fires and the command vanishes from undo history entirely.
- * That second failure mode is why `afterChange` here throws rather than going negative.
+ * Both halves are modelled from the shipped frontend bundle, because the interesting failure
+ * lives in the seam between them:
+ *
+ *   LGraph:        `beforeChange(){ …; this.canvasAction(c => c.onBeforeChange?.(this)) }`
+ *                  `canvasAction(cb){ const l = this.list_of_graphcanvas; if (l) for (const c of l) cb(c) }`
+ *   ChangeTracker: `beforeChange(){ this.changeCount++ }`
+ *                  `afterChange(){ --this.changeCount || this.captureCanvasState() }`
+ *
+ * So the hooks reach the tracker only through ATTACHED canvases. Detach the graph — which is
+ * exactly what switching workflow tabs or leaving a subgraph does — and a close reaches
+ * nobody, leaving the tracker at 1 forever: `--this.changeCount` never returns 0 again and NO
+ * later edit in that workflow is ever captured. `detachCanvas()` reproduces it.
+ *
+ * Nested pairs collapse into one captured state, and an unmatched close would drive the count
+ * negative — which is truthy, so the capture never fires at all. That is why `onAfterChange`
+ * throws rather than going below zero.
  */
 function trackedGraph(node) {
-  const g = {
-    node,
+  const tracker = {
     changeCount: 0,
     /** One entry per undo step the tracker would record: the widget names at that moment. */
     captures: [],
+    onBeforeChange() {
+      tracker.changeCount += 1;
+    },
+    onAfterChange() {
+      tracker.changeCount -= 1;
+      if (tracker.changeCount < 0) {
+        throw new Error("afterChange() without a matching beforeChange() — the undo entry would be lost");
+      }
+      if (tracker.changeCount === 0) tracker.captures.push(g.node.widgets.map((w) => w.name));
+    },
+  };
+  const canvas = {
+    onBeforeChange: () => tracker.onBeforeChange(),
+    onAfterChange: () => tracker.onAfterChange(),
+  };
+  const g = {
+    node,
+    tracker,
+    list_of_graphcanvas: [canvas],
     log: [],
     beforeChange() {
       g.log.push("before");
-      g.changeCount += 1;
+      for (const c of g.list_of_graphcanvas) c.onBeforeChange?.(g);
     },
     afterChange() {
       g.log.push("after");
-      g.changeCount -= 1;
-      if (g.changeCount < 0) {
-        throw new Error("afterChange() without a matching beforeChange() — the undo entry would be lost");
-      }
-      if (g.changeCount === 0) g.captures.push(g.node.widgets.map((w) => w.name));
+      for (const c of g.list_of_graphcanvas) c.onAfterChange?.(g);
     },
     setDirtyCanvas() {
       g.log.push("dirty");
+    },
+    /** The user switched workflow tabs, or left the subgraph. */
+    detachCanvas() {
+      g.list_of_graphcanvas = [];
     },
   };
   return g;
@@ -511,10 +616,11 @@ function executor(node, overrides = {}) {
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,
     awaitObjectInfoHistorySeed: async () => {},
-    // The REAL classifier and the REAL creator: a double here would let the executor pass
-    // against a route that never fires, which is precisely the defect under test.
+    // The REAL classifier, creator and claim-release: a double here would let the executor
+    // pass against a route that never fires, which is precisely the defect under test.
     isRgthreeLoraRowCreation,
     createRgthreeLoraRow,
+    noteRgthreeLoraRowWritten,
     assertActiveWorkflowCommandTarget: () => {},
     WORKFLOW_UUID_FIELD: "workflow_uuid",
     runSetWidget: overrides.runSetWidget ?? stubRunSetWidget(),
@@ -534,18 +640,45 @@ function executor(node, overrides = {}) {
 const SLOT_JSON = JSON.stringify(SLOT);
 
 test("#757 executor: create + assign is ONE undo step", async () => {
+  // The creation is deliberately NOT bracketed. ChangeTracker captures whole-graph snapshots,
+  // not deltas, so the pair runSetWidget opens for the write closes with the row already
+  // present — and that single entry covers the creation and the assign together.
   const node = loader();
   const { run, graph } = executor(node);
   const reply = await run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" });
   assert.equal(reply.created_widget, "lora_1", "the structural change is disclosed");
   assert.ok(node.widgets.some((w) => w.name === "lora_1"));
-  assert.equal(graph.changeCount, 0, "the transaction is balanced");
+  assert.equal(graph.tracker.changeCount, 0, "the transaction is balanced");
   assert.equal(
-    graph.captures.length,
+    graph.tracker.captures.length,
     1,
     "two captures would be two Ctrl+Z, the first of which leaves a default row behind",
   );
-  assert.ok(graph.captures[0].includes("lora_1"), "and the one undo step covers the created row");
+  assert.ok(graph.tracker.captures[0].includes("lora_1"), "and the one undo step covers the created row");
+});
+
+test("#757 executor: a workflow switch during the await cannot wedge the undo history", async () => {
+  // THE REGRESSION THIS GUARDS IS WORSE THAN #757 ITSELF. LiteGraph delivers beforeChange /
+  // afterChange through ATTACHED canvases. Holding a transaction across the /object_info
+  // await means that if the user switches workflow tabs mid-flight, the close reaches no
+  // canvas at all and the tracker sits at 1 forever — `--this.changeCount || capture()` never
+  // returns to zero, so NO further edit in that workflow is ever captured for undo, for the
+  // rest of the session. Nothing in this command may open a transaction it then awaits across.
+  const node = loader();
+  const graph = trackedGraph(node);
+  const runSetWidget = async (n, w, v, opts) => {
+    graph.detachCanvas(); // the user switched tabs while /object_info was in flight
+    opts.beforeChange?.();
+    opts.afterChange?.();
+    throw new Error("the workflow changed while this write was in flight");
+  };
+  const { run } = executor(node, { graph, runSetWidget });
+  await assert.rejects(() => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }));
+  assert.equal(
+    graph.tracker.changeCount,
+    0,
+    "a tracker left above zero stops capturing undo snapshots for the whole session",
+  );
 });
 
 test("#757 executor: a REFUSED write takes the row back out", async () => {
@@ -579,18 +712,13 @@ test("#757 executor: a refused write rewinds the row counter too", async () => {
   assert.equal(reply.created_widget, "lora_1", "retrying the same request works, rather than drifting to lora_2");
 });
 
-test("#757 executor: a refused write leaves NO undo step to step through", async () => {
+test("#757 executor: a refused write is balanced and leaves the graph as it found it", async () => {
   const node = loader();
   const before = node.widgets.map((w) => w.name);
   const { run, graph } = executor(node, { runSetWidget: stubRunSetWidget({ fail: new Error("nope") }) });
   await assert.rejects(() => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }));
-  assert.equal(graph.changeCount, 0, "the transaction is closed exactly once, even on the error path");
-  assert.equal(graph.captures.length, 1, "closed once — not zero times, and not twice");
-  assert.deepEqual(
-    graph.captures[0],
-    before,
-    "and the state it captured is the state the command started from, so nothing is recorded",
-  );
+  assert.equal(graph.tracker.changeCount, 0, "every transaction opened is closed, even on the error path");
+  assert.deepEqual(node.widgets.map((w) => w.name), before, "and the row is gone again");
 });
 
 test("#757 executor: an ordinary write opens no transaction of its own", async () => {
@@ -602,19 +730,77 @@ test("#757 executor: an ordinary write opens no transaction of its own", async (
   const reply = await run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" });
   assert.equal(reply.created_widget, undefined, "nothing was created, so nothing is disclosed");
   assert.deepEqual(graph.log, ["before", "after"], "exactly one pair, and it is runSetWidget's");
-  assert.equal(graph.captures.length, 1);
+  assert.equal(graph.tracker.captures.length, 1);
 });
 
-test("#757 executor: creation that REFUSES closes its transaction and never reaches the write", async () => {
+test("#757 executor: creation that REFUSES opens no transaction, and never reaches the write", async () => {
   const node = loader({ addNew: false }); // a pack build with no addNewLoraWidget
   const { run, graph, runSetWidget } = executor(node);
   await assert.rejects(
     () => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }),
     /does not expose addNewLoraWidget/,
   );
-  assert.equal(graph.changeCount, 0, "an unclosed transaction would swallow the next command's undo entry");
-  assert.equal(graph.captures.length, 1, "closed exactly once");
+  assert.equal(graph.tracker.changeCount, 0, "an unclosed transaction would swallow the next command's undo entry");
+  assert.deepEqual(graph.log, [], "a refusal that changed nothing has no bookkeeping to do");
   assert.equal(runSetWidget.calls.length, 0, "the write is never attempted for a row that does not exist");
+});
+
+test("#757 executor: a CONCURRENT write's row is never rolled back under it", async () => {
+  // Command frames run concurrently. Request A mints lora_1 and parks in its write; request B
+  // arrives, sees a row that now exists, writes it and reports SUCCESS; A then fails. An
+  // unconditional rollback would delete the row B was just told it had written — a reported
+  // success that no longer matches the graph, which is worse than the stray row the rollback
+  // exists to prevent.
+  const node = loader();
+  let releaseA;
+  const parked = new Promise((_, reject) => {
+    releaseA = reject;
+  });
+  const graph = trackedGraph(node);
+  const a = executor(node, {
+    graph,
+    runSetWidget: async (n, w, v, opts) => {
+      opts.beforeChange?.();
+      opts.afterChange?.();
+      return parked; // A is still in flight
+    },
+  });
+  const aDone = assert.rejects(
+    () => a.run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }),
+    /A lost its race/,
+  );
+  await Promise.resolve(); // let A get as far as its await, with the row created
+
+  assert.ok(node.widgets.some((w) => w.name === "lora_1"), "A created the row");
+  // B: an ordinary write to a row that already exists. It must report success and keep it.
+  const b = executor(node, { graph });
+  const bReply = await b.run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" });
+  assert.equal(bReply.created_widget, undefined, "B did not create anything — the row was there");
+
+  releaseA(new Error("A lost its race"));
+  await aDone;
+  assert.ok(
+    node.widgets.some((w) => w.name === "lora_1"),
+    "B was told the write succeeded; A's rollback must not delete the row out from under it",
+  );
+});
+
+test("#757 executor: a refused write that could NOT roll back still says the row exists", async () => {
+  // The other half of the concurrency rule: when the row survives because somebody else wrote
+  // it, the reply must not go on claiming nothing was created.
+  const node = loader();
+  const graph = trackedGraph(node);
+  const { run } = executor(node, {
+    graph,
+    runSetWidget: async (n, w, v, opts) => {
+      opts.beforeChange?.();
+      opts.afterChange?.();
+      noteRgthreeLoraRowWritten(node, "lora_1"); // somebody else's write landed
+      throw new Error("this one still failed");
+    },
+  });
+  await assert.rejects(() => run({ node_id: 153, widget: "lora_1", value: SLOT_JSON, workflow_uuid: "u" }));
+  assert.ok(node.widgets.some((w) => w.name === "lora_1"), "the claimed-by-someone-else row stays");
 });
 
 test("#757 executor: the write is handed the row that was just created", async () => {
