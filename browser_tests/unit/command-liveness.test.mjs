@@ -795,7 +795,7 @@ test("#1095 codex P1: the duplicate-replay wait is marked, and released in a fin
 });
 
 test("#1095 codex P1: the canvas-tool disclosure is decided when the frame LEAVES", () => {
-  // A held frame is sent after a hello the hold expedited, and a landed hello ADVANCES
+  // A held frame is sent after the hello it was waiting for, and a landed hello ADVANCES
   // agentSessionEpoch. Deciding the disclosure at call time therefore decides it for the
   // agent generation the message will not reach: if the outgoing generation had proven its
   // tools, `disclose` is false, the NEW generation gets no disclosure, and
@@ -835,7 +835,10 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
   const holdSites = [];
   const staleReads = [];
   (function walk(n) {
-    if (ts.isCallExpression(n) && n.expression.getText(sf) === "rehelloGate.sendAfterAdvertise") {
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "rehelloGate.holdForRoute") {
+      // Every hold must STAMP the route it was composed for. An unstamped frame is one a
+      // later advertisement for a DIFFERENT workflow will deliver to that workflow.
+      assert.equal(n.arguments.length, 2, "a held frame must carry the route it was composed for");
       holdSites.push(n.getStart(sf));
     }
     if (ts.isCallExpression(n) && n.expression.getText(sf) === "advertisedRouteIsStale") {
@@ -861,8 +864,8 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
     const body = src.slice(at, end);
     assert.match(
       body,
-      /if \(advertisedRouteIsStale\(\)\) return rehelloGate\.sendAfterAdvertise\(send\);/,
-      `${name} must hold the frame when the advertised route is stale`,
+      /if \(advertisedRouteIsStale\(\)\) return rehelloGate\.holdForRoute\(send, [^;]+\);/,
+      `${name} must hold the frame, stamped with its route, when the advertised route is stale`,
     );
     const guardAt = body.indexOf("if (advertisedRouteIsStale())");
     const plainAt = body.lastIndexOf("return send();");
@@ -879,6 +882,26 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
   const sentAt = advBody.indexOf("if (sent) {");
   const recordAt = advBody.indexOf("lastAdvertisedRouteId = advertisedRouteId;");
   assert.ok(sentAt !== -1 && recordAt !== -1 && recordAt > sentAt, "the route is recorded only once a hello LANDED");
+  // …and the held queue is released from that same landed path, with the route that was
+  // ACTUALLY carried. Releasing on intent rather than on arrival would send frames onto a
+  // route the orchestrator was never told about.
+  const notifyAt = advBody.indexOf("rehelloGate.noteAdvertised(advertisedRouteId);");
+  assert.ok(notifyAt !== -1 && notifyAt > sentAt, "held frames are released by a LANDED hello, not an attempted one");
+
+  // THE RULE THAT ENDS THE FAMILY: no send path may cause an advertisement. The workflow
+  // poll binds SESSION_KEY before re-helloing and is the only place that commits a switch
+  // as a whole — so anything else that advertises publishes a half-committed switch, pairing
+  // the new route with the previous workflow's session.
+  const gateSrc = readFileSync(join(HERE, "../../web/js/lib/rehello-gate.js"), "utf8");
+  const holdStart = gateSrc.indexOf("    holdForRoute(send, route) {");
+  assert.notEqual(holdStart, -1, "could not locate holdForRoute");
+  const holdEnd = gateSrc.indexOf("\n    },", holdStart);
+  const holdBody = gateSrc.slice(holdStart, holdEnd);
+  assert.equal(
+    /\b(flush|request)\(\)/.test(holdBody),
+    false,
+    "holding a frame must never trigger an advertisement — it waits for one",
+  );
 });
 
 test("#1095 codex P2: the reachability scan SEES a return inside the marked try", () => {

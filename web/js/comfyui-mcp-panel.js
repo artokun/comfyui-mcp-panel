@@ -19719,6 +19719,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // …and THIS is the binding the orchestrator now holds for this socket. Outbound
           // frames it routes by binding are compared against it (advertisedRouteIsStale).
           lastAdvertisedRouteId = advertisedRouteId;
+          // #1095 — release exactly the held frames composed FOR this route, and discard any
+          // composed for a workflow the panel has since moved past. Driven from the landed
+          // path, so "advertised" means the orchestrator was told, never that we meant to.
+          rehelloGate.noteAdvertised(advertisedRouteId);
           // #654 — registration succeeded: the refused-hello retry budget is
           // replenished and any pending retry is moot.
           routeRefusalRetries = 0;
@@ -19983,11 +19987,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // #1095 P1 — a `user_message` carries NO tab id, so the orchestrator routes it by the
       // binding this socket already has. Sent while a re-advertise is still parked, the
       // user's text, context and images for the workflow they are LOOKING AT are delivered
-      // to the agent for the previous one. Hold it behind the hello instead — it waits for
-      // the one the deferral will produce and cannot force it out, so holding a message can
-      // never withdraw a route from a command that has not replied. Bounded by the deferral
-      // budget. See routeIsStale and sendAfterAdvertise in lib/rehello-gate.js.
-      if (advertisedRouteIsStale()) return rehelloGate.sendAfterAdvertise(send);
+      // to the agent for the previous one. Hold it instead, STAMPED with the route it was
+      // composed for: it leaves only when that route has actually been advertised, it never
+      // causes the advertisement (only the workflow poll may author one — it binds the
+      // session first), and if the panel commits to a different workflow meanwhile it is
+      // discarded rather than delivered there. See holdForRoute in lib/rehello-gate.js.
+      if (advertisedRouteIsStale()) return rehelloGate.holdForRoute(send, bridgeRouteId());
       return send();
     },
     /** Send an arbitrary control frame (set_options, new_session, …). */
@@ -20035,7 +20040,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // canvas. Held for the same reason, and in the SAME queue as user_message so the two
       // cannot overtake each other — frames on one socket are ordered, and a hold that
       // reordered them would trade a routing bug for a conversation bug.
-      if (advertisedRouteIsStale()) return rehelloGate.sendAfterAdvertise(send);
+      //
+      // Stamped with `routeId`, which is the route this frame's own tab_id already names, so
+      // the stamp and the payload can never disagree.
+      if (advertisedRouteIsStale()) return rehelloGate.holdForRoute(send, routeId);
       return send();
     },
     /** Run a whitelisted backend tool directly (no agent turn), cid-correlated.

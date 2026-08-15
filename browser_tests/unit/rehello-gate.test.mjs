@@ -257,13 +257,18 @@ test("#1095: a leaked mark delays the hello but can never block it", async () =>
 
 // --- joining an advertisement already on its way (codex P2) ---------------
 
-test("#1095 codex P2: a hold JOINS the advertisement already on its way", async () => {
-  // The most common path in this whole feature, not an edge case: an ordinary workflow
-  // switch with an existing session and nothing in flight. rehelloForWorkflow starts the
-  // hello and immediately sends resume_session; that frame finds the route still stale
-  // (the hello has published nothing yet) and asks to be held. Without the join, the hold
-  // started a SECOND full registration — duplicate hello, duplicate "agent ready" greeting,
-  // and TWO agentSessionEpoch increments for one switch.
+test("#1095 codex P2: two requests during ONE advertisement produce ONE registration", async () => {
+  // A hello is asynchronous — it awaits the tab-identity lease before it can even build its
+  // payload — so "a hello is happening" has real duration, and two callers that both want
+  // the route advertised in that window want the SAME hello. Without the join they got two:
+  // duplicate registration, duplicate "agent ready" greeting, and TWO agentSessionEpoch
+  // increments for one switch. The doubled epoch is not cosmetic; it feeds the canvas-tool
+  // disclosure, whose whole job is to run exactly once per generation.
+  //
+  // (The path that originally exposed this — an outbound frame arriving mid-hello — can no
+  // longer reach an advertisement at all: `holdForRoute` waits and never triggers one. The
+  // join still governs every genuine re-advertise caller: the poll, the #607 fence, the
+  // #310 free_vram re-advertise and the #508 self-heal.)
   let hellos = 0;
   let resolveHello;
   const gate = createRehelloGate({
@@ -277,13 +282,11 @@ test("#1095 codex P2: a hold JOINS the advertisement already on its way", async 
   });
   const first = gate.request(); // the switch's own hello — nothing in flight, so it goes now
   assert.equal(hellos, 1);
-  gate.sendAfterAdvertise(() => {}); // resume_session, riding right behind it
-  assert.equal(hellos, 1, "one switch must produce exactly one registration");
+  const second = gate.request(); // the fence, say, while that one is still on its way
+  assert.equal(hellos, 1, "one window must produce exactly one registration");
 
   resolveHello(true);
-  assert.equal(await first, true);
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(gate.heldFrames(), 0, "the held frame still drains on the joined advertisement");
+  assert.deepEqual(await Promise.all([first, second]), [true, true], "both callers get the same outcome");
 });
 
 test("#1095 codex P2: the join ends when the advertisement does", async () => {
@@ -387,190 +390,138 @@ test("#1095 codex P1: the advertised route is STALE once the committed workflow 
   assert.equal(routeIsStale({}), false);
 });
 
-test("#1095 codex P1: a held frame does not leave before the re-advertise lands", async () => {
+test("#1095 codex P1: a held frame leaves only when ITS OWN route has been advertised", () => {
   // The leak: a user_message carries NO tab id, so the orchestrator routes it by the socket
-  // binding. Sent during the deferral it reaches the PREVIOUS workflow's agent — the user's
-  // text, context and images delivered into another canvas's conversation.
+  // binding. Sent before the new route is advertised it reaches the PREVIOUS workflow's
+  // agent — the user's text, context and images delivered into another canvas's conversation.
   const order = [];
-  let resolveHello;
-  const gate = manualGate(() => {
-    order.push("hello");
-    return new Promise((r) => {
-      resolveHello = r;
-    });
-  });
-  const mark = gate.began("ask_user"); // a human-paced command is holding the route
-  const accepted = gate.sendAfterAdvertise(() => order.push("user_message"));
+  const gate = manualGate(() => Promise.resolve(true));
+  const accepted = gate.holdForRoute(() => order.push("user_message"), "tmp:B");
   assert.equal(accepted, true, "the frame is accepted, not refused — it is queued, not dropped");
-  assert.deepEqual(order, [], "the frame must not go out, and must not force a hello either");
+  assert.deepEqual(order, [], "and it does not go out yet");
   assert.equal(gate.heldFrames(), 1);
 
-  gate.ended(mark); // the command replies, so the deferral releases the hello
-  assert.deepEqual(order, ["hello"], "the hello goes first");
-  resolveHello(true);
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, ["hello", "user_message"], "the frame follows the hello, never precedes it");
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, ["user_message"], "released by the advertisement of its own route");
   assert.equal(gate.heldFrames(), 0);
 });
 
-test("#1095 codex R4: holding must NOT force the parked hello out", async () => {
-  // An earlier cut expedited here, argued as "a person is waiting, and their action outranks
-  // an in-flight command's reply". The argument was sound for the case it was written about
-  // and wrong for the traffic it covered: rehelloForWorkflow ALSO runs automatically and
-  // sends `resume_session` with nobody waiting. That frame reached the hold, expedited the
-  // hello the gate had correctly parked, and let the backend drop the old mapping before an
-  // in-flight command's reply — the very race this PR closes, re-opened by the convenience.
+test("#1095 codex R5: a held frame NEVER causes an advertisement", () => {
+  // THE RULE THAT ENDS THE FAMILY, rather than another instance of it.
+  //
+  // `bridgeRouteId()` moves the instant the user clicks a workflow tab, but SESSION_KEY is
+  // not rebound until the 600ms poll runs — and the hello reads SESSION_KEY for its
+  // spawn-time `resume`. Anything that advertises inside that gap pairs the NEW route with
+  // the PREVIOUS workflow's session, which on a route with no live agent spawns a
+  // resume-FORK of the previous conversation. onWorkflowMaybeChanged binds the session
+  // first and is the only place that commits a switch as a whole, so it must be the only
+  // author of a workflow re-advertisement. Earlier cuts had the hold call `request()`,
+  // which advertises immediately when nothing is in flight — so an outbound frame arriving
+  // in the gap was itself what published the half-committed switch.
   const { gate, sends, advance } = harness();
-  const mark = gate.began("ask_user"); // 30s budget — the worst case
-  gate.request();
-  assert.deepEqual(sends, [], "parked, as the #1095 fix intends");
-
-  gate.sendAfterAdvertise(() => {});
-  assert.deepEqual(sends, [], "an outbound frame must not withdraw the route from a live command");
-  advance(REHELLO_DEFER_MS + 1);
-  assert.deepEqual(sends, [], "…not even past the MACHINE budget, since ask_user set the deadline");
-
-  // It goes out when the deferral says so — on drain here — and the frame follows.
-  gate.ended(mark);
-  assert.equal(sends.length, 1);
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(gate.heldFrames(), 0, "the held frame follows the hello it waited for");
+  gate.holdForRoute(() => {}, "tmp:B");
+  assert.deepEqual(sends, [], "an outbound frame must not start a hello");
+  advance(REHELLO_DEFER_HUMAN_MS - 1);
+  assert.deepEqual(sends, [], "…not on any timer of its own either");
+  assert.equal(gate.heldFrames(), 1, "it is waiting, not driving");
 });
 
-test("#1095 codex R4: a held frame still gets a hello when nothing is in flight", async () => {
-  // Waiting must not mean waiting forever. With no command marked, `request()` advertises
-  // immediately, so the ordinary case pays nothing.
-  const { gate, sends } = harness();
+test("#1095 codex R5: a frame composed for B is DISCARDED when the panel commits to C", () => {
+  // A→B queues B's user_message / resume_session; the user switches B→C before it drains;
+  // the hello advertises C. Without the route stamp the loop delivered B's frames onto C.
   const order = [];
-  gate.sendAfterAdvertise(() => order.push("frame"));
-  assert.equal(sends.length, 1, "no deferral to respect ⇒ the hello goes now");
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, ["frame"]);
+  const gate = manualGate(() => Promise.resolve(true));
+  gate.holdForRoute(() => order.push("for-B"), "tmp:B");
+  gate.noteAdvertised("tmp:C");
+  assert.deepEqual(order, [], "a message composed for B has no correct meaning on C");
+  assert.equal(gate.heldFrames(), 0, "…and it is dropped rather than left to leak later");
 });
 
-test("#1095 codex R4: a held frame is bounded by the budget, not by the command", async () => {
-  // The cost of refusing to expedite, stated and pinned: a command that never replies delays
-  // the frame by the budget and no longer.
-  const { gate, sends, advance } = harness();
+test("#1095 codex R5: only the matching frames are released; the rest are discarded together", () => {
   const order = [];
-  gate.began("graph_set_widget"); // never released
-  gate.sendAfterAdvertise(() => order.push("frame"));
-  assert.deepEqual(sends, [], "held while the command still has budget");
-  advance(REHELLO_DEFER_MS + 1);
-  assert.equal(sends.length, 1, "the budget expires and the hello goes out");
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, ["frame"], "…and the frame follows it");
+  const gate = manualGate(() => Promise.resolve(true));
+  gate.holdForRoute(() => order.push("B-1"), "tmp:B");
+  gate.holdForRoute(() => order.push("C-1"), "tmp:C");
+  gate.holdForRoute(() => order.push("B-2"), "tmp:B");
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, ["B-1", "B-2"], "B's frames go, in order; C's does not ride along");
+  assert.equal(gate.heldFrames(), 0, "the queue is emptied by the advertisement, never left half-drained");
 });
 
-// --- a cancelled generation's drain (codex P2) ----------------------------
-
-test("#1095 codex R4: a cancelled generation's drain cannot send on the replacement connection", async () => {
-  // cancel() used to clear `waiters` and `inFlight` but leave `held` and its already-
-  // scheduled `then` intact. The retired advertisement would settle, the drain would run
-  // against the MUTABLE current socket, and a frame composed for the old connection would be
-  // written to the new one — or dropped after `true` had been returned. Same generation
-  // lesson as the marks, one layer out.
+test("#1095 codex R5: the hold is BOUNDED — a route that is never advertised drops its frames", () => {
+  // The poll advertises a genuine switch within ~600ms, so this is the abandoned case: the
+  // user switched away and never came back, or the poll is not running. Holding forever
+  // would be a mute panel; sending on whatever route the orchestrator does hold is the leak.
   const order = [];
-  let resolveHello;
-  const gate = manualGate(() => new Promise((r) => { resolveHello = r; }));
-  const mark = gate.began("graph_set_widget");
-  gate.sendAfterAdvertise(() => order.push("frame-from-the-old-connection"));
-  assert.equal(gate.heldFrames(), 1);
-  gate.ended(mark); // the hello for the OLD connection is now on its way
-
-  gate.cancel(); // setUrl / stop / destroy / an active close, mid-hello
-  assert.equal(gate.heldFrames(), 0, "the batch is retired with the connection that built it");
-
-  resolveHello(true); // the retired advertisement settles late
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, [], "a frame built for a dead route must never reach the live socket");
+  const { gate, advance } = harness();
+  gate.holdForRoute(() => order.push("never-advertised"), "tmp:B");
+  advance(REHELLO_DEFER_HUMAN_MS - 1);
+  assert.equal(gate.heldFrames(), 1, "still inside the bound");
+  advance(2);
+  assert.equal(gate.heldFrames(), 0, "past it, the frame is discarded");
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, [], "…and a late advertisement cannot resurrect it");
 });
 
-test("#1095 codex R4: a retired advertisement must not drain the REPLACEMENT's queue", async () => {
-  // Clearing `held` on cancel is not sufficient on its own, and mutation testing is what
-  // showed it: with only the clear, removing the generation check broke nothing, because the
-  // stale drain found an empty batch. The two diverge exactly here — when a NEW frame has
-  // been queued on the replacement connection before the RETIRED advertisement settles. The
-  // stale drain would then splice a batch that is not its own and write it out before the new
-  // connection's own hello had landed, which is the stale-route send this all exists to stop.
+test("#1095 codex R5: held frames keep their order", () => {
   const order = [];
-  let resolveRetired;
-  let hellos = 0;
-  const gate = manualGate(() => {
-    hellos++;
-    if (hellos === 1) return new Promise((r) => { resolveRetired = r; });
-    return new Promise(() => {}); // the replacement's own hello is still on its way
-  });
-
-  const mark = gate.began("graph_set_widget");
-  gate.sendAfterAdvertise(() => order.push("old-connection-frame"));
-  gate.ended(mark); // the retired connection's hello is now on its way
-  gate.cancel(); // …and the connection is replaced before it settles
-
-  gate.sendAfterAdvertise(() => order.push("replacement-frame"));
-  assert.equal(gate.heldFrames(), 1, "the replacement queued its own frame");
-
-  resolveRetired(true); // the RETIRED advertisement settles late
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, [], "a dead connection's advertisement may not release the live queue");
-  assert.equal(gate.heldFrames(), 1, "…the live frame still waits for its OWN hello");
-});
-
-test("#1095 codex R4: a stale never-settling advertisement cannot wedge later frames", async () => {
-  // The other half of the same defect: with `held` left populated behind a promise that
-  // never settles, every later frame queued behind `held.length > 1` and no drain was ever
-  // scheduled for it.
-  const order = [];
-  let hellos = 0;
-  const gate = manualGate(() => {
-    hellos++;
-    return hellos === 1 ? new Promise(() => {}) : Promise.resolve(true);
-  });
-  const mark = gate.began("graph_set_widget");
-  gate.sendAfterAdvertise(() => order.push("stranded"));
-  gate.ended(mark); // hello #1 starts, and never settles
-  gate.cancel();
-
-  // A new connection, a new frame — it must get its own advertisement and its own drain.
-  gate.sendAfterAdvertise(() => order.push("live"));
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, ["live"], "the queue is usable again after the connection was replaced");
-});
-
-test("#1095 codex P1: held frames keep their order and drain as one batch", async () => {
-  const order = [];
-  let resolveHello;
-  const gate = manualGate(() => new Promise((r) => { resolveHello = r; }));
-  const mark = gate.began("graph_set_widget");
-  for (const n of [1, 2, 3]) gate.sendAfterAdvertise(() => order.push(n));
+  const gate = manualGate(() => Promise.resolve(true));
+  for (const n of [1, 2, 3]) gate.holdForRoute(() => order.push(n), "tmp:B");
   assert.equal(gate.heldFrames(), 3, "one queue, not one per frame");
-  gate.ended(mark);
-  resolveHello(true);
-  await new Promise((r) => setTimeout(r, 0));
+  gate.noteAdvertised("tmp:B");
   assert.deepEqual(order, [1, 2, 3], "frames on one socket are ordered; the hold must not reorder them");
 });
 
-test("#1095 codex P1: a FAILED re-advertise still drains the hold — a mute panel is worse", async () => {
-  const order = [];
-  const gate = manualGate(() => Promise.reject(new Error("hello failed")));
-  const mark = gate.began("graph_set_widget");
-  gate.sendAfterAdvertise(() => order.push("sent"));
-  gate.ended(mark);
-  await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(order, ["sent"], "a frame held forever would be a panel that silently stops talking");
-});
-
-test("#1095 codex P1: one frame's failure does not strand the rest of the batch", async () => {
+test("#1095 codex R5: one frame's failure does not strand the rest of the batch", () => {
   const order = [];
   const gate = manualGate(() => Promise.resolve(true));
-  const mark = gate.began("graph_set_widget");
-  gate.sendAfterAdvertise(() => {
+  gate.holdForRoute(() => {
     throw new Error("this frame blew up");
-  });
-  gate.sendAfterAdvertise(() => order.push("second"));
-  gate.ended(mark);
-  await new Promise((r) => setTimeout(r, 0));
+  }, "tmp:B");
+  gate.holdForRoute(() => order.push("second"), "tmp:B");
+  gate.noteAdvertised("tmp:B");
   assert.deepEqual(order, ["second"]);
+});
+
+// --- retiring the queue with its connection (codex P2) --------------------
+
+test("#1095 codex R4: a frame built for a retired connection is never sent on its replacement", () => {
+  const order = [];
+  const gate = manualGate(() => Promise.resolve(true));
+  gate.holdForRoute(() => order.push("frame-from-the-old-connection"), "tmp:B");
+  assert.equal(gate.heldFrames(), 1);
+
+  gate.cancel(); // setUrl / stop / destroy / an active close
+  assert.equal(gate.heldFrames(), 0, "the batch is retired with the connection that built it");
+
+  // Even the SAME route id on the replacement connection must not resurrect it: the frame
+  // was composed against a socket that no longer exists.
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, [], "a frame built for a dead connection must never reach the live socket");
+});
+
+test("#1095 codex R4: a retired entry cannot ride out on the replacement's advertisement", () => {
+  // The generation check and the batch clear are not the same guard, and mutation testing is
+  // what showed it. They diverge when an entry from the OLD connection is still in the queue
+  // while the replacement advertises — which is what happens if anything ever queues without
+  // going through cancel's clear. Pinned directly so the fence is not merely redundant.
+  const order = [];
+  const gate = manualGate(() => Promise.resolve(true));
+  gate.holdForRoute(() => order.push("old"), "tmp:B");
+  gate.cancel();
+  gate.holdForRoute(() => order.push("new"), "tmp:B");
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, ["new"], "only the live connection's frame goes out");
+});
+
+test("#1095 codex R4: the queue is usable again after the connection was replaced", () => {
+  const order = [];
+  const gate = manualGate(() => Promise.resolve(true));
+  gate.holdForRoute(() => order.push("stranded"), "tmp:B");
+  gate.cancel();
+  gate.holdForRoute(() => order.push("live"), "tmp:B");
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, ["live"]);
 });
 
 // --- the gate's own failure modes ----------------------------------------

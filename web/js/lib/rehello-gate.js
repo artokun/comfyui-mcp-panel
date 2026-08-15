@@ -204,7 +204,11 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   // Frames that must not leave before the route has been re-advertised (see `routeIsStale`).
   // FIFO, and drained as one batch, because frames on a socket are ordered and holding some
   // while letting others past would reorder a conversation.
+  // Each entry is { send, route, bornAt } — see `holdForRoute` for why a bare callback was
+  // not enough: a frame must carry the route it was composed for, or a later advertisement
+  // for a DIFFERENT workflow delivers it to that one.
   const held = [];
+  let holdTimer = null;
   // Which CONNECTION the state above belongs to. Bumped by `cancel()`, so anything already
   // scheduled against the retired connection — a queued drain in particular — can tell that
   // it no longer speaks for the live one. Same generation-scoping rule as the mark ids, one
@@ -389,6 +393,14 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       // promise that never settles leaves every later frame stuck behind `held.length > 1`.
       generation++;
       held.length = 0;
+      if (holdTimer !== null) {
+        try {
+          disarm(holdTimer);
+        } catch {
+          // A stray timer only clears an already-empty queue.
+        }
+        holdTimer = null;
+      }
       // The advertisement on its way belongs to the connection being retired. A frame held
       // on the REPLACEMENT socket must not join it and conclude the new route is published
       // because the old socket's hello landed.
@@ -423,45 +435,101 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
      * a person involved. So the expedite is GONE, and the rule is now uniform: a frame that
      * needs the new route waits for it, and the deferral decides when that is.
      *
-     * What that costs is bounded and visible: a frame can wait up to the deferral budget
-     * (4 s, or 30 s behind a human-paced command) before the hello goes out and it follows.
-     * The message sits in the pending tray meanwhile and its own delivery timeout still
-     * covers it. What it buys is that NO outbound frame can withdraw a route from a command
-     * that has not replied — by construction rather than by case analysis.
+     * TWO RULES, AND THEY REPLACE FOUR ROUNDS OF POINT FIXES.
      *
-     * Ordering is preserved two ways: the hold is FIFO, and the whole batch runs after the
-     * SAME advertisement settles, so nothing overtakes anything. A rejected advertisement
-     * still drains — a frame held forever is a mute panel, which is worse than a frame sent
-     * on a route we could not confirm.
+     * (1) A HELD FRAME IS SCOPED TO THE ROUTE IT WAS COMPOSED FOR. It leaves only when THAT
+     *     route is the one the orchestrator has been told about. If the panel commits to a
+     *     different workflow first, the frame is discarded rather than delivered, because a
+     *     message composed for B has no correct meaning on C. (A→B queues B's frames, the
+     *     user switches B→C, the hello advertises C — without the stamp the loop delivered
+     *     B's `user_message` and `resume_session` onto C.)
+     *
+     * (2) A HELD FRAME NEVER CAUSES AN ADVERTISEMENT. It waits for one. This is the rule
+     *     that stops the family of bugs rather than another instance of it, and it is worth
+     *     stating why.
+     *
+     *     `onWorkflowMaybeChanged` is the ONLY place that commits a workflow switch as a
+     *     whole: it binds SESSION_KEY and only then re-hellos, and its own comment says
+     *     "Order is the whole fix" — the hello reads SESSION_KEY for its spawn-time
+     *     `resume`, so advertising before the bind spawns the new route as a resume-FORK of
+     *     the previous workflow's conversation. But `bridgeRouteId()` is derived from the
+     *     LIVE canvas and moves the instant the user clicks a tab, while SESSION_KEY does
+     *     not move until the 600 ms poll runs. Anything that advertises inside that gap
+     *     pairs the NEW route with the PREVIOUS workflow's session.
+     *
+     *     Earlier cuts of this hold called `request()`, which advertises immediately when
+     *     nothing is in flight — so an outbound frame arriving in the gap was itself the
+     *     thing that published the half-committed switch. Removing the trigger removes the
+     *     whole class: the poll remains the only author of a workflow re-advertisement, and
+     *     everything else observes.
+     *
+     * COST, stated plainly. A frame composed in the gap waits for the poll (~600 ms) plus
+     * any deferral, and is bounded at `REHELLO_DEFER_HUMAN_MS`; past that, or if the panel
+     * commits to a different workflow, it is DISCARDED and the caller's delivery timeout
+     * surfaces it in the pending tray. Refusing a write is acceptable; sending it to the
+     * wrong workflow's agent is not.
+     *
+     * Ordering is preserved: the queue is FIFO and drains as one batch per advertisement.
      */
-    sendAfterAdvertise(send) {
+    holdForRoute(send, route) {
       if (typeof send !== "function") return false;
-      held.push(send);
-      if (held.length > 1) return true; // a drain is already scheduled for this batch
-      // GENERATION-FENCED, the same lesson as the marks one layer out. Without this,
-      // cancel() cleared `waiters` and `inFlight` but left `held` and this already-scheduled
-      // `then` intact: the retired connection's advertisement would settle, the drain would
-      // run against the MUTABLE current `sock`, and the old frame would either be written to
-      // the REPLACEMENT connection or silently dropped after `true` had been returned. And
-      // if that stale promise never settled, every later frame stayed wedged behind
-      // `held.length > 1`.
-      const bornAt = generation;
-      const drain = () => {
-        if (bornAt !== generation) return; // the connection this batch belonged to is gone
-        const batch = held.splice(0, held.length);
-        for (const fn of batch) {
-          try {
-            fn();
-          } catch {
-            // One frame's failure must not strand the rest of the batch.
-          }
+      // GENERATION-FENCED, the same lesson as the marks one layer out: an entry must be able
+      // to say which CONNECTION it belongs to, so a cancel can retire it.
+      held.push({ send, route, bornAt: generation });
+      // Bounded, so a route that is never advertised (the user switched away and never came
+      // back, the poll is not running) cannot hold a frame forever. The bound is the human
+      // budget because that is already the longest a legitimate advertisement can be
+      // deferred — anything shorter would discard frames the poll was still going to serve.
+      if (holdTimer === null) {
+        try {
+          holdTimer = arm(() => {
+            holdTimer = null;
+            // Nothing advertised in time. These frames were composed for a route the
+            // orchestrator was never told about; sending them now would send them on
+            // whatever route it does hold, which is the leak this exists to prevent.
+            held.length = 0;
+          }, REHELLO_DEFER_HUMAN_MS);
+        } catch {
+          // No timer source: prefer dropping the frame to holding it forever on a route
+          // that may never be advertised.
+          held.length = 0;
+          return false;
         }
-      };
-      // `request()`, not `flush()`: it advertises immediately when nothing is in flight, and
-      // otherwise JOINS the parked hello and resolves when that one actually goes out. Either
-      // way a hello is guaranteed to happen, so a held frame cannot wait forever.
-      Promise.resolve(request()).then(drain, drain);
+      }
       return true;
+    },
+
+    /**
+     * #1095 — a hello has LANDED, carrying `route`. Release exactly the frames composed for
+     * it, and discard the rest.
+     *
+     * This is the observation side of the rule above. It is called from the hello's success
+     * path, so "advertised" means the orchestrator was actually told — never that the panel
+     * intended to tell it.
+     */
+    noteAdvertised(route) {
+      if (holdTimer !== null) {
+        try {
+          disarm(holdTimer);
+        } catch {
+          // A stray timer only clears an already-empty queue.
+        }
+        holdTimer = null;
+      }
+      const batch = held.splice(0, held.length);
+      for (const entry of batch) {
+        // A frame from a retired connection, or composed for a workflow the panel has since
+        // moved past, has no correct destination. Dropped, deliberately and silently at this
+        // layer — the caller that was told `true` learns about it through its own delivery
+        // timeout, which is the mechanism that already exists for "it never got there".
+        if (entry.bornAt !== generation) continue;
+        if (entry.route !== route) continue;
+        try {
+          entry.send();
+        } catch {
+          // One frame's failure must not strand the rest of the batch.
+        }
+      }
     },
 
     /** Diagnostics/tests: whether a re-advertise is currently parked. */
