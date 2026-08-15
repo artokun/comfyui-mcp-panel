@@ -206,6 +206,67 @@ function restoreNodeSize(node, previous) {
   }
 }
 
+// A NEW ROW HAS A SETTLING PERIOD; AN EXISTING ONE DOES NOT. This is the difference that
+// produced two separate P1s, and it is worth stating exactly once, here.
+//
+// `new PowerLoraLoaderWidget()` sets `showModelAndClip = null`, and the field is only
+// synchronised with the node in `draw()` — read verbatim from the pack:
+//
+//     // PowerLoraLoaderWidget.draw
+//     let currentShowModelAndClip =
+//       node.properties[PROP_LABEL_SHOW_STRENGTHS] === PROP_VALUE_SHOW_STRENGTHS_SEPARATE;
+//     if (this.showModelAndClip !== currentShowModelAndClip) {
+//       let oldShowModelAndClip = this.showModelAndClip;
+//       this.showModelAndClip = currentShowModelAndClip;
+//       …
+//     }
+//
+//     // PowerLoraLoaderWidget.serializeValue
+//     const v = { ...this.value };
+//     if (!this.showModelAndClip) { delete v.strengthTwo; }
+//     else { this.value.strengthTwo = this.value.strengthTwo ?? 1; v.strengthTwo = …; }
+//
+// (rgthree-comfy/web/comfyui/power_lora_loader.js.) So a row that has not been DRAWN yet has
+// `showModelAndClip === null`, which is falsy — every serialization takes the first branch and
+// simply drops `strengthTwo`. A human never sees this: they click "➕ Add Lora", the canvas
+// repaints, and the row is settled long before they touch a value. An agent creating and
+// writing in one synchronous command gets no frame in between, so it writes into an unsettled
+// row: the write verifies (nothing touched the value), and the FIRST draw afterwards flips
+// `showModelAndClip` to true, at which point `serializeValue` rewrites `strengthTwo: null` to
+// 1. A verified success that changes later, which is the one thing this file exists to prevent.
+//
+// The fix is to do what the first draw would have done, at creation time. Only the
+// synchronisation is copied — NOT the value adjustment beside it, which the pack itself skips
+// on a first draw (`oldShowModelAndClip != null` is false for a row that has never been drawn).
+// That keeps a created row byte-identical to the same row created by the button and drawn once.
+const RGTHREE_SHOW_STRENGTHS_PROP = "Show Strengths";
+const RGTHREE_SHOW_STRENGTHS_SEPARATE = "Separate Model & Clip";
+
+/**
+ * Put a just-minted row into the state its first canvas draw would have left it in.
+ *
+ * Deliberately NARROW: one named field, mirroring one specific line of the pack's `draw`.
+ * A blanket "copy everything a sibling has" would carry `value` and `name` across and corrupt
+ * the row, and a general "simulate a draw" is not available without a canvas context.
+ *
+ * Best-effort on READS — a node whose `properties` throws simply leaves the row as it was, and
+ * the caller's own verification still applies — but an assignment that throws propagates, so
+ * the creation is rolled back rather than left half-settled.
+ */
+function settleCreatedRow(node, widget) {
+  if (!widget) return;
+  // Absent (not merely null) means this pack build has no such mode: nothing to settle.
+  if (!("showModelAndClip" in widget)) return;
+  if (widget.showModelAndClip !== null && widget.showModelAndClip !== undefined) return;
+  let separate;
+  try {
+    separate = node?.properties?.[RGTHREE_SHOW_STRENGTHS_PROP] === RGTHREE_SHOW_STRENGTHS_SEPARATE;
+  } catch {
+    return; // an unreadable node tells us nothing; leave the row exactly as the pack made it
+  }
+  widget.showModelAndClip = separate;
+}
+
 /** Drop a widget the node grew but that we are not keeping. Best-effort, never throws. */
 function removeCreatedRow(node, widget) {
   try {
@@ -382,9 +443,6 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
     );
   }
 
-  // GROW THE NODE, as the pack's own button does. Marking the canvas dirty only repaints.
-  fitNodeToRows(node);
-  setDirty?.();
   // The row OBJECT, captured now — see `remove` below.
   const createdWidget = (() => {
     try {
@@ -393,6 +451,29 @@ export function createRgthreeLoraRow(node, widgetName, { beforeChange, afterChan
       return null;
     }
   })();
+  // EVERYTHING BELOW MUTATES A ROW THAT IS ALREADY ON THE NODE while the caller still has no
+  // way to undo it — `remove` is only handed back at the very end, and runSetWidget evaluates
+  // this whole function BEFORE it enters the try that would clean up. So a throw in any of
+  // these steps (a hostile `computeSize`, an injected `setDirty` that raises, a widget whose
+  // mode field has a throwing setter) used to strand the row, the row NAME it had spent and
+  // the height it had grown, while the command reported a failure that had changed the graph.
+  // The tail therefore undoes itself before it rethrows.
+  try {
+    // SETTLE THE ROW BEFORE ANYTHING READS IT. See `settleCreatedRow`.
+    settleCreatedRow(node, createdWidget);
+    // GROW THE NODE, as the pack's own button does. Marking the canvas dirty only repaints.
+    fitNodeToRows(node);
+    try {
+      setDirty?.();
+    } catch {
+      /* a repaint hint is cosmetic — it must never fail a creation that otherwise worked */
+    }
+  } catch (err) {
+    if (createdWidget) removeCreatedRow(node, createdWidget);
+    restoreRowCounter(node, counterBefore);
+    restoreNodeSize(node, sizeBefore);
+    throw err;
+  }
   // The counter as it stands with THIS row's increment and no other. `remove` refuses to
   // rewind unless it still reads exactly this, because anything else means the number it
   // would rewind past is not only ours. See the note on the rollback below.

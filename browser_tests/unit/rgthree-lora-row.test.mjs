@@ -553,6 +553,216 @@ test("#757 remove() reports a row it could not take back out", () => {
 });
 
 // ---------------------------------------------------------------------------
+// THE SETTLING PERIOD — a new row is not an existing row until it has been drawn
+// ---------------------------------------------------------------------------
+//
+// The widget below is modelled on the SHIPPED one, because the defect lives entirely in the
+// gap between construction and the first draw:
+//
+//   constructor:    this.showModelAndClip = null;
+//   draw:           this.showModelAndClip =
+//                     node.properties["Show Strengths"] === "Separate Model & Clip";
+//   serializeValue: const v = {...this.value};
+//                   if (!this.showModelAndClip) delete v.strengthTwo;
+//                   else { this.value.strengthTwo = this.value.strengthTwo ?? 1; … }
+//
+// `null` is falsy, so an UNDRAWN row serializes down the first branch and quietly drops
+// strengthTwo. A human never meets this — clicking "➕ Add Lora" repaints before they touch
+// anything. An agent creating and writing in one synchronous command does.
+
+/** The pack's row widget, with the two behaviours that matter reproduced verbatim. */
+function powerLoraRowWidget(name) {
+  return {
+    name,
+    showModelAndClip: null, // set only by draw()
+    value: { on: true, lora: null, strength: 1, strengthTwo: null },
+    serializeValue() {
+      const v = { ...this.value };
+      if (!this.showModelAndClip) {
+        delete v.strengthTwo;
+      } else {
+        this.value.strengthTwo = this.value.strengthTwo ?? 1; // MUTATES the live value
+        v.strengthTwo = this.value.strengthTwo;
+      }
+      return v;
+    },
+  };
+}
+
+function powerLoraNode({ separate = false, drawnRows = [] } = {}) {
+  const node = {
+    id: 153,
+    type: POWER_LORA_LOADER_TYPE,
+    properties: { "Show Strengths": separate ? "Separate Model & Clip" : "Single Strength" },
+    widgets: [{ name: "divider" }, { name: "PowerLoraLoaderHeaderWidget" }, { name: "divider" }, { name: "➕ Add Lora" }],
+    loraWidgetsCounter: 0,
+    size: [200, 60],
+    computeSize: () => [200, 60 + 20 * node.widgets.filter((w) => /^lora_\d+$/.test(w?.name ?? "")).length],
+    removeWidget(w) {
+      const i = node.widgets.indexOf(w);
+      if (i >= 0) node.widgets.splice(i, 1);
+    },
+    addNewLoraWidget() {
+      node.widgets.push(powerLoraRowWidget(`lora_${++node.loraWidgetsCounter}`));
+    },
+  };
+  for (const name of drawnRows) {
+    node.addNewLoraWidget();
+    // An existing row has been drawn at least once, so its mode is already synchronised.
+    node.widgets.at(-1).showModelAndClip = separate;
+  }
+  return node;
+}
+
+const LORA_REGISTRY = { [POWER_LORA_LOADER_TYPE]: {} };
+const loraOracle = { getFreshObjectInfo: async () => ({ [POWER_LORA_LOADER_TYPE]: {} }) };
+
+/**
+ * Drive the REAL runSetWidget over the fixture, with a capture that SERIALIZES.
+ *
+ * ChangeTracker captures by serializing the graph, which is what runs each widget's
+ * `serializeValue` — so a probe that does not serialize cannot see this class of defect at all.
+ */
+async function loraWriteThrough(node, { create }) {
+  let depth = 0;
+  const serializeAll = () => {
+    for (const w of node.widgets) {
+      try {
+        w.serializeValue?.(node, 0);
+      } catch {
+        /* the capture swallows a widget that cannot serialize */
+      }
+    }
+  };
+  const opts = {
+    registry: LORA_REGISTRY,
+    ...loraOracle,
+    beforeChange: () => {
+      depth += 1;
+    },
+    afterChange: () => {
+      depth -= 1;
+      if (depth === 0) serializeAll();
+    },
+    ...(create
+      ? {
+          prepareWriteTarget: () => {
+            const made = createRgthreeLoraRow(node, "lora_1", {});
+            return { undo: () => made.remove().incomplete };
+          },
+        }
+      : {}),
+  };
+  try {
+    return { ok: true, result: await runSetWidget(node, "lora_1", SLOT_JSON, opts) };
+  } catch (err) {
+    return { ok: false, message: err.message };
+  }
+}
+
+test("#757 a Separate Model & Clip CREATION reports what an existing-row write reports", async () => {
+  // ROUND-7 P1, and the invariant the whole feature is judged on. In Separate mode the pack's
+  // serializeValue rewrites `strengthTwo: null` to 1 during the capture — before the write is
+  // verified — so an EXISTING-row write is refused for a value that did not stick. A newly
+  // created row, still undrawn, took the other branch and silently dropped strengthTwo, so the
+  // write verified clean and the value changed at the NEXT queue or save instead.
+  const created = await loraWriteThrough(powerLoraNode({ separate: true }), { create: true });
+  const existing = await loraWriteThrough(powerLoraNode({ separate: true, drawnRows: ["lora_1"] }), { create: false });
+  assert.equal(
+    created.ok,
+    existing.ok,
+    `creation reported ok=${created.ok} where an existing row reported ok=${existing.ok}`,
+  );
+  assert.equal(created.ok, false, "the pack overrides strengthTwo in this mode, so both must refuse");
+  assert.match(created.message, /did not retain the requested value/);
+  assert.match(existing.message, /did not retain the requested value/);
+});
+
+test("#757 a Single Strength creation still SUCCEEDS — the originally reported case", async () => {
+  // The other side of the settle: getting the mode wrong in this direction would refuse the
+  // very case #757 exists to fix, because the pack drops strengthTwo from the serialized form
+  // here by design and touches nothing.
+  const node = powerLoraNode({ separate: false });
+  const created = await loraWriteThrough(node, { create: true });
+  assert.equal(created.ok, true, created.message);
+  const row = node.widgets.find((w) => w.name === "lora_1");
+  assert.equal(row.value.lora, "x.safetensors", "and the requested value is on the row");
+  assert.equal(row.value.strengthTwo, null, "untouched, because this mode does not use it");
+});
+
+test("#757 the created row is settled to the SAME mode an existing row has", async () => {
+  for (const separate of [true, false]) {
+    const node = powerLoraNode({ separate });
+    createRgthreeLoraRow(node, "lora_1", {});
+    const row = node.widgets.find((w) => w.name === "lora_1");
+    assert.equal(row.showModelAndClip, separate, `mode ${separate} must be synchronised at creation`);
+  }
+});
+
+test("#757 a pack build with no such mode is left exactly as it was", () => {
+  // `showModelAndClip` ABSENT (not merely null) is an older/other build with nothing to settle.
+  // Inventing the field would hand its serializeValue a branch it never had.
+  const node = powerLoraNode({ separate: true });
+  node.addNewLoraWidget = () => {
+    const w = powerLoraRowWidget(`lora_${++node.loraWidgetsCounter}`);
+    delete w.showModelAndClip;
+    node.widgets.push(w);
+  };
+  createRgthreeLoraRow(node, "lora_1", {});
+  const row = node.widgets.find((w) => w.name === "lora_1");
+  assert.ok(!("showModelAndClip" in row), "no field was invented on a build that does not have one");
+});
+
+test("#757 an unreadable node leaves the row as the pack made it, without throwing", () => {
+  const node = powerLoraNode({ separate: true });
+  Object.defineProperty(node, "properties", {
+    get() {
+      throw new Error("properties is hostile");
+    },
+    configurable: true,
+  });
+  assert.doesNotThrow(() => createRgthreeLoraRow(node, "lora_1", {}));
+  assert.equal(node.widgets.find((w) => w.name === "lora_1").showModelAndClip, null, "left untouched");
+});
+
+test("#757 a throwing setDirty does not strand the row (round-7 P2)", () => {
+  // The repaint hint is cosmetic, exactly as the resize is. What must NOT happen is the
+  // creation failing after the row, the row NAME and the height are already committed, with
+  // the caller holding no handle to undo any of it.
+  const node = powerLoraNode({ separate: false });
+  const made = createRgthreeLoraRow(node, "lora_1", {
+    setDirty: () => {
+      throw new Error("setDirtyCanvas blew up");
+    },
+  });
+  assert.equal(made.created, "lora_1", "a cosmetic failure is not a gate");
+  assert.ok(node.widgets.some((w) => w.name === "lora_1"));
+});
+
+test("#757 anything else that throws in the tail rolls the creation back (round-7 P2)", () => {
+  // `remove` is only handed back at the END of the helper, and runSetWidget evaluates the whole
+  // preparation BEFORE entering the try that would clean up — so a throw in the tail had no
+  // undo available anywhere and stranded the row, its name and the grown height.
+  const node = powerLoraNode({ separate: true });
+  const sizeBefore = [...node.size];
+  node.addNewLoraWidget = () => {
+    const w = powerLoraRowWidget(`lora_${++node.loraWidgetsCounter}`);
+    Object.defineProperty(w, "showModelAndClip", {
+      get: () => null,
+      set: () => {
+        throw new Error("this widget refuses the mode");
+      },
+      configurable: true,
+    });
+    node.widgets.push(w);
+  };
+  assert.throws(() => createRgthreeLoraRow(node, "lora_1", {}), /refuses the mode/);
+  assert.ok(!node.widgets.some((w) => w.name === "lora_1"), "the row was taken back out");
+  assert.equal(node.loraWidgetsCounter, 0, "and the name it spent was returned");
+  assert.deepEqual([...node.size], sizeBefore, "and the height it grew was put back");
+});
+
+// ---------------------------------------------------------------------------
 // The panel wiring
 // ---------------------------------------------------------------------------
 
