@@ -198,3 +198,40 @@ test("user data in a summary is never mistaken for a placeholder", () => {
     'Set text = "a {node_id} b" on node 12',
   );
 });
+
+test("#1126: the summary discloses an unvalidated write, scoped to the widget it is about", () => {
+  // Driven through the REAL extracted describeCommand, not matched in source: a wiring scan
+  // cannot tell a live branch from a dead one, and this text is the only line most users
+  // read about a write nothing compared to anything.
+  __setCatalogForTest("en", {});
+  const plain = say("graph_set_widget", { set: { widget: "model", value: "x.fbx", node_id: 4, previous: "" } });
+  assert.equal(plain, 'Set model = "x.fbx" on node 4', "an ordinary write is unchanged");
+
+  const unread = say("graph_set_widget", {
+    option_list_unreadable: true,
+    set: { widget: "model", value: "F:/x.fbx", node_id: 4, previous: "" },
+  });
+  assert.match(unread, /^Set model = "F:\/x\.fbx" on node 4/);
+  assert.match(unread, /NOT validated/);
+  // Scoped: the claim is about THIS widget's own list, which is the only list that went
+  // unread. An unqualified "nothing checked the value" is false when a rail did.
+  assert.match(unread, /this combo's own option list could not be read/);
+});
+
+test("#1126: a value the parent RAIL validated is NOT reported as wholly unchecked", () => {
+  // The promoted case. The sibling cross-check compares the value against the rail's list
+  // and proceeds only on membership, so "nothing checked the value" would be false in
+  // precisely the case where the most checking happened.
+  __setCatalogForTest("en", {});
+  const railChecked = say("graph_set_widget", {
+    option_list_unreadable: true,
+    promoted_rail_validated: true,
+    set: { widget: "model_alias", value: "b.fbx", node_id: 320, previous: "" },
+  });
+  assert.match(railChecked, /^Set model_alias = "b\.fbx" on node 320/);
+  assert.match(railChecked, /this combo's own option list could not be read/);
+  assert.match(railChecked, /checked against the parent subgraph rail's list/);
+  // It must NOT keep asserting that nothing checked it.
+  assert.doesNotMatch(railChecked, /nothing checked the value/);
+  assert.doesNotMatch(railChecked, /NOT validated/);
+});

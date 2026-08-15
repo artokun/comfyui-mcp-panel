@@ -1184,6 +1184,10 @@ export function applyWidgetWrite(
   const innerObservation = emptyAccepted
     ? "the inner widget's option list is empty"
     : "the inner widget's option list could not be READ";
+  // #1126 — set when a mutated sibling's readable, non-empty list CONTAINS the value. Only
+  // meaningful on the unreadable path, where it narrows an otherwise-unqualified
+  // "nothing validated this" down to the truth.
+  let siblingValidated = false;
   if (emptyAccepted || unreadableAccepted) {
     let adoptedOption = false;
     // Each sibling's option list AS READ during admission. A STATEFUL non-function
@@ -1226,7 +1230,17 @@ export function applyWidgetWrite(
         snapshot = null;
       }
       siblingSnapshots.push({ name: other.name, options: snapshot });
-      if (otherOptions.includes(coerced)) continue;
+      if (otherOptions.includes(coerced)) {
+        // #1126 — a POSITIVE validation, recorded. This sibling's list WAS readable and
+        // WAS non-empty and DOES contain the value, so on the unreadable path the claim
+        // "nothing checked the value" stops being true: the target widget's own list could
+        // not be read, but the rail this write also mutates — the one that serializes at
+        // queue time — vouched for it. Reported as data so the reply and the activity
+        // summary can scope their disclosure to what was actually unchecked instead of
+        // asserting a blanket "unvalidated" the code itself contradicts.
+        siblingValidated = true;
+        continue;
+      }
       // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
       // a numeric request (4444) against a rail list holding the string "4444" must
       // not refuse an option the rail itself publishes. On a label match ADOPT the
@@ -1887,6 +1901,11 @@ export function applyWidgetWrite(
           // WHICH observation, verbatim from the read that decided it — so the reply
           // states the reason instead of a plausible-sounding default.
           option_list_unreadable_detail: coerceOutcome.unreadableObservation,
+          // #1126 — and whether a mutated sibling's real list nonetheless vouched for the
+          // value. Emitted only when it is TRUE, so a reader that does not know the field
+          // sees exactly what it saw before, and the disclosure never claims a check that
+          // did not happen. The cross-check above is what establishes it.
+          ...(siblingValidated ? { promoted_rail_validated: true } : {}),
         }
       : {}),
     ...(writeWarning

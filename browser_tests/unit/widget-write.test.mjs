@@ -3470,6 +3470,63 @@ test("#1126: the unreadable acceptance ARMS the rail cross-check but NEVER adopt
   assert.equal(out.value, "4444");
   assert.equal(rail2.value, "4444");
   assert.equal(inner2.widgets[0].value, "4444", "the caller's STRING, never a rail number");
+  // …and that IS a validation, so it must be reported as one. See the dedicated test below.
+  assert.equal(out.promoted_rail_validated, true);
+});
+
+test("#1126: a rail that VALIDATED the value is reported as having done so — the disclosure must not over-claim", () => {
+  // The write is disclosed as "unvalidated" because the TARGET widget's own list could not
+  // be read. On a promoted write that is only half the story: the sibling cross-check
+  // compares the value against the parent rail's list when that list is readable and
+  // non-empty, and proceeds ONLY on membership. So in exactly the case where the most
+  // checking happened, a flat "nothing checked the value" is false — and on a change whose
+  // entire value is telling the truth about what was and was not validated, an over-claimed
+  // disclosure is worse than a missing one.
+  const mkInner = () => {
+    const w = unreadableCombo("threw");
+    w.name = "model";
+    return { id: 301, type: "FbxRenderer", widgets: [w] };
+  };
+  const mkParent = (inner, rail) => ({
+    id: 320,
+    type: "SubgraphNode",
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [
+      { name: "model_alias", _widget: rail, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [rail],
+  });
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+
+  // Rail list READ, NON-EMPTY, CONTAINS the value ⇒ it validated it.
+  const innerA = mkInner();
+  const railA = { name: "model_alias", type: "combo", options: { values: ["a.fbx", "b.fbx"] }, value: "" };
+  const outA = applyWidgetWrite(mkParent(innerA, railA), "model_alias", "b.fbx", {
+    ...ACCEPT_UNREADABLE,
+    resolveSource,
+  });
+  assert.equal(outA.option_list_unreadable, true, "the target widget's own list still could not be read");
+  assert.equal(outA.promoted_rail_validated, true, "but the rail's list DID vouch for the value");
+
+  // Rail list EMPTY ⇒ skipped by the cross-check, so it vouched for nothing. The field must
+  // be ABSENT, not false: a reader that does not know it sees exactly what it saw before.
+  const innerB = mkInner();
+  const railB = { name: "model_alias", type: "combo", options: { values: [] }, value: "" };
+  const outB = applyWidgetWrite(mkParent(innerB, railB), "model_alias", "b.fbx", {
+    ...ACCEPT_UNREADABLE,
+    resolveSource,
+  });
+  assert.equal(outB.option_list_unreadable, true);
+  assert.equal(outB.promoted_rail_validated, undefined, "an empty rail list validates nothing");
+
+  // A DIRECT (non-promoted) write has no rail at all — nothing checked it, and the
+  // unqualified disclosure is the correct one.
+  const direct = { id: 4, type: "FbxRenderer", widgets: [unreadableCombo("threw")] };
+  direct.widgets[0].name = "model";
+  const outC = applyWidgetWrite(direct, "model", "x.fbx", ACCEPT_UNREADABLE);
+  assert.equal(outC.option_list_unreadable, true);
+  assert.equal(outC.promoted_rail_validated, undefined, "no rail exists, so none validated anything");
 });
 
 test("#1126: readComboOptions reports WHICH observation, and comboOptions is unchanged", () => {

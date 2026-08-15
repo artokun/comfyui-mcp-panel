@@ -1938,3 +1938,145 @@ test("#1126 e2e: the unreadable acceptance is the LAST resort — a refreshable 
   assert.equal(res.refreshed, true, "the authoritative retry is what accepted it");
   assert.equal(res.option_list_unreadable, undefined, "nothing went unvalidated");
 });
+
+// ── #1223 × #1126: the "server declares it empty" evidence must be LIVE ──────────────
+//
+// A cross-feature hole, opened by two changes that are each correct alone. #1223 (shipped
+// as v0.14.39) lets `getFreshObjectInfo` answer from the LAST-OBSERVED schema snapshot when
+// both live probes go silent. This fallback's second condition reads that answer as "the
+// SERVER declares this input's option list empty" — but a snapshot is what the server said
+// BEFORE it went quiet, retained across exactly the window in which nobody can re-fetch.
+// Options change without a reconnect (a model downloaded while this node's own callback
+// keeps failing), so a stale `[]` would newly authorize an unvalidated write.
+
+const snapshotOpts = (reg, extra = {}) => ({
+  registry: reg,
+  getRegistry: () => reg,
+  // The (stale) schema publishes NO list for this input — the shape that would authorize.
+  getFreshObjectInfo: async () => starObjectInfo([]),
+  wasTypeEverDefined: () => true,
+  refreshCombos: refreshFromServer,
+  ...HOOKS,
+  ...extra,
+});
+
+test("#1223 × #1126: a SNAPSHOT-sourced empty list does NOT authorize a blind write", async () => {
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      // The oracle fell back: this schema is the last-observed one, not the server now.
+      schemaFromSnapshot: () => true,
+    }),
+    (err) =>
+      /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\)/.test(err.message) &&
+      /LAST-OBSERVED schema snapshot/.test(err.message) &&
+      // It must name WHICH fact is missing. "Refresh and retry" is only actionable if the
+      // caller knows it is the SCHEMA, not their value, that could not be established.
+      /not from the server answering now/.test(err.message) &&
+      /Reconnect to ComfyUI/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — no mutation on stale evidence");
+});
+
+test("#1223 × #1126: the SAME call writes when the schema was fetched LIVE", async () => {
+  // The other half: this must fail closed on a snapshot WITHOUT disabling the fallback for
+  // the live case it exists to serve. Only the provenance differs between the two tests.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaFromSnapshot: () => false,
+  });
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true);
+});
+
+test("#1223 × #1126: UNKNOWN provenance fails closed — a throwing probe is not a live one", async () => {
+  // A provenance probe that throws has established nothing, and "nothing established" must
+  // not read as "live". The default (no probe wired at all) is the pre-#1223 world, where
+  // the oracle had no snapshot branch to take, so it stays permissive — that is the case
+  // every other test on this ladder exercises.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaFromSnapshot: () => {
+        throw new Error("provenance unknown");
+      },
+    }),
+    (err) => /LAST-OBSERVED schema snapshot/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation when provenance could not be established");
+});
+
+// ── #1126: a NESTED promotion is refused, not blind-written ──────────────────────────
+//
+// The rejection this fallback answers describes the IMMEDIATE promoted projection. On a
+// nested chain the value is driven on into a DEEPER concrete widget this path never read,
+// whose own client-populated list may be perfectly readable — so the premise "the valid set
+// is not knowable from here" is not established. Refusing is the deliberate choice over
+// validating the concrete widget: see the refusal's own comment for why.
+
+test("#1126: the unreadable fallback REFUSES a nested promotion rather than writing blind", async () => {
+  // outer SubgraphNode → intermediate SubgraphNode → concrete node. The widget the ladder
+  // reads is the intermediate's projection (unreadable); the concrete widget below it has a
+  // perfectly readable list that nothing on this path ever consulted.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  // Registered exactly as ComfyUI_frontend's registerSubgraphNodeDef builds them: the type
+  // is the subgraph's UUID (never in /object_info) and the class carries the synthesized
+  // nodeDef, so the #458/#512 authorization treats them as real containers rather than as
+  // an uninstalled pack.
+  const container = (uuid, id, widget, innerNode, innerId) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    reg[uuid] = ctor;
+    return {
+      id,
+      type: uuid,
+      constructor: ctor,
+      subgraph: { _nodes: [innerNode], getNodeById: (x) => (String(x) === innerId ? innerNode : null) },
+      inputs: [{ name: widget.name, _widget: widget, widget: { name: widget.name }, _subgraphSlot: { name: widget.name } }],
+      widgets: [widget],
+    };
+  };
+  const MID_UUID = "11111111-1111-4111-8111-111111111111";
+  const OUTER_UUID = "22222222-2222-4222-8222-222222222222";
+  const concreteWidget = { name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const concrete = {
+    id: 302,
+    type: "StarOllamaPromptHelper",
+    widgets: [concreteWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const midWidget = { name: "model_mid", type: "combo", options: { values: THROWS }, value: "" };
+  const mid = container(MID_UUID, 301, midWidget, concrete, "302");
+  const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
+  const outer = container(OUTER_UUID, 320, outerWidget, mid, "301");
+  const resolveSource = (_node, subgraphInput) => {
+    if (subgraphInput?.name === "model_alias") return { sourceNodeId: "301", sourceWidgetName: "model_mid" };
+    if (subgraphInput?.name === "model_mid") return { sourceNodeId: "302", sourceWidgetName: "model" };
+    return null;
+  };
+  await assert.rejects(
+    runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo([]),
+      // A virtual SubgraphNode's type is its subgraph UUID and is NEVER in /object_info by
+      // design, so it must not read as a since-REMOVED backend type (#458) — only the
+      // concrete node at the end of the chain was ever backend-defined.
+      wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+      resolveSource,
+      ...HOOKS,
+    }),
+    (err) =>
+      /panel_set_widget refused "model_alias" on node 320/.test(err.message) &&
+      /NESTED promotion/.test(err.message) &&
+      /may be readable/.test(err.message) &&
+      /panel_enter_subgraph/.test(err.message),
+  );
+  assert.equal(concreteWidget.value, "", "the concrete widget is untouched");
+  assert.equal(midWidget.value, "", "the intermediate projection is untouched");
+  assert.equal(outerWidget.value, "", "the outer rail is untouched");
+});

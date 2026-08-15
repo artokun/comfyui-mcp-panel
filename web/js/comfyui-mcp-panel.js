@@ -12150,6 +12150,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // While the history is NOT reliably seeded, FAIL CLOSED (treat every absent type as
       // ever-seen) so a failed/empty baseline never opens a hole (codex round-10).
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
+      // #1223 × #1126 — hand the lib the PROVENANCE of the schema it is about to reason
+      // from. A FUNCTION, because `getFreshObjectInfo` above has not run when this object is
+      // built: which branch answered is only known afterwards. Uses the same `!== null`
+      // convention as the `schema_source` disclosure at the end of this executor, so one
+      // variable stays the single source of truth for "authorized from the snapshot".
+      schemaFromSnapshot: () => setWidgetSchemaFromSnapshot !== null,
       resolveSource: sourceForSubgraphInput,
       canvas: app.canvas,
       beforeChange: () => graph.beforeChange(),
@@ -21755,6 +21761,14 @@ function describeCommand(cmd, msg, reply) {
       // would say the panel checked a value it never compared to anything. Read as DATA
       // (the field the lib sets on exactly that path), never pattern-matched from prose.
       const unvalidatedUnreadable = r.option_list_unreadable === true;
+      // …and whether the parent subgraph RAIL this promoted write also mutates validated it
+      // anyway. The cross-check in the lib compares the value against that rail's list when
+      // it is readable and non-empty, and proceeds only on membership — so the unqualified
+      // "nothing checked the value" was false in precisely the case where the most checking
+      // happened. Read as DATA the lib emits on that path; never inferred from the shape of
+      // the result. Given that this PR's whole value is telling the truth about what was and
+      // was not validated, an over-claimed disclosure is worse here than a missing one.
+      const railValidatedUnreadable = r.promoted_rail_validated === true;
       // One base clause for every variant, so a translated warning line can never drift
       // from the plain one — the disclosure is appended, exactly as the English did.
       const setLine = tr("panel.set_widget", "Set {widget} = {value} on node {node_id}", {
@@ -21781,10 +21795,15 @@ function describeCommand(cmd, msg, reply) {
             text:
               setLine +
               (unvalidatedUnreadable
-                ? tr(
-                    "panel.set_widget_option_list_unreadable",
-                    " — NOT validated: this combo's option list could not be read, so nothing checked the value",
-                  )
+                ? railValidatedUnreadable
+                  ? tr(
+                      "panel.set_widget_option_list_unreadable_rail_checked",
+                      " — this combo's own option list could not be read; the value was checked against the parent subgraph rail's list, which does contain it",
+                    )
+                  : tr(
+                      "panel.set_widget_option_list_unreadable",
+                      " — NOT validated: this combo's own option list could not be read, so nothing checked the value",
+                    )
                 : "") +
               (writeDisclosed
                 ? threwInNodeCallback

@@ -80,8 +80,37 @@ export async function runSetWidget(
     assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
+    // #1223 × #1126 — did `getFreshObjectInfo` answer from the LAST-OBSERVED schema
+    // snapshot rather than a live fetch? Read as a FUNCTION, at the moment of decision,
+    // because the answer is only known AFTER the oracle has run.
+    //
+    // Only the #1126 blind-write fallback consults it, and it must: that fallback's entire
+    // justification is "the SERVER authoritatively declares this input's option list empty",
+    // and a snapshot is not the server answering — it is the last thing the server said
+    // before it went quiet (#1223, v0.14.39). Options can change without a reconnect (models
+    // downloaded while the node's own live callback stays unreadable), and the snapshot is
+    // kept precisely across the window where nobody can re-fetch, so a stale `[]` would
+    // newly authorize an unvalidated write against a list that is no longer empty.
+    //
+    // Defaults to "not from a snapshot", matching the panel's own `=== null` convention for
+    // the live case and leaving every caller that never falls back behaving exactly as
+    // before. The panel threads the fact rather than letting this infer it: only the oracle
+    // knows which branch answered.
+    schemaFromSnapshot,
   } = {},
 ) {
+  // Never re-derived, and never cached: the oracle may not have run yet when this closure is
+  // built, and a caller that answers differently per call is answering about a different
+  // fetch. A non-function (or a throwing one) is read as UNKNOWN provenance, which fails
+  // CLOSED for the one branch that asks — an unknown answer must not license a blind write.
+  const schemaCameFromSnapshot = () => {
+    if (typeof schemaFromSnapshot !== "function") return false;
+    try {
+      return schemaFromSnapshot() === true;
+    } catch {
+      return true;
+    }
+  };
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
 
   // (0) FRESH-BACKEND TYPE AUTHORIZATION (#458 set_widget gap, found in review of
@@ -169,9 +198,16 @@ export async function runSetWidget(
   // name may differ from the concrete def's input name — this map bridges them (#458).
   const writeTargetWidgetName = isResolvedPromotion ? promotedResolution.target.widget?.name : undefined;
   let concreteWidgetName;
+  // #1126 — is the promotion NESTED (outer → intermediate subgraph → … → concrete), as
+  // opposed to a single hop straight to the concrete node? Keyed on exactly what
+  // followPromotionToConcrete's own `while (node && node.subgraph)` loop keys on, so the
+  // two can never disagree about whether the chain continues past the immediate target.
+  // Read only by the #1126 unreadable fallback; see its refusal for why it matters.
+  let nestedPromotion = false;
   if (promotedButUnresolvable) {
     authTarget = null;
   } else if (isResolvedPromotion) {
+    nestedPromotion = Boolean(promotedResolution.target?.node?.subgraph);
     const concrete = followPromotionToConcrete(promotedResolution.target, resolveSource);
     if (concrete.node && !concrete.node.subgraph && typeof concrete.node.type === "string") {
       // Reached a genuine concrete backend node WITH a real type string — authorize it.
@@ -682,6 +718,58 @@ export async function runSetWidget(
         concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
       )
     ) {
+      // #1223 × #1126 — condition 2 above says "the SERVER declares this input's list
+      // empty". A snapshot-sourced schema does not establish that: it is what the server
+      // said BEFORE it went silent, retained across exactly the window in which nobody can
+      // re-fetch. Options can change without a reconnect — a model downloaded while this
+      // node's own live callback keeps failing — and the stale `[]` would then authorize an
+      // unvalidated write against a list that is no longer empty. That is a NEW hole opened
+      // by the interaction of two changes that are each correct alone, so it is refused at
+      // the point where the two meet rather than by weakening either.
+      //
+      // Fails closed: no live declaration, no blind write. The user is told which of the two
+      // facts is missing, because "refresh and retry" is only actionable if they know the
+      // schema — not the value — is what could not be established.
+      if (schemaCameFromSnapshot()) {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} The panel could have written it unvalidated — this widget's ` +
+            `option list could not be READ, and that is normally enough when /object_info ` +
+            `also declares the input's list empty — but the live schema probe went silent, so ` +
+            `that "empty" came from the LAST-OBSERVED schema snapshot, not from the server ` +
+            `answering now (#1223). Options can change without a reconnect, so a stale empty ` +
+            `list is not evidence the valid set is unknowable. Reconnect to ComfyUI (or wait ` +
+            `for the backend to answer /object_info again) and retry.`,
+        );
+      }
+      // #1126 — a NESTED promotion is refused rather than blind-written, and this is the
+      // deliberate choice between the two defensible options.
+      //
+      // The rejection being answered describes the IMMEDIATE promoted projection. On a
+      // nested chain the value is ultimately driven into a DEEPER concrete widget that this
+      // path never read — and that widget's own client-populated list may be perfectly
+      // readable, in which case the fallback's premise ("the valid set is not knowable from
+      // here") is simply false and a live list was available all along.
+      //
+      // Refusing beats validating the concrete widget here. Validating it would mean running
+      // membership at another level on a last-resort path, against a dynamic source with the
+      // same never-read-twice and stateful-callback hazards the sibling cross-check already
+      // documents — new blind-write surface in the one place least able to carry it. A
+      // refusal is recoverable and names the shape; a wrong blind write into a nested chain
+      // lands on a serializing rail. The direct and single-hop promoted cases, where the
+      // widget that was read IS the one the value drives, are unaffected.
+      if (nestedPromotion) {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} This is a NESTED promotion — the value is driven through one ` +
+            `or more intermediate subgraphs to a deeper concrete widget — and the unreadable ` +
+            `list observed here belongs to the intermediate projection, not to that concrete ` +
+            `widget, whose own option list may be readable. The panel will not write a value ` +
+            `nothing validated through a chain it has not checked end to end (#1126). Set the ` +
+            `widget on the concrete node directly (panel_enter_subgraph to reach it), or fix ` +
+            `the node's option callback so the list can be read.`,
+        );
+      }
       let set;
       try {
         set = write({ acceptUnreadableComboOptions: true });
@@ -709,16 +797,31 @@ export async function runSetWidget(
         ...(set?.option_list_unreadable
           ? {
               option_list_unreadable: true,
+              ...(set.promoted_rail_validated ? { promoted_rail_validated: true } : {}),
+              // Scoped to the widget the claim is actually about. A promoted write also
+              // mutates the parent rail, and when that rail's list IS readable the sibling
+              // cross-check compares the value against it and only proceeds on membership —
+              // so a flat "nothing checked it" was false in exactly the case where the most
+              // checking happened. The two sentences are chosen by DATA the write emitted,
+              // never by re-deriving what the cross-check did.
               option_list_unreadable_note:
-                `Written WITHOUT validation because the option list could NOT BE READ — not ` +
-                `because the value was checked and passed. Observed on the widget: ` +
+                `Written WITHOUT validation against THIS widget's own option list, because that ` +
+                `list could NOT BE READ — not because the value was checked and passed. ` +
+                `Observed on the widget: ` +
                 `${set.option_list_unreadable_detail ?? "its option list could not be READ"}. ` +
                 `The server's own /object_info declares this input's option list EMPTY, so the ` +
-                `valid set is not knowable from the panel and nothing compared your value to ` +
-                `anything (#1126). If the node rejects it at runtime that is the node's answer, ` +
-                `not a panel refusal to retry around. The graph now holds a value no option list ` +
-                `vouches for, so a later reader — including the ComfyUI dropdown itself — may ` +
-                `show it as out-of-range.`,
+                `valid set is not knowable from the widget itself (#1126). ` +
+                (set.promoted_rail_validated
+                  ? `It was NOT written entirely unchecked: this promoted write also mutates the ` +
+                    `parent subgraph's rail widget, whose option list WAS readable and DOES ` +
+                    `contain this value — the write proceeded only because that list vouched for ` +
+                    `it. The rail is what serializes at queue time, so the value is a real option ` +
+                    `there. `
+                  : `Nothing compared your value to anything. `) +
+                `If the node rejects it at runtime that is the node's answer, not a panel ` +
+                `refusal to retry around. The graph now holds a value this widget's own option ` +
+                `list does not vouch for, so a later reader — including the ComfyUI dropdown ` +
+                `itself — may show it as out-of-range.`,
             }
           : {}),
       });
