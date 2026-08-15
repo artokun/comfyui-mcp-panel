@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.42] - 2026-08-15
+
+### Fixed
+- run-to-node is no longer permanently refused when an armed Seed (rgthree) substitutes its value at queue time — that substitution is not graph drift, and every retry used to fail identically (#1124)
+
+
 ## [0.14.41] - 2026-08-15
 
 ### Fixed
