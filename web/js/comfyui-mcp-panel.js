@@ -29048,7 +29048,23 @@ function buildPanel() {
     // or a fast re-render it is cannot be proven, and losing a render the user waited
     // for would be worse than an extra message. The console line makes the annotation
     // visible without the agent having to infer it.
-    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs, noMedia, duplicateOf, looksCached }) => {
+    // #1199 — `finishedAt` and `reconciled` MUST be destructured here. The tracker
+    // has always passed a finish time, and this closure has always dropped it on the
+    // floor, so the composer stamped its own clock — which is why a completion
+    // recovered from /history days later announced itself as having finished in the
+    // second it was delivered. Fixing the tracker alone changes nothing observable;
+    // the value has to be forwarded to reach the agent.
+    onFlush: ({
+      promptId,
+      images: flImages,
+      videos: flVideos,
+      durationMs,
+      noMedia,
+      duplicateOf,
+      looksCached,
+      finishedAt,
+      reconciled,
+    }) => {
       // #370: track whether the composed completion frame actually reached the
       // agent. sendFrame returns false when the bridge socket is down — in that
       // case the completion is LOST, so we re-pend the prompt (markUndelivered) so
@@ -29068,7 +29084,17 @@ function buildPanel() {
         // no image or video. Without it the composer returns null, the call site
         // below reads that as "empty batch ⇒ already delivered", and the agent that
         // panel_run told to end its turn and wait is never told anything.
-        { promptId, images: flImages, videos: flVideos, durationMs, noMedia, duplicateOf, looksCached },
+        {
+          promptId,
+          images: flImages,
+          videos: flVideos,
+          durationMs,
+          noMedia,
+          duplicateOf,
+          looksCached,
+          finishedAt,
+          reconciled,
+        },
         {
           sendFrame: (frame) => {
             const ok = client.sendFrame(frame);
