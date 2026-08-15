@@ -273,6 +273,39 @@ test("#1126 wiring: the activity summary DISCLOSES a write nothing validated", (
   assert.match(branch, /writeDisclosed \|\| unvalidatedUnreadable \? "pi-exclamation-triangle"/);
 });
 
+test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into runSetWidget", () => {
+  // The lib's blind-write fallback fails closed on a SNAPSHOT-sourced empty list, and
+  // node-resolve.test.mjs proves that behaviour by passing `schemaFromSnapshot` directly.
+  // But the lib can only know the provenance if the executor hands it over: which branch
+  // of `getFreshObjectInfo` answered is a fact ONLY the panel holds. Stub the wiring to a
+  // constant `false` and every behavioural test in this repo stays green while production
+  // authorizes blind writes from stale schemas again — a dead-code fix of exactly the kind
+  // this PR's own body warns about (#1223 v1, #757 v1). So it is asserted at the source,
+  // like the #718 fence above.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
+  assert.notEqual(start, -1, "graph_set_widget executor must exist");
+  const end = src.indexOf("\n  graph_set_node_property(", start);
+  assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
+  const body = src.slice(start, end);
+  // A FUNCTION, not a value: `getFreshObjectInfo` has not run when the options object is
+  // built, so which branch answered is only knowable afterwards. A snapshotted boolean
+  // would always read "live".
+  assert.match(
+    body,
+    /schemaFromSnapshot:\s*\(\)\s*=>\s*setWidgetSchemaFromSnapshot !== null/,
+    "the executor must thread the LIVE-vs-snapshot fact it holds, as a deferred read",
+  );
+  // …and it must be the SAME variable that drives the reply's own `schema_source`
+  // disclosure. Two independent sources for one fact can disagree, and then the reply says
+  // "last-observed" about a write the fallback authorized as live (or the reverse).
+  assert.match(
+    body,
+    /if \(setWidgetSchemaFromSnapshot !== null[\s\S]*schema_source: "last-observed"/,
+    "one variable must be the single source of truth for 'authorized from the snapshot'",
+  );
+});
+
 test("#458 set_widget: REMOVED type (stale registry positive, absent from fresh object_info) ⇒ FAIL CLOSED, no mutation", async () => {
   // GoneNode's pack was uninstalled + ComfyUI restarted WITHOUT a tab reload: the
   // registry still holds it (with a def) AND the instance is genuinely-resolved, so
