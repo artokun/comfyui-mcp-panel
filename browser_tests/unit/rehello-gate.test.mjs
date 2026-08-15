@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import {
   createRehelloGate,
   deferBudgetMs,
+  routeIsStale,
   HUMAN_PACED_COMMANDS,
   REHELLO_DEFER_MS,
   REHELLO_DEFER_HUMAN_MS,
@@ -279,6 +280,105 @@ test("#1095: cancel() DROPS the parked hello — it must not fire into a replace
   assert.equal(armed(), 0, "no timer may outlive the client");
   advance(REHELLO_DEFER_HUMAN_MS * 2);
   assert.deepEqual(sends, [], "and nothing fires later either");
+});
+
+// --- the outbound-frame leak (codex P1) ----------------------------------
+
+test("#1095 codex P1: the advertised route is STALE once the committed workflow moves past it", () => {
+  // onWorkflowMaybeChanged commits the new workflow inline while the hello is parked, so
+  // for the length of the deferral the panel is on B and the orchestrator's binding says A.
+  assert.equal(routeIsStale({ advertised: "tmp:A", live: "tmp:B", mapped: true }), true);
+  assert.equal(routeIsStale({ advertised: "tmp:A", live: "tmp:A", mapped: true }), false);
+
+  // Before a hello has LANDED on this socket there is no binding to disagree with, and the
+  // first hello is never deferred — so nothing may be held on that account.
+  assert.equal(routeIsStale({ advertised: "tmp:A", live: "tmp:B", mapped: false }), false);
+  assert.equal(routeIsStale({ advertised: null, live: "tmp:B", mapped: true }), false);
+
+  // FAILS OPEN on an unreadable id: an id we cannot read is not one we know to be
+  // different (the #607 fence's own rule). Treating it as stale would hold every frame for
+  // as long as it stayed unreadable, turning a leak into a mute panel.
+  assert.equal(routeIsStale({ advertised: "tmp:A", live: null, mapped: true }), false);
+  assert.equal(routeIsStale({ advertised: "tmp:A", live: "", mapped: true }), false);
+  assert.equal(routeIsStale({}), false);
+});
+
+test("#1095 codex P1: a held frame does not leave before the re-advertise lands", async () => {
+  // The leak: a user_message carries NO tab id, so the orchestrator routes it by the socket
+  // binding. Sent during the deferral it reaches the PREVIOUS workflow's agent — the user's
+  // text, context and images delivered into another canvas's conversation.
+  const order = [];
+  let resolveHello;
+  const gate = createRehelloGate({
+    advertise: () => {
+      order.push("hello");
+      return new Promise((r) => {
+        resolveHello = r;
+      });
+    },
+    now: () => 0,
+  });
+  gate.began("ask_user"); // a human-paced command is holding the route
+  const accepted = gate.sendAfterAdvertise(() => order.push("user_message"));
+  assert.equal(accepted, true, "the frame is accepted, not refused — it is queued, not dropped");
+  assert.deepEqual(order, ["hello"], "the hello is EXPEDITED, and the frame has not gone out");
+  assert.equal(gate.heldFrames(), 1);
+
+  resolveHello(true);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["hello", "user_message"], "the frame follows the hello, never precedes it");
+  assert.equal(gate.heldFrames(), 0);
+});
+
+test("#1095 codex P1: holding EXPEDITES the parked hello rather than waiting out the budget", () => {
+  // The trade, stated: the user has done something that requires the new route, and their
+  // action outranks an in-flight command's reply. A lost reply is OUTCOME UNKNOWN, which is
+  // honest and recoverable; a message delivered to the previous workflow's agent is not.
+  const { gate, sends } = harness();
+  gate.began("ask_user"); // 30s budget — the worst case for the leak
+  gate.request();
+  assert.deepEqual(sends, [], "parked, as the #1095 fix intends");
+  gate.sendAfterAdvertise(() => {});
+  assert.equal(sends.length, 1, "a frame that needs the new route forces the hello out now");
+});
+
+test("#1095 codex P1: held frames keep their order and drain as one batch", async () => {
+  const order = [];
+  let resolveHello;
+  const gate = createRehelloGate({
+    advertise: () => new Promise((r) => { resolveHello = r; }),
+    now: () => 0,
+  });
+  gate.began("graph_set_widget");
+  for (const n of [1, 2, 3]) gate.sendAfterAdvertise(() => order.push(n));
+  assert.equal(gate.heldFrames(), 3, "one queue, not one per frame");
+  resolveHello(true);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, [1, 2, 3], "frames on one socket are ordered; the hold must not reorder them");
+});
+
+test("#1095 codex P1: a FAILED re-advertise still drains the hold — a mute panel is worse", async () => {
+  const order = [];
+  const gate = createRehelloGate({
+    advertise: () => Promise.reject(new Error("hello failed")),
+    now: () => 0,
+  });
+  gate.began("graph_set_widget");
+  gate.sendAfterAdvertise(() => order.push("sent"));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["sent"], "a frame held forever would be a panel that silently stops talking");
+});
+
+test("#1095 codex P1: one frame's failure does not strand the rest of the batch", async () => {
+  const order = [];
+  const gate = createRehelloGate({ advertise: () => Promise.resolve(true), now: () => 0 });
+  gate.began("graph_set_widget");
+  gate.sendAfterAdvertise(() => {
+    throw new Error("this frame blew up");
+  });
+  gate.sendAfterAdvertise(() => order.push("second"));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(order, ["second"]);
 });
 
 // --- the gate's own failure modes ----------------------------------------

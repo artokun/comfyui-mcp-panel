@@ -103,6 +103,40 @@ export const REHELLO_DEFER_MS = 4000;
  *  is unknown, which is true, rather than being left with a tab nothing can reach. */
 export const REHELLO_DEFER_HUMAN_MS = 30000;
 
+/**
+ * #1095 — does this socket's ADVERTISED route still name the workflow the panel has
+ * already committed to?
+ *
+ * THIS IS THE PROPERTY THE DEFERRAL PUTS AT RISK, and it is separate from the deferral
+ * itself. `onWorkflowMaybeChanged` commits the new workflow inline (that is deliberate —
+ * see its own note), so between the commit and the parked hello landing, the panel believes
+ * it is on workflow B while the orchestrator still has this socket bound to A.
+ *
+ * A `user_message` frame carries NO tab id — only `sendFrame` stamps one — so the
+ * orchestrator can route it ONLY by the binding the socket already has. Sent in that window
+ * it is handled by the agent for the PREVIOUS workflow: the user's text, context and images
+ * for B delivered into A's conversation. That is a cross-workflow leak, not a lost route,
+ * and the human budget that `ask_user` earns is exactly the window that makes it worst.
+ *
+ * Kept pure, and separate from the gate, because it is a claim about two ids rather than
+ * about timing — so it can be driven directly rather than asserted about at the call site.
+ *
+ * FAILS OPEN on an unreadable id, deliberately. An id we cannot READ is not an id we know
+ * to be different (the same rule the #607 fence applies to its own identity). Treating
+ * unreadable as stale would hold every frame on this socket for as long as it stayed
+ * unreadable, which converts a leak into a mute panel.
+ *
+ * @param {{advertised: string|null, live: string|null, mapped: boolean}} state
+ *   `mapped` is whether a hello has actually LANDED on the current socket — before that
+ *   there is no binding to disagree with, and the first hello is never deferred.
+ */
+export function routeIsStale({ advertised, live, mapped } = {}) {
+  if (!mapped) return false;
+  if (typeof advertised !== "string" || !advertised) return false;
+  if (typeof live !== "string" || !live) return false;
+  return live !== advertised;
+}
+
 /** How long `cmd` may hold the route before a pending re-advertise stops waiting for it.
  *  An unknown or absent command name gets the machine budget: under-declaring only shortens
  *  the wait, while over-declaring would let any unrecognised frame pin the route for 30 s. */
@@ -167,6 +201,10 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   // identity, and one hello carrying the identity live at send time says exactly that.
   let waiters = null;
   let timer = null;
+  // Frames that must not leave before the route has been re-advertised (see `routeIsStale`).
+  // FIFO, and drained as one batch, because frames on a socket are ordered and holding some
+  // while letting others past would reorder a conversation.
+  const held = [];
 
   function disarmTimer() {
     if (timer === null) return;
@@ -302,9 +340,52 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       if (pending) for (const resolve of pending) resolve(false);
     },
 
+    /**
+     * #1095 — run `send` only once this socket's route has been (re)advertised.
+     *
+     * Used for outbound frames the orchestrator routes by the socket's BINDING rather than
+     * by a stamped tab id (see `routeIsStale`). The frame is not refused and not dropped: it
+     * is queued behind a hello that is EXPEDITED — the parked re-advertise goes out now
+     * rather than waiting out its budget.
+     *
+     * That expedite is the deliberate trade. The user has done something that requires the
+     * new route (typed, switched session, hit stop), and their action necessarily outranks
+     * an in-flight command's reply: losing that reply reports OUTCOME UNKNOWN, which is
+     * honest and recoverable, while delivering their message to the previous workflow's
+     * agent is silent and is not. The #1095 case this PR is actually about — an agent
+     * running a batch of mutations while nobody types — never reaches here at all.
+     *
+     * Ordering is preserved two ways: the hold is FIFO, and the whole batch runs after the
+     * SAME advertise settles, so nothing overtakes anything. A rejected advertise still
+     * drains — a frame held forever is a mute panel, which is worse than a frame sent on a
+     * route we could not confirm (the caller's own delivery timeout still covers it).
+     */
+    sendAfterAdvertise(send) {
+      if (typeof send !== "function") return false;
+      held.push(send);
+      if (held.length > 1) return true; // a drain is already scheduled for this batch
+      const drain = () => {
+        const batch = held.splice(0, held.length);
+        for (const fn of batch) {
+          try {
+            fn();
+          } catch {
+            // One frame's failure must not strand the rest of the batch.
+          }
+        }
+      };
+      Promise.resolve(flush()).then(drain, drain);
+      return true;
+    },
+
     /** Diagnostics/tests: whether a re-advertise is currently parked. */
     deferring() {
       return waiters !== null;
+    },
+
+    /** Diagnostics/tests: how many outbound frames are waiting on the route. */
+    heldFrames() {
+      return held.length;
     },
   };
 }

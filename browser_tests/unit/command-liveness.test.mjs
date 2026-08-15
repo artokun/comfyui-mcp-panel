@@ -43,6 +43,44 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 
+/**
+ * #1095 — the line numbers of every statement that can EXIT `root` between `from` and `to`
+ * without falling through to the reply.
+ *
+ * THE TRY BLOCK IS TRAVERSED, and the first cut of this scan did not traverse it. It
+ * returned at every TryStatement and examined only the catch and finally, so a `return`
+ * placed inside the marked executor's `try` — which skips the catch entirely, never reaches
+ * deliverReply, and leaks the in-flight mark — was invisible, and this test would have gone
+ * on passing. That is the same defect class as the counting version this scan replaced: an
+ * assertion that cannot observe the property it claims to check. The fixture test below
+ * drives exactly that shape.
+ *
+ * Only a CAUGHT `throw` is excluded, because the executor's catch is what turns a throw into
+ * a reply — that is the whole point of it. A `return` is never caught by anything, and a
+ * `throw` outside a try (or inside a catch/finally, which the enclosing try does not cover)
+ * escapes just the same.
+ */
+function escapingExits(sf, root, from, to) {
+  const escapes = [];
+  (function scan(node, caught) {
+    if (ts.isFunctionLike(node) && node !== root) return; // nested callbacks have their own exits
+    if (ts.isTryStatement(node)) {
+      ts.forEachChild(node.tryBlock, (child) => scan(child, caught || !!node.catchClause));
+      // A throw raised IN the handlers is not caught by this try — carry the outer state.
+      if (node.catchClause) ts.forEachChild(node.catchClause, (child) => scan(child, caught));
+      if (node.finallyBlock) ts.forEachChild(node.finallyBlock, (child) => scan(child, caught));
+      return;
+    }
+    const at = node.getStart(sf);
+    if (at > from && at < to) {
+      const escapesHere = ts.isReturnStatement(node) || (ts.isThrowStatement(node) && !caught);
+      if (escapesHere) escapes.push(sf.getLineAndCharacterOfPosition(at).line + 1);
+    }
+    ts.forEachChild(node, (child) => scan(child, caught));
+  })(root, false);
+  return escapes;
+}
+
 // --- honest cause reporting ----------------------------------------------
 
 test("#508: the cause is REPORTED, not guessed", () => {
@@ -669,24 +707,7 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
   assert.ok(incPos !== -1 && replyPos !== -1, "the branch must mark in flight and deliver a reply");
   assert.ok(incPos < replyPos, "the mark must precede the reply that releases it");
 
-  const escapes = [];
-  (function scan(n) {
-    if (ts.isFunctionLike(n) && n !== branch) return; // nested callbacks have their own exits
-    if (ts.isTryStatement(n)) {
-      // A throw inside `try` is caught and answered; only the handlers can truly exit.
-      if (n.catchClause) ts.forEachChild(n.catchClause, scan);
-      if (n.finallyBlock) ts.forEachChild(n.finallyBlock, scan);
-      return;
-    }
-    if (
-      (ts.isReturnStatement(n) || ts.isThrowStatement(n)) &&
-      n.getStart(sf) > incPos &&
-      n.getStart(sf) < replyPos
-    ) {
-      escapes.push(sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1);
-    }
-    ts.forEachChild(n, scan);
-  })(branch);
+  const escapes = escapingExits(sf, branch, incPos, replyPos);
   assert.deepEqual(
     escapes,
     [],
@@ -717,6 +738,126 @@ test("#1095: the in-flight mark is paired across the command branch", () => {
     src.slice(gStart, gEnd),
     /const refusalMark = rehelloGate\.began\(\);/,
     "the superseded refusal must balance the release its deliverReply performs",
+  );
+});
+
+test("#1095 codex P1: BOTH outbound send paths consult the advertised route first", () => {
+  // The leak this closes: onWorkflowMaybeChanged commits the new workflow inline, so while
+  // the hello is parked the panel is on B and the socket's binding still says A. A
+  // `user_message` carries NO tab id, so the orchestrator routes it by that binding — the
+  // user's text, context and images for B delivered into A's conversation.
+  //
+  // Structural because the claim is a CLOSURE one: every path that writes an agent-directed
+  // frame must pass the check. The check's own behaviour is driven in rehello-gate.test.mjs.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const sf = ts.createSourceFile(PANEL_JS, src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
+
+  const holdSites = [];
+  const staleReads = [];
+  (function walk(n) {
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "rehelloGate.sendAfterAdvertise") {
+      holdSites.push(n.getStart(sf));
+    }
+    if (ts.isCallExpression(n) && n.expression.getText(sf) === "advertisedRouteIsStale") {
+      staleReads.push(n.getStart(sf));
+    }
+    ts.forEachChild(n, walk);
+  })(sf);
+  assert.equal(holdSites.length, 2, "sendUserMessage and sendFrame must both be able to hold");
+  assert.equal(staleReads.length, 2, "…and each hold must be gated on the check");
+  assert.equal(
+    (src.match(/^\s*function advertisedRouteIsStale\(\) \{/gm) || []).length,
+    1,
+    "ONE definition of the check — a second copy is how two send paths drift apart",
+  );
+
+  // Each guard must sit INSIDE its send path, and the raw `sock.send` must be reachable only
+  // through the closure the guard chooses between — not left as a second, ungated exit.
+  for (const name of ["sendUserMessage", "sendFrame"]) {
+    const at = src.indexOf(`    ${name}(`);
+    assert.notEqual(at, -1, `could not locate ${name}`);
+    const end = src.indexOf("\n    },", at);
+    assert.notEqual(end, -1, `could not bound ${name}`);
+    const body = src.slice(at, end);
+    assert.match(
+      body,
+      /if \(advertisedRouteIsStale\(\)\) return rehelloGate\.sendAfterAdvertise\(send\);/,
+      `${name} must hold the frame when the advertised route is stale`,
+    );
+    const guardAt = body.indexOf("if (advertisedRouteIsStale())");
+    const plainAt = body.lastIndexOf("return send();");
+    assert.ok(guardAt !== -1 && plainAt > guardAt, `${name} must only send directly AFTER the guard`);
+    // The frame must be built ONCE, before the branch, so a held frame is byte-identical to
+    // the one that would have gone out immediately — same context, same disclosure decision.
+    const buildAt = body.indexOf("const send = () => {");
+    assert.ok(buildAt !== -1 && buildAt < guardAt, `${name} must build the frame before deciding`);
+  }
+
+  // The comparison must be against what the hello ACTUALLY carried, recorded on the landed
+  // path only — the same rule as lastAdvertisedWorkflowUuid and advertisedSock beside it.
+  const advBody = src.slice(src.indexOf("function advertiseHello() {"));
+  const sentAt = advBody.indexOf("if (sent) {");
+  const recordAt = advBody.indexOf("lastAdvertisedRouteId = advertisedRouteId;");
+  assert.ok(sentAt !== -1 && recordAt !== -1 && recordAt > sentAt, "the route is recorded only once a hello LANDED");
+});
+
+test("#1095 codex P2: the reachability scan SEES a return inside the marked try", () => {
+  // The scan is the only thing standing between a refactor and a silently leaked mark, so
+  // it is itself driven against fixtures rather than trusted. The first cut skipped every
+  // TryStatement's body outright, which made case (b) below invisible — a test that could
+  // not fail on the defect it exists to catch.
+  const build = (body) => {
+    const source = `async function h(){ if (isCommandFrame) { ${body} } }`;
+    const sf = ts.createSourceFile("fixture.js", source, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
+    let branch = null;
+    let from = -1;
+    let to = -1;
+    (function walk(n) {
+      if (ts.isIfStatement(n) && n.expression.getText(sf) === "isCommandFrame") branch = n;
+      if (ts.isCallExpression(n) && n.expression.getText(sf) === "rehelloGate.began") from = n.getStart(sf);
+      if (ts.isCallExpression(n) && n.expression.getText(sf) === "deliverReply") to = n.getStart(sf);
+      ts.forEachChild(n, walk);
+    })(sf);
+    assert.ok(branch && from !== -1 && to !== -1, "fixture must mark and reply");
+    return escapingExits(sf, branch, from, to);
+  };
+
+  // (a) the shape the panel actually has — a throw inside the try is CAUGHT and answered,
+  // so it is not an escape.
+  assert.deepEqual(
+    build(`rehelloGate.began(c); try { if (x) throw new Error("boom"); r = await run(); } catch (e) { r = err(e); } deliverReply(r);`),
+    [],
+    "a caught throw is turned into a reply — the catch is what makes it safe",
+  );
+
+  // (b) THE DEFECT. A return inside the try skips the catch, never reaches deliverReply,
+  // and leaks the mark. The old scan reported nothing here.
+  assert.deepEqual(
+    build(`rehelloGate.began(c); try { if (x) return; r = await run(); } catch (e) { r = err(e); } deliverReply(r);`),
+    [1],
+    "a return inside the marked try must be reported as a leaking exit",
+  );
+
+  // (c) a throw in the CATCH is not covered by its own try, so it escapes too.
+  assert.deepEqual(
+    build(`rehelloGate.began(c); try { r = await run(); } catch (e) { throw e; } deliverReply(r);`),
+    [1],
+    "a rethrow from the handler escapes the branch just like a bare throw",
+  );
+
+  // (d) an exit AFTER the reply is not this invariant's business — the mark is already
+  // released by then.
+  assert.deepEqual(
+    build(`rehelloGate.began(c); deliverReply(r); if (superseded) return;`),
+    [],
+    "the window ends at the reply",
+  );
+
+  // (e) a nested callback has its own exits and must not be attributed to the branch.
+  assert.deepEqual(
+    build(`rehelloGate.began(c); items.forEach((i) => { if (i) return; }); deliverReply(r);`),
+    [],
+    "a return that leaves only an inner function is not a branch exit",
   );
 });
 

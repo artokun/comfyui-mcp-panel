@@ -511,7 +511,7 @@ import {
   buildHelloPayload,
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
-import { createRehelloGate } from "./lib/rehello-gate.js";
+import { createRehelloGate, routeIsStale } from "./lib/rehello-gate.js";
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
 import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
@@ -18360,6 +18360,26 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // all, which is strictly worse than the race. Every other caller (#654's refused-route
   // retry included) is a re-advertise by definition and passes through the gate.
   let advertisedSock = null;
+  // #1095 — the route id the last LANDED hello actually carried. Compared against the live
+  // `bridgeRouteId()` to tell whether the orchestrator's binding still names the workflow
+  // the panel has already committed to; see routeIsStale in lib/rehello-gate.js for why
+  // that gap exists at all and what leaks through it.
+  let lastAdvertisedRouteId = null;
+
+  /** #1095 — is this socket's binding out of date with the committed workflow? */
+  function advertisedRouteIsStale() {
+    let live = null;
+    try {
+      live = bridgeRouteId();
+    } catch {
+      live = null; // unreadable ⇒ not provably different; routeIsStale fails open
+    }
+    return routeIsStale({
+      advertised: lastAdvertisedRouteId,
+      live,
+      mapped: !!sock && sock === advertisedSock,
+    });
+  }
   function markConnected() {
     handshakeDone = true;
     handshakenSock = sock;
@@ -19565,6 +19585,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // `lastAdvertisedWorkflowUuid` only on the success path below: the #607
     // budget counts what reached the orchestrator, not what we meant to send.
     let advertisedWorkflowUuid = null;
+    // #1095 — likewise for the ROUTE id this hello carries. Read where the payload is built
+    // (bridgeRouteId() is derived from the LIVE active workflow, so it moves under us) and
+    // published only on the landed path below, for the same reason as the uuid: a hello that
+    // never reached the orchestrator advertised no route.
+    let advertisedRouteId = null;
     return sendBridgeHello({
       socket: target,
       isCurrent: () => sock === target && target.readyState === WebSocket.OPEN,
@@ -19590,6 +19615,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         scheduleRouteRefusalRetry();
         return null;
       }
+      // #1095 — recorded only past the refusal, so `advertisedRouteId` is never a route the
+      // hello declined to carry. It is published to `lastAdvertisedRouteId` only once the
+      // send has landed, which is the same "nothing is recorded before it is true" rule the
+      // adopt above and the epoch bump below both follow.
+      advertisedRouteId = routeId;
       // Carry the last session id so the orchestrator resumes the agent's
       // memory after a panel reload (only honored before the tab's agent spawns).
       const resume = getResume?.();
@@ -19666,6 +19696,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // established nothing, and arming the gate on it would defer the retry that
           // could actually register this tab.
           advertisedSock = target;
+          // …and THIS is the binding the orchestrator now holds for this socket. Outbound
+          // frames it routes by binding are compared against it (advertisedRouteIsStale).
+          lastAdvertisedRouteId = advertisedRouteId;
           // #654 — registration succeeded: the refused-hello retry budget is
           // replenished and any pending retry is moot.
           routeRefusalRetries = 0;
@@ -19881,6 +19914,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       });
       const disclosed = disclosure.disclose && typeof text === "string";
       const outText = disclosed ? CANVAS_TOOL_DISCLOSURE + text : text;
+      // #1095 — the frame is BUILT now and SENT possibly a moment later, so everything the
+      // send consumes (the merged context, the disclosure decision, the epoch stamps) is
+      // captured here, at the instant the user pressed send. A held frame is therefore
+      // byte-identical to the one that would have gone out immediately.
+      const send = () => {
       try {
         sock.send(
           JSON.stringify({
@@ -19910,6 +19948,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       } catch {
         return false;
       }
+      };
+      // #1095 P1 — a `user_message` carries NO tab id, so the orchestrator routes it by the
+      // binding this socket already has. Sent while a re-advertise is still parked, the
+      // user's text, context and images for the workflow they are LOOKING AT are delivered
+      // to the agent for the previous one. Hold it behind the hello instead; the hold
+      // expedites that hello, so the wait is the hello's own round trip rather than the
+      // deferral budget. See routeIsStale in lib/rehello-gate.js.
+      if (advertisedRouteIsStale()) return rehelloGate.sendAfterAdvertise(send);
+      return send();
     },
     /** Send an arbitrary control frame (set_options, new_session, …). */
     sendFrame(frame) {
@@ -19930,6 +19977,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // #640 — refuse rather than emit a frame with no established route.
       const routeId = bridgeRouteId();
       if (!routeId) return false;
+      // #1095 — `frame` is captured, not copied into a new name: the mute/blind gate above
+      // has already finished rewriting it, and every assertion about this send is written
+      // against `...frame`. The closure only moves WHEN it runs, never WHAT it sends.
+      const send = () => {
       try {
         sock.send(JSON.stringify({ tab_id: routeId, ...frame }));
         // #291 — `new_session` / `resume_session` hand the next turn to a different
@@ -19943,6 +19994,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       } catch {
         return false;
       }
+      };
+      // #1095 P1 — a control frame DOES carry a tab id, and `routeId` above is derived from
+      // the LIVE active workflow — so during a deferral it names a route the orchestrator
+      // has not been told about yet. `new_session` / `resume_session` in particular hand the
+      // next turn to a different agent over this socket, and doing that against a binding
+      // that is about to be replaced is how a conversation ends up attached to the wrong
+      // canvas. Held for the same reason, and in the SAME queue as user_message so the two
+      // cannot overtake each other — frames on one socket are ordered, and a hold that
+      // reordered them would trade a routing bug for a conversation bug.
+      if (advertisedRouteIsStale()) return rehelloGate.sendAfterAdvertise(send);
+      return send();
     },
     /** Run a whitelisted backend tool directly (no agent turn), cid-correlated.
      *  Resolves { ok, result, error } where result is the MCP content array
