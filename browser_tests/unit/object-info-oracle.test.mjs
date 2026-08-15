@@ -161,7 +161,20 @@ test("#982 source guard: the refusal states an observation, and the panel wires 
     "and can report what failed",
   );
   // The burst cache still wraps it: two transports must not become two fetches per write.
-  assert.match(panel, /await objectInfoCache\.read\(async \(\) => \{/, "still read through the #716 cache");
+  // Either entry point satisfies that — #1126 added `readWithProvenance` so the cache can
+  // also report whether the answer it served is LIVE, and the set_widget/remove_widget routes
+  // take that form. What this asserts is the property the issue cares about: the oracle is
+  // reached THROUGH the cache, never called directly.
+  assert.match(
+    panel,
+    /await objectInfoCache\.read(WithProvenance)?\(\s*async \(\) =>/,
+    "still read through the #716 cache",
+  );
+  assert.doesNotMatch(
+    panel,
+    /^\s*const outcome = await fetchWholeObjectInfo\(/m,
+    "and never around it",
+  );
 });
 
 test("#982 (codex) the fallback is consulted ONLY when the client returned nothing usable", () => {

@@ -70,9 +70,15 @@ function describeThrown(err) {
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message, { combo = false, emptyOptions = false, unreadableOptions = false } = {}) {
+  constructor(message, { combo = false, emptyOptions = false, unreadableOptions = false, partialWrite = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // #1126 — the graph WAS MUTATED and the rollback did not fully take. Every other
+    // WidgetWriteError is a pre-mutation refusal: nothing was applied, and a caller may
+    // safely reword it as "refused". This one must never be reworded that way, because
+    // telling a caller "nothing was applied" when something was is precisely the class of
+    // false report this change exists to eliminate. Callers that frame refusals check it.
+    this.partialWrite = partialWrite;
     // #1126 — `unreadableOptions` narrows `combo` to the OTHER unknowable case: the
     // option list could not be READ AT ALL, because `options.values` is a callback that
     // threw, returned a non-list, or is absent. That is an OBSERVATION about the LIST,
@@ -1875,6 +1881,10 @@ export function applyWidgetWrite(
         `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) write failed: ${failure} ` +
           `Rollback of ${rollbackFailed} did not take effect (a value setter or history hook ` +
           `rejected/overrode it) — the graph may be in a partial state; re-set the widget or undo.`,
+        // The one WidgetWriteError raised AFTER the graph was mutated and NOT cleanly
+        // restored. Marked so no caller can reword it into a "refused, nothing applied"
+        // frame — see the flag's declaration.
+        { partialWrite: true },
       );
     }
     // Rollback succeeded: preserve the original WidgetWriteError message where there

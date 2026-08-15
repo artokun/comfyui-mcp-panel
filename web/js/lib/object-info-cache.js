@@ -83,80 +83,154 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
   // rather than merely forgetting the value it will produce.
   let generation = 0;
 
+  /**
+   * Read through the cache AND classify the answer's provenance.
+   *
+   * WHY THIS LIVES HERE. Callers used to reconstruct "is this answer live" from the outside,
+   * by observing whether their loader body had run. That proxy is not the question, and it
+   * was wrong in three separate ways discovered one round at a time (#1126): a cache hit, a
+   * response the backend reconnected underneath, and a response an `invalidate()` retired
+   * mid-flight all ran the loader — or didn't — without the caller being able to tell. Each
+   * fix bolted another condition onto a classifier the caller had to keep in sync with this
+   * file's internals.
+   *
+   * So this file answers it instead, because it is the only thing that knows: it owns the
+   * generation counter whose entire purpose is retiring in-flight requests, it decides
+   * whether a read is served, joined, or issued, and it can compare the caller's own
+   * issuance stamp across the await. A retirement mechanism added here in future is
+   * classified here too, rather than silently reading as "live" at every call site.
+   *
+   * @param {() => Promise<any>} fetchDefs the real fetch
+   * @param {{stamp?: () => unknown}} [opts] `stamp` is an opaque caller-owned token read at
+   *   ISSUANCE and again at delivery — the panel passes its backend-reconnect epoch. This
+   *   file never interprets it; it only reports whether it moved. Kept opaque on purpose:
+   *   the cache has no business knowing what a reconnect IS, only that the caller has a
+   *   fact that must not have changed underneath the request.
+   * @returns {Promise<{value: any, provenance: "live"|"cache"|"reconnected"|"retired"|"unknown"}>}
+   */
+  async function readInternal(fetchDefs, stamp) {
+    const readStamp = typeof stamp === "function" ? stamp : null;
+    // SERVED from the stored payload: nobody asked the server during this call.
+    if (value !== null && now() - at < ttlMs) return { value, provenance: "cache" };
+    // Join a concurrent miss — but ONLY one issued under the current generation. Without
+    // that check an invalidation could be overtaken by the very request it was meant to
+    // retire. Coalescing matters: a burst arriving faster than the fetch completes would
+    // otherwise still issue one request per caller, which is the reported symptom moved.
+    //
+    // A JOINED read is "cache" for the same reason a served one is: this call did not issue
+    // the request, so it cannot vouch for when it was issued or for what has happened since.
+    if (inflight && inflightGeneration === generation) return { value: await inflight, provenance: "cache" };
+    const issuedAt = generation;
+    // Captured AT ISSUANCE, exactly like `issuedAt` above and for exactly the same reason.
+    // A stamp that THROWS establishes nothing, and nothing established must not be allowed
+    // to read as "live" — so it degrades to "unknown", which every caller must fail closed on.
+    let issuedStamp = null;
+    let stampUnreadable = false;
+    if (readStamp) {
+      try {
+        issuedStamp = readStamp();
+      } catch {
+        stampUnreadable = true;
+      }
+    }
+    // An id captured BEFORE the promise exists, because `finally` must not name the
+    // binding it is being assigned to: a fetchDefs() that throws SYNCHRONOUSLY runs the
+    // finally before that assignment completes, and comparing against `request` there
+    // raised a temporal-dead-zone ReferenceError that REPLACED the real error (codex).
+    // It failed closed, but it lied about why.
+    const requestId = ++requestSeq;
+    const request = (async () => {
+      // YIELD FIRST, and this is load-bearing rather than stylistic. A `fetchDefs()` that
+      // throws SYNCHRONOUSLY would otherwise run the whole try/finally during this IIFE's
+      // initial synchronous execution — before the slot below is assigned. The finally
+      // would then fail to release a slot that had not been taken yet, and the rejected
+      // promise would be attached immediately afterwards, so every later read in this
+      // generation would join a permanently rejected request. One microtask makes the
+      // ordering unconditional.
+      await null;
+      try {
+        const defs = await fetchDefs();
+        // Store only a USABLE payload from a still-current generation. Caching a
+        // null/empty would pin the fence's fail-closed state for the whole TTL, turning
+        // one transient failure into a second and a half of refused writes.
+        // #982 — the loader may return either the schema map itself or an OUTCOME
+        // wrapper `{ defs, failures }`, so a caller that JOINS an in-flight failed
+        // read still receives the diagnostics of the attempt that actually ran. The
+        // usability test therefore looks at the payload the fence will rule on, not at
+        // the wrapper around it — a wrapper carrying `defs: null` has two keys and
+        // would otherwise be cached as a success, pinning fail-closed for the TTL,
+        // which is exactly what this file exists to prevent (codex).
+        const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
+        if (
+          issuedAt === generation &&
+          payload &&
+          typeof payload === "object" &&
+          Object.keys(payload).length > 0
+        ) {
+          // SHARED IDENTITY IS NEW (codex): every write used to get its own object, and
+          // now they share one. A consumer that mutated the map would contaminate every
+          // later authorization instead of only its own call. Freezing the TOP LEVEL —
+          // the level the fence's `hasOwnProperty(defs, type)` reads — makes adding or
+          // removing a type key throw here and now, in a test or a dev console, rather
+          // than silently authorizing a type nobody installed. Shallow on purpose: a
+          // deep freeze of a 5MB schema on every fetch would cost more than the fetch
+          // this exists to avoid, and per-class contents are not what the fence rules on.
+          value = Object.freeze(defs);
+          at = now();
+        }
+        return defs;
+      } finally {
+        // Release the slot only if it is still ours — a newer generation may have started
+        // its own request while this one was in flight.
+        if (inflightId === requestId) {
+          inflight = null;
+          inflightGeneration = -1;
+          inflightId = 0;
+        }
+      }
+    })();
+    inflight = request;
+    inflightGeneration = issuedAt;
+    inflightId = requestId;
+    // Classified only AFTER the request settles, because everything that can retire it
+    // happens while it is in flight. A rejection propagates unchanged — an error has no
+    // provenance to report and the caller must see the error, not a verdict about it.
+    const resolved = await request;
+    let currentStamp = null;
+    if (readStamp && !stampUnreadable) {
+      try {
+        currentStamp = readStamp();
+      } catch {
+        stampUnreadable = true;
+      }
+    }
+    // Order matters. A reconnect is the more specific and more actionable event — the
+    // backend PROCESS was replaced, which is the one thing that changes what the server
+    // publishes — and it can also have bumped the generation on its way through, so it is
+    // reported in preference to the generic retirement it may have caused.
+    const provenance = stampUnreadable
+      ? "unknown"
+      : readStamp && currentStamp !== issuedStamp
+        ? "reconnected"
+        : issuedAt !== generation
+          ? "retired"
+          : "live";
+    return { value: resolved, provenance };
+  }
+
   return {
     /**
-     * Read through the cache.
+     * Read through the cache. Unchanged contract: the payload only.
      *
      * @param {() => Promise<any>} fetchDefs the real fetch
      */
     async read(fetchDefs) {
-      if (value !== null && now() - at < ttlMs) return value;
-      // Join a concurrent miss — but ONLY one issued under the current generation. Without
-      // that check an invalidation could be overtaken by the very request it was meant to
-      // retire. Coalescing matters: a burst arriving faster than the fetch completes would
-      // otherwise still issue one request per caller, which is the reported symptom moved.
-      if (inflight && inflightGeneration === generation) return inflight;
-      const issuedAt = generation;
-      // An id captured BEFORE the promise exists, because `finally` must not name the
-      // binding it is being assigned to: a fetchDefs() that throws SYNCHRONOUSLY runs the
-      // finally before that assignment completes, and comparing against `request` there
-      // raised a temporal-dead-zone ReferenceError that REPLACED the real error (codex).
-      // It failed closed, but it lied about why.
-      const requestId = ++requestSeq;
-      const request = (async () => {
-        // YIELD FIRST, and this is load-bearing rather than stylistic. A `fetchDefs()` that
-        // throws SYNCHRONOUSLY would otherwise run the whole try/finally during this IIFE's
-        // initial synchronous execution — before the slot below is assigned. The finally
-        // would then fail to release a slot that had not been taken yet, and the rejected
-        // promise would be attached immediately afterwards, so every later read in this
-        // generation would join a permanently rejected request. One microtask makes the
-        // ordering unconditional.
-        await null;
-        try {
-          const defs = await fetchDefs();
-          // Store only a USABLE payload from a still-current generation. Caching a
-          // null/empty would pin the fence's fail-closed state for the whole TTL, turning
-          // one transient failure into a second and a half of refused writes.
-          // #982 — the loader may return either the schema map itself or an OUTCOME
-          // wrapper `{ defs, failures }`, so a caller that JOINS an in-flight failed
-          // read still receives the diagnostics of the attempt that actually ran. The
-          // usability test therefore looks at the payload the fence will rule on, not at
-          // the wrapper around it — a wrapper carrying `defs: null` has two keys and
-          // would otherwise be cached as a success, pinning fail-closed for the TTL,
-          // which is exactly what this file exists to prevent (codex).
-          const payload = defs && typeof defs === "object" && defs[CACHE_OUTCOME] === true ? defs.defs : defs;
-          if (
-            issuedAt === generation &&
-            payload &&
-            typeof payload === "object" &&
-            Object.keys(payload).length > 0
-          ) {
-            // SHARED IDENTITY IS NEW (codex): every write used to get its own object, and
-            // now they share one. A consumer that mutated the map would contaminate every
-            // later authorization instead of only its own call. Freezing the TOP LEVEL —
-            // the level the fence's `hasOwnProperty(defs, type)` reads — makes adding or
-            // removing a type key throw here and now, in a test or a dev console, rather
-            // than silently authorizing a type nobody installed. Shallow on purpose: a
-            // deep freeze of a 5MB schema on every fetch would cost more than the fetch
-            // this exists to avoid, and per-class contents are not what the fence rules on.
-            value = Object.freeze(defs);
-            at = now();
-          }
-          return defs;
-        } finally {
-          // Release the slot only if it is still ours — a newer generation may have started
-          // its own request while this one was in flight.
-          if (inflightId === requestId) {
-            inflight = null;
-            inflightGeneration = -1;
-            inflightId = 0;
-          }
-        }
-      })();
-      inflight = request;
-      inflightGeneration = issuedAt;
-      inflightId = requestId;
-      return request;
+      return (await readInternal(fetchDefs, null)).value;
+    },
+
+    /** Read through the cache and get this file's own verdict on the answer. See above. */
+    async readWithProvenance(fetchDefs, { stamp } = {}) {
+      return readInternal(fetchDefs, stamp);
     },
 
     /**

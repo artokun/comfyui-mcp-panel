@@ -217,6 +217,127 @@ test("#716: a SYNCHRONOUSLY throwing fetch reports its own error and unblocks th
   assert.equal(cache.peek().cached, true);
 });
 
+// ── #1126: this file answers "is this response LIVE", because it is the only thing that ──
+// can. Callers used to reconstruct it from whether their loader body had run, and four
+// review rounds each found another way that proxy was wrong: a served cache hit, a joined
+// read, a reconnect landing mid-flight, and an invalidate() retiring the request. All four
+// are decided here, from state this file owns.
+
+const prov = async (cache, fetchDefs, opts) => (await cache.readWithProvenance(fetchDefs, opts)).provenance;
+
+test("#1126: an ISSUED request that nothing retired is live", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  const got = await cache.readWithProvenance(async () => DEFS, { stamp: () => 3 });
+  assert.deepEqual(got, { value: DEFS, provenance: "live" });
+});
+
+test("#1126: a SERVED cache hit and a JOINED read are both 'cache' — neither asked the server", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  assert.equal(await prov(cache, async () => DEFS), "live", "the first read issues");
+  // Served from the stored payload, still inside the TTL.
+  assert.equal(await prov(cache, async () => DEFS), "cache", "the second is served");
+
+  // …and a JOINED read: it never runs its own loader, so it cannot vouch for when the
+  // request it is riding on was issued.
+  const c2 = clock();
+  const cache2 = createObjectInfoCache({ now: c2.now });
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const first = cache2.readWithProvenance(async () => {
+    await gate;
+    return DEFS;
+  });
+  const joined = cache2.readWithProvenance(async () => {
+    throw new Error("a joined read must never run its own loader");
+  });
+  release();
+  assert.equal((await first).provenance, "live");
+  assert.equal((await joined).provenance, "cache", "riding another call's request is not asking");
+});
+
+test("#1126: an invalidate() DURING the request retires it — 'retired', not live", async () => {
+  // The fourth way, and the one a healthy backend hits most: registerComfyNodeDefs drops
+  // this cache on a refresh, a pack install, or a download completing. The generation moves
+  // WITHOUT the reconnect epoch moving, so an epoch test alone still calls this live — while
+  // the very refresh that retired the response may be what filled the option list.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const pending = cache.readWithProvenance(
+    async () => {
+      await gate;
+      return DEFS;
+    },
+    { stamp: () => 5 }, // the epoch never moves — only the generation does
+  );
+  cache.invalidate();
+  release();
+  const got = await pending;
+  assert.equal(got.value, DEFS, "the original waiter still gets its answer, as this file promises");
+  assert.equal(got.provenance, "retired", "…but it is not evidence of what the server publishes now");
+});
+
+test("#1126: a stamp that MOVES mid-flight is 'reconnected', and outranks a retirement", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  let epoch = 1;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const pending = cache.readWithProvenance(
+    async () => {
+      await gate;
+      return DEFS;
+    },
+    { stamp: () => epoch },
+  );
+  epoch = 2;
+  // A reconnect typically ALSO drops the cache. The more specific cause is reported, because
+  // "the backend process was replaced" and "the panel refreshed the defs" need different advice.
+  cache.invalidate();
+  release();
+  assert.equal((await pending).provenance, "reconnected");
+});
+
+test("#1126: a THROWING stamp establishes nothing — 'unknown', never live", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  const got = await cache.readWithProvenance(async () => DEFS, {
+    stamp: () => {
+      throw new Error("epoch unreadable");
+    },
+  });
+  assert.equal(got.value, DEFS);
+  assert.equal(got.provenance, "unknown", "nothing established must not read as the server answering");
+});
+
+test("#1126: read() keeps its old contract — the payload, nothing else", async () => {
+  // Every other consumer of this cache is untouched by the provenance work.
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  assert.equal(await cache.read(async () => DEFS), DEFS);
+  // A FRESH cache: the one above now holds DEFS, so a second read would be served and the
+  // loader below would never run — which is the cache working, not the contract under test.
+  const c2 = clock();
+  const failing = createObjectInfoCache({ now: c2.now });
+  await assert.rejects(
+    failing.read(async () => {
+      throw new Error("boom");
+    }),
+    /boom/,
+    "a rejection still propagates as itself, not as a verdict about itself",
+  );
+  // …and the same for the provenance form: an error has no provenance to report.
+  await assert.rejects(
+    failing.readWithProvenance(async () => {
+      throw new Error("bang");
+    }),
+    /bang/,
+  );
+});
+
 test("#716: a retired request cannot overwrite a newer value — deterministically", async () => {
   // codex asked for this as an explicit schedule rather than relying on a hanging test:
   // old request starts, invalidate, new request starts and succeeds, THEN the old one

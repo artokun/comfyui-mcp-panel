@@ -2054,6 +2054,86 @@ test("#1126: a RECONNECT-SPANNING response is not live — the replaced process 
   assert.equal(widget.value, "", "fails closed — the answer describes a process that is gone");
 });
 
+test("#1126: a RETIRED response is not live — the panel's own refresh superseded it", async () => {
+  // The fourth way a response turned out not to be live, and the one a healthy backend hits
+  // most: registerComfyNodeDefs drops the burst cache on a refresh, a pack install, or a
+  // download completing. That bumps the cache GENERATION without moving the reconnect epoch,
+  // so an epoch test alone still calls it live — while the very refresh that retired it may
+  // be what filled this option list.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "retired",
+    }),
+    (err) =>
+      /panel REFRESHED the node definitions while that \/object_info request was in flight/.test(err.message) &&
+      /may be what filled this list/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — the answer was superseded before it arrived");
+});
+
+test("#1126: a NESTED promotion is refused BEFORE any re-fetch is paid for", async () => {
+  // The chain shape is already known and no schema can make this writable, so establishing
+  // evidence for it is pure cost — and on a non-live provenance that cost is a cache drop
+  // plus a multi-megabyte /object_info round trip, spent to answer a question whose answer
+  // cannot change the outcome.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const container = (uuid, id, w, innerNode, innerId) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    reg[uuid] = ctor;
+    return {
+      id,
+      type: uuid,
+      constructor: ctor,
+      subgraph: { _nodes: [innerNode], getNodeById: (x) => (String(x) === innerId ? innerNode : null) },
+      inputs: [{ name: w.name, _widget: w, widget: { name: w.name }, _subgraphSlot: { name: w.name } }],
+      widgets: [w],
+    };
+  };
+  const concreteWidget = { name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const concrete = {
+    id: 302,
+    type: "StarOllamaPromptHelper",
+    widgets: [concreteWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const midWidget = { name: "model_mid", type: "combo", options: { values: THROWS }, value: "" };
+  const mid = container("11111111-1111-4111-8111-111111111111", 301, midWidget, concrete, "302");
+  const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
+  const outer = container("22222222-2222-4222-8222-222222222222", 320, outerWidget, mid, "301");
+  let invalidated = 0;
+  let fetches = 0;
+  await assert.rejects(
+    runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => {
+        fetches += 1;
+        return starObjectInfo([]);
+      },
+      wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+      resolveSource: (_n, si) => {
+        if (si?.name === "model_alias") return { sourceNodeId: "301", sourceWidgetName: "model_mid" };
+        if (si?.name === "model_mid") return { sourceNodeId: "302", sourceWidgetName: "model" };
+        return null;
+      },
+      // A provenance that WOULD trigger the re-ask if the nested check did not come first.
+      schemaProvenance: () => "cache",
+      invalidateObjectInfoCache: () => {
+        invalidated += 1;
+      },
+      ...HOOKS,
+    }),
+    (err) => /NESTED promotion/.test(err.message),
+  );
+  assert.equal(invalidated, 0, "the burst cache is not dropped for a write that cannot succeed");
+  assert.equal(fetches, 1, "only the ladder's own authorization fetch — no last-resort re-ask");
+});
+
 test("#716 × #1126: a CACHE-HIT empty list does NOT authorize a blind write either", async () => {
   // The layer below the snapshot, and the one a healthy backend actually hits: #716's burst
   // cache answers writes 2..N of a burst without asking the server at all. "Not from a
@@ -2161,6 +2241,49 @@ test("#1223 × #1126: UNKNOWN provenance fails closed — a throwing probe is no
     (err) => /provenance could not be established at all/.test(err.message),
   );
   assert.equal(widget.value, "", "no mutation when provenance could not be established");
+});
+
+test("#1126: a PARTIAL write is never reworded into a 'refused' frame", async () => {
+  // Every `panel_set_widget refused …` message asserts more than the text it wraps: that
+  // nothing was applied, so the caller may retry or give up freely. Exactly one
+  // WidgetWriteError breaks that — the one raised AFTER the graph was mutated and the
+  // rollback failed to restore it. Reporting THAT as a refusal tells the caller "nothing
+  // happened" about a graph now in a partial state, which is the class of false report this
+  // whole change exists to eliminate.
+  //
+  // Driven through the REAL ladder: the value is refused by the widget's own callback after
+  // the write lands, and the rollback is defeated by a value setter that refuses to restore.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: ["a.fbx"] }, value: "a.fbx" };
+  let landed = false;
+  Object.defineProperty(widget, "value", {
+    configurable: true,
+    get: () => (landed ? "STUCK" : "a.fbx"),
+    set: () => {
+      // Accepts nothing: the write cannot verify, and the rollback cannot restore either.
+      landed = true;
+    },
+  });
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [widget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  await assert.rejects(
+    runSetWidget(node, "model", "a.fbx", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo(["a.fbx"]),
+      wasTypeEverDefined: () => true,
+      ...HOOKS,
+    }),
+    (err) =>
+      // The write's own partial-state warning reaches the caller intact…
+      /partial state/.test(err.message) &&
+      // …and is NOT dressed up as a refusal, which would claim nothing was applied.
+      !/panel_set_widget refused/.test(err.message),
+  );
 });
 
 test("#1126: a stateful callback that finally answers [] takes #507's acceptance, not a refusal", async () => {

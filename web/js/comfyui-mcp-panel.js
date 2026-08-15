@@ -11956,14 +11956,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // #1223 — why the snapshot could not stand in, kept OFF the route list so the route
     // count stays honest. Per-request for the same reason the other two are.
     let snapshotIneligibility = "";
-    // #1126 — WHERE the schema the LAST getFreshObjectInfo call answered with came from:
-    // "live" (this call issued the request), "cache" (#716's ≤1.5s burst cache answered, or
-    // this call joined another's in-flight read), "snapshot" (#1223's last-observed schema
-    // stood in), or "none". Only "live" may authorize the #1126 blind combo write, because
-    // that fallback's whole justification is the SERVER declaring the option list empty and
-    // the other three are the server's past word. Reassigned on every read — unlike
-    // `setWidgetSchemaFromSnapshot`, which is STICKY on purpose: a write that consulted the
-    // snapshot at any point must keep disclosing that, even if a later re-ask came back live.
+    // #1126 — WHERE the schema the LAST getFreshObjectInfo call answered with came from.
+    // Four of the values are object-info-cache.js's own verdict, copied through verbatim
+    // ("live", "cache", "reconnected", "retired"); this file adds "snapshot" when #1223's
+    // last-observed schema stood in, and "none" when nothing was established. Only "live"
+    // may authorize the #1126 blind combo write, because that fallback's whole justification
+    // is the SERVER declaring the option list empty and every other value is the server's
+    // past word — or no word at all.
+    //
+    // Reassigned on every read — unlike `setWidgetSchemaFromSnapshot`, which is STICKY on
+    // purpose: a write that consulted the snapshot at any point must keep disclosing that,
+    // even if a later re-ask came back live.
     let setWidgetSchemaProvenance = "none";
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
@@ -12056,84 +12059,65 @@ const GRAPH_TOOL_EXECUTORS = {
       // after a restart-without-reload. Mirrors graph_add_node.
       getRegistry: () => LG?.registered_node_types ?? {},
       getFreshObjectInfo: async () => {
-        // #1223 — the epoch at which THIS CALL actually fetched, or null if it did not.
-        //
-        // Set INSIDE the loader, which the burst cache runs only on a miss. Capturing it
-        // out here instead was a defect: a CACHE HIT returns a payload fetched up to a TTL
-        // ago, and a reconnect can land in between — the reconnect's own refresh is
-        // payload-less and gets coalesced into any in-flight run, so it never reaches
-        // `objectInfoCache.invalidate()` either. The pre-reconnect schema would then be
-        // stamped with the post-reconnect epoch and retained with no TTL at all, which is
-        // precisely the #458 hole this file promises not to open.
-        //
-        // A JOINED read (another call's in-flight request) leaves this null for the same
-        // reason and is likewise not recorded: this call cannot vouch for when that fetch
-        // was issued. Only the call that actually asked may file the answer as evidence.
-        let observedAtEpoch = null;
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
         // only how often it is re-fetched. Dropped by anything that knows the schema
         // moved. See lib/object-info-cache.js for why the per-class route #767 used
         // for add_node is NOT safe here.
-        const outcome = await objectInfoCache.read(async () => {
-          // #982 — TWO TRANSPORTS for the same question. The reporter's fence refused
-          // for "object_info is unavailable" while `/object_info/VAELoader` answered on
-          // the same machine, so the frontend client can fail where the HTTP route does
-          // not. Whatever each attempt actually did is recorded and reaches the refusal,
-          // because "unreachable or the fetch failed" named two causes and established
-          // neither.
-          //
-          // The OUTCOME rides through the cache, not just the schema (codex): a second
-          // concurrent write JOINS this in-flight read and never runs its own loader, so
-          // returning bare defs would leave that caller's refusal naming no routes at all.
-          // This body runs ONLY on a cache miss, so this is the moment the request is
-          // issued — the only epoch that can honestly be attributed to the answer.
-          observedAtEpoch = backendReconnectEpoch;
-          return fetchWholeObjectInfo({
-            getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
-            fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-          });
-        });
+        //
+        // #1126 — and the cache REPORTS ITS OWN VERDICT on the answer rather than letting
+        // this file reconstruct one. Four rounds of review each found another way a response
+        // could fail to be live — served from the TTL, joined to another call's request, the
+        // backend reconnected underneath it, an `invalidate()` retiring it mid-flight — and
+        // each was patched by adding a condition here, derived from whether the loader body
+        // had run. That proxy was never the question. The cache owns the generation counter
+        // that retires requests and decides which of the three ways a read is answered, so it
+        // is the only thing that can answer it; the reconnect epoch is handed in as an opaque
+        // `stamp` it re-checks across the await without needing to know what it means.
+        const { value: outcome, provenance: readProvenance } = await objectInfoCache.readWithProvenance(
+          async () => {
+            // #982 — TWO TRANSPORTS for the same question. The reporter's fence refused
+            // for "object_info is unavailable" while `/object_info/VAELoader` answered on
+            // the same machine, so the frontend client can fail where the HTTP route does
+            // not. Whatever each attempt actually did is recorded and reaches the refusal,
+            // because "unreachable or the fetch failed" named two causes and established
+            // neither.
+            //
+            // The OUTCOME rides through the cache, not just the schema (codex): a second
+            // concurrent write JOINS this in-flight read and never runs its own loader, so
+            // returning bare defs would leave that caller's refusal naming no routes at all.
+            return fetchWholeObjectInfo({
+              getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+              fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+            });
+          },
+          { stamp: () => backendReconnectEpoch },
+        );
         const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
         if (defs) {
+          // #1126 — ONE fact, from the one component that can establish it. The cache says
+          // whether the answer it just handed back is the server speaking NOW ("live") or a
+          // payload that was served, joined, reconnected out from under, or retired by an
+          // `invalidate()` mid-flight. This file no longer re-derives any of that.
+          setWidgetSchemaProvenance = readProvenance;
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
-          // above), so it is one #1223's fallback may hold — but ONLY when this call issued
-          // the fetch itself, and only if no reconnect landed while it was in flight.
+          // above), so it is one #1223's fallback may hold — but ONLY if it is live.
           //
-          // This guard is DEFENCE IN DEPTH, and mutation testing reports removing it as a
-          // surviving mutant for that reason: `record` independently rejects a non-finite
-          // `observedAtEpoch`, which is exactly what a cache hit leaves here. It is kept
-          // because it states the rule at the point of decision — "only the caller that
-          // asked may file the answer" — rather than leaving it to be inferred from a
-          // validation two files away.
-          if (observedAtEpoch !== null) {
+          // Gated on the SAME verdict, deliberately. `record` applies its own epoch test and
+          // would still accept a GENERATION-RETIRED response, because a `registerComfyNodeDefs`
+          // refresh/install/download bumps the cache generation WITHOUT moving the reconnect
+          // epoch — so the snapshot could retain a schema the panel itself had just superseded.
+          // Reading the cache's verdict closes that without weakening `record`, whose own
+          // checks stay as defence in depth for callers that do not have a verdict to offer.
+          if (readProvenance === "live") {
             objectInfoSnapshot.record(defs, {
-              observedAtEpoch,
+              observedAtEpoch: backendReconnectEpoch,
               currentEpoch: backendReconnectEpoch,
               whole: true,
             });
           }
-          // #1126 — the SAME two facts `record` above is gated on, reported to the lib, so the
-          // two can never disagree about whether an answer is usable as backend evidence.
-          //
-          //   * a NULL epoch means this call did not issue the request: #716's burst cache
-          //     answered, or it joined another call's in-flight read. Nobody asked the server
-          //     during this call, so the payload can be a full TTL old.
-          //   * an epoch that NO LONGER MATCHES means the backend reconnected while the
-          //     request was in flight. object-info-cache deliberately still returns a retired
-          //     response to its original waiter, and `record` refuses to file it for exactly
-          //     this reason — it describes a ComfyUI process that has been replaced, and a
-          //     restart is the one event that changes what the server publishes. Calling that
-          //     "live" merely because the loader ran would let the old process's empty option
-          //     list authorize a blind write against the new one's real list.
-          setWidgetSchemaProvenance =
-            observedAtEpoch === null
-              ? "cache"
-              : observedAtEpoch === backendReconnectEpoch
-                ? "live"
-                : "reconnected";
           return recordObjectInfoTypes(defs);
         }
         // #1223 — the probe produced nothing. If it went SILENT (rather than answering
@@ -12313,26 +12297,27 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     let oracleFailures = [];
-    // #1223 — the epoch at which THIS CALL fetched, or null if the burst cache answered from
-    // store or this read joined another call's request. Set inside the loader for the same
-    // reason graph_set_widget's is: only the caller that issued the request can say which
-    // connection the answer describes.
-    let observedAtEpoch = null;
-    const outcome = await objectInfoCache.read(async () => {
-      observedAtEpoch = backendReconnectEpoch;
-      return fetchWholeObjectInfo({
-        getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
-        fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-      });
-    });
+    // #1126 — the cache's own verdict, exactly as graph_set_widget takes it. This route files
+    // into the same snapshot, so it needs the same test: "did this call issue the request" is
+    // NOT the question, because an `invalidate()` from a refresh/install/download retires a
+    // response mid-flight without moving the reconnect epoch, and `record`'s epoch check alone
+    // would then file a schema the panel itself had just superseded.
+    const { value: outcome, provenance: readProvenance } = await objectInfoCache.readWithProvenance(
+      async () =>
+        fetchWholeObjectInfo({
+          getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+        }),
+      { stamp: () => backendReconnectEpoch },
+    );
     const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
     oracleFailures = defs ? [] : (outcome?.failures ?? []);
     // #1223 — this command already paid for a WHOLE /object_info; dropping it leaves the
     // next render-time widget edit refused for want of the map just read. Same argument the
     // history note below already makes for its own trust root.
-    if (defs && observedAtEpoch !== null) {
+    if (defs && readProvenance === "live") {
       objectInfoSnapshot.record(defs, {
-        observedAtEpoch,
+        observedAtEpoch: backendReconnectEpoch,
         currentEpoch: backendReconnectEpoch,
         whole: true,
       });

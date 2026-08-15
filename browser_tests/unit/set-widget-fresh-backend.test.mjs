@@ -286,7 +286,10 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
   const src = readFileSync(PANEL_JS, "utf8");
   const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
   assert.notEqual(start, -1, "graph_set_widget executor must exist");
-  const end = src.indexOf("\n  graph_set_node_property(", start);
+  // Bounded at the NEXT executor, not at graph_set_node_property: graph_remove_widget sits
+  // between them and does its own /object_info read, so the wider slice made a negative
+  // assertion about this executor fail on a neighbour's code.
+  const end = src.indexOf("\n  async graph_remove_widget(", start);
   assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
   const body = src.slice(start, end);
   // A FUNCTION, not a value: `getFreshObjectInfo` has not run when the options object is
@@ -297,35 +300,57 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
     /schemaProvenance:\s*\(\)\s*=>\s*setWidgetSchemaProvenance/,
     "the executor must thread the schema provenance it holds, as a deferred read",
   );
-  // Every branch of the oracle must SET it, or an unassigned path silently keeps the
-  // previous call's verdict — which is the stale-evidence bug this exists to prevent,
-  // reintroduced one level up.
+  // THE VERDICT IS DELEGATED, not reconstructed. Four review rounds each found another way
+  // a response could fail to be live while this file's own reconstruction still said it was
+  // (served from the TTL, joined to another read, reconnected out from under, retired
+  // mid-flight by an invalidate). object-info-cache.js owns the generation counter and
+  // decides how every read is served, so it answers; the panel copies that answer through.
+  assert.match(
+    body,
+    /objectInfoCache\.readWithProvenance\(/,
+    "the executor must ask the cache for its verdict rather than infer one",
+  );
+  assert.match(
+    body,
+    /provenance: readProvenance \} = await objectInfoCache\.readWithProvenance\(/,
+    "…and take the verdict from that call",
+  );
+  assert.match(
+    body,
+    /setWidgetSchemaProvenance = readProvenance;/,
+    "the threaded provenance must BE the cache's verdict, not a re-derivation of it",
+  );
+  // The reconnect epoch is the one fact the cache cannot know, handed in as an opaque stamp
+  // it re-checks across the await. Drop this and a reconnect-spanning response reads as live.
+  assert.match(
+    body,
+    /\{\s*stamp:\s*\(\)\s*=>\s*backendReconnectEpoch\s*,?\s*\}/,
+    "the reconnect epoch must be handed to the cache as an issuance stamp",
+  );
+  // Nothing may reconstruct liveness alongside the delegated answer — two sources for one
+  // fact is exactly what produced four rounds of drift. Scoped to the DECLARATION of a local
+  // signal, not to the identifier: `record`'s own option is still named `observedAtEpoch`,
+  // and that is its API, not a second opinion about this response.
+  assert.doesNotMatch(
+    body,
+    /let observedAtEpoch/,
+    "the executor must not keep a second, hand-rolled liveness signal",
+  );
+  // The other two branches are the panel's own to report: the cache never sees them.
   for (const [branch, pattern] of [
-    [
-      "live / cache / reconnected",
-      /setWidgetSchemaProvenance =\s*observedAtEpoch === null\s*\?\s*"cache"\s*:\s*observedAtEpoch === backendReconnectEpoch\s*\?\s*"live"\s*:\s*"reconnected"/,
-    ],
     ["snapshot", /setWidgetSchemaProvenance = "snapshot"/],
     ["nothing established", /setWidgetSchemaProvenance = "none"/],
   ]) {
     assert.match(body, pattern, `the ${branch} branch must record its provenance`);
   }
-  // "live" is gated on BOTH facts `objectInfoSnapshot.record` is gated on, or the two
-  // disagree about whether an answer is usable as backend evidence:
-  //   1. the epoch captured INSIDE the cache loader, which only a call that actually issued
-  //      the request ever sets (a cache hit or a joined read leaves it null), and
-  //   2. that epoch still matching, so a response the backend reconnected underneath — which
-  //      object-info-cache deliberately still returns to its original waiter, and which
-  //      `record` refuses to file — is not relabelled "live" merely because the loader ran.
+  // #1223's snapshot may only retain a LIVE answer, gated on the same verdict. `record`'s own
+  // epoch test would still accept a GENERATION-RETIRED response — a refresh/install bumps the
+  // cache generation without moving the reconnect epoch — so the snapshot could otherwise
+  // retain a schema the panel itself had just superseded.
   assert.match(
     body,
-    /observedAtEpoch = backendReconnectEpoch;[\s\S]*fetchWholeObjectInfo/,
-    "the epoch must be captured inside the cache loader, which runs only on a miss",
-  );
-  assert.match(
-    body,
-    /observedAtEpoch === backendReconnectEpoch/,
-    "a reconnect-spanning response must not be reported as live",
+    /if \(readProvenance === "live"\) \{\s*objectInfoSnapshot\.record\(/,
+    "only a live answer may be filed as the last-observed schema",
   );
   // …and the lib must be able to force a genuinely live re-read, or a cache hit could only
   // ever fail closed — refusing writes 2..N of an ordinary burst.
