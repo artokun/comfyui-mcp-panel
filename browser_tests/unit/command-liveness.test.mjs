@@ -559,8 +559,18 @@ test("#508 wiring: an undelivered reply is journaled, replayed after hello, and 
   // codex R10 — replay must fire on the real HANDSHAKE, not at bare socket-open: an open
   // socket only proves something is listening on the port, while the `models` frame proves
   // a real orchestrator is behind it. The hello already went out at open.
-  const openHandler = src.slice(src.indexOf('thisSock.addEventListener("open"'));
-  assert.match(openHandler.slice(0, 2000), /sendHello\(\);/, "the hello still rides socket-open");
+  // Bounded by the handler's OWN closing brace, not by a character count. This file has
+  // already corrected the same trap twice — for markConnected (#1145) and for the
+  // superseded guard (#1095) — and the window had 71 characters left: ONE more comment
+  // line in the open handler and this assertion goes red for a reason that has nothing to
+  // do with whether the hello rides socket-open. Measured, not guessed: `sendHello();` sat
+  // at offset 1929 of 2000 in a 3308-character handler.
+  const openAt = src.indexOf('thisSock.addEventListener("open"');
+  assert.notEqual(openAt, -1, "could not locate the socket open handler");
+  const openEnd = src.indexOf("\n    });", openAt);
+  assert.notEqual(openEnd, -1, "could not locate the end of the open handler");
+  const openHandler = src.slice(openAt, openEnd);
+  assert.match(openHandler, /sendHello\(\);/, "the hello still rides socket-open");
   assert.equal(
     /replayLostReplies\(thisSock\);/.test(src),
     false,
