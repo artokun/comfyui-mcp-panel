@@ -1,3 +1,5 @@
+import { describeSaveFailureCause } from "./userdata-failure-cause.js";
+
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
 // #442 defect 3 — the in-place-overwrite gate compares the on-disk file's RAW BYTES
@@ -42,6 +44,42 @@ function workflowExt(wf) {
  *  misread as "same file" and turned into a destructive rename. */
 function targetPath(wf, base) {
   return normalizePath(`${directoryOf(wf)}${base}${workflowExt(wf)}`);
+}
+
+/** A readable, TOTAL description of a thrown value for an error message. Deliberately
+ *  local and defensive: `String(err)` on a plain object yields "[object Object]", and
+ *  `JSON.stringify` returns UNDEFINED for an object whose `toJSON()` does — so neither is
+ *  trusted on its own (codex gate r2). Every fall-through names WHAT was thrown instead
+ *  of printing an opaque token, and a throwing `message`/`toJSON`/`constructor` getter is
+ *  contained by the outer catch so the error path itself can never fail. */
+function describeThrown(err) {
+  try {
+    if (err instanceof Error && err.message) return err.message;
+    if (typeof err === "string") return err || "a non-Error empty string was thrown";
+    if (err == null) return `a non-Error value (${String(err)}) was thrown`;
+    if (typeof err === "object") {
+      const message = err.message;
+      if (typeof message === "string" && message) return message;
+      let json = null;
+      try {
+        json = JSON.stringify(err);
+      } catch {
+        json = null; // circular / throwing toJSON
+      }
+      if (typeof json === "string" && json && json !== "{}") return json;
+      let name = null;
+      try {
+        name = err.constructor?.name;
+      } catch {
+        name = null;
+      }
+      return `a non-Error ${typeof name === "string" && name ? name : "object"} was thrown`;
+    }
+    const text = String(err);
+    return text || `a non-Error ${typeof err} was thrown`;
+  } catch {
+    return "unknown error";
+  }
 }
 
 /** True when `name` is a placeholder rather than a name the user/agent chose.
@@ -184,6 +222,44 @@ export async function groundingIsSafe(wf, existsOnDisk) {
   return exists === false; // ONLY a proven absence (404) authorizes the save
 }
 
+/** #708 — normalize the caller's LIVE-CANVAS identity oracle to a tri-state.
+ *
+ *  WHY a save needs one at all. ComfyUI keeps ONE root graph object (`app.rootGraph`)
+ *  and ONE `activeWorkflow` pointer, and they can disagree: after a reconnect the
+ *  frontend restores a tab's graph onto that shared canvas by itself, so a canvas
+ *  holding workflow W can sit under an `activeWorkflow` that is a different, brand-new
+ *  tab N. Everything ChangeTracker captures in that window (`captureCanvasState()`
+ *  serializes `app.rootGraph`, unconditionally) is W's content recorded as N's state.
+ *  A save that then reads "the current canvas" writes W's graph into N's file and
+ *  reports success — panel#708, where a `panel_new_workflow` tab came back after a
+ *  reconnect holding the previous workflow's 12 nodes and 4 groups.
+ *
+ *  The oracle answers ONE question: does the live root canvas positively belong to
+ *  the workflow we are about to persist?
+ *    - `"bound"`   — it positively carries THIS workflow's identity.
+ *    - `"foreign"` — it positively carries a DIFFERENT workflow's identity.
+ *    - `"unknown"` — no durable identity on one side or the other; PROVES NOTHING.
+ *
+ *  Identity, not content. A content comparison cannot answer this: two tabs holding
+ *  the same workflow are content-identical, and a correctly-bound canvas legitimately
+ *  drifts from its tracker between captures (#696/#701/#702/#663). Only the durable
+ *  per-workflow tag can, which is why the panel wires this to the SAME
+ *  graphRootWorkflowUuidMatches / graphRootWorkflowUuidMismatches pair the graph
+ *  fences use, and why "unknown" is the answer whenever a tag is absent.
+ *
+ *  Total and non-throwing: no oracle, a throw, or any unrecognized return ⇒
+ *  `"unknown"`, which never refuses a save and never licenses a canvas capture. */
+export function normalizeCanvasBinding(canvasBinding, wf) {
+  if (typeof canvasBinding !== "function") return "unknown";
+  let verdict;
+  try {
+    verdict = canvasBinding(wf);
+  } catch {
+    return "unknown";
+  }
+  return verdict === "bound" || verdict === "foreign" ? verdict : "unknown";
+}
+
 // #330 single-flight: SERIALIZE grounding per workflow SERVICE, not per workflow
 // instance. The atomic copy-trio activates a FRESH temporary copy (openWorkflow)
 // BEFORE its write commits, so the active-workflow identity changes mid-save — a
@@ -196,17 +272,45 @@ const _groundingChain = new Map(); // svc -> tail Promise<void>
  *  EXACT SAME workflow it probed (`expect: wf` → saveActiveWorkflow refuses if the
  *  active workflow changed during the async probe, so we never authorize on tab A
  *  and write to tab B). Best-effort: any refusal/hiccup ⇒ null (leave ungrounded). */
-async function groundOnce(svc, { existsOnDisk, autoWorkflowName, reconcileSavedCopy } = {}) {
+async function groundOnce(
+  svc,
+  { existsOnDisk, autoWorkflowName, reconcileSavedCopy, canvasBinding, identityProbe, onGrounded } = {},
+) {
   try {
     const wf = svc?.activeWorkflow;
     if (!needsGrounding(wf)) return null;
+    // #847 — probe the identity of the EXACT workflow this transaction is about to save,
+    // SYNCHRONOUSLY with reading it, before any await can change what is active.
+    //
+    // Doing this in the caller around `await groundActiveWorkflow(...)` is NOT equivalent,
+    // and that difference was a real defect (codex): grounding is single-flighted, so a
+    // caller can capture workflow B, await a grounding already running for A, and receive a
+    // truthy result — then record B's forms against A's save. Capture and record have to
+    // sit inside the same serialized operation as the save itself, keyed to `wf`.
+    let preIdentity = null;
+    try {
+      preIdentity = typeof identityProbe === "function" ? identityProbe(wf) : null;
+    } catch {
+      preIdentity = null; // bookkeeping must never stop a save that protects user work
+    }
     if (!(await groundingIsSafe(wf, existsOnDisk))) return null;
-    return await saveActiveWorkflow(svc, undefined, {
+    const savedName = await saveActiveWorkflow(svc, undefined, {
       autoWorkflowName,
       existsOnDisk,
       reconcileSavedCopy,
+      canvasBinding,
       expect: wf,
     });
+    // The name the save ITSELF produced — never re-read from `svc.activeWorkflow`, which by
+    // now may be a different tab entirely.
+    if (savedName && preIdentity && typeof onGrounded === "function") {
+      try {
+        onGrounded({ savedName, identity: preIdentity, workflow: wf });
+      } catch {
+        /* same rule: never fail the save for bookkeeping */
+      }
+    }
+    return savedName;
   } catch {
     return null;
   }
@@ -265,11 +369,32 @@ export async function groundActiveWorkflow(svc, opts = {}) {
  *  a real file (must never be moved). This STRENGTHENS the #226 invariant — it
  *  is only ever consulted after the in-memory oracles are inconclusive, and its
  *  absence / failure leaves the classification "unknown" → refuse (fail safe).
+ *
+ *  `canvasBinding(wf)` is an OPTIONAL identity oracle over the LIVE root canvas —
+ *  `"bound"` (the canvas positively carries THIS workflow's identity), `"foreign"`
+ *  (it positively carries a DIFFERENT workflow's), or `"unknown"`. See
+ *  `normalizeCanvasBinding` and the two places it is consulted (#708): the WRONG-CANVAS
+ *  guard at the top of this function (which refuses EVERY route on a proven-foreign
+ *  canvas) and the source capture inside the copy trio.
+ *  Absent / throwing / any other value ⇒ `"unknown"`, which never refuses.
  */
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, readDiskBytes, reconcileSavedCopy, expect, details } = {},
+  {
+    autoWorkflowName,
+    existsOnDisk,
+    readDiskBytes,
+    reconcileSavedCopy,
+    canvasBinding,
+    expect,
+    details,
+    // #771 — ComfyUI answers EVERY filesystem error on this path with one 400 that
+    // blames the filename, and logs the real cause. Injected rather than imported so
+    // this module keeps no opinion about how the log is reached, and so a caller that
+    // cannot reach it simply omits it.
+    readSaveFailureCause,
+  } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
@@ -289,6 +414,61 @@ export async function saveActiveWorkflow(
     }
   };
   assertExpect();
+
+  // #708 WRONG-CANVAS GUARD — asserted on entry (before ANY classification, probe or
+  // write, so a refusal mutates nothing) and RE-ASSERTED immediately before every write.
+  //
+  // EVERY save route here ultimately persists `wf.activeState`: the in-place branch
+  // writes it through `saveWorkflow`, and both copy routes read it in `saveAs`. That
+  // state is not written by this module — ComfyUI's ChangeTracker fills it by
+  // serializing the ONE shared `app.rootGraph` into whichever workflow is ACTIVE, on
+  // user input, on `graphChanged`, and (in this panel) after every completed bridge
+  // command. So whenever the live canvas is a DIFFERENT workflow's — a reconnect
+  // restored another tab's graph onto the shared canvas while this tab stayed active —
+  // `wf.activeState` may already BE that other workflow's graph, and every route writes
+  // it out reporting success. Concretely (codex gate r3):
+  //   - never-persisted source ⇒ a brand-new "Untitled …" file holding another
+  //     workflow's graph, which is the reported #708;
+  //   - EXTERNAL source ⇒ a copy in the workflows dir holding another workflow's graph;
+  //   - PERSISTED source, in-place ⇒ the user's REAL file overwritten with another
+  //     workflow's graph. That last one is strictly worse than the reported bug, and
+  //     scoping the guard to first-saves would have left it standing.
+  //
+  // RE-ASSERTION IS REQUIRED, exactly like #330's `assertExpect` (codex gate r4).
+  // `assertExpect` protects the WORKFLOW OBJECT, not the canvas: a reconnect landing
+  // during this function's awaited disk probes can repaint the shared canvas with
+  // another tab's graph while `wf` stays active, and an entry-only sample would then
+  // wave through the very write it exists to stop. So every write site re-asserts
+  // synchronously, with no await between the assert and the write:
+  //   - both COPY routes assert inside the trio adapter, immediately before `saveAs`.
+  //     That is a tight bound rather than a best effort: `saveAs` CLONES the state
+  //     there and the copy is persisted from that clone, so a canvas drift afterwards
+  //     cannot change the bytes that land.
+  //   - the IN-PLACE route asserts immediately before `saveInPlace`. Its residual is
+  //     the same one the module already accepts elsewhere: ComfyUI's `save()` awaits a
+  //     dynamic import before reading `activeState`, so a reconnect restore landing in
+  //     that sub-millisecond microtask gap is not caught. Closing it needs a frontend
+  //     primitive that does not exist (a canvas-generation token on the write).
+  //
+  // Refusing here is consistent, not novel: `assertGraphBoundToActiveWorkflow` already
+  // fences every graph READ and MUTATION on this exact signal, so there is no state in
+  // which an agent could usefully save a tab it is not allowed to edit. And the bar is
+  // the same POSITIVE one — a durable identity conflict the workflow's own lineage does
+  // not claim. "unknown" (no tag, no oracle, an unreadable root) never refuses, so
+  // older frontends and first observation are untouched.
+  const assertCanvasNotForeign = () => {
+    if (normalizeCanvasBinding(canvasBinding, wf) === "foreign") {
+      throw new Error(
+        `refusing to save "${baseName(wf.filename) || wf.path || "this workflow"}": the live canvas ` +
+          `positively belongs to a DIFFERENT workflow, so this tab's in-memory graph cannot be ` +
+          `trusted to be its own — ComfyUI records whatever is on the shared canvas as the ACTIVE ` +
+          `tab's state, and saving now could write the other workflow's graph over this one ` +
+          `(issue #708). Nothing was written. Open the workflow you mean (panel_open_workflow) and ` +
+          `retry.`,
+      );
+    }
+  };
+  assertCanvasNotForeign();
 
   // An EXPLICIT name (any string, even "  ") must resolve to a real name. If it
   // normalizes to empty, refuse — never silently reinterpret an explicit-but-
@@ -383,7 +563,7 @@ export async function saveActiveWorkflow(
     // never references the source's on-disk file. If that copy API is unavailable,
     // REFUSE rather than risk moving the external original.
     if (isExternalWorkflowPath(sourcePath)) {
-      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy });
+      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy, canvasBinding, assertCanvasNotForeign });
       if (!copyToUserDir) {
         throw new Error(
           "save-as (copy) is unavailable on this frontend for an externally-loaded workflow; " +
@@ -407,18 +587,9 @@ export async function saveActiveWorkflow(
 
     const cls = await classifySource(svc, wf, sourcePath, existsOnDisk);
 
-    // #226 CLASSIFICATION GUARD (hoisted so it applies regardless of which copy API
-    // is used) — a source ACTING temporary that isn't PROVABLY never-persisted must
-    // not be relocated: it might be a real on-disk file a relocate could move or
-    // destroy. This is about the SOURCE, not the write mechanism. A correctly-opened
-    // persisted workflow (isTemporary === false) hits the copy path below.
-    if (wf.isTemporary === true && cls !== "never-persisted") {
-      throw new Error(
-        `refusing to save: the active workflow is flagged unsaved but its source "${sourcePath}" ` +
-          `${cls === "persisted" ? "exists on disk" : "cannot be proven absent from disk"} — ` +
-          `saving now could MOVE (destroy) the original (issue #226). Re-open the workflow and try again.`,
-      );
-    }
+    // The #226 CLASSIFICATION GUARD lives just below, AFTER the write route is
+    // resolved, because the hazard it names belongs to the route and not to the
+    // source. See the comment at that check (#1066 defect 2).
 
     // #226/#309 P1-1 — a relocating Save-As can COLLIDE with an existing file, and a
     // non-atomic HEAD pre-check can NEVER make an OVERWRITING write safe (a target can
@@ -447,14 +618,58 @@ export async function saveActiveWorkflow(
     // (#566 codex P0 — "whatever is active after the await" is NOT succession
     // evidence; a mid-trio switch to a foreign tab must thread/consume NOTHING).
     const producedRecord = {};
-    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord });
+    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign });
+
+    // #226 CLASSIFICATION GUARD, scoped to the hazard it actually names (#1066 defect 2).
+    //
+    // A source ACTING temporary that isn't PROVABLY never-persisted must not be MOVED:
+    // it might be a real on-disk file a relocate would destroy. That is the invariant,
+    // and it is unchanged. What changed is where it can be violated.
+    //
+    // The guard used to run BEFORE the route was chosen, on the reasoning that it is
+    // "about the SOURCE, not the write mechanism". That was true when a moving route
+    // existed: the frontend's `saveWorkflowAs` branches on `isTemporary` and MOVES a
+    // temporary via renameWorkflow. It is no longer reachable — `saveWorkflowAs` and
+    // `renameWorkflow` now appear in this module only in comments, and every non-atomic
+    // relocation throws (see the refusal below this block). The one surviving relocating
+    // route is the atomic trio, and it is move-free BY CONSTRUCTION, verified against the
+    // real frontend rather than inferred: `workflowStore.saveAs(existing, path)` builds a
+    // NEW ComfyWorkflow from a deep copy of `existing.activeState`, inserts it at
+    // `workflowLookup[path]`, and returns it — it never reads `existing.path`, never calls
+    // /userdata, and never deletes. `saveWorkflow(copy)` then POSTs the COPY with
+    // `overwrite: copy.isPersisted` → false (a fresh copy has `size === -1`), so the
+    // target is server-guarded too. The source file is untouchable from this path.
+    //
+    // So on the trio the refusal could only ever be a FALSE one — and #1066 is what that
+    // costs a user: a URL-derived temporary tab whose source can be classified by nothing
+    // (the in-memory oracle returns the tab itself; ComfyUI's /userdata answers a URL-shaped
+    // path with a 500, not a 404 — measured, see the issue) was unsaveable under ANY name,
+    // by the panel or by ComfyUI's own Save-As.
+    //
+    // FAILS CLOSED: the exemption is conditioned on the move-free route being the one that
+    // will actually run, so reintroducing any moving fallback re-arms the guard rather than
+    // silently inheriting the exemption. Without a move-free route we still refuse here,
+    // with the message naming the SOURCE — which is the more useful of the two refusals
+    // available, and the reason this is not simply deleted in favour of the generic
+    // "atomic Save-As is unavailable" throw below.
+    if (wf.isTemporary === true && cls !== "never-persisted" && !atomicCopy) {
+      throw new Error(
+        `refusing to save: the active workflow is flagged unsaved but its source "${sourcePath}" ` +
+          `${cls === "persisted" ? "exists on disk" : "cannot be proven absent from disk"} — ` +
+          `saving now could MOVE (destroy) the original (issue #226). Re-open the workflow and try again.`,
+      );
+    }
+
     if (atomicCopy) {
       assertExpect(); // #330: still the workflow we probed?
       // Authoritative outcome: a "never-persisted" source (a temp / new_workflow tab
       // with no backing file) is a FIRST SAVE (panel#363 — no original to preserve);
       // a "persisted" source is a Save-As COPY of a real file that stays put (#579).
-      // (cls is only ever "persisted" or "never-persisted" here — the #226 guard above
-      // has already thrown for a temporary source that isn't provably never-persisted.)
+      // An "unknown" source (#1066 defect 2) reports as a COPY too, and that is the
+      // honest label rather than a fallback: the trio copied, and we cannot claim the
+      // "no original to preserve" that "first-save" asserts. Under-claiming here also
+      // keeps the two decisions that DO turn on proof — predecessor consumption and the
+      // move backstop — reading "not never-persisted", which is what they must see.
       recordOutcome(details, cls === "never-persisted" ? "first-save" : "save-as-copy", {
         sourcePath,
         targetPath: finalTargetPath,
@@ -475,15 +690,42 @@ export async function saveActiveWorkflow(
       // (disk 200) was present and is now CONFIRMED absent (disk 404) — classifyOriginalOnDisk
       // "lost". Every indeterminate case (no oracle / unknown pre or post / in-memory-only
       // signal) is a NO-OP, never a false "moved" (#226).
-      if (cls === "persisted") {
+      //
+      // Runs for an UNKNOWN source as well as a persisted one (#1066 defect 2). An
+      // unknown source is exactly the case where we could not establish what is on disk,
+      // so it is the one that most needs the observed check afterwards — and the check
+      // costs nothing when the answer stays unknown, because "lost" demands a CONFIRMED
+      // 200 before and a CONFIRMED 404 after. For the URL-derived tab this issue is about,
+      // both probes are 500 ⇒ null ⇒ "unverified" ⇒ no-op. Only never-persisted skips it,
+      // and only because a proven-absent source has nothing to lose.
+      //
+      // It is also the mitigation for the one thing the route exemption above cannot
+      // check: that exemption is DUCK-TYPED (three method names), so a frontend whose
+      // `saveAs` is not the move-free one verified against 1.50.3 would take the copy
+      // path with nothing having proven it move-free. This probe observes the OUTCOME
+      // rather than trusting the shape, and an unknown source is precisely the case with
+      // no other evidence — so it is the one that most needs observing (codex).
+      //
+      // ACCEPTED RESIDUAL (codex): two probes establish DISAPPEARANCE, not CAUSATION. A
+      // source deleted by something ELSE during the awaited persist trips this too, and no
+      // client-side check can separate the two — /userdata exposes no per-file version or
+      // actor. That is why the message below reports what was OBSERVED and names both
+      // causes instead of asserting this save moved it. The residual is inherited rather
+      // than introduced: the identical race already applied to a "persisted" source before
+      // this condition was widened. Erring toward a loud, accurate report is deliberate —
+      // the alternative is silence about a file that really is gone.
+      if (cls !== "never-persisted") {
         const sourceOnDiskAfter = await probeSourceOnDisk(existsOnDisk, sourceNorm);
         if (
           classifyOriginalOnDisk({ preExisted: sourceOnDiskBefore, postExists: sourceOnDiskAfter }) ===
           "lost"
         ) {
           throw new Error(
-            `save moved the original workflow "${sourcePath}" instead of copying it — ` +
-              `the source no longer exists on disk (issue #226)`,
+            `the original workflow "${sourcePath}" was on disk when this save began and is GONE ` +
+              `now — the copy "${finalTargetPath}" was written, but the source disappeared across ` +
+              `the save. Most likely this save moved it instead of copying it (issue #226); it can ` +
+              `also mean something else deleted it mid-save, which these two probes cannot tell ` +
+              `apart. Check the source before relying on it.`,
           );
         }
       }
@@ -508,6 +750,17 @@ export async function saveActiveWorkflow(
       // user/reconnect switch to a DISTINCT tab during the awaited persist fails that
       // proof ⇒ consume NOTHING and thread NOTHING (fail safe: the cosmetic ghost
       // stays — never the #349 wrong-canvas seeding of a foreign tab).
+      // #941 — thread the adapter's PROVEN produced record for the reply's identity,
+      // whatever the source classification. A Save-As from a PERSISTED workflow takes the
+      // branch below and so never reached `details`, which is why the reply had no identity
+      // to report and the caller's session was stranded.
+      //
+      // A SEPARATE field from `savedRecord` deliberately: that one is the #557 succession
+      // proof and carries the PREDECESSOR's identity onto the successor, which a Save-As
+      // copy must never do — it is a new workflow. This one only says "the save activated
+      // this object", so the reply can report ITS identity rather than re-reading whichever
+      // canvas is active later (codex).
+      if (details && producedRecord.record) details.activatedRecord = producedRecord.record;
       if (cls === "never-persisted") {
         const produced = producedRecord.record ?? null;
         if (produced) {
@@ -600,9 +853,66 @@ export async function saveActiveWorkflow(
         `(issue #442).`,
     );
   }
+  // #708 r4 — the canvas verdict is re-asserted here too: the awaited disk read above
+  // is exactly the window a reconnect can repaint the shared canvas in. Synchronous,
+  // with nothing awaited between it and saveInPlace (see the guard's own note on the
+  // residual microtask gap inside ComfyUI's save()).
+  assertCanvasNotForeign();
+  // #878 — REFRESH BEFORE OVERWRITING, exactly as the copy route does at its own
+  // write (see the `prepareForSave` note in the save-as adapter below).
+  //
+  // This route persists `wf.activeState` through `saveWorkflow`, and ComfyUI fills
+  // that on USER INPUT events. So a value written by a NODE — an
+  // ImpactWildcardEncode populate, a control_after_generate roll, a subgraph's
+  // promoted widgets — was absent from it, and an in-place save wrote the STALE
+  // bytes over the user's real file. Measured: live canvas 1337, tracker
+  // [512,512,1], on disk after the save [512,512,1]. Silent, because a save does
+  // not repaint: the screen still showed 1337 while the file disagreed.
+  //
+  // The copy routes have had this flush since #708; in-place — the one route that
+  // overwrites an EXISTING file — did not. The panel's own command dispatch
+  // captures after each completed command, which is why a panel edit then a save
+  // was fine and only node-written values were exposed.
+  //
+  // Same three properties as the copy route, and for the same reasons:
+  //   · ONLY when the canvas is PROVEN this tab's. `prepareForSave` serializes the
+  //     one shared root into whichever tracker is active, so capturing an unproven
+  //     canvas is how #708 wrote a foreign graph into the wrong file.
+  //   · A THROWING capture REFUSES the save. It leaves the tracker knowably behind
+  //     the canvas, and writing anyway would silently drop the newest edit — the
+  //     precise failure this fix exists to remove, reintroduced one line later.
+  //   · An ABSENT tracker/method is not a throw. Optional chaining takes no capture,
+  //     which is the same position as an unproven binding and stays allowed.
+  //
+  // WHY "bound" IS ENOUGH, since it is the highest-risk question here (codex).
+  // `prepareForSave()` serializes the ONE shared root into whichever tracker is
+  // ACTIVE, so the worry is a bound canvas coexisting with a non-active `wf`. It
+  // cannot write the wrong graph either way: ComfyUI's `prepareForSave` is a
+  // documented no-op unless its own workflow is the active one (isActiveTracker) —
+  // the same fact the copy route relies on below — so a `wf` that is not active
+  // captures NOTHING, and a `wf` that IS active captures a canvas "bound" has
+  // already proven to be this workflow's. Both branches are safe; the guard is the
+  // belt over ComfyUI's braces, not the only thing standing between us and #708.
+  //
+  // Synchronous, immediately after the re-assert and with nothing awaited before the
+  // write, so it cannot open a window the assert just closed — and, for the same
+  // reason, it cannot widen the #442 raw-byte gate's check-to-write interval either:
+  // no other JS runs between them.
+  if (normalizeCanvasBinding(canvasBinding, wf) === "bound") {
+    try {
+      wf?.changeTracker?.prepareForSave?.();
+    } catch (err) {
+      throw new Error(
+        `refusing to save "${currentName || finalTargetPath}" in place: the live canvas is this ` +
+          `workflow's, but capturing it failed (${describeThrown(err)}), so the overwrite could ` +
+          `silently drop the newest edits. Nothing was written — retry, or reload the ComfyUI tab ` +
+          `if it persists (#878).`,
+      );
+    }
+  }
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
-  const savedRecord = await saveInPlace(svc, wf);
+  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath });
   // r10 — thread the save API's own produced record (when it returns one) through
   // details, so the identity carry can prove succession from the replacement
   // EVENT. An empty/non-object return simply carries no thread (fail safe).
@@ -725,8 +1035,13 @@ async function probeSourceOnDisk(existsOnDisk, normPath) {
  *  is NOT succession evidence (a user/reconnect switch during saveWorkflow lands
  *  on a foreign tab); this is the same proof class the #557 r10 carry demands —
  *  the save's own produced record, never post-await active-tab occupancy. A proof
- *  failure threads NOTHING (fail safe). */
-function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord } = {}) {
+ *  failure threads NOTHING (fail safe).
+ *
+ *  `canvasBinding` is the #708 live-canvas identity oracle (see
+ *  normalizeCanvasBinding). It decides ONE thing here: whether the SOURCE tab's
+ *  serialized state may be refreshed from the live canvas before the copy is taken.
+ *  See the comment at that call. */
+function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign } = {}) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
   // returns is UNLOADED (no changeTracker → activeState === null), and
   // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
@@ -742,6 +1057,59 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord } = {}) {
     typeof svc?.openWorkflow === "function"
   ) {
     return async (wf, effectiveName, finalTargetPath) => {
+      // #708 r4 — RE-ASSERT the canvas here, synchronously, before the clone `saveAs`
+      // takes below. The caller's entry-time assert is stale by now (awaited disk
+      // probes sit between), and this is the moment the copy's bytes are fixed.
+      assertCanvasNotForeign?.();
+      // #708 — REFRESH THE SOURCE, NEVER THE COPY. The copy's content is whatever
+      // `saveAs` reads out of `wf.activeState`, and that state can legitimately lag the
+      // canvas by a capture (ComfyUI snapshots on user-input events; bridge edits are
+      // snapshotted after the fact). Flushing the canvas into the tracker before the copy
+      // is taken is what keeps a save current.
+      //
+      // But `prepareForSave()` is `captureCanvasState()`, and that serializes the ONE
+      // shared `app.rootGraph` into whichever tracker is ACTIVE — it is a read of the
+      // global canvas, not of a tab. It used to be called on the COPY, AFTER
+      // `openWorkflow(copy)` made the copy active. That is the #708 defect in one line:
+      // `workflowStore.openWorkflow` moves the `activeWorkflow` pointer and does NOT
+      // repaint the canvas (only `workflowService.openWorkflow` calls loadGraphData), so
+      // the capture ran against a canvas that had never been asked to hold the copy's
+      // graph — and on a reconnect-restored canvas it OVERWROTE the tab-local state that
+      // `saveAs` had just faithfully copied with the previously-active workflow's graph.
+      // The blank tab was then persisted holding 12 foreign nodes, reported as saved.
+      //
+      // So the flush happens HERE, on the SOURCE, while the source is still the active
+      // tab — and only when the canvas is PROVEN to be this tab's canvas. Without that
+      // proof the tab-local state stands as written: possibly one capture stale, always
+      // this tab's own graph. Stale-but-right beats fresh-but-someone-else's, and the
+      // never-persisted case where the state itself may already be poisoned is refused
+      // outright upstream (the first-save binding guard).
+      //
+      // No #330 re-assert is needed around it: the caller re-asserted `expect`
+      // immediately before this adapter with no await in between, and the capture is
+      // self-guarding anyway — ComfyUI's `prepareForSave` is a documented no-op unless
+      // its own workflow is the active one (isActiveTracker), so a tab that is no longer
+      // active cannot be written to and no OTHER tab can be written to by this call.
+      // A capture that THROWS is not the same as one we chose not to take (codex gate).
+      // "bound" proves the canvas is this tab's; it does not prove `serialize()` works,
+      // and a serializer that throws mid-capture leaves the tracker holding a state we
+      // now know may be BEHIND the canvas. main aborted the whole save in that case (its
+      // capture sat inside the trio's try, so the throw propagated and nothing was
+      // written); swallowing it here would silently downgrade that into a reported
+      // success that quietly dropped the user's latest edit. So REFUSE, matching main.
+      // An ABSENT tracker/method is not a throw — optional chaining simply takes no
+      // capture, which is the same position as an unproven binding and stays allowed.
+      if (normalizeCanvasBinding(canvasBinding, wf) === "bound") {
+        try {
+          wf?.changeTracker?.prepareForSave?.();
+        } catch (err) {
+          throw new Error(
+            `refusing to save "${effectiveName}": the live canvas is this workflow's, but capturing ` +
+              `it failed (${describeThrown(err)}), so the saved copy could silently omit the newest ` +
+              `edits. Nothing was written — retry, or reload the ComfyUI tab if it persists (#708).`,
+          );
+        }
+      }
       // FINAL, SYNCHRONOUS collision re-check IMMEDIATELY before saveAs — this closes
       // the TOCTOU window between probeTargetCollision's async disk HEAD and this
       // write: another unsaved tab may have occupied the target WHILE the HEAD was
@@ -819,7 +1187,10 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord } = {}) {
       };
       try {
         await svc.openWorkflow(copy);
-        copy.changeTracker?.prepareForSave?.();
+        // NO capture on the copy — see the #708 note at the top of this adapter. The
+        // copy persists the state `saveAs` took from the source tab; asking the copy's
+        // tracker to "prepare" re-reads the shared global canvas, which is precisely the
+        // read that put a foreign workflow's graph into a brand-new tab's file.
         await svc.saveWorkflow(copy);
       } catch (err) {
         // P2 — distinguish a CONFIRMED pre-commit failure (409 conflict, or the
@@ -947,7 +1318,13 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   // call that SUCCEEDS: `persisted` if it shows a persisted workflow here,
   // `confirmedAbsent` only if a successful lookup shows none. An oracle that
   // THROWS proves nothing (a thrown lookup is not proof of absence, #226) — we
-  // leave both false so the result stays "unknown" → refuse.
+  // leave both false so the result stays "unknown".
+  //
+  // What "unknown" COSTS is no longer a blanket refusal (#1066 defect 2, codex): it
+  // withholds the two rights that need proof — taking a MOVE path, and CONSUMING the
+  // source tab (#566) — while a provably move-free copy may still proceed. So this
+  // function's job is unchanged and its strictness matters just as much; only the
+  // consequence downstream is narrower than "refuse".
   let persisted = false;
   let confirmedAbsent = false;
 
@@ -991,9 +1368,9 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   // real file (#226/#215). They are indistinguishable in memory; only the disk
   // can tell them apart. Consult the authoritative filesystem oracle: a proven
   // ABSENCE (404) means there is no backing file to destroy → never-persisted
-  // (safe to ground); a proven PRESENCE means a real file → persisted (refuse).
-  // Unknown/failure changes nothing (stays "unknown" → refuse), so this only
-  // ever ADDS safe grounds to save and never weakens the #226 refusal.
+  // (safe to ground); a proven PRESENCE means a real file → persisted (copy it,
+  // never move it). Unknown/failure changes nothing (stays "unknown"), so this
+  // only ever ADDS safe grounds and never weakens the #226 invariant.
   if (typeof existsOnDisk === "function" && wf?.isPersisted !== true) {
     let exists = null;
     try {
@@ -1034,13 +1411,49 @@ function isExternalWorkflowPath(path) {
   return /^[a-zA-Z]:/.test(raw) || /^[\\/]/.test(raw);
 }
 
+/** #1066 — a URL-DERIVED workflow path, which is a different thing from an external file.
+ *
+ *  ComfyUI mints a TEMPORARY workflow whose path is the URL an asset was opened from:
+ *  `workflows/http://127.0.0.1:8188/api/view?filename=x.png&type=output&…`. Renaming that
+ *  tab replaces only the FILENAME, so the URL survives as the tab's DIRECTORY — and the
+ *  managed `workflows/` prefix is RETAINED, which is why this is not anchored. An earlier
+ *  attempt anchored it at position 0 and therefore never fired on the reported value.
+ *
+ *  WHY A SEPARATE PREDICATE, rather than widening isExternalWorkflowPath (codex): that one
+ *  also gates the low-level root-copy route, whose whole premise is that the source is a
+ *  REAL existing file being copied — it records `save-as-copy` and refuses outright when the
+ *  copy API is missing, to avoid moving or destroying the original. A URL source is not a
+ *  file at all; there is nothing to copy and nothing to destroy. Classifying it as external
+ *  would keep the tab unsaveable by a different route, which is what the reporter observed:
+ *  their first successful save came only from treating the URL source as never persisted.
+ *
+ *  Requiring "//" keeps this off an ordinary Windows drive letter and off a folder
+ *  legitimately named "notes:draft".
+ *
+ *  What that leaves unmatched is narrower than "opaque schemes" (codex): `blob:http://…`
+ *  DOES match, on its embedded hierarchical URL. Only a form carrying no "://" at all —
+ *  `data:application/json,{}` — stays unmatched. Catching those needs a bare `scheme:`,
+ *  which would hit real folder names, and no reported shape needs it.
+ *
+ *  KNOWN FALSE POSITIVE: on POSIX a managed directory may syntactically contain "://"
+ *  (`workflows/notes://draft`), and this redirects its Save-As to the workflows root. Taken
+ *  knowingly rather than discovered later — a redirected save is recoverable and visible,
+ *  where the 500 it replaces left the tab unsaveable under any name. It cannot arise on
+ *  Windows, where ":" is illegal in a filename. */
+function isUrlDerivedWorkflowPath(path) {
+  return /[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(String(path || ""));
+}
+
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
  *  preserving the workflow's containing folder. An EXTERNAL (absolute) source
  *  directory is unwritable via /userdata, so its Save-As copy is redirected to the
  *  user workflows root (#285). Defaults to the workflows root. */
 function directoryOf(wf) {
   const dir = String(wf?.directory || "").replace(/[\\/]+$/, "");
-  if (!dir || isExternalWorkflowPath(dir)) return `${WORKFLOWS_ROOT}/`;
+  // #1066 — a URL-derived directory is redirected too. It is not a writable managed
+  // folder, and accepting it verbatim built `workflows/http://…/Name.json`, which
+  // /userdata rejects with a 500 — leaving the tab unsaveable under ANY name.
+  if (!dir || isExternalWorkflowPath(dir) || isUrlDerivedWorkflowPath(dir)) return `${WORKFLOWS_ROOT}/`;
   return `${dir}/`;
 }
 
@@ -1054,13 +1467,80 @@ export function normalizePath(path) {
     .replace(/\/+$/, "");
 }
 
-async function saveInPlace(svc, wf) {
+/**
+ * #771 — ComfyUI answers a userdata write with HTTP 400 for ANY OSError, and then
+ * blames the FILENAME regardless of what actually failed.
+ *
+ * app/user_manager.py, post_userdata — this is the only 400 on the write path:
+ *
+ *     except OSError as e:
+ *         logging.warning(f"Error saving file '{path}': {e}")
+ *         return web.Response(status=400,
+ *             reason="Invalid filename. Please avoid special characters like :\/*?\"<>|")
+ *
+ * So a full disk (ENOSPC), a read-only or unwritable directory, a missing parent
+ * (mkstemp on a directory that does not exist), or hitting an fd limit all arrive
+ * as "invalid filename". The reporter's name was `wan22_flf_seg1_alone_to_reaching`
+ * — no special characters anywhere — and they were on a remote box, where a full
+ * volume is a common failure.
+ *
+ * The real errno IS known, one line earlier, in the ComfyUI SERVER LOG. It never
+ * reaches the HTTP response, so the client cannot recover it — which makes naming
+ * where to look the entire value this can add.
+ *
+ * DELIBERATELY NAMES NO SINGLE CAUSE. Picking "your disk is full" would be the
+ * same defect one level up: an inference presented as a finding. It lists what 400
+ * can mean here and points at the one place that says which.
+ */
+export function explainUserDataStoreFailure(message) {
+  const text = typeof message === "string" ? message : "";
+  // Match the shape ComfyUI's client produces, and ONLY the 400: 409 is a genuine
+  // name collision with its own handling (#309/#442), and augmenting it would bury
+  // an accurate message under an irrelevant one.
+  // Deliberately NO word-boundary escapes here. An earlier revision used a word-boundary-
+  // anchored pattern and both escapes were mangled into literal BACKSPACE bytes
+  // (0x08) on the way into this file: the regex still PARSED, the file stayed
+  // git-text, the diff looked normal, and it silently matched nothing. A digit
+  // boundary expressed as a character class says the same thing with no escape
+  // that can be eaten in transit.
+  if (!/storing user data file/i.test(text)) return text;
+  if (!/(^|[^0-9])400([^0-9]|$)/.test(text)) return text;
+  return (
+    text +
+    " — NOTE: ComfyUI returns 400 here for ANY filesystem error while blaming the filename." +
+    " It is the same response for a full disk, an unwritable or read-only directory, a missing" +
+    " parent directory, or an fd limit, so the stated reason is only occasionally the real one." +
+    " ComfyUI logs the actual error one line earlier: look for \"Error saving file\" in the" +
+    " ComfyUI server log — that names the true cause. On a remote or container host, check free" +
+    " space first. The workflow is still open and unsaved; nothing was written or overwritten."
+  );
+}
+
+async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
   // Return the save API's own result: when it yields the workflow record it
   // PRODUCED (a re-registered successor object), that is the one unambiguous
   // replacement-event thread the identity carry can use (r10) — path occupancy
   // proves nothing (a close→reopen occupies the same path with a new identity).
-  if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
-  if (typeof wf.save === "function") return await wf.save();
+  try {
+    if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
+    if (typeof wf.save === "function") return await wf.save();
+  } catch (err) {
+    // #771 — augment ONLY the userdata-400 shape; every other failure is
+    // rethrown byte-identical so no existing message or matcher changes.
+    const raw = err instanceof Error ? err.message : String(err);
+    const augmented = explainUserDataStoreFailure(raw);
+    if (err instanceof Error && augmented !== err.message) {
+      // Only ask the server WHY once we know this is the userdata-400 shape —
+      // `augmented !== raw` is that test, and it keeps every other failure on the
+      // byte-identical rethrow path with no extra request.
+      let tail = "";
+      if (typeof readSaveFailureCause === "function") {
+        tail = describeSaveFailureCause(await readSaveFailureCause(path));
+      }
+      err.message = augmented + tail;
+    }
+    throw err;
+  }
   throw new Error("workflow save API unavailable on this frontend");
 }
 

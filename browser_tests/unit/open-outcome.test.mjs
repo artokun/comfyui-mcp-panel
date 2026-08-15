@@ -473,8 +473,17 @@ test("#721 P1: an already-active workflow requires state even when empty, then p
   assert.ok(repaintAt !== -1 && proofAt > repaintAt && openedAt > proofAt, "must prove the repaint before success");
   // A failed/missing repaint is an honest unknown after s.openWorkflow may have
   // switched tabs, never the old fabricated {opened} receipt.
-  assert.match(body, /if \(rebindFailed\) throw failOpenRebindUnknown\(rebindFailed\);/);
+  // The throw itself, not the one-line `if` it used to be — #1089's follow-up wraps it
+  // in a block to append a foreign-source finding to the message. The guarantee is the
+  // same: a failed/missing repaint is an honest unknown, never a fabricated {opened}.
+  assert.match(body, /throw failOpenRebindUnknown\(rebindFailed\);/);
   assert.match(body, /workflow_open could not rebind the active canvas/);
+  // Whatever that block does, it may not turn a failure into a success.
+  const failAt = body.indexOf("if (rebindFailed) {");
+  if (failAt !== -1) {
+    const failBlock = body.slice(failAt, body.indexOf("throw failOpenRebindUnknown(rebindFailed);", failAt));
+    assert.doesNotMatch(failBlock, /applied: true/, "the failure path must never emit a success receipt");
+  }
 });
 
 test("#721 P1: dirty rebind success requires the target UUID, never only a read-shaped comparison", () => {
@@ -491,7 +500,13 @@ test("#721 P1: dirty rebind success requires the target UUID, never only a read-
   assert.match(repaint, /const instanceStillTarget = sameWorkflowObject\(activeNow, target\);/);
   assert.doesNotMatch(repaint, /activeWorkflowRef\(\) !== target/, "the raw-identity comparison must be gone");
   assert.match(repaint, /graphRootWorkflowUuidMatches\(\{ rootGraph, activeWorkflowUuid: targetUuid \}\)/);
-  assert.match(repaint, /graphRootMatchesState\(\{ rootGraph, state: repaintState \}\)/);
+  // #1001 — still a proof against the state that was LOADED, but no longer a byte-shape
+  // equality: the frontend recomputes node geometry while reproducing a graph faithfully,
+  // and demanding byte-identity made every such open report CONTENT_UNVERIFIED (which
+  // throws, which withholds the fence). The predicate still refuses anything but a
+  // nodes-only, same-set, geometry-only difference.
+  assert.match(repaint, /graphRootReproducesStateContent\(\{ rootGraph, state: repaintState \}\)/);
+  assert.match(repaint, /const contentMatches = contentProof\.proven;/);
   // The ATTEMPT-scoped marker: a workflow uuid can be on the root from a previous load
   // or a rebind heal, so it cannot say that THIS load landed.
   assert.match(repaint, /\[OPEN_PROOF_FIELD\]: openProofMarker/, "the payload must carry a single-use marker");
@@ -506,8 +521,19 @@ test("#721 P1: a failed rebind never re-baselines, reads disk, or reloads the st
   assert.match(successOnly, /await clearSpuriousOpenModified\(target, \{/);
   assert.match(successOnly, /await withDeadline\(/);
   assert.match(successOnly, /await app\.loadGraphData\(diskGraph/);
-  const unknownAt = body.indexOf("if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);");
+  // Anchored on the THROW, not on the one-line `if` it used to be: #1089's follow-up
+  // wraps this in a block so a foreign-source finding can be appended to the message
+  // first. What must hold is unchanged â the unknown receipt is still emitted only
+  // after the guarded success-only work.
+  const unknownAt = body.indexOf("throw failOpenRebindUnknown(rebindFailed);");
+  assert.notEqual(unknownAt, -1);
   assert.ok(unknownAt > body.indexOf("if (!rebindFailed)"), "the unknown receipt is emitted only after the guarded success-only work");
+  // ...and nothing between the success-only block and that throw may re-baseline, read
+  // disk, or load: the appended message is the only thing allowed there.
+  const between = body.slice(body.indexOf("if (openFailed)"), unknownAt);
+  for (const forbidden of [/clearSpuriousOpenModified/, /withDeadline\(/, /loadGraphData\(/]) {
+    assert.doesNotMatch(between, forbidden, "the failure path must stay side-effect free");
+  }
 });
 
 test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no silent data loss)", () => {
@@ -914,8 +940,20 @@ test("#716 wiring: post-open and active workflow responses carry the live instan
   assert.match(list, /const \{ active, activeIdentity \} = liveWorkflowListActive\(\);/);
   assert.doesNotMatch(list, /const active = s\.activeWorkflow;/, "workflow_list must not publish a pre-reconnect service binding");
   assert.match(list, /activeIdentity \? \{ workflow_uuid: activeIdentity\.uuid \} : \{\}/);
-  assert.match(open, /activeWorkflowUuidForOpenReply\(target\)/);
+  // #887 — the uuid gate now shares ONE observation of the active workflow with the
+  // binding report beside it. Two separate reads let a reply pair a uuid decided against
+  // one observation with binding fields decided against a later one, which is internally
+  // contradictory diagnostics (codex) — the exact class of thing #887 reports.
+  assert.match(open, /activeWorkflowUuidForOpenReply\(target, liveActiveAtReply\)/);
+  assert.match(open, /const liveActiveAtReply = /, "the snapshot must be taken once");
   assert.doesNotMatch(open, /activeWorkflowUuidForOpenReply\(target, s\.activeWorkflow\)/);
+  // The snapshot is what the #887 fields are derived from too — not a second read.
+  assert.match(open, /describeOpenActiveBinding\(\{/);
+  assert.doesNotMatch(
+    open,
+    /activeRoutingKey: \(\(\) => \{\s*try \{\s*const live = activeWorkflowRef\(\)/,
+    "the binding report must use the shared snapshot, not read the active workflow again",
+  );
   assert.match(open, /activeWorkflowUuid \? \{ workflow_uuid: activeWorkflowUuid \} : \{\}/);
 });
 
@@ -1031,7 +1069,30 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   assert.equal(workflowUuids.has(malformedActive), false, "must not mint an ephemeral workflow UUID");
 });
 
-test("#716 P1: a temporary workflow UUID is never published as a durable refresh source", () => {
+// #760 — this test used to assert the OPPOSITE ("a temporary workflow UUID is
+// never published as a durable refresh source"), on the reading that "its tmp
+// routing identity is ephemeral, so it cannot refresh the MCP's durable command
+// fence". Two things in that premise do not hold, and the cost of acting on it
+// was that an unsaved canvas could never rebind its fence at all:
+//
+//   • it conflates two different values. What gets published as the fence source
+//     is `workflowObjectUuid` — the canonical per-instance uuid from the LIVE-
+//     OBJECT map — NOT the tmp handle. The tmp handle is only the routing key.
+//   • the tmp handle is not ephemeral either: `_tempWorkflowInstanceIds` is keyed
+//     on the live object exactly so "the same unsaved workflow must keep ONE tmp:
+//     id for its lifetime" (a churning id would cause a re-hello storm).
+//
+// And a fence REFRESH is not a durable-resume record: it re-stamps commands for
+// the canvas that is live right now and is discarded when the tab changes.
+// Decisively, the panel's own fence comparison uses workflowStableUuid(), which
+// for an unsaved workflow returns this same objectUuid — so publishing it makes
+// the orchestrator's stamp match the panel's active uuid exactly, which is the
+// whole point of the refresh.
+//
+// The #716 rule that DOES still hold — a reply must never INITIALIZE an identity
+// — is unchanged and separately pinned by the test below: workflowObjectUuid is a
+// pure read, so an object with no established uuid still publishes nothing.
+test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const pathSource = namedFunctionSource(src, "savedWorkflowPath");
   const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
@@ -1039,10 +1100,12 @@ test("#716 P1: a temporary workflow UUID is never published as a durable refresh
   const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
   const temporaryActive = { isPersisted: false, isTemporary: true };
   const workflowUuids = new WeakMap([[temporaryActive, "33333333-3333-4333-8333-333333333333"]]);
+  const tempIds = new WeakMap([[temporaryActive, "tmp:33333333-3333-4333-8333-333333333333"]]);
   const replyUuid = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
+    "workflowTabId",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
@@ -1051,11 +1114,66 @@ test("#716 P1: a temporary workflow UUID is never published as a durable refresh
     // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
     // `wf:` + path here would be the second spelling the shared helper removed.
     savedWorkflowHandle,
+    (wf) => tempIds.get(wf),
   );
 
-  // Even an existing object-map UUID is insufficient for a temporary tab:
-  // its tmp routing identity is ephemeral, so it cannot refresh the MCP's
-  // durable command fence.
+  // The FENCE uuid is published — the canonical live-object value, not the handle.
+  assert.equal(replyUuid(temporaryActive), "33333333-3333-4333-8333-333333333333");
+});
+
+test("#760: an unsaved canvas with NO established uuid still publishes nothing (#716 holds)", () => {
+  // The establishment test moved, it did not go away. workflowObjectUuid is a
+  // pure WeakMap read, so an object the panel has never established has no uuid
+  // and the reply refuses to invent one — which is the actual #716 invariant.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const unestablished = { isPersisted: false, isTemporary: true };
+  let tabIdCalls = 0;
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "workflowObjectUuid",
+    "savedWorkflowHandle",
+    "workflowTabId",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => unestablished,
+    () => undefined, // never established
+    savedWorkflowHandle,
+    () => {
+      tabIdCalls += 1;
+      return "tmp:should-never-be-reached";
+    },
+  );
+
+  assert.equal(replyUuid(unestablished), null);
+  // …and it bailed BEFORE reaching the handle, so nothing was minted on the way.
+  assert.equal(tabIdCalls, 0, "an unestablished object must not even ask for a routing handle");
+});
+
+test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
+  // The canonical-shape gate must not be bypassed by the new unsaved branch.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const temporaryActive = { isPersisted: false, isTemporary: true };
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "workflowObjectUuid",
+    "savedWorkflowHandle",
+    "workflowTabId",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => temporaryActive,
+    () => "tmp:not-a-uuid", // the ROUTING handle, wrongly offered as the uuid
+    savedWorkflowHandle,
+    (wf) => `tmp:${String(!!wf)}`,
+  );
+
   assert.equal(replyUuid(temporaryActive), null);
 });
 

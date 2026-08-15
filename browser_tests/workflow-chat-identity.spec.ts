@@ -70,10 +70,20 @@ test('opening a workflow does not dirty it and first record keeps provenance off
   await panel.connect()
   // The greeting record resolves this workflow's identity as thread
   // provenance (history metadata) without re-stamping the deleted graph tag.
+  //
+  // mcp#884 — this replaces main's #847 "save first, THEN assert the embed"
+  // block. That block existed to make the embed assertion reachable on an
+  // unsaved canvas, and it ran under `setWorkflowScope(page)`, forcing
+  // `comfyui-mcp.chatScope = 'workflow'`. Neither survives here: the scope
+  // setting is retired, so the workflow-scoped embed path
+  // (`workflowStorageKey({ embed: true })`) is never reached and there is no
+  // graph tag to assert. Provenance now rides history metadata instead, which
+  // is the whole point — a conversation is no longer keyed off the canvas.
   await expect.poll(() => page.evaluate((threadsKey) => {
     const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
     return threads.find((t: any) => t.msgs?.length)?.workflowKey ?? null
   }, THREADS_KEY)).toMatch(/^workflow:/)
+
   const recorded = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
@@ -84,6 +94,9 @@ test('opening a workflow does not dirty it and first record keeps provenance off
   })
   expect(recorded.embedded).toBeNull()
   expect(recorded.calls).toEqual({ before: 0, after: 0, dirty: 0 })
+  // No cleanup needed: main's version had to SAVE a workflow to reach the embed,
+  // and deleted the file afterwards. This version never saves — the canvas is
+  // left exactly as it was found.
 })
 
 test('default mode opens pre-upgrade history without re-keying it', async ({

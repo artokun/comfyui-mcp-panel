@@ -113,6 +113,7 @@ function buildWorkflowNew({
     "stampGraphRootWorkflowUuid",
     "backendReconnectEpoch",
     "activeWorkflowResyncEpoch",
+    "isCanonicalWorkflowInstanceUuid",
     `${methodSource}\nreturn workflow_new;`,
   );
   return factory(
@@ -128,8 +129,16 @@ function buildWorkflowNew({
     onStamp,
     1,
     0,
+    realIsCanonicalWorkflowInstanceUuid,
   );
 }
+
+/** The REAL canonical-uuid gate from the shipped source — never a second spelling
+ *  of the regex here (#640). */
+const realIsCanonicalWorkflowInstanceUuid = new Function(
+  `${balancedFrom(SRC, "function isCanonicalWorkflowInstanceUuid(value)")}
+return isCanonicalWorkflowInstanceUuid;`,
+)();
 
 const EMPTY_SERIALIZE = () => ({ nodes: [], links: [], extra: { ds: { offset: [0, 0], scale: 1 } } });
 
@@ -144,6 +153,7 @@ test("#606 workflow_new stamps the fresh tab's identity onto a proven-empty root
   });
   const out = await workflow_new({ rid: "r1" });
   assert.equal(out.created, true);
+  assert.equal(out.empty, true, "#708 — the proof that licensed the stamp also licenses the claim");
   assert.equal(out.routing_key, "tmp:new-tab");
   assert.equal(stamps.length, 1, "the creation stamp must fire exactly once");
   assert.equal(stamps[0][0], rootGraph, "stamps the LIVE root");
@@ -165,7 +175,11 @@ test("#606 workflow_new does NOT stamp a root that still holds content (fail clo
     onStamp: (...args) => stamps.push(args),
   });
   const out = await workflow_new({ rid: "r1" });
-  assert.equal(out.created, true, "creation itself still succeeds");
+  // #708 — the tab and its routing identity are real, but "blank" was never proven,
+  // so the acknowledgement must not claim it (see the ack tests in
+  // new-workflow-persistence.test.mjs for the full contract).
+  assert.equal(out.created, "unknown", "an unproven canvas is not a confirmed blank tab");
+  assert.equal(out.routing_key, "tmp:new-tab", "the routing identity is still returned");
   assert.equal(stamps.length, 0, "no re-tagging a root with foreign content");
 });
 
@@ -186,7 +200,9 @@ test("#606 workflow_new does NOT stamp when the NEW workflow is not itself prove
   ]) {
     const stamps = [];
     const workflow_new = buildWorkflowNew({ rootGraph, activeWorkflow: wf, onStamp: (...a) => stamps.push(a) });
-    assert.equal((await workflow_new({ rid: "r1" })).created, true, "creation still succeeds");
+    const out = await workflow_new({ rid: "r1" });
+    assert.equal(out.created, "unknown", "#708 — an unprovable tab is reported as outcome-unknown");
+    assert.equal(out.routing_key, "tmp:new-tab", "the tab was still created and is addressable");
     assert.equal(stamps.length, 0, "an unprovable workflow side must not license the stamp");
   }
   assert.equal(
@@ -206,7 +222,7 @@ test("#606 workflow_new does NOT stamp an unserializable root, and a throwing st
     activeWorkflow: wf,
     onStamp: (...args) => stamps.push(args),
   });
-  assert.equal((await workflow_new({ rid: "r1" })).created, true);
+  assert.equal((await workflow_new({ rid: "r1" })).created, "unknown", "#708 — unserializable root ⇒ unproven");
   assert.equal(stamps.length, 0);
   // A stamp that throws: creation still reports success (the guard simply keeps its say).
   const rootGraph = { _nodes: [], extra: {}, serialize: EMPTY_SERIALIZE };
@@ -217,7 +233,11 @@ test("#606 workflow_new does NOT stamp an unserializable root, and a throwing st
       throw new Error("root refuses the tag");
     },
   });
-  assert.equal((await workflow_new_throwing({ rid: "r2" })).created, true);
+  // #708 — the emptiness proof is evaluated BEFORE the stamp and in its own guard, so a
+  // stamp that throws is identity bookkeeping failing, never evidence the tab has content.
+  const thrown = await workflow_new_throwing({ rid: "r2" });
+  assert.equal(thrown.created, true);
+  assert.equal(thrown.empty, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -368,8 +388,12 @@ test("#607 the dispatch-time fence also re-advertises before refusing", () => {
   const marker = "const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];";
   const start = SRC.indexOf(marker);
   assert.notEqual(start, -1);
-  const end = SRC.indexOf("workflow instance mismatch:", start);
-  assert.notEqual(end, -1);
+  // #750 moved the refusal TEXT into one shared builder (both dispatch sites used
+  // to carry their own copy), so the literal no longer appears after this point.
+  // Anchor on the call to that builder instead — same place in the flow, and it
+  // now also fails if a site goes back to hand-rolling its own message.
+  const end = SRC.indexOf("workflowInstanceMismatchMessage(", start);
+  assert.notEqual(end, -1, "the dispatch fence must refuse via the shared builder");
   const fenceRegion = SRC.slice(start, end);
   const noteAt = fenceRegion.indexOf("noteWorkflowInstanceMismatch();");
   assert.notEqual(noteAt, -1, "the dispatch fence must re-advertise on refusal");

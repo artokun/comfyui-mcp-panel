@@ -196,19 +196,54 @@ export function severNodeLinks(graph, node) {
   }
 }
 
-/** True for the recognized #420 link-disconnect crash: a TypeError from litegraph
- *  resolving a link's far end and calling a SLOT-LOOKUP method on something that
- *  isn't a proper LGraphNode (minified: "t.findInputSlot is not a function"). The
- *  match is deliberately narrow — only findInputSlot / findOutputSlot, the far-end
- *  slot lookups litegraph performs during link disconnection — so an unrelated
- *  TypeError won't be treated as recoverable. (Recovery never re-runs litegraph's
- *  disconnect, so even in the extraordinarily rare case a custom hook throws this
- *  exact internal signature, the retry does not re-invoke it — see safeRemoveNode.) */
+/** #713 — the far-end SLOT MIRROR WRITE variant. Same disconnect phase and same
+ *  cause as the method-call variant above: while clearing the far end's mirror of a
+ *  link litegraph writes `farNode.inputs[slot].link = null` /
+ *  `farNode.outputs[slot].links = …`, and during a rapid batched removal of LINKED
+ *  nodes a sibling removal can tear that slot array out from under it, so the
+ *  indexed slot reads `undefined`/`null` and the property write throws.
+ *
+ *  Kept as narrow as the method-call form by requiring the `link`/`links` property
+ *  NAME: an unrelated undefined-write ("… (setting 'foo')") is not recoverable.
+ *
+ *  Both V8 phrasings are matched. Current V8 (Chrome ≥ 91) says
+ *  `Cannot set properties of undefined (setting 'link')` — the exact text in the
+ *  #713 report — while older Chromium/Electron builds say
+ *  `Cannot set property 'link' of undefined`. Panels do run on old embedded
+ *  Chromium, and recognizing only the modern phrasing there would reopen the same
+ *  hole this fixes.
+ *
+ *  KNOWN LIMIT, deliberately not papered over: SpiderMonkey ("o.inputs[3] is
+ *  undefined") and JavaScriptCore ("undefined is not an object") do not name the
+ *  property at all, so this variant cannot be recognized narrowly on those engines
+ *  and is left unrecovered rather than matched by a broad pattern that would swallow
+ *  unrelated TypeErrors. */
+const SLOT_MIRROR_WRITE_RE =
+  /Cannot set propert(?:y|ies) of (?:undefined|null) \(setting ['"](?:link|links)['"]\)|Cannot set property ['"](?:link|links)['"] of (?:undefined|null)/;
+
+/** True for a recognized link-disconnect crash — a TypeError thrown by litegraph
+ *  while it is tearing down the FAR END of a link during `graph.remove`. Two
+ *  variants, same phase and same recovery:
+ *
+ *  (a) #420, the slot-LOOKUP method call: the far end resolves to something that is
+ *      not a proper LGraphNode, so calling a slot lookup on it throws (minified:
+ *      "t.findInputSlot is not a function"). Narrowed to findInputSlot /
+ *      findOutputSlot, the only far-end lookups litegraph performs there.
+ *  (b) #713, the slot-MIRROR WRITE — see SLOT_MIRROR_WRITE_RE above.
+ *
+ *  Both stay narrow so an unrelated TypeError is never treated as recoverable, and
+ *  message shape is only the FIRST of safeRemoveNode's two guards: the crash must
+ *  also have left residual links, which is what actually distinguishes a
+ *  disconnect-phase crash from a post-disconnect hook error. (Recovery never re-runs
+ *  litegraph's disconnect, so even if a custom hook threw one of these exact internal
+ *  signatures, the retry does not re-invoke it — see safeRemoveNode.) */
 export function isLinkDisconnectCrash(err) {
   if (!(err instanceof TypeError)) return false;
   const msg = String(err?.message ?? "");
-  if (!/is not a function/.test(msg)) return false;
-  return /find(Input|Output)Slot/.test(msg);
+  // (a) far-end slot-LOOKUP method invoked on something that isn't an LGraphNode.
+  if (/is not a function/.test(msg) && /find(Input|Output)Slot/.test(msg)) return true;
+  // (b) far-end slot MIRROR WRITE onto a slot that is already gone.
+  return SLOT_MIRROR_WRITE_RE.test(msg);
 }
 
 /** True when `node` still has at least one link attached — via its own slot refs OR a

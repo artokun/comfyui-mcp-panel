@@ -32,6 +32,7 @@ Env knobs:
 - ``COMFYUI_URL`` — the ComfyUI the agent targets (auto-detected otherwise).
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -455,6 +456,71 @@ def _start_hint(port, comfyui_url=None):
 # It never spawns or kills a process (Comfy Registry security standards) — see
 # the module docstring.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# #584 — a BACKSTOP for hosts that set no cache policy for extension assets.
+#
+# MEASURED, and the measurement killed two of my own claims in turn.
+#
+# First: ComfyUI 0.31.1 already answers `Cache-Control: no-store` on every `/extensions/`
+# path — ours and other packs' alike — so the HTTP cache is not the mechanism there. (What
+# I had actually reproduced while shipping #753 was a reload CANCELLED by ComfyUI's
+# unsaved-changes prompt, which is not a cache at all.)
+#
+# Second, and the reason this sets `no-store` rather than the `no-cache` it first used
+# (codex): a middleware appended here runs INSIDE the host's own `cache_control`, so ours
+# finishes first. ComfyUI's applies `setdefault("Cache-Control", "no-store")` — which
+# PRESERVES whatever we already put there. Setting the weaker `no-cache` therefore did not
+# no-op on 0.31.1 as claimed; it DOWNGRADED the host's policy on every panel asset. Only
+# checking 'is the header absent' cannot see that, because the outer middleware has not
+# run yet.
+#
+# Matching the host's own value removes the inversion by construction: where ComfyUI sets a
+# policy the result is identical, and where a host sets none (older builds — see ComfyUI's
+# e0982a71: an aiohttp ETag from mtime+size, a 304, stale content served) the asset gets
+# the same policy the current host would have given it. This pack does not get to invent a
+# weaker rule for its own files than the server applies to everyone else's.
+#
+# Scoped to this pack's own assets, and it still never overwrites a header already present.
+# ---------------------------------------------------------------------------
+_ASSET_PREFIX = "/extensions/comfyui-mcp-panel/"
+
+
+def _install_no_cache_middleware(web):
+    try:
+        from server import PromptServer  # type: ignore
+
+        app = PromptServer.instance.app
+    except Exception as _e:  # pragma: no cover - headless host
+        _log("asset revalidation not installed (no app): {}".format(_e))
+        return False
+
+    @web.middleware
+    async def _revalidate_panel_assets(request, handler):
+        response = await handler(request)
+        # contextlib.suppress rather than try/except/pass: identical behaviour, and the
+        # Comfy Registry's Bandit parity scan flags the bare form (B110). A header must
+        # never break a response — an already-prepared streaming response, for instance,
+        # can refuse a late header — so the failure mode here is 'no header', never 'no page'.
+        with contextlib.suppress(Exception):
+            if request.path.startswith(_ASSET_PREFIX):
+                # Never overwrite a header the host set deliberately.
+                if not response.headers.get("Cache-Control"):
+                    response.headers["Cache-Control"] = "no-store"
+        return response
+
+    try:
+        # aiohttp FREEZES middlewares once the app starts. Custom nodes are imported
+        # during server setup, before run_app, so this normally succeeds — but a host
+        # that imports packs later would raise, and a cache header is never worth
+        # failing to load the panel over.
+        app.middlewares.append(_revalidate_panel_assets)
+    except Exception as _e:  # pragma: no cover - frozen app / exotic host
+        _log("asset revalidation not installed: {}".format(_e))
+        return False
+    _log("panel assets given a cache policy where the host set none (Cache-Control: no-store)")
+    return True
+
+
 def _register_routes():
     try:
         from server import PromptServer  # type: ignore
@@ -673,6 +739,8 @@ def _register_routes():
             },
             status=503,
         )
+
+    _install_no_cache_middleware(web)
 
     _log("agent panel routes registered (read-only; orchestrator runs out-of-band)")
 

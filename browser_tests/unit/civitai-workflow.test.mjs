@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deflateRawSync } from "node:zlib";
+import { readFileSync } from "node:fs";
 import { CivitaiClient } from "../../web/js/cmcp-civitai.js";
 import { graphDirtyForConfirm } from "../../web/js/cmcp-civitai-ui.js";
 
@@ -324,4 +325,213 @@ test("downloadVersionFile surfaces the HTTP status for the sign-in hint", async 
     () => client.downloadVersionFile(1),
     (e) => e.status === 401 && /401/.test(e.message),
   );
+});
+
+// ── #882: the confirm gate must not trust a flag a node cannot set ─────────
+
+test("WIRING #882: graphIsDirty captures the canvas before reading isModified", () => {
+  // `isModified` comes from a snapshot ComfyUI takes on USER INPUT events only, so a
+  // value a NODE wrote leaves it false while the canvas already differs from the
+  // file. This gate fails closed for an UNREADABLE flag — it said so — but a STALE
+  // flag is readable and wrong, so the overwrite confirmation was skipped and an
+  // unsaved canvas clobbered without asking.
+  //
+  // The provider is a closure inside the panel needing a live DOM, so it is pinned
+  // at source; the behaviour it feeds (`graphDirtyForConfirm`) is unit-tested above.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const site = src.slice(src.indexOf("graphIsDirty: () => {"), src.indexOf("loadGraph: async (graph)"));
+  assert.ok(site.length > 0, "the provider must exist");
+  assert.ok(
+    site.includes("captureCanvasIntoTracker(wf)"),
+    "it must capture before reading the flag",
+  );
+  // Synchronous caller: a capture it cannot wait for, or one that threw, leaves the
+  // flag not known to be current — the same position as unreadable, so confirm.
+  assert.ok(
+    /captured === "pending" \|\| captured === "failed" \|\| captured === "unverified"/.test(site),
+    "an unwaitable, failed or unverified capture must fall back to confirming",
+  );
+  const captureAt = site.indexOf("captureCanvasIntoTracker(wf)");
+  const readAt = site.lastIndexOf("return wf.isModified;");
+  assert.ok(captureAt < readAt, "the capture must precede the read");
+});
+
+test("WIRING #882: the shared capture reports WHY it could not capture", () => {
+  // A boolean would force both callers to guess, which is the shape of the bug: the
+  // close guard can await a pending capture, the synchronous confirm gate cannot,
+  // and neither may treat "could not capture" as "not dirty".
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const fn = src.slice(
+    src.indexOf("function captureCanvasIntoTracker(wf) {"),
+    src.indexOf("function captureWasSuppressed(tracker) {"),
+  );
+  assert.ok(fn.length > 0, "the helper must exist");
+  for (const verdict of [
+    '"unavailable"',
+    '"captured"',
+    '"pending"',
+    '"failed"',
+    '"inactive"',
+    '"unverified"',
+  ]) {
+    assert.ok(fn.includes(verdict), `it must be able to report ${verdict}`);
+  }
+  // "captured" must rest on EVIDENCE, not on the call returning. Upstream returns the
+  // same `undefined` for a real snapshot and for every silent no-op (mid-undo, open
+  // change transaction, graph loading), so claiming success from a bare return would
+  // authorise a close on a stale flag — this bug exactly (codex).
+  assert.ok(
+    /after\.value !== before\.value\) return "captured"/.test(fn),
+    "a replaced snapshot object must be accepted as proof the capture landed",
+  );
+  assert.ok(
+    fn.includes("captureWasSuppressed(tracker)"),
+    "an unproven capture must be checked against the documented no-op windows",
+  );
+  assert.ok(
+    /suppressed \|\| captureWasSuppressed\(tracker\) \? "unverified" : "captured"/.test(fn),
+    "a possibly-suppressed capture must report unverified, not captured",
+  );
+  // Suppression is sampled TWICE — at call time and again when the verdict is taken —
+  // because an asynchronous capture does its work later, so the window that matters
+  // may open after the first sample (codex).
+  assert.equal(
+    (fn.match(/captureWasSuppressed\(tracker\)/g) || []).length,
+    2,
+    "suppression must be sampled at call time and again at verdict time",
+  );
+  // `activeState` is a plain field today, but a version making it a throwing accessor
+  // must not blow past these callers — every read goes through the guarded reader.
+  assert.ok(
+    /const readState = \(\) => \{\s*try \{/.test(fn),
+    "the snapshot must be read through a guard",
+  );
+  // Exactly one read of the raw field, and it is the one inside the guard.
+  assert.equal(
+    (fn.match(/tracker\.activeState/g) || []).length,
+    1,
+    "no unguarded activeState read may remain",
+  );
+  assert.ok(
+    /try \{\s*return \{ ok: true, value: tracker\.activeState \};/.test(fn),
+    "the single raw read must be the guarded one",
+  );
+  // A read that THREW must report failure, not a successful read of `undefined` —
+  // otherwise every verdict silently compares undefined to undefined and claims proof.
+  assert.ok(
+    /catch \{\s*return \{ ok: false, value: undefined \};/.test(fn),
+    "a throwing snapshot read must report ok:false",
+  );
+  // And an unreadable snapshot BEFORE the call means no evidence can be established
+  // at all, so the verdict must be unverified rather than proceeding blind.
+  assert.ok(
+    /if \(!before\.ok\) return \{ verdict: "unverified" \};/.test(fn),
+    "an unreadable snapshot must short-circuit to unverified",
+  );
+  // Written as an early return for the non-thenable case, so accept either polarity —
+  // what matters is that thenability is what separates "captured" from "pending".
+  assert.ok(
+    /typeof result\.then [!=]== "function"/.test(fn),
+    "a thenable must be reported as pending",
+  );
+  assert.ok(fn.includes("} catch {"), "a throwing capture must not propagate");
+
+  // Only the ACTIVE workflow may be flushed. Upstream `captureCanvasState()` returns
+  // early for a non-active tracker, so asking would report a capture that never
+  // happened — and an inactive tab was already frozen by ComfyUI's `deactivate()`.
+  assert.ok(
+    fn.includes("wf !== active) return { verdict: \"inactive\" }"),
+    "a non-active workflow must be reported inactive rather than flushed",
+  );
+  // But "inactive" may only be claimed on a READABLE identity. `activeWorkflowRef()`
+  // answers null both when nothing is active and when the lookup threw, and reading
+  // null as inactive would trust a stale flag on the very target needing capture.
+  assert.ok(
+    /if \(!active\) return \{ verdict: "unverified" \};/.test(fn),
+    "an unreadable active-workflow identity must not be dismissed as inactive",
+  );
+  // `checkState` is deprecated upstream (it warns, then delegates), so the current
+  // name must be preferred and the old one kept only as the fallback.
+  assert.ok(
+    /capture\s*=\s*tracker\?\.captureCanvasState\s*\?\?\s*tracker\?\.checkState/.test(fn),
+    "the non-deprecated capture must be preferred over checkState",
+  );
+  // `settled` must derive from the capture's OWN promise. Calling the capture a
+  // second time to await would run it twice — and a capture that sees a change is not
+  // a read: it pushes an undo entry and clears redo.
+  // `settled` must be a REAL promise. A callable thenable can return a non-promise from
+  // `.then()`, and awaiting that yields undefined — matching no verdict, so it would
+  // slip past the refusal into the stale flag.
+  assert.ok(
+    /settled = Promise\.resolve\(result\)\.then\(landed, \(\) => "failed"\)/.test(fn),
+    "the pending verdict must normalise the capture's own promise",
+  );
+  // Even ASKING whether the result is thenable can throw, if `then` is an accessor.
+  assert.ok(
+    /isThenable = !!result && typeof result\.then === "function";/.test(fn),
+    "thenability must be probed inside a guard",
+  );
+  assert.equal(
+    (fn.match(/capture\.call\(tracker\)/g) || []).length,
+    1,
+    "the capture must be invoked exactly once",
+  );
+});
+
+test("WIRING #882: closing awaits a pending capture and refuses a failed one", () => {
+  // The close executor is async, so unlike the confirm gate it CAN wait — and a
+  // capture that failed leaves the tracker knowably behind, so the flag proves
+  // nothing and the close must refuse rather than discard.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const site = src.slice(
+    src.indexOf("const captured = captureCanvasIntoTracker(target);"),
+    src.indexOf("await s.closeWorkflow(target);"),
+  );
+  assert.ok(site.length > 0, "the close guard must capture");
+  // Await the capture's OWN promise. An earlier draft started a SECOND capture and
+  // swallowed its rejection, so a rejected capture still read as "pending" and the
+  // close went ahead on a stale flag — the very failure this guard exists to stop.
+  assert.ok(site.includes("await captured.settled"), "a pending capture must be awaited");
+  // An empty verdict must land on the refusal side, never slip through to the flag.
+  assert.ok(
+    (site.match(/\?\? "unverified"/g) || []).length >= 2,
+    "an absent verdict must default to unverified on both branches",
+  );
+  assert.ok(
+    !site.includes("changeTracker.checkState()"),
+    "it must not start a second capture to await",
+  );
+  // The refusal must key off the SETTLED verdict, not the provisional one, or a
+  // capture that rejects after being awaited is still treated as merely pending.
+  assert.ok(
+    /verdict === "failed" \|\| verdict === "unverified"/.test(site),
+    "a failed OR unproven capture must refuse",
+  );
+  assert.ok(site.includes("target.isModified && !force"), "the original guard must remain");
+  // The refusal must stay escapable, or a data-loss bug becomes a cannot-close bug.
+  assert.ok(site.includes("!force"), "force:true must still be able to close");
+});
+
+test("WIRING #882: the no-op windows are read defensively", () => {
+  // Upstream returns early — no throw, no signal — while a graph loads, while an
+  // undo restores, and inside an open change transaction. These are the documented
+  // conditions; an unreadable tracker must answer "suppressed" so the destructive
+  // callers confirm instead of assuming.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const fn = src.slice(
+    src.indexOf("function captureWasSuppressed(tracker) {"),
+    src.indexOf("function activeWorkflowRef() {"),
+  );
+  assert.ok(fn.length > 0, "the helper must exist");
+  for (const flag of ["_restoringState", "changeCount", "isLoadingGraph"]) {
+    assert.ok(fn.includes(flag), `it must account for ${flag}`);
+    // And each must be checked for PRESENCE first. A renamed field would otherwise
+    // read `undefined`, compare false, and silently delete a refusal signal instead
+    // of degrading safely — the frontend would have changed shape unnoticed.
+    assert.ok(
+      new RegExp(`typeof tracker\\?[^;]*\\b${flag}\\b === "undefined"\\) return true;`).test(fn),
+      `a missing ${flag} must be treated as suppressed, not as absent-and-safe`,
+    );
+  }
+  assert.ok(/catch\s*{\s*\n?\s*return true;/.test(fn), "an unreadable tracker must not claim a capture");
 });

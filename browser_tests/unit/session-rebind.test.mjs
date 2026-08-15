@@ -4,10 +4,15 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+// #1138 adds one structural test (the call site's polarity), which the rest of this
+// pure-logic file does not need.
+import { readFileSync } from "node:fs";
 
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  shouldNudgeAfterMidTaskReconnect,
+  createBridgeOutageTracker,
   planSoftReloadRecovery,
   performSoftReloadRecovery,
   isTransientReconnectError,
@@ -519,4 +524,417 @@ test("#419: N open tabs each independently reconnect — no subset left dead", a
     assert.deepEqual(r.events, ["stop", "start"]); // this tab reconnected
     assert.equal(r.result.reconnect, true);
   }
+});
+
+// ── #1138: a mid-task "you dropped" nudge needs a drop to have happened ──────
+//
+// The nudge injects a user message and writes to the durable transcript. Both are false,
+// and the injection is harmful, unless the orchestrator really died: telling a working
+// agent to resume makes it restart or duplicate what it is doing.
+//
+// The gap heuristic was right; the sentinel's arithmetic betrayed it. The drop stamp was
+// 0 until the bridge socket CLOSED, and `Date.now() - 0` is ~56 years — the longest
+// possible gap, read as the strongest possible evidence of a real restart. So the guard
+// was inverted exactly where it mattered: the better established that nothing dropped, the
+// more confidently it nudged. Reachable on a live socket because `ready` repeats on one and
+// #310 re-advertises after every successful free_vram.
+//
+// #1145 restated the predicate's input as a MEASURED OUTAGE rather than a timestamp to
+// subtract from `now` (see the module note). The #1138 rule is unchanged and still locked
+// below — "no drop was recorded" is now the honest value 0 instead of a sentinel that
+// subtracted like 1970.
+
+test("#1138: NEVER dropped must not nudge, however long the session has run", () => {
+  // The reported shape: a live socket, a re-advertise, a ready ack, and no drop anywhere.
+  // The old guard subtracted the 0 sentinel from a real clock and passed on ~56 years;
+  // an unmeasured outage is now simply 0 ms, which cannot be mistaken for a long one.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 0 }), false);
+  for (const noDrop of [undefined, null, 0, -1, NaN, Infinity, "0", "30000", {}]) {
+    assert.equal(
+      shouldNudgeAfterMidTaskReconnect({ outageMs: noDrop }),
+      false,
+      `no measured outage must never nudge: ${JSON.stringify(noDrop)}`,
+    );
+  }
+  assert.equal(shouldNudgeAfterMidTaskReconnect(), false, "no arguments must not nudge");
+});
+
+test("#1138: a REAL restart still nudges — the fix must not disable the feature", () => {
+  // The behaviour #278/#588 rely on: a long outage is a real restart.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 30_000 }), true);
+  // Exactly at the boundary counts as real (>= minOutageMs), so the threshold is not
+  // silently exclusive.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 6000 }), true);
+});
+
+test("#1138: a FAST reconnect after a real drop still does not nudge", () => {
+  // The pre-existing half of the rule, preserved: a sidebar remount or a brief WS blip
+  // means the orchestrator never died, so the turn kept running.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 1 }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 5999 }), false);
+});
+
+test("#1138: a NEGATIVE duration is not evidence of a long outage", () => {
+  // A wall-clock adjustment must not read as an ancient drop — the same class of mistake
+  // as the 0 sentinel, one step along.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: -60_000 }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: -1 }), false);
+  // …and an unreadable threshold decides nothing either.
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 30_000, minOutageMs: NaN }), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: 30_000, minOutageMs: "6s" }), false);
+});
+
+test("#1138: the guard is INVERSION-SENSITIVE, unlike a source scan", () => {
+  // #1096's review proved by mutation that a token-presence source scan stays green when
+  // the guard is inverted. This asserts the two sides disagree, so an inverted or dropped
+  // condition cannot pass: the never-dropped case and the real-restart case must differ.
+  const neverDropped = shouldNudgeAfterMidTaskReconnect({ outageMs: 0 });
+  const realRestart = shouldNudgeAfterMidTaskReconnect({ outageMs: 30_000 });
+  assert.notEqual(
+    neverDropped,
+    realRestart,
+    "if these ever agree, the guard has stopped distinguishing no-drop from a real restart",
+  );
+  assert.equal(neverDropped, false);
+  assert.equal(realRestart, true);
+});
+
+test("#1138 wiring: the call site NEGATES the predicate and returns", () => {
+  // The predicate is tested by behaviour above; this covers the one thing a pure test
+  // cannot see — that the call site consults it in the right POLARITY. Dropping the
+  // negation would invert the fix into "nudge only when nothing dropped", which is worse
+  // than the original bug. An exact-substring claim on purpose: #1096's review proved by
+  // mutation that loose token-presence scans over this file assert nothing at all.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.ok(
+    src.includes(
+      "if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;",
+    ),
+    "the ready-ack mid-task branch must NEGATE the predicate and read the measured outage",
+  );
+  // The reverted sessionStorage twin must not return without its own review: every
+  // confirmed leak on this branch came from persisting that timestamp.
+  assert.doesNotMatch(src, /BRIDGE_DOWN_AT_KEY/, "the persisted drop timestamp stays reverted");
+  // #1145 — and the tracker measures on the MONOTONIC clock. This is the one part a
+  // behavioural test over the module cannot see: the tracker's own default is
+  // `Date.now()` (it must stay usable standalone), so which clock the PANEL measures
+  // with is decided at the construction site and nowhere else. reconnect-staleness.js
+  // already fixed this rule for elapsed-window state after a prior review; a wall clock
+  // here lets an NTP/DST correction inside a reconnect invent or erase an outage.
+  assert.ok(
+    src.includes("createBridgeOutageTracker({ now: monotonicNow })"),
+    "the panel's outage tracker must measure on the monotonic clock",
+  );
+  // #1145 — and the two WRITE sites, not just the read. The tracker's behaviour is
+  // covered above, but a tracker nothing feeds answers 0 forever and every one of these
+  // tests still passes: deleting `noteBridgeClosed()` from the close handler silently
+  // restores "no drop was ever recorded", which is the bug #1138 fixed. Each site is
+  // pinned by exact substring for #1096's reason — loose token scans over this file
+  // assert nothing.
+  for (const [site, snippet] of [
+    ["the socket close handler must open the outage", "bridgeOutage.noteBridgeClosed();"],
+    ["the models handshake must close it", "bridgeOutage.noteHandshake();"],
+    ["a turn start must scope the evidence to that turn", "bridgeOutage.noteTurnStarted();"],
+  ]) {
+    assert.ok(src.includes(snippet), site);
+  }
+  // NOTE: two attempts to also pin the WEDGE-death paths were removed with the code
+  // they described. A wedged orchestrator holds its socket open and never fires a
+  // close, so nothing records that death — a real gap, tracked separately. It is not
+  // pinned here because the assertions that tried to were themselves wrong: the
+  // negative half scanned stop()/setUrl()/destroy() for a literal `bridgeOutage.`,
+  // while the design it claimed to reject put the stamp in a shared helper CALLED
+  // from those bodies — so it would have passed against the very regression it named.
+});
+
+// ── #1145: the interval must be the OUTAGE, not one backoff step ─────────────
+//
+// `connect()` assigns `sock` before the connection resolves, so a REFUSED attempt during
+// a restart is still the active socket and runs the close handler in full. The old code
+// re-stamped the drop time there, and with backoff doubling from RECONNECT_BASE_MS the
+// retries land near t=1s/3s/7s/15s — so the successful attempt was separated from the
+// previous failed close by only THAT attempt's delay. The guard weighed one backoff step,
+// and a genuine restart returning inside ~7s measured ~4s and lost its nudge: the session
+// resumed with full context and no pending turn, leaving the agent idle after exactly the
+// event the nudge exists for.
+//
+// These drive the tracker through the real ORDER of events, which is the only way to see
+// it: no single call distinguishes "the drop" from "the third refused retry".
+
+/** A tracker over a hand-driven clock: `clock.t` is the wall time it reads. */
+function trackerAt(t0 = 1_700_000_000_000) {
+  const clock = { t: t0 };
+  return { clock, tracker: createBridgeOutageTracker({ now: () => clock.t }) };
+}
+
+test("#1145: refused retries during a restart must not reset the outage clock", () => {
+  // The reported sequence, to scale: the bridge drops, three reconnect attempts are
+  // refused at the backoff delays, and the fourth connects — a 7s outage.
+  const { clock, tracker } = trackerAt();
+  const t0 = clock.t;
+  tracker.noteTurnStarted(); // a turn is in flight; this is the mid-task case
+  tracker.noteBridgeClosed(); // t=0 — the real drop
+  for (const t of [1000, 3000]) {
+    clock.t = t0 + t;
+    tracker.noteBridgeClosed(); // a REFUSED attempt closes exactly like a drop
+  }
+  clock.t = t0 + 7000;
+  tracker.noteHandshake(); // the attempt at ~7s connects
+
+  assert.equal(
+    tracker.outageMs(),
+    7000,
+    "the measured interval must be the whole outage, not the last backoff step",
+  );
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    true,
+    "a genuine restart that returns in ~7s must keep its nudge",
+  );
+});
+
+test("#1145: the old per-attempt stamp would have measured one step and lost the nudge", () => {
+  // The counterfactual, asserted rather than described: had the final refused close reset
+  // the clock (the defect), the interval would have been 7000-3000=4000ms — under the 6s
+  // threshold, so no nudge. This is what must never come back.
+  const lastBackoffStep = 7000 - 3000;
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: lastBackoffStep }), false);
+  assert.notEqual(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: 7000 }),
+    shouldNudgeAfterMidTaskReconnect({ outageMs: lastBackoffStep }),
+    "outage and backoff-step must not agree, or the regression is invisible",
+  );
+});
+
+test("#1145: a genuinely fast reconnect still measures fast", () => {
+  // The other half of the rule: measuring the outage must not turn every blip into a
+  // restart. One close, reconnected in 2s, is still a blip.
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed();
+  clock.t += 2000;
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 2000);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
+});
+
+test("#1145: a handshake that ended NO outage inherits nothing", () => {
+  // `ready`/`models` repeat on a LIVE socket — #310 re-advertises after every successful
+  // free_vram. A re-advertise must record nothing rather than adopting the previous
+  // outage; adopting it is how a settled drop gets reported as "your connection dropped".
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed();
+  clock.t += 30_000;
+  tracker.noteHandshake(); // a real 30s outage ends
+  assert.equal(tracker.outageMs(), 30_000);
+
+  clock.t += 600_000; // ten quiet minutes on the same live socket
+  tracker.noteHandshake(); // a free_vram re-advertise draws a fresh handshake
+  assert.equal(
+    tracker.outageMs(),
+    30_000,
+    "a re-advertise must not restate the elapsed time as a NEW outage",
+  );
+  assert.equal(tracker.isDown(), false);
+});
+
+test("#1145: an outage that ended BEFORE this turn is not this turn's evidence", () => {
+  // #1138 fixed a stale 0 reading as ~56 years. A stale POSITIVE duration is the same
+  // defect one step along: a real 30s outage, settled two turns ago, must not be re-read
+  // by a `ready` that merely repeats on the live socket during the turn running now.
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed();
+  clock.t += 30_000;
+  tracker.noteHandshake();
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+
+  clock.t += 300_000;
+  tracker.noteTurnStarted(); // a NEW turn begins — the old outage is not about it
+  assert.equal(tracker.outageMs(), 0);
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    false,
+    "a settled outage must not nudge a turn that started after it",
+  );
+});
+
+test("#1145: a drop DURING the turn is still this turn's evidence", () => {
+  // The complement of the test above — turn-scoping must not swallow the case the nudge
+  // exists for. A turn starts, THEN the bridge drops for 30s and comes back.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  clock.t += 5000;
+  tracker.noteBridgeClosed();
+  clock.t += 30_000;
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 30_000);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1145: a fresh tracker has seen no outage", () => {
+  // The #1138 case at the source: a page load / panel mount that never saw a drop reports
+  // 0, not a sentinel that subtracts like 1970.
+  const { tracker } = trackerAt();
+  assert.equal(tracker.outageMs(), 0);
+  assert.equal(tracker.isDown(), false);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
+});
+
+test("#1145: a backwards clock cannot manufacture or corrupt an outage", () => {
+  // A wall-clock adjustment mid-outage must not yield a negative duration, and an
+  // unreadable clock must withhold the nudge rather than invent one — a missed nudge
+  // leaves an idle agent, an invented one derails a working agent.
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed();
+  clock.t -= 60_000; // the clock jumps backwards during the outage
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 0);
+
+  const broken = createBridgeOutageTracker({ now: () => NaN });
+  broken.noteBridgeClosed();
+  broken.noteHandshake();
+  assert.equal(broken.outageMs(), 0);
+  assert.equal(broken.isDown(), false, "an untimed outage must still be closed out");
+});
+
+test("#1145: a `ready` ack that beats the models handshake still measures the outage", () => {
+  // THE ORDERING THIS NEARLY GOT WRONG. The reader is the ready ack, and ready does not
+  // wait for the handshake that closes an outage: the orchestrator pushes its models
+  // frame from an async continuation (`void ensureModels(backend).then(…)`) while the
+  // ready ack goes out synchronously once hello is processed. For any backend whose
+  // model discovery costs a probe, ready arrives FIRST — so at read time the outage is
+  // still open. Reporting the last CLOSED outage there would answer 0 and swallow the
+  // nudge on exactly the real restart this issue exists to restore.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed(); // ComfyUI restarts
+  clock.t += 30_000; // socket is back and hello processed; models still discovering
+  assert.equal(tracker.isDown(), true, "the handshake has not closed the outage yet");
+  assert.equal(
+    tracker.outageMs(),
+    30_000,
+    "an outage still in progress must read live, not as the last closed one",
+  );
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+
+  // …and the models frame landing moments later agrees, rather than revising it.
+  clock.t += 40;
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 30_040);
+});
+
+test("#1145: a LIVE reading still measures the outage, not the last backoff step", () => {
+  // The live path must not be a back door to the original defect: refused retries during
+  // the outage must leave its start alone here too.
+  const { clock, tracker } = trackerAt();
+  const t0 = clock.t;
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed();
+  for (const t of [1000, 3000]) {
+    clock.t = t0 + t;
+    tracker.noteBridgeClosed(); // refused attempts
+  }
+  clock.t = t0 + 7000; // the ready ack arrives before models
+  assert.equal(tracker.outageMs(), 7000, "live reading measures the outage, not 7000-3000");
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1145: a never-dropped bridge reads 0 live, not the age of the session", () => {
+  // The #1138 case against the live path: with no outage open, the live branch must not
+  // engage at all. If it measured from a 0 start it would report the whole session as an
+  // outage — the ~56-year sentinel bug, reintroduced through the new reading.
+  const { clock, tracker } = trackerAt();
+  clock.t += 3_600_000; // an hour of uptime, never a drop
+  assert.equal(tracker.isDown(), false);
+  assert.equal(tracker.outageMs(), 0);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
+});
+
+// ── #1163: a turn start CLOSES the outage, it does not merely zero the total ──
+//
+// Zeroing alone left `startedAt` running across the turn boundary, so an outage that
+// began before the turn was still measured from before the turn existed. Reachable
+// because sendUserMessage needs only an OPEN socket, not a handshake, and the socket
+// reopens well before the `models` frame — so a user can type into the gap and have the
+// reply nudged as though their connection had just dropped.
+
+test("#1163: a turn started during an open outage is not charged with it", () => {
+  // The reported sequence. Bridge drops; the socket is back but unhandshaken; the user
+  // sends a message; the late handshake must NOT measure from before that turn.
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed(); // t=0, the real drop
+  clock.t += 5000; // socket reopens; `models` still pending
+  tracker.noteTurnStarted(); // the user's new message draws turn:working
+  assert.equal(tracker.isDown(), false, "a frame from the orchestrator ends the outage");
+  assert.equal(tracker.outageMs(), 0);
+
+  clock.t += 30_000; // the models frame finally lands
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 0, "the pre-turn drop must not be measured here");
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    false,
+    "a turn the user just started must never be told its connection dropped",
+  );
+});
+
+test("#1163: any turn start during an outage ends it — a working agent is never nudged", () => {
+  // Deliberately stated as the TRACKER's contract, not as a claim about frame ordering.
+  // An earlier version of this test asserted that a surviving orchestrator's re-announce
+  // beats the `ready` ack; the panel guarantees no such ordering, so that test pinned an
+  // assumption rather than a behaviour. What is true without any ordering assumption:
+  // whenever a turn start is seen, a turn is in flight, and the nudge exists only to
+  // rescue an IDLE agent — so from that moment there is nothing to rescue. If the ack
+  // arrives FIRST the outage still stands and the nudge fires, which is correct too:
+  // nothing had yet said a turn was running.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted(); // turn begins
+  tracker.noteBridgeClosed(); // ComfyUI bounces, orchestrator survives
+  clock.t += 30_000;
+  tracker.noteTurnStarted(); // the surviving turn re-announces on reconnect
+  assert.equal(
+    shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }),
+    false,
+    "a turn that never died must not be told to resume",
+  );
+});
+
+test("#1163: an orchestrator that DIED still nudges — no re-announce arrives first", () => {
+  // The complement, so the fix cannot be satisfied by never nudging: a dead orchestrator
+  // has no live turn to re-announce, so nothing closes the outage before the ready ack.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed();
+  clock.t += 30_000;
+  tracker.noteHandshake(); // only the handshake arrives — no turn:working
+  assert.equal(tracker.outageMs(), 30_000);
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1163: a drop AFTER the turn start is still measured in full", () => {
+  // Closing on a turn start must not blunt the live path: a drop that happens after the
+  // turn begins is entirely this turn's, including when read before the handshake.
+  const { clock, tracker } = trackerAt();
+  tracker.noteTurnStarted();
+  clock.t += 1000;
+  tracker.noteBridgeClosed();
+  clock.t += 20_000;
+  assert.equal(tracker.outageMs(), 20_000, "live read, ready ahead of models");
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), true);
+});
+
+test("#1145: a second outage measures itself, not the gap since the first", () => {
+  // The outage must close cleanly, or the NEXT drop measures from the previous one's
+  // start and every later reconnect reads as a longer and longer restart.
+  const { clock, tracker } = trackerAt();
+  tracker.noteBridgeClosed();
+  clock.t += 30_000;
+  tracker.noteHandshake();
+
+  clock.t += 600_000;
+  tracker.noteTurnStarted();
+  tracker.noteBridgeClosed(); // a SECOND, brief outage
+  clock.t += 1500;
+  tracker.noteHandshake();
+  assert.equal(tracker.outageMs(), 1500, "the second outage is 1.5s, not 10 minutes");
+  assert.equal(shouldNudgeAfterMidTaskReconnect({ outageMs: tracker.outageMs() }), false);
 });

@@ -13,7 +13,21 @@
 // cmcp-cv-filters / cmcp-cv-flabel / cmcp-cv-frow / cmcp-cv-chip) so CivitAI's
 // filter panel + its Playwright/agent-drive specs keep working unchanged.
 
+// TRANSLATION: both "Filters" literals are DEFAULT PARAMETERS, which is why the
+// string extractor never proposed them — it matches `title:`-style assignment
+// contexts, and a default lives in a destructuring pattern instead. Defaults
+// evaluate per CALL, not at module load, so tr() here resolves against whatever
+// catalog is loaded by the time a filter button or sheet is built.
+//
+// Be aware of what this does NOT cover: today BOTH defaults are dead. Apps passes
+// its own "Filter apps" to each (cmcp-apps-ui.js), and CivitAI passes title:null
+// for a deliberately tooltip-less button and titles its sheet from its own
+// openSubModal("Filters") call (cmcp-civitai-ui.js). Those literals belong to
+// those files and are converted with them. What is translated here is the
+// contract this module publishes for a caller that omits the argument.
+
 import { openSubModal as openSubModalBase } from "./cmcp-modal.js";
+import { tr } from "./lib/i18n.js";
 
 const el = (tag, cls, txt) => {
   const n = document.createElement(tag);
@@ -32,7 +46,7 @@ function injectFilterCss() {
   _cssInjected = true;
   const css = `
   .cmcp-cv-filters { display: flex; flex-direction: column; gap: .7rem; }
-  .cmcp-cv-flabel { font-size: .7rem; text-transform: uppercase; letter-spacing: .04em;
+  .cmcp-cv-flabel { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); text-transform: uppercase; letter-spacing: .04em;
     color: var(--p-text-muted-color,#a1a1aa); width: 100%; }
   `;
   const style = document.createElement("style");
@@ -64,7 +78,7 @@ export function chipRow(container, label, options, isOn, onPick) {
  *  layout). `title` is applied only when truthy — CivitAI passes null to stay
  *  byte-identical to its original title-less button. Returns { btn, dot,
  *  setActive }. */
-export function makeFilterButton({ onOpen, title = "Filters", marginLeftAuto = true } = {}) {
+export function makeFilterButton({ onOpen, title = tr("filter.filters", "Filters"), marginLeftAuto = true } = {}) {
   const btn = el("button", "cmcp-cv-iconbtn");
   if (marginLeftAuto) btn.style.marginLeft = "auto";
   if (title) btn.title = title;
@@ -84,7 +98,7 @@ export function makeFilterButton({ onOpen, title = "Filters", marginLeftAuto = t
  *  re-invokes render after a chip toggles so its pressed state flips immediately
  *  (the pattern CivitAI's sheet uses). `onClose` runs on any dismissal. Returns
  *  the sheet handle ({ body, close }). */
-export function openFilterPanel({ openModal = openSubModalBase, title = "Filters", onClose, render } = {}) {
+export function openFilterPanel({ openModal = openSubModalBase, title = tr("filter.filters", "Filters"), onClose, render } = {}) {
   injectFilterCss();
   const sheet = openModal(title, onClose);
   const rerender = () => {

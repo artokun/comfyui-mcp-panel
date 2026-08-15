@@ -1,0 +1,206 @@
+{
+  "comfyui-mcp_starGithub": {
+    "name": "在 GitHub 上加星",
+    "tooltip": "覺得 ComfyUI Agent Panel 好用嗎？在 GitHub 上加一顆星真的很有幫助。會在新分頁開啟這個專案。"
+  },
+  "comfyui-mcp_whatsNew": {
+    "name": "更新內容",
+    "tooltip": "在面板對話中顯示最近的變更 —— 這個版本以及先前版本推出了哪些東西。面板可能會自動從 Comfy Registry 更新，所以當你覺得某個行為跟記憶中不一樣時，先來這裡看看。"
+  },
+  "comfyui-mcp_readDocs": {
+    "name": "說明文件",
+    "tooltip": "面板、工具、本機 LLM 與疑難排解的完整指南 —— comfyui-mcp.artokun.io/docs"
+  },
+  "comfyui-mcp_joinDiscord": {
+    "name": "社群",
+    "tooltip": "加入 comfyui-mcp 的 Discord —— 公告、使用技巧與求助。會在新分頁開啟。"
+  },
+  "comfyui-mcp_getHelp": {
+    "name": "需要協助嗎？",
+    "tooltip": "卡住了嗎？這會把一份簡短的診斷摘要（面板版本、後端、ComfyUI、作業系統）複製到剪貼簿並開啟 Discord —— 把它貼進你的訊息裡，我們才能快速幫上忙。"
+  },
+  "comfyui-mcp_defaultBackend": {
+    "name": "預設代理後端",
+    "tooltip": "面板預設要連線的背景代理。Claude 使用你的 Claude 訂閱；ChatGPT 使用你的 Codex（ChatGPT）帳號；Gemini 使用你的 Google（Gemini）登入。這會決定面板的初始後端（以及下方哪一組設定會用於執行階段）；你仍然可以在模型選單中即時切換（即時切換只影響目前的工作階段，不會更動這個預設值）。"
+  },
+  "comfyui-mcp_autoConnect": {
+    "name": "載入時自動連線",
+    "tooltip": "面板開啟時就自動連線代理（並啟動本機協調器），不必按「連線」。預設為關閉 —— 否則協調器只會在你明確按下「連線」時才啟動。"
+  },
+  "comfyui-mcp_language": {
+    "name": "面板語言",
+    "tooltip": "面板本身文字所使用的語言。選「偵測」會跟隨 ComfyUI 的語言設定，所以改 ComfyUI 的語言就會一起改面板。尚未翻譯的內容會退回英文顯示。重新開啟或重新載入面板後生效。"
+  },
+  "comfyui-mcp_mobileAppBeta": {
+    "name": "用手機 App 遙控（Beta）",
+    "tooltip": "在面板標題列顯示遙控配對按鈕（QR code），並在下方顯示 Beta 版 App 的下載連結。手機 App 仍在 Beta 階段且變動頻繁 —— 請預期會有不完善之處、版本之間的破壞性變更，以及偶爾需要重新配對。除非你自己選擇網際網路模式，否則配對只會在你自己的電腦／網路內進行。"
+  },
+  "comfyui-mcp_featureFlag_apps": {
+    "name": "顯示「應用」",
+    "tooltip": "在工具列顯示「應用」按鈕 —— 也就是微應用層（把工作流程轉成一鍵應用、在本機或 Pod 上執行、發布／探索）。預設關閉；這個開關也會傳給已連線的手機 App。"
+  },
+  "comfyui-mcp_featureFlag_training": {
+    "name": "顯示「訓練」",
+    "tooltip": "在工具列顯示「訓練」按鈕 —— 也就是 LoRA 訓練精靈（蒐集資料集／標註／啟動／監看）。預設關閉；這個開關也會傳給已連線的手機 App。"
+  },
+  "comfyui-mcp_featureFlag_runpod": {
+    "name": "顯示「RunPod／本機」",
+    "tooltip": "在工具列顯示「RunPod／本機」主機按鈕 —— 部署／啟動／停止／連線雲端 GPU Pod，或切回本機。預設關閉；這個開關也會傳給已連線的手機 App。"
+  },
+  "comfyui-mcp_mobileAppLinks": {
+    "name": "取得 Beta 版 App",
+    "tooltip": "ComfyUI MCP 手機 App 的測試版下載。iOS 透過 Apple TestFlight 安裝，Android 透過 Firebase App Distribution。兩個管道都是 Beta：版本更新頻繁，可能需要重新與這個面板配對。"
+  },
+  "comfyui-mcp_uiScale": {
+    "name": "面板介面縮放（%）",
+    "tooltip": "整個代理側邊欄一起縮放 —— 文字、圖示與間距同步調整。如果在高 DPI 或大螢幕上看不清楚，就把它調大。預設是 100%，可設 100-250。立即套用到所有已開啟的面板。請注意：在使用者樣式表裡覆寫 `.cmcp-root { font-size }` 是「沒有用」的，因為面板內部尺寸用的是 `rem`，會以頁面根元素為基準而不是面板，所以大部分文字都不會理它。要縮放面板，這個設定才是受支援的做法。"
+  },
+  "comfyui-mcp_stallWarningSeconds": {
+    "name": "算圖停滯警告（秒）",
+    "tooltip": "ComfyUI 算圖可以完全「沒有進度」多久，之後才警告代理它的算圖看起來卡住了（例如 OOM 卡在取樣步驟），並要求它取消／重啟，而不是再排一次。影片的每一步本來就慢，所以這個值請設寬鬆一點。預設 180 秒，範圍 15–3600。協調器下次啟動時才會套用 —— 若要改變執行中的代理，請先「中斷連線」再「連線」（或用 /restart）。"
+  },
+  "comfyui-mcp_remoteComfyuiUrl": {
+    "name": "遠端 ComfyUI 網址（進階）",
+    "tooltip": "讓「代理」指向遠端的 ComfyUI 而不是這台電腦 —— 例如位於 https://xxxxxxxx-8188.proxy.runpod.net 的 RunPod Pod。留空則使用本機 ComfyUI（預設）。設定之後，代理的工具（佇列、模型、歷史記錄、上傳）都會指向遠端伺服器，而只能在本機執行的工具則會停用：模型下載 (download_model)、安裝器節點包、模型掃描。協調器下次啟動時才會套用 —— 請先「中斷連線」再「連線」。你的即時畫布仍然跟著你在瀏覽器中開啟的那個 ComfyUI 走。"
+  },
+  "comfyui-mcp_bridgeUrl_single": {
+    "name": "橋接網址（進階）",
+    "tooltip": "面板協調器橋接的 WebSocket 網址 —— 現在「一條」橋接就服務所有供應商（預設 ws://127.0.0.1:9180）。只有在你用非預設連接埠啟動協調器時才需要更改 (COMFYUI_MCP_BRIDGE_PORT)。下次按「連線」時生效。"
+  },
+  "comfyui-mcp_zoomToAction": {
+    "name": "縮放到代理的修改處",
+    "tooltip": "當代理更動某個節點的值時，把畫布平滑地縮放到那個節點（保留一點邊距），讓你看著變化發生；等修改停下來之後，再縮回可看見整張節點圖的比例。只針對「數值」修改 —— 接線與節點擺放不會移動視野。預設開啟；想讓畫布保持不動就關掉它。"
+  },
+  "comfyui-mcp_preferredModels": {
+    "name": "偏好模型",
+    "tooltip": "你自己愛用的模型，以逗號分隔 —— 可以是 Ollama 標籤（artokun/gemma4-comfyui-mcp:e4b —— 我們針對 ComfyUI 微調的模型、gemma4:12b、qwen3:4b），也可以是 OpenRouter 的 id（xiaomi/mimo-v2.5、moonshotai/kimi-k2.5）。它們會被釘在模型選單的最上方（若不在自動探索到的清單中會標上 ★）。由協調器保存，因此重新啟動後仍然有效，而且立即套用。"
+  },
+  "comfyui-mcp_ollama_api": {
+    "name": "端點類型",
+    "tooltip": "Ollama 後端要用哪種方式跟端點溝通。選「Ollama（本機）」會使用本機 Ollama 原生的 /api/chat。選「OpenAI 相容」則走 /chat/completions —— OpenRouter、vLLM、LM Studio、DeepSeek 等請用這個（並在下方設定基底網址；API 金鑰取自協調器的環境變數，例如 OPENROUTER_API_KEY 之類）。只影響「新的」工作階段 —— 改完請先「中斷連線」再「連線」。"
+  },
+  "comfyui-mcp_ollama_baseUrl": {
+    "name": "端點基底網址",
+    "tooltip": "上面那個端點的基底網址。使用本機 Ollama 請留空（http://127.0.0.1:11434）。OpenAI 相容端點要包含 /v1（例如 https://openrouter.ai/api/v1）。只影響「新的」工作階段 —— 改完請先「中斷連線」再「連線」。"
+  },
+  "comfyui-mcp_custom_baseUrl": {
+    "name": "端點基底網址",
+    "tooltip": "任何 OpenAI 相容的端點 —— vLLM、DeepSeek、Together、Azure OpenAI、跑在另一台機器上的 llama-server… 網址要包含 /v1（例如 http://192.168.1.20:8000/v1）。由協調器保存並立即套用；如果伺服器需要金鑰，請用下方的「設定 API 金鑰…」。留空則停用這個供應商。"
+  },
+  "comfyui-mcp_defaultModel_claude": {
+    "name": "預設模型",
+    "tooltip": "Claude 背景代理的預設模型，從為 Claude 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Claude 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_codex": {
+    "name": "預設模型",
+    "tooltip": "ChatGPT 背景代理的預設模型，從為 ChatGPT 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 ChatGPT 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_gemini": {
+    "name": "預設模型",
+    "tooltip": "Gemini 背景代理的預設模型，從為 Gemini 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Gemini 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_antigravity": {
+    "name": "預設模型",
+    "tooltip": "Antigravity 背景代理的預設模型，從為 Antigravity 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Antigravity 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_pi": {
+    "name": "預設模型",
+    "tooltip": "Pi 背景代理的預設模型，從為 Pi 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Pi 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_grok": {
+    "name": "預設模型",
+    "tooltip": "Grok 背景代理的預設模型，從為 Grok 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Grok 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_kimi": {
+    "name": "預設模型",
+    "tooltip": "Kimi 背景代理的預設模型，從為 Kimi 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Kimi 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_moonshot": {
+    "name": "預設模型",
+    "tooltip": "Kimi K3 背景代理的預設模型，從為 Kimi K3 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Kimi K3 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_glm": {
+    "name": "預設模型",
+    "tooltip": "GLM（z.ai）背景代理的預設模型，從為 GLM（z.ai）取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 GLM（z.ai）之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_minimax": {
+    "name": "預設模型",
+    "tooltip": "MiniMax 背景代理的預設模型，從為 MiniMax 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 MiniMax 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_ollama": {
+    "name": "預設模型",
+    "tooltip": "Ollama 背景代理的預設模型，從為 Ollama 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Ollama 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_openrouter": {
+    "name": "預設模型",
+    "tooltip": "OpenRouter 背景代理的預設模型，從為 OpenRouter 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 OpenRouter 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_lmstudio": {
+    "name": "預設模型",
+    "tooltip": "LM Studio 背景代理的預設模型，從為 LM Studio 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 LM Studio 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_llamacpp": {
+    "name": "預設模型",
+    "tooltip": "llama.cpp 背景代理的預設模型，從為 llama.cpp 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 llama.cpp 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultModel_custom": {
+    "name": "預設模型",
+    "tooltip": "自訂端點背景代理的預設模型，從為自訂端點取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上自訂端點之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
+  "comfyui-mcp_defaultEffort_claude": {
+    "name": "預設推理強度",
+    "tooltip": "Claude 代理的預設推理強度，從它自己的級距挑選（low–max）。選「模型預設」則不指定。"
+  },
+  "comfyui-mcp_defaultEffort_codex": {
+    "name": "預設推理強度",
+    "tooltip": "ChatGPT 代理的預設推理強度，從它自己的級距挑選（none–ultra）。選「模型預設」則不指定。"
+  },
+  "comfyui-mcp_defaultEffort_gemini": {
+    "name": "預設推理強度",
+    "tooltip": "Gemini 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_antigravity": {
+    "name": "預設推理強度",
+    "tooltip": "Antigravity 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_pi": {
+    "name": "預設推理強度",
+    "tooltip": "Pi 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_grok": {
+    "name": "預設推理強度",
+    "tooltip": "Grok 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_kimi": {
+    "name": "預設推理強度",
+    "tooltip": "Kimi 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_moonshot": {
+    "name": "預設推理強度",
+    "tooltip": "Kimi K3 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_glm": {
+    "name": "預設推理強度",
+    "tooltip": "GLM（z.ai）沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_minimax": {
+    "name": "預設推理強度",
+    "tooltip": "MiniMax 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_setOpenrouterKey": {
+    "name": "OpenRouter API 金鑰",
+    "tooltip": "安全地保存你的 OpenRouter API 金鑰。會開啟一個遮蔽輸入框；輸入的值直接送進協調器權限 0600 的儲存區（~/.comfyui-mcp） —— 絕對不會寫進 ComfyUI 設定、記錄檔、聊天記錄或代理的上下文。只需要橋接就能用（請先按「連線」 —— 不需要任何供應商準備就緒）。"
+  },
+  "comfyui-mcp_setCustomEndpointKey": {
+    "name": "自訂端點 API 金鑰",
+    "tooltip": "安全地保存你的自訂端點 API 金鑰。會開啟一個遮蔽輸入框；輸入的值直接送進協調器權限 0600 的儲存區（~/.comfyui-mcp） —— 絕對不會寫進 ComfyUI 設定、記錄檔、聊天記錄或代理的上下文。只需要橋接就能用（請先按「連線」 —— 不需要任何供應商準備就緒）。"
+  },
+  "comfyui-mcp_setCivitaiToken": {
+    "name": "CivitAI 權杖",
+    "tooltip": "安全地保存你的 CivitAI API 權杖。會開啟一個遮蔽輸入框；輸入的值直接送進協調器權限 0600 的儲存區（~/.comfyui-mcp） —— 絕對不會寫進 ComfyUI 設定、記錄檔、聊天記錄或代理的上下文。只需要橋接就能用（請先按「連線」 —— 不需要任何供應商準備就緒）。"
+  },
+  "comfyui-mcp_setHuggingfaceToken": {
+    "name": "HuggingFace 權杖",
+    "tooltip": "安全地保存你的 HuggingFace API 權杖。會開啟一個遮蔽輸入框；輸入的值直接送進協調器權限 0600 的儲存區（~/.comfyui-mcp） —— 絕對不會寫進 ComfyUI 設定、記錄檔、聊天記錄或代理的上下文。只需要橋接就能用（請先按「連線」 —— 不需要任何供應商準備就緒）。"
+  }
+}

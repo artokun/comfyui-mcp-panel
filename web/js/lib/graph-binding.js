@@ -1,3 +1,10 @@
+import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
+import { nodeInputsDifferOnlyByDefinitionRebuild } from "./node-inputs-rebuild.js";
+import {
+  isEmptyBaselineMismatch,
+  emptyBaselineNote,
+  emptyBaselineRemedy,
+} from "./empty-baseline-deadend.js";
 /**
  * Detect a graph READ that is out of sync with the ACTIVE workflow (panel#389).
  *
@@ -169,13 +176,23 @@ export function graphRootMidPopulation({
  *   - with NO active workflow service at all, the legacy availability path
  *     stands (that frontend never had binding fences).
  */
-export function graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid } = {}) {
+export function graphEmptyBindingUnproven({
+  graph,
+  rootGraph,
+  activeWorkflow,
+  activeWorkflowUuid,
+  graphLoading = false,
+} = {}) {
   if (!!rootGraph && graph && graph !== rootGraph) return false; // subgraph scope
   const live = rootGraph?._nodes;
   if (!Array.isArray(live) || live.length !== 0) return false; // populated or unobservable
   if (!activeWorkflow) return false; // no workflow service — legacy availability
   if (activeWorkflowProvenEmpty(activeWorkflow)) return false; // PROVEN empty — truthful 0
   if (graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false; // positively bound
+  // #833 — both sides provably content-free. The clause above cannot fire on a blank
+  // tab (always dirty), which left the ordinary "about to build a workflow" state
+  // permanently refused.
+  if (emptyCanvasBindingProven({ rootGraph, activeWorkflow, graphLoading })) return false;
   return true; // empty + unproven + unbound ⇒ inconclusive, never authoritative-empty
 }
 
@@ -227,16 +244,90 @@ const SERIALIZED_FORMAT_METADATA_KEYS = new Set([
 ]);
 
 /**
+ * Can a value inside `extra` be GRAPH CONTENT — nodes, links, groups, subgraph
+ * definitions, anything whose loss would mean a canvas is not really empty?
+ *
+ * #833 — the rule used to be "any non-empty value in `extra` defeats the proof",
+ * and on a real install that meant NO empty workflow was ever provably empty.
+ * Every workflow ComfyUI writes carries `extra.frontendVersion` (a version
+ * string), and installed extensions add their own per-workflow settings —
+ * `VHS_latentpreview: false`, `workflowRendererVersion`, `workflowHash`. All
+ * verified against this repo owner's own `user/default/workflows`. A blank
+ * canvas therefore failed `activeWorkflowProvenEmpty`, which is the FIRST escape
+ * out of `graphEmptyBindingUnproven`, and the panel fell through to the seal —
+ * where a second blank tab makes the exclusivity probe ambiguous, so nothing
+ * sealed and every graph tool refused with no way out.
+ *
+ * THE RULE IS BY TYPE, NOT BY TRUST (codex). The first cut said "a scalar cannot
+ * be graph content" and admitted every scalar, present and future, from any
+ * extension. That is an accept-all-unknown policy on a fence that also gates root
+ * UUID stamping, and it has a real counterexample: an extension may stash a
+ * serialized graph as a JSON STRING. So:
+ *
+ *  - a BOOLEAN or a NUMBER is admitted, because a graph cannot be encoded in one.
+ *    That is a property of the type, not a judgement about who wrote it, so it
+ *    needs no allowlist and cannot be invalidated by a future extension;
+ *  - a STRING must be NAMED. `extra.frontendVersion` and its siblings are the
+ *    stamps that made every real workflow unprovable, and they are a short,
+ *    knowable list. Anything else stays content until someone establishes
+ *    otherwise — a workflow that keeps refusing is recoverable, a canvas stamped
+ *    with the wrong identity is not;
+ *  - an ARRAY or OBJECT is structured and stays content, which is what keeps
+ *    `groupNodes`, `ue_links`, `linkExtensions` and a stashed `reroutes`
+ *    defeating the proof exactly as before.
+ *
+ * This does not weaken the #560 protection it was written for. A tab that is
+ * MID-RESTORE has the full graph in its tracker state — that is the restore
+ * source — so it fails the `nodes.length !== 0` check above and never reaches
+ * this rule. The strictness on version stamps was protecting nothing and costing
+ * the empty-canvas case its only exit.
+ */
+const EXTRA_METADATA_STRING_KEYS = new Set([
+  "frontendVersion",
+  "workflowRendererVersion",
+  "workflowHash",
+  "version",
+  "revision",
+]);
+
+/** Could this text be carrying STRUCTURED data rather than naming or stamping
+ *  something? A version, a hash and an extension's setting name are all short and
+ *  free of JSON delimiters; a stashed graph is neither. Applied to admitted string
+ *  VALUES and to the KEY itself, because a graph can be encoded in an object key
+ *  with a boolean value just as easily as in a string value (codex round 2). */
+const STRUCTURAL_TEXT_CHARS = ["{", "}", "[", "]"];
+const looksStructured = (text) =>
+  text.length > 64 || STRUCTURAL_TEXT_CHARS.some((ch) => text.includes(ch));
+
+const extraValueMayBeGraphContent = (key, value) => {
+  // The KEY first: a name carrying JSON delimiters is not a setting name, and the
+  // value's type says nothing about what the key is smuggling.
+  if (typeof key === "string" && looksStructured(key)) return true;
+  if (isEmptySurfaceValue(value)) return false;
+  if (typeof value === "boolean" || typeof value === "number") return false;
+  if (typeof value === "string") {
+    // A named stamp still has to LOOK like one. Trusting the key alone would let
+    // `frontendVersion: '{"nodes":[…]}'` through on the strength of its name.
+    return !EXTRA_METADATA_STRING_KEYS.has(key) || looksStructured(value);
+  }
+  // Arrays, objects, and anything exotic (bigint, symbol, function) stay content:
+  // an unrecognized shape is not evidence of emptiness.
+  return true;
+};
+
+/**
  * POSITIVE proof that a serialized graph state holds NO workflow content at
  * all — the empty-canvas relaxation's evidence bar (#565 gate). True only
  * when `state` is a well-formed serialized graph whose `nodes` is a PRESENT
  * empty array (a missing/malformed read proves nothing) AND every own
  * surface outside the format-metadata allowlist is absent-or-empty. Inside
  * `extra`, `ds` (viewport) and `comfyui_mcp` (the panel's own identity tag)
- * are not content; any other key must hold an empty value. A single
- * non-empty subgraphs/groups/reroutes/links surface — or any unknown
- * non-empty surface — defeats the proof, so a foreign content-bearing canvas
- * can never be re-stamped through the relaxation.
+ * are not content, and neither is a boolean, a number or a NAMED version stamp
+ * (see above, #833); any other key
+ * must hold an empty value. A single non-empty subgraphs/groups/reroutes/links
+ * surface — or any unknown non-empty STRUCTURED surface — defeats the proof, so
+ * a foreign content-bearing canvas can never be re-stamped through the
+ * relaxation.
  */
 export function serializedStateProvenEmpty(state) {
   try {
@@ -248,11 +339,14 @@ export function serializedStateProvenEmpty(state) {
         if (value == null) continue;
         if (typeof value !== "object" || Array.isArray(value)) return false;
         const { ds: viewport, comfyui_mcp: panelTag, ...workflowExtra } = value;
-        for (const extraValue of Object.values(workflowExtra)) {
-          if (!isEmptySurfaceValue(extraValue)) return false;
+        for (const [extraKey, extraValue] of Object.entries(workflowExtra)) {
+          if (extraValueMayBeGraphContent(extraKey, extraValue)) return false;
         }
         continue;
       }
+      // OUTSIDE `extra` the surfaces are the graph's own (nodes, links, groups,
+      // reroutes, subgraphs, definitions), so the strict rule stands: anything
+      // non-empty here is content by construction.
       if (!isEmptySurfaceValue(value)) return false;
     }
     return true;
@@ -275,6 +369,54 @@ export function serializedStateProvenEmpty(state) {
 export function activeWorkflowProvenEmpty(activeWorkflow) {
   try {
     if (activeWorkflow?.isModified === true) return false;
+    return serializedStateProvenEmpty(activeWorkflowCurrentState(activeWorkflow));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * BOTH SIDES PROVABLY CONTENT-FREE — the one thing that can bind an EMPTY canvas
+ * (#833).
+ *
+ * Content cannot identify an empty canvas: every blank canvas serializes alike, so
+ * `rootContentProvesActiveWorkflow` has nothing to compare and the seal never fires.
+ * And a blank tab is ALWAYS dirty — creating or clearing it is what dirties it — so
+ * `activeWorkflowProvenEmpty` short-circuits on `isModified` and can never succeed
+ * either. Both proofs are therefore permanently unavailable in exactly the state a
+ * user is in right before asking an agent to build a workflow: reads refused as
+ * `empty-binding-unproven`, mutations as `dirty-mutation-binding-unproven`, with no
+ * recovery that clears it.
+ *
+ * This is #565's own rule, applied where it was never reached. That gate already
+ * re-stamps a MISMATCHED tag when both sides are proven content-free, on the stated
+ * grounds that **the #349 fence protects CONTENT** and there is none. The same holds
+ * for an UNTAGGED root, and it does not stop holding because the tab is dirty:
+ *
+ *   - the lag `isModified` guards against (#545) is neutralised by the CONJUNCTION,
+ *     not by cleanliness. A lagging tracker's state is merely OLD; if either the
+ *     stale snapshot or the live root held content, that side fails its proof and
+ *     this returns false. Both sides can only agree on empty when neither has any.
+ *   - what cleanliness genuinely proves elsewhere is IDENTITY by content match, and
+ *     that is not what is claimed here. Nothing is being matched — the claim is only
+ *     that there is no content anywhere to mis-attribute.
+ *
+ * `graphLoading` is the one case emptiness alone cannot exclude: a canvas mid-load
+ * reads genuinely empty at that instant and is about to be populated, which is the
+ * FALSE-EMPTY reading the refusal text names. The caller passes ComfyUI's own
+ * `ChangeTracker.isLoadingGraph` rather than a proxy for it; unreadable ⇒ pass true
+ * and prove nothing.
+ *
+ * Deliberately NOT weakened to "the root is empty": an empty ROOT with a workflow
+ * that reports content is #389, and it must keep failing.
+ */
+export function emptyCanvasBindingProven({ rootGraph, activeWorkflow, graphLoading = false } = {}) {
+  try {
+    if (graphLoading === true) return false; // mid-load ⇒ a 0 read may be FALSE-empty
+    if (!activeWorkflow) return false; // no workflow service — legacy availability path
+    if (!graphRootProvenEmpty(rootGraph)) return false; // the live canvas holds content
+    // The workflow's OWN current state, WITHOUT the cleanliness short-circuit — see
+    // above for why dirtiness does not weaken a both-sides-empty claim.
     return serializedStateProvenEmpty(activeWorkflowCurrentState(activeWorkflow));
   } catch {
     return false;
@@ -395,6 +537,179 @@ function graphShape(state) {
 }
 
 /**
+ * Per-node fields that carry no workflow CONTENT — the ones the ComfyUI frontend
+ * is free to rewrite while loading a graph it reproduced faithfully.
+ *
+ * THE LIST IS BORROWED, NOT INVENTED. `diffGraphsForAgent` — the panel's own
+ * user-facing graph diff — already draws this line, and states it: it reports
+ * adds, removes, mode, widget values, titles and connections, and "ignores pure
+ * moves/resizes/recolors (noise)". This set is exactly that noise, so the two
+ * places that decide what counts as a real edit cannot disagree.
+ *
+ * `size` is the reported case (#825): a node's box is recomputed from live
+ * widget/DOM metrics on load, so a workflow saved by one frontend build and
+ * loaded by another routinely comes back resized with an identical graph.
+ * `order` is LiteGraph's recomputed execution index, not user state.
+ *
+ * DELIBERATELY ABSENT, each one a way this could have lied (codex):
+ *  - `widgets_values` — the difference between two runs. Content.
+ *  - `title` — user-editable and persisted by `graph_edit_node`; the panel's own
+ *    diff reports a title change as a real edit. A load that reset a custom title
+ *    HAS lost something, and must not be waved through as a resize.
+ *  - `flags` — not just `collapsed`: `graph_edit_node` persists `pinned` here too.
+ *  - `mode` — bypass/mute is execution semantics.
+ */
+/**
+ * Node fields whose difference cannot mean AUTHORED CONTENT WAS LOST (#696).
+ *
+ * The rule, because a bare list grows by whoever filed last. `cosmeticOnly` licenses
+ * exactly one sentence downstream — "every node that was loaded is on it with the
+ * same id and type, nothing was lost" — so a field belongs here only when a
+ * difference in it is compatible with that sentence being TRUE. Not "does not affect
+ * execution": a node `title` does not affect execution either, and a title that
+ * changed IS lost authoring, so it stays out.
+ *
+ * By that test:
+ *   size, pos     the frontend re-measures and re-places on load
+ *   order         recomputed topologically, never authored directly
+ *   color/bgcolor authored, and a difference IS an authoring difference — but not a
+ *                 lost node and not a lost widget value, which is all the sentence
+ *                 downstream now claims.
+ *
+ * `showAdvanced` was added here for #696 and then REMOVED again (codex). The
+ * argument for it was that a display toggle cannot carry a lost value; the argument
+ * against is simply that a boolean IS a value, and this classifier sees every node
+ * type there will ever be. A pack can legitimately serialize meaningful state under
+ * that name, and nothing here can tell the two apart — a field name is not a
+ * contract, and a value-shape guard only re-states the name's promise in another
+ * form. #696 is fixed instead by not needing the question answered: see
+ * `nodeSetIntact` below, where the reassurance that actually matters rests on the
+ * node SET, which is proven, rather than on guessing what a field means.
+ *
+ * DENYLIST, deliberately, and it must stay one. An unknown field reads as
+ * non-cosmetic, so a pack the panel has never seen makes the disclosure cautious —
+ * noisy, and safe. Inverting to an allowlist of execution-relevant fields would make
+ * every unknown field cosmetic, i.e. the panel would tell a user "nothing was lost"
+ * about a surface it has never heard of. That is the fabricated all-clear this whole
+ * module exists to avoid, and it is worth more than the noise.
+ */
+const COSMETIC_NODE_FIELDS = new Set(["size", "pos", "order", "color", "bgcolor"]);
+
+
+/** The node's identity for set comparison: what makes it THIS node rather than
+ *  another one. Type included, because an id reused for a different type is a
+ *  different node however the count reads.
+ *
+ *  JSON-encoded rather than joined on a delimiter, because a join is not
+ *  injective (codex): with `id + "|" + type`, `{id:"a|b",type:"c"}` and
+ *  `{id:"a",type:"b|c"}` produce the SAME key, and two different nodes reading as
+ *  one is precisely the mis-pairing `sameNodeSet` must never make. Any delimiter
+ *  has this problem for some input; encoding the boundary removes it. */
+function nodeIdentityKey(node) {
+  return JSON.stringify([String(node?.id ?? ""), String(node?.type ?? "")]);
+}
+
+/**
+ * WHY two node arrays differ — specifically, whether anything was LOST.
+ *
+ * THE DEFECT THIS ANSWERS (#825). `nodes` is a single surface holding the whole
+ * serialized array, so "the graph on the canvas differs from what was loaded on:
+ * nodes" is emitted identically for a node that vanished and for a node whose box
+ * the frontend re-measured. A reporter read that after a perfectly good open and
+ * was pushed toward redoing work that was fine.
+ *
+ * This does NOT soften the verdict — see `resolveOpenRebindVerdict`, which stays
+ * `unknown` either way, deliberately. It makes the DISCLOSURE say which of the two
+ * it observed, because they send a reader to opposite places.
+ *
+ * Returns `{ comparable, sameNodeSet, cosmeticOnly, fields }`:
+ *  - `sameNodeSet` — every loaded node is present with the same id AND type, and
+ *    no extra ones appeared. Nothing was dropped, added or retyped.
+ *  - `cosmeticOnly` — sameNodeSet AND every per-node difference is confined to
+ *    COSMETIC_NODE_FIELDS. This is the "the frontend re-measured it" case.
+ *  - `fields` — the per-node keys that actually differed, so the disclosure can
+ *    name them instead of asking the reader to guess.
+ * Anything unreadable is `comparable:false` and asserts nothing.
+ */
+export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
+  const NOT_COMPARABLE = { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [] };
+  if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return NOT_COMPARABLE;
+  try {
+    const byKey = (list) => {
+      const map = new Map();
+      for (const node of list) {
+        if (!node || typeof node !== "object") return null; // a junk entry makes the set unreadable
+        const key = nodeIdentityKey(node);
+        if (map.has(key)) return null; // duplicate identity — cannot pair them up honestly
+        map.set(key, node);
+      }
+      return map;
+    };
+    const expected = byKey(expectedNodes);
+    const actual = byKey(actualNodes);
+    if (!expected || !actual) return NOT_COMPARABLE;
+
+    if (expected.size !== actual.size) return { ...NOT_COMPARABLE, comparable: true };
+    for (const key of expected.keys()) {
+      if (!actual.has(key)) return { ...NOT_COMPARABLE, comparable: true };
+    }
+
+    // Same set. Now: which per-node keys disagree?
+    //
+    // PRESENCE IS COMPARED BEFORE VALUE (codex). An earlier cut wrote
+    // `canonicalizeShapeValue(v) ?? null`, which made an ABSENT field equal to one
+    // explicitly set to `null` — so a node that lost its `widgets_values`
+    // (present-as-null on one side, gone on the other) dropped out of `fields`
+    // entirely, and a size change alongside it passed the cosmetic gate. A
+    // classifier that erases the very field that would have blocked the all-clear
+    // is the worst possible failure here.
+    //
+    // `undefined` IS ABSENT, though — and only `undefined` (#1001). A saved workflow
+    // is JSON, and `JSON.stringify` drops a key whose value is `undefined`, so no
+    // file can carry one: comparing a live in-memory `serialize()` against a parsed
+    // file declares a difference in a form that cannot exist on disk. MEASURED on
+    // ComfyUI 0.31.1 / frontend 1.48.7 — every node the frontend instantiates carries
+    // `showAdvanced: undefined`, absent from the file, so EVERY open of EVERY saved
+    // workflow reported a non-cosmetic per-node difference and the caller was told to
+    // go read widget values that had never changed.
+    //
+    // `null` stays significant, deliberately: JSON carries null, so present-as-null
+    // and absent are genuinely different states of a saved file, and collapsing them
+    // is the erasure the paragraph above exists to prevent. Spelling this `!= null`
+    // would in fact behave identically today — the value comparison below flags
+    // absent-vs-null anyway, `"undefined" !== "null"` — so the strict test is chosen
+    // for what it MEANS, not because the looser one currently misbehaves. Verified by
+    // mutation: swapping it changes no result, which is why no test claims otherwise.
+    const has = (node, field) =>
+      Object.prototype.hasOwnProperty.call(node, field) && node[field] !== undefined;
+    const fields = new Set();
+
+    for (const [key, expectedNode] of expected) {
+      const actualNode = actual.get(key);
+      const keys = new Set([...Object.keys(expectedNode), ...Object.keys(actualNode)]);
+      for (const field of keys) {
+        if (has(expectedNode, field) !== has(actualNode, field)) {
+          fields.add(field);
+          continue;
+        }
+        const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]));
+        const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]));
+        if (a !== b) fields.add(field);
+      }
+    }
+    const list = [...fields].sort();
+    return {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: list.length > 0 && list.every((field) => COSMETIC_NODE_FIELDS.has(field)),
+      fields: list,
+    };
+  } catch {
+    return NOT_COMPARABLE;
+  }
+}
+
+/**
  * WHICH surfaces of a just-loaded state the live root does not reproduce.
  *
  * This exists for the DISCLOSURE only — it names what disagreed so the answer is
@@ -403,18 +718,24 @@ function graphShape(state) {
  * `resolveOpenRebindVerdict` for why no classification of a content mismatch is
  * currently trustworthy enough to soften a verdict.
  *
+ * `nodeDifference` (#825) is the one refinement, and it refines the SENTENCE, not
+ * the verdict: within the `nodes` surface it separates "a node is missing" from
+ * "the frontend re-measured the boxes", which the surface name alone cannot.
+ *
  * "The panel could not compare" and "the panel compared and they differ" are
  * different answers, and collapsing the first into the second is the defect this
  * whole cluster is about. `comparable:false` means exactly that no comparison
  * happened — it is never evidence of a mismatch.
  */
 export function describeGraphStateDifference({ rootGraph, state } = {}) {
-  const NOT_COMPARABLE = { comparable: false, surfaces: [] };
+  const NOT_COMPARABLE = { comparable: false, surfaces: [], nodeDifference: null };
   try {
     const expectedShape = buildGraphShape(state);
     let actualShape = null;
+    let actualState = null;
     try {
-      actualShape = buildGraphShape(rootGraph?.serialize?.());
+      actualState = rootGraph?.serialize?.();
+      actualShape = buildGraphShape(actualState);
     } catch {
       actualShape = null;
     }
@@ -426,7 +747,17 @@ export function describeGraphStateDifference({ rootGraph, state } = {}) {
     };
     const expected = canon(expectedShape);
     const actual = canon(actualShape);
-    return { comparable: true, surfaces: Object.keys(expected).filter((key) => expected[key] !== actual[key]) };
+    const surfaces = Object.keys(expected).filter((key) => expected[key] !== actual[key]);
+    return {
+      comparable: true,
+      surfaces,
+      // Only when `nodes` is one of the disagreeing surfaces: otherwise there is
+      // nothing about the nodes to explain, and an all-clear here would read as
+      // one about the difference that actually fired.
+      nodeDifference: surfaces.includes("nodes")
+        ? classifyNodeDifference({ expectedNodes: state?.nodes, actualNodes: actualState?.nodes })
+        : null,
+    };
   } catch {
     return NOT_COMPARABLE;
   }
@@ -451,6 +782,208 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
     return expected != null && actual != null && expected === actual;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Per-node fields the ComfyUI frontend RECOMPUTES while loading a graph it
+ * reproduced faithfully.
+ *
+ * Deliberately NARROWER than `COSMETIC_NODE_FIELDS`. That set answers "may I
+ * reassure the reader", and it includes `color`/`bgcolor` because the sentence it
+ * feeds names the fields. THIS set answers "may the panel call the content
+ * PROVEN", and a lost `color` is a lost authored value — it must be able to hold
+ * the proof back even though it is cosmetic to look at.
+ *
+ * ONLY FIELDS THAT WERE MEASURED, and each one carries its own check below —
+ * membership here is necessary, never sufficient. An earlier cut also listed
+ * `pos` and `order`, on the reasoning that they are layout too. Neither was
+ * observed being rewritten by anything, `pos` is authored by the user dragging a
+ * node, and `order` is execution-order state in a LiteGraph-derived graph —
+ * proving content across a changed `order` would publish a fence for a graph
+ * whose observable behaviour changed (codex). Both remain OUT.
+ *
+ *   `size`   — the live install rewrote node HEIGHT on every open of every saved
+ *              workflow. Admitted only when the difference is height-only.
+ *   `inputs` — #1467. MEASURED in comfyui_frontend_package 1.48.7:
+ *              `ComfyNode.prototype.configure` GENERATES the live array from the
+ *              node definition (definition order, with `name`/`type`/`shape`/
+ *              `localized_name`/`widget` overlaid from it, unknown saved slots
+ *              appended), so a faithful open cannot round-trip what was saved.
+ *              Admitted only when every difference fits that rebuild.
+ *
+ * `widgets_values` is deliberately absent despite ALSO being rewritten on every
+ * load (`migrateWidgetsValues`): it is the field a genuine partial load drops,
+ * which is what #1111/#1089 are about, so admitting it would gut this guard.
+ *
+ * The rule stands: this grows only when a measurement says it must, and the
+ * measurement has to characterise the rewrite well enough to write its check.
+ */
+const RECOMPUTED_NODE_FIELDS = new Set(["size", "inputs"]);
+
+/**
+ * Did the live root reproduce this state's CONTENT — allowing for the geometry the
+ * frontend measures for itself?
+ *
+ * THE DEFECT THIS ANSWERS (#1001). `workflow_open` proved its content with
+ * `graphRootMatchesState`, a byte-shape equality over the whole serialized node
+ * array. MEASURED on ComfyUI 0.31.1 / frontend 1.48.7, opening a saved workflow
+ * from the user's own library: the frontend re-measured node boxes on load
+ * (`SaveVideo` 358 -> 126 high), so the shapes differed and the open reported
+ * CONTENT_UNVERIFIED — on a load that was perfect. That verdict throws, and a
+ * throwing open never reaches the line that publishes `workflow_uuid`, so the
+ * caller's fence stayed stale and the NEXT command was refused as a workflow
+ * instance mismatch. The reporter needed four calls to reach a state the panel
+ * already believed it was in.
+ *
+ * The difference is not a race — sampled at 0ms, one frame, 50ms, 250ms, 1s and 2s
+ * after the load resolved, it was identical every time. It is deterministic, and it
+ * applies to any workflow whose stored sizes are not what this frontend computes.
+ *
+ * Returns `{ proven, exact, fields }`. `exact` distinguishes a byte-identical
+ * repaint from one where geometry was rewritten, so a caller can DISCLOSE the
+ * difference instead of the panel quietly deciding it did not happen.
+ */
+/**
+ * Every node whose `size` differs differs ONLY in height, and both sides are a readable
+ * `[width, height]` pair.
+ *
+ * The measurement behind the whole exemption is a recomputed BOX HEIGHT. Width is not
+ * something the frontend was observed rewriting, so a width change is not covered by
+ * the evidence and must not ride in on the field's name (codex r2). Anything
+ * unreadable — a non-pair, a non-finite number, an unpairable node — answers false,
+ * because a proof cannot rest on a value nobody could read.
+ */
+function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
+  try {
+    if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return false;
+    // STRICTLY numbers. `Number.isFinite(Number(n))` would accept `null` (Number(null)
+    // is 0) and a numeric string — and a JSON round-trip turns NaN into null, so a
+    // height that arrived unreadable would have passed as a readable zero.
+    const readable = (size) =>
+      Array.isArray(size) && size.length === 2 && size.every((n) => typeof n === "number" && Number.isFinite(n));
+    const actualByKey = new Map();
+    for (const node of actualNodes) {
+      if (!node || typeof node !== "object") return false;
+      actualByKey.set(nodeIdentityKey(node), node);
+    }
+    for (const expectedNode of expectedNodes) {
+      if (!expectedNode || typeof expectedNode !== "object") return false;
+      const actualNode = actualByKey.get(nodeIdentityKey(expectedNode));
+      if (!actualNode) return false;
+      const before = expectedNode.size;
+      const after = actualNode.size;
+      if (JSON.stringify(canonicalizeShapeValue(before)) === JSON.stringify(canonicalizeShapeValue(after))) continue;
+      if (!readable(before) || !readable(after)) return false;
+      if (Number(before[0]) !== Number(after[0])) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
+  const NOT_PROVEN = { proven: false, exact: false, fields: [] };
+  try {
+    // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
+    // per check let a synchronous serialization hook — a broken or hostile custom node —
+    // show a height-only difference to the classifier and then alter a widget before the
+    // size check re-serialized, so a fence would be published for content no comparison
+    // ever saw. A single snapshot cannot disagree with itself.
+    const actualState = rootGraph?.serialize?.();
+    if (actualState == null) return NOT_PROVEN;
+    const frozen = { serialize: () => actualState };
+    if (graphRootMatchesState({ rootGraph: frozen, state })) return { proven: true, exact: true, fields: [] };
+    const diff = describeGraphStateDifference({ rootGraph: frozen, state });
+    // Never inferred from an absent comparison: `comparable:false` means no
+    // comparison happened, which is not evidence either way.
+    if (diff?.comparable !== true) return NOT_PROVEN;
+    const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
+    // ONE surface, and it must be `nodes`. A group or a link that disagrees is
+    // unexplained by anything the node comparison establishes.
+    // #886 — a `definitions` surface may accompany `nodes`, but ONLY when the whole
+    // of it is link renumbering. Measured: the frontend regenerates link identity
+    // inside subgraph definitions on load (state.lastLinkId advanced 2092 -> 2106 on
+    // a real 4-subgraph workflow) while node ids, types and topology stay identical.
+    // Before this, a faithful open of ANY workflow containing subgraphs reported
+    // CONTENT_UNVERIFIED — binding proven, nodes perfect, refused on a surface nobody
+    // had characterised.
+    //
+    // Everything else still refuses. `definitionsDifferOnlyByLinkRenumber` returns
+    // false for anything it cannot fully account for, and the caller reads that as
+    // "not proven" — never as "changed".
+    // The surface set must be a subset of { nodes, definitions } — nothing else is
+    // accounted for, and an unaccounted surface refuses.
+    //
+    // `definitions` is admitted ONLY when the difference there is pure link
+    // renumbering, which is what loading a persisted workflow does to
+    // definitions.subgraphs (measured: state.lastLinkId 2092 -> 2106).
+    //
+    // `nodes` is NOT required to be present. The earlier version demanded it, which
+    // review caught: the reported #886 case is a graph where definitions is the ONLY
+    // differing surface, so requiring `nodes` refused exactly the case this exists to
+    // prove — a fix wired into a branch its own bug report cannot reach.
+    const unique = [...new Set(surfaces)];
+    if (!unique.length) return NOT_PROVEN;
+    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return NOT_PROVEN;
+    if (unique.includes("definitions")) {
+      if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
+        return NOT_PROVEN;
+      }
+    }
+    // A definitions-only difference is fully accounted for once the renumber check
+    // passes: there is no node difference to classify.
+    if (!unique.includes("nodes")) {
+      return { proven: true, exact: false, fields: [] };
+    }
+    const nodes = diff.nodeDifference;
+    // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
+    // mutation: `classifyNodeDifference` only computes `fields` once the sets match, so
+    // a changed set arrives here as `sameNodeSet:false` with an EMPTY field list and
+    // either check refuses it. Removing BOTH does fail the suite. They are kept as two
+    // because they answer different questions — "is this the same graph" and "can the
+    // panel name what moved" — and a later change to one classifier must not silently
+    // remove the other's guarantee.
+    if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return NOT_PROVEN;
+    const fields = Array.isArray(nodes.fields) ? nodes.fields : [];
+    // WIDTH IS NOT MEASURED (codex r2). The evidence is a recomputed HEIGHT, and a
+    // field-name allowlist admits any rewrite of the whole `[w, h]` pair — so a changed
+    // width, or an arbitrary replacement, would have been PROVEN on the strength of a
+    // measurement about something else. Every differing size must be height-only.
+    if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, actualState?.nodes)) {
+      return NOT_PROVEN;
+    }
+    // #1467 — `inputs` is REBUILT by the frontend, not restored, and admitting it
+    // needs the same treatment `size` gets: characterise the rewrite and require
+    // every difference to fit it, rather than allowlisting the field name and
+    // waving through any change that lands in it.
+    //
+    // MEASURED (comfyui_frontend_package 1.48.7, ComfyNode.prototype.configure,
+    // which runs before LiteGraph's): the live array is generated by walking the
+    // node DEFINITION, overlaying `name`/`type`/`shape`/`localized_name`/`widget`
+    // from it, and appending saved slots the definition does not know. So its
+    // order is the definition's and five of its keys come from the definition on
+    // every load — a faithful open cannot reproduce the saved array.
+    //
+    // `nodeInputsDifferOnlyByDefinitionRebuild` returns false for anything that
+    // rewrite does not explain — a slot name appearing or vanishing, a changed
+    // `link`, any other key that moved — and false reads as NOT PROVEN here,
+    // never as "changed".
+    if (
+      fields.includes("inputs") &&
+      !nodeInputsDifferOnlyByDefinitionRebuild(state?.nodes, actualState?.nodes)
+    ) {
+      return NOT_PROVEN;
+    }
+    // An empty field list with a differing `nodes` surface means the two disagreed
+    // somewhere this classifier could not name — proving content off a difference
+    // nobody can point at is exactly the fabricated all-clear to avoid.
+    if (!fields.length) return NOT_PROVEN;
+    if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return NOT_PROVEN;
+    return { proven: true, exact: false, fields };
+  } catch {
+    return NOT_PROVEN;
   }
 }
 
@@ -513,6 +1046,158 @@ export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } 
   const expectedSet = new Set(expectedShapes);
   if (expectedSet.size !== expectedShapes.length) return false;
   return liveShapes.some((entry) => !expectedSet.has(entry));
+}
+
+/**
+ * The STRUCTURE of a serialized graph — everything that says WHICH workflow a
+ * canvas holds — with the per-node content that can legitimately drift on a
+ * correctly-bound canvas removed.
+ *
+ * Derived from `buildGraphShape` so it can never disagree with the full
+ * comparison about what a surface even IS (the one-normalization rule above);
+ * the ONLY difference is that each node collapses to its `id` and `type`. Every
+ * non-node surface — links, floating links, reroutes, groups, config, top-level
+ * subgraphs, definitions, extra — is compared in FULL, unchanged, because those
+ * are where a genuinely different workflow shows itself.
+ *
+ * `null` when no structural read is possible (no serialized state, or any node
+ * without a usable id/type): callers must treat that as NOT a match, never as
+ * one — "could not compare" is not "compared and equal".
+ */
+function buildGraphStructureShape(state) {
+  const shape = buildGraphShape(state);
+  if (shape == null) return null;
+  const nodes = [];
+  for (const node of shape.nodes) {
+    const id = node?.id;
+    const type = node?.type;
+    if ((typeof id !== "string" && typeof id !== "number") || typeof type !== "string") return null;
+    // Type-qualified, exactly like the legacy id:type fallback: numeric 1 and
+    // string "1" are different ids and must not collide.
+    nodes.push({ id: `${typeof id}:${id}`, type });
+  }
+  return { ...shape, nodes };
+}
+
+function graphStructureShape(state) {
+  const shape = buildGraphStructureShape(state);
+  if (shape == null) return null;
+  try {
+    return JSON.stringify(canonicalizeShapeValue(shape));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #696/#663/#701/#702 — the live root differs from the active workflow's own
+ * current state ONLY in per-node mutable content, on a canvas that POSITIVELY
+ * carries this workflow's identity. That is drift on the RIGHT canvas, not
+ * evidence of a different one, and it must not refuse a graph command.
+ *
+ * WHY the plain content comparison is the wrong evidence. `graphRootMismatches-
+ * ActiveWorkflow` reads a difference between `rootGraph.serialize()` and
+ * ChangeTracker's `activeState` as "bound to a different graph". That inference
+ * needs `activeState` to be a faithful mirror of the live root whenever the tab
+ * is clean — and it is not. ComfyUI's ChangeTracker captures on USER INPUT
+ * events (see the panel's post-command `deferChangeTrackerSnapshot` wiring, which
+ * exists precisely because bridge-driven edits are otherwise invisible to it), so
+ * a widget a NODE rewrites without user input drifts the root while the tab still
+ * reports `isModified: false`: Impact-Pack's ImpactWildcardEncode re-resolving
+ * `populated_text` on every execution, `control_after_generate` advancing a seed,
+ * an rgthree mode toggle, any extension's `loadedGraphNode` hook. Every reported
+ * instance of this cluster carried the RIGHT node count on the RIGHT tab.
+ *
+ * It is self-reinforcing, which is what made "the remedy does not remedy" (#701):
+ * the tracker is re-captured only after a command SUCCEEDS, and `workflow_open`'s
+ * repaint re-runs the same hook that rewrote the widget, so its own content proof
+ * fails, its tracker re-baseline is skipped, and the retried read fails
+ * identically. Only a page reload broke the loop.
+ *
+ * The relaxation is deliberately NARROW, and both conjuncts are load-bearing:
+ *
+ *   IDENTITY — `graphRootWorkflowUuidMatches`. Structural equality alone cannot
+ *     tell the active tab's canvas from a DUPLICATE tab's: two copies of one
+ *     workflow are structurally identical and differ only in widget values, which
+ *     is exactly the difference this would wave through. The same exclusivity
+ *     problem already blocks `sealProvenRootBinding`, and the answer is the same
+ *     one — require the canvas to positively claim THIS workflow. An untagged
+ *     root is absence of proof and stays refused; a foreign tag is the #349
+ *     wrong-canvas case and is refused earlier still.
+ *
+ *   STRUCTURE — every surface that identifies a workflow must be EQUAL, read
+ *     through the shared normalization. A different node set, a different id or
+ *     type, different links, groups, reroutes, floating links, top-level
+ *     subgraphs, definitions or content-bearing extra all remain refusals, so
+ *     #349 is untouched. A count-short mid-restore canvas (#618) differs in its
+ *     node set and cannot reach this at all.
+ *
+ * An unreadable structural comparison on EITHER side returns false: the relaxation
+ * only ever fires on a positive, completed match.
+ *
+ * KNOWN, DELIBERATE GAPS — both pre-existing, neither opened here:
+ *
+ *   drift INSIDE a `subgraphs`/`definitions` payload still refuses, because that
+ *   surface is compared whole. Narrowing it would mean recursing a nested
+ *   serializer dialect, and the fail-closed direction is the right one to leave
+ *   standing.
+ *
+ *   a BYTE-IDENTICAL duplicate whose canvas got the active workflow's tag, and
+ *   this one IS widened here — stated plainly rather than argued away (codex
+ *   gate, two rounds). The only writer that can put A's tag on a root without A's
+ *   own claim is `sealProvenRootBinding`, and it fires only on an UNTAGGED root
+ *   that already serializes EQUAL to A's current state with no other OPEN
+ *   workflow matching it — which a CLOSED duplicate's stranded canvas can satisfy,
+ *   since the exclusivity sweep can only see open tabs (its own comment says so).
+ *   From the seal onward that canvas is content-equal to A, so reads AND
+ *   mutations alike were already permitted on it; what the old shape guard added
+ *   was that the permission ENDED whenever the stranded canvas happened to drift.
+ *   This removes that late stop. It is accepted knowingly: the stop was
+ *   timing-dependent (it arrived only after arbitrary work had already landed on
+ *   that same canvas), the ambiguity it half-covered is `proofExclusive`'s
+ *   documented limit, and in the one construction that reaches it the stranded
+ *   root is also the object the active workflow would itself serialize on save.
+ *   Buying back that fraction of a case by refusing the four reported ones — the
+ *   right canvas, permanently locked, with no working remedy — is the worse trade.
+ */
+export function graphRootContentDriftOnBoundCanvas({
+  rootGraph,
+  activeWorkflow,
+  activeWorkflowUuid,
+} = {}) {
+  if (!graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false;
+  return graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
+}
+
+/**
+ * Does the live root reproduce the active workflow's STRUCTURE — its node set
+ * (ids and types), links, floating links, reroutes, groups, config, top-level
+ * subgraphs, definitions and content-bearing extra?
+ *
+ * Exported separately from the relaxation above because the answer is also what
+ * makes a REFUSAL truthful. "The counts agree but the contents differ" leaves the
+ * reader unable to tell a genuinely different graph from the right one whose
+ * widgets drifted — and the old message resolved that ambiguity by asserting the
+ * worse reading ("a load, tab switch, or reconnect left this command pointed at
+ * the wrong canvas"), which is the sentence three reports in this cluster were
+ * derailed by. With this the disclosure states which of the two was measured.
+ *
+ * False when either side cannot be read: an uncompleted comparison is not a match.
+ */
+export function graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
+  try {
+    const expected = graphStructureShape(activeWorkflowCurrentState(activeWorkflow));
+    if (expected == null) return false;
+    let actual = null;
+    try {
+      actual = graphStructureShape(rootGraph?.serialize?.());
+    } catch {
+      return false;
+    }
+    return actual != null && actual === expected;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -579,6 +1264,121 @@ export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
   if (typeof proofMarker !== "string" || !proofMarker) return false;
   const seen = rootGraph?.extra?.[PANEL_GRAPH_META_KEY]?.[OPEN_PROOF_FIELD];
   return typeof seen === "string" && seen === proofMarker;
+}
+
+/**
+ * #1089 — does the STATE this open is about to repaint FROM belong to the tab
+ * being opened?
+ *
+ * Every proof `resolveOpenRebindVerdict` weighs is taken AFTER the load, against
+ * the root the loader produced. None of them looks at the state the load was
+ * handed. So when that state holds another workflow's graph, the open repaints it
+ * faithfully, stamps the target's identity onto it, and all four parts pass — not
+ * by being fooled, but because each one is a TRUE statement about a poisoned
+ * source. That is #1089 exactly: a clean success, `modified: false`, and the
+ * previous workflow's graph on the canvas.
+ *
+ * #968 closed the writer this repo owns (the pre-repaint `checkState` capture) and
+ * recorded its own residual: an UNTAGGED root is still captured. A state poisoned
+ * before that fix shipped, through the residual, or by any capture the panel does
+ * not mediate, still reaches this load — and the load is the step that turns it
+ * into durable loss, because the stamp makes a later save write the foreign graph
+ * to the target's file.
+ *
+ * WHAT THE ANSWER IS FOR. Not a refusal — `workflow_open` must not refuse on this,
+ * and the first attempt at this fix did (codex NO-SHIP, round 1). The repaint's root
+ * re-stamp is the one documented heal for a conflicting root tag, so refusing before
+ * the load removes it and strands the pointer on the target with another workflow's
+ * uuid on `app.graph`. Every `graph_*` command is then refused by
+ * `assertGraphBoundToActiveWorkflow` — including the `panel_load_workflow` the
+ * refusal recommended, whose own error says to re-open the tab, which re-enters the
+ * refusal. A hard loop, on true positives as much as false ones.
+ *
+ * `foreign` therefore authorizes a DISCLOSURE and nothing else. The load proceeds
+ * exactly as before, the root gets re-stamped by it, and the caller is told to verify
+ * the graph before editing. That is the whole remedy, and the reason it is the whole
+ * remedy is worth reading before anyone tries to strengthen it again.
+ *
+ * The evidence rule is `describeLiveCanvasBinding`'s (#708/#349), applied to the
+ * source state instead of the live canvas, plus ONE additional requirement:
+ *
+ *   bound   — the state carries the target's own identity.
+ *   foreign — the state carries a tag the target does not claim, AND that tag is
+ *             owned by a DIFFERENT currently-open workflow.
+ *   unknown — anything else.
+ *
+ * WHY THE LIVE OWNER. `workflowOwnsRootUuidTag`'s header records that a lagging
+ * `activeState` can carry a REPLACED PREDECESSOR's uuid residue, "indistinguishable
+ * from the genuine lineage stamp". A predecessor is not an open tab, so requiring a
+ * live owner separates residue from another tab's graph.
+ *
+ * WHAT THIS DOES NOT ESTABLISH, and cannot. The tag does not prove the GRAPH is
+ * foreign. #817 is the counter-example: a tab switch leaves the previous workflow's
+ * tag on the reused `app.graph`, and the guard's rebind re-stamps that root on
+ * CONTENT proof — `rootContentProvesActiveWorkflow`, not a claimed tag.
+ * `stampGraphRootWorkflowUuid` writes `rootGraph.extra` and nothing else, so a
+ * capture taken before the heal leaves the tab's OWN content under the other tab's
+ * meta block, indefinitely. The whole `comfyui_mcp` block travels together as
+ * residue, so no field in it separates the two. The disclosure says "may be" for
+ * that reason and hands the comparison to the caller, who knows what the workflow
+ * should contain.
+ *
+ * TWO STRONGER REMEDIES WERE BUILT AND REMOVED. Both are recorded because both look
+ * obviously right and are not.
+ *
+ *   REFUSING the open (codex NO-SHIP). The repaint's root re-stamp is the one
+ *   documented heal for a conflicting root tag, so refusing strands the pointer on
+ *   the target with another workflow's uuid on `app.graph`. Every `graph_*` command
+ *   is then refused — including the `panel_load_workflow` the refusal recommended,
+ *   whose own error says to re-open the tab, which re-enters the refusal. A hard
+ *   loop, on true positives as much as false ones.
+ *
+ *   AUTO-CORRECTING from disk. Gated on the tab being clean, which cannot bear it:
+ *   #874 records that ChangeTracker captures on USER INPUT events only, so a value a
+ *   NODE wrote (a populated wildcard, a rolled seed) is on the canvas, never marks
+ *   the tab modified, and was never saved — the re-read would silently replace
+ *   exactly what an agent just generated. The same flag fails in the other direction
+ *   too: a first-time open never runs `clearSpuriousOpenModified`, so a cold-opened
+ *   tab reads modified forever, and gating on it would have disarmed this guard for
+ *   that entire population. #442's re-read survives the argument only because it
+ *   fires on the FILE provably having changed, which is independent evidence about
+ *   the disk copy. A foreign source tag is no evidence about the file at all.
+ *
+ * STATED RESIDUAL: this warns, it does not prevent. An agent that ignores the
+ * disclosure can still edit the wrong graph. Closing that needs evidence separating
+ * residue from a foreign graph, which does not exist here — and every remedy tried
+ * on the weaker evidence traded a silent wrong-graph edit for a wedge or a silent
+ * data loss.
+ *
+ * Pure, so the ownership questions arrive as injected predicates. A predicate that
+ * throws is inconclusive, never a positive answer.
+ */
+export function describeRepaintSourceBinding({
+  state,
+  targetUuid,
+  targetClaimsTag,
+  tagOwnedByOtherOpenWorkflow,
+} = {}) {
+  try {
+    const tag = state?.extra?.[PANEL_GRAPH_META_KEY]?.workflow_uuid;
+    if (typeof tag !== "string" || !tag) return "unknown";
+    if (typeof targetUuid !== "string" || !targetUuid) return "unknown";
+    if (tag === targetUuid) return "bound";
+    // A conflicting tag the target's own lineage claims is its own drifted stamp
+    // (#545/#557), not another tab's graph.
+    try {
+      if (targetClaimsTag?.(tag) === true) return "unknown";
+    } catch {
+      return "unknown";
+    }
+    try {
+      return tagOwnedByOtherOpenWorkflow?.(tag) === true ? "foreign" : "unknown";
+    } catch {
+      return "unknown";
+    }
+  } catch {
+    return "unknown";
+  }
 }
 
 export const OPEN_REBIND_STATUS = Object.freeze({
@@ -668,6 +1468,33 @@ export function resolveOpenRebindVerdict({
   return { status: OPEN_REBIND_STATUS.PROVEN, bindingProven: true, unproven: [] };
 }
 
+/**
+ * What a CONTENT_UNVERIFIED open must ALSO say (#702).
+ *
+ * That branch has already PROVEN the binding — instance, marker and identity all match —
+ * and only the content is unconfirmed. But the reply still throws, so it never reaches
+ * the line that publishes `workflow_uuid`, and the caller's fence keeps whatever it had.
+ * The disclosure then closed by recommending `panel_graph_outline`, which is precisely
+ * the call that is about to be refused as a `workflow instance mismatch`. Two reporters
+ * followed that advice into the refusal and concluded, reasonably, that only a full
+ * panel_reload could recover.
+ *
+ * So the reply names the state it leaves behind and the ONE cheap call that clears it.
+ * `workflow_list` is deliberately fence-EXEMPT (#759/#932) precisely to be the recovery
+ * probe, and it republishes the active identity — measured: after this outcome it
+ * returns the same uuid and a stamped graph read then succeeds.
+ *
+ * The note promises a fence refresh and nothing more (codex). On the fourth wording the
+ * panel could not READ the graph at all, and a refreshed fence cannot make that read
+ * succeed — it only stops the mismatch from being the reason it fails.
+ */
+const FENCE_NOT_REFRESHED =
+  " This reply carries NO fence refresh — an open that could not verify its content" +
+  " publishes no workflow_uuid, so a command stamped from an older one is still refused" +
+  " as a workflow instance mismatch. Call panel_list_workflows first: it is exempt from" +
+  " the fence and republishes the active identity, which permits a freshly stamped graph" +
+  " read. Reloading the panel is NOT required to refresh the fence (#702).";
+
 /** Did a content comparison actually HAPPEN? The single rule every sentence about
  *  content asks, so the headline and the per-part clause cannot disagree with each
  *  other — which they did, because one tested `=== true` and the other `=== false`
@@ -679,6 +1506,52 @@ export function resolveOpenRebindVerdict({
  *  observation must never license the definite claim. */
 function contentWasCompared(observed) {
   return observed?.contentComparable === true;
+}
+
+/**
+ * The sentence that says whether anything was LOST from the node set (#825).
+ *
+ * "nodes differ" is the same three words whether a node vanished or the frontend
+ * re-measured every box, and the reporter read it after a perfectly good open as
+ * possible data loss. So when the node set is intact, say so — plainly, in the
+ * same breath, because a warning the reader cannot size is one they must assume
+ * the worst about.
+ *
+ * It states an OBSERVATION and stops. `cosmeticOnly` names the fields that moved
+ * and says the frontend rewrites them; a widget-value difference is NOT cosmetic
+ * and gets the plain same-set sentence with no reassurance attached. Nothing here
+ * touches the verdict, which stays `unknown` either way.
+ */
+function nodeSurfaceClause(observed = {}) {
+  const diff = observed.contentNodeDifference;
+  if (!diff || diff.comparable !== true) return "";
+  if (!diff.sameNodeSet) {
+    return (
+      ` — and the node SET itself differs (a node is missing, extra, or has a different type), ` +
+      `which is not something the frontend does while loading a graph faithfully`
+    );
+  }
+  const fields = (diff.fields ?? []).join(", ") || "no readable field";
+  if (diff.cosmeticOnly) {
+    // States the NODE observation and stops. The overall "nothing to redo"
+    // conclusion is the headline's to draw, and only when `nodes` is the sole
+    // surface that differed — a group or a link lost alongside the re-measured
+    // boxes is work the node set cannot vouch for.
+    // #696 (codex) — no claim about WHO changed these. "which the ComfyUI frontend
+    // recomputes on load" was true of size/pos/order and false of `color`/`bgcolor`,
+    // which are in the same cosmetic set and are authored by the user, not
+    // recomputed by anything. Naming the fields says more than the guess did, and
+    // says only what was observed.
+    return (
+      ` — but every node that was loaded IS on the canvas with the same id and type, and nothing ` +
+      `extra appeared, so NO node was lost. What differs is per-node presentation (${fields})`
+    );
+  }
+  return (
+    ` — every node that was loaded IS on the canvas with the same id and type and nothing extra ` +
+    `appeared, so no node was lost; what differs is per-node (${fields}). A widget value is real ` +
+    `content, so read it (panel_graph_outline) before assuming either way`
+  );
 }
 
 /** One clause per failed part, naming the TWO VALUES that disagreed. A refusal
@@ -716,7 +1589,8 @@ function openRebindPartClause(part, observed = {}) {
       // the burden sits on the CLAIM: only a positive "yes, compared" licenses it.
       return contentWasCompared(observed)
         ? `the graph on the canvas differs from what was loaded on: ` +
-            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}`
+            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}` +
+            nodeSurfaceClause(observed)
         : `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
             `not established — whether the whole graph landed`;
     default:
@@ -760,6 +1634,70 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // apart and the caller passes that through as `contentComparable`; anything but
     // an explicit `true` takes the non-asserting wording.
     const compared = contentWasCompared(observed);
+    // #825 — the headline may only claim "the panel cannot tell" while that is
+    // still true. When the ONLY surface that differs is `nodes` and the node set
+    // came through intact with just presentation rewritten, the panel CAN tell:
+    // it compared the sets and nothing was lost. Leaving the generic sentence
+    // there is what made a healthy open read as possible data loss, and sent a
+    // reporter looking for work to redo that was never gone. Narrow on purpose —
+    // any second differing surface is unexplained by a node-set observation, so
+    // it falls back to the honest "cannot tell".
+    const nodesOnly =
+      (observed.contentSurfaces ?? []).length === 1 && (observed.contentSurfaces ?? [])[0] === "nodes";
+    // #696 — this used to also require `cosmeticOnly`, i.e. that every differing
+    // field be on an allowlist of names. That made the reassurance hostage to
+    // guessing what a field MEANS: one unrecognised display flag from any node pack
+    // (`showAdvanced` was the reported one) sent a perfectly healthy open down the
+    // "the load may only have partly applied" path. Chasing it by extending the
+    // allowlist just moves the problem to the next pack, and a value-shape guard only
+    // restates the name's promise in another form (codex).
+    //
+    // The node SET is what the panel actually PROVED: every node that was loaded is
+    // on the canvas with the same id and type, and nothing extra appeared. That is
+    // worth saying on its own, whatever fields differ — so it is what the headline
+    // now rests on, with the differing fields NAMED so the reader judges the rest.
+    const nodeSetIntact =
+      observed.contentNodeDifference?.comparable === true &&
+      observed.contentNodeDifference?.sameNodeSet === true;
+    const valuesMatched = observed.contentNodeDifference?.cosmeticOnly === true;
+    if (compared && nodesOnly && nodeSetIntact) {
+      // Two claims, and only the ones the comparison supports (codex). The node set
+      // is proven in both branches. `cosmeticOnly` additionally establishes that the
+      // fields carrying VALUES — `widgets_values`, `inputs` — matched, because those
+      // are not on the cosmetic allowlist; it does NOT establish "no value is
+      // missing" in general, since `color`/`bgcolor` are authored values that may
+      // legitimately differ. So say the narrow thing.
+      // The differing fields are NOT named here: `because` already names them, in
+      // almost these words. An earlier cut added them to the headline too and a
+      // mutation test caught the duplication by refusing to fail — the assertion
+      // could not tell the addition from the clause that was already there. The
+      // headline states the conclusion; `because` carries the detail.
+      // Each branch is its OWN sentence. An earlier cut shared a `which the panel
+      // cannot call byte-identical` tail between them, which read fine after the
+      // cosmetic clause and attached to the wrong phrase after the other one
+      // ("...or the load applied them differently, which the panel cannot call
+      // byte-identical"). Sharing a tail across two different claims is how wording
+      // drifts away from meaning.
+      const head =
+        `workflow_open RAN, the canvas IS bound to ${workflow}, and every node that was loaded ` +
+        `is on it with the same id and type`;
+      if (valuesMatched) {
+        return (
+          `${head}, carrying the same widget values and links. What differs is per-node ` +
+          `presentation only, which the panel cannot call byte-identical, so the content ` +
+          `is reported UNCONFIRMED rather than failed.${because} You are on the right workflow ` +
+          `and there is no missing work to redo; if you need the exact graph, read it with ` +
+          `panel_graph_outline.` + FENCE_NOT_REFRESHED
+        );
+      }
+      return (
+        `${head}, and nothing extra appeared — no node was lost. What differs is ` +
+        `per-node fields; the panel cannot tell from here whether the ComfyUI frontend ` +
+        `normalized those or the load applied them differently, so the content is reported ` +
+        `UNCONFIRMED rather than failed.${because} You are on the right workflow; if you need ` +
+        `the exact graph, read it with panel_graph_outline.` + FENCE_NOT_REFRESHED
+      );
+    }
     return (
       `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but ` +
       (compared
@@ -769,7 +1707,19 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
         : `the panel could not READ the graph on it to compare against the state that was loaded, so ` +
           `whether the whole graph landed is unestablished — NOT established as wrong. `) +
       `Treat the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} ` +
-      `You are NOT on the wrong workflow: ${workflow} IS the active one.`
+      `The identity is settled — ${workflow} IS the active one — but that is a statement about ` +
+      `the IDENTITY, not about the nodes: this outcome has been reported (#1111, #1089) with the ` +
+      `PREVIOUS workflow's graph still on the canvas, which a re-read then returns as if it were ` +
+      `this workflow's. So compare what you read against what you expect, and if it is the wrong ` +
+      `graph, panel_load_workflow with this workflow's path reloads it — that is what recovered ` +
+      `it for both reporters, and neither panel_graph_outline nor a fence refresh will. It loads ` +
+      `from DISK, so whatever is on the canvas right now is replaced: if the graph you are looking ` +
+      `at holds unsaved work — and if it is the previous workflow's, it may — preserve it FIRST. ` +
+      `To a NEW path, with Save As or an export: a plain save would write it to ${workflow}, ` +
+      `because that is what the active identity already names, and the stale graph would land on ` +
+      `top of the workflow you were trying to open. Recovering the binding is not worth losing a ` +
+      `graph to, and neither is preserving one.` +
+      FENCE_NOT_REFRESHED
     );
   }
   if (verdict?.status === OPEN_REBIND_STATUS.UNPROVEN) {
@@ -803,13 +1753,45 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
  *                record ties it to the tag): the tag is the active tab's own
  *                lineage, stale relative to its current identity, so the root
  *                is provably its own canvas — re-stamp and proceed. Also when
- *                `staleTagOnEmptyCanvas` is set (#565): ComfyUI reuses the
- *                app.graph object across tabs and its clear/configure does NOT
- *                reset graph.extra, so a brand-new blank tab inherits the
+ *                `staleTagOnEmptyCanvas` is set (#565): on the frontend that
+ *                report came from, ComfyUI reused the app.graph object across
+ *                tabs and its clear/configure did NOT reset graph.extra, so a
+ *                brand-new blank tab inherited the
  *                PREVIOUS workflow's tag while minting its own identity. With
  *                zero nodes on BOTH sides there is no workflow content that
  *                could be confused — the #349 fence protects CONTENT — so the
  *                leftover tag is stale metadata: re-stamp and proceed;
+ *                Also when `contentProvesActiveWorkflow` is set (#817): the live
+ *                root serializes EQUAL to the active workflow's own current
+ *                state, on a clean tab, with no other open workflow able to
+ *                claim the same canvas. That is the same proof
+ *                `sealProvenRootBinding` accepts to stamp an UNTAGGED root, and
+ *                the evidence does not get weaker because a stale tag happens to
+ *                be sitting on the object. The asymmetry it removes was the #817
+ *                report: switching tabs leaves the PREVIOUS workflow's tag on the
+ *                reused app.graph (on that build configure did not reset graph.extra — the
+ *                same mechanism the empty-canvas clause above records), so a
+ *                canvas that IS the active workflow's, byte for byte, was refused
+ *                where an untagged copy of it was allowed. Nothing self-healed
+ *                it: the seal declines a root that already carries a tag, so a
+ *                WRONG tag was stickier than no tag at all;
+ *
+ * MEASURED 2026-08-09 on ComfyUI frontend 1.48.7 — stamp a marker on the live
+ * root, then change its content three ways, same graph object throughout:
+ *
+ *   configure(payload with extra:{})      -> tag gone, nodes 10 -> 1
+ *   configure(payload with NO extra key)  -> tag gone, nodes  1 -> 2
+ *   clear()                               -> tag gone, nodes    -> 0
+ *
+ * So on THAT build a tag does not survive a content change, including the
+ * no-extra-key case both clauses above name. Their premise is therefore
+ * frontend-specific, and the clauses may simply not be reachable on current
+ * builds. They are left in place deliberately: both ADMIT (they widen the
+ * fence), so an unreachable one costs nothing, while removing one would make
+ * the fence stricter for anyone still on the frontend that reported it. The
+ * wording is scoped rather than deleted so the next reader does not inherit a
+ * universal claim from a single observation — in either direction. Verified on
+ * one frontend, which is exactly why neither statement should be universal.
  *   "conflict" — anything else. A tag claimed by a FOREIGN open workflow is the
  *                #349 wrong-canvas case, and a tag NOBODY claims may be a
  *                closed tab's stale canvas — re-stamping either would authorize
@@ -822,9 +1804,12 @@ export function resolveGraphRootUuidRebind({
   activeWorkflowUuid,
   rootTagClaimedByActiveWorkflow = false,
   staleTagOnEmptyCanvas = false,
+  contentProvesActiveWorkflow = false,
 } = {}) {
   if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "none";
-  return rootTagClaimedByActiveWorkflow || staleTagOnEmptyCanvas ? "rebind" : "conflict";
+  return rootTagClaimedByActiveWorkflow || staleTagOnEmptyCanvas || contentProvesActiveWorkflow
+    ? "rebind"
+    : "conflict";
 }
 
 /**
@@ -853,6 +1838,28 @@ const READ_ONLY_GRAPH_COMMANDS = new Set([
   "graph_get_subgraph",
   "graph_list_subgraphs",
   "graph_screenshot",
+  // #1478 — `graph_get_errors` reads the error surface and writes nothing. It was
+  // missing here, so `graphCommandMayMutateWorkflow` called it a MUTATION and a
+  // dirty tab refused it as `dirty-mutation-binding-unproven` — a message that
+  // calls a read "this mutation" and prescribes reloading the tab or re-opening
+  // the workflow, neither of which a read should ever cost.
+  //
+  // It is also the worst possible moment to refuse it: the reporter had just
+  // loaded a pack whose nodes were already red, which is exactly when this tool
+  // is the one to call. They fell back to filesystem globs.
+  //
+  // WHY THIS LIST IS THE FIX AND NOT THE GUARD. Membership here lowers the bar
+  // for a command, so it is an enumeration that must stay conservative: a read
+  // aimed at the wrong canvas returns wrong DATA, while a mutation aimed there
+  // corrupts a graph, and that asymmetry is the whole reason reads have a lower
+  // bar at all. So this grows one verified command at a time, never by pattern.
+  //
+  // `graph_get_object_info` and `graph_prompt_director_audit` are also absent and
+  // also look like reads, but "looks like" is not the standard for weakening a
+  // guard — they stay out until someone establishes it the way this one was
+  // (the orchestrator's own tool description says "Read-only", and its executor
+  // touches no graph state).
+  "graph_get_errors",
 ]);
 
 export function graphCommandMayMutateWorkflow(command) {
@@ -891,6 +1898,129 @@ export function graphCommandMayMutateWorkflow(command) {
  *     keeps the pre-seal fail-closed behaviour.
  * Returns true only when it actually wrote the stamp.
  */
+/**
+ * POSITIVE proof that the live root graph IS the active workflow's own canvas,
+ * from its CONTENT alone — independent of whatever identity tag it happens to
+ * carry.
+ *
+ * This is the bar `sealProvenRootBinding` has always used; #817 lifted it out so
+ * a second caller could ask the same question without the two drifting. Every
+ * clause is load-bearing:
+ *   - ROOT scope: a descended subgraph is not the workflow's root canvas;
+ *   - CLEAN tab: a dirty tracker's state can lag the real canvas (#545), so it
+ *     cannot prove anything about it;
+ *   - the root must serialize EQUAL to the workflow's own CURRENT state — not
+ *     its load baseline, which legitimately differs from an edited canvas;
+ *   - EXCLUSIVE: two clean, separately open DUPLICATE tabs can carry
+ *     byte-identical state, and equality alone cannot tell the active tab's
+ *     canvas from its twin's. The caller establishes this by enumerating the
+ *     other open workflows; an enumeration that cannot run is NOT exclusive.
+ */
+export function rootContentProvesActiveWorkflow({
+  rootGraph,
+  activeWorkflow,
+  inSubgraph = false,
+  proofExclusive = false,
+} = {}) {
+  try {
+    if (inSubgraph) return false;
+    if (proofExclusive !== true) return false;
+    if (!rootGraph || !activeWorkflow) return false;
+    if (activeWorkflow.isModified === true) return false;
+    return graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * EXCLUSIVITY for a content proof that has to hold even though the active tab has
+ * unsaved edits (#995).
+ *
+ * The ordinary exclusivity check SKIPS a dirty twin — "unprovable, not evidence of
+ * ambiguity" — which is right while the ACTIVE side must be clean, because a clean
+ * active workflow plus a dirty twin still leaves only one provable owner. Once the
+ * active side may itself be dirty, that skip becomes the hole: a dirty twin holding the
+ * same content would be invisible, and the panel could re-stamp the active identity onto
+ * a root that is the twin's canvas — wedging THAT tab the moment the user switched to it.
+ *
+ * So here a dirty twin is DISQUALIFYING rather than skippable. `others` is every OTHER
+ * open workflow; each must be readable and provably different from the root, and any one
+ * of them being modified (or unreadable) makes the whole thing unprovable.
+ */
+export function contentProofExclusiveAmongOpen({ rootGraph, others } = {}) {
+  try {
+    if (!rootGraph || !Array.isArray(others)) return false;
+    for (const other of others) {
+      if (!other || typeof other !== "object") return false; // unreadable — prove nothing
+      // A lagging tracker cannot establish that its canvas DIFFERS either, so a dirty
+      // twin is not "no evidence" here: it is missing evidence the proof requires.
+      if (other.isModified === true) return false;
+      const state = activeWorkflowCurrentState(other);
+      if (state == null) return false; // no readable state — same reason
+      if (graphRootMatchesState({ rootGraph, state })) return false; // a proven twin
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #995 — the content proof, for a canvas whose tab has UNSAVED EDITS.
+ *
+ * MEASURED on ComfyUI 0.31.1 / frontend 1.48.7, reproducing the report through UI clicks:
+ * a modified workflow whose canvas the panel's own comparison proves is its own, and a
+ * root still carrying the PREVIOUS workflow's tag:
+ *
+ *   active workflow            probe995.json, isModified true
+ *   root tag                   e66e531b…  (another workflow's)
+ *   uuid mismatch              true
+ *   rootContentProvesActiveWorkflow   false   <- only because the tab is dirty
+ *   graphRootMatchesState(root, tracker state)   TRUE
+ *   rebind verdict             "conflict"      -> every graph tool refused
+ *
+ * The clean-tab requirement on the ordinary proof exists because a dirty tracker can LAG
+ * the canvas (#545). But a lagging snapshot makes an equality test FAIL, not falsely
+ * succeed — the failure mode it guards against is a false NEGATIVE. What a dirty tab
+ * genuinely costs is the twin comparison, which is why this takes its exclusivity from
+ * `contentProofExclusiveAmongOpen` instead, where a dirty twin disqualifies.
+ *
+ * Deliberately NOT used by `sealProvenRootBinding`. That path WRITES a tag onto an
+ * untagged root, and relaxing what may be written is a different decision from relaxing
+ * what may be re-stamped over a tag the panel itself minted.
+ */
+export function rootContentProvesActiveWorkflowDespiteEdits({
+  rootGraph,
+  activeWorkflow,
+  inSubgraph = false,
+  proofExclusive = false,
+} = {}) {
+  try {
+    if (inSubgraph) return false;
+    if (proofExclusive !== true) return false;
+    if (!rootGraph || !activeWorkflow) return false;
+    // AN EMPTY CANVAS CANNOT IDENTIFY ITSELF. Every blank graph serialises alike, so
+    // equality against a blank tracker state is not evidence about WHOSE canvas this is —
+    // a dirty blank twin is exactly as plausible an owner, and re-stamping would wedge
+    // THAT tab. The clean path guards this through `staleTagOnEmptyCanvas`, which demands
+    // both sides be provably empty AND the tab be clean; here the tab is dirty, so the
+    // only safe answer is to refuse. (Caught by the #565 gate, not by reasoning.)
+    // Both sides are tested, and neither can be killed alone by mutation: the proof only
+    // fires when the two are EQUAL, so an empty one implies an empty other and either
+    // check refuses. Removing BOTH does fail the suite. They are kept as two because they
+    // answer the question about different objects, and a later change to one side's
+    // emptiness rule must not silently remove the other's guarantee.
+    if (graphRootProvenEmpty(rootGraph)) return false;
+    const state = activeWorkflowCurrentState(activeWorkflow);
+    if (state == null) return false;
+    if (serializedStateProvenEmpty(state)) return false;
+    return graphRootMatchesState({ rootGraph, state });
+  } catch {
+    return false;
+  }
+}
+
 export function sealProvenRootBinding({
   rootGraph,
   activeWorkflow,
@@ -899,14 +2029,18 @@ export function sealProvenRootBinding({
   proofExclusive = true,
 } = {}) {
   try {
-    if (inSubgraph) return false;
-    if (proofExclusive !== true) return false;
-    if (!rootGraph || !activeWorkflow) return false;
     if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
-    if (activeWorkflow.isModified === true) return false;
+    // A CONFLICTING stamp is the rebind path's decision, never overwritten here.
     const existing = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
     if (typeof existing === "string" && existing) return false;
-    if (!graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) })) {
+    // #833 — an EMPTY canvas can never clear this proof: every blank canvas serialises
+    // alike, so there is nothing to match, and a blank tab is always dirty besides. That
+    // is why mutations stay refused on one. Sealing on emptiness was tried and withdrawn:
+    // it would stamp the ACTIVE identity onto a root that a reconnect tab restore may
+    // have left holding a DIFFERENT blank workflow (the #708 mismatch), putting the first
+    // node on the wrong canvas. Emptiness proves there is nothing to mis-attribute; a
+    // seal claims WHOSE canvas this is, and only the read gate needs the weaker fact.
+    if (!rootContentProvesActiveWorkflow({ rootGraph, activeWorkflow, inSubgraph, proofExclusive })) {
       return false;
     }
     const extra =
@@ -953,7 +2087,17 @@ export const MUTATION_BINDING_BAR = Object.freeze({
 export function graphCommandBindingBar(command) {
   return graphCommandMayMutateWorkflow(command)
     ? { ...MUTATION_BINDING_BAR }
-    : { includeBaselineReadGuard: false, requireDirtyMutationBinding: false };
+    : {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: false,
+        // #995 — POSITIVE evidence that this call is a classified read, set in exactly
+        // one place. The stale-tag content bypass is gated on this rather than on
+        // `requireDirtyMutationBinding !== true`, which is default-permit: a caller that
+        // omits the flag, or a fence call added later without the classification, would
+        // have inherited a bypass nobody decided to give it (codex). Opting in here means
+        // the read list above is the whole surface that can reach it.
+        staleTagReadBypass: true,
+      };
 }
 
 /**
@@ -979,6 +2123,7 @@ export function resolveGraphBindingVerdict({
   includeBaselineReadGuard = true,
   requireDirtyMutationBinding = false,
   postReconnectWindow = false,
+  graphLoading = false,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -1009,7 +2154,24 @@ export function resolveGraphBindingVerdict({
       inSubgraph,
       postReconnectWindow,
     });
-  const rootShapeMismatch = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  // #696/#663/#701/#702 — a content difference is only WRONG-CANVAS evidence when
+  // it is STRUCTURAL. On a root that positively carries this workflow's identity
+  // and reproduces every structural surface, the residue is a widget the canvas
+  // rewrote itself between ChangeTracker captures (see
+  // graphRootContentDriftOnBoundCanvas): the right canvas, drifted — and refusing
+  // it blocked every read and write with no recovery, because the remedy's own
+  // repaint re-created the same drift.
+  //
+  // The structural answer is computed ONCE and kept, because it is also what the
+  // refusal has to say when it does fire: without it a shape refusal cannot tell
+  // "a different graph" from "this graph, drifted, with no identity stamp", and
+  // the old message resolved that ambiguity by asserting the worse one.
+  const contentDiffers = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const structureMatches =
+    contentDiffers && graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const rootShapeMismatch =
+    contentDiffers &&
+    !(structureMatches && graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   const baselineReadDesync =
     currentStateTrustworthy &&
@@ -1033,9 +2195,13 @@ export function resolveGraphBindingVerdict({
         ? activeWorkflowCurrentNodeCount(activeWorkflow)
         : activeWorkflowNodeCount(activeWorkflow),
       live: nodeCount,
+      // Only meaningful for the shape verdict, and only ever a POSITIVE `true`:
+      // a comparison that could not run leaves it false, which the message reads
+      // as "unestablished", never as "they differ".
+      ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
-  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
+  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid, graphLoading })) {
     return { reason: "empty-binding-unproven", expected: activeWorkflowNodeCount(activeWorkflow) };
   }
   return null;
@@ -1096,12 +2262,25 @@ export function graphBindingRefusalMessage(verdict) {
     `Re-open the active workflow tab (panel_open_workflow) to rebind the graph in place; if that ` +
     `does not clear it, reload the panel (panel_reload scope:frontend), then retry. The reload is ` +
     `REQUESTED, NOT CONFIRMED — the panel cannot observe whether it rebound the canvas, so treat ` +
-    `the retry's own result as the answer rather than assuming the binding was repaired.`;
+    `the retry's own result as the answer rather than assuming the binding was repaired. ` +
+    // #663 — agents burned retries on the WRONG recovery signal: panel_set_workflow_target
+    // only re-points which workflow the agent session follows; it never touches the
+    // canvas binding this guard checks, so its success response does not mean the
+    // desync is resolved. Say so, so the retry budget goes to the remedies that can work.
+    `Re-targeting with panel_set_workflow_target is NOT a remedy for this — it re-points the ` +
+    `session, it does not rebind the canvas.`;
   if (verdict.reason === "root-workflow-uuid-mismatch") {
+    // The predicate observed TWO TAGS THAT DISAGREE and nothing else. The earlier
+    // text went on to narrate "a load, tab switch, or reconnect left a stale tag
+    // behind" — a cause nobody watched happen, and one of several (a stranded
+    // canvas from a closed tab reads identically). Same defect as the shape
+    // message's wrong-canvas sentence, one branch over: state the observation,
+    // offer the usual causes as possibilities rather than as the finding.
     return (
       `[root-workflow-uuid-mismatch] The live canvas carries a different workflow's identity tag ` +
-      `than the active workflow — a load, tab switch, or reconnect left a stale tag behind, so ` +
-      `this command was NOT applied. ${remedy}`
+      `than the active workflow, so this command was NOT applied. What the panel observed is the ` +
+      `disagreement itself, not what produced it — a load, tab switch or reconnect leaving a stale ` +
+      `tag behind is the usual explanation, but none of them was witnessed here. ${remedy}`
     );
   }
   // #601 — name the ACTUAL failing predicate. This verdict is not a node-count
@@ -1124,15 +2303,96 @@ export function graphBindingRefusalMessage(verdict) {
       `remedy: close the extra tab.`
     );
   }
-  const expectation =
-    Number(verdict.expected) > 0
-      ? `the workflow reports ${verdict.expected} node(s), but the canvas is bound to a different graph`
-      : `the canvas's content does not match the active workflow's own state`;
-  return (
-    `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation}. ` +
-    `A load, tab switch, or reconnect left this command pointed at the wrong canvas, so it was ` +
-    `NOT applied. ${remedy}`
+  // #701/#702 — SAY WHAT WAS MEASURED, AND ONLY THAT.
+  //
+  // The verdict already carried the LIVE count and the message threw it away, then
+  // asserted "a load, tab switch, or reconnect left this command pointed at the
+  // wrong canvas" from the half it kept. In every report in this cluster the two
+  // counts were EQUAL and the difference was a widget the canvas rewrote itself,
+  // so that sentence narrated a cause nobody observed — and three diagnoses went
+  // hunting a wrong-tab bug that was not there.
+  //
+  // Three distinct observations now get three distinct sentences:
+  //   sizes DISAGREE          → the canvas provably holds a different graph;
+  //   structure MATCHES       → the canvas reproduces this workflow's node set,
+  //                             links and groups exactly, and only its content and
+  //                             its identity stamp are unestablished. That is the
+  //                             one case where the ONLY thing missing is proof,
+  //                             and it names the remedy that supplies it;
+  //   anything else           → the contents disagree and the panel does not know
+  //                             which of the two it is looking at. Say that.
+  const expected = Number(verdict.expected);
+  const live = Number(verdict.live);
+  const measured = Number.isFinite(live) && Number.isFinite(expected);
+  const sizesDisagree = measured && expected > 0 && live !== expected;
+  if (verdict.reason === "root-shape-mismatch" && verdict.structureMatches === true && !sizesDisagree) {
+    return (
+      `[root-shape-mismatch] The live canvas reproduces this workflow's STRUCTURE exactly — same ` +
+      `node ids and types${measured ? ` (${expected})` : ""}, same links, groups and subgraphs — but its ` +
+      `CONTENT differs from the state the workflow last captured, and the canvas carries no identity ` +
+      `stamp proving it is this workflow's. A canvas whose widgets a node rewrote itself (a populate/ ` +
+      `wildcard node, control_after_generate, a bypass toggle) looks exactly like a DUPLICATE tab's ` +
+      `canvas from here, and the panel cannot tell them apart, so this command was NOT applied. ` +
+      `Re-open the active workflow tab (panel_open_workflow): its repaint is the one path that can ` +
+      `put this workflow's identity on the canvas, which is the proof this refusal is missing. ` +
+      `Whether it lands is REQUESTED, NOT CONFIRMED — the open reports its own rebind verdict and the ` +
+      `panel cannot observe the outcome otherwise, so treat the retry's own result as the answer. If ` +
+      `it still refuses, do NOT read that as proof the difference is more than content: an open that ` +
+      `could not prove its rebind leaves this refusal exactly where it was. A panel reload ` +
+      `(panel_reload scope:frontend) is the next step, and it is unconfirmed on the same terms. ` +
+      `Re-targeting with panel_set_workflow_target is NOT a remedy for this — it re-points the ` +
+      `session, it does not rebind the canvas.`
+    );
+  }
+  // #803 — an EMPTY baseline against a populated canvas is not evidence of a different
+  // graph. The panel captures a workflow's state on user input, so a reconnect or a
+  // ComfyUI restart can leave it empty for a canvas that is perfectly correct. Asserting
+  // "bound to a different graph" here is the #796 shape: cannot-determine rendered as
+  // is-not-the-case. What gets REFUSED is unchanged (#565 rejected a zero-node skip);
+  // only the claim is.
+  const emptyBaseline = sizesDisagree && isEmptyBaselineMismatch({ expected, live });
+  const expectation = emptyBaseline
+    ? emptyBaselineNote(live)
+    : sizesDisagree
+    ? `the workflow reports ${expected} node(s) but the live canvas holds ${live} — it is bound to a ` +
+      `different graph`
+    : measured && expected > 0
+      ? `both the workflow and the live canvas report ${expected} node(s), but the canvas does not ` +
+        `reproduce the workflow's own state — the difference is in the graph's CONTENT, not its size`
+      : expected > 0
+        ? `the workflow reports ${expected} node(s) and the live count was not measured here`
+        : `the canvas's content does not match the active workflow's own state`;
+  // Neither branch narrates an EVENT. A size disagreement establishes the canvas
+  // holds a different graph — it does not establish what put it there, and the
+  // load/switch/reconnect list is a set of usual explanations, not the finding
+  // (codex gate r3; the same defect the uuid-mismatch branch had). A content
+  // disagreement at equal size does not even establish that much: it is exactly
+  // the ambiguity above, and resolving it in the text is how this message misled
+  // three readers.
+  const cause = emptyBaseline
+    ? ""
+    : sizesDisagree
+    ? `The canvas therefore holds a graph other than the one the workflow describes, so this ` +
+      `command was NOT applied. A load, tab switch or reconnect leaving the command on the wrong ` +
+      `canvas is the usual explanation — the panel observed the mismatch, not the event.`
+    : `The panel cannot tell whether this is a DIFFERENT workflow's canvas or this workflow's own ` +
+      `canvas drifted from the state it last captured, so it was NOT applied.`;
+  // #803 — the remedy is REPLACED for the empty-baseline case, not appended to. The
+  // standing advice ("re-open the active workflow tab") is what turned this into a
+  // dead end: the captured state is refreshed only after a command SUCCEEDS, so while
+  // this refusal stands the repair that would refresh it is itself blocked, and the
+  // retry fails identically. A reload is the step known to break the loop.
+  const finalRemedy = emptyBaseline ? emptyBaselineRemedy() : remedy;
+  // Join the non-empty parts rather than collapsing whitespace across the whole
+  // string. The collapse was only there to absorb the empty `cause` in this branch,
+  // and review was right that it overreached: it rewrote INTERPOLATED content too
+  // (verdict.reason, the existing remedy), so a value carrying meaningful newlines or
+  // repeated spaces would have been silently reflowed. This change is scoped to the
+  // claim and the remedy; it has no business touching either of those.
+  const parts = [emptyBaseline ? expectation : `${expectation}.`, cause, finalRemedy].filter(
+    (s) => typeof s === "string" && s.trim() !== "",
   );
+  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${parts.join(" ")}`;
 }
 
 /**

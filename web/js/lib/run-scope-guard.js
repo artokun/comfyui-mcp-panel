@@ -1,3 +1,4 @@
+import { tr } from "./i18n.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -65,17 +66,23 @@
 //
 //  - The prompt CONTENT HASH (r7) must be computable BEFORE dispatch: a
 //    stable hash of the full queued prompt — node ids, class types, links,
-//    every input/widget value — excluding ONLY the inputs that self-mutate at
-//    queue time (beforeQueued hooks: seed widgets re-rolled by their linked
+//    every input/widget value — excluding ONLY (a) the inputs that self-mutate
+//    at queue time (beforeQueued hooks: seed widgets re-rolled by their linked
 //    control_after_generate, and the hook widgets themselves), which change
 //    between any two serializations of the SAME graph by design (#572: the
 //    exclusion must reach the hook's serialized TARGET, not just the
-//    unserialized control the hook hangs on). A topology-only fingerprint is
+//    unserialized control the hook hangs on), and (b) inputs whose value the
+//    POST body's JSON cannot carry (undefined/function/symbol, or a toJSON
+//    that yields one), which the in-memory graphToPrompt output carries but
+//    the wire always drops — hashing
+//    those refused every scoped run on such a graph as a false "graph
+//    CHANGED" (#659). A topology-only fingerprint is
 //    insufficient: a busy queue defers serialization to post time, and a user
 //    edit in between (a changed widget value, a rewired link) leaves node
 //    ids/types untouched while rendering a DIFFERENT workflow — the guard
 //    refuses that drifted post and the run ends with a truthful "the graph
-//    changed" error. If the hash can't be computed at all (graphToPrompt
+//    changed" error NAMING the differing inputs (#659). If the hash can't be
+//    computed at all (graphToPrompt
 //    failed), the run FAILS CLOSED: it refuses upfront and never calls
 //    queuePrompt.
 //
@@ -106,16 +113,42 @@ export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
  * The ordered list of 3rd-argument shapes to try for app.queuePrompt when a
  * run-to-node scope is requested. The positional array comes first (native on
  * positional builds, normalized by the Array.isArray shim on options builds);
- * the QueuePromptOptions object is the fallback for builds that dropped the
- * shim. `[undefined]` when no scope was requested — a plain full run, exactly
- * the historical call shape.
+ * the QueuePromptOptions object is next for builds that dropped the shim.
+ * `[undefined]` when no scope was requested — a plain full run, exactly the
+ * historical call shape.
+ *
+ * #752 — the THIRD shape, `{ partialExecutionTargets }`, exists because the
+ * frontend uses TWO DIFFERENT OPTION KEYS at two different layers. Read out of a
+ * shipped ComfyUI_frontend 1.47.12 bundle:
+ *
+ *   store  async queuePrompt(e,t=1,n={}){ let {queueNodeIds:r,intent:i} =
+ *            Array.isArray(n) ? {queueNodeIds:n} : n; …
+ *            await api.queuePrompt(e, m, {partialExecutionTargets:n, …})
+ *
+ *   api    async queuePrompt(e,t,n){ … ...n?.partialExecutionTargets &&
+ *            {partial_execution_targets: n.partialExecutionTargets} … }
+ *
+ * So the store speaks `queueNodeIds` and translates it, while the api layer
+ * speaks `partialExecutionTargets` and is the one that actually writes the
+ * request field. A build whose `app.queuePrompt` IS — or forwards straight to —
+ * the api-level function silently ignores both shapes we sent, the scope never
+ * reaches the body, and the run falls through to request_body_repair. That is
+ * exactly what two field reports show (#752, on frontend 1.45.21).
+ *
+ * Strictly additive: builds that already answered shape 1 or 2 never reach this
+ * one. Destructuring ignores unknown keys, so offering the extra key cannot harm
+ * a build that does not read it.
  *
  * @param {string[]|undefined} partialTargets
  * @returns {(string[]|{queueNodeIds:string[]}|undefined)[]}
  */
 export function queuePromptScopeArgs(partialTargets) {
   if (!Array.isArray(partialTargets) || !partialTargets.length) return [undefined];
-  return [partialTargets, { queueNodeIds: partialTargets }];
+  return [
+    partialTargets,
+    { queueNodeIds: partialTargets },
+    { partialExecutionTargets: partialTargets },
+  ];
 }
 
 /**
@@ -143,6 +176,7 @@ export function queuePromptScopeAttempts(partialTargets) {
   return [
     { arg: partialTargets, repair: false },
     { arg: { queueNodeIds: partialTargets }, repair: false },
+    { arg: { partialExecutionTargets: partialTargets }, repair: false },
     { arg: partialTargets, repair: true },
   ];
 }
@@ -163,39 +197,181 @@ const fnv1aHex = (s) =>
   fnv1a32(s, 0x9e3779b9).toString(16).padStart(8, "0");
 
 /**
+ * The CANONICAL FORM of a queued prompt — sorted node entries of
+ * [execId, class_type, [[inputName, value], …]] — shared by the content hash
+ * and by the drift diff reported on a graph_changed refusal (#659).
+ *
+ * Two exclusion rules, both required for the SAME unmodified graph to
+ * canonicalize identically through the two channels this module compares —
+ * the in-memory `graphToPrompt().output` object (pre-dispatch) and the parsed
+ * POST /prompt body (post-time serialization after a JSON round-trip):
+ *
+ *  1. VOLATILE INPUTS — inputs that self-mutate at queue time (a
+ *     `beforeQueued` hook — stock seed widgets re-rolled by their linked
+ *     control_after_generate, third-party hook widgets, etc.): those change
+ *     between any two serializations of the SAME graph by design, so hashing
+ *     them would refuse our own dispatch. Exclusions are PER-NODE pairs
+ *     (prompt node id + input name, r8): an edit to a NON-hook node's
+ *     same-named input is still detected as drift, and a prompt node that
+ *     can't be resolved to a live node carrying the hook gets NO exclusions
+ *     (fail toward detecting drift). #572: the stock hook rides on the
+ *     unserialized control widget and mutates its LINKED target, so the
+ *     exclusion follows the linkedWidgets convention to the serialized
+ *     target (see collectVolatileInputs).
+ *
+ *  2. JSON-INVISIBLE VALUES (#659) — an input whose value JSON.stringify
+ *     would DROP from the inputs object: `undefined`, functions, symbols,
+ *     and object values whose own `toJSON()` returns one of those. The
+ *     in-memory output object CARRIES the key (graphToPrompt assigns
+ *     `inputs[name] = widget.value` unconditionally for serialized widgets),
+ *     but the key never reaches the POST body, so the parsed body never has
+ *     it. Without this filter the pre-dispatch hash and the post-body hash
+ *     of an untouched graph differ deterministically and every scoped run is
+ *     refused as "graph CHANGED". Live-observed shape: an async-populated
+ *     combo whose fetch produced no value (e.g. OllamaConnectivityV2's
+ *     `"model": ((), {})` — an empty-options combo with no default, left
+ *     `undefined` when the Ollama server is unreachable), and the shim
+ *     widgets a multi-spec COMFY_AUTOGROW_V3 group creates with no value at
+ *     all.
+ *
+ *     The check is an exact emulation of the wire, not a type guess: each
+ *     input is serialized once in a one-key probe object UNDER ITS REAL NAME
+ *     (codex gate r2: `toJSON(key)` receives the property name, so probing
+ *     under a fixed key misjudges a key-sensitive `toJSON`), a dropped key
+ *     yields exactly `"{}"`, and the probe's PARSED value is what the canon
+ *     stores — so `toJSON` fires exactly once per input, with the same key
+ *     the POST body would use, and the canon holds the same wire-normalized
+ *     value the parsed body will (dates, toJSON results, -0, NaN→null all
+ *     land identically on both channels). A value that THROWS on stringify
+ *     (BigInt, circular) is KEPT raw — fail toward detecting drift; the hash
+ *     itself then fails closed exactly as before.
+ *
+ *     This is NOT a drift-detection loosening: the guard's invariant is that
+ *     the workflow that WOULD EXECUTE is unchanged, and a value JSON cannot
+ *     transmit never reaches the server — it cannot be part of what
+ *     executes. Any change the wire CAN represent still flips the hash: an
+ *     edit from `undefined` to a value makes the key APPEAR in the body
+ *     (mismatch ⇒ refused), and an edit from a value to `undefined` makes it
+ *     VANISH (mismatch ⇒ refused). Only "absent on both channels" is
+ *     tolerated.
+ *
+ * Returns null for a missing/empty prompt (the caller fails closed).
+ */
+export function canonicalizePrompt(output, volatileInputs = null) {
+  if (!output || typeof output !== "object") return null;
+  const keys = Object.keys(output).sort();
+  if (!keys.length) return null;
+  return keys.map((k) => {
+    const node = output[k] ?? {};
+    const inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
+    // An own `toJSON` FUNCTION on the inputs object hijacks JSON.stringify's
+    // hook protocol for the WHOLE object (codex gate r3): on the wire the
+    // body carries whatever `inputs.toJSON("inputs")` returns instead of
+    // these keys, and the same name would hijack the one-key probe below.
+    // The wire form of such a node cannot be predicted faithfully from here,
+    // so fail CLOSED — dispatchScopedRun's catch turns this throw into the
+    // upfront "cannot fingerprint" refusal, never a false "graph CHANGED".
+    if (typeof inputs.toJSON === "function") {
+      throw new TypeError(`prompt node ${k} carries an own toJSON function — its wire form is not predictable`);
+    }
+    const names = [];
+    const wireValues = new Map();
+    for (const n of Object.keys(inputs)) {
+      if (volatileInputs?.has(`${k} ${n}`)) continue;
+      let probe;
+      try {
+        probe = JSON.stringify({ [n]: inputs[n] });
+      } catch {
+        // Unstringifyable (BigInt/circular): keep the RAW value — the hash
+        // then fails closed exactly as before #659, never dropping coverage.
+        names.push(n);
+        continue;
+      }
+      // A one-key object renders as exactly "{}" when the key is dropped —
+      // that value cannot reach the server, so it cannot drift.
+      if (probe === "{}") continue;
+      names.push(n);
+      // The canon stores the WIRE form of the value (toJSON applied once,
+      // under the real key) so both channels compare the same thing.
+      wireValues.set(n, JSON.parse(probe)[n]);
+    }
+    names.sort();
+    return [k, node.class_type ?? null, names.map((n) => [n, wireValues.has(n) ? wireValues.get(n) : inputs[n]])];
+  });
+}
+
+/**
  * The CONTENT fingerprint attributing a POST /prompt body to THIS run (r7):
  * a stable hash of the full queued prompt — node ids, class types, links, and
  * every input/widget value — canonicalized (sorted keys) so serialization
  * order can't blur it. A topology-only fingerprint (node-id|class_type) is
  * NOT enough: a busy queue defers serialization to post time, and a user edit
  * in between (a changed widget value, a rewired link) leaves the topology
- * untouched while rendering a DIFFERENT workflow.
- *
- * The ONLY values excluded are inputs that self-mutate at queue time (a
- * `beforeQueued` hook — stock seed widgets re-rolled by their linked
- * control_after_generate, third-party hook widgets, etc.): those change
- * between any two serializations of the SAME graph by design, so hashing them
- * would refuse our own dispatch. Exclusions are PER-NODE pairs (prompt node id
- * + input name, r8): an edit to a NON-hook node's same-named input is still
- * detected as drift, and a prompt node that can't be resolved to a live node
- * carrying the hook gets NO exclusions (fail toward detecting drift). #572:
- * the stock hook rides on the unserialized control widget and mutates its
- * LINKED target, so the exclusion follows the linkedWidgets convention to the
- * serialized target (see collectVolatileInputs).
+ * untouched while rendering a DIFFERENT workflow. See canonicalizePrompt for
+ * the two exclusion rules (queue-time-volatile inputs; JSON-invisible values).
  */
 export function promptContentHash(output, volatileInputs = null) {
-  if (!output || typeof output !== "object") return null;
-  const keys = Object.keys(output).sort();
-  if (!keys.length) return null;
-  const canon = keys.map((k) => {
-    const node = output[k] ?? {};
-    const inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
-    const names = Object.keys(inputs)
-      .filter((n) => !volatileInputs?.has(`${k} ${n}`))
-      .sort();
-    return [k, node.class_type ?? null, names.map((n) => [n, inputs[n]])];
-  });
+  const canon = canonicalizePrompt(output, volatileInputs);
+  if (!canon) return null;
   return fnv1aHex(JSON.stringify(canon));
+}
+
+/**
+ * WHAT differed between two canonical prompts (#659) — the observation a
+ * graph_changed refusal must report instead of asserting a cause it cannot
+ * see. One token per difference:
+ *  - `"<id> <inputName>"` — that input's value changed, or it exists on only
+ *    one side (a mid-window edit: changed widget, added/removed link);
+ *  - `"<id> (node only in queued prompt)"` / `"(node only in dispatch
+ *    body)"` — a node was removed/added in the deferred window;
+ *  - `"<id> (class_type changed)"` — the node was replaced.
+ * Input-name tokens name the pair without asserting WHICH side is newer —
+ * the guard knows only that the two serializations differ. Returns null when
+ * either canon is unusable. Never throws: this runs on the refusal path.
+ */
+export function diffPromptCanons(canonA, canonB) {
+  try {
+    if (!Array.isArray(canonA) || !Array.isArray(canonB)) return null;
+    const byId = (canon) => {
+      const m = new Map();
+      for (const entry of canon) {
+        if (Array.isArray(entry)) m.set(String(entry[0]), entry);
+      }
+      return m;
+    };
+    const A = byId(canonA);
+    const B = byId(canonB);
+    const tokens = [];
+    for (const k of A.keys()) {
+      if (!B.has(k)) tokens.push(`${k} (node only in queued prompt)`);
+    }
+    for (const k of B.keys()) {
+      if (!A.has(k)) tokens.push(`${k} (node only in dispatch body)`);
+    }
+    for (const [k, entryA] of A) {
+      const entryB = B.get(k);
+      if (!entryB) continue;
+      if (entryA[1] !== entryB[1]) {
+        tokens.push(`${k} (class_type changed)`);
+        continue;
+      }
+      const insA = Array.isArray(entryA[2]) ? entryA[2] : [];
+      const insB = Array.isArray(entryB[2]) ? entryB[2] : [];
+      const mapA = new Map(insA.filter(Array.isArray).map(([n, v]) => [String(n), v]));
+      const mapB = new Map(insB.filter(Array.isArray).map(([n, v]) => [String(n), v]));
+      for (const [n, v] of mapA) {
+        if (!mapB.has(n) || JSON.stringify(mapB.get(n)) !== JSON.stringify(v)) {
+          tokens.push(`${k} ${n}`);
+        }
+      }
+      for (const n of mapB.keys()) {
+        if (!mapA.has(n)) tokens.push(`${k} ${n}`);
+      }
+    }
+    return tokens;
+  } catch {
+    return null;
+  }
 }
 
 /** Content hash of a raw POST /prompt body, or null when unparseable/odd. */
@@ -303,16 +479,34 @@ function bodyQueueMark(bodyText) {
  *
  * The previous single "scope_missing" verdict covered FOUR different states
  * and its message asserted one specific cause for all of them ("this frontend
- * build ignored the run-to-node argument"). That assertion is a BUCKET
- * narrated as a CAUSE, and the evidence says it is usually the wrong cause:
- * every ComfyUI_frontend build from 1.42 through 1.50 demonstrably accepts
- * BOTH `app.queuePrompt` third-argument shapes (the positional
- * `NodeExecutionId[]` natively on older builds, and on newer builds through an
- * `Array.isArray(optionsOrQueueNodeIds)` normalisation into
- * `{ queueNodeIds }`), and both funnel into `api.queuePrompt`'s
- * `options.partialExecutionTargets` → `body.partial_execution_targets`. Three
- * separate field reports on #556 pasted that asserted cause verbatim into the
- * tracker, which is precisely why the real cause is still unknown.
+ * That assertion is a BUCKET narrated as a CAUSE. Three separate field reports
+ * on #556 pasted that asserted cause verbatim into the tracker, which is
+ * precisely why the real cause stayed unknown for so long.
+ *
+ * #752 - this paragraph USED to continue: "every ComfyUI_frontend build from
+ * 1.42 through 1.50 demonstrably accepts BOTH third-argument shapes ... and both
+ * funnel into api.queuePrompt's options.partialExecutionTargets ->
+ * body.partial_execution_targets". It is FALSE on at least one build, and it was
+ * the same defect this paragraph is ABOUT: a claim about builds nobody here had
+ * run, stated as demonstrated.
+ *
+ * MEASURED on a live ComfyUI_frontend 1.48.7 - intercepting POST /prompt and
+ * BLOCKING it so nothing queued - calling app.queuePrompt(0, 1, third):
+ *
+ *   positional [id]             -> partial_execution_targets: ["9"]
+ *   { queueNodeIds: [id] }      -> partial_execution_targets: {"queueNodeIds":["9"]}
+ *   { partialExecutionTargets } -> partial_execution_targets: {"partialExecutionTargets":["9"]}
+ *
+ * The third argument is copied into the body VERBATIM; nothing unwraps an
+ * options object. So on that build only the positional shape yields a usable
+ * target list, and either options shape puts an OBJECT where the server expects
+ * an array. readScopeFromBody's `not_a_list` state is what catches it - which is
+ * why that state must stay: the KEY being present is not evidence the scope
+ * landed, and a presence-only check would have accepted a malformed body.
+ *
+ * Which builds honour which shape is still not something this file can assert.
+ * The shapes are tried in order and the emitted request is measured; that is the
+ * only claim available from inside one of them.
  *
  * So the states are now reported separately, the message states only what was
  * OBSERVED, and the body's top-level keys ride along as evidence.
@@ -526,14 +720,58 @@ function scopeObservation(verdict) {
  */
 export function scopeDroppedError({ toNodeId, verdict }) {
   if (verdict?.reason === "graph_changed") {
+    // #659 — report WHAT differed (the observation), not a guessed cause. The
+    // old message named only the control_after_generate hook, which sent the
+    // reporter chasing the wrong layer for five runs. When the drift diff is
+    // available, the differing "execId inputName" pairs lead; the hook
+    // guidance stays as a fallback for when the diff could not be computed.
+    //
+    // The tokens are normalized defensively (codex gate r1): verdict.drift is
+    // module-internal today (diffPromptCanons only ever emits bounded
+    // strings), but this function is exported and runs on the refusal path —
+    // a malformed caller-supplied drift must degrade to the no-diff message,
+    // never throw out of the refusal's description.
+    const drift = (() => {
+      try {
+        if (!Array.isArray(verdict.drift) || !verdict.drift.length) return null;
+        const tokens = verdict.drift
+          .filter((t) => typeof t === "string" && t.length)
+          .map((t) => (t.length > 120 ? `${t.slice(0, 120)}…` : t));
+        return tokens.length ? tokens : null;
+      } catch {
+        return null;
+      }
+    })();
+    const MAX_DRIFT_TOKENS = 12;
+    const driftText = drift
+      ? `The differing entr${drift.length === 1 ? "y" : "ies"}: ` +
+        drift.slice(0, MAX_DRIFT_TOKENS).join("; ") +
+        (drift.length > MAX_DRIFT_TOKENS ? `; …and ${drift.length - MAX_DRIFT_TOKENS} more` : "") +
+        `. `
+      : "";
+    // Enumerate CANDIDATES, never assert one (codex gate r1/r2): the guard
+    // observed two differing serializations, nothing more — it cannot see
+    // WHAT rewrote the value, or even that a "rewrite" happened at all (a
+    // nondeterministic widget serializer — a serializeValue emitting a
+    // timestamp — produces this same refusal on an untouched graph).
+    const causeText = drift
+      ? `If you did not edit ${drift.length === 1 ? "it" : "these"} between queueing and ` +
+        `dispatch, the two serializations differ for a reason the panel cannot identify from ` +
+        `here — candidates: a queue-time widget hook (e.g. control_after_generate), a ` +
+        `dynamic-input node reshaping its slots, or a nondeterministic widget serializer. ` +
+        `Please report this with the differing list above. `
+      : `If this recurs without any edit in between, the two serializations differ for a ` +
+        `reason the panel cannot identify from here — candidates: a queue-time widget hook ` +
+        `mutating values between serialization and dispatch (e.g. a control_after_generate ` +
+        `widget with WidgetControlMode "before" — switch it to "after" or fix the target ` +
+        `widget's value), or a nondeterministic widget serializer. `;
     return (
       `run-to-node scope for node ${toNodeId} was NOT applied: the workflow graph ` +
       `CHANGED after the run was queued — the deferred dispatch would render a ` +
-      `modified workflow, not the one that was scoped. Retrying is safe (nothing ` +
-      `was queued); if this recurs without any edit in between, a queue-time widget ` +
-      `hook is mutating values between serialization and dispatch (e.g. a ` +
-      `control_after_generate widget with WidgetControlMode "before" — switch it to ` +
-      `"after" or fix the target widget's value). ` +
+      `modified workflow, not the one that was scoped. ` +
+      driftText +
+      `Retrying is safe (nothing was queued). ` +
+      causeText +
       `Nothing was queued — refusing to fall through to a full-graph execution (#556).`
     );
   }
@@ -547,8 +785,16 @@ export function scopeDroppedError({ toNodeId, verdict }) {
     `To render this branch now, either run it unscoped (panel_run without to_node_id, ` +
     `which executes the WHOLE graph — every other output branch included, at full GPU/API ` +
     `cost) or delete/bypass the output nodes you do not want and run unscoped. ` +
-    `Please report this with the body keys above — this path is not reproducible against ` +
-    `ComfyUI_frontend 1.42–1.50, where both argument shapes are honoured.`
+    // #752 — the removed clause said this path is "not reproducible against
+    // ComfyUI_frontend 1.42–1.50, where both argument shapes are honoured".
+    // Three field reports on 1.45.21 sit INSIDE that range and reproduced it, so
+    // the claim was false, and it was expensive: it told each reporter their own
+    // evidence could not be happening, and sent them (and me) to audit argument
+    // shapes that were fine. A build range is a claim about builds nobody here
+    // has run — the panel can measure the request it just made and nothing else.
+    `Please report this with the body keys above, and your ComfyUI_frontend version — ` +
+    `which builds honour which argument shape is not something the panel can determine ` +
+    `from inside one of them.`
   );
 }
 
@@ -650,7 +896,7 @@ const SCOPE_DROPPED_RESPONSE = () =>
     JSON.stringify({
       error: {
         type: "partial_execution_scope_dropped",
-        message: "run-to-node scope was not applied; nothing was queued",
+        message: tr("run_scope_guard.run_to_node_scope_was_not_applied", "run-to-node scope was not applied; nothing was queued"),
       },
     }),
     { status: 400, headers: { "Content-Type": "application/json" } },
@@ -791,6 +1037,7 @@ export function createScopedRunGuard({
   execIds,
   contentHash,
   volatileInputs = null,
+  contentCanon = null,
   batch = 1,
   toNodeId = null,
   queueMark,
@@ -801,10 +1048,24 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
+  };
+  // #659 — WHAT differed between the pre-dispatch canonical prompt and this
+  // attributed body's, for the graph_changed refusal to report. Runs only on
+  // the refusal path, after the refusal is already decided; a failure to diff
+  // (unparseable body, odd canon) degrades to null and never changes the
+  // refusal itself.
+  const driftTokensForBody = (bodyText) => {
+    try {
+      if (!contentCanon) return null;
+      const body = JSON.parse(bodyText);
+      return diffPromptCanons(contentCanon, canonicalizePrompt(body?.prompt, volatileInputs));
+    } catch {
+      return null;
+    }
   };
 
   const guard = async (route, options) => {
@@ -889,6 +1150,14 @@ export function createScopedRunGuard({
         forwardOptions = { ...options, body: repairedBody };
         targets = expected.slice();
         state.repaired++;
+        // #752 — WHAT THE BODY ACTUALLY CONTAINED. Three reports have not
+        // narrowed this because the note says the scope "did not reach the
+        // request" without saying what did. The keys distinguish the cases
+        // that matter: a frontend that dropped the field entirely, versus one
+        // that renamed it, versus one that put it somewhere else. Recorded
+        // from the FIRST repair only — later posts in a batch are the same
+        // shape, and a growing list would read as several distinct causes.
+        if (state.repairedFromKeys === null) state.repairedFromKeys = scopeRead.bodyKeys;
       }
     }
     if (contentOk && targets && sameSet(targets, expected)) {
@@ -972,7 +1241,7 @@ export function createScopedRunGuard({
       // no-usable-scope states actually occurred (readScopeFromBody), with
       // the body's top-level keys as evidence for the next report.
       const verdict = !contentOk
-        ? { ok: false, reason: "graph_changed" }
+        ? { ok: false, reason: "graph_changed", drift: driftTokensForBody(options?.body) }
         : targets
           ? { ok: false, reason: "scope_mismatch", expected, got: targets }
           : {
@@ -1158,19 +1427,25 @@ export async function dispatchScopedRun({
   // The CONTENT HASH that (with the queue mark) attributes a POST /prompt
   // body to THIS run: the full prompt we are about to queue — ids, class
   // types, links, widget values — minus only the self-mutating (beforeQueued)
-  // inputs that change between any two serializations by design. No hash ⇒
-  // no attribution ⇒ fail closed BEFORE dispatch.
+  // inputs that change between any two serializations by design, and the
+  // JSON-invisible values that cannot survive the POST body at all (#659).
+  // No hash ⇒ no attribution ⇒ fail closed BEFORE dispatch. The canonical
+  // form is RETAINED (contentCanon) so a graph_changed refusal can say WHAT
+  // differed instead of asserting a cause (#659).
   let contentHash = null;
+  let contentCanon = null;
   let volatileInputs = null;
   try {
     if (typeof app.graphToPrompt === "function") {
       // This panel's live root is app.graph (r8) — app.rootGraph only as a
       // fallback for frontends that expose it instead.
       volatileInputs = collectVolatileInputs(app?.graph ?? app?.rootGraph ?? null);
-      contentHash = promptContentHash((await app.graphToPrompt())?.output, volatileInputs);
+      contentCanon = canonicalizePrompt((await app.graphToPrompt())?.output, volatileInputs);
+      contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
     }
   } catch {
     contentHash = null;
+    contentCanon = null;
   }
   if (!contentHash) {
     return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
@@ -1221,6 +1496,7 @@ export async function dispatchScopedRun({
       execIds,
       contentHash,
       volatileInputs,
+      contentCanon,
       batch,
       toNodeId,
       queueMark: mark,
@@ -1375,6 +1651,7 @@ export async function dispatchScopedRun({
         verified: guard.state.observed,
         repaired: guard.state.repaired,
         scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        repairedFromKeys: guard.state.repairedFromKeys,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
       };
@@ -1394,6 +1671,7 @@ export async function dispatchScopedRun({
         // ran with isPartialExecution=false. graph_run states this in the
         // result rather than letting the caller infer a native scoped run.
         scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        repairedFromKeys: guard.state.repairedFromKeys,
         // DISCLOSE a fenced overrun (r3). The requested prompts DID queue, so
         // this is not a failure and must not be reported as one — but an extra
         // identical-identity post was blocked, and the caller should know their

@@ -69,9 +69,13 @@ export function installGitUrl({ id, repository } = {}) {
  *
  * A git URL (via `id` OR `repository`, any recognized protocol) always routes to
  * the repo-name-as-id payload: v4 installs by {id: repoName, selected_version:
- * ref||"nightly", channel:"dev"} (no files — v4 resolves by CNR/repo name);
- * v2-batch + legacy install the URL natively via {id: repoName, version:
- * "unknown", files:[url]}. A registry id keeps the versioned body. `id` is
+ * ref||"nightly", channel:"dev", repository: url}. The `repository` half was missing
+ * and is #920 — without it v4 has only the NAME and resolves it against the registry,
+ * which is a lookup rather than a clone; Manager's own InstallPackParams documents the
+ * field as "required if selected_version is nightly". v2-batch + legacy install the URL
+ * natively via {id: repoName, version: "unknown", files:[url]} — a different shape whose
+ * handler reads files[0], so they were never missing it. A registry id keeps the
+ * versioned body and carries no `repository` at all. `id` is
  * NEVER a full URL (a full URL matches nothing on v4 → silent "done"; on 3.x it
  * fails LATER while resolving, past the immediate `failed` array).
  */
@@ -89,6 +93,23 @@ export function buildInstallRequest(dialect, args = {}, ui_id) {
           id: gitRepoName(gitUrl),
           version: selected,
           selected_version: selected,
+          // #920 — SEND THE URL. Reducing it to `gitRepoName` and stopping there turned a
+          // from-source install into a registry lookup, and Manager answered
+          // "Node '<name>@nightly' not found in [ManagerChannel.dev,
+          // ManagerDatabaseSource.cache]" — both sources being the two defaults below.
+          //
+          // The field is not inferred. Manager's own model declares it:
+          //
+          //   class InstallPackParams(ManagerPackInfo):
+          //     repository: Optional[str] = Field(
+          //       None, description="GitHub repository URL (required if selected_version
+          //                          is nightly)")
+          //
+          // and "required if nightly" is exactly the reported call. `id` stays the derived
+          // NAME rather than the URL: sending a URL there made v4 silently mark the
+          // install done while doing nothing, which is why it was derived in the first
+          // place — that behaviour is preserved, this only stops discarding the URL.
+          repository: gitUrl,
           channel: channel || "dev",
           mode: mode || "cache",
         },
@@ -378,6 +399,13 @@ export function installedListRoute() {
   return "customnode/installed?mode=default";
 }
 
+/** Tag an error the Manager transport could not get an answer for, so the
+ *  fallback ladder can recognise it WITHOUT reading its wording (#423). */
+export function markManagerUnreachable(err) {
+  if (err && typeof err === "object") err.managerTransportUnreachable = true;
+  return err;
+}
+
 /** #423 — does a Manager error mean "route/prefix not present on this build"
  *  (a 404 / the panel's "not reachable" throw), i.e. we should retry the
  *  absolute (no-/v2) legacy route? A legacy-UI pip build can answer the queue
@@ -385,8 +413,31 @@ export function installedListRoute() {
  *  /v2/customnode/installed 404s while /customnode/installed serves fine.
  *  Broad on purpose: it gates IDEMPOTENT GET fallbacks, where re-issuing the
  *  request after even an ambiguous transport failure is safe. Mutations must
- *  use the stricter isManagerRouteMissing instead (codex P0). */
+ *  use the stricter isManagerRouteMissing instead (codex P0).
+ *
+ *  ## Why this asks the error, not the sentence
+ *
+ *  This used to decide by matching the English words "not reachable". The
+ *  message it reads is composed by `classifyManager404`, which runs it through
+ *  `tr()` — so on all 11 non-English locales the match failed, every rung of the
+ *  ladder rethrew, and the generic error surfaced while the Manager was running
+ *  and answering. The fallbacks existed and were unreachable code for anyone not
+ *  using the panel in English, which is how #423 recurred on 0.14.36 with the
+ *  whole ladder already shipped.
+ *
+ *  The facts were never in the prose: a route-missing 404 is already tagged
+ *  `managerRouteMissing`, and the transports now tag their no-response throw. The
+ *  wording test is kept LAST and only as a bridge for any path that throws a bare
+ *  Error without passing through those — it can only add matches, never remove
+ *  one, so a locale can no longer take a fallback away. */
 export function isManagerUnreachable(err) {
+  // #706, structurally. A security refusal means a handler RAN and declined; it is
+  // not an unreachable route in any language. This used to hold only because that
+  // message happens not to contain "not reachable" — but it embeds up to 300
+  // characters of UPSTREAM body text, so the wording was never ours to rely on.
+  if (err?.managerSecurityRefusal === true) return false;
+  if (isManagerRouteMissing(err)) return true;
+  if (err?.managerTransportUnreachable === true) return true;
   const msg = String(err?.message ?? err ?? "");
   return /not reachable/i.test(msg) || /HTTP\s*404\b/.test(msg);
 }
@@ -484,7 +535,28 @@ export function parseNodeMappings(data, query, limit) {
     }
   }
   const max = Math.min(Number(limit) || 15, 40);
-  return { count: out.length, results: out.slice(0, max) };
+  // #808 — `catalogue_size` is how many packs the payload CONTAINED, before the query
+  // filter. Without it, "the catalogue is empty" and "the catalogue is fine, your query
+  // matched nothing" both arrive as `count: 0` — and the reader takes the first for the
+  // second, concludes the pack does not exist, and goes on trying variations of a search
+  // that cannot succeed. That conflation is the whole of #808.
+  return { count: out.length, results: out.slice(0, max), catalogue_size: catalogueSize(data) };
+}
+
+/**
+ * #808 — how many packs a `/customnode/getmappings` payload actually carries, counted
+ * RAW: before id extraction, and before the query filter.
+ *
+ * Raw deliberately. The question is "did Manager return any packs at all", and counting
+ * only the entries that yielded an installable id would fold a PARSE fault into the
+ * EMPTY-CATALOGUE answer — a different problem with a different remedy. A body that is
+ * not a catalogue at all (null, a string, a proxy's sign-in HTML) contains no packs
+ * either, so 0 is the correct answer for it too.
+ */
+export function catalogueSize(data) {
+  if (Array.isArray(data)) return data.length;
+  if (data && typeof data === "object") return Object.keys(data).length;
+  return 0;
 }
 
 /**
@@ -577,6 +649,119 @@ export function managerUnavailableResult(query, err) {
 }
 
 /**
+ * #808 — Manager ANSWERED, and its node catalogue is EMPTY.
+ *
+ * `searchNodesVia` asks for `customnode/getmappings?mode=cache`, so Manager serves from
+ * its own local cache. A cache it never managed to populate — because Manager itself
+ * could not reach the node registry — answers HTTP 200 with `{}`. Filtered against a
+ * query that produces `count: 0`, which is the SAME answer a healthy catalogue gives when
+ * nothing matches. Empty and unreachable look identical, so the reader concludes their
+ * query was wrong and keeps trying variations of an action that can never succeed. A
+ * Chinese-speaking user reported exactly that — "我这边搜不到任何内容" — and three rounds
+ * of advice were spent sending them at a door that could not open.
+ *
+ * Zero packs is sound evidence: any working install has thousands.
+ *
+ * WHAT AN EMPTY CATALOGUE ACTUALLY MEANS — read out of ComfyUI-Manager's own source
+ * (`glob/manager_core.py`, `get_data_by_mode`), not assumed:
+ *
+ *   • A NETWORK failure does NOT produce `{}`. The `except` branch falls back to the
+ *     copy of `extension-node-map.json` BUNDLED in the Manager package (2.2 MB and
+ *     populated on a stock install), so a blocked channel still yields a full — if
+ *     stale — catalogue. This is why the message below does NOT lead with "your
+ *     network is filtered": Manager masks that case rather than emptying the list.
+ *   • `{}` comes from the `network_mode == 'offline'` path when NEITHER the cache file
+ *     NOR the local bundled file exists, or when the file that is found is itself empty
+ *     or unreadable.
+ *
+ * So zero packs means Manager assembled a catalogue from NONE of its three sources —
+ * channel, cache, bundled copy. That is genuinely anomalous (a working install has
+ * thousands), which is what makes the branch safe from false positives.
+ *
+ * WHAT THIS DOES NOT CLAIM. The panel does not make the channel request — Manager does —
+ * so it never observed a DNS failure, a timeout or a TLS error and must not report one.
+ * It says what it saw: Manager answered, the catalogue is empty, so NOTHING WAS SEARCHED
+ * and nothing follows about whether the pack exists. The host it names is the one this
+ * catalogue actually comes from — Manager's `DEFAULT_CHANNEL`,
+ * `raw.githubusercontent.com/ltdrdata/ComfyUI-Manager` — and NOT `api.comfy.org`, which
+ * serves pack installs rather than this mapping. Naming the wrong host would send a
+ * filtered user to check something irrelevant, which is the same failure as saying
+ * nothing.
+ *
+ * KNOWN LIMITATION, deliberately not solved here: because Manager degrades to the bundled
+ * copy, a genuinely blocked channel surfaces as a STALE catalogue rather than an empty
+ * one, and the panel cannot currently tell stale from current. That is a separate gap
+ * needing a signal Manager does not expose today; inventing a staleness claim here would
+ * repeat the very fault #808 reports.
+ */
+/**
+ * #890 — what a NO-MATCH over a populated catalogue may honestly say.
+ *
+ * Only two things are claimed, and the panel knows both for certain: how many packs the
+ * catalogue it searched contained, and that it asked Manager for the CACHED copy. It does
+ * NOT claim the cache is stale, or old, or that the registry is blocked — none of that is
+ * observable from the response, and asserting it is the fault the parent issue was filed
+ * about.
+ *
+ * `mode=cache` is read off the route actually requested rather than hardcoded, so if the
+ * route changes and this text does not, the note stops claiming a mode that was not asked
+ * for.
+ */
+export function cachedCatalogueNoMatch(query, catalogueSize, route) {
+  const q = query == null ? "" : String(query);
+  const mode = /[?&]mode=([^&]+)/.exec(String(route ?? ""))?.[1] ?? null;
+  // STRICTLY a number. `Number.isFinite(Number(v))` accepts `null` — Number(null) is 0 —
+  // and would print "(0 packs)" for an absent size, which reads as an EMPTY catalogue:
+  // the one thing this branch is not about, and the case #808 answers far more strongly.
+  const size = typeof catalogueSize === "number" && Number.isFinite(catalogueSize) ? catalogueSize : null;
+  if (mode !== "cache") return {};
+  return {
+    // REQUESTED, not served (codex). Naming this `catalogue_mode` asserted where the
+    // bytes came from, which is the one thing this code cannot see: the parameter is what
+    // the panel ASKED for, and nothing in the answer says whether Manager honoured it.
+    requested_mode: "cache",
+    no_match_note:
+      `No pack in the catalogue matched${q ? ` "${q}"` : ""}${
+        size == null ? "" : `, out of ${size} packs searched`
+      }. This request asked ComfyUI-Manager for mode=cache. What the response came FROM is ` +
+      "not something the panel can tell: Manager does not report whether it honoured that " +
+      "parameter, when the data was fetched, or whether it served the network, its on-disk " +
+      "cache or the copy bundled with the Manager package (#890). So this result cannot " +
+      "distinguish \"no such pack\" from \"a pack too recent for whatever list was " +
+      "searched\". If the pack is recent, refresh Manager's cache from its UI and search " +
+      "again before concluding it does not exist.",
+  };
+}
+
+export function emptyCatalogueResult(query) {
+  const q = query == null ? "" : String(query);
+  return {
+    supported: true,
+    managerReachable: true,
+    catalogue_empty: true,
+    catalogue_size: 0,
+    searched: false,
+    count: 0,
+    results: [],
+    query: q,
+    message:
+      "ComfyUI-Manager answered, but its node catalogue contains ZERO packs — so " +
+      `nothing was actually searched, and this result says NOTHING about whether ${
+        q ? `"${q}"` : "a pack"
+      } exists. (This is not "no matches": a populated catalogue has thousands of packs.) ` +
+      "Manager assembles this list from its channel (by default " +
+      "raw.githubusercontent.com/ltdrdata/ComfyUI-Manager), falling back to its on-disk " +
+      "cache and then to the copy bundled in the Manager package — so an empty list " +
+      "means NONE of those three produced data. The usual causes are Manager running " +
+      "with network_mode 'offline' and no cache yet, or a Manager install whose data " +
+      "files are missing or unreadable. Refresh the cache from the Manager UI and " +
+      "retry; if this machine is behind corporate, campus or national network " +
+      "filtering, that channel host is the one to check. Nodes already installed are " +
+      "unaffected: list them with panel_list_nodes.",
+  };
+}
+
+/**
  * Run the nodes_search flow with graceful degradation against an unreachable /
  * legacy ComfyUI-Manager (#251/#255). Dependency-injected `managerGet` (dialect-
  * routed; adds /v2 for pip builds, strips it for legacy) and `managerCall`
@@ -611,7 +796,25 @@ export async function searchNodesVia(
       throw err2;
     }
   }
-  return parseNodeMappings(data, query, limit);
+  const parsed = parseNodeMappings(data, query, limit);
+  // #808 — an EMPTY catalogue is not a no-match, and only this branch can tell the
+  // caller so. Checked on `catalogue_size` (packs the payload carried) rather than
+  // `count` (packs that matched), because a healthy catalogue legitimately returns
+  // count 0 all the time and must keep reading as the ordinary no-match it is.
+  if (parsed.catalogue_size === 0) return emptyCatalogueResult(query);
+  // #890 — a NO-MATCH over a populated catalogue is the case #808 left open, and it is
+  // the likelier one in the field because Manager works hard never to return empty. A
+  // blocked registry yields a FULL list that may be months old, presented identically to
+  // a current one, so "no matches" and "that pack does not exist" arrive as the same
+  // answer. Nothing in the payload carries provenance — no fetch time, no indication of
+  // network vs cache vs bundle — and the issue's own follow-up measured that a
+  // "is this the bundled map" discriminator would never fire (5583 served vs 4884
+  // bundled, sharing ~1800 keys), so it would ship as a check that always passes.
+  //
+  // What IS observable without inventing anything: this search asked for `mode=cache`.
+  // That is the panel's own request, not an inference about the payload, and it is
+  // exactly the fact a reader needs before concluding a pack does not exist.
+  return parsed.count === 0 ? { ...parsed, ...cachedCatalogueNoMatch(query, parsed.catalogue_size, route) } : parsed;
 }
 
 /** #425 — ordered reboot {route, method} candidates for the detected dialect.
@@ -676,6 +879,69 @@ function taskStatusStr(item) {
  * shape we don't recognize can never become a FALSE failure). Prefers the
  * `status.messages` (the crash/exception text) for the reason, then `result`.
  */
+/**
+ * #920 — does this Manager failure mean "that pack is not in the registry"?
+ *
+ * v4 resolves an install from its OWN database — `get_custom_nodes(channel, mode)`,
+ * falling back to `cnr_map[node_id]` — and when neither has the pack it answers
+ *
+ *   Node '<id>@<version>' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]
+ *
+ * Matched on the STABLE part ("not found in" + a bracketed source list) rather than
+ * the enum spellings, which vary with channel/mode. Deliberately narrow: only a
+ * message we positively recognise is reshaped, everything else passes through.
+ */
+export function isRegistryLookupMiss(text) {
+  return typeof text === "string" && /Node\s+'[^']*@[^']*'\s+not found in\s*\[[^\]]*\]/i.test(text);
+}
+
+/**
+ * #920 — what to add when a GIT URL install hits that miss.
+ *
+ * The reporter passed a repository URL and got a registry-lookup failure naming a
+ * pack id they never supplied. That reads like a lookup bug and sends people to
+ * re-check spelling, channel and mode; none of it is the problem.
+ *
+ * Both facts below are read from ComfyUI-Manager's SOURCE, not its schema — the
+ * schema is what misled two separate attempts at this issue (`InstallPackParams`
+ * declares `repository` "required if selected_version is nightly", and `do_install`
+ * reads only id/selected_version/channel/mode/skip_post_install):
+ *
+ *   1. the pack is not in the registry — that IS what the lookup missed;
+ *   2. a stock v4 has NO route that installs an arbitrary git URL. The legacy
+ *      `/manager/queue/install` route does (`@unknown` + `files:[url]`), but
+ *      `comfyui_manager/__init__.py` registers the legacy server only under
+ *      `--enable-manager-legacy-ui`.
+ *
+ * Returns "" when there is nothing extra to say, so callers may append blindly.
+ */
+export function unlistedGitUrlAdvice(failureText) {
+  if (!isRegistryLookupMiss(failureText)) return "";
+  // Phrased for BOTH readers, because the surface that shows this failure
+  // (panel_node_queue_status) does not carry the original request and plumbing it
+  // through for a message is not worth the coupling. Someone who mistyped a
+  // registry id needs the first sentence; someone who passed a git URL needs the
+  // rest, and the conditional wording keeps it from asserting which they did.
+  return (
+    ` — NOTE: that is a NODE REGISTRY lookup. The pack is not in the registry under that` +
+    ` name. IF YOU PASSED A GIT URL: this ComfyUI-Manager cannot install one. It resolves` +
+    ` installs from its own database, and the parameter that would carry a URL (repository)` +
+    ` is accepted and then IGNORED by its install handler — so no argument to this tool will` +
+    ` make it clone your URL. USE install_custom_node INSTEAD: that tool runs on the` +
+    ` machine rather than in this browser, and when the Manager cannot resolve a pack it` +
+    ` clones the repository into custom_nodes/ itself. It is the one path that installs an` +
+    ` unlisted URL — so this tool's usual "prefer me over the headless install_custom_node"` +
+    ` guidance does NOT hold for this case. Restart ComfyUI afterwards to load it.` +
+    ` If that is not available (a REMOTE target has no local tree to clone into, and it` +
+    ` keeps the Manager's error for that reason), the remaining options are to clone into` +
+    ` custom_nodes/ by hand, or ask the pack author to publish to the registry. A legacy` +
+    ` git-URL route also exists but needs TWO steps — --enable-manager-legacy-ui (which` +
+    ` REPLACES the v2 Manager API) AND allow_git_url_install = true in ComfyUI-Manager's` +
+    ` config.ini, without which an unlisted pack is rated "high+" risk and it answers 404.` +
+    ` IF YOU MEANT A REGISTRY PACK: check the id and the channel/mode named in the brackets.`
+  );
+}
+
 export function taskFailureReason(item) {
   if (!isTaskHistoryItem(item)) return null;
   if (!TASK_FAILURE_STATUS.has(taskStatusStr(item))) return null;
@@ -797,4 +1063,25 @@ export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
       `usually required to load an updated node. If it still misbehaves, check the ` +
       `ComfyUI server log.`,
   };
+}
+
+/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
+ *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
+ *  silent success on a failed op is exactly the #184 no-op bug.
+ *
+ *  Lives HERE rather than in the panel (#367): the unit harness injects the panel's
+ *  mutation deps by name from this module, and it was destructuring an `assertBatchOk`
+ *  this module never exported — so every batch-path test would have crashed on
+ *  `assertBatchOk is not a function`. None did, because none reached the batch branch.
+ *  Exporting it is what makes that branch testable at all.
+ */
+export function assertBatchOk(res, id, op) {
+  const failed = Array.isArray(res?.failed) ? res.failed : [];
+  if (failed.length && (id === undefined || failed.includes(id))) {
+    throw new Error(
+      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
+        "(check the ComfyUI server log for the underlying error — security_level " +
+        "gating is a common cause). The pack was NOT installed.",
+    );
+  }
 }
