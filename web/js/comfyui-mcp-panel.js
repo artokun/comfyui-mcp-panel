@@ -512,6 +512,12 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { createRehelloGate, routeIsStale } from "./lib/rehello-gate.js";
+/** #1095 — control frames that must arrive AFTER the hello that establishes their route,
+ *  and whose senders ignore the return value. Those two properties together are what makes
+ *  a frame queueable: a queued frame's outcome is not yet known, so it may only be queued
+ *  where nobody is going to act on an answer it cannot give. Everything else is refused
+ *  while the route is stale (see sendFrame). */
+const SESSION_ORDERED_FRAMES = new Set(["resume_session", "new_session"]);
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
 import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
@@ -19990,9 +19996,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // to the agent for the previous one. Hold it instead, STAMPED with the route it was
       // composed for: it leaves only when that route has actually been advertised, it never
       // causes the advertisement (only the workflow poll may author one — it binds the
-      // session first), and if the panel commits to a different workflow meanwhile it is
-      // discarded rather than delivered there. See holdForRoute in lib/rehello-gate.js.
-      if (advertisedRouteIsStale()) return rehelloGate.holdForRoute(send, bridgeRouteId());
+      // session first).
+      //
+      // REFUSED, NOT QUEUED. Queueing a user message and answering `true` would report it
+      // delivered while it can still be discarded — and `trackSend` arms a delivery timeout
+      // on that answer, so the message would sit "sent" and then quietly never arrive.
+      // Queueing and answering `false` is worse: the tray shows it failed, the user presses
+      // Send now, and the queued copy goes out too. A plain refusal is the only answer that
+      // is true when it is given: nothing was written, the tray says so, and one retry
+      // sends exactly one message. See holdForRoute in lib/rehello-gate.js.
+      if (advertisedRouteIsStale()) return false;
       return send();
     },
     /** Send an arbitrary control frame (set_options, new_session, …). */
@@ -20041,9 +20054,27 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // cannot overtake each other — frames on one socket are ordered, and a hold that
       // reordered them would trade a routing bug for a conversation bug.
       //
+      // Only SESSION-ORDERED frames are queued; everything else is refused outright.
+      //
+      // The split is not a convenience. A queued frame cannot be reported as delivered (it
+      // may still be discarded) and cannot be reported as failed (the queued copy may still
+      // go out), so it may only be queued when NO caller reads the answer. `resume_session`
+      // and `new_session` are exactly that: fire-and-forget, and meaningless before the
+      // hello anyway — they hand the next turn to an agent on a route the orchestrator has
+      // not been told about yet.
+      //
+      // Everything else is refused, which every caller already handles correctly. It matters
+      // most for `agent_event`: runCompletion reads the answer and, on `true`, calls
+      // markDelivered — retiring the prompt from pending so it is NEVER recovered from
+      // /history. A refusal re-pends it instead, which is the behaviour that path was built
+      // for ("sendFrame returns false when the bridge socket is down").
+      //
       // Stamped with `routeId`, which is the route this frame's own tab_id already names, so
       // the stamp and the payload can never disagree.
-      if (advertisedRouteIsStale()) return rehelloGate.holdForRoute(send, routeId);
+      if (advertisedRouteIsStale()) {
+        if (!SESSION_ORDERED_FRAMES.has(frame?.type)) return false;
+        return rehelloGate.holdForRoute(send, routeId);
+      }
       return send();
     },
     /** Run a whitelisted backend tool directly (no agent turn), cid-correlated.

@@ -298,6 +298,48 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     flush();
   }
 
+  /**
+   * (Re)arm the expiry that discards held frames when no advertisement arrives.
+   *
+   * IT TRACKS THE DEFERRAL, rather than being a fixed timeout from the first enqueue. The
+   * first cut armed once, for the first frame, and never moved it — but the advertisement a
+   * held frame is waiting for is itself deferred by whatever commands are in flight, and
+   * `began()` pushes that deadline out. A route switch queues a frame; an `ask_user` then
+   * starts while the hello is parked; the hello may legitimately not go out until 30 s after
+   * THAT command, while a timer armed 30 s after the earlier enqueue clears the queue first.
+   * The frame is then discarded while the advertisement it is waiting for is still perfectly
+   * pending — a self-inflicted loss, not a timeout.
+   *
+   * So the expiry is "the deferral's own deadline, plus a machine budget for the hello to
+   * actually land", floored at the human budget so an unparked hold still gets a full window.
+   */
+  function armHoldExpiry() {
+    if (!held.length) return;
+    const afterDrain = drainDeadline > 0 ? drainDeadline - clock() + REHELLO_DEFER_MS : 0;
+    const ms = Math.max(REHELLO_DEFER_HUMAN_MS, afterDrain);
+    if (holdTimer !== null) {
+      try {
+        disarm(holdTimer);
+      } catch {
+        // A stray timer only clears an already-empty queue.
+      }
+      holdTimer = null;
+    }
+    try {
+      holdTimer = arm(() => {
+        holdTimer = null;
+        // Nothing advertised in time. These frames were composed for a route the
+        // orchestrator was never told about; sending them now would send them on whatever
+        // route it does hold, which is the leak this exists to prevent.
+        held.length = 0;
+      }, ms);
+    } catch {
+      // No timer source: prefer dropping the frames to holding them forever on a route that
+      // may never be advertised.
+      held.length = 0;
+    }
+  }
+
   function armFor(ms) {
     disarmTimer();
     try {
@@ -345,6 +387,9 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
         // early. (`fire` would catch this on its own, but re-arming keeps the timer honest
         // rather than relying on a re-check to paper over a wrong wake-up.)
         if (waiters) armFor(drainDeadline - clock());
+        // …and held frames must not expire while the advertisement they wait for is still
+        // legitimately deferred by THIS command. See armHoldExpiry.
+        armHoldExpiry();
       }
       return mark;
     },
@@ -480,27 +525,22 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     holdForRoute(send, route) {
       if (typeof send !== "function") return false;
       held.push({ send, route });
-      // Bounded, so a route that is never advertised (the user switched away and never came
-      // back, the poll is not running) cannot hold a frame forever. The bound is the human
-      // budget because that is already the longest a legitimate advertisement can be
-      // deferred — anything shorter would discard frames the poll was still going to serve.
-      if (holdTimer === null) {
-        try {
-          holdTimer = arm(() => {
-            holdTimer = null;
-            // Nothing advertised in time. These frames were composed for a route the
-            // orchestrator was never told about; sending them now would send them on
-            // whatever route it does hold, which is the leak this exists to prevent.
-            held.length = 0;
-          }, REHELLO_DEFER_HUMAN_MS);
-        } catch {
-          // No timer source: prefer dropping the frame to holding it forever on a route
-          // that may never be advertised.
-          held.length = 0;
-          return false;
-        }
-      }
-      return true;
+      armHoldExpiry();
+      // ALWAYS FALSE, and this is the contract fix rather than a detail.
+      //
+      // The synchronous return of every send path means one thing — "the bytes reached the
+      // socket" — and for a queued frame that is simply not true yet, and may never become
+      // true: the queue is discarded on a mismatched advertisement, on expiry, and on
+      // cancellation. Returning `true` here propagated up through sendFrame as a successful
+      // write, and `runCompletion` acts on that IRREVERSIBLY: `framePushed` → markDelivered
+      // → the prompt is retired from pending and never recovered from /history. A frame
+      // reported as delivered and then discarded is neither refused nor delivered but
+      // invisible, which is worse than either.
+      //
+      // Callers that must not be lied to therefore see a plain "not sent" and use the
+      // recovery they already have. The ONE caller that queues (a session-ordered control
+      // frame, which has no meaning before the hello anyway) ignores the return entirely.
+      return false;
     },
 
     /**

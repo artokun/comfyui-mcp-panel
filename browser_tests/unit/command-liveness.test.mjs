@@ -846,8 +846,14 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
     }
     ts.forEachChild(n, walk);
   })(sf);
-  assert.equal(holdSites.length, 2, "sendUserMessage and sendFrame must both be able to hold");
-  assert.equal(staleReads.length, 2, "…and each hold must be gated on the check");
+  // ONE hold site, not two. A queued frame's outcome is not yet known, so it may only be
+  // queued where nobody reads the answer — which is `sendFrame`'s session-ordered control
+  // frames alone. `sendUserMessage` REFUSES instead: queueing it and answering `true` would
+  // report it delivered while it can still be discarded (runCompletion's markDelivered
+  // retires a prompt permanently on exactly that answer), and answering `false` would leave
+  // the tray showing failed while the queued copy still goes out on the next advertisement.
+  assert.equal(holdSites.length, 1, "only the session-ordered control frames may be queued");
+  assert.equal(staleReads.length, 2, "…but BOTH send paths must consult the route first");
   assert.equal(
     (src.match(/^\s*function advertisedRouteIsStale\(\) \{/gm) || []).length,
     1,
@@ -862,11 +868,6 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
     const end = src.indexOf("\n    },", at);
     assert.notEqual(end, -1, `could not bound ${name}`);
     const body = src.slice(at, end);
-    assert.match(
-      body,
-      /if \(advertisedRouteIsStale\(\)\) return rehelloGate\.holdForRoute\(send, [^;]+\);/,
-      `${name} must hold the frame, stamped with its route, when the advertised route is stale`,
-    );
     const guardAt = body.indexOf("if (advertisedRouteIsStale())");
     const plainAt = body.lastIndexOf("return send();");
     assert.ok(guardAt !== -1 && plainAt > guardAt, `${name} must only send directly AFTER the guard`);
@@ -875,6 +876,35 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
     const buildAt = body.indexOf("const send = () => {");
     assert.ok(buildAt !== -1 && buildAt < guardAt, `${name} must build the frame before deciding`);
   }
+
+  // sendUserMessage refuses outright; only sendFrame may queue, and only for the frames
+  // whose senders ignore the answer.
+  const umAt = src.indexOf("    sendUserMessage(");
+  const umBody = src.slice(umAt, src.indexOf("\n    },", umAt));
+  assert.match(umBody, /if \(advertisedRouteIsStale\(\)\) return false;/, "a user message is refused, never queued");
+  // The CALL, not the word — the comment above it names holdForRoute to explain why this
+  // path deliberately does not use it.
+  assert.equal(
+    /rehelloGate\.holdForRoute\(/.test(umBody),
+    false,
+    "…and it must not reach the queue at all",
+  );
+
+  const sfAt = src.indexOf("    sendFrame(frame) {");
+  const sfBody = src.slice(sfAt, src.indexOf("\n    },", sfAt));
+  assert.match(
+    sfBody,
+    /if \(!SESSION_ORDERED_FRAMES\.has\(frame\?\.type\)\) return false;/,
+    "every other control frame is refused, so runCompletion re-pends instead of retiring",
+  );
+  assert.match(sfBody, /return rehelloGate\.holdForRoute\(send, routeId\);/, "…and the queued one carries its route");
+  // The set must stay exactly the fire-and-forget session frames. Adding a frame whose
+  // sender reads the return would reintroduce "reported delivered, then discarded".
+  assert.match(
+    src,
+    /const SESSION_ORDERED_FRAMES = new Set\(\["resume_session", "new_session"\]\);/,
+    "only fire-and-forget session frames may be queued",
+  );
 
   // The comparison must be against what the hello ACTUALLY carried, recorded on the landed
   // path only — the same rule as lastAdvertisedWorkflowUuid and advertisedSock beside it.

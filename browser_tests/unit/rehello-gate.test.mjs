@@ -390,6 +390,43 @@ test("#1095 codex P1: the advertised route is STALE once the committed workflow 
   assert.equal(routeIsStale({}), false);
 });
 
+test("#1095 codex R6: a QUEUED frame is never reported as delivered", () => {
+  // The return of every send path means one thing — "the bytes reached the socket" — and a
+  // queued frame has not. Reporting `true` propagated up as a successful write, and
+  // runCompletion acts on that IRREVERSIBLY: framePushed → markDelivered → the prompt is
+  // retired from pending and never recovered from /history. A frame reported as delivered
+  // and then discarded is neither refused nor delivered but invisible, which is worse than
+  // either of them.
+  const gate = manualGate(() => Promise.resolve(true));
+  assert.equal(
+    gate.holdForRoute(() => {}, "tmp:B"),
+    false,
+    "queued is not sent, and must not be answered as if it were",
+  );
+  assert.equal(gate.heldFrames(), 1, "…while still actually being queued");
+});
+
+test("#1095 codex R6: the expiry follows a deferral that is EXTENDED after the frame queued", () => {
+  // The advertisement a held frame waits for is itself deferred by whatever commands are in
+  // flight, and a command that starts LATER pushes that deadline out. Armed once at enqueue
+  // and never moved, the expiry cleared the queue while the hello it was waiting for was
+  // still perfectly pending — a self-inflicted loss rather than a timeout.
+  const order = [];
+  const { gate, advance } = harness();
+  gate.holdForRoute(() => order.push("frame"), "tmp:B");
+
+  // 20s in, an ask_user starts: the hello may now legitimately not go out until t≈50s.
+  advance(20000);
+  gate.began("ask_user");
+
+  // Past the ORIGINAL 30s window from enqueue — the frame must still be alive.
+  advance(11000);
+  assert.equal(gate.heldFrames(), 1, "a frame must not expire while its advertisement is still due");
+
+  gate.noteAdvertised("tmp:B");
+  assert.deepEqual(order, ["frame"], "…and it is still there to be released");
+});
+
 test("#1095 codex P1: a held frame leaves only when ITS OWN route has been advertised", () => {
   // The leak: a user_message carries NO tab id, so the orchestrator routes it by the socket
   // binding. Sent before the new route is advertised it reaches the PREVIOUS workflow's
@@ -397,7 +434,7 @@ test("#1095 codex P1: a held frame leaves only when ITS OWN route has been adver
   const order = [];
   const gate = manualGate(() => Promise.resolve(true));
   const accepted = gate.holdForRoute(() => order.push("user_message"), "tmp:B");
-  assert.equal(accepted, true, "the frame is accepted, not refused — it is queued, not dropped");
+  assert.equal(accepted, false, "queued is not sent — see the R6 contract test above");
   assert.deepEqual(order, [], "and it does not go out yet");
   assert.equal(gate.heldFrames(), 1);
 
