@@ -142,10 +142,10 @@ test("add_node: unknown-type error points at a LIVE class-type oracle, not a ret
     // The retired panel_get_graph must never be recommended.
     assert.doesNotMatch(e.message, /panel_get_graph/);
     // #741: panel_search_nodes searches installable Manager PACKS, not node classes,
-    // so it can never answer "what is the exact class_type" — get_node_info (the live
-    // /object_info) is the oracle that can.
+    // so it can never answer "what is the exact class_type" — create_workflow
+    // (action:"node_info", the live /object_info) is the oracle that can.
     assert.doesNotMatch(e.message, /panel_search_nodes/);
-    assert.match(e.message, /get_node_info/);
+    assert.match(e.message, /create_workflow \(action:"node_info"\)/);
   }
 });
 
@@ -1021,10 +1021,11 @@ test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a fron
 //      MarkdownNote (frontend-only virtual types, never in /object_info) must be
 //      ADDABLE on a healthy backend, while a genuinely-bogus type is still refused —
 //      and the refusal must steer the agent at a tool that can actually resolve an
-//      exact class_type (get_node_info, the live /object_info), never
-//      panel_search_nodes (which searches installable Manager PACKS). ---------------
+//      exact class_type (create_workflow action:"node_info", the live
+//      /object_info), never panel_search_nodes (which searches installable
+//      Manager PACKS). ------------------------------------------------------
 
-test("#741 add_node: Note/MarkdownNote are accepted; a bogus type is refused and points at get_node_info, not panel_search_nodes", async () => {
+test('#741 add_node: Note/MarkdownNote are accepted; a bogus type is refused and points at create_workflow (action:"node_info"), not panel_search_nodes', async () => {
   const reg = registryWithNatives(); // natives registered as LiteGraph registers them
   const fresh = objectInfo(); // healthy backend — never lists the virtual types
   for (const t of ["Note", "MarkdownNote"]) {
@@ -1037,7 +1038,7 @@ test("#741 add_node: Note/MarkdownNote are accepted; a bogus type is refused and
     () => assertAddNodeResolvableRefreshing(() => reg, "TotallyBogusNode", ADD_OPTS(fresh)),
     (err) => {
       assert.match(err.message, /Unknown node type "TotallyBogusNode"/);
-      assert.match(err.message, /get_node_info/);
+      assert.match(err.message, /create_workflow \(action:"node_info"\)/);
       assert.doesNotMatch(err.message, /panel_search_nodes/);
       return true;
     },

@@ -14,6 +14,23 @@
 //   formModal   ({title,fields[],submitLabel,cancelLabel})        -> Promise<values|null>
 //
 // All user text goes through textContent (el() below) — no HTML injection.
+//
+// TRANSLATION: every word this module supplies itself ("Confirm"/"Cancel"/
+// "Save"/"OK") lives in a DEFAULT PARAMETER, which is why the string extractor
+// never proposed them — it matches `label:`-style assignment contexts, and a
+// default sits in a destructuring pattern instead. Defaults are evaluated per
+// CALL, not at module load, so tr() here resolves against whatever catalog is
+// loaded by the time a sheet actually opens; there is no ordering hazard with
+// loadCatalog().
+//
+// Only `cancelLabel` is currently reached: no caller anywhere passes one, while
+// every live call site overrides title/confirmLabel/submitLabel with its own
+// wording (cmcp-apps-ui.js). Those literals are that file's to translate. The
+// rest are the contract this module publishes for a caller that omits them, and
+// a dead default that renders English the day someone stops passing one is the
+// bug this is here to prevent.
+
+import { tr } from "./lib/i18n.js";
 
 const el = (tag, cls, txt) => {
   const n = document.createElement(tag);
@@ -55,7 +72,7 @@ export function toast(msg, { ms = 3500 } = {}) {
   // whole explorer just closed after a successful load).
   t.style.cssText = "position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);" +
     "max-width:min(38rem,90vw);text-align:center;background:var(--p-surface-800,#27272a);" +
-    "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:.82rem;" +
+    "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0092);" +
     "box-shadow:0 4px 16px rgba(0,0,0,.5)";
   document.body.appendChild(t);
   setTimeout(() => t.remove(), ms);
@@ -67,12 +84,12 @@ function injectModalCss() {
   _mdlCss = true;
   const css = `
 .cmcp-mdl{display:flex;flex-direction:column;gap:.85rem;}
-.cmcp-mdl-msg{font-size:.85rem;line-height:1.55;white-space:pre-wrap;color:var(--p-text-color,#fafafa);}
+.cmcp-mdl-msg{font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);line-height:1.55;white-space:pre-wrap;color:var(--p-text-color,#fafafa);}
 .cmcp-mdl-field{display:flex;flex-direction:column;gap:.3rem;}
-.cmcp-mdl-label{font-size:.72rem;font-weight:600;opacity:.8;text-transform:uppercase;letter-spacing:.03em;}
+.cmcp-mdl-label{font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);font-weight:600;opacity:.8;text-transform:uppercase;letter-spacing:.03em;}
 .cmcp-mdl-field input,.cmcp-mdl-field textarea{padding:.5rem .6rem;border-radius:8px;
   border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-surface-950,#111113);
-  color:var(--p-text-color,#fafafa);font:inherit;font-size:.85rem;box-sizing:border-box;width:100%;}
+  color:var(--p-text-color,#fafafa);font:inherit;font-size:calc(var(--cmcp-fs, 0.8125rem) * 1.0462);box-sizing:border-box;width:100%;}
 .cmcp-mdl-field input:focus,.cmcp-mdl-field textarea:focus{outline:none;border-color:var(--p-primary-color,#60a5fa);}
 .cmcp-mdl-field textarea{resize:vertical;min-height:4.5rem;}
 .cmcp-mdl-btns{display:flex;justify-content:flex-end;gap:.5rem;margin-top:.15rem;}
@@ -90,10 +107,10 @@ function injectModalCss() {
 /** Yes/No confirmation. Resolves true only when the confirm button is clicked;
  *  ✕ / backdrop / cancel all resolve false. */
 export function confirmModal({
-  title = "Confirm",
+  title = tr("modal.confirm", "Confirm"),
   message = "",
-  confirmLabel = "Confirm",
-  cancelLabel = "Cancel",
+  confirmLabel = tr("modal.confirm", "Confirm"),
+  cancelLabel = tr("panel.cancel", "Cancel"),
   danger = false,
 } = {}) {
   injectModalCss();
@@ -121,7 +138,12 @@ export function confirmModal({
 
 /** Multi-field form modal. `fields` = [{key,label,value,placeholder,type,multiline,rows}].
  *  Resolves a { key: value } object on submit, or null when dismissed. */
-export function formModal({ title = "", fields = [], submitLabel = "Save", cancelLabel = "Cancel" } = {}) {
+export function formModal({
+  title = "",
+  fields = [],
+  submitLabel = tr("panel.save", "Save"),
+  cancelLabel = tr("panel.cancel", "Cancel"),
+} = {}) {
   injectModalCss();
   return new Promise((resolve) => {
     let settled = false;
@@ -180,8 +202,8 @@ export function promptModal({
   value = "",
   placeholder = "",
   multiline = false,
-  submitLabel = "OK",
-  cancelLabel = "Cancel",
+  submitLabel = tr("modal.ok", "OK"),
+  cancelLabel = tr("panel.cancel", "Cancel"),
 } = {}) {
   return formModal({
     title,

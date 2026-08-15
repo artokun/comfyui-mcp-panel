@@ -34,7 +34,8 @@ export function parseHistoryEntry(entry, { isVideo } = {}) {
 
   // ComfyUI records a manually stopped render as status_str:"error" plus an
   // execution_interrupted lifecycle message. That is a terminal cancellation,
-  // not an execution failure: diagnose_run makes the same distinction. An actual
+  // not an execution failure: get_history action:"diagnose" makes the same
+  // distinction. An actual
   // execution_error wins if an unusual record carries both markers.
   const hasMessage = (name) => messages.some((message) => Array.isArray(message) && message[0] === name);
   const hasExecutionError = hasMessage("execution_error");

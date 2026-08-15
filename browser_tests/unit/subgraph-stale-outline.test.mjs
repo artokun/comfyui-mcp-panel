@@ -29,12 +29,26 @@ const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, g
 assert.ok(cleanupMatch, "could not locate clearStaleRedFlag in panel source");
 const cleanupSource = cleanupMatch[0];
 
+// Both conversion executors now assert the converted node actually landed before
+// reporting it (the null-coalesced `node_id` used to let a no-op conversion read as a
+// success). Inject the REAL helper, extracted the same way as the cleanup above, so
+// these tests keep exercising the shipped guard rather than a stub that would hide a
+// regression in it.
+const landedMatch = panelSrc.match(
+  /function assertSubgraphNodeLanded\(res, graph, what\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(landedMatch, "could not locate assertSubgraphNodeLanded in panel source");
+const assertSubgraphNodeLanded = new Function(
+  `return ${landedMatch[0]};`,
+)();
+
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
     "getGraphCtx",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "assertSubgraphNodeLanded",
     `const executors = { ${createSource} }; return executors.graph_create_subgraph;`,
-  )(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion);
+  )(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion, assertSubgraphNodeLanded);
 }
 
 function realGroup(
@@ -50,6 +64,7 @@ function realGroup(
     "syncGraphNodeAreas",
     "groupMemberNodes",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "assertSubgraphNodeLanded",
     `const executors = { ${groupSource} }; return executors.graph_subgraph_group;`,
   )(
     getGraphCtx,
@@ -57,6 +72,7 @@ function realGroup(
     syncGraphNodeAreas,
     groupMemberNodes,
     clearStaleRedFlagsAfterSubgraphConversion,
+    assertSubgraphNodeLanded,
   );
 }
 

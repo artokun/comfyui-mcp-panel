@@ -24,37 +24,77 @@
  */
 import { test, expect } from './fixtures/panelTest'
 
-// A canned /v1/images feed page. Distinct ids so highlight-by-id is meaningful.
-// `page` selects which ids come back so a later "page" can carry a target that
-// the first page didn't (the scroll/append-highlight case).
-function imagesPage(ids: number[], nextCursor: string | null) {
+// A canned search page. Distinct ids so highlight-by-id is meaningful. `page`
+// selects which ids come back so a later "page" can carry a target that the
+// first page didn't (the scroll/append-highlight case).
+//
+// panel#793 — this used to emit the REST `/v1/images` shape,
+// `{ items, metadata: { nextCursor } }`. The panel does not call that endpoint
+// for a keyword search; it POSTs CivitAI's Meilisearch:
+//
+//     https://search-new.civitai.com/multi-search
+//
+// and reads `data.results[0].hits` (cmcp-civitai.js:925 → `_fromMeili`). The
+// stub therefore answered every search with a body the reader found no hits in,
+// so the grid stayed on its spinner with zero cards and all five specs here
+// failed waiting for a card that could never render. The ITEM fields were right
+// all along — only the envelope was stale.
+function imagesPage(ids: number[]) {
   return {
-    items: ids.map((id) => ({
-      id,
-      url: `https://cdn/${id}.jpeg`,
-      type: 'image',
-      width: 512,
-      height: 512,
-      nsfwLevel: 1,
-      username: `user${id}`,
-      stats: { likeCount: id },
-      meta: { prompt: `prompt for ${id}` }
-    })),
-    metadata: { nextCursor }
+    results: [
+      {
+        hits: ids.map((id) => ({
+          id,
+          url: `https://cdn/${id}.jpeg`,
+          type: 'image',
+          width: 512,
+          height: 512,
+          nsfwLevel: 1,
+          username: `user${id}`,
+          stats: { likeCount: id },
+          meta: { prompt: `prompt for ${id}` }
+        }))
+      }
+    ]
   }
 }
+
+/** An exhausted feed. Meili carries no cursor, so "no more results" is an empty
+ *  hit list — the job `metadata.nextCursor: null` used to do. Without it the
+ *  stub replays its last page forever and the grid fills with duplicates of the
+ *  same id, which makes a `[data-id=N]` locator ambiguous. */
+const EXHAUSTED = { results: [{ hits: [] as unknown[] }] }
 
 async function stubCivitai(page: import('@playwright/test').Page, pages: Record<string, unknown>[]) {
   let call = 0
   // All CivitAI REST/tRPC calls funnel through the same-origin POST proxy.
   await page.route('**/comfyui_mcp_panel/civitai/api', (route) => {
-    const body = pages[Math.min(call, pages.length - 1)]
+    const body = call < pages.length ? pages[call] : EXHAUSTED
     call += 1
     route.fulfill({ json: body })
   })
-  // Media proxy — a 1px PNG is enough for <img>/<video> src.
+  // Media proxy. This must be a DECODABLE image, not just the PNG signature.
+  //
+  // #847 — it used to be `Buffer.from([0x89, 0x50, 0x4e, 0x47])`, four bytes that
+  // look like a PNG header and are not a PNG. Chrome fails to decode it and fires
+  // `error` on the <img>, and the card's own handler responds by hiding itself:
+  //
+  //     img.addEventListener("error", () => { card.style.display = "none" })
+  //
+  // …which is correct product behaviour (a broken thumbnail should not leave a dead
+  // tile in the grid) and made every card in this file disappear a moment after it
+  // rendered. Assertions RACED that error event: `toBeVisible()` won often enough
+  // that the specs mostly passed, and `append-on-scroll` — which waits for a second
+  // page before asserting — lost about one run in three. The card was in the DOM
+  // with the right class the whole time; it was `display: none`.
+  //
+  // A real 1x1 PNG decodes, so no card hides and nothing is racing.
+  const ONE_PIXEL_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  )
   await page.route('**/comfyui_mcp_panel/civitai/media*', (route) =>
-    route.fulfill({ body: Buffer.from([0x89, 0x50, 0x4e, 0x47]), contentType: 'image/png' })
+    route.fulfill({ body: ONE_PIXEL_PNG, contentType: 'image/png' })
   )
   // Signed-out OAuth status so the favorites tab / account button stay inert.
   await page.route('**/comfyui_mcp_panel/civitai/oauth/status', (route) =>
@@ -75,7 +115,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([11, 12, 13], null)])
+    await stubCivitai(page, [imagesPage([11, 12, 13])])
     await openPanel(panel, mockBridge)
 
     // Agent opens docked and IMMEDIATELY highlights — before results exist.
@@ -89,7 +129,7 @@ test.describe('agent-driven CivitAI modal', () => {
   })
 
   test('a reload (switch_tab / search) clears the glow', async ({ page, panel, mockBridge }) => {
-    await stubCivitai(page, [imagesPage([21, 22], null)])
+    await stubCivitai(page, [imagesPage([21, 22])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'a', dock: true })
     await mockBridge.command('civitai_highlight', { ids: [21] })
@@ -107,8 +147,8 @@ test.describe('agent-driven CivitAI modal', () => {
   }) => {
     // First page lacks id 99; the second page (next cursor) carries it.
     await stubCivitai(page, [
-      imagesPage([31, 32], 'c1'),
-      imagesPage([99], null)
+      imagesPage([31, 32]),
+      imagesPage([99])
     ])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'x', dock: true })
@@ -127,7 +167,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([41, 42, 43, 44], null)])
+    await stubCivitai(page, [imagesPage([41, 42, 43, 44])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'y', dock: true })
     const res = await mockBridge.command('civitai_results', { limit: 2 })
@@ -146,7 +186,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([51], null)])
+    await stubCivitai(page, [imagesPage([51])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'z', dock: true })
     await expect(page.locator('.cmcp-civitai-modal')).toBeVisible()
@@ -164,7 +204,7 @@ test.describe('agent-driven CivitAI modal', () => {
     panel,
     mockBridge
   }) => {
-    await stubCivitai(page, [imagesPage([61], null)])
+    await stubCivitai(page, [imagesPage([61])])
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_civitai', { query: 'q', dock: true })
     const overlay = page.locator('.cmcp-cv-overlay.cmcp-docked')
@@ -177,6 +217,9 @@ test.describe('agent-driven CivitAI modal', () => {
 })
 
 test.describe('agent-driven Training modal', () => {
+  // panel#793 — off-by-default flag; see fixtures/panelTest.ts.
+  test.use({ panelFlags: ['comfyui-mcp.featureFlag.training'] })
+
   test('training-first glow: step highlight works without the CivitAI CSS ever loading', async ({
     page,
     panel,
@@ -222,7 +265,11 @@ test.describe('agent-driven Training modal', () => {
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_training', { dock: true })
     await expect(page.locator('.cmcp-tr-modal')).toBeVisible()
-    const reply = await mockBridge.command('training_goto_step', { step: 2 })
+    // panel#793 — entering a wizard step runs the backend-capability probe,
+    // which callJson's with a 15s timeout. MockBridge.command defaults to 10s,
+    // so the harness gave up 5s before the panel could answer and the failure
+    // read as a hung command. The rejection itself is correct and honest.
+    const reply = await mockBridge.command('training_goto_step', { step: 2 }, 25_000)
     expect(reply.ok).toBe(false)
     // Backend-capability or dataset-name/image gate fires — either is an honest
     // rejection rather than a silent jump.

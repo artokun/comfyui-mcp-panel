@@ -7,7 +7,9 @@ import { dirname, join } from 'node:path'
 import {
   activeWorkflowFenceApplies,
   commandIsCanvasIndependent,
+  commandIsCanvasTargetless,
   commandWorkflowMismatch,
+  commandTargetsActiveWorkflow,
   hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
@@ -87,6 +89,92 @@ test('#570 fence does NOT apply to navigation / resolved-non-active workflow ops
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename', targetsNonActive: true }), false)
 })
 
+// #932/#607/#688 — the wedge was PERMANENT because the repair probe was fenced.
+// The orchestrator refreshes a stale stamp exactly one way: rebindWorkflowFence()
+// asks the panel for `workflow_list` and re-derives the fence from the record it
+// reports active. Fencing that probe made the repair require the fence to be
+// already-correct, so a stale stamp refused the only command that could clear it.
+test('#932 workflow_list — the recovery probe — is NOT fenced', () => {
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_list' }), false)
+})
+
+test('#932 a STALE stamp must not refuse the probe that would refresh it', () => {
+  // The exact wedge: the session is fenced to a workflow the user has navigated
+  // away from, so every stamp it sends names the wrong canvas.
+  const stale = { commandUuid: 'uuid-the-session-still-believes', activeUuid: 'uuid-actually-on-screen' }
+  // Graph work is correctly refused — that is the fence doing its job, and this
+  // assertion is what keeps the exemption from being read as "the fence relaxed".
+  assert.equal(commandTargetsActiveWorkflow({ cmd: 'graph_add_node', ...stale }), false)
+  assert.equal(commandTargetsActiveWorkflow({ cmd: 'graph_get_state', ...stale }), false)
+  // …but the probe that learns the right answer must get through, or nothing can.
+  assert.equal(commandTargetsActiveWorkflow({ cmd: 'workflow_list', ...stale }), true)
+})
+
+test('#932 the probe survives an ABSENT stamp too, which is how #718 wedges', () => {
+  // #718's half: an unstamped frame is refused HARDER than a mismatched one
+  // (an advertised fence must not fail open). That made the unstamped case the
+  // unrecoverable one, so the probe has to clear it as well — an exemption that
+  // only covered a mismatched uuid would leave exactly that wedge in place.
+  for (const commandUuid of [undefined, null, '', '   ']) {
+    assert.equal(commandWorkflowMismatch({ commandUuid, activeUuid: 'live' }), true, 'still a mismatch')
+    assert.equal(
+      commandTargetsActiveWorkflow({ cmd: 'workflow_list', commandUuid, activeUuid: 'live' }),
+      true,
+      'but the probe still runs',
+    )
+  }
+})
+
+test('#932 an UNRESOLVABLE active uuid still lets the probe through', () => {
+  // The panel fails closed when it cannot resolve its own active uuid (#186), which
+  // is precisely the moment the caller most needs the listing to find out what IS
+  // active. Fencing here would wedge the recovery at its most useful instant.
+  for (const activeUuid of [undefined, null, '']) {
+    assert.equal(commandTargetsActiveWorkflow({ cmd: 'workflow_list', commandUuid: 'x', activeUuid }), true)
+    assert.equal(commandTargetsActiveWorkflow({ cmd: 'graph_add_node', commandUuid: 'x', activeUuid }), false)
+  }
+})
+
+test('#932 the shared predicate covers BOTH guards, and is strictly wider', () => {
+  // Everything canvas-independent stays targetless…
+  for (const cmd of ['nodes_search', 'nodes_list', 'nodes_install', 'nodes_queue_status',
+                     'graph_update_node', 'comfy_reboot', 'free_vram']) {
+    assert.equal(commandIsCanvasTargetless(cmd), true, `${cmd} targets no canvas`)
+  }
+  // …plus exactly one more.
+  assert.equal(commandIsCanvasTargetless('workflow_list'), true)
+  assert.equal(commandIsCanvasIndependent('workflow_list'), false, 'wider, not the same set')
+  // And nothing else leaks in — a canvas write or a content read must still be
+  // refusable by the pin guard, which is the guard this predicate now also feeds.
+  for (const cmd of ['graph_add_node', 'graph_outline', 'graph_get_state', 'workflow_save',
+                     'workflow_close', 'workflow_open', 'refresh_nodes', 'some_future_command']) {
+    assert.equal(commandIsCanvasTargetless(cmd), false, `${cmd} still answers to target guards`)
+  }
+  assert.equal(commandIsCanvasTargetless(undefined), false)
+})
+
+test('#932 workflow_list is exempt WITHOUT being called canvas-independent', () => {
+  // It does observe the canvas — it reports which tab is active — so folding it into
+  // CANVAS_INDEPENDENT_COMMANDS ("never reads or mutates a canvas") would make that
+  // set's own contract false. The two ideas stay distinct: not canvas-independent,
+  // but not canvas-TARGETING either, which is what the fence actually guards.
+  assert.equal(commandIsCanvasIndependent('workflow_list'), false)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_list' }), false)
+})
+
+test('#932 the exemption is workflow_list ALONE — sibling reads stay fenced', () => {
+  // Guards against the fix being widened into "reads are safe". These all return
+  // graph CONTENT, so a stale-stamped caller would read the wrong canvas and
+  // believe it read the right one.
+  for (const cmd of ['graph_get_state', 'graph_outline', 'graph_query', 'graph_view_selected']) {
+    assert.equal(activeWorkflowFenceApplies({ cmd }), true, `${cmd} returns canvas content — stays fenced`)
+  }
+  // Nor does it leak to look-alike command names.
+  for (const cmd of ['workflow_list_nodes', 'workflow_lis', 'workflow_listx', 'WORKFLOW_LIST']) {
+    assert.equal(activeWorkflowFenceApplies({ cmd }), true, `${cmd} is not the probe`)
+  }
+})
+
 // #602 — a command whose execution AND reply never reference the active canvas
 // (Manager registry/server ops, ComfyUI server controls) must not be fenced to the
 // active workflow's uuid: a tab switch after issue manufactured a false refusal for
@@ -119,9 +207,12 @@ test('#602 the exemption stays EXPLICIT — canvas ops, workflow mutators, and u
   // Active-workflow mutators.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save' }), true)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close' }), true)
-  // workflow_list's reply DESCRIBES the active workflow — a stale-stamped call
-  // must not answer for the wrong tab, so it is NOT canvas-independent.
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_list' }), true)
+  // workflow_list observes the canvas (it reports which tab is active), so it is
+  // genuinely NOT canvas-independent and that half of this test still holds. What
+  // changed in #932 is the other half: being canvas-OBSERVING does not make it
+  // canvas-TARGETING, and it is the sole probe the fence repair runs through, so it
+  // is exempt from the fence while staying out of CANVAS_INDEPENDENT_COMMANDS.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_list' }), false)
   assert.equal(commandIsCanvasIndependent('workflow_list'), false)
   // An unknown/new command fails closed: coverage is lost only by an explicit opt-out.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_future_command' }), true)
@@ -140,16 +231,104 @@ test('#602 wiring: dispatch skips the graph-binding assert for canvas-independen
   )
   // Same for the PIN guard (codex gate round 2): a pin exists to stop a CANVAS
   // write landing on the wrong workflow — canvas-independent commands must not
-  // be refused by it either.
+  // be refused by it either. #932 widened this to commandIsCanvasTargetless so the
+  // recovery probe clears BOTH guards: exempting it from the uuid fence alone would
+  // have left a pinned session wedged in exactly the same way, one guard over, with
+  // the pin refusal advertising the very re-target that runs through workflow_list.
   assert.match(
     src,
-    /pinnedPath\.trim\(\)\s*&&\s*!commandIsCanvasIndependent\(msg\.cmd\)/,
-    'the pinned-target guard must skip commands that never touch a canvas',
+    /pinnedPath\.trim\(\)\s*&&\s*!commandIsCanvasTargetless\(msg\.cmd\)/,
+    'the pinned-target guard must skip commands that target no canvas',
+  )
+  // …and it must be the WIDER predicate, not the narrow one, at that call site.
+  assert.ok(
+    !/pinnedPath\.trim\(\)\s*&&\s*!commandIsCanvasIndependent\(msg\.cmd\)/.test(src),
+    'the pin guard must not fall back to the narrow canvas-independent test',
   )
   // The workflow-instance-mismatch refusal renders for real users; it once shipped
-  // with a mojibake em dash ("â€”"). Pin the clean form.
-  assert.ok(src.includes('active canvas — the workflow was switched or replaced'), 'fence message keeps its em dash')
+  // with a mojibake em dash ("â€”"). Pin the clean form. #750 rewrote the sentence
+  // that used to carry the dash (it asserted a cause the panel never observed), so
+  // the guard now pins the em dash in its replacement.
+  assert.ok(
+    src.includes('That is the comparison, not the cause — the panel observed only that the two'),
+    'fence message keeps its em dash',
+  )
   assert.ok(!src.includes('â€'), 'no mojibake anywhere in the panel source')
+  // …and the refusal is built in exactly ONE place now, so the two dispatch sites
+  // cannot drift apart the way they did while each carried its own copy.
+  assert.equal(
+    (src.match(/workflow instance mismatch: /g) || []).length,
+    1,
+    'the refusal text must have a single spelling',
+  )
+})
+
+// #750 — the refusal must report the COMPARISON it made, not a cause it did not
+// observe. The old text committed to "the workflow was switched or replaced after it
+// was issued"; in the report behind #750 no tab was connected at all, and in the wedge
+// behind artokun/comfyui-mcp#932 nothing had been switched — the fence simply could
+// never be rebound. Both diagnoses were sent down the wrong path by this sentence.
+function loadMismatchMessage() {
+  const HERE = dirname(fileURLToPath(import.meta.url))
+  const src = readFileSync(join(HERE, '../../web/js/comfyui-mcp-panel.js'), 'utf8')
+  const start = src.indexOf('function workflowInstanceMismatchMessage(')
+  assert.notEqual(start, -1, 'the shared refusal builder must exist in the shipped source')
+  const end = src.indexOf('\n}', start)
+  assert.notEqual(end, -1)
+  const body = src.slice(start, end + 2)
+  return new Function(`${body}\nreturn workflowInstanceMismatchMessage;`)()
+}
+
+test('#750 the refusal states the two identities it compared', () => {
+  const msg = loadMismatchMessage()({ commandUuid: 'uuid-issued-for', activeUuid: 'uuid-on-screen' })
+  assert.match(msg, /uuid-issued-for/, 'names the instance the command was issued for')
+  assert.match(msg, /uuid-on-screen/, 'and what the canvas actually reports')
+  assert.match(msg, /Nothing was applied/, 'and that it did not partially run')
+})
+
+test('#750 it does NOT assert a cause it never observed', () => {
+  const msg = loadMismatchMessage()({ commandUuid: 'a', activeUuid: 'b' })
+  // The old sentence, as a bare claim, must be gone.
+  assert.doesNotMatch(
+    msg,
+    /the workflow was switched or replaced after it was issued\./,
+    'the single-cause assertion must not return',
+  )
+  // The switch is still OFFERED as one possibility among several — removing it
+  // entirely would be the opposite error, hiding the most common cause.
+  assert.match(msg, /can mean the workflow was switched or replaced/)
+  assert.match(msg, /never established or could not\s+be refreshed/, 'the #932 cause is listed')
+  assert.match(msg, /identity could not be read/, 'and the unreadable case')
+  assert.match(msg, /comparison, not the cause/, 'and it says which of the two this is')
+})
+
+test('#750 an UNSTAMPED command says so, rather than claiming a different workflow', () => {
+  // #718 refuses unstamped commands too. "your command carried no stamp" and "your
+  // stamp names another workflow" need different fixes; the old text described only
+  // the second, for both.
+  for (const commandUuid of [undefined, null, '', '   ']) {
+    const msg = loadMismatchMessage()({ commandUuid, activeUuid: 'uuid-on-screen' })
+    assert.match(msg, /carries no workflow-instance stamp/)
+    assert.doesNotMatch(msg, /issued for workflow instance/)
+  }
+})
+
+test('#750 an UNRESOLVABLE active identity is reported as unresolvable, not as a value', () => {
+  for (const activeUuid of [undefined, null, '']) {
+    const msg = loadMismatchMessage()({ commandUuid: 'uuid-issued-for', activeUuid })
+    assert.match(msg, /reports no resolvable identity/)
+    assert.doesNotMatch(msg, /reports undefined|reports null|reports \./)
+  }
+})
+
+test('#750 the remedy covers the disconnected case the old text stranded', () => {
+  // The #750 reporter had NO tab connected; the advertised remedies cannot help
+  // there, and it took six tool calls to find that out.
+  const msg = loadMismatchMessage()({ commandUuid: 'a', activeUuid: 'b' })
+  assert.match(msg, /panel_set_workflow_target/)
+  assert.match(msg, /panel_open_workflow/)
+  assert.match(msg, /If NO panel tab is\s+connected, neither will help/)
+  assert.match(msg, /panel_graph_outline reports connectivity/)
 })
 
 test('#570 pinned command after in-place replacement at the same path: uuid mismatch ⇒ REFUSED', () => {
@@ -575,9 +754,24 @@ test('#607 canvas and workflow commands stay fenced; unknown commands fail close
     // lists on the active graph (refreshComfyNodeDefs → reapplyDefsToLiveNodes) —
     // a canvas mutation, so the stamp must be proven before it runs (codex gate).
     'refresh_nodes',
-    // workflow_list's reply DESCRIBES the active workflow, so a stale-stamped
-    // call would answer for the wrong tab — fenced by #624's criterion.
-    'workflow_list',
+    // workflow_list USED to be fenced here, on the reading that its reply
+    // "describes the active workflow, so a stale-stamped call would answer for the
+    // wrong tab". #932/#607/#688 showed that premise does not hold and the cost of
+    // acting on it was a permanent wedge:
+    //   • the reply is computed from liveWorkflowListActive() at EXECUTION time, so
+    //     it always describes the genuinely-active tab — the stamp never enters the
+    //     answer, and there is no "wrong tab" for it to answer for;
+    //   • unlike a graph read, the reply CARRIES ITS OWN IDENTITY (routing_key per
+    //     record plus an `active` flag), so a caller holding a stale expectation can
+    //     see the difference rather than misattribute the result. graph_outline
+    //     returns node content with nothing to check it against — which is exactly
+    //     why it stays in this list;
+    //   • the orchestrator corroborates the active record against the open list
+    //     (corroborateActiveForFence) before adopting a uuid from it, so the panel
+    //     fence was not the thing preventing a bad adoption.
+    // And fencing it made the ONE repair probe depend on the fence being already
+    // correct, which is what left the documented recovery a no-op. Exemption and
+    // reasoning: see the '#932 …' tests above.
     'workflow_save',
     'workflow_save_as',
     'workflow_rename',

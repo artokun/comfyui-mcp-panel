@@ -26,7 +26,7 @@ test("#505 panel wiring records the backends frame before allowing Pi ack promot
   assert.ok(backendsStart >= 0 && ackStart > backendsStart, "could not locate bridge callbacks");
   const backends = source.slice(backendsStart, ackStart);
   const ack = source.slice(ackStart, source.indexOf("    getResume:", ackStart));
-  const statusStart = source.indexOf("    onStatus(state) {");
+  const statusStart = source.indexOf("    onStatus(state, socketId) {");
   const status = source.slice(statusStart, source.indexOf("    onSay(", statusStart));
 
   assert.match(backends, /piBackendsReadinessReceived = true/, "backends frame must unlock Pi ack promotion");

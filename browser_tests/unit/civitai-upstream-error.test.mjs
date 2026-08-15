@@ -294,7 +294,18 @@ test("#599: a plain upstream error with no prior attempt is unchanged", async ()
   await assert.rejects(
     () => client._request({ url: "https://civitai.red/api/v1/models" }),
     (err) => {
-      assert.equal(err.message, "CivitAI API 503: Service Unavailable");
+      // #705 changed this exact string: a bare status was the misleading-error
+      // defect, so the description now names what came back (here: nothing —
+      // this double has no text()) and whether retrying can help. The guard the
+      // test exists for is unchanged: no attempt trail, no cause, nothing about
+      // a first attempt that never happened.
+      assert.equal(
+        err.message,
+        "CivitAI API 503: Service Unavailable — There was no detail in CivitAI's " +
+          "response body. CivitAI failed this request on its own side rather than " +
+          "rejecting it, so retrying shortly may succeed.",
+      );
+      assert.doesNotMatch(err.message, /attempt/i);
       assert.equal(err.cause, undefined);
       return true;
     },

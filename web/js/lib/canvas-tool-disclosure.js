@@ -60,16 +60,44 @@
  *     They are also ordered by likelihood, and each names its OWN cause: a crowded
  *     tool budget, a deliberate `full` override, and a session that needs rebuilding
  *     are three different faults and must not be narrated as one.
+ *
+ *  4. #857 — IT ASKS ABOUT THE WHOLE TOOLSET, NOT THE PART HANDED OVER UP FRONT.
+ *     Backends increasingly advertise tool NAMES eagerly and their schemas lazily:
+ *     the model resolves a deferred entry on demand and calls it. Codex and Claude
+ *     Code both work this way. A disclosure whose two branches were "IS in your
+ *     toolset" and "IS NOT" therefore had no true branch for the common case — the
+ *     reporter's session found no `panel_graph_outline` in its initial description,
+ *     found `mcp__panel__panel_graph_outline` in the lazy registry, called it, and
+ *     got the live 41-node graph back. Routed down the absence branch, it told the
+ *     user to update comfyui-mcp, prune their MCP config, or switch backends: three
+ *     remedies for a problem it did not have, and a diagnosis flatly contradicted by
+ *     a `tools/list` against the same endpoint.
+ *
+ *     That is #291 running in reverse and it is not a milder bug. #291 exists
+ *     because a model that cannot reach the canvas improvises; a false NEGATIVE
+ *     makes a model that CAN reach it improvise too, and hands the user a repair
+ *     procedure for a healthy install.
+ *
+ *     So the lookup comes FIRST, before either branch, and it is BOUNDED: one check
+ *     of each surface, then answer. "Look harder" with no stopping rule would turn a
+ *     genuinely tool-less session — the #291 session this module was written for —
+ *     into a search loop, which is the same failure to give the user a straight
+ *     answer, just slower.
  */
 export const CANVAS_TOOL_DISCLOSURE =
   `⚙ LIVE-CANVAS TOOLS — CHECK YOUR TOOLSET BEFORE YOU ACT ON THE CANVAS. ` +
   `The panel_* tools that read and edit the workflow this user has open are supplied to you by the ` +
   `panel's orchestrator, and the panel CANNOT observe whether they reached your toolset — only you ` +
   `can see that. This is a question, not a claim that anything is wrong.\n` +
-  `• IF panel_graph_outline IS in your toolset: work on the canvas normally. But being listed is not ` +
-  `proof the canvas is reachable — if a panel_* call then FAILS, report that failure and what it ` +
-  `said; do NOT quietly substitute a headless workaround for it.\n` +
-  `• IF IT IS NOT in your toolset: do NOT improvise a substitute — no saving a workflow file instead ` +
+  `• LOOK IN BOTH SURFACES BEFORE YOU ANSWER. Some backends hand you a tool's full schema up front; ` +
+  `others list it in a lazy/deferred registry you resolve on demand, where it appears as ` +
+  `mcp__panel__panel_graph_outline. A tool you can CALL is present no matter which surface it came ` +
+  `from, so search the deferred registry too before concluding anything is missing. Check each once, ` +
+  `then answer — do not keep hunting.\n` +
+  `• IF panel_graph_outline IS available in EITHER surface: work on the canvas normally. But being ` +
+  `listed is not proof the canvas is reachable — if a panel_* call then FAILS, report that failure ` +
+  `and what it said; do NOT quietly substitute a headless workaround for it.\n` +
+  `• IF IT IS IN NEITHER: do NOT improvise a substitute — no saving a workflow file instead ` +
   `of editing the canvas, no headless generate_image/enqueue_workflow standing in for a canvas run — ` +
   `and never describe graph edits you did not make. Say plainly that this session did not receive the ` +
   `live-canvas tools, then give the user these remedies in order: (1) update comfyui-mcp — on a ` +

@@ -439,3 +439,105 @@ test("works against the back-compat `links` record store (no _links Map)", () =>
   assert.equal(A.outputs[0].links, null);
   assert.equal(B.inputs[0].link, null);
 });
+
+// ── #713: the far-end SLOT MIRROR WRITE variant ────────────────────────────
+//
+// Same disconnect phase as #420, different signature. `graph.remove` clears the far
+// end's mirror of each link with a plain property write
+// (`farNode.inputs[slot].link = null`). In a rapid BATCHED removal of linked nodes a
+// sibling removal can tear that slot array out from under it, so the indexed slot
+// reads undefined and the write throws a TypeError instead of a "is not a function".
+// That fell through the old signature check to `throw err`, aborting the removal and
+// leaving the graph half-edited — with 9 sibling removals in the same batch reporting
+// success (the reported #713).
+
+/** A graph whose remove() reproduces the tear NATURALLY: the far end's slot array is
+ *  emptied (as a concurrent sibling removal would) and then the same mirror write the
+ *  real code performs is attempted, so the TypeError is thrown BY V8 with whatever
+ *  message this engine actually produces — never a hand-written string. If V8 ever
+ *  rephrases it, this test fails rather than passing against a stale literal. */
+function makeTearingGraph({ prop = "link" } = {}) {
+  const nodesById = new Map();
+  let torn = false;
+  return {
+    _links: new Map(),
+    inputNode: null,
+    outputNode: null,
+    getNodeById: (id) => nodesById.get(id) ?? null,
+    _register: (n) => nodesById.set(n.id, n),
+    remove(node) {
+      for (const out of node.outputs ?? []) {
+        for (const id of Array.isArray(out.links) ? [...out.links] : []) {
+          const link = this._links.get(id);
+          if (!link) continue;
+          const far = this.getNodeById(link.target_id);
+          if (far && !torn) {
+            torn = true;
+            far.inputs.length = 0; // a sibling removal tore the slot array out
+            // The real mirror write, on a slot that is now gone → genuine TypeError.
+            far.inputs[link.target_slot][prop] = null;
+          }
+          if (far && far.inputs[link.target_slot]) far.inputs[link.target_slot].link = null;
+          this._links.delete(id);
+        }
+        out.links = null;
+      }
+      for (const inp of node.inputs ?? []) {
+        if (inp.link != null) { this._links.delete(inp.link); inp.link = null; }
+      }
+      nodesById.delete(node.id);
+      node._removed = true;
+    },
+  };
+}
+
+test("#713 the slot-mirror WRITE crash is recovered, not aborted (error thrown by V8, not a literal)", () => {
+  const graph = makeTearingGraph();
+  const A = { id: 1, inputs: [], outputs: [{ name: "out", links: [10] }] };
+  const B = { id: 2, inputs: [{ name: "in", link: 10 }], outputs: [] };
+  graph._register(A); graph._register(B);
+  graph._links.set(10, { id: 10, origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 });
+
+  const res = safeRemoveNode(graph, A);
+  assert.deepEqual(res, { removed: true, recovered: true }, "recovered instead of aborting");
+  assert.equal(graph.getNodeById(1), null, "the node really was removed on the retry");
+  assert.equal(graph._links.has(10), false, "the dangling link record was severed");
+});
+
+test("#713 the `links` (output mirror) spelling is recovered too", () => {
+  const graph = makeTearingGraph({ prop: "links" });
+  const A = { id: 1, inputs: [], outputs: [{ name: "out", links: [10] }] };
+  const B = { id: 2, inputs: [{ name: "in", link: 10 }], outputs: [] };
+  graph._register(A); graph._register(B);
+  graph._links.set(10, { id: 10, origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 });
+  assert.deepEqual(safeRemoveNode(graph, A), { removed: true, recovered: true });
+});
+
+test("#713 predicate: both V8 phrasings match, and only for the link/links slot mirror", () => {
+  // Current V8 (Chrome >= 91) — the exact text in the #713 report.
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot set properties of undefined (setting 'link')")), true);
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot set properties of undefined (setting 'links')")), true);
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot set properties of null (setting 'link')")), true);
+  // Legacy Chromium/Electron phrasing — panels do run on old embedded Chromium, and
+  // matching only the modern text would reopen this hole there.
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot set property 'link' of undefined")), true);
+  assert.equal(isLinkDisconnectCrash(new TypeError('Cannot set property "links" of null')), true);
+
+  // Still NARROW: the property name is required, so an unrelated undefined-write is
+  // not recoverable. This is the assertion that keeps the widening honest.
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot set properties of undefined (setting 'foo')")), false);
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot set property 'widget' of undefined")), false);
+  assert.equal(isLinkDisconnectCrash(new TypeError("Cannot read properties of undefined (reading 'link')")), false, "a READ is a different failure");
+  assert.equal(isLinkDisconnectCrash(new Error("Cannot set properties of undefined (setting 'link')")), false, "not a TypeError");
+});
+
+test("#713 NARROW CATCH: the mirror-write message from a POST-disconnect hook still propagates", () => {
+  // The second guard (residual links) is what actually separates a disconnect-phase
+  // crash from an onRemoved() hook error. Widening the message shape must not weaken
+  // it: with every link already gone, this must abort, not retry the hook.
+  const graph = makeGraph();
+  const A = { id: 1, inputs: [], outputs: [] }; // no residual links at all
+  graph._register(A);
+  graph.remove = () => { throw new TypeError("Cannot set properties of undefined (setting 'link')"); };
+  assert.throws(() => safeRemoveNode(graph, A), /Cannot set properties of undefined/);
+});

@@ -295,7 +295,29 @@ test("#458 set_widget: backend UNREACHABLE (fresh object_info null) ⇒ FAIL CLO
     (err) =>
       err instanceof Error &&
       /Cannot set widget on node 3 \("KSampler"\)/.test(err.message) &&
-      /cannot verify node type|object_info is unavailable|backend is unreachable/i.test(err.message),
+      // #982 — the wording no longer asserts an unreachable backend, because the panel
+      // never established that: a reporter read exactly that sentence while their backend
+      // was answering /object_info by hand. What it claims now is only what it observed.
+      /no usable \/object_info schema was obtained/i.test(err.message) &&
+      !/backend is unreachable/i.test(err.message),
+  );
+  // …and when the oracle recorded WHAT it tried, the refusal carries it. Without this
+  // the whole point of the change — a reporter reading "unavailable" while their backend
+  // answered by hand — is unfixed even though the wording changed.
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "steps", 30, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null,
+        describeObjectInfoFailure: () =>
+          " Tried 2 routes: api.getNodeDefs() threw: Failed to fetch; GET /object_info was not OK (status 503).",
+        ...HOOKS,
+      }),
+    (err) =>
+      err instanceof Error &&
+      /Tried 2 routes: api\.getNodeDefs\(\) threw: Failed to fetch/.test(err.message) &&
+      /status 503/.test(err.message),
   );
   assert.equal(node.widgets[0].value, 20, "value must NOT be mutated when the backend is unverifiable");
 });

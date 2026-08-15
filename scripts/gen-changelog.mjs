@@ -22,6 +22,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { isReleaseSubject, pickReleaseSha } from "./lib/changelog-match.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHANGELOG = join(ROOT, "CHANGELOG.md");
@@ -48,27 +49,124 @@ const git = (args) => execSync(`git ${args}`, { cwd: ROOT, encoding: "utf-8", st
 
 /** The ref to diff against = the previous release. Prefer the most recent
  *  version tag (mcp); fall back to the most recent release commit (the panel
- *  has no per-release tags); else the first commit. */
+ *  has no per-release tags); else the first commit.
+ *
+ *  MEMOIZED. Five call sites ask for this in one run, and the answer cannot change
+ *  between them — but each call re-ran `describe`, a full `git log`, and a `merge-base`.
+ *  #1191 made that visible rather than merely wasteful: the range warning below printed
+ *  once per call, and a diagnostic that repeats itself reads like several problems. */
+let prevTagMemo;
 function prevTag() {
+  if (prevTagMemo !== undefined) return prevTagMemo;
+  prevTagMemo = computePrevTag();
+  return prevTagMemo;
+}
+function computePrevTag() {
   try {
-    const t = git("describe --tags --abbrev=0");
-    if (t) return t;
+    // --match, because bare `describe --tags` accepts the nearest reachable tag of ANY
+    // name — a `backup`, a CI marker, anything — and would silently make it the release
+    // base (codex, #932). This repo has no tags today, so this guards the sibling mcp
+    // repo and whatever tags land here later, not a present bug.
+    //
+    // It is a GLOB, not a regex: `[0-9]*` is one digit followed by anything, so a tag like
+    // `v1.backup.2.3` still gets through (codex). It rules out the obviously-unrelated
+    // names, not every malformed one. Two further limits on a tagged repo, unaddressed
+    // because neither can arise here: describe can pick the CURRENT release's tag if
+    // generation runs after tagging, yielding an empty range, and nothing validates that
+    // the tag is an exact version.
+    const t = git('describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" --match "[0-9]*.[0-9]*.[0-9]*"');
+    if (t) {
+      // WHICHEVER IS NEWER, not the tag unconditionally. Tags here lag releases — 0.11.85
+      // shipped untagged while v0.11.84 existed — and taking the tag anyway made the base
+      // a release too old, so 0.11.86 re-listed #954, which 0.11.85 had already announced.
+      // A duplicated entry is the mild version; the same gap re-attributes shipped work to
+      // a release that did not contain it.
+      //
+      // The release commit wins only when it is a DESCENDANT of the tag. Ancestry, not
+      // dates: a rebase or an out-of-order merge can leave a commit dated before a tag it
+      // sits after, and "which contains which" is the question actually being asked.
+      // ONE `git log`, and its failure must not escape past the `return t` below. The first
+      // version of the warning re-ran this command outside the guard, so a throw skipped the
+      // return, hit the OUTER catch as "no version tags", and dropped the base to
+      // `rev-list --max-parents=0` — the first commit. That regenerates the entire history
+      // into one entry: the #932/#1191 catastrophe, caused by the diagnostic added to
+      // announce it. Not hypothetical either — execSync's default 1 MiB maxBuffer against an
+      // output already past 130 KB and growing with every commit, or any transient non-zero
+      // exit such as a concurrent gc holding index.lock.
+      let newestRelease = null;
+      let historyUnreadable = false;
+      try {
+        newestRelease = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
+      } catch {
+        historyUnreadable = true;
+      }
+      if (newestRelease) {
+        try {
+          git(`merge-base --is-ancestor ${t} ${newestRelease}`); // throws when NOT an ancestor
+          return newestRelease;
+        } catch {
+          /* the tag is at or ahead of the newest release commit — use the tag */
+        }
+      }
+      // #1191 — SAY SO. Falling back to the tag is legitimate, and it is also exactly what
+      // happens when this file has stopped recognising the repo's release commits — which
+      // has now shipped twice (#932, #1191), both times silently, and the second time for
+      // nine consecutive releases. The generator already refuses to drop a commit without
+      // reporting it; the RANGE deserves the same treatment, because a wrong range is the
+      // failure that produces a plausible-looking entry crediting a release with work it
+      // did not contain.
+      //
+      // A warning rather than a hard failure: a genuinely fresh tag is the normal case on a
+      // repo that tags, and this script also runs inside `set-version.mjs` during a release.
+      const detail = historyUnreadable
+        ? "the commit history could not be READ, so no release commit could be considered — this is a git failure, not a predicate one"
+        : newestRelease
+          ? `newest release commit ${newestRelease.slice(0, 8)} is not a descendant of it`
+          : "NO commit in history is recognised as a release — the subject predicate may no longer match this repo's release shape (see scripts/lib/changelog-match.mjs)";
+      console.error(`changelog: WARNING — bounding the range at tag ${t}; ${detail}.`);
+      console.error("changelog: if that is wrong, the entry below will re-list work that already shipped.");
+      return t;
+    }
   } catch {
-    /* no tags */
+    /* no version tags */
   }
   try {
-    const sha = git('log -1 --pretty=format:%H --grep="^\\(chore(release)\\|release\\):"');
-    if (/^[0-9a-f]{7,40}$/.test(sha)) return sha;
+    // #932 — match the shape this repo ACTUALLY produces. Releases here are squash
+    // merges titled `<version> — <description> (#N)`, so a grep for `release:` or
+    // `chore(release):` never matched one, every run fell through to the first commit,
+    // and each entry regenerated the entire history. The anchor is the version at the
+    // START of the subject; whatever follows it is free text.
+    // Subjects only, matched in JS. NOT `--grep`: that searches the whole message per
+    // line, so `^<version>` also fires on a BODY line and an ordinary commit becomes the
+    // release boundary — silently truncating the entry (codex, #932).
+    const sha = pickReleaseSha(git("log --pretty=format:%H%x1f%s"));
+    if (sha) return sha;
   } catch {
     /* no release commit */
   }
-  return git("rev-list --max-parents=0 HEAD").split(/\s+/)[0]; // first commit
+  // #1191 — THE SAME WARNING, on the branch that had none. The tag path above announces a
+  // fallback; this one reached the FIRST COMMIT in silence, which is the worse outcome of
+  // the two: bounding at a stale tag re-lists one release, bounding at the root re-lists
+  // every commit in history. A first pass added the warning to the tag branch only, so the
+  // untagged repo — which is what this project actually is — kept the original failure.
+  //
+  // Not a hard failure: a genuinely fresh repository has no release commit and this IS its
+  // correct answer. The point is that it should never be reached without saying so.
+  const root = git("rev-list --max-parents=0 HEAD").split(/\s+/)[0];
+  console.error(
+    `changelog: WARNING — no version tag AND no recognisable release commit; bounding at the FIRST commit ${root.slice(0, 8)}.`,
+  );
+  console.error(
+    "changelog: unless this is a brand-new repository, the entry below will re-list the entire history —" +
+      " check scripts/lib/changelog-match.mjs still matches this repo's release subjects.",
+  );
+  return root;
 }
 
-/** A release commit, in either shape we actually produce: `release: 0.11.40`, or the
- *  squash-merge form GitHub writes from a PR titled with the bare version — `0.11.40 (#656)`.
- *  Only the first was recognised. */
-const isReleaseSubject = (s) => /^release:/i.test(s) || /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s);
+// The release-subject rules live in ./lib/changelog-match.mjs so the tests can import the
+// SHIPPED predicate. This file rewrites CHANGELOG.md at import time and so is untestable
+// directly — the first attempt at a test copied the predicate instead, and passed against
+// a copy while the real one stayed broken (#932).
 
 /** Parsed commits since `range`, newest-first, minus noise.
  *
@@ -173,9 +271,22 @@ function autoBody(commits, coveredPRs) {
   return lines.join("\n").trimEnd();
 }
 
+/**
+ * The release date, in UTC — ONE source, deliberately.
+ *
+ * This used to read local calendar fields (`getFullYear`/`getMonth`/`getDate`) while release
+ * notes written by hand carried the UTC date. That is how 0.14.31, 0.14.32 and 0.14.33 each
+ * ended up with two headings a day apart: the release commits were authored around
+ * 23:00-0600, so the generator stamped the 13th while the hand-written half stamped the 14th.
+ * The split made the duplication obvious, which was lucky — identical dates would have hidden
+ * it for longer.
+ *
+ * UTC rather than local, because a changelog is read by people in other timezones and by
+ * `changelog-delta`, and "the day it shipped" has to mean one thing. `toISOString` is used
+ * rather than assembling UTC fields by hand so there is no second way to get this wrong.
+ */
 function today() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return new Date().toISOString().slice(0, 10);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -194,6 +305,28 @@ const writeChangelog = (s) => writeFileSync(CHANGELOG, EOL === "\r\n" ? s.replac
 /** Build a dated entry string for `ver` from commits in `range`, folding in any
  *  hand-written highlights (deduped by PR). */
 function buildEntry(ver, range, highlights = "") {
+  // BARE `#N` ONLY, deliberately — this set is compared against PANEL PR numbers.
+  //
+  // A first attempt at #1219 widened this to `/\((?:[\w.-]+)?#(\d+)\)/g` so it would also see
+  // `(comfyui-mcp#1478)`, on the theory that upstream-first descriptions were failing to
+  // suppress their commits. That is wrong twice over. The two ids are different numbers in
+  // different namespaces — panel PR #1211 and mcp issue #1478 name the same change — so
+  // capturing the upstream number cannot match anything here. And it would be actively
+  // dangerous: an upstream issue number that happens to equal an unrelated panel PR number
+  // would suppress that PR's commit from the auto body, silently dropping shipped work.
+  //
+  // Cross-namespace dedupe is not solvable by number, and NOTHING here replaces it. An
+  // earlier version of this comment pointed at "the post-write assertion at the bottom of
+  // this file" — an assertion that was removed in the same change as unreachable, so the
+  // comment claimed a protection that did not exist.
+  //
+  // Stated accurately: a highlight citing `comfyui-mcp#1478` and a commit carrying panel PR
+  // `#1211` for the same change will BOTH be listed, as two bullets in one section.
+  // `changelog-integrity.test.mjs` catches duplicate version HEADINGS; it does not compare
+  // bullet text, so this particular redundancy is unguarded and is caught only by a human
+  // reading the release notes. That is a smaller problem than the duplicate sections this
+  // issue was about — a reader sees one release saying a thing twice, not two releases — and
+  // fixing it needs an identifier map the repo does not have.
   const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
   const commits = parseCommits(range);
   const auto = autoBody(commits, covered);
@@ -275,12 +408,40 @@ if (!version) {
 }
 
 if (md.includes(`## [${version}]`)) {
-  console.error(`CHANGELOG already has a [${version}] section — nothing to do.`);
+  // Exit 0 is deliberate: re-running the generator for an already-released version is a
+  // benign no-op and must not fail a release. But #1219 showed this message can also mean
+  // something is genuinely wrong — release notes hand-written under a pre-numbered
+  // `## [version]` heading instead of under Unreleased — and in that case the notes ship
+  // WITHOUT the auto-generated commit body, because this returns before writing it. Say both,
+  // so the operator can tell which one they are looking at.
+  console.error(
+    `CHANGELOG already has a [${version}] section — nothing to do.\n` +
+    `  If this is a re-run, that is expected.\n` +
+    `  If you just wrote the release notes yourself, they are in the WRONG PLACE: put them under\n` +
+    `  "${unrelHeader}" instead. This script promotes whatever is there VERBATIM into the one\n` +
+    `  dated section it writes, and appends the commits those notes did not mention. A\n` +
+    `  pre-numbered heading skips all of that — and leaves a SECOND heading once this script is\n` +
+    `  run again, which is how 0.14.31, 0.14.32 and 0.14.33 each ended up duplicated.`,
+  );
   process.exit(0);
 }
 
 const { text: entry, commits } = buildEntry(version, `${prevTag()}..HEAD`, highlights);
 const next = md.replace(UNREL, `${unrelHeader}\n\n${entry}\n\n`);
+
+// #1219 — NO POST-WRITE ASSERTION HERE, and the reason is worth stating so it is not added.
+//
+// A first attempt at #1219 put a duplicate-heading check right here, after building `next`.
+// It cannot fire. In the ordering that actually produced 0.14.31/32/33, the hand-written
+// numbered section was added AFTER this script had already run and exited — so at write time
+// there was exactly one heading and the check would have passed. In the opposite ordering the
+// pre-write check above returns first, so this point is never reached with a duplicate either.
+// Dead code shaped like a guard is worse than no guard: it reads as coverage.
+//
+// This script cannot defend against an edit made after it exits. The check that DOES catch it
+// is `browser_tests/unit/changelog-integrity.test.mjs`, which asserts the shape of the
+// committed file and therefore runs on the release PR no matter which step introduced the
+// second heading.
 writeChangelog(next);
 
 const nComp = new Set(commits.map((c) => componentOf(c.scope))).size;
