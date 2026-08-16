@@ -124,7 +124,10 @@ test("#709: a rejected Web Locks request also omits identity instead of hanging 
 
 test("#709: the live bridge sender awaits the leased identity helper, never getTabId directly", () => {
   const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  const start = source.indexOf("function sendHello() {");
+  // #1095 — the PAYLOAD builder. `sendHello` in front of it is the gate that holds a
+  // re-advertise until in-flight commands have replied, and contains none of this.
+  const start = source.indexOf("function advertiseHello() {");
+  assert.notEqual(start, -1, "could not locate the hello payload builder");
   const body = source.slice(start, source.indexOf("\n  }", start));
   assert.match(body, /sendBridgeHello\(/);
   assert.match(body, /resolveTabIdentity: \(\) => restartTabIdentity\.resolve\(\)/);
