@@ -262,10 +262,22 @@ export function clipCompactValue(v, n = COMPACT_VALUE_CLIP) {
   return s.length > n ? { text: s.slice(0, n - 1) + "…", clipped: true } : { text: s, clipped: false };
 }
 
-/** #809: the one-line footer for compact rows whose values were clipped. */
-export function compactClipNote(count) {
+/** #809: the one-line footer for compact rows whose values were clipped.
+ *
+ *  #1634: `cap` is the per-value cap ACTUALLY in force. On a PINPOINT read (explicit
+ *  `ids`) it is raised off the survey clip, and then "read fuller values with
+ *  `fields`:"detail"" would be exactly the dead retry #809 exists to remove — detail
+ *  applies the SAME fixed cap. Name the cap that fired, and the lever that would help.
+ *  Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts. */
+export function compactClipNote(count, cap = COMPACT_VALUE_CLIP) {
   if (!count) return "";
-  return `\n(${count} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
+  // #1634: the cap is uniform across the row and is only ever the survey clip or the fixed
+  // per-value cap, so the note has exactly two honest forms. An intermediate, budget-derived
+  // cap was tried and removed: it made the note name a number that was in force for no
+  // widget, and called a cut "unraisable" that raising `max_chars` lifted (gate).
+  if (cap <= COMPACT_VALUE_CLIP)
+    return `\n(${count} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
+  return `\n(${count} widget value(s) clipped to ${WIDGET_VALUE_CAP} chars — the same fixed per-value cap \`fields\`:"detail" applies, which no parameter raises.)`;
 }
 
 // ---------------------------------------------------------------------------

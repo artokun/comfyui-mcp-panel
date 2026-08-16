@@ -254,6 +254,9 @@ import {
   compactClipNote,
   LIMIT_CEILING,
   MAX_CHARS_CEILING,
+  // #1634: the pinpoint per-value cap for an explicit-`ids` read is derived from these.
+  WIDGET_VALUE_CAP,
+  COMPACT_VALUE_CLIP,
   OUTLINE_DETAIL_LEVELS,
   clampOutlineMaxChars,
   outlineDegradeBanner,
@@ -10284,6 +10287,44 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // 4) Projection, char-bounded.
     const proj = fields === "ids" || fields === "detail" ? fields : "compact";
+    // #1634: a compact row's 60-char value clip is a SURVEY cap — it keeps a 200-node
+    // listing of nodes you have not identified yet small. When the caller passed explicit
+    // `ids` they have ALREADY identified the nodes, so the read is a PINPOINT one and the
+    // survey cap is starving the value they asked for. A Discord reporter kept getting a
+    // cut-off positive prompt quoted back as the node's content; measured on a FOUR-node
+    // graph, {ids:["2"]} returned the prompt cut at 60 chars in a 301-char reply against a
+    // 12000-char budget — so this is not the outline ladder degrading on a big graph.
+    //
+    // Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts.
+    // Deliberately unchanged: the compact SHAPE, the survey path, `max_chars`, and the
+    // outline ladder.
+    //
+    // Only a SINGLE id is a pinpoint read. Treating any `ids` list as one cost rows the
+    // caller explicitly asked for and main returned in full — 20 ordinary 600-char prompts
+    // at the default budget went from 20/20 to 18/20 (gate). One id also means at most one
+    // row, so there is no budget to divide and no row-count to regress.
+    const pinpoint = wantIds?.length === 1;
+    // Raise the cap only when the generous row DEMONSTRABLY fits. Arithmetic reserves kept
+    // leaking — a floor of 60 per widget still grows without bound across many widgets, so
+    // a 24-widget node breached `max_chars` on default parameters while reporting
+    // truncated:false (gate). A fit test cannot leak: if the generous rendering does not
+    // fit we use main's rendering instead.
+    //
+    // This does not make the `max_chars` bound softer than main's — but nor does it fix
+    // the softness that is already there: clipLine bounds the LINE, while the header and
+    // clip note ride outside it, so both main and this overshoot slightly on hostile
+    // shapes. It must not be read as claiming otherwise.
+    const compactValueCap = (() => {
+      if (!pinpoint) return COMPACT_VALUE_CLIP;
+      const only = byId.get(wantIds[0]);
+      if (!only) return COMPACT_VALUE_CLIP;
+      let total = 0;
+      for (const [k, v] of Object.entries(widgetsOf(only)))
+        total += k.length + 2 + clipCompactValue(v, WIDGET_VALUE_CAP).text.length;
+      // The reserve covers what shares the budget with the row: header, the row's own
+      // prefix and ref lists, the truncation tail and the clip note.
+      return total <= maxChars - 1024 ? WIDGET_VALUE_CAP : COMPACT_VALUE_CLIP;
+    })();
     const clip = (v, n = 60) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
       return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -10332,7 +10373,11 @@ const GRAPH_TOOL_EXECUTORS = {
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
         const w = Object.entries(widgetsOf(n))
           .map(([k, v]) => {
-            const c = clipCompactValue(v);
+            // ONE cap across the row (see compactValueCap above). A per-widget cap that
+            // varied as a budget drained made the clip note incoherent: values cut at
+            // 2048, 736 and 60 were all reported as "clipped to 2048 … which no parameter
+            // raises", while raising `max_chars` demonstrably lifted them (gate).
+            const c = clipCompactValue(v, compactValueCap);
             if (c.clipped) rowClips++;
             return `${k}=${c.text}${driven[k] ? drivenTag(driven[k]) : ""}`;
           })
@@ -10371,7 +10416,7 @@ const GRAPH_TOOL_EXECUTORS = {
           })
         : "";
       const body = proj === "ids" ? lines.join(",") : lines.join("\n");
-      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0))}`;
+      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0), compactValueCap)}`;
     };
     let text = assemble();
     while (text.length > maxChars && lines.length > 1) {

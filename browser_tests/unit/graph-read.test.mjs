@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   WIDGET_VALUE_CAP,
+  COMPACT_VALUE_CLIP,
   linkDrivenWidgets,
   drivenWidgetsFor,
   drivenTag,
@@ -498,4 +499,50 @@ test("budget loop stays bounded for a large ids list — only the first overflow
   }
   assert.ok(shown >= 1 && shown < 10, `bounded: rendered ${shown} of 10, not all`);
   assert.equal(truncated, true, "the rest are honestly marked truncated");
+});
+
+// #1634 — a compact row's 60-char clip is a SURVEY cap. On a PINPOINT read (explicit
+// `ids`) it starved the very value the caller asked for: measured on a FOUR-node graph,
+// {ids:["2"]} returned a 300-char prompt cut at 60 in a 301-char reply against a
+// 12000-char budget. These pin the note's half of that fix — it must name the cap that
+// ACTUALLY fired, because at the fixed cap "use fields:detail" is a dead retry.
+test("#1634 the clip note names the cap actually in force", () => {
+  // Survey read: unchanged — 60 chars, and `fields`:"detail" is a live remedy.
+  const survey = compactClipNote(3);
+  assert.match(survey, /clipped to 60 chars by `fields`:"compact"/);
+  assert.match(survey, /read fuller values with `fields`:"detail"/);
+  assert.equal(compactClipNote(3), compactClipNote(3, 60), "60 is the survey default");
+
+  // Pinpoint at the FIXED cap: `fields`:"detail" applies the SAME cap, so pointing
+  // there would be exactly the dead retry #809 exists to remove.
+  const atCap = compactClipNote(1, WIDGET_VALUE_CAP);
+  assert.match(atCap, new RegExp(`clipped to ${WIDGET_VALUE_CAP} chars`));
+  assert.doesNotMatch(atCap, /read fuller values with `fields`:"detail"/);
+  assert.match(atCap, /no parameter raises/);
+
+  // #1634 (gate): there are exactly TWO honest forms, because the cap is uniform across
+  // the row and is only ever the survey clip or the fixed cap. An intermediate,
+  // budget-derived cap was tried and removed — it named a number that was in force for no
+  // widget, and called a cut "unraisable" that raising `max_chars` demonstrably lifted.
+  // The survey clip is one of them, verbatim.
+  assert.equal(compactClipNote(1, 60), compactClipNote(1), "the survey cap uses the survey note");
+  // Whichever form is emitted, the number it names is a cap that really applies — never a
+  // budget-derived figure that was in force for no widget.
+  for (const cap of [COMPACT_VALUE_CLIP, WIDGET_VALUE_CAP]) {
+    const named = /clipped to (\d+) chars/.exec(compactClipNote(1, cap))?.[1];
+    assert.equal(named, String(cap), `the note must name the cap in force (${cap})`);
+  }
+  assert.equal(compactClipNote(0, WIDGET_VALUE_CAP), "", "still silent when nothing clipped");
+});
+
+test("#1634 clipCompactValue honours a raised cap for a pinpoint read", () => {
+  const prompt = "m".repeat(300);
+  // Survey cap starves it...
+  const survey = clipCompactValue(prompt, 60);
+  assert.equal(survey.clipped, true);
+  assert.ok(survey.text.length < 70);
+  // ...the pinpoint cap carries it whole, with no clip to report.
+  const pinpoint = clipCompactValue(prompt, WIDGET_VALUE_CAP);
+  assert.equal(pinpoint.clipped, false);
+  assert.equal(pinpoint.text, prompt);
 });
