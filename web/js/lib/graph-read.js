@@ -271,10 +271,18 @@ export function clipCompactValue(v, n = COMPACT_VALUE_CLIP) {
  *  Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts. */
 export function compactClipNote(count, cap = COMPACT_VALUE_CLIP, maxChars = undefined) {
   if (!count) return "";
+  // When the budget degraded the pinpoint cap back to the survey clip, the cap in force
+  // IS the survey one — emit the survey note verbatim rather than a longer one saying the
+  // same thing. The longer text is not free: it rides inside `max_chars`, and at the 500
+  // floor it alone pushed a reply that fitted past the bound (gate).
   if (cap <= COMPACT_VALUE_CLIP)
     return `\n(${count} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
+  // #1634 (gate): dropping the `fields`:"detail" pointer is only honest AT the fixed cap,
+  // where detail applies the same cap. BELOW it detail is strictly better — capSummaryWidgets
+  // reserves less of the budget for framing — so suppressing the pointer there would hand
+  // back the very clipped prompt this issue is about, minus the lever that works.
   return cap < WIDGET_VALUE_CAP
-    ? `\n(${count} widget value(s) clipped to ${cap} chars to fit \`max_chars\`=${maxChars} — ${raiseOrCeiling("max_chars", maxChars, MAX_CHARS_CEILING)} for fuller values, up to a fixed ${WIDGET_VALUE_CAP}-char per-value cap.)`
+    ? `\n(${count} widget value(s) clipped to ${cap} chars to fit \`max_chars\`=${maxChars} — ${raiseOrCeiling("max_chars", maxChars, MAX_CHARS_CEILING)}, or read this node with \`fields\`:"detail", which reserves less of the budget for framing and so carries more at this size.)`
     : `\n(${count} widget value(s) clipped to ${WIDGET_VALUE_CAP} chars — the same fixed per-value cap \`fields\`:"detail" applies, which no parameter raises.)`;
 }
 

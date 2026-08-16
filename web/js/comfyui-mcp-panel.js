@@ -10351,10 +10351,21 @@ const GRAPH_TOOL_EXECUTORS = {
       } else {
         // #607: flag link-driven widgets in the compact line too.
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+        // Never below the survey clip, so a tight budget degrades to main's behaviour.
+        let rowBudget = pinpoint
+          ? Math.max(COMPACT_VALUE_CLIP, maxChars - 1024)
+          : Number.POSITIVE_INFINITY;
         const w = Object.entries(widgetsOf(n))
           .map(([k, v]) => {
-            const c = clipCompactValue(v, compactValueCap);
+            // #1634 (gate): a PER-VALUE cap does not bound the ROW — N widgets at the cap
+            // sum to N×cap, and the #609-protected first row can never be dropped to
+            // recover, so a multi-widget pinpoint node breached max_chars on DEFAULT
+            // parameters (12169/12000 with six long widgets; 2700/2500 with an ordinary
+            // positive+negative pair). ONE budget spent across the row, not per widget.
+            const cap = Math.min(compactValueCap, Math.max(COMPACT_VALUE_CLIP, rowBudget));
+            const c = clipCompactValue(v, cap);
             if (c.clipped) rowClips++;
+            rowBudget -= c.text.length;
             return `${k}=${c.text}${driven[k] ? drivenTag(driven[k]) : ""}`;
           })
           .join(" ");

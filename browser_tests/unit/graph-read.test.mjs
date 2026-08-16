@@ -523,6 +523,13 @@ test("#1634 the clip note names the cap actually in force", () => {
   const byBudget = compactClipNote(1, 976, 2000);
   assert.match(byBudget, /clipped to 976 chars to fit `max_chars`=2000/);
   assert.match(byBudget, /raise `max_chars`/);
+  // #1634 (gate): BELOW the fixed cap, `fields`:"detail" reserves less of the budget for
+  // framing and genuinely carries more — suppressing it there is the #809 wrong-lever bug.
+  assert.match(byBudget, /`fields`:"detail"/);
+  // ...and when the budget degraded the cap back to the survey clip, the survey note is
+  // emitted verbatim: the longer text rides inside max_chars and at the floor it alone
+  // pushed a reply that fitted past the bound.
+  assert.equal(compactClipNote(1, 60, 500), compactClipNote(1));
 
   // At the ceiling, "raise max_chars" would itself be dead.
   assert.match(compactClipNote(1, 1024, 60000), /already at its ceiling of 60000/);
