@@ -10301,10 +10301,27 @@ const GRAPH_TOOL_EXECUTORS = {
     // and never drops — breaches the bound outright on a small `max_chars`.
     //
     // Deliberately unchanged: the compact SHAPE, the survey path, and `max_chars`.
-    const pinpoint = !!wantIds?.length;
-    const compactValueCap = pinpoint
-      ? Math.min(WIDGET_VALUE_CAP, Math.max(COMPACT_VALUE_CLIP, maxChars - 1024))
-      : COMPACT_VALUE_CLIP;
+    // Only a SINGLE id is a pinpoint read. Treating any `ids` list as one cost rows the
+    // caller explicitly asked for and main returned in full — 20 ordinary 600-char prompts
+    // at the default budget went from 20/20 to 18/20 (gate). One id also means at most one
+    // row, so there is no budget to divide and no row-count to regress.
+    const pinpoint = wantIds?.length === 1;
+    // Raise the cap only when the generous row DEMONSTRABLY fits. Arithmetic reserves kept
+    // leaking — a floor of 60 per widget still grows without bound across many widgets, so
+    // a 24-widget node breached `max_chars` on default parameters while reporting
+    // truncated:false (gate). A fit test cannot leak: if the generous rendering does not
+    // fit we use main's, so this is never worse than main on any shape.
+    const compactValueCap = (() => {
+      if (!pinpoint) return COMPACT_VALUE_CLIP;
+      const only = byId.get(wantIds[0]);
+      if (!only) return COMPACT_VALUE_CLIP;
+      let total = 0;
+      for (const [k, v] of Object.entries(widgetsOf(only)))
+        total += k.length + 2 + clipCompactValue(v, WIDGET_VALUE_CAP).text.length;
+      // The reserve covers what shares the budget with the row: header, the row's own
+      // prefix and ref lists, the truncation tail and the clip note.
+      return total <= maxChars - 1024 ? WIDGET_VALUE_CAP : COMPACT_VALUE_CLIP;
+    })();
     const clip = (v, n = 60) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
       return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -10351,21 +10368,14 @@ const GRAPH_TOOL_EXECUTORS = {
       } else {
         // #607: flag link-driven widgets in the compact line too.
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
-        // Never below the survey clip, so a tight budget degrades to main's behaviour.
-        let rowBudget = pinpoint
-          ? Math.max(COMPACT_VALUE_CLIP, maxChars - 1024)
-          : Number.POSITIVE_INFINITY;
         const w = Object.entries(widgetsOf(n))
           .map(([k, v]) => {
-            // #1634 (gate): a PER-VALUE cap does not bound the ROW — N widgets at the cap
-            // sum to N×cap, and the #609-protected first row can never be dropped to
-            // recover, so a multi-widget pinpoint node breached max_chars on DEFAULT
-            // parameters (12169/12000 with six long widgets; 2700/2500 with an ordinary
-            // positive+negative pair). ONE budget spent across the row, not per widget.
-            const cap = Math.min(compactValueCap, Math.max(COMPACT_VALUE_CLIP, rowBudget));
-            const c = clipCompactValue(v, cap);
+            // ONE cap across the row (see compactValueCap above). A per-widget cap that
+            // varied as a budget drained made the clip note incoherent: values cut at
+            // 2048, 736 and 60 were all reported as "clipped to 2048 … which no parameter
+            // raises", while raising `max_chars` demonstrably lifted them (gate).
+            const c = clipCompactValue(v, compactValueCap);
             if (c.clipped) rowClips++;
-            rowBudget -= c.text.length;
             return `${k}=${c.text}${driven[k] ? drivenTag(driven[k]) : ""}`;
           })
           .join(" ");
@@ -10403,7 +10413,7 @@ const GRAPH_TOOL_EXECUTORS = {
           })
         : "";
       const body = proj === "ids" ? lines.join(",") : lines.join("\n");
-      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0), compactValueCap, maxChars)}`;
+      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0), compactValueCap)}`;
     };
     let text = assemble();
     while (text.length > maxChars && lines.length > 1) {
