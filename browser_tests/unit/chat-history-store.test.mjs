@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 
 import {
   CHAT_HISTORY_LOCAL_SNAPSHOT_KEY,
@@ -9,6 +12,8 @@ import {
   isThreadInScope,
   mergeHistorySnapshots,
   normalizeThread,
+  panelScopeKeyForBackend,
+  resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
   parseHistoryImport,
@@ -1124,13 +1129,389 @@ test('panel selection preserves provenance and recovers when its tab pointer is 
   assert.equal(threads[0].workflowKey, 'wf:workflows/a.json')
 })
 
-test('reload keeps the tab-pointed panel conversation instead of switching to a newer thread', () => {
+// mcp#884 upgrade guard: a build that still had the workflow/ask scopes could
+// leave the panel:global pointer behind and keep SELECTING per-workflow
+// threads (the retired mode stamped a workflow-scoped active op on every
+// thread creation and open). On upgrade the newest SELECTION wins — message
+// timestamps are deliberately not evidence (gate P0-3: imports, straggler
+// writes, and skewed clocks carry newer messages without any user selection).
+test('a stale panel pointer loses to a newer retired-mode selection, never to mere messages', () => {
+  const threads = [
+    {
+      id: 'stale-panel-thread',
+      workflowKey: 'panel:global',
+      updatedAt: 1_000,
+      msgs: [{ id: 'old-msg', role: 'user', text: 'months ago', createdAt: 1_000 }]
+    },
+    {
+      id: 'current-workflow-thread',
+      workflowKey: 'workflow:wf-current',
+      updatedAt: 9_000,
+      msgs: [{ id: 'new-msg', role: 'user', text: 'this week', createdAt: 9_000 }]
+    }
+  ]
+  const stalePanelPointer = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'stale-panel-thread',
+    { updatedAt: 1_001, writerId: 'old-build', sequence: 1 }
+  )
+
+  // The retired workflow mode recorded its selection as a workflow-scoped op —
+  // newer than the abandoned panel pointer, so it wins.
+  const withWorkflowSelection = updateMetadataEntry(
+    stalePanelPointer,
+    'activeByScope',
+    'workflow:wf-current',
+    'current-workflow-thread',
+    { updatedAt: 8_000, writerId: 'old-build', sequence: 2 }
+  )
+  assert.equal(selectPanelThread(threads, withWorkflowSelection)?.id, 'current-workflow-thread')
+
+  // Same result when the panel op was compacted into the checkpoint baseline
+  // (value survives, its revision does not).
+  const compactedPanelValue = {
+    activeByScope: {
+      'panel:global': 'stale-panel-thread',
+      'workflow:wf-current': 'current-workflow-thread'
+    },
+    activeOps: withWorkflowSelection.activeOps && Object.fromEntries(
+      Object.entries(withWorkflowSelection.activeOps)
+        .filter(([key]) => key !== 'panel:global')
+    )
+  }
+  assert.equal(selectPanelThread(threads, compactedPanelValue)?.id, 'current-workflow-thread')
+
+  // A panel pointer stamped AFTER the workflow selection (the user returned to
+  // panel mode / opened a chat from the archive) is the latest selection and
+  // sticks.
+  const returnedToPanel = updateMetadataEntry(
+    withWorkflowSelection,
+    'activeByScope',
+    'panel:global',
+    'stale-panel-thread',
+    { updatedAt: 9_500, writerId: 'archive-open', sequence: 3 }
+  )
+  assert.equal(selectPanelThread(threads, returnedToPanel)?.id, 'stale-panel-thread')
+
+  // Gate P0-3: newer MESSAGES without any selection op (an imported archive
+  // keeps its original createdAt; a straggler write lands without a pointer
+  // move) never steal the selection.
+  assert.equal(selectPanelThread(threads, stalePanelPointer)?.id, 'stale-panel-thread')
+
+  // A retired-mode op whose target no longer exists is not evidence either.
+  const danglingWorkflowSelection = updateMetadataEntry(
+    stalePanelPointer,
+    'activeByScope',
+    'workflow:wf-gone',
+    'deleted-thread',
+    { updatedAt: 8_000, writerId: 'old-build', sequence: 2 }
+  )
+  assert.equal(selectPanelThread(threads, danglingWorkflowSelection)?.id, 'stale-panel-thread')
+})
+
+// Gate P0-2: the selection pointer is BACKEND-scoped (one conversation per
+// backend, mirroring the orchestrator's orchestrator::<backend> session key).
+test('panel selection is backend-scoped with a one-way legacy fallback', () => {
+  // `provider` is the ownership stamp record() writes on mint and on every append.
+  // It is what forks the LEGACY route per backend (mcp#884) — see the dedicated
+  // upgrade test below.
+  const threads = [
+    { id: 'claude-thread', provider: 'claude', updatedAt: 100, msgs: [] },
+    { id: 'codex-thread', provider: 'codex', updatedAt: 200, msgs: [] },
+    { id: 'legacy-thread', provider: 'claude', updatedAt: 50, msgs: [] }
+  ]
+  let meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:backend:claude',
+    'claude-thread',
+    { updatedAt: 1_000, writerId: 'claude-tab', sequence: 1 }
+  )
+  meta = updateMetadataEntry(
+    meta,
+    'activeByScope',
+    'panel:backend:codex',
+    'codex-thread',
+    { updatedAt: 2_000, writerId: 'codex-tab', sequence: 1 }
+  )
+
+  // Each backend resolves its own conversation; the other backend's newer
+  // selection is not evidence for this one.
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:claude' })?.id,
+    'claude-thread'
+  )
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:codex' })?.id,
+    'codex-thread'
+  )
+
+  // A backend key never written falls back to the legacy shared pointer...
+  const legacyOnly = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'legacy-thread',
+    { updatedAt: 500, writerId: 'pre-upgrade', sequence: 1 }
+  )
+  assert.equal(resolvePanelPointer(legacyOnly, 'panel:backend:claude').activeId, 'legacy-thread')
+  assert.equal(
+    selectPanelThread(threads, legacyOnly, { scopeKey: 'panel:backend:claude' })?.id,
+    'legacy-thread'
+  )
+
+  // ...but a written backend key (including a deliberate CLEAR) never falls
+  // back: migration is one-way per backend.
+  const cleared = updateMetadataEntry(
+    legacyOnly,
+    'activeByScope',
+    'panel:backend:claude',
+    null,
+    { updatedAt: 1_500, writerId: 'claude-tab', sequence: 2 }
+  )
+  const clearedPointer = resolvePanelPointer(cleared, 'panel:backend:claude')
+  assert.equal(clearedPointer.activeId, null)
+  assert.equal(clearedPointer.cleared, true)
+  assert.equal(selectPanelThread(threads, cleared, { scopeKey: 'panel:backend:claude' }), null)
+  // The legacy pointer serves other backends only where it can — and it CANNOT here.
+  // `legacy-thread` is claude's (provider: 'claude'); handing it to codex as well is
+  // precisely the shared-transcript corruption the fork rule exists to stop. Codex
+  // resolves its OWN most recent conversation instead.
+  assert.equal(
+    selectPanelThread(threads, cleared, { scopeKey: 'panel:backend:codex' })?.id,
+    'codex-thread'
+  )
+})
+
+test('mcp#884 UPGRADE: one legacy pointer never becomes TWO backends conversation', () => {
+  // THE UPGRADE PATH EVERY EXISTING USER TAKES. A pre-upgrade snapshot has a single
+  // shared `panel:global` pointer and no per-backend keys, so before the fork every
+  // backend key fell back to the SAME thread id. Claude and Codex both claimed it,
+  // `loadThread` scrubbed its foreign session, and `record()` rewrote its provider on
+  // every append — two providers sharing and corrupting one transcript.
+  const legacy = { id: 'the-one-conversation', provider: 'claude', updatedAt: 500, msgs: [] }
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'the-one-conversation',
+    { updatedAt: 500, writerId: 'pre-upgrade', sequence: 1 }
+  )
+
+  const forClaude = selectPanelThread([legacy], meta, { scopeKey: 'panel:backend:claude' })
+  const forCodex = selectPanelThread([legacy], meta, { scopeKey: 'panel:backend:codex' })
+
+  // The owner keeps it — the single-backend upgrade, which is the common case, is
+  // completely unaffected.
+  assert.equal(forClaude?.id, 'the-one-conversation', 'the owning backend still adopts it')
+  // …and nobody else does.
+  assert.equal(forCodex, null, 'a second backend must NOT resolve the same conversation')
+  assert.notEqual(
+    forClaude?.id,
+    forCodex?.id,
+    'two backends resolving one thread id is the corruption this rule exists to prevent'
+  )
+
+  // Stated for a third backend too: the rule is "only the owner", not "only the second
+  // one loses".
+  assert.equal(selectPanelThread([legacy], meta, { scopeKey: 'panel:backend:gemini' }), null)
+
+  // The legacy thread is NOT deleted — it stays in history and opens through the picker
+  // like any archived conversation, exactly as the retired per-workflow threads do.
+  assert.ok([legacy].includes(legacy))
+})
+
+test('mcp#884 UPGRADE: a provider-less legacy thread fails CLOSED rather than into every backend', () => {
+  // Very old snapshots can carry a thread with no provider stamp. There is no evidence
+  // of ownership, so no backend auto-adopts it: fail-open here is exactly the collision
+  // above, and the cost of failing closed is bounded and non-destructive (the
+  // conversation stays in history and opens through the picker).
+  const orphan = { id: 'no-provider', updatedAt: 500, msgs: [] }
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'no-provider',
+    { updatedAt: 500, writerId: 'pre-upgrade', sequence: 1 }
+  )
+  for (const backend of ['claude', 'codex', 'gemini']) {
+    assert.equal(
+      selectPanelThread([orphan], meta, { scopeKey: `panel:backend:${backend}` }),
+      null,
+      `${backend} must not claim a conversation nothing attributes to it`
+    )
+  }
+})
+
+test('mcp#884 UPGRADE: the no-pointer recency fallback is forked per backend too', () => {
+  // The OTHER door into the same collision, and the one a fix aimed only at the legacy
+  // POINTER would miss: a snapshot with no panel pointer at all fell through to
+  // "most recently updated thread", which is equally the same id for every backend.
+  const threads = [
+    { id: 'codex-newest', provider: 'codex', updatedAt: 900, msgs: [] },
+    { id: 'claude-older', provider: 'claude', updatedAt: 100, msgs: [] }
+  ]
+  assert.equal(
+    selectPanelThread(threads, {}, { scopeKey: 'panel:backend:claude' })?.id,
+    'claude-older',
+    'claude falls back to ITS most recent conversation, not the globally newest one'
+  )
+  assert.equal(
+    selectPanelThread(threads, {}, { scopeKey: 'panel:backend:codex' })?.id,
+    'codex-newest'
+  )
+})
+
+test("mcp#884 another backend's selection never competes — even for a thread THIS backend could claim", () => {
+  // REGRESSION GUARD FOR THE GUARD. The `panel:` skip in the compete loop was
+  // previously pinned by a fixture whose threads had no provider. Adding the upgrade
+  // fork MASKED that: another backend's op now usually resolves to a thread this
+  // backend cannot claim anyway, so deleting the skip stopped failing anything.
+  //
+  // The two rules are NOT the same rule. The fork asks "could this backend own the
+  // thread"; the skip asks "is another backend's selection evidence for mine". A
+  // thread whose provider matches BOTH questions separates them — which is exactly
+  // reachable, because a thread's provider changes when the user switches backends
+  // while it is open.
+  const threads = [
+    { id: 'mine', provider: 'codex', updatedAt: 100, msgs: [] },
+    // Same provider, so the fork happily allows it. Only the `panel:` skip stops it.
+    { id: 'claudes-pick', provider: 'codex', updatedAt: 900, msgs: [] }
+  ]
+  let meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:backend:codex',
+    'mine',
+    { updatedAt: 1_000, writerId: 'codex-tab', sequence: 1 }
+  )
+  // Written LATER, under ANOTHER backend's key. If it were allowed to compete it would
+  // win on revision and move codex onto claude's conversation.
+  meta = updateMetadataEntry(
+    meta,
+    'activeByScope',
+    'panel:backend:claude',
+    'claudes-pick',
+    { updatedAt: 9_000, writerId: 'claude-tab', sequence: 2 }
+  )
+
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:codex' })?.id,
+    'mine',
+    "a Claude tab's newer selection must not move the Codex conversation"
+  )
+  // And the mirror, so the rule is not "codex always wins".
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:claude' })?.id,
+    'claudes-pick'
+  )
+})
+
+test('mcp#884 a backend pointer this backend WROTE is honoured whatever the provider stamp says', () => {
+  // The fork must not become a second, stricter gate on normal operation. A thread
+  // legitimately changes provider when the user switches backends while it is open, so
+  // a pointer the backend wrote for itself is its own evidence and outranks the stamp.
+  const threads = [{ id: 'mine', provider: 'claude', updatedAt: 100, msgs: [] }]
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:backend:codex',
+    'mine',
+    { updatedAt: 1_000, writerId: 'codex-tab', sequence: 1 }
+  )
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:codex' })?.id,
+    'mine',
+    'codex selected this conversation itself — the stale provider stamp must not veto that'
+  )
+})
+
+test('metadata-only edits on an archived chat never steal the panel selection', () => {
+  // Rename/pin bump thread.updatedAt without new messages; grooming the archive
+  // must not hijack the conversation every tab is in.
+  const threads = [
+    {
+      id: 'active-conversation',
+      workflowKey: 'workflow:wf-a',
+      updatedAt: 5_000,
+      msgs: [{ id: 'live-msg', role: 'user', text: 'live', createdAt: 5_000 }]
+    },
+    {
+      id: 'renamed-archive',
+      workflowKey: 'workflow:wf-b',
+      updatedAt: 9_999,
+      title: 'freshly renamed',
+      msgs: [{ id: 'archived-msg', role: 'user', text: 'archived', createdAt: 100 }]
+    }
+  ]
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'active-conversation',
+    { updatedAt: 4_000, writerId: 'writer', sequence: 1 }
+  )
+
+  assert.equal(selectPanelThread(threads, meta)?.id, 'active-conversation')
+})
+
+// mcp#884/#897: with the agent session orchestrator-global, the SHARED pointer
+// is authoritative on reload — a tab preference only bridges legacy snapshots
+// that predate the shared pointer.
+test('reload keeps the tab-pointed panel conversation only until a shared pointer exists', () => {
   const threads = [
     { id: 'visible', workflowKey: 'workflow:wf-a', updatedAt: 100, msgs: [] },
     { id: 'newer-background', workflowKey: 'workflow:wf-b', updatedAt: 999, msgs: [] }
   ]
 
+  // Legacy snapshot (no panel:global pointer): the tab pointer is the only
+  // record of what this tab had open, so honor it.
   assert.equal(selectRestoreThread(threads, {}, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  })?.id, 'visible')
+
+  // Shared pointer present: every tab must restore the same conversation the
+  // orchestrator's single session is in, tab preference notwithstanding.
+  const shared = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'newer-background',
+    { updatedAt: 2_000, writerId: 'other-tab', sequence: 1 }
+  )
+  assert.equal(selectRestoreThread(threads, shared, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  })?.id, 'newer-background')
+
+  // A deliberately cleared pointer (new chat elsewhere) restores the empty
+  // view, not the tab's old conversation.
+  const cleared = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    null,
+    { updatedAt: 2_000, writerId: 'other-tab', sequence: 1 }
+  )
+  assert.equal(selectRestoreThread(threads, cleared, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  }), null)
+
+  // A DANGLING pointer (its thread was evicted or lost in a partial merge)
+  // says nothing about which conversation the global session is in — the tab
+  // that was just using one is better evidence than guessing by recency.
+  const dangling = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'evicted-thread',
+    { updatedAt: 2_000, writerId: 'other-tab', sequence: 1 }
+  )
+  assert.equal(selectRestoreThread(threads, dangling, {
     panelOwned: true,
     preferredThreadId: 'visible'
   })?.id, 'visible')
@@ -2272,4 +2653,115 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
     }
     store.close()
   }
+})
+// ---------------------------------------------------------------------------
+// mcp#884 — THE INVARIANT, pinned as a gate rather than left to inspection.
+//
+// "Sessions are ORCHESTRATOR-scoped, never workflow-scoped or tab-scoped" is a
+// project invariant, and this branch is what makes the panel honour it. The
+// retired workflow/ask machinery is still PRESENT in the panel source as
+// deliberately unreachable defence-in-depth (see historyScopeFollowsPanel()),
+// which is a reasonable choice and also a standing hazard: the whole of it wakes
+// up again the moment chatScopeMode() stops being a constant. Reading the source
+// once proved it is unreachable today; these assertions are what keep it so.
+// ---------------------------------------------------------------------------
+
+const PANEL_SRC = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), '../../web/js/comfyui-mcp-panel.js'),
+  'utf8'
+).replace(/\r\n/g, '\n')
+
+/** The body of a top-level `function name() {` … column-0 `}`. */
+function topLevelFunction(name) {
+  const start = PANEL_SRC.indexOf(`\nfunction ${name}(`)
+  assert.notEqual(start, -1, `${name}() must exist as a top-level function`)
+  const end = PANEL_SRC.indexOf('\n}\n', start)
+  assert.ok(end > start, `${name}() must be closed`)
+  return PANEL_SRC.slice(start, end)
+}
+
+test('mcp#884 chatScopeMode is a CONSTANT — no setting can reintroduce workflow scope', () => {
+  const body = topLevelFunction('chatScopeMode')
+  // Exactly one return, and it is the literal. A `getSetting(...)` read here is
+  // the single edit that would revive every workflow-scoped path below it.
+  const returns = [...body.matchAll(/return\s+([^;]*);/g)].map((m) => m[1].trim())
+  assert.deepEqual(returns, ['"panel"'], 'chatScopeMode() returns the literal "panel" and nothing else')
+  assert.ok(!/getSetting|localStorage|sessionStorage/.test(body), 'it reads no stored value')
+})
+
+test('mcp#884 no chat-scope setting is registered any more', () => {
+  const start = PANEL_SRC.indexOf('function panelSettingsList() {')
+  assert.notEqual(start, -1)
+  const body = PANEL_SRC.slice(start, PANEL_SRC.indexOf('\n}\n', start))
+  // The combo is what wrote the value chatScopeMode() used to read. A row for it
+  // cannot come back without this failing.
+  assert.ok(!/SETTING_CHAT_SCOPE/.test(body), 'the "Chat conversation scope" row stays retired')
+  assert.ok(!/SETTING_SESSION_FOLLOWS_PANEL/.test(body), 'the legacy boolean stays retired')
+  assert.ok(!/applyChatScope/.test(PANEL_SRC.replace(/\/\/[^\n]*/g, '')), 'no live scope switcher hook')
+})
+
+test('mcp#884 currentHistoryScopeKey resolves to a backend axis for a panel-owned chat', () => {
+  const at = PANEL_SRC.indexOf('function currentHistoryScopeKey(')
+  assert.notEqual(at, -1)
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf('\n  }\n', at))
+  // The workflow branch is the unreachable one and must STAY behind the guard —
+  // if the guard is ever deleted, the remaining return must still be the backend
+  // key, never workflowStorageKey().
+  // The key is built by the store's exported helper now (mcp#884), so the panel and the
+  // backend-switch path cannot interpolate two different shapes for the same axis.
+  assert.match(
+    body,
+    /return panelScopeKeyForBackend\(/,
+    'the panel-owned answer is keyed on the backend, the same axis as orchestrator::<backend>'
+  )
+  // …and the helper really does produce that axis, so this is not just a rename.
+  assert.equal(panelScopeKeyForBackend('codex'), 'panel:backend:codex')
+  assert.equal(panelScopeKeyForBackend(null), 'panel:backend:claude', 'the documented default')
+  const wfReturn = /if \(!historyScopeFollowsPanel\(\)\) return workflowStorageKey/.test(body)
+  assert.ok(wfReturn, 'the workflow key is reachable ONLY through the historyScopeFollowsPanel() guard')
+})
+
+test('mcp#884 every selection-pointer WRITE uses the backend key, never a workflow key', () => {
+  // The pointer is the one piece of state that decides which conversation a tab
+  // renders and records into. If any writer can address it by a workflow key, the
+  // conversation is workflow-scoped again no matter what chatScopeMode() says.
+  const writes = [...PANEL_SRC.matchAll(/setActiveThread\(\s*([^,]+),/g)]
+    .map((m) => m[1].trim())
+    .filter((arg) => arg !== 'scopeKey' || false)
+  const allowed = new Set([
+    'currentHistoryScopeKey()', // the backend key
+    'scopeKey', // a local already assigned from currentHistoryScopeKey()
+    'key' // the delete sweep, iterating keys that already exist in metadata
+  ])
+  const offenders = writes.filter((arg) => !allowed.has(arg))
+  assert.deepEqual(offenders, [], `setActiveThread called with a non-backend scope key: ${offenders.join(', ')}`)
+
+  // …and the one `scopeKey` local really is the backend key, not a workflow one.
+  assert.match(
+    PANEL_SRC,
+    /const scopeKey = currentHistoryScopeKey\(\);/,
+    'the scopeKey local is assigned from currentHistoryScopeKey()'
+  )
+})
+
+test('mcp#884 the workflow-keyed session bind is unreachable while the chat is panel-owned', () => {
+  // `ssSet(SESSION_KEY, existing?.sessionId || null)` in onWorkflowMaybeChanged is
+  // the exact line that made a session belong to a WORKFLOW. It still exists, and
+  // it is only safe because the panel-owned branch returns before reaching it.
+  const at = PANEL_SRC.indexOf('function onWorkflowMaybeChanged() {')
+  assert.notEqual(at, -1)
+  const body = PANEL_SRC.slice(at, PANEL_SRC.indexOf('\n  }\n', at))
+  const guardAt = body.indexOf('if (followsPanel) {')
+  assert.ok(guardAt > -1, 'the panel-owned branch exists')
+  // The guard block must END in a return, so nothing below it can run.
+  const afterGuard = body.slice(guardAt)
+  const guardEnd = afterGuard.indexOf('\n    }\n')
+  assert.ok(guardEnd > -1, 'the panel-owned branch closes at its own 4-space brace')
+  assert.match(
+    afterGuard.slice(0, guardEnd),
+    /\n {6}return;$/,
+    'the panel-owned branch RETURNS — this is the only thing keeping the workflow-scoped tail dead'
+  )
+  const tail = body.slice(guardAt + guardEnd)
+  assert.match(tail, /ssSet\(SESSION_KEY, existing\?\.sessionId/, 'the workflow-keyed bind lives in the dead tail')
 })

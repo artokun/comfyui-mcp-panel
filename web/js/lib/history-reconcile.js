@@ -20,11 +20,16 @@
  * @param {object}   [opts]
  * @param {(m:object)=>boolean} [opts.isVideo]  Classifies an output ref as video
  *   (else still image), matching the live path's classification.
+ * @param {() => number} [opts.now]  Clock (epoch ms) used ONLY to reject a
+ *   timestamp implausibly far in the future. Injectable for tests.
  * @returns {null | { terminal:boolean, status:("success"|"error"|"interrupted"|"unknown"),
- *   images:object[], videos:{m:object,nodeId:string}[] }}
- *   `null` when there's no usable entry.
+ *   images:object[], videos:{m:object,nodeId:string}[],
+ *   startedAt:(number|null), finishedAt:(number|null) }}
+ *   `null` when there's no usable entry. `startedAt`/`finishedAt` are epoch ms
+ *   recovered from the entry's own lifecycle messages, or null when this entry
+ *   records no trustworthy value (see historyMessageTimeMs).
  */
-export function parseHistoryEntry(entry, { isVideo } = {}) {
+export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {}) {
   if (!entry || typeof entry !== "object") return null;
 
   const status = entry.status && typeof entry.status === "object" ? entry.status : {};
@@ -68,12 +73,67 @@ export function parseHistoryEntry(entry, { isVideo } = {}) {
     }
   }
 
+  // #1199 — the run's OWN times, so a completion recovered from history can report
+  // when it actually rendered instead of when the recovery happened. Read here
+  // because this is the only place the raw entry is in scope.
+  const nowMs = typeof now === "function" ? now() : Date.now();
+  const startedAt = historyMessageTimeMs(messages, "execution_start", nowMs);
+  const finishedAt = historyMessageTimeMs(messages, "execution_success", nowMs);
+
   return {
     terminal,
     status: isError ? "error" : isInterrupted ? "interrupted" : isSuccess ? "success" : "unknown",
     images,
     videos,
+    startedAt,
+    finishedAt,
   };
+}
+
+// A timestamp more than this far AHEAD of our clock is not a finish time we can
+// trust — it is clock skew between ComfyUI's host and ours, or a counter that
+// isn't an epoch at all. Rejected rather than used: a "finished" stamp in the
+// future computes to a NEGATIVE age, which would present a days-old render as
+// one that just landed — precisely the #1199 defect this extraction prevents.
+const FUTURE_SKEW_TOLERANCE_MS = 60_000;
+
+/**
+ * Read a lifecycle message's `timestamp` from `status.messages` as epoch ms.
+ *
+ * ComfyUI records each execution message as `[name, data]` where `data.timestamp`
+ * is the moment it fired. Which UNIT depends on the ComfyUI version — some builds
+ * write epoch seconds, others milliseconds — so the magnitude decides, mirroring
+ * `normalizeEpochMs` in comfyui-mcp (`src/services/job-history.ts`) so both repos
+ * mean the same thing by "the run's real completion time".
+ *
+ * Scans rather than taking the first match positionally: a malformed duplicate
+ * message must not shadow a well-formed one later in the list.
+ *
+ * @param {any[]} messages  `entry.status.messages` (already array-guarded).
+ * @param {string} name     Lifecycle message name, e.g. "execution_success".
+ * @param {number} nowMs    Our clock, for the future-skew rejection.
+ * @returns {number|null}   Epoch ms, or null when no trustworthy value exists.
+ */
+function historyMessageTimeMs(messages, name, nowMs) {
+  for (const message of messages) {
+    if (!Array.isArray(message) || message[0] !== name) continue;
+    const data = message[1];
+    if (data === null || typeof data !== "object" || Array.isArray(data)) continue;
+    const ms = normalizeEpochMs(data.timestamp);
+    if (ms === null) continue;
+    if (Number.isFinite(nowMs) && ms > nowMs + FUTURE_SKEW_TOLERANCE_MS) continue;
+    return ms;
+  }
+  return null;
+}
+
+// Epoch SECONDS or MILLISECONDS by magnitude. Anything below the seconds
+// threshold (a relative counter, 0, a duration) is not an epoch at all ⇒ null.
+function normalizeEpochMs(ts) {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return null;
+  if (ts > 1_000_000_000_000) return ts; // already epoch ms
+  if (ts > 1_000_000_000) return ts * 1000; // epoch seconds
+  return null;
 }
 
 /**

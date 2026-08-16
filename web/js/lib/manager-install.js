@@ -324,7 +324,39 @@ export function classifyInstallOutcome({
   listError = false,
   batchFailed,
   renameProne = false,
+  taskFailure = null,
 }) {
+  // #1539 — the Manager's OWN terminal verdict for the task we submitted (keyed
+  // by our ui_id) outranks every proxy below, and is checked before the
+  // not-drained early return: a terminal record is conclusive whether or not the
+  // queue has drained (a neighbouring task can keep it busy indefinitely).
+  //
+  // Everything below is a proxy — "the queue drained and the pack is not there".
+  // For a git URL those proxies can NEVER conclude failure, because renameProne
+  // suppresses the queueFailureSignal branch (a git pack may install under a
+  // directory the name-match cannot see, so absence is not proof). That is
+  // exactly the reported bug: v4 rejects an unlisted repo by REGISTRY LOOKUP —
+  // `Node '<name>@nightly' not found in [ManagerChannel.dev,
+  // ManagerDatabaseSource.cache]` — records the error, drains, and the install
+  // reported `queued: true, pending: true`. The record said "failed" the whole
+  // time; nothing read it.
+  if (taskFailure) {
+    return {
+      state: "failed",
+      status,
+      message:
+        `"${target}" install FAILED: the ComfyUI-Manager task terminated with an error` +
+        (dialect ? ` (dialect ${dialect})` : "") +
+        `: ${taskFailure}. The install did NOT complete — check the ComfyUI server log ` +
+        `for the full traceback.` +
+        // The registry-miss case has a specific, verified way forward (#920), and
+        // it is worth far more HERE than on a later poll: this is the reply to the
+        // install call itself, so the caller learns it without having to know to
+        // ask again. Empty for every other failure.
+        unlistedGitUrlAdvice(taskFailure),
+    };
+  }
+
   const drained = queueDrained(status);
   const listReadable = !listError && isReadableInstalledList(installed);
 
@@ -494,6 +526,54 @@ export function dialectRetryTarget(failed, fresh) {
 }
 
 /**
+ * #1088 — split a search query into lowercased TERMS, matched independently.
+ *
+ * The whole query used to be one contiguous substring to find, and that returned zero
+ * for packs the catalogue plainly contains, because the SEPARATOR differs between the
+ * two sides. Pack identity lives in the repo name and spells the same words
+ * `comfyui-textoverlay` or `ComfyUI-text-overlay`; a human types `text overlay`.
+ * Neither spelling contains `"text overlay"`, so all three of the reporter's packs
+ * reported absent while the single token `overlay` found them. Printed next to
+ * `catalogue_size: 5583`, that 0 reads as "this pack does not exist" — the #808
+ * conflation, arriving through the query instead of through an empty catalogue.
+ *
+ * Splitting on WHITESPACE only, and never on `-` or `_`: those are real characters in
+ * a pack id, and a term of `text` already matches `text-overlay` and `textoverlay`
+ * alike as a substring. Splitting the HAYSTACK too would be the change that needs
+ * justifying; this one only stops treating the user's spaces as literal.
+ *
+ * A whitespace-only query yields NO terms and therefore filters nothing — the same
+ * answer `""` already gave, rather than the empty result a literal match produced for
+ * a query the caller may not be able to see is padded.
+ */
+export function queryTerms(query) {
+  return String(query ?? "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * Does `hay` contain EVERY term? AND, deliberately, not OR.
+ *
+ * OR would be a worse defect than the one being fixed: `impact overlay` would match
+ * every pack containing either word, and a caller reading a 40-row result cannot tell
+ * a real hit from noise — a search that answers everything is as useless as one that
+ * answers nothing, and unlike the zero it does not announce itself.
+ *
+ * This is a strict SUPERSET of the contiguous match it replaces: if a haystack
+ * contained the query as one substring, it contains each of the query's terms as a
+ * substring too. So no search that worked before can stop working — the property that
+ * makes this safe to ship, pinned by a test rather than left as an argument.
+ */
+export function matchesAllTerms(hay, terms) {
+  for (const t of terms) {
+    if (!hay.includes(t)) return false;
+  }
+  return true;
+}
+
+/**
  * Normalize a ComfyUI-Manager `/customnode/getmappings` payload into the
  * nodes_search result shape `{ count, results:[{id,title,description}] }`,
  * filtered by `query` and capped at `limit` (default 15, max 40). Pure so the
@@ -513,12 +593,12 @@ export function dialectRetryTarget(failed, fresh) {
  * display.
  */
 export function parseNodeMappings(data, query, limit) {
-  const q = String(query ?? "").toLowerCase();
+  const terms = queryTerms(query);
   const out = [];
   const push = (id, title, desc) => {
     if (!id) return;
     const hay = `${id} ${title ?? ""} ${desc ?? ""}`.toLowerCase();
-    if (!q || hay.includes(q)) {
+    if (matchesAllTerms(hay, terms)) {
       out.push({ id, title: title ?? id, description: String(desc ?? "").slice(0, 160) });
     }
   };
@@ -571,7 +651,7 @@ export function catalogueSize(data) {
  * installed, so no registry install id is needed.
  */
 export function parseObjectInfoSearch(objectInfo, query, limit) {
-  const q = String(query ?? "").toLowerCase();
+  const terms = queryTerms(query);
   const out = [];
   if (objectInfo && typeof objectInfo === "object") {
     for (const [cls, meta] of Object.entries(objectInfo)) {
@@ -579,7 +659,7 @@ export function parseObjectInfoSearch(objectInfo, query, limit) {
       const desc = meta?.description ?? "";
       const category = meta?.category ?? "";
       const hay = `${cls} ${title} ${category} ${desc}`.toLowerCase();
-      if (!q || hay.includes(q)) {
+      if (matchesAllTerms(hay, terms)) {
         out.push({ id: cls, title, description: String(desc).slice(0, 160), installed: true });
       }
     }

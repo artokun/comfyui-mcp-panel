@@ -23,10 +23,6 @@
     "name": "Backend d'agent par défaut",
     "tooltip": "L'agent d'arrière-plan auquel le panneau se connecte par défaut. Claude tourne sur votre abonnement Claude ; ChatGPT sur votre compte Codex (ChatGPT) ; Gemini sur votre connexion Google (Gemini). Amorce le backend du panneau (et détermine quel groupe ci-dessous amorce le runtime) ; vous pouvez toujours changer à chaud dans le sélecteur de modèles (un changement à chaud ne vaut que pour la session et ne modifie PAS cette valeur par défaut)."
   },
-  "comfyui-mcp_chatScope": {
-    "name": "Portée des conversations",
-    "tooltip": "Panneau : une seule conversation suit tous les canevas. Workflow : chaque workflow enregistré possède son propre jeu persistant de conversations, identifié par un UUID intégré, de sorte que les renommages conservent l'historique et que les copies restent séparées. Demander : vous choisissez à chaque changement de workflow si la conversation en cours doit suivre. Tous les modes survivent à un redémarrage complet de ComfyUI/MCP."
-  },
   "comfyui-mcp_autoConnect": {
     "name": "Connexion automatique au chargement",
     "tooltip": "Connecte automatiquement l'agent (en démarrant l'orchestrateur local) à l'ouverture du panneau, sans cliquer sur Connecter. Désactivé par défaut — sinon l'orchestrateur n'est démarré que par un clic explicite sur Connecter."
