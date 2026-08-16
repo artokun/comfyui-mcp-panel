@@ -116,6 +116,10 @@ function buildVerifyInstalled({ routes, calls = [], budgetMs }) {
     INSTALL_VERIFY_BUDGET_MS: budgetMs ?? 4000,
     AbortSignal,
     setTimeout,
+    // comfyui-mcp#1606 — the capture the verifier now also consults. EMPTY here
+    // on purpose: these tests pin the HTTP history path, and an empty log proves
+    // the capture cannot short-circuit or alter it.
+    managerTaskResults: ManagerInstall.createManagerTaskResultLog(),
   };
   const factory = new Function(
     ...Object.keys(deps),

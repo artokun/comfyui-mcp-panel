@@ -1103,6 +1103,274 @@ export function collectRecentTaskFailures(resp, { limit = 20 } = {}) {
   return out.slice(-limit);
 }
 
+// ---------------------------------------------------------------------------
+// comfyui-mcp#1606 — a per-task result on the build that keeps NO task history
+// ---------------------------------------------------------------------------
+//
+// #1539 gave install the Manager's own terminal verdict by reading
+// /v2/manager/queue/history?ui_id=. Released 3.x ("legacy") registers no such
+// route, so there it reads nothing and the install falls back to the drain +
+// name-presence proxies. The reporter's install drained and left no trace at
+// all: panel_node_queue_status showed an idle queue with NOTHING in it, and the
+// pack was absent.
+//
+// The record is not missing — it is DELETED. Read out of ComfyUI-Manager 3.41's
+// glob/manager_server.py: `task_worker` accumulates every task's outcome in
+// `nodepack_result[ui_id]` (do_install returns the literal string 'success', or
+// the error text — "Cannot resolve install target: …", the failed
+// `install_by_id` res.msg, a traceback summary). When the queue empties it
+// broadcasts that whole map and then throws it away:
+//
+//     PromptServer.instance.send_sync("cm-queue-status",
+//         {'status': 'done', 'nodepack_result': nodepack_result, …})
+//     nodepack_result = {}
+//     task_queue = queue.Queue()
+//
+// `queue/status` derives done_count from `len(nodepack_result)`, so the line
+// after the broadcast is what makes total/done/in_progress all read 0 — the
+// reporter's "empty idle queue", produced BY the task finishing. `queue/start`
+// clears the map too. No later HTTP read can recover the outcome.
+//
+// So the broadcast is the only place 3.x ever states it — and a panel living in
+// the ComfyUI page is already a client of it. `send_sync` with no sid goes to
+// every connected client, and ComfyUI-Manager's own UI reads it exactly this
+// way (`api.addEventListener("cm-queue-status", …)` in js/custom-nodes-manager.js).
+// The helpers below turn that frame into records the same shape the history
+// reader produces, so the verdict path above needs no new branch: a captured
+// failure is fed in as `taskFailure` and classifies identically.
+
+/**
+ * The per-task outcomes carried by ONE `cm-queue-status` payload.
+ *
+ * Only the DRAIN frame ('done') carries outcomes. The per-task 'in_progress'
+ * frame names the task that just finished (`target`) but never says how it went,
+ * so reading it as a result would record every task as an unknown one — and an
+ * unknown result is indistinguishable from a failure string here.
+ *
+ * Unknown/foreign shapes yield []: this is additive evidence, so a payload we do
+ * not recognise must add nothing rather than guess. That is also what keeps it
+ * safe on a Manager generation that emits a same-named event of its own.
+ *
+ * @returns {{ui_id: string, result: string}[]}
+ */
+export function queueEventTaskResults(detail) {
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) return [];
+  if (detail.status !== "done") return [];
+  const out = [];
+  for (const key of ["nodepack_result", "model_result"]) {
+    const map = detail[key];
+    if (!map || typeof map !== "object" || Array.isArray(map)) continue;
+    for (const [ui_id, raw] of Object.entries(map)) {
+      const result = taskResultText(raw);
+      if (ui_id && result !== undefined) out.push({ ui_id, result });
+    }
+  }
+  return out;
+}
+
+/** A `nodepack_result` value as the 3.41 worker writes it: the worker's return
+ *  value, which is a STRING for install/uninstall/disable/fix and for 'update'
+ *  (it stores `msg['msg']`), but the whole `{msg, url, title}` record for
+ *  'update-main'. Anything else is not a result this can read. */
+function taskResultText(raw) {
+  if (typeof raw === "string") return raw.trim() || undefined;
+  if (raw && typeof raw === "object" && typeof raw.msg === "string") return raw.msg.trim() || undefined;
+  return undefined;
+}
+
+/**
+ * Is a captured result a FAILURE, and what did the Manager say?
+ *
+ * The 3.x worker writes a fixed success vocabulary and returns the ERROR TEXT
+ * itself for everything else, so "not one of the success words" is the failure
+ * test and the value IS the reason. The Manager's ComfyUI self-update task also
+ * answers "success-stable-<tag>", hence the prefix arm — a version-tagged
+ * success is still a success.
+ *
+ * Returns null for a success and for anything unreadable: this may only ever ADD
+ * a positive failure verdict, never manufacture one.
+ */
+export function queueEventFailureReason(result) {
+  if (typeof result !== "string") return null;
+  const v = result.trim();
+  if (!v) return null;
+  const lower = v.toLowerCase();
+  if (TASK_SUCCESS_STATUS.has(lower)) return null;
+  if (/^success[-:\s]/.test(lower)) return null;
+  return v;
+}
+
+/** How many captured task records to keep. Bounds the log in a tab that stays
+ *  open for days; the reads below are all "the recent ones" anyway. */
+const TASK_RESULT_LOG_LIMIT = 50;
+
+/**
+ * A bounded log of Manager task outcomes captured from `cm-queue-status`.
+ *
+ * Kept in this module rather than the panel so it is unit-testable without a
+ * browser: the panel owns the subscription (one `api.addEventListener`), this
+ * owns what the frames MEAN.
+ *
+ * Insertion-ordered by ui_id, so eviction is oldest-first and re-recording a
+ * ui_id moves it to the newest position.
+ *
+ * @param {{limit?: number, now?: () => number}} [opts]
+ */
+export function createManagerTaskResultLog({ limit = TASK_RESULT_LOG_LIMIT, now = () => Date.now() } = {}) {
+  /** @type {Map<string, {ui_id: string, target?: string, kind?: string, result?: string, at?: number}>} */
+  const byUiId = new Map();
+
+  const touch = (ui_id, patch) => {
+    const prev = byUiId.get(ui_id);
+    byUiId.delete(ui_id); // re-insert so Map order stays newest-last
+    byUiId.set(ui_id, { ...(prev ?? {}), ui_id, ...patch });
+    while (byUiId.size > limit) byUiId.delete(byUiId.keys().next().value);
+  };
+
+  return {
+    /** Correlate a ui_id we are about to submit with WHAT it acts on. The
+     *  broadcast carries only ui_id → result, so without this a captured
+     *  failure could name no pack. Optional: an uncorrelated failure is still
+     *  reported, just without an `id`. */
+    note(ui_id, { target, kind } = {}) {
+      if (typeof ui_id !== "string" || !ui_id) return;
+      touch(ui_id, { target, kind });
+    },
+
+    /** Ingest one `cm-queue-status` payload. Returns how many outcomes it carried. */
+    record(detail) {
+      const results = queueEventTaskResults(detail);
+      for (const { ui_id, result } of results) {
+        touch(ui_id, { result, at: now() });
+        // A later SUCCESS retires an earlier failure for the SAME pack. Without
+        // this, a reinstall that worked leaves the original failure sitting in
+        // the log, and the next queue poll reports a defeat that has already
+        // been undone — the stale-verdict failure mode this whole area is about.
+        const rec = byUiId.get(ui_id);
+        if (rec && rec.target && !queueEventFailureReason(rec.result)) {
+          for (const [key, other] of byUiId) {
+            if (key !== ui_id && other.target === rec.target && queueEventFailureReason(other.result)) {
+              byUiId.delete(key);
+            }
+          }
+        }
+      }
+      return results.length;
+    },
+
+    /** The Manager's own failure text for THIS ui_id, or null. Correlated by the
+     *  id we submitted, so a neighbouring task's failure is never attributed to
+     *  it — the same rule the history read follows. */
+    failureFor(ui_id) {
+      const rec = typeof ui_id === "string" ? byUiId.get(ui_id) : undefined;
+      return rec ? queueEventFailureReason(rec.result) : null;
+    },
+
+    /**
+     * Captured FAILURES, in the `{ui_id, kind, id, result}` shape
+     * collectRecentTaskFailures produces so both sources merge without a second
+     * format.
+     *
+     * `maxAgeMs` bounds how long a capture stays reportable. A failure from
+     * hours ago is not what a poll is asking about, and re-reporting it reads as
+     * a fresh one; a record with no timestamp (noted but never resolved) is not
+     * a failure and never appears here anyway.
+     */
+    recentFailures({ limit: cap = 20, maxAgeMs } = {}) {
+      const cutoff = typeof maxAgeMs === "number" ? now() - maxAgeMs : undefined;
+      const out = [];
+      for (const rec of byUiId.values()) {
+        const reason = queueEventFailureReason(rec.result);
+        if (!reason) continue;
+        if (cutoff !== undefined && !(typeof rec.at === "number" && rec.at >= cutoff)) continue;
+        out.push({ ui_id: rec.ui_id, kind: rec.kind, id: rec.target, result: reason });
+      }
+      return out.slice(-cap);
+    },
+
+    /** Records held, for tests and for bounding assertions. */
+    size() {
+      return byUiId.size;
+    },
+  };
+}
+
+/**
+ * Did a history fetch POSITIVELY return a task-history document?
+ *
+ * A missing history route does not reliably THROW: ComfyUI answers an
+ * UNREGISTERED GET with its SPA index, and an empty body parses to null — the
+ * same trap looksLikeQueueStatus guards dialect detection against. Both would
+ * otherwise traverse to zero failures and be reported as "nothing failed".
+ *
+ * Accepts the `{history: …}` envelope in item, map or array form, and a bare
+ * array/map. An empty ARRAY or an empty envelope is a real answer ("no tasks");
+ * a bare `{}` is not — it says nothing about any queue.
+ */
+export function looksLikeTaskHistory(resp) {
+  if (!resp || typeof resp !== "object") return false;
+  const hasKey = !Array.isArray(resp) && "history" in resp;
+  const history = hasKey ? resp.history : resp;
+  if (!history || typeof history !== "object") return false;
+  const items = Array.isArray(history) ? history : Object.values(history);
+  if (items.length === 0) return hasKey || Array.isArray(history);
+  if (items.every((v) => !!v && typeof v === "object")) return true;
+  // The single-record (ui_id-queried) shape: the task's own fields, so its
+  // values are strings rather than records.
+  return isTaskHistoryItem(history);
+}
+
+/**
+ * Does this Manager dialect serve a PER-TASK terminal record over HTTP?
+ *
+ * Established by #364 and already relied on by the update path: released 3.x
+ * ("legacy") has no per-task history route, and the bundled 3.x server behind
+ * --enable-manager-legacy-ui ("v2-batch") serves only BATCH history keyed by
+ * `id` and rejects a ui_id query. Only the pip Manager v4 ("v2") records a
+ * task's outcome where a later read can find it.
+ *
+ * This is what `nodes_queue_status` was missing: on the other two builds it asked
+ * for a history that cannot exist, got nothing, and returned a bare status —
+ * byte-identical to a v4 that served its history and had nothing to report.
+ */
+export function dialectServesTaskHistory(dialect) {
+  return dialect === "v2";
+}
+
+/**
+ * What to tell a queue poll that could not read per-task outcomes over HTTP.
+ *
+ * Says only what is known, and does NOT claim anything failed — the point is
+ * that on this build silence is not evidence either way. The live capture is
+ * named because it is the one thing that CAN answer here, and its limit stated:
+ * it only sees tasks that finished while this browser tab was open.
+ *
+ * THREE causes, not two. An UNKNOWN dialect (detection failed) must not borrow
+ * 3.x's explanation: "this build keeps no history" is a claim about a build we
+ * did not identify, and asserting the mechanism we happen to have written about
+ * is how a plausible sentence becomes a false one. It gets its own arm.
+ */
+export function taskHistoryBlindNote(dialect) {
+  const cause =
+    dialect === undefined || dialect === null || dialect === ""
+      ? "this panel could not determine which ComfyUI-Manager generation is running, so it " +
+        "cannot say whether a per-task record even exists here"
+      : dialectServesTaskHistory(dialect)
+        ? "this Manager's per-task history could not be read just now (a transient error, or a " +
+          "response this panel did not recognise)"
+        : "this ComfyUI-Manager build keeps NO readable per-task history (released 3.x deletes " +
+          "each task's result the moment the queue drains)";
+  return (
+    `NOTE — A FAILED TASK MAY NOT BE VISIBLE HERE: ${cause}. Any failure listed above was ` +
+    `captured live from the Manager's completion broadcast, which this panel only hears for ` +
+    `tasks that finish while this browser tab is open — so an EMPTY list is not proof that ` +
+    `nothing failed. A drained/idle queue is not proof either: the Manager counts a task it ` +
+    `aborted as "done" exactly like one it completed. VERIFY the pack with panel_list_nodes ` +
+    `before restarting or reporting success; if it is absent, the reason is in the ComfyUI ` +
+    `server log (security_level gating is a common cause).`
+  );
+}
+
 /**
  * Decide the TRUE outcome of an UPDATE after it was queued+started (#364). Pure,
  * unit-testable. Precedence guarantees neither a false success nor a false

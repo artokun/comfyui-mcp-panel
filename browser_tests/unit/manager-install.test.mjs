@@ -860,6 +860,10 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
     "MANAGER_FETCH_TIMEOUT_MS",
     "NODES_INSTALL_COMMAND_BUDGET_MS",
     "AbortSignal",
+    // comfyui-mcp#1606 — the handler correlates its ui_id with the pack, so the
+    // Manager's completion broadcast can name what failed. A real log, not a
+    // stub: an injected no-op would let the correlation regress unnoticed here.
+    "managerTaskResults",
     `${stallMatch[0]}\nconst handler = { ${body} };\nreturn handler.nodes_install;`,
   );
   return factory(
@@ -878,6 +882,7 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
     15000,
     budgetMs,
     AbortSignal,
+    ManagerInstall.createManagerTaskResultLog(),
   );
 }
 
