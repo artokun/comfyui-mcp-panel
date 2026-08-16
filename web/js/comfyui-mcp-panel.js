@@ -290,6 +290,12 @@ import {
   unresolvedNodeTypes,
 } from "./lib/missing-node-preflight.js";
 import {
+  danglingInputLinks,
+  disconnectedBoundaryInputs,
+  brokenConversionRefusal,
+  brokenConversionWarning,
+} from "./lib/subgraph-conversion-integrity.js";
+import {
   classifyWorkflowRefresh,
   knownSelectorSample,
   openWorkflowNotFoundMessage,
@@ -8368,6 +8374,54 @@ function assertSubgraphNodeLanded(res, graph, what) {
   return node;
 }
 
+/** Confirm the subgraph `convertToSubgraph` produced can actually be SERIALIZED.
+ *
+ *  #1571 — the sibling above answers "did a node land?". A conversion can answer yes to
+ *  that and still leave the new subgraph holding an input that references a link id the
+ *  subgraph does not contain, which is the one condition ComfyUI's own
+ *  `ExecutableNodeDTO.resolveInput` throws `InvalidLinkError` on. The tool reported
+ *  success; the workflow could not be run afterwards, and the run's error named a
+ *  flattened id (`[302:192]`) with no visible connection to this call.
+ *
+ *  It REFUSES only where the break is provable with no modelling at all — a dangling
+ *  input on a node the serializer does not skip, whose every input it therefore resolves
+ *  unconditionally. Corruption on a muted, bypassed or virtual node is reached only
+ *  through a consumer chain that ComfyUI's resolver alone can walk (three review rounds
+ *  killed three attempts to walk it from here), so that tier is reported as a WARNING on
+ *  the success payload instead of refusing a workflow that may run perfectly well.
+ *
+ *  Returns the advisory findings so the caller can report them on a conversion that is
+ *  not refused. See lib/subgraph-conversion-integrity.js for the whole argument. */
+function assertSubgraphConversionSerializable(res, node, what) {
+  const dangling = danglingInputLinks(res?.subgraph);
+  const certain = dangling.filter((entry) => entry.certainly_reached);
+  const unproven = dangling.filter((entry) => !entry.certainly_reached);
+  const disconnected = disconnectedBoundaryInputs(node);
+  if (certain.length) {
+    throw new Error(
+      brokenConversionRefusal({ what, subgraphNodeId: node?.id, dangling: certain, disconnected }),
+    );
+  }
+  const warning = unproven.length
+    ? brokenConversionWarning({ what, subgraphNodeId: node?.id, dangling: unproven, disconnected })
+    : null;
+  return { disconnected, dangling: unproven, warning };
+}
+
+/** The advisory keys a conversion reports, omitted entirely when empty — an
+ *  `unfed_boundary_inputs: []` on every healthy conversion reads as a finding.
+ *
+ *  `warning` carries the same findings as PROSE. A caller that reads only the message
+ *  and a caller that reads only the structured list must both learn about the
+ *  corruption; shipping it in one form alone is how a finding goes unnoticed. */
+function subgraphConversionAdvisories({ disconnected, dangling, warning }) {
+  return {
+    ...(disconnected.length ? { unfed_boundary_inputs: disconnected } : {}),
+    ...(dangling.length ? { dangling_inputs: dangling } : {}),
+    ...(warning ? { warning } : {}),
+  };
+}
+
 function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
   try {
     for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links)) {
@@ -15427,11 +15481,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // `node_id: null` inside a `subgraph:` payload reads as a success with a missing
     // field, not as a failure. Refuse instead — see assertSubgraphNodeLanded.
     const created = assertSubgraphNodeLanded(res, graph, "panel_create_subgraph");
+    // #1571: a node that LANDED can still be unserializable. Refuse rather than report a
+    // success the next run will contradict — see assertSubgraphConversionSerializable.
+    const advisories = assertSubgraphConversionSerializable(res, created, "panel_create_subgraph");
     return {
       subgraph: {
         node_id: created.id,
         name: res?.subgraph?.name ?? null,
         from_nodes: ns.map((n) => n.id),
+        ...subgraphConversionAdvisories(advisories),
       },
     };
   },
@@ -15472,12 +15530,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // Same guard as panel_create_subgraph: a conversion that produced no node must
     // not report a subgraph with a null id.
     const grouped = assertSubgraphNodeLanded(res, graph, "panel_subgraph_group");
+    // #1571 was reported through THIS path: the group held a bypassed node whose input
+    // link did not survive the conversion, and the tool said "subgraph created".
+    const advisories = assertSubgraphConversionSerializable(res, grouped, "panel_subgraph_group");
     return {
       subgraph: {
         node_id: grouped.id,
         name: res?.subgraph?.name ?? null,
         from_group: g.title ?? null,
         from_nodes: ns.map((n) => n.id),
+        ...subgraphConversionAdvisories(advisories),
       },
     };
   },

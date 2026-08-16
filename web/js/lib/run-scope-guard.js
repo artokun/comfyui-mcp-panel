@@ -848,13 +848,54 @@ export function scopeDroppedError({ toNodeId, verdict }) {
  * (graphToPrompt failed before dispatch). Without a signature our dispatch
  * can't be told apart from a stranger's, so a scoped run must NOT dispatch at
  * all — fail closed, nothing queued.
+ *
+ * #1571 — `cause` is the error `graphToPrompt` actually threw, and dropping it was
+ * expensive. The reporter's graph had been left unserializable by a subgraph
+ * conversion; ComfyUI threw `InvalidLinkError: No link found in parent graph for id
+ * [302:192] slot [0] conditioning`, which names the offending node outright. This
+ * refusal caught it, discarded it, and said only "graphToPrompt failed" — so the
+ * reporter concluded that run-to-node "cannot fingerprint NESTED output targets".
+ * Nesting had nothing to do with it. The panel knew the real reason and did not say it.
+ *
+ * The cause is quoted, never interpreted: this path cannot tell a corrupt graph from a
+ * missing pack from an extension throwing inside its own serializer, and guessing
+ * between them is how a reporter gets sent to fix the wrong thing. `cause` is optional
+ * because the refusal also fires with nothing thrown at all — a frontend with no
+ * `graphToPrompt`, or a prompt that canonicalizes to nothing — and inventing a cause
+ * for those would be the same defect pointed the other way.
  */
-export function scopeUnattributableError({ toNodeId }) {
+export function scopeUnattributableError({ toNodeId, cause } = {}) {
+  const reason = describeFingerprintFailure(cause);
   return (
     `run-to-node scope for node ${toNodeId} cannot be dispatched safely: the ` +
     `prompt could not be fingerprinted (graphToPrompt failed), so the panel ` +
     `cannot distinguish its own dispatch from unrelated queue traffic. ` +
+    `${reason}` +
     `Nothing was queued rather than risk a full-graph execution (#556).`
+  );
+}
+
+/** How many characters of a thrown serializer error are worth quoting verbatim. */
+const FINGERPRINT_CAUSE_CAP = 400;
+
+/**
+ * The `cause` clause for {@link scopeUnattributableError}: the serializer's own words,
+ * bounded, or nothing at all when there were none.
+ *
+ * Deliberately says WHERE the text came from. An unattributed sentence in the middle of
+ * a panel refusal reads as the panel's own diagnosis, and this one is a third party's —
+ * ComfyUI's serializer, or whatever extension is patched into it.
+ */
+export function describeFingerprintFailure(cause) {
+  const raw = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  const text = raw.trim().replace(/\s+/g, " ");
+  if (!text) return "";
+  const quoted = text.length > FINGERPRINT_CAUSE_CAP ? `${text.slice(0, FINGERPRINT_CAUSE_CAP)}…` : text;
+  return (
+    `ComfyUI's serializer failed with: "${quoted}" — that is the frontend's own error, ` +
+    `not the panel's diagnosis of it. A graph left unserializable by an earlier edit ` +
+    `(comfyui-mcp#1571: a subgraph conversion that dropped a boundary link) fails here ` +
+    `whatever node you scope to, so this is not specific to run-to-node or to nesting. `
   );
 }
 
@@ -1482,6 +1523,10 @@ export async function dispatchScopedRun({
   let contentHash = null;
   let contentCanon = null;
   let volatileInputs = null;
+  // #1571 — KEEP what was thrown. The refusal below is the only thing the caller sees,
+  // and without this the serializer's own message (which names the offending node) was
+  // discarded at exactly the moment it was needed.
+  let fingerprintCause = null;
   try {
     if (typeof app.graphToPrompt === "function") {
       // This panel's live root is app.graph (r8) — app.rootGraph only as a
@@ -1490,12 +1535,17 @@ export async function dispatchScopedRun({
       contentCanon = canonicalizePrompt((await app.graphToPrompt())?.output, volatileInputs);
       contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
     }
-  } catch {
+  } catch (err) {
     contentHash = null;
     contentCanon = null;
+    fingerprintCause = err;
   }
   if (!contentHash) {
-    return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
+    return {
+      outcome: "unverifiable",
+      queueMark: mark,
+      error: scopeUnattributableError({ toNodeId, cause: fingerprintCause }),
+    };
   }
   // #572/#1124 — the inputs this run does NOT drift-cover (queue-time hook
   // carriers plus their linked, serialized targets; and an armed rgthree Seed
