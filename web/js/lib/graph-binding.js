@@ -1850,9 +1850,18 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // strict proof saw something else — a second serialization of a live canvas can
     // move between the verdict and this message. The sentence stays for that, and it
     // stays TRUE of what it is describing, because it asks the same question.
+    //
+    // #1588 — fed the UNEXPLAINED surfaces, not the raw list, for the same reason
+    // `nodesOnly` above is: an accounted `definitions` difference (pure link
+    // renumbering, verified by the fail-closed predicate that produced
+    // `contentAccountedSurfaces`) is not a second surface anyone should weigh, and
+    // the predicate refuses on ANY second surface. Passing the raw list re-blocked
+    // the reassurance one level below the gate the accounted list was added to fix.
+    // Anything NOT accounted for still arrives here and still refuses — `unexplained`
+    // only ever drops a surface the panel has already fully characterised.
     const valuesMatched = openContentDifferenceIsPresentationOnly({
       comparable: compared,
-      surfaces: observed.contentSurfaces,
+      surfaces: unexplained,
       nodeDifference: observed.contentNodeDifference,
     });
     if (compared && nodesOnly && nodeSetIntact) {
