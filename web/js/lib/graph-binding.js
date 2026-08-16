@@ -728,7 +728,7 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
  * happened — it is never evidence of a mismatch.
  */
 export function describeGraphStateDifference({ rootGraph, state } = {}) {
-  const NOT_COMPARABLE = { comparable: false, surfaces: [], nodeDifference: null };
+  const NOT_COMPARABLE = { comparable: false, surfaces: [], accountedSurfaces: [], nodeDifference: null };
   try {
     const expectedShape = buildGraphShape(state);
     let actualShape = null;
@@ -748,9 +748,32 @@ export function describeGraphStateDifference({ rootGraph, state } = {}) {
     const expected = canon(expectedShape);
     const actual = canon(actualShape);
     const surfaces = Object.keys(expected).filter((key) => expected[key] !== actual[key]);
+    // #1588 — WHICH OF THOSE SURFACES IS ALREADY EXPLAINED.
+    //
+    // `surfaces` answers "what disagreed". It cannot answer "and is that a difference
+    // anyone should act on", and treating the two as the same sentence is what made a
+    // faithful open of any workflow containing SUBGRAPHS read as possible data loss:
+    // the reporter's message named `nodes, definitions`, and the mere presence of a
+    // second surface sent it down the maximal-alarm path.
+    //
+    // `definitions` is the one surface with a hardened account of WHY it differs.
+    // #886 measured it on the rig: loading a persisted workflow regenerates link
+    // identity inside `definitions.subgraphs` (`state.lastLinkId` 2092 -> 2106) while
+    // node ids, types and topology stay identical. `definitionsDifferOnlyByLinkRenumber`
+    // is the predicate `graphRootReproducesStateContent` — the VERDICT — already trusts
+    // for exactly this, and it fails CLOSED: anything it cannot fully account for
+    // returns false, which is read as "not accounted for", never as "changed".
+    //
+    // So this reports the SAME judgement the verdict makes, to the sentence that had no
+    // access to it. It decides nothing new; it stops the disclosure from being blind to
+    // a difference the verdict has already characterised.
+    const accountedSurfaces = surfaces.filter(
+      (key) => key === "definitions" && definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions),
+    );
     return {
       comparable: true,
       surfaces,
+      accountedSurfaces,
       // Only when `nodes` is one of the disagreeing surfaces: otherwise there is
       // nothing about the nodes to explain, and an all-clear here would read as
       // one about the difference that actually fired.
@@ -1643,6 +1666,45 @@ function nodeSurfaceClause(observed = {}) {
   );
 }
 
+/** The only surfaces this file has a written account of. `definitions` differs on a
+ *  faithful open because loading a saved workflow regenerates link ids inside subgraph
+ *  definitions (#886, measured: state.lastLinkId 2092 -> 2106), and
+ *  `definitionsDifferOnlyByLinkRenumber` decides per-case whether THIS difference is
+ *  only that. Nothing else has such an account, so nothing else may be waved through. */
+const ACCOUNTABLE_CONTENT_SURFACES = new Set(["definitions"]);
+
+/**
+ * #1588 — the differing surfaces, split by whether anything ACCOUNTS for them.
+ *
+ * `contentAccountedSurfaces` is produced by `describeGraphStateDifference` from the
+ * same predicate the content VERDICT uses, so the disclosure and the verdict cannot
+ * disagree about what a `definitions` difference means. Absent (an older caller, or a
+ * comparison that never happened) it is an empty list, which reproduces the previous
+ * behaviour exactly — an unknown account is not an account.
+ */
+function accountedContentSurfaces(observed = {}) {
+  const accounted = observed.contentAccountedSurfaces;
+  if (!Array.isArray(accounted)) return [];
+  const surfaces = observed.contentSurfaces ?? [];
+  // TWO gates, and both are about the direction that costs something. This list
+  // SHRINKS the set of differences a reader is asked to worry about, so a wrong entry
+  // here waves away a real one.
+  //  • `ACCOUNTABLE_CONTENT_SURFACES` — only a surface with a written, hardened account
+  //    of WHY it differs may appear. Today that is `definitions` and nothing else; a
+  //    caller cannot use this channel to excuse `groups` or `links`, whose differences
+  //    nothing has characterised. Widening it means writing the account first.
+  //  • membership in `contentSurfaces` — a name that did not actually differ is not an
+  //    account of anything, and must not be able to shorten the unexplained list.
+  return accounted.filter(
+    (s) => typeof s === "string" && ACCOUNTABLE_CONTENT_SURFACES.has(s) && surfaces.includes(s),
+  );
+}
+
+function unexplainedContentSurfaces(observed = {}) {
+  const accounted = accountedContentSurfaces(observed);
+  return (observed.contentSurfaces ?? []).filter((s) => !accounted.includes(s));
+}
+
 /** One clause per failed part, naming the TWO VALUES that disagreed. A refusal
  *  that says only "the fence rejected" is not actionable; one that says which
  *  observation failed and what was seen instead is. */
@@ -1676,12 +1738,29 @@ function openRebindPartClause(part, observed = {}) {
       // (which tests `=== true`) correctly said the panel could not read the graph,
       // and one disclosure contradicted itself. Both now ask the same question, and
       // the burden sits on the CLAIM: only a positive "yes, compared" licenses it.
-      return contentWasCompared(observed)
-        ? `the graph on the canvas differs from what was loaded on: ` +
-            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}` +
-            nodeSurfaceClause(observed)
-        : `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
-            `not established — whether the whole graph landed`;
+      if (!contentWasCompared(observed)) {
+        return (
+          `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
+          `not established — whether the whole graph landed`
+        );
+      }
+      // #1588 — name the surfaces that are still UNEXPLAINED, and account for the rest
+      // separately. Listing an accounted-for `definitions` alongside a genuinely
+      // unexplained `nodes` invites the reader to weigh two differences when only one
+      // of them is a question.
+      const unexplained = unexplainedContentSurfaces(observed);
+      const accounted = accountedContentSurfaces(observed);
+      const named = unexplained.join(", ") || "an unnamed surface";
+      return (
+        `the graph on the canvas differs from what was loaded on: ${named}` +
+        nodeSurfaceClause(observed) +
+        (accounted.length
+          ? `. Its \`${accounted.join("`, `")}\` also differ, and that one IS accounted for: the ` +
+            `whole difference is link RENUMBERING — loading a saved workflow regenerates link ids ` +
+            `inside subgraph definitions while the wiring stays identical — so it is not a content ` +
+            `change and is not part of what is unconfirmed here`
+          : "")
+      );
     default:
       return `an unrecognized check (${part}) did not pass`;
   }
@@ -1731,8 +1810,22 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // reporter looking for work to redo that was never gone. Narrow on purpose —
     // any second differing surface is unexplained by a node-set observation, so
     // it falls back to the honest "cannot tell".
-    const nodesOnly =
-      (observed.contentSurfaces ?? []).length === 1 && (observed.contentSurfaces ?? [])[0] === "nodes";
+    //
+    // #1588 — UNEXPLAINED, not merely PRESENT, and the distinction is the whole bug.
+    // The gate above tested the raw surface list, so ANY workflow containing subgraphs
+    // failed it: #886 measured that loading one regenerates link ids inside
+    // `definitions.subgraphs`, which puts `definitions` in that list on every faithful
+    // open. The reporter's message named `nodes, definitions` and fell to the maximal-
+    // alarm paragraph — while the clause below it said every node had come through with
+    // the same id and type.
+    //
+    // The narrowness was right and is kept: what may not gate this is a surface the
+    // panel has already fully characterised with the same predicate the content VERDICT
+    // trusts. `definitionsDifferOnlyByLinkRenumber` fails closed, so a `definitions`
+    // difference that is anything more than renumbering is NOT accounted for and still
+    // sends this to the honest "cannot tell" — as does any other second surface.
+    const unexplained = unexplainedContentSurfaces(observed);
+    const nodesOnly = unexplained.length === 1 && unexplained[0] === "nodes";
     // #696 — this used to also require `cosmeticOnly`, i.e. that every differing
     // field be on an allowlist of names. That made the reassurance hostage to
     // guessing what a field MEANS: one unrecognised display flag from any node pack
