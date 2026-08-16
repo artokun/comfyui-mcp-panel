@@ -254,6 +254,9 @@ import {
   compactClipNote,
   LIMIT_CEILING,
   MAX_CHARS_CEILING,
+  // #1634: the pinpoint per-value cap for an explicit-`ids` read is derived from these.
+  WIDGET_VALUE_CAP,
+  COMPACT_VALUE_CLIP,
   OUTLINE_DETAIL_LEVELS,
   clampOutlineMaxChars,
   outlineDegradeBanner,
@@ -10284,6 +10287,24 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // 4) Projection, char-bounded.
     const proj = fields === "ids" || fields === "detail" ? fields : "compact";
+    // #1634: a compact row's 60-char value clip is a SURVEY cap — it keeps a 200-node
+    // listing of nodes you have not identified yet small. When the caller passed explicit
+    // `ids` they have ALREADY identified the nodes, so the read is a PINPOINT one and the
+    // survey cap is starving the value they asked for. A Discord reporter kept getting a
+    // cut-off positive prompt quoted back as the node's content; measured on a FOUR-node
+    // graph, {ids:["2"]} returned the prompt cut at 60 chars in a 301-char reply against a
+    // 12000-char budget — so this is not the outline ladder degrading on a big graph.
+    //
+    // Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts. The cap is
+    // tightened to `max_chars` (as capSummaryWidgets does for `detail`) and floored at the
+    // survey clip: without that reserve the FIRST row — which #609 protects from the budget
+    // and never drops — breaches the bound outright on a small `max_chars`.
+    //
+    // Deliberately unchanged: the compact SHAPE, the survey path, and `max_chars`.
+    const pinpoint = !!wantIds?.length;
+    const compactValueCap = pinpoint
+      ? Math.min(WIDGET_VALUE_CAP, Math.max(COMPACT_VALUE_CLIP, maxChars - 1024))
+      : COMPACT_VALUE_CLIP;
     const clip = (v, n = 60) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
       return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -10332,7 +10353,7 @@ const GRAPH_TOOL_EXECUTORS = {
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
         const w = Object.entries(widgetsOf(n))
           .map(([k, v]) => {
-            const c = clipCompactValue(v);
+            const c = clipCompactValue(v, compactValueCap);
             if (c.clipped) rowClips++;
             return `${k}=${c.text}${driven[k] ? drivenTag(driven[k]) : ""}`;
           })
@@ -10371,7 +10392,7 @@ const GRAPH_TOOL_EXECUTORS = {
           })
         : "";
       const body = proj === "ids" ? lines.join(",") : lines.join("\n");
-      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0))}`;
+      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0), compactValueCap, maxChars)}`;
     };
     let text = assemble();
     while (text.length > maxChars && lines.length > 1) {

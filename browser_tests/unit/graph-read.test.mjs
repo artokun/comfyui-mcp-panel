@@ -499,3 +499,45 @@ test("budget loop stays bounded for a large ids list — only the first overflow
   assert.ok(shown >= 1 && shown < 10, `bounded: rendered ${shown} of 10, not all`);
   assert.equal(truncated, true, "the rest are honestly marked truncated");
 });
+
+// #1634 — a compact row's 60-char clip is a SURVEY cap. On a PINPOINT read (explicit
+// `ids`) it starved the very value the caller asked for: measured on a FOUR-node graph,
+// {ids:["2"]} returned a 300-char prompt cut at 60 in a 301-char reply against a
+// 12000-char budget. These pin the note's half of that fix — it must name the cap that
+// ACTUALLY fired, because at the fixed cap "use fields:detail" is a dead retry.
+test("#1634 the clip note names the cap actually in force", () => {
+  // Survey read: unchanged — 60 chars, and `fields`:"detail" is a live remedy.
+  const survey = compactClipNote(3);
+  assert.match(survey, /clipped to 60 chars by `fields`:"compact"/);
+  assert.match(survey, /read fuller values with `fields`:"detail"/);
+  assert.equal(compactClipNote(3), compactClipNote(3, 60), "60 is the survey default");
+
+  // Pinpoint at the FIXED cap: `fields`:"detail" applies the SAME cap, so pointing
+  // there would be exactly the dead retry #809 exists to remove.
+  const atCap = compactClipNote(1, WIDGET_VALUE_CAP, 60000);
+  assert.match(atCap, new RegExp(`clipped to ${WIDGET_VALUE_CAP} chars`));
+  assert.doesNotMatch(atCap, /read fuller values with `fields`:"detail"/);
+  assert.match(atCap, /no parameter raises/);
+
+  // Pinpoint cut by max_chars instead: name max_chars, which genuinely helps.
+  const byBudget = compactClipNote(1, 976, 2000);
+  assert.match(byBudget, /clipped to 976 chars to fit `max_chars`=2000/);
+  assert.match(byBudget, /raise `max_chars`/);
+
+  // At the ceiling, "raise max_chars" would itself be dead.
+  assert.match(compactClipNote(1, 1024, 60000), /already at its ceiling of 60000/);
+
+  assert.equal(compactClipNote(0, WIDGET_VALUE_CAP, 12000), "", "still silent when nothing clipped");
+});
+
+test("#1634 clipCompactValue honours a raised cap for a pinpoint read", () => {
+  const prompt = "m".repeat(300);
+  // Survey cap starves it...
+  const survey = clipCompactValue(prompt, 60);
+  assert.equal(survey.clipped, true);
+  assert.ok(survey.text.length < 70);
+  // ...the pinpoint cap carries it whole, with no clip to report.
+  const pinpoint = clipCompactValue(prompt, WIDGET_VALUE_CAP);
+  assert.equal(pinpoint.clipped, false);
+  assert.equal(pinpoint.text, prompt);
+});
