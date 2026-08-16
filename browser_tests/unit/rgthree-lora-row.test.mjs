@@ -1293,6 +1293,8 @@ const EXECUTOR_DEPS = [
   "applyPromptRelayTimelineWrite",
   "classifyRgthreeFastGroupsWrite",
   "rgthreeFastGroupsRefusal",
+  "classifyIdeogram4PromptBuilderWrite",
+  "ideogram4PromptBuilderRefusal",
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
@@ -1432,6 +1434,10 @@ function executor(node, overrides = {}) {
     classifyLtxTimelineWrite: () => null,
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,
+    // #1569 guard, added to the extracted method after this harness was written. The rgthree
+    // stand-in is never an Ideogram4PromptBuilderKJ, so it classifies nothing — same as the
+    // other pack classifiers above.
+    classifyIdeogram4PromptBuilderWrite: () => null,
     awaitObjectInfoHistorySeed: async () => {},
     // The REAL classifier and creator: a double here would let the executor pass against a
     // route that never fires, which is precisely the defect under test.
