@@ -10295,12 +10295,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph, {ids:["2"]} returned the prompt cut at 60 chars in a 301-char reply against a
     // 12000-char budget — so this is not the outline ladder degrading on a big graph.
     //
-    // Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts. The cap is
-    // tightened to `max_chars` (as capSummaryWidgets does for `detail`) and floored at the
-    // survey clip: without that reserve the FIRST row — which #609 protects from the budget
-    // and never drops — breaches the bound outright on a small `max_chars`.
+    // Mirrors the orchestrator twin in comfyui-mcp src/services/graph-query.ts.
+    // Deliberately unchanged: the compact SHAPE, the survey path, `max_chars`, and the
+    // outline ladder.
     //
-    // Deliberately unchanged: the compact SHAPE, the survey path, and `max_chars`.
     // Only a SINGLE id is a pinpoint read. Treating any `ids` list as one cost rows the
     // caller explicitly asked for and main returned in full — 20 ordinary 600-char prompts
     // at the default budget went from 20/20 to 18/20 (gate). One id also means at most one
@@ -10310,7 +10308,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // leaking — a floor of 60 per widget still grows without bound across many widgets, so
     // a 24-widget node breached `max_chars` on default parameters while reporting
     // truncated:false (gate). A fit test cannot leak: if the generous rendering does not
-    // fit we use main's, so this is never worse than main on any shape.
+    // fit we use main's rendering instead.
+    //
+    // This does not make the `max_chars` bound softer than main's — but nor does it fix
+    // the softness that is already there: clipLine bounds the LINE, while the header and
+    // clip note ride outside it, so both main and this overshoot slightly on hostile
+    // shapes. It must not be read as claiming otherwise.
     const compactValueCap = (() => {
       if (!pinpoint) return COMPACT_VALUE_CLIP;
       const only = byId.get(wantIds[0]);
