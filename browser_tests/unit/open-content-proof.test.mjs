@@ -96,6 +96,9 @@ test("#1001 a byte-identical repaint is still reported as exact", () => {
     proven: true,
     exact: true,
     fields: [],
+    // #1623 — a graph that matched has no difference to classify, so the weaker
+    // "nothing authored was lost" ground is not what carried it.
+    presentationOnly: false,
   });
 });
 
@@ -227,6 +230,10 @@ test("#1001 an unreadable root proves nothing — absence of comparison is not e
       proven: false,
       exact: false,
       fields: [],
+      // #1623 — and it must not answer the WEAKER question either. A root nobody
+      // could read supports "nothing authored was lost" exactly as little as it
+      // supports "the content was reproduced".
+      presentationOnly: false,
     });
   }
   assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(state), state: null }).proven, false);

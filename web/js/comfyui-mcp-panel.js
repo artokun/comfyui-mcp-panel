@@ -14466,6 +14466,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // and the reply says which fields moved rather than quietly deciding it did not
     // happen: the caller is the one who knows whether stored node sizes matter to them.
     let openGeometryRewritten = null;
+    // #1623 — the per-node PRESENTATION that differs on a load where nothing authored
+    // can have been lost. Distinct from `openGeometryRewritten`, which is the STRICT
+    // proof's disclosure and whose note asserts a characterised height-only rewrite:
+    // this one carries the weaker, differently-earned claim and must not borrow that
+    // sentence.
+    let openPresentationRewritten = null;
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
@@ -14770,9 +14776,29 @@ const GRAPH_TOOL_EXECUTORS = {
               // stale and the next command was refused as an instance mismatch. The
               // rewritten geometry is DISCLOSED on the reply rather than swallowed.
               const contentProof = graphRootReproducesStateContent({ rootGraph, state: repaintState });
-              const contentMatches = contentProof.proven;
+              // #1623 — TWO grounds, and they license different sentences.
+              //
+              // `proven` is "the content was reproduced": every difference fits a
+              // rewrite this panel has measured, field by field.
+              // `presentationOnly` is the weaker "nothing AUTHORED was lost": the node
+              // set is intact, `nodes` is the only differing surface, and every field
+              // that moved is one a difference in cannot mean lost content
+              // (`COSMETIC_NODE_FIELDS`). Widget values, properties, title, flags, mode
+              // and the link-bearing slots are all outside it, so the mid-`configure()`
+              // partial load that `resolveOpenRebindVerdict` refuses to guess at cannot
+              // reach here — it drops exactly those.
+              //
+              // The open's pass/fail turns on the WEAKER question, because that is the
+              // one the caller acts on, and because the panel's own disclosure already
+              // answered it: a reporter was told "you are on the right workflow and
+              // there is no missing work to redo" by a call reported as an ERROR, twice
+              // in a row, and re-read a graph that was already correct.
+              const contentMatches = contentProof.proven || contentProof.presentationOnly;
               if (contentProof.proven && !contentProof.exact) {
                 openGeometryRewritten = contentProof.fields;
+              }
+              if (contentProof.presentationOnly) {
+                openPresentationRewritten = contentProof.fields;
               }
               const verdict = resolveOpenRebindVerdict({
                 instanceStillTarget,
@@ -15181,6 +15207,28 @@ const GRAPH_TOOL_EXECUTORS = {
               `reproduced and the workflow_uuid is published rather than refused. It is still a ` +
               `real difference from what is on disk: saving from here writes the recomputed ` +
               `value (#1001).`,
+          }
+        : {}),
+      // #1623 — present only when the open was reported applied on the PRESENTATION-only
+      // ground rather than the strict content proof. Its own key and its own note: the
+      // two claims are different sizes, and letting this case borrow
+      // `geometry_rewritten_note` would tell the caller every difference is a height
+      // with the width unchanged, which is exactly what was NOT established here.
+      ...(openPresentationRewritten?.length
+        ? {
+            presentation_rewritten: openPresentationRewritten,
+            // States what was COMPARED and stops, like its neighbour. It does NOT say
+            // the frontend recomputed these: `color`/`bgcolor` are authored by the user
+            // and nothing here observed a cause, only a difference.
+            presentation_rewritten_note:
+              `Every node in this workflow came back with the same id and type, nothing extra ` +
+              `appeared, and every serialized field that can carry authored content — widget ` +
+              `values, properties, title, flags, mode, and the input/output slots — matched what ` +
+              `was loaded. What differs is per-node presentation: ${openPresentationRewritten.join(", ")}. ` +
+              `No node and no value was lost, so the open is reported APPLIED and the workflow_uuid ` +
+              `is published rather than refused (#1623). The panel observed the difference and not ` +
+              `its cause, and it is still a real difference from what is on disk: saving from here ` +
+              `writes the live values.`,
           }
         : {}),
       modified: !!target.isModified,

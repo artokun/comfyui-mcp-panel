@@ -883,8 +883,68 @@ function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
   }
 }
 
+/**
+ * Is the whole difference confined to PRESENTATION — i.e. can nothing AUTHORED have
+ * been lost? (#1623)
+ *
+ * THE DEFECT THIS ANSWERS. `workflow_open`'s pass/fail is taken from
+ * `graphRootReproducesStateContent`, whose `RECOMPUTED_NODE_FIELDS` answers a
+ * different question — "is this difference explained by a rewrite this panel has
+ * MEASURED" — and holds only `size` (height-only) and `inputs`. The DISCLOSURE asks
+ * the question the caller acts on, `cosmeticOnly`, and on the very same observation
+ * answers "you are on the right workflow and there is no missing work to redo".
+ *
+ * A reporter got exactly that sentence with the call reported as an ERROR, on two
+ * consecutive workflow switches, and went and re-read a graph that was already
+ * correct (#1623). One reply cannot say both things. So the sentence's own predicate
+ * is promoted to a shared function, and the VERDICT is taken from it too: two lists
+ * that agreed by accident and then stopped is what produced the contradiction.
+ *
+ * WHY THIS IS SAFE, against the reason `content` blocks success at all.
+ * `resolveOpenRebindVerdict` records the mechanism: `loadGraphData` catches a
+ * `configure()` throw and returns, leaving the complete node id/type set, the links
+ * and the panel's marker over nodes that silently LOST their widget values and
+ * properties — byte-identical to "the loader normalized the values", with no
+ * discriminator to separate them. That failure cannot present HERE.
+ * `widgets_values`, `properties`, `title`, `flags`, `mode`, `inputs` and `outputs`
+ * are every one of them OUTSIDE `COSMETIC_NODE_FIELDS`, and `configure()` writes
+ * them in the same pass as the cosmetic five — so a load that died mid-configure
+ * answers false on the first node it reached. The discriminator that comment says
+ * does not exist is WHICH FIELDS DIFFER, and the panel already computes it.
+ *
+ * It is deliberately NOT a widening of `RECOMPUTED_NODE_FIELDS`. That set licenses
+ * "the content was reproduced", which is why it demands a characterised rewrite per
+ * field; this one licenses only "nothing authored was lost", which is the weaker
+ * claim the open's pass/fail actually turns on. `widgets_values` stays outside BOTH,
+ * so the guard #1111 and #1089 exist for is untouched: a widget value that differs
+ * still fails the open, however plausibly a frontend might have normalized it.
+ */
+export function openContentDifferenceIsPresentationOnly({ comparable, surfaces, nodeDifference } = {}) {
+  // Never inferred from an absent comparison — `comparable:false` means no comparison
+  // happened, which is not evidence in either direction.
+  if (comparable !== true) return false;
+  const unique = Array.isArray(surfaces) ? [...new Set(surfaces)] : [];
+  // `nodes`, and NOTHING else. A group, a link, a reroute or a definitions difference
+  // is unexplained by anything a node comparison establishes — #825's own rule, kept.
+  if (unique.length !== 1 || unique[0] !== "nodes") return false;
+  // THESE TWO OVERLAP for anything `classifyNodeDifference` produces — it computes
+  // `fields` only once the sets match, so its `cosmeticOnly:true` already implies
+  // `sameNodeSet:true`, and deleting the set check kills no test off that classifier
+  // alone (measured: the mutation survived until a test was written for it). Both are
+  // kept because they answer different questions — "is this the same graph" and "can
+  // the panel name what moved" — and this predicate is EXPORTED, so it must refuse an
+  // inconsistent shape rather than let a set difference through on a field list.
+  return (
+    nodeDifference?.comparable === true &&
+    nodeDifference.sameNodeSet === true &&
+    // `cosmeticOnly` is itself false for an EMPTY field list, so this cannot pass on a
+    // `nodes` surface nobody could name a difference in.
+    nodeDifference.cosmeticOnly === true
+  );
+}
+
 export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
-  const NOT_PROVEN = { proven: false, exact: false, fields: [] };
+  const NOT_PROVEN = { proven: false, exact: false, fields: [], presentationOnly: false };
   try {
     // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
     // per check let a synchronous serialization hook — a broken or hostile custom node —
@@ -894,11 +954,40 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     const actualState = rootGraph?.serialize?.();
     if (actualState == null) return NOT_PROVEN;
     const frozen = { serialize: () => actualState };
-    if (graphRootMatchesState({ rootGraph: frozen, state })) return { proven: true, exact: true, fields: [] };
+    if (graphRootMatchesState({ rootGraph: frozen, state })) {
+      return { proven: true, exact: true, fields: [], presentationOnly: false };
+    }
     const diff = describeGraphStateDifference({ rootGraph: frozen, state });
     // Never inferred from an absent comparison: `comparable:false` means no
     // comparison happened, which is not evidence either way.
     if (diff?.comparable !== true) return NOT_PROVEN;
+    // #1623 — the WEAKER question ("could anything authored have been lost"), asked
+    // off THE SAME SNAPSHOT the strict proof below reads. Answering it from a second
+    // serialization would reopen exactly the hole the frozen snapshot closes: a
+    // synchronous serialization hook could show a cosmetic-only difference here and a
+    // changed widget to the proof, and the open would be reported applied on content
+    // no single comparison ever saw.
+    //
+    // Every refusal BELOW this line is a refusal of the strict proof only, so each one
+    // carries this answer out rather than discarding it — the reporter's own case
+    // (`pos`/`order`, and a `size` whose WIDTH moved) is refused by the strict proof
+    // and is presentation-only, and returning the shared `NOT_PROVEN` there is what
+    // would have left the fix wired into a branch its own bug report cannot reach.
+    const presentationOnly = openContentDifferenceIsPresentationOnly({
+      comparable: true,
+      surfaces: diff.surfaces,
+      nodeDifference: diff.nodeDifference,
+    });
+    const notProven = {
+      proven: false,
+      exact: false,
+      // NAMED, so the reply can tell the caller which fields moved instead of asking
+      // them to guess — the same contract `geometry_rewritten` already has. Empty
+      // unless presentation-only, because on any other refusal these fields describe a
+      // difference nobody has accounted for.
+      fields: presentationOnly && Array.isArray(diff.nodeDifference?.fields) ? diff.nodeDifference.fields : [],
+      presentationOnly,
+    };
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
     // unexplained by anything the node comparison establishes.
@@ -925,17 +1014,17 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // differing surface, so requiring `nodes` refused exactly the case this exists to
     // prove — a fix wired into a branch its own bug report cannot reach.
     const unique = [...new Set(surfaces)];
-    if (!unique.length) return NOT_PROVEN;
-    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return NOT_PROVEN;
+    if (!unique.length) return notProven;
+    if (unique.some((s) => s !== "nodes" && s !== "definitions")) return notProven;
     if (unique.includes("definitions")) {
       if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
-        return NOT_PROVEN;
+        return notProven;
       }
     }
     // A definitions-only difference is fully accounted for once the renumber check
     // passes: there is no node difference to classify.
     if (!unique.includes("nodes")) {
-      return { proven: true, exact: false, fields: [] };
+      return { proven: true, exact: false, fields: [], presentationOnly: false };
     }
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
@@ -945,14 +1034,14 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // because they answer different questions — "is this the same graph" and "can the
     // panel name what moved" — and a later change to one classifier must not silently
     // remove the other's guarantee.
-    if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return NOT_PROVEN;
+    if (nodes?.comparable !== true || nodes.sameNodeSet !== true) return notProven;
     const fields = Array.isArray(nodes.fields) ? nodes.fields : [];
     // WIDTH IS NOT MEASURED (codex r2). The evidence is a recomputed HEIGHT, and a
     // field-name allowlist admits any rewrite of the whole `[w, h]` pair — so a changed
     // width, or an arbitrary replacement, would have been PROVEN on the strength of a
     // measurement about something else. Every differing size must be height-only.
     if (fields.includes("size") && !sizeDifferenceIsHeightOnly(state?.nodes, actualState?.nodes)) {
-      return NOT_PROVEN;
+      return notProven;
     }
     // #1467 — `inputs` is REBUILT by the frontend, not restored, and admitting it
     // needs the same treatment `size` gets: characterise the rewrite and require
@@ -974,14 +1063,14 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
       fields.includes("inputs") &&
       !nodeInputsDifferOnlyByDefinitionRebuild(state?.nodes, actualState?.nodes)
     ) {
-      return NOT_PROVEN;
+      return notProven;
     }
     // An empty field list with a differing `nodes` surface means the two disagreed
     // somewhere this classifier could not name — proving content off a difference
     // nobody can point at is exactly the fabricated all-clear to avoid.
-    if (!fields.length) return NOT_PROVEN;
-    if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return NOT_PROVEN;
-    return { proven: true, exact: false, fields };
+    if (!fields.length) return notProven;
+    if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return notProven;
+    return { proven: true, exact: false, fields, presentationOnly: false };
   } catch {
     return NOT_PROVEN;
   }
@@ -1659,7 +1748,20 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     const nodeSetIntact =
       observed.contentNodeDifference?.comparable === true &&
       observed.contentNodeDifference?.sameNodeSet === true;
-    const valuesMatched = observed.contentNodeDifference?.cosmeticOnly === true;
+    // #1623 — the SHARED predicate, not a fourth spelling of it. This sentence and
+    // `workflow_open`'s pass/fail must not be able to disagree about the same
+    // observation, which is the defect that was reported: the caller was told "there
+    // is no missing work to redo" on a call reported as an error.
+    //
+    // The panel now reports that case APPLIED, so reaching this branch means the
+    // strict proof saw something else — a second serialization of a live canvas can
+    // move between the verdict and this message. The sentence stays for that, and it
+    // stays TRUE of what it is describing, because it asks the same question.
+    const valuesMatched = openContentDifferenceIsPresentationOnly({
+      comparable: compared,
+      surfaces: observed.contentSurfaces,
+      nodeDifference: observed.contentNodeDifference,
+    });
     if (compared && nodesOnly && nodeSetIntact) {
       // Two claims, and only the ones the comparison supports (codex). The node set
       // is proven in both branches. `cosmeticOnly` additionally establishes that the
