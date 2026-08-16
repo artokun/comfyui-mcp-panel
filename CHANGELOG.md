@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.44] - 2026-08-16
+
+### Fixed
+- a node read by id returns its full widget value, not a survey clip (#1634)
+- a drifted graph fence is refreshed before the next call, not after it refuses (#1209)
+- the Settings path no longer leaves the saved default naming a backend it never reached (#1198)
+- a wedged orchestrator's death is recorded where the panel concludes it (#1168)
+- an open where only presentation moved is not a failure (#1623)
+- a subgraph conversion that broke the graph stops reporting success (#1571)
+- a Manager that CANNOT report a failure stops reading as one reporting none (#1606)
+- a subgraph is not a second unexplained difference, and the reassurance's own predicate reads the UNEXPLAINED surfaces too (#1588)
+- graph mutations no longer lose the tab route after creating a workflow (#1095)
+- a combo write is decided by whether the panel could READ the option list (#1126)
+- a completion recovered from history reports when it RENDERED, not when it was replayed (#1199)
+- a multi-word panel_search_nodes query finds the pack it names (#1088)
+- a Manager task that terminally errored is not a queued install (#1539)
+- a widget the node computes from its own editor is not writable (#1569)
+
+
 ## [0.14.43] - 2026-08-15
 
 ### Fixed
