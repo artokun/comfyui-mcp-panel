@@ -222,15 +222,181 @@ for (const commandUuid of [undefined, "   "]) {
 
 test("#718 wiring: graph_set_widget passes the execution-time workflow fence into runSetWidget", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  const start = src.indexOf("async graph_set_widget({ node_id, widget, value, workflow_uuid })");
+  // Located loosely, then the stamp is asserted separately below. Pinning the exact
+  // destructuring made this fail on ANY added or removed argument and report "must accept
+  // the bridge-owned stamp" about a signature that still accepts it — a locator failure
+  // dressed up as a fence failure. The stamp itself is asserted, so nothing is lost.
+  const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
   const end = src.indexOf("\n  graph_set_node_property(", start);
-  assert.notEqual(start, -1, "graph_set_widget executor must accept the bridge-owned stamp");
+  assert.notEqual(start, -1, "graph_set_widget executor must exist");
+  assert.match(
+    src.slice(start, src.indexOf(")", start)),
+    /workflow_uuid/,
+    "graph_set_widget executor must accept the bridge-owned stamp",
+  );
   assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
   const body = src.slice(start, end);
   assert.match(
     body,
     /assertTargetStillCurrent:\s*\(\)\s*=>\s*assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
     "the post-await write boundary must recheck the exact command stamp",
+  );
+});
+
+test("#1126 wiring: the activity summary DISCLOSES a write nothing validated", () => {
+  // The lib sets `option_list_unreadable` when the combo's option list could not be read
+  // and the value was taken as written. If the summary ignores it, the one line a user
+  // actually reads renders an admittedly-unchecked write as an ordinary "Set … " success
+  // — which is the same class of lie #366 and #639 each had to fix here. Asserted against
+  // the SOURCE because this is a one-expression install in the renderer: deleting it would
+  // leave every behavioural test in this repo green.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf('case "graph_set_widget": {');
+  assert.notEqual(start, -1, "the graph_set_widget summary branch must exist");
+  const end = src.indexOf('case "graph_get_subgraph":', start);
+  assert.notEqual(end, -1, "the summary branch boundary must exist");
+  const branch = src.slice(start, end);
+  // Read as DATA off the result — never pattern-matched out of the disclosure prose,
+  // which is translated and would disarm a text predicate in 11 of 12 locales.
+  assert.match(
+    branch,
+    /r\.option_list_unreadable === true/,
+    "the summary must read the lib's field, not the note's wording",
+  );
+  // …and it must actually reach the rendered text, not merely be computed.
+  assert.match(
+    branch,
+    /unvalidatedUnreadable[\s\S]*tr\(\s*"panel\.set_widget_option_list_unreadable"/,
+    "the disclosure must be appended to the summary line",
+  );
+  // The warning icon, so it does not read as a clean success at a glance.
+  assert.match(branch, /writeDisclosed \|\| unvalidatedUnreadable \? "pi-exclamation-triangle"/);
+});
+
+test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into runSetWidget", () => {
+  // The lib's blind-write fallback fails closed on any schema that is not LIVE, and
+  // node-resolve.test.mjs proves that behaviour by passing `schemaProvenance` directly.
+  // But the lib can only know the provenance if the executor hands it over: which branch
+  // of `getFreshObjectInfo` answered — and whether a reconnect landed while it was in
+  // flight — are facts ONLY the panel holds. Stub the wiring to a constant `"live"` and
+  // every behavioural test in this repo stays green while production authorizes blind
+  // writes from stale schemas again — a dead-code fix of exactly the kind this PR's own
+  // body warns about (#1223 v1, #757 v1). So it is asserted at the source, like the #718
+  // fence above.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
+  assert.notEqual(start, -1, "graph_set_widget executor must exist");
+  // Bounded at the NEXT executor, not at graph_set_node_property: graph_remove_widget sits
+  // between them and does its own /object_info read, so the wider slice made a negative
+  // assertion about this executor fail on a neighbour's code.
+  const end = src.indexOf("\n  async graph_remove_widget(", start);
+  assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
+  const body = src.slice(start, end);
+  // A FUNCTION, not a value: `getFreshObjectInfo` has not run when the options object is
+  // built, so which branch answered is only knowable afterwards — and the lib may re-ask,
+  // which changes the answer. A snapshotted value would always read as the first call's.
+  assert.match(
+    body,
+    /schemaProvenance:\s*\(\)\s*=>\s*setWidgetSchemaProvenance/,
+    "the executor must thread the schema provenance it holds, as a deferred read",
+  );
+  // THE VERDICT IS DELEGATED, not reconstructed. Four review rounds each found another way
+  // a response could fail to be live while this file's own reconstruction still said it was
+  // (served from the TTL, joined to another read, reconnected out from under, retired
+  // mid-flight by an invalidate). object-info-cache.js owns the generation counter and
+  // decides how every read is served, so it answers; the panel copies that answer through.
+  assert.match(
+    body,
+    /objectInfoCache\.readWithProvenance\(/,
+    "the executor must ask the cache for its verdict rather than infer one",
+  );
+  // …and hold the QUESTION, not the answer. A verdict is a statement about a moment, and
+  // this ladder awaits a combo refresh and an upload probe between reading the schema and
+  // deciding — so a stored string can be superseded during those awaits while still
+  // insisting the answer is live. `provenanceNow` re-answers on every call.
+  assert.match(
+    body,
+    /provenanceNow,\s*\} = await readThroughCache\(/,
+    "…and take the re-askable verdict from that call",
+  );
+  assert.match(
+    body,
+    /setWidgetSchemaProvenance = provenanceNow;/,
+    "the threaded provenance must be the cache's re-askable question, not a snapshot of it",
+  );
+  assert.match(
+    body,
+    /schemaProvenance: \(\) => setWidgetSchemaProvenance\(\)/,
+    "…and the lib must INVOKE it, so its read happens after the recovery awaits",
+  );
+  // The reconnect epoch is the one fact the cache cannot know, handed in as an opaque stamp
+  // it re-checks across the await. Drop this and a reconnect-spanning response reads as live.
+  assert.match(
+    body,
+    /\{\s*stamp:\s*\(\)\s*=>\s*backendReconnectEpoch\s*,?\s*\}/,
+    "the reconnect epoch must be handed to the cache as an issuance stamp",
+  );
+  // Nothing may reconstruct liveness alongside the delegated answer — two sources for one
+  // fact is exactly what produced four rounds of drift. Scoped to the DECLARATION of a local
+  // signal, not to the identifier: `record`'s own option is still named `observedAtEpoch`,
+  // and that is its API, not a second opinion about this response.
+  assert.doesNotMatch(
+    body,
+    /let observedAtEpoch/,
+    "the executor must not keep a second, hand-rolled liveness signal",
+  );
+  // The other two branches are the panel's own to report: the cache never sees them.
+  // Also as functions, so every branch answers the same shape of question.
+  for (const [branch, pattern] of [
+    ["snapshot", /setWidgetSchemaProvenance = \(\) => "snapshot"/],
+    ["nothing established", /setWidgetSchemaProvenance = \(\) => "none"/],
+  ]) {
+    assert.match(body, pattern, `the ${branch} branch must record its provenance`);
+  }
+  // #1223's snapshot may only retain a LIVE answer, gated on the same verdict. `record`'s own
+  // epoch test would still accept a GENERATION-RETIRED response — a refresh/install bumps the
+  // cache generation without moving the reconnect epoch — so the snapshot could otherwise
+  // retain a schema the panel itself had just superseded.
+  assert.match(
+    body,
+    /if \(readProvenance === "live"\) \{\s*objectInfoSnapshot\.record\(/,
+    "only a live answer may be filed as the last-observed schema",
+  );
+  // …and the lib must be able to force a genuinely live re-read, or a cache hit could only
+  // ever fail closed — refusing writes 2..N of an ordinary burst. Through `readFresh`, NOT a
+  // global `invalidate()`: two writes reaching this path together each invalidated, and the
+  // second retired the first's just-issued request, so one caller refused another's valid
+  // write. `readFresh` bypasses only the stored entry and coalesces concurrent rereads.
+  assert.match(
+    body,
+    /refetchObjectInfoLive:[\s\S]{0,240}objectInfoCache\.readFresh\(/,
+    "the executor must offer a coalescing, non-retiring forced reread",
+  );
+  assert.doesNotMatch(
+    body,
+    /objectInfoCache\.invalidate\(\)/,
+    "…and must NOT reach for the global invalidation on the recovery path",
+  );
+  // Both entry points must share ONE oracle body, or the snapshot fallback, the failure-route
+  // bookkeeping and the provenance handling drift between the ordinary and forced reads.
+  assert.match(
+    body,
+    /getFreshObjectInfo: async \(\) =>\s*setWidgetOpts\.readObjectInfo\(/,
+    "the ordinary read must go through the shared oracle body",
+  );
+  assert.match(
+    body,
+    /refetchObjectInfoLive: async \(\) =>\s*setWidgetOpts\.readObjectInfo\(/,
+    "and so must the forced one",
+  );
+  // The snapshot disclosure keeps its own STICKY variable: a write that consulted the
+  // snapshot at any point must keep reporting `schema_source`, even if a later re-ask came
+  // back live. Provenance answers "may this authorize?"; the note answers "what did this
+  // call touch?" — they are different questions and must not be collapsed.
+  assert.match(
+    body,
+    /if \(setWidgetSchemaFromSnapshot !== null[\s\S]*schema_source: "last-observed"/,
+    "the reply's snapshot disclosure must stay driven by its own sticky variable",
   );
 });
 

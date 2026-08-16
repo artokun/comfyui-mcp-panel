@@ -70,9 +70,23 @@ function describeThrown(err) {
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message, { combo = false, emptyOptions = false } = {}) {
+  constructor(message, { combo = false, emptyOptions = false, unreadableOptions = false, partialWrite = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // #1126 — the graph WAS MUTATED and the rollback did not fully take. Every other
+    // WidgetWriteError is a pre-mutation refusal: nothing was applied, and a caller may
+    // safely reword it as "refused". This one must never be reworded that way, because
+    // telling a caller "nothing was applied" when something was is precisely the class of
+    // false report this change exists to eliminate. Callers that frame refusals check it.
+    this.partialWrite = partialWrite;
+    // #1126 — `unreadableOptions` narrows `combo` to the OTHER unknowable case: the
+    // option list could not be READ AT ALL, because `options.values` is a callback that
+    // threw, returned a non-list, or is absent. That is an OBSERVATION about the LIST,
+    // not a verdict about the VALUE — nothing was ever compared — so runSetWidget's
+    // #1126 last-resort may act on it, and never on a "not a valid option" miss against
+    // a list it read successfully. Destructured explicitly: this constructor drops meta
+    // it does not name, so a flag that is not added here is silently lost.
+    this.unreadableOptions = unreadableOptions;
     // `emptyOptions` narrows `combo` to the ONE case runSetWidget's #507 last-resort
     // path may act on: the option list was READ successfully and is EMPTY. It is set
     // ONLY by that branch, so the caller never has to pattern-match a message, and a
@@ -88,21 +102,77 @@ export class WidgetWriteError extends Error {
 }
 
 /**
- * The current option list for a combo widget, or null if it cannot be read.
- * `options.values` may be an array or a function `(widget) => string[]`
- * (litegraph dynamic combos). A function that throws yields null (unreadable).
+ * #1126 — READ a combo's current option list ONCE and report WHAT WAS OBSERVED.
+ *
+ * `options.values` may be an array or a function `(widget) => string[]` (litegraph
+ * dynamic combos). That function is the node's own code: it can mutate the widget and
+ * it can fail. So there are two materially different outcomes, and collapsing them into
+ * a bare `null` is what made the panel answer "not a valid option" for a list it had
+ * never actually read:
+ *
+ *   * READ  — `{ options: [...] }`. Membership is decidable. An off-list value is a
+ *             genuine rejection (a typo, a model that is not installed).
+ *   * UNREADABLE — `{ options: null, unreadable: true, reason }`. Nothing was compared
+ *             against anything. The valid set is not knowable from here, so a refusal
+ *             phrased as a verdict on the VALUE is a false statement about the write.
+ *
+ * `reason` records WHICH observation, so callers can say it rather than guess it.
+ *
+ * INVOKED EXACTLY ONCE per call, by design: the callback has side effects (it commonly
+ * repopulates the widget), and a second read of a stateful source can disagree with the
+ * first — which would turn any decision keyed on it into an escape hatch. Callers keep
+ * the returned snapshot; they never re-read to re-derive a verdict.
  */
-export function comboOptions(widget) {
+export function readComboOptions(widget) {
   const raw = widget?.options?.values;
-  let vals = raw;
   if (typeof raw === "function") {
+    let vals;
     try {
       vals = raw(widget);
-    } catch {
-      return null;
+    } catch (err) {
+      return { options: null, unreadable: true, reason: "threw", detail: describeThrown(err) };
     }
+    return Array.isArray(vals)
+      ? { options: vals, unreadable: false, reason: null }
+      : {
+          options: null,
+          unreadable: true,
+          reason: "not_a_list",
+          detail: `the callback returned ${vals === null ? "null" : typeof vals}, not an array`,
+        };
   }
-  return Array.isArray(vals) ? vals : null;
+  if (Array.isArray(raw)) return { options: raw, unreadable: false, reason: null };
+  return {
+    options: null,
+    unreadable: true,
+    reason: "absent",
+    detail:
+      raw === undefined
+        ? "the widget declares no options.values"
+        : `options.values is a ${typeof raw}, neither an array nor a callback`,
+  };
+}
+
+/**
+ * The current option list for a combo widget, or null if it cannot be read.
+ * Thin wrapper over `readComboOptions` — one invocation of the callback, same
+ * null-means-unreadable contract every existing caller was written against.
+ */
+export function comboOptions(widget) {
+  return readComboOptions(widget).options;
+}
+
+/** #1126 — the human-readable half of a `readComboOptions` UNREADABLE outcome. */
+function describeUnreadable(read) {
+  const why = read?.detail ? ` (${read.detail})` : "";
+  switch (read?.reason) {
+    case "threw":
+      return `its option list could not be READ: the widget's own options.values callback threw${why}`;
+    case "not_a_list":
+      return `its option list could not be READ: the widget's own options.values callback did not return a list${why}`;
+    default:
+      return `its option list could not be READ${why}`;
+  }
 }
 
 export function isComboWidget(widget) {
@@ -306,7 +376,7 @@ export function coerceWidgetValue(
   value,
   mergeBaseWidget = widget,
   subFieldPath = null,
-  { acceptEmptyComboOptions = false, out } = {},
+  { acceptEmptyComboOptions = false, acceptUnreadableComboOptions = false, out } = {},
 ) {
   const name = widget?.name ?? "(widget)";
 
@@ -376,15 +446,68 @@ export function coerceWidgetValue(
   }
 
   if (isComboWidget(widget)) {
-    const options = comboOptions(widget);
-    // A declared combo whose option list we cannot read cannot be validated —
-    // refuse rather than write a value that may be reinterpreted as an index
-    // (#240 fail-open). Covers missing options.values and a throwing fn.
+    // ONE read, kept as a snapshot. Never re-read to re-derive a verdict below (#1126).
+    const read = readComboOptions(widget);
+    const options = read.options;
+    // #1126 — the list COULD NOT BE READ. That is an observation about the LIST, and the
+    // panel used to answer it with a flat refusal — which, after the ladder in
+    // set-widget.js re-tried and gave up, reached the user as a message about their
+    // VALUE. It was never compared to anything: a node whose runtime handler takes an
+    // absolute path had its path refused as though the path were wrong.
+    //
+    // So the two outcomes are answered differently, and BOTH from what was observed:
+    //
+    //   * The list was read and the value is not in it  ⇒ REFUSE (below). There is a
+    //     real, closed set of choices, and an off-list value is a typo worth catching
+    //     before a run fails deep in model loading. #240/#507 unchanged.
+    //   * The list could not be read at all ⇒ the valid set is not knowable from here,
+    //     exactly like #507's empty list, and #240's reason for strict membership (a
+    //     number silently reinterpreted as an INDEX into a real list) has no list to
+    //     index into. Accept — but only under `acceptUnreadableComboOptions`, which
+    //     runSetWidget sets LAST, after every authoritative recovery has been tried and
+    //     the server has confirmed it publishes no list for this input either.
+    //
+    // Default is unchanged: a retryable combo refusal, so a merely-transient callback
+    // failure is refreshed and re-read before anything is decided.
     if (!options) {
+      if (acceptUnreadableComboOptions) {
+        // A NON-EMPTY STRING only. Two separate rules, neither traded away:
+        //   * #347 — clearing a combo to "" is refused, and an unreadable list must not
+        //     become a new door to it.
+        //   * #240 — a real option list exists on this widget, we simply cannot read it,
+        //     so a NUMBER could still be reinterpreted as an index into it. No file path
+        //     or model name is a number, so nothing legitimate is lost by refusing one.
+        // Marked NON-retryable: no refresh can turn a number into a string.
+        if (typeof value !== "string" || value === "") {
+          throw new WidgetWriteError(
+            `Combo widget "${name}": ${describeUnreadable(read)}, so ` +
+              `${JSON.stringify(value)} cannot be validated against it. A value written to a ` +
+              `combo whose options cannot be enumerated must be a NON-EMPTY STRING — a number ` +
+              `could be reinterpreted as an index into the list that exists but cannot be read, ` +
+              `and "" clears the widget. Refusing to write.`,
+          );
+        }
+        // This path's OWN marker. It gates the promoted-write rail cross-check below and
+        // drives the reply's disclosure; it is deliberately NOT the empty-list marker,
+        // which is a different (stronger) observation and carries a label-adoption rule
+        // that must not run here.
+        //
+        // The observation travels WITH it. A success reply has no error message to carry
+        // the reason, and there are three distinct ones (the callback threw, it returned a
+        // non-list, there is no callback) — a disclosure that picks one and states it
+        // would be wrong two-thirds of the time.
+        if (out) {
+          out.unreadableAcceptanceUsed = true;
+          out.unreadableObservation = describeUnreadable(read);
+        }
+        return value;
+      }
       throw new WidgetWriteError(
-        `Combo widget "${name}" has no readable option list; cannot validate ` +
-          `value ${JSON.stringify(value)} — refusing to write.`,
-        { combo: true },
+        `Combo widget "${name}": ${describeUnreadable(read)}, so ` +
+          `${JSON.stringify(value)} could not be checked against it — this is NOT a verdict ` +
+          `that the value is wrong, nothing was compared. Refusing to write until the list ` +
+          `can be read.`,
+        { combo: true, unreadableOptions: true },
       );
     }
     // #507: a DYNAMIC, CLIENT-POPULATED combo declared with an EMPTY option list —
@@ -450,10 +573,18 @@ export function coerceWidgetValue(
     // (options ["alpha","beta","gamma"] with value 1 matches no label).
     const labelIdx = optionLabelIndex(options, value);
     if (labelIdx >= 0) return options[labelIdx];
+    // The other half of #1126, and the direction that must NOT move: this list WAS read,
+    // it holds real choices, and the value is not one of them. That is a verdict about
+    // the VALUE, and it is worth keeping — a typo'd sampler or a model that is not
+    // installed is caught here instead of failing 40 seconds into a run. The message says
+    // which of the two happened, so an agent can tell "your value is wrong" apart from
+    // "the panel could not look" and stop treating them as the same failure.
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
-        `"${name}". Valid options (${options.length}): ${preview}` +
+        `"${name}". Its option list WAS read successfully and holds ${options.length} ` +
+        `option${options.length === 1 ? "" : "s"}, none of them this value — so this is a ` +
+        `rejected VALUE, not an unreadable list. Valid options (${options.length}): ${preview}` +
         (options.length > 40 ? ", …" : ""),
       { combo: true },
     );
@@ -971,6 +1102,11 @@ export function applyWidgetWrite(
     // and take the value as written. Default false ⇒ the empty case is a RETRYABLE
     // combo rejection, so a merely-stale empty list is refreshed before any decision.
     acceptEmptyComboOptions = false,
+    // #1126: only the FINAL attempt may treat an UNREADABLE option list (the widget's
+    // own options.values callback threw / returned a non-list) as "not knowable" and take
+    // a non-empty string as written. Default false ⇒ the unreadable case is a RETRYABLE
+    // combo rejection, so a transient callback failure is re-read before any decision.
+    acceptUnreadableComboOptions = false,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -988,8 +1124,11 @@ export function applyWidgetWrite(
   let { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
-      // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
-      // membership) is what admitted the value. Read below — never re-derived.
+      acceptUnreadableComboOptions,
+      // Filled in by coerceWidgetValue with WHICH acceptance admitted the value — the
+      // EMPTY-LIST one (#507) or the UNREADABLE-LIST one (#1126) — rather than ordinary
+      // membership. Read below; NEVER re-derived by reading the option list again, since
+      // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
     });
 
@@ -1032,7 +1171,40 @@ export function applyWidgetWrite(
   // and never re-derived by reading the list again: a second read of a stateful dynamic
   // source can disagree with the first, which would turn the narrowing into an escape
   // hatch around this very check (codex confirmation round).
-  if (coerceOutcome.emptyAcceptanceUsed) {
+  //
+  // #1126 extends the SAME gate to the UNREADABLE-list acceptance, for the identical
+  // reason: it too writes a value the inner list did not validate, so a rail/proxy with a
+  // real closed list must still be satisfied. What it does NOT inherit is the #667
+  // label-ADOPTION below. Adoption replaces the caller's value with the rail list's own
+  // original — sound when the inner list is EMPTY (any scalar was admissible there, so the
+  // rail's own option is at least as valid), but wrong here: the inner list EXISTS and
+  // could not be read, so a rail label like the NUMBER 4444 would be written to a widget
+  // whose real, unread list may not contain it — reintroducing exactly the #240 index
+  // hazard the string-only rule above preserves. Unreadable ⇒ verify or refuse, never
+  // substitute.
+  const emptyAccepted = coerceOutcome.emptyAcceptanceUsed === true;
+  const unreadableAccepted = coerceOutcome.unreadableAcceptanceUsed === true;
+  // The inner-widget OBSERVATION, stated once and reused in every refusal below so the
+  // message can never describe the wrong one (the empty-list wording on an unreadable
+  // list said "the inner widget's option list is empty" about a list nobody had read).
+  const innerObservation = emptyAccepted
+    ? "the inner widget's option list is empty"
+    : "the inner widget's option list could not be READ";
+  // #1126 — set when the AUTHORITATIVE PARENT RAIL's readable, non-empty list contains the
+  // value. Only meaningful on the unreadable path, where it narrows an otherwise-unqualified
+  // "nothing validated this" down to the truth.
+  //
+  // Deliberately NOT "any sibling". A promotion can mutate two kinds of widget: the parent
+  // subgraph's RAIL — the one that SERIALIZES at queue time — and #477's display proxies,
+  // which are read-only mirrors the outer node shows. On a dual-projection promotion a
+  // display proxy can hold a list the rail does not, so a match there would emit
+  // `promoted_rail_validated` and make the reply and the activity summary both claim the
+  // serializing rail vouched for a value it never listed. On a change whose whole value is
+  // telling the truth about what was and was not validated, an overstated disclosure is
+  // worse than a missing one — a proxy match therefore stays silent and the write is
+  // reported as fully unvalidated, which is what it is as far as the rail is concerned.
+  let railValidated = false;
+  if (emptyAccepted || unreadableAccepted) {
     let adoptedOption = false;
     // Each sibling's option list AS READ during admission. A STATEFUL non-function
     // source (an accessor/proxy answering differently per read) must not be read a
@@ -1052,7 +1224,7 @@ export function applyWidgetWrite(
         throw new WidgetWriteError(
           `Cannot verify value ${JSON.stringify(coerced)} against the parent subgraph's combo ` +
             `widget "${other.name}", which this promoted write also mutates: its option list is ` +
-            `computed dynamically and the inner widget's list is empty, so nothing authoritative ` +
+            `computed dynamically and ${innerObservation}, so nothing authoritative ` +
             `validates the value. Refusing to write.`,
         );
       }
@@ -1074,14 +1246,32 @@ export function applyWidgetWrite(
         snapshot = null;
       }
       siblingSnapshots.push({ name: other.name, options: snapshot });
-      if (otherOptions.includes(coerced)) continue;
+      if (otherOptions.includes(coerced)) {
+        // #1126 — a POSITIVE validation, recorded, but ONLY from the authoritative rail.
+        // Its list WAS readable and WAS non-empty and DOES contain the value, so on the
+        // unreadable path the claim "nothing checked the value" stops being true: the target
+        // widget's own list could not be read, but the widget that SERIALIZES at queue time
+        // vouched for it. A #477 display proxy matching proves nothing about what gets
+        // queued, so it is not recorded — see the declaration above. Reported as data so the
+        // reply and the activity summary can scope their disclosure to what was actually
+        // unchecked instead of asserting a blanket "unvalidated" the code itself contradicts.
+        if (other === parentWidget) railValidated = true;
+        continue;
+      }
       // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
       // a numeric request (4444) against a rail list holding the string "4444" must
       // not refuse an option the rail itself publishes. On a label match ADOPT the
       // rail list's ORIGINAL value for the whole write (the inner's empty list
       // accepted any scalar, so writing the rail's own option there is at least as
       // valid), never the incoming scalar — the #240 no-index guarantee holds.
-      const siblingLabelIdx = optionLabelIndex(otherOptions, coerced);
+      //
+      // #1126 — EMPTY-list acceptance ONLY. Its justification is "the inner list admitted
+      // any scalar", which is true of an empty list and FALSE of one that exists but could
+      // not be read: adopting there would write a rail's NUMBER onto a widget whose own
+      // (unread) list may not hold it, and would silently replace the value the caller
+      // sent. The unreadable path therefore falls straight through to the refusal below —
+      // recoverable, and it never invents a value.
+      const siblingLabelIdx = emptyAccepted ? optionLabelIndex(otherOptions, coerced) : -1;
       if (siblingLabelIdx >= 0) {
         adoptedOption = true;
         coerced = otherOptions[siblingLabelIdx];
@@ -1090,8 +1280,8 @@ export function applyWidgetWrite(
       throw new WidgetWriteError(
         `Value ${JSON.stringify(coerced)} is not a valid option for the parent subgraph's ` +
           `combo widget "${other.name}" (${otherOptions.length} options), which this promoted ` +
-          `write also mutates — the inner widget's option list is empty, but this one is not. ` +
-          `Refusing to write.`,
+          `write also mutates — ${innerObservation}, but this one WAS read and does not ` +
+          `contain the value. Refusing to write.`,
       );
     }
     // Codex delta-gate: an adoption REPLACES the value mid-loop, and a later sibling
@@ -1691,6 +1881,10 @@ export function applyWidgetWrite(
         `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) write failed: ${failure} ` +
           `Rollback of ${rollbackFailed} did not take effect (a value setter or history hook ` +
           `rejected/overrode it) — the graph may be in a partial state; re-set the widget or undo.`,
+        // The one WidgetWriteError raised AFTER the graph was mutated and NOT cleanly
+        // restored. Marked so no caller can reword it into a "refused, nothing applied"
+        // frame — see the flag's declaration.
+        { partialWrite: true },
       );
     }
     // Rollback succeeded: preserve the original WidgetWriteError message where there
@@ -1716,6 +1910,30 @@ export function applyWidgetWrite(
     widget: w.name,
     previous: parentWidget ? previousParent : previous,
     value: w.value,
+    // #1126 — the COERCION-TIME verdict, so the caller reports WHAT HAPPENED instead of
+    // inferring it from the rejection that led here. `options.values` is a callback and
+    // can answer differently per call: the final attempt may well have been admitted by
+    // ordinary membership after the list became readable, and claiming an unvalidated
+    // write then would be false. Set ONLY when the unreadable-list acceptance is what
+    // admitted the value — same never-read-twice discipline `emptyAcceptanceUsed` follows.
+    ...(coerceOutcome.unreadableAcceptanceUsed
+      ? {
+          option_list_unreadable: true,
+          // WHICH observation, verbatim from the read that decided it — so the reply
+          // states the reason instead of a plausible-sounding default.
+          option_list_unreadable_detail: coerceOutcome.unreadableObservation,
+          // #1126 — and whether the AUTHORITATIVE parent rail's real list nonetheless
+          // vouched for the value. Emitted only when it is TRUE, so a reader that does not
+          // know the field sees exactly what it saw before, and the disclosure never claims
+          // a check that did not happen. The cross-check above is what establishes it, and
+          // only a match on the serializing rail counts — never a #477 display proxy.
+          ...(railValidated ? { promoted_rail_validated: true } : {}),
+        }
+      : {}),
+    // #507/#1126 — the empty-list acceptance is what admitted the value. Reported here so a
+    // caller reaching that acceptance from EITHER ladder branch sees one field with one
+    // name, rather than the #507 branch alone naming it at the runSetWidget level.
+    ...(coerceOutcome.emptyAcceptanceUsed ? { empty_option_list: true } : {}),
     ...(writeWarning
       ? {
           write_warning: writeWarning,

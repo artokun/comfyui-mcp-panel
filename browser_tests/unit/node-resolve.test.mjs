@@ -40,6 +40,10 @@ import { runSetWidget } from "../../web/js/lib/set-widget.js";
 // oracle that gates #507's last-resort acceptance.
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
 import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
+// #1223 — the REAL snapshot, so the #1126 fallback is driven against the DETACHED name-only
+// map production actually hands back, never a hand-rolled full schema.
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -1785,4 +1789,682 @@ test("#512: the flag does not authorize a provenance-bearing NON-container leaf"
     () => assertMutatedNodeAuthorized(fresh, reg, leaf, "outer subgraph", () => false, RESOLVED),
     /not a verifiable frontend-only \/ virtual-subgraph node/i,
   );
+});
+
+// ── #1126 e2e: a combo whose options CANNOT BE ENUMERATED, through the real ladder ──
+//
+// `options.values` is the node's own callback. When it throws, the panel has compared the
+// value to nothing — yet the ladder refused, and the refusal reached the user as a verdict
+// about their value. The decision below is made from the panel's OWN observation (the read
+// failed) confirmed against the server (it publishes no list for this input either), never
+// from an assertion the caller makes about the node.
+
+/** The reported shape: a dynamic file combo whose populate callback fails. */
+function unreadableComboFixture(values) {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return { reg, node, widget };
+}
+const THROWS = () => {
+  throw new Error("the node's own populate() failed");
+};
+
+test("#1126 e2e: an UNREADABLE option list writes the path and discloses that nothing checked it", async () => {
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    registry: reg,
+    getRegistry: () => reg,
+    // The server publishes no list for this input either — so the valid set is not
+    // knowable from anywhere the panel can see.
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true, "the caller must be told nothing validated it");
+  assert.match(res.option_list_unreadable_note, /could NOT BE READ/);
+  assert.match(res.option_list_unreadable_note, /not because the value was checked and passed/);
+  // The note states the OBSERVED reason rather than a plausible default: there are three
+  // distinct ones and only the read that decided it knows which.
+  assert.match(res.option_list_unreadable_note, /options\.values callback threw/);
+  assert.match(res.option_list_unreadable_note, /the node's own populate\(\) failed/);
+  assert.match(res.set.option_list_unreadable_detail, /callback threw/);
+  // It must NOT claim the empty-list path: "the server declared zero options" is a
+  // different observation, and reporting one as the other misdescribes the write.
+  assert.equal(res.empty_option_list, undefined);
+});
+
+test("#1126 e2e: a failed live read is NOT licence to ignore a list the SERVER publishes", async () => {
+  // The second condition, and the one that keeps this from becoming "skip validation
+  // whenever the callback is flaky". /object_info publishes a real list for this input,
+  // so the valid set IS knowable from somewhere — and the panel does not get to write
+  // blindly just because the node's own callback failed.
+  //
+  // The refresh cannot repair this shape (refreshComboOptionsFromDefs deliberately never
+  // clobbers a FUNCTION option source — a dynamic list computes its own), so the write
+  // stays refused, exactly as it was before this change. That is the deliberate
+  // conservative edge: the panel refuses rather than validating against a server list the
+  // widget itself has not adopted. The refusal still says which observation it rests on.
+  for (const value of ["llama3.2:3b", "not-installed:70b"]) {
+    const { reg, node, widget } = unreadableComboFixture(THROWS);
+    await assert.rejects(
+      runSetWidget(node, "model", value, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+      (err) =>
+        /panel_set_widget refused "model" on node 9/.test(err.message) &&
+        /option list could not be READ/.test(err.message) &&
+        // Never a claim about the value: nothing was compared to anything.
+        !/is not a valid option/.test(err.message),
+      `a server-published list withholds the acceptance for ${value}`,
+    );
+    assert.equal(widget.value, "", "no mutation on the refusal");
+  }
+});
+
+test("#1126 e2e: a list that WAS read still refuses an off-list value, framed and self-describing", async () => {
+  // The other direction, end to end. Nothing about the escape reaches a combo the panel
+  // could enumerate: the value is simply not one of the choices.
+  const { reg, node, widget } = starNodesFixture(["qwen3-vl:8b", "llama3.2:3b"]);
+  await assert.rejects(
+    runSetWidget(node, "model", "not-installed:70b", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) =>
+      // The frame survives — tool, widget, node — so the refusal is attributable.
+      /panel_set_widget refused "model" on node 9/.test(err.message) &&
+      /is not a valid option/.test(err.message) &&
+      // …and it says WHICH of the two happened, so an agent does not read a rejected
+      // value as an unreadable list (or keep retrying a value that will never be valid).
+      /option list WAS read successfully/.test(err.message) &&
+      /rejected VALUE, not an unreadable list/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation on the refusal");
+});
+
+test("#1126 e2e: an unreadable list REFUSES a non-string, and the refusal keeps its frame", async () => {
+  // The last-resort attempt can itself refuse (#240 keeps a number out of a combo whose
+  // real list exists but cannot be read). That refusal is raised inside the final write,
+  // outside the ladder's try/catch — so without explicit framing it would surface as a
+  // bare `Combo widget "model": …` with no tool, node, or widget attached.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", 640, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo([]),
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) =>
+      /panel_set_widget refused "model" on node 9/.test(err.message) &&
+      /option list unreadable/.test(err.message) &&
+      /NON-EMPTY STRING/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation");
+});
+
+test("#1126 e2e: the unreadable acceptance is the LAST resort — a refreshable list is fixed first", async () => {
+  // Ordering matters: if the acceptance ran before the authoritative refresh it would
+  // quietly become "skip validation whenever the callback is flaky", and a transient
+  // failure would write an off-list value into a combo the server can enumerate perfectly
+  // well. Here the callback fails once and the refresh replaces it with the server's list.
+  let calls = 0;
+  const flaky = () => {
+    calls += 1;
+    if (calls === 1) throw new Error("transient");
+    return ["qwen3-vl:8b", "llama3.2:3b"];
+  };
+  const { reg, node, widget } = unreadableComboFixture(flaky);
+  const res = await runSetWidget(node, "model", "llama3.2:3b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(widget.value, "llama3.2:3b");
+  assert.equal(res.refreshed, true, "the authoritative retry is what accepted it");
+  assert.equal(res.option_list_unreadable, undefined, "nothing went unvalidated");
+});
+
+// ── #1223/#716 × #1126: the "server declares it empty" evidence must be LIVE ──────────
+//
+// A cross-feature hole, opened by changes that are each correct alone. #1223 (v0.14.39) lets
+// `getFreshObjectInfo` answer from the LAST-OBSERVED schema snapshot when both live probes go
+// silent; #716's burst cache lets it answer from a payload up to 1.5s old. This fallback's
+// second condition reads either answer as "the SERVER declares this input's option list
+// empty" — but both are what the server said BEFORE, retained across a window in which nobody
+// re-asked. Options change without a reconnect AND without a cache drop (a model downloaded
+// while this node's own callback keeps failing), so either stale `[]` would authorize an
+// unvalidated write. Same defect, two layers.
+
+const snapshotOpts = (reg, extra = {}) => ({
+  registry: reg,
+  getRegistry: () => reg,
+  // The (stale) schema publishes NO list for this input — the shape that would authorize.
+  getFreshObjectInfo: async () => starObjectInfo([]),
+  wasTypeEverDefined: () => true,
+  refreshCombos: refreshFromServer,
+  ...HOOKS,
+  ...extra,
+});
+
+/**
+ * The REAL map #1223's fallback hands back — built by driving `record` + `authorize`, never
+ * hand-rolled. This matters: the snapshot deliberately stores a DETACHED map of TYPE NAMES,
+ * every value the shared frozen EMPTY_DEF with no `input` at all (retaining the payload would
+ * let a beforeRegisterNodeDef hook launder frontend-mutated defs back as backend evidence).
+ * A test that supplies a full `starObjectInfo([])` here would be testing a shape production
+ * never produces — which is how the snapshot branch came to be dead code in the first place.
+ */
+function detachedSnapshotDefs(fullMap) {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(
+    snap.record(fullMap, { observedAtEpoch: 7, currentEpoch: 7, whole: true }),
+    true,
+    "fixture precondition: the snapshot accepted the whole map",
+  );
+  const { defs } = snap.authorize({
+    epoch: 7,
+    socketDown: false,
+    // Both transports contacted and silent — the only state that licenses the fallback.
+    outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }, { kind: TRANSPORT_OUTCOME.NOTHING_RETURNED }],
+  });
+  assert.ok(defs, "fixture precondition: the snapshot authorized");
+  return defs;
+}
+
+test("#1223 fixture: the real snapshot map holds NAMES ONLY — it cannot answer an option-list question", () => {
+  // Pins the premise the refusal below rests on, so a future change that re-attached payloads
+  // to the snapshot fails HERE with a clear reason rather than silently reviving a branch that
+  // was reasoned about as unreachable.
+  const defs = detachedSnapshotDefs(starObjectInfo([]));
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(defs, "StarOllamaPromptHelper"),
+    "membership survives — that is what the snapshot is for",
+  );
+  assert.equal(defs["StarOllamaPromptHelper"].input, undefined, "…but the def carries no input");
+  assert.equal(
+    serverDeclaresEmptyComboOptions(defs, "StarOllamaPromptHelper", "model"),
+    false,
+    "so the shape test is ALWAYS false against a snapshot, for every input on every node",
+  );
+});
+
+test("#1223 × #1126: a SNAPSHOT can never authorize the blind write, and says why", async () => {
+  // Driven against the REAL detached map, not a hand-built full one. The shape test cannot
+  // pass here — a name-only map answers "no" for every input in existence — so the honest
+  // outcome is a refusal that names the silent backend rather than the generic end-of-ladder
+  // message, which would send the caller to look at their value instead.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      getFreshObjectInfo: async () => detachedSnapshotDefs(starObjectInfo([])),
+      schemaProvenance: () => "snapshot",
+    }),
+    (err) =>
+      /panel_set_widget refused "model" on node 9 \(StarOllamaPromptHelper\)/.test(err.message) &&
+      /LAST-OBSERVED one \(#1223\)/.test(err.message) &&
+      /detached map of TYPE NAMES ONLY/.test(err.message) &&
+      // It must name WHICH fact is missing. "Reconnect and retry" is only actionable if the
+      // caller knows it is the SCHEMA, not their value, that could not be established.
+      /holds no option lists at all/.test(err.message) &&
+      /Reconnect to ComfyUI/.test(err.message) &&
+      // And it must NOT be the cache/stale wording: a map that holds no lists is not a map
+      // holding a stale one, and telling the user to "retry in a moment" would be wrong.
+      !/burst cache/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — a name-only map establishes nothing");
+});
+
+test("#1126: a RECONNECT-SPANNING response is not live — the replaced process cannot authorize", async () => {
+  // object-info-cache deliberately still hands a retired response to its ORIGINAL waiter, and
+  // objectInfoSnapshot.record refuses to file it because observed !== current. The provenance
+  // must apply the same test: a schema describing the ComfyUI process that has been replaced
+  // must not authorize a blind write against the replacement's option lists — a restart is
+  // precisely the event that changes what the server publishes.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "reconnected",
+    }),
+    (err) =>
+      /backend RECONNECTED while that \/object_info request was in flight/.test(err.message) &&
+      /has since been replaced/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — the answer describes a process that is gone");
+});
+
+test("#1126: a RETIRED response is not live — the panel's own refresh superseded it", async () => {
+  // The fourth way a response turned out not to be live, and the one a healthy backend hits
+  // most: registerComfyNodeDefs drops the burst cache on a refresh, a pack install, or a
+  // download completing. That bumps the cache GENERATION without moving the reconnect epoch,
+  // so an epoch test alone still calls it live — while the very refresh that retired it may
+  // be what filled this option list.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "retired",
+    }),
+    (err) =>
+      /panel REFRESHED the node definitions while that \/object_info request was in flight/.test(err.message) &&
+      /may be what filled this list/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — the answer was superseded before it arrived");
+});
+
+test("#1126: a NESTED promotion is refused BEFORE any re-fetch is paid for", async () => {
+  // The chain shape is already known and no schema can make this writable, so establishing
+  // evidence for it is pure cost — and on a non-live provenance that cost is a cache drop
+  // plus a multi-megabyte /object_info round trip, spent to answer a question whose answer
+  // cannot change the outcome.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const container = (uuid, id, w, innerNode, innerId) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    reg[uuid] = ctor;
+    return {
+      id,
+      type: uuid,
+      constructor: ctor,
+      subgraph: { _nodes: [innerNode], getNodeById: (x) => (String(x) === innerId ? innerNode : null) },
+      inputs: [{ name: w.name, _widget: w, widget: { name: w.name }, _subgraphSlot: { name: w.name } }],
+      widgets: [w],
+    };
+  };
+  const concreteWidget = { name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const concrete = {
+    id: 302,
+    type: "StarOllamaPromptHelper",
+    widgets: [concreteWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const midWidget = { name: "model_mid", type: "combo", options: { values: THROWS }, value: "" };
+  const mid = container("11111111-1111-4111-8111-111111111111", 301, midWidget, concrete, "302");
+  const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
+  const outer = container("22222222-2222-4222-8222-222222222222", 320, outerWidget, mid, "301");
+  let refetched = 0;
+  let fetches = 0;
+  await assert.rejects(
+    runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => {
+        fetches += 1;
+        return starObjectInfo([]);
+      },
+      wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+      resolveSource: (_n, si) => {
+        if (si?.name === "model_alias") return { sourceNodeId: "301", sourceWidgetName: "model_mid" };
+        if (si?.name === "model_mid") return { sourceNodeId: "302", sourceWidgetName: "model" };
+        return null;
+      },
+      // A provenance that WOULD trigger the re-ask if the nested check did not come first.
+      schemaProvenance: () => "cache",
+      // Wired for real, so the assertion below measures something. Stubbing a capability the
+      // lib no longer reads would make "it was never called" true by construction.
+      refetchObjectInfoLive: async () => {
+        refetched += 1;
+        return starObjectInfo([]);
+      },
+      ...HOOKS,
+    }),
+    (err) => /NESTED promotion/.test(err.message),
+  );
+  assert.equal(refetched, 0, "no forced reread is paid for a write that cannot succeed");
+  assert.equal(fetches, 1, "only the ladder's own authorization fetch — no last-resort re-ask");
+});
+
+test("#716 × #1126: a CACHE-HIT empty list does NOT authorize a blind write either", async () => {
+  // The layer below the snapshot, and the one a healthy backend actually hits: #716's burst
+  // cache answers writes 2..N of a burst without asking the server at all. "Not from a
+  // snapshot" is NOT the same as "live". Here the re-ask is impossible (no invalidator
+  // wired), so the fallback must fail closed rather than trust a payload nobody refreshed.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => "cache",
+    }),
+    (err) =>
+      /burst cache \(#716\)/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message) &&
+      // Never blamed on the snapshot: naming the wrong layer sends the user to reconnect
+      // when all they had to do was wait out a 1.5s TTL.
+      !/LAST-OBSERVED schema snapshot/.test(err.message),
+  );
+  assert.equal(widget.value, "", "fails closed — a cached [] is not the server answering");
+});
+
+test("#716 × #1126: a cache hit is RE-ASKED, and a live empty answer authorizes the write", async () => {
+  // Failing closed on every cache hit would refuse writes 2..N of an ordinary burst — the
+  // exact multi-widget case this fix exists to serve. So the fallback drops the cache and
+  // re-asks ONCE. The re-ask is what must flip the provenance; the write follows from that.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let refetched = 0;
+  let provenance = "cache";
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => provenance,
+    // ONE capability naming the outcome the ladder needs, so the cache decides how to get a
+    // fresh answer without a global invalidation that would disturb concurrent writers.
+    refetchObjectInfoLive: async () => {
+      refetched += 1;
+      provenance = "live";
+      return starObjectInfo([]);
+    },
+  });
+  assert.equal(refetched, 1, "the forced reread happens exactly once");
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true);
+});
+
+test("#1126: a verdict that EXPIRES during the recovery awaits does not authorize the write", async () => {
+  // Round-5's defect, and a different species from rounds 1-4. Those asked "what KIND of
+  // response is this"; this asks "is that still TRUE". The initial /object_info read is
+  // genuinely live — and then definitions change while `refreshCombos` and the upload probe
+  // are AWAITED. A stored "live" string keeps insisting otherwise, so the blind write is
+  // authorized from a schema that has since been superseded, bypassing a list that may have
+  // become non-empty in exactly that window.
+  //
+  // The panel therefore threads `provenanceNow`, a QUESTION rather than an answer, and the
+  // lib asks it after those awaits. Modelled here by a provenance that is live at the first
+  // read and retired by the time the ladder decides.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let refreshed = false;
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      // The refresh is what supersedes the schema — exactly what registerComfyNodeDefs does
+      // on an install, a download completing, or an explicit refresh.
+      refreshCombos: async (...args) => {
+        const out = refreshFromServer(...args);
+        refreshed = true;
+        return out;
+      },
+      // LIVE at delivery; RETIRED once the refresh above has run. Re-asked, this tells the
+      // truth; remembered, it does not.
+      schemaProvenance: () => (refreshed ? "retired" : "live"),
+      // No re-ask capability wired, so the ladder must fail closed rather than paper over it.
+    }),
+    (err) =>
+      /panel REFRESHED the node definitions while that \/object_info request was in flight/.test(err.message) &&
+      /did not come from the server answering now/.test(err.message),
+  );
+  assert.equal(refreshed, true, "the recovery await really did run before the decision");
+  assert.equal(widget.value, "", "fails closed — the verdict had expired by the time it was used");
+});
+
+test("#716 × #1126: a re-ask that finds a REAL list refuses instead of writing blind", async () => {
+  // The hole the re-ask exists to find: the cached `[]` was stale and the server does publish
+  // a list for this input. Good provenance must not become permission to write past the very
+  // answer that was just fetched to check it.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let provenance = "cache";
+  const res = runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => provenance,
+    refetchObjectInfoLive: async () => {
+      provenance = "live";
+      // The model finished downloading while the node's own callback kept failing.
+      return starObjectInfo(["qwen3-vl:8b"]);
+    },
+  });
+  await assert.rejects(
+    res,
+    (err) =>
+      /the live re-read NO LONGER declares it empty/.test(err.message) &&
+      // The refusal must state the OBSERVATION and name the possibilities, not pick one.
+      // `serverDeclaresEmptyComboOptions` returning false is equally true when the server
+      // publishes a real list and when it stops describing this input at all — asserting
+      // the first as fact is the same over-claim this PR exists to remove.
+      /either it now publishes a real option list for this input, or it no longer/.test(err.message) &&
+      !/produced one that DOES publish a list/.test(err.message) &&
+      /panel_set_widget refused "model"/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no blind write once the premise no longer holds");
+});
+
+test("#1223 × #1126: the SAME call writes when the schema was fetched LIVE", async () => {
+  // The other half: this must fail closed on stale evidence WITHOUT disabling the fallback
+  // for the live case it exists to serve. Only the provenance differs between the two tests.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => "live",
+  });
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+  assert.equal(res.option_list_unreadable, true);
+});
+
+test("#1223 × #1126: UNKNOWN provenance fails closed — a throwing probe is not a live one", async () => {
+  // A provenance probe that throws has established nothing, and "nothing established" must
+  // not read as "live". The default (no probe wired at all) is the pre-#716/#1223 world,
+  // where the oracle had neither a cache nor a snapshot branch to take and could only ever
+  // have fetched, so it stays permissive — that is the case every other test here exercises.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  await assert.rejects(
+    runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      ...snapshotOpts(reg),
+      schemaProvenance: () => {
+        throw new Error("provenance unknown");
+      },
+    }),
+    (err) => /provenance could not be established at all/.test(err.message),
+  );
+  assert.equal(widget.value, "", "no mutation when provenance could not be established");
+});
+
+test("#1126: a PARTIAL write is never reworded into a 'refused' frame", async () => {
+  // Every `panel_set_widget refused …` message asserts more than the text it wraps: that
+  // nothing was applied, so the caller may retry or give up freely. Exactly one
+  // WidgetWriteError breaks that — the one raised AFTER the graph was mutated and the
+  // rollback failed to restore it. Reporting THAT as a refusal tells the caller "nothing
+  // happened" about a graph now in a partial state, which is the class of false report this
+  // whole change exists to eliminate.
+  //
+  // Driven through the REAL ladder: the value is refused by the widget's own callback after
+  // the write lands, and the rollback is defeated by a value setter that refuses to restore.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: ["a.fbx"] }, value: "a.fbx" };
+  let landed = false;
+  Object.defineProperty(widget, "value", {
+    configurable: true,
+    get: () => (landed ? "STUCK" : "a.fbx"),
+    set: () => {
+      // Accepts nothing: the write cannot verify, and the rollback cannot restore either.
+      landed = true;
+    },
+  });
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [widget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  await assert.rejects(
+    runSetWidget(node, "model", "a.fbx", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo(["a.fbx"]),
+      wasTypeEverDefined: () => true,
+      ...HOOKS,
+    }),
+    (err) =>
+      // The write's own partial-state warning reaches the caller intact…
+      /partial state/.test(err.message) &&
+      // …and is NOT dressed up as a refusal, which would claim nothing was applied.
+      !/panel_set_widget refused/.test(err.message),
+  );
+});
+
+test("#1126: a stateful callback that finally answers [] takes #507's acceptance, not a refusal", async () => {
+  // `options.values` is a callback and can answer differently per call. If it throws on the
+  // initial read and on the refreshed read but returns [] on the FINAL one, only the
+  // unreadable acceptance was enabled — so coercion fell through to #507's empty-list branch,
+  // raised a RETRYABLE emptyOptions rejection, and refused with "the server's option list may
+  // simply be stale, refreshing it before deciding" at the end of a ladder that had already
+  // refreshed it. By that point the LIVE server schema has ALREADY confirmed the list empty,
+  // which is #507's own precondition, so this is a valid transition being rejected.
+  const { reg, node, widget } = unreadableComboFixture(THROWS);
+  let reads = 0;
+  widget.options.values = () => {
+    reads += 1;
+    // Throws for every read the ladder makes before the final write attempt.
+    if (reads < 3) throw new Error("ollama not reachable");
+    return [];
+  };
+  const res = await runSetWidget(node, "model", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+    ...snapshotOpts(reg),
+    schemaProvenance: () => "live",
+  });
+  assert.equal(widget.value, String.raw`F:\Downloads\Scarlet1.0.fbx`, "the write lands");
+  // Pins the ladder shape this test depends on: the list is UNREADABLE for the initial read
+  // and for the post-refresh retry — so the #1126 branch is the one reached — and answers []
+  // only on the final write attempt. If the ladder ever reads a different number of times,
+  // this fails loudly instead of quietly covering the #507 branch instead.
+  assert.equal(reads, 3, "throws on the initial read and the post-refresh retry, [] on the final write");
+  // Reported as what ACTUALLY admitted it, decided at coercion time — an empty list really
+  // was read on the attempt that counted, so this is #507's outcome and says so.
+  assert.equal(res.empty_option_list, true, "#507's acceptance, named as #507's");
+  assert.equal(res.option_list_unreadable, undefined, "not claimed as an unreadable-list write");
+});
+
+test("#1126 e2e: the reply note does not claim 'nothing checked it' when the RAIL did", async () => {
+  // End-to-end through the real ladder: a SINGLE-HOP promotion (so the nested refusal below
+  // does not apply), inner list unreadable, parent rail's list readable and containing the
+  // value. The sibling cross-check compares against that rail and proceeds only on
+  // membership — so the reply must scope its "unvalidated" claim to the widget it is about.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const UUID = "33333333-3333-4333-8333-333333333333";
+  const innerWidget = { name: "model", type: "combo", options: { values: THROWS }, value: "" };
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [innerWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const rail = { name: "model_alias", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: UUID };
+  ctor.comfyClass = UUID;
+  reg[UUID] = ctor;
+  const outer = {
+    id: 320,
+    type: UUID,
+    constructor: ctor,
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [{ name: "model_alias", _widget: rail, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [rail],
+  };
+  const res = await runSetWidget(outer, "model_alias", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+    resolveSource: (_n, si) =>
+      si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null,
+    ...HOOKS,
+  });
+  assert.equal(rail.value, "qwen3-vl:8b");
+  assert.equal(innerWidget.value, "qwen3-vl:8b");
+  assert.equal(res.option_list_unreadable, true, "the inner widget's own list still went unread");
+  assert.equal(res.promoted_rail_validated, true, "…but the rail's list vouched for the value");
+  assert.match(res.option_list_unreadable_note, /NOT written entirely unchecked/);
+  assert.match(res.option_list_unreadable_note, /rail widget, whose option list WAS readable/);
+  assert.doesNotMatch(res.option_list_unreadable_note, /Nothing compared your value to anything/);
+});
+
+// ── #1126: a NESTED promotion is refused, not blind-written ──────────────────────────
+//
+// The rejection this fallback answers describes the IMMEDIATE promoted projection. On a
+// nested chain the value is driven on into a DEEPER concrete widget this path never read,
+// whose own client-populated list may be perfectly readable — so the premise "the valid set
+// is not knowable from here" is not established. Refusing is the deliberate choice over
+// validating the concrete widget: see the refusal's own comment for why.
+
+test("#1126: the unreadable fallback REFUSES a nested promotion rather than writing blind", async () => {
+  // outer SubgraphNode → intermediate SubgraphNode → concrete node. The widget the ladder
+  // reads is the intermediate's projection (unreadable); the concrete widget below it has a
+  // perfectly readable list that nothing on this path ever consulted.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  // Registered exactly as ComfyUI_frontend's registerSubgraphNodeDef builds them: the type
+  // is the subgraph's UUID (never in /object_info) and the class carries the synthesized
+  // nodeDef, so the #458/#512 authorization treats them as real containers rather than as
+  // an uninstalled pack.
+  const container = (uuid, id, widget, innerNode, innerId) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    reg[uuid] = ctor;
+    return {
+      id,
+      type: uuid,
+      constructor: ctor,
+      subgraph: { _nodes: [innerNode], getNodeById: (x) => (String(x) === innerId ? innerNode : null) },
+      inputs: [{ name: widget.name, _widget: widget, widget: { name: widget.name }, _subgraphSlot: { name: widget.name } }],
+      widgets: [widget],
+    };
+  };
+  const MID_UUID = "11111111-1111-4111-8111-111111111111";
+  const OUTER_UUID = "22222222-2222-4222-8222-222222222222";
+  const concreteWidget = { name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" };
+  const concrete = {
+    id: 302,
+    type: "StarOllamaPromptHelper",
+    widgets: [concreteWidget],
+    constructor: reg["StarOllamaPromptHelper"],
+  };
+  const midWidget = { name: "model_mid", type: "combo", options: { values: THROWS }, value: "" };
+  const mid = container(MID_UUID, 301, midWidget, concrete, "302");
+  const outerWidget = { name: "model_alias", type: "combo", options: { values: THROWS }, value: "" };
+  const outer = container(OUTER_UUID, 320, outerWidget, mid, "301");
+  const resolveSource = (_node, subgraphInput) => {
+    if (subgraphInput?.name === "model_alias") return { sourceNodeId: "301", sourceWidgetName: "model_mid" };
+    if (subgraphInput?.name === "model_mid") return { sourceNodeId: "302", sourceWidgetName: "model" };
+    return null;
+  };
+  await assert.rejects(
+    runSetWidget(outer, "model_alias", String.raw`F:\Downloads\Scarlet1.0.fbx`, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => starObjectInfo([]),
+      // A virtual SubgraphNode's type is its subgraph UUID and is NEVER in /object_info by
+      // design, so it must not read as a since-REMOVED backend type (#458) — only the
+      // concrete node at the end of the chain was ever backend-defined.
+      wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper",
+      resolveSource,
+      ...HOOKS,
+    }),
+    (err) =>
+      /panel_set_widget refused "model_alias" on node 320/.test(err.message) &&
+      /NESTED promotion/.test(err.message) &&
+      /may be readable/.test(err.message) &&
+      /panel_enter_subgraph/.test(err.message),
+  );
+  assert.equal(concreteWidget.value, "", "the concrete widget is untouched");
+  assert.equal(midWidget.value, "", "the intermediate projection is untouched");
+  assert.equal(outerWidget.value, "", "the outer rail is untouched");
 });

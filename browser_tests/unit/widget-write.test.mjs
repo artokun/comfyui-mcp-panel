@@ -24,6 +24,7 @@ import {
   isComboWidget,
   isCompositeObjectWidget,
   isNumericWidget,
+  readComboOptions,
   resolvePromotedInnerTarget,
   WidgetWriteError,
 } from "../../web/js/lib/widget-write.js";
@@ -614,7 +615,7 @@ test("combo: declared combo with UNREADABLE options is refused (fail-closed, HIG
   const missing = { id: 1, type: "N", widgets: [{ name: "c", type: "combo", value: "x" }] };
   assert.throws(
     () => applyWidgetWrite(missing, "c", 1, HOOKS),
-    (err) => err instanceof WidgetWriteError && /no readable option list/.test(err.message),
+    (err) => err instanceof WidgetWriteError && /option list could not be READ/.test(err.message),
   );
   // Dynamic options fn that throws.
   const throwing = {
@@ -2041,7 +2042,7 @@ test("#507: an UNREADABLE option list is STILL refused — empty is not the same
   const missing = { id: 9, type: "N", widgets: [{ name: "model", type: "combo", value: "x" }] };
   assert.throws(
     () => applyWidgetWrite(missing, "model", "anything", ACCEPT_EMPTY),
-    (err) => err instanceof WidgetWriteError && /no readable option list/.test(err.message),
+    (err) => err instanceof WidgetWriteError && /option list could not be READ/.test(err.message),
   );
   const throwing = {
     id: 9,
@@ -3212,4 +3213,379 @@ test("#667×#507 (final gate): an adoption that cannot be re-validated against a
   assert.equal(inner.widgets[0].value, "", "inner untouched");
   assert.equal(railWidget.value, "", "rail untouched");
   assert.equal(proxyWidget.value, "", "proxy untouched");
+});
+
+// ── #1126: "could not enumerate" is not "invalid value" ─────────────────────
+//
+// A dynamic combo's options come from `options.values(widget)` — the NODE's own callback.
+// It can mutate the widget, and it can fail. When it fails, the panel has compared the
+// value to NOTHING; the old code answered that with a refusal, and after set-widget.js's
+// ladder gave up, the user read it as a verdict on their value. The reported shape was a
+// custom node whose runtime handler takes an absolute .fbx path: the path was refused,
+// and the only workaround was copying the file into ComfyUI's input directory.
+//
+// Both directions are load-bearing and both are decided from what was OBSERVED:
+//   * list UNREADABLE → the valid set is not knowable here, so an opt-in LAST resort
+//     writes it (non-empty string only) and says so.
+//   * list READ, value absent → still refused. A typo'd model name must not become
+//     writable just because the escape exists.
+// No inference from option NAMES, no caller assertion about the node: the panel acts on
+// whether its own read succeeded.
+
+const ACCEPT_UNREADABLE = { ...HOOKS, acceptUnreadableComboOptions: true };
+
+/** A combo whose options callback fails — the #1126 observation, in each shape it takes. */
+function unreadableCombo(kind) {
+  const values =
+    kind === "threw"
+      ? () => {
+          throw new Error("node's own populate() blew up");
+        }
+      : kind === "not_a_list"
+        ? () => undefined
+        : undefined;
+  return { name: "fbx_file", type: "combo", value: "", ...(values ? { options: { values } } : {}) };
+}
+
+test("#1126: an UNREADABLE option list accepts the path, and says the list could not be READ", () => {
+  for (const kind of ["threw", "not_a_list", "absent"]) {
+    const node = { id: 4, type: "FbxRenderer", widgets: [unreadableCombo(kind)] };
+    // Default: still refused — and the refusal states the observation, never a verdict
+    // about the value. That distinction is the whole bug: an agent that reads "not a
+    // valid option" retries with different values forever.
+    assert.throws(
+      () => applyWidgetWrite(node, "fbx_file", String.raw`F:\Downloads\Scarlet1.0.fbx`, HOOKS),
+      (err) =>
+        err instanceof WidgetWriteError &&
+        /option list could not be READ/.test(err.message) &&
+        /nothing was compared/.test(err.message) &&
+        !/is not a valid option/.test(err.message),
+      `refusal must name the observation for the ${kind} shape`,
+    );
+    assert.equal(node.widgets[0].value, "", "the refusal must not have mutated the widget");
+
+    // With the last-resort opt-in the write lands, and the reply discloses that NOTHING
+    // validated it — a caller must not read this success as "the panel checked it".
+    const out = applyWidgetWrite(
+      node,
+      "fbx_file",
+      String.raw`F:\Downloads\Scarlet1.0.fbx`,
+      ACCEPT_UNREADABLE,
+    );
+    assert.equal(out.value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+    assert.equal(node.widgets[0].value, String.raw`F:\Downloads\Scarlet1.0.fbx`);
+    assert.equal(out.option_list_unreadable, true, `unvalidated write disclosed for ${kind}`);
+    // …and it reports WHICH observation, so a reply built from it cannot assert the
+    // wrong reason. Three shapes, three distinct answers.
+    assert.match(
+      out.option_list_unreadable_detail,
+      kind === "threw" ? /callback threw/ : kind === "not_a_list" ? /did not return a list/ : /could not be READ/,
+      `the disclosed reason must match the ${kind} shape`,
+    );
+  }
+});
+
+test("#1126: a list that WAS read still refuses an off-list value — and says which happened", () => {
+  // The direction that must not move. This combo's options were read successfully, so
+  // the value is genuinely wrong: a model that is not installed, caught here instead of
+  // 40 seconds into a run. The escape does not reach it, because the escape is keyed on
+  // the panel's own failed read and this read succeeded.
+  const mk = () => ({
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [
+      { name: "model", type: "combo", options: { values: () => ["qwen3-vl:8b", "llama3.2:3b"] }, value: "qwen3-vl:8b" },
+    ],
+  });
+  for (const opts of [HOOKS, ACCEPT_EMPTY, ACCEPT_UNREADABLE]) {
+    const node = mk();
+    assert.throws(
+      () => applyWidgetWrite(node, "model", "not-installed:70b", opts),
+      (err) =>
+        err instanceof WidgetWriteError &&
+        /is not a valid option/.test(err.message) &&
+        // …and it says the list WAS read, so the two failures never read alike.
+        /option list WAS read successfully/.test(err.message) &&
+        /rejected VALUE, not an unreadable list/.test(err.message),
+    );
+    assert.equal(node.widgets[0].value, "qwen3-vl:8b", "no mutation on the refusal");
+  }
+});
+
+test("#1126: the options callback is INVOKED EXACTLY ONCE per write attempt", () => {
+  // It is the node's own code and it commonly mutates the widget (repopulating the
+  // dropdown), so a decision that re-reads to re-derive its own verdict both risks side
+  // effects and can be answered differently the second time.
+  let calls = 0;
+  const node = {
+    id: 11,
+    type: "FbxRenderer",
+    widgets: [
+      {
+        name: "fbx_file",
+        type: "combo",
+        value: "a.fbx",
+        options: {
+          values: () => {
+            calls += 1;
+            return ["a.fbx", "b.fbx"];
+          },
+        },
+      },
+    ],
+  };
+  applyWidgetWrite(node, "fbx_file", "b.fbx", HOOKS);
+  assert.equal(calls, 1, "an accepted write reads the list once");
+
+  calls = 0;
+  assert.throws(() => applyWidgetWrite(node, "fbx_file", "nope.fbx", HOOKS), WidgetWriteError);
+  assert.equal(calls, 1, "a refusal reads the list once — the message is built from that read");
+
+  // And the UNREADABLE path does not probe a second time to work out why it failed.
+  let failCalls = 0;
+  const failing = {
+    id: 12,
+    type: "FbxRenderer",
+    widgets: [
+      {
+        name: "fbx_file",
+        type: "combo",
+        value: "",
+        options: {
+          values: () => {
+            failCalls += 1;
+            throw new Error("boom");
+          },
+        },
+      },
+    ],
+  };
+  applyWidgetWrite(failing, "fbx_file", "C:/models/x.fbx", ACCEPT_UNREADABLE);
+  assert.equal(failCalls, 1, "the failed read is described from the caught error, not re-run");
+});
+
+test("#1126: an unreadable list still refuses a NUMBER and an empty string", () => {
+  // The list EXISTS on this widget; we simply could not read it. So #240's reason for
+  // strict membership survives — a number could be reinterpreted as an index into the
+  // list nobody could see — and #347's rule that clearing a combo to "" is refused must
+  // not be reopened through a new door. No file path or model name is a number.
+  for (const bad of [1, 0, 4444, true, false, ""]) {
+    const node = { id: 5, type: "FbxRenderer", widgets: [unreadableCombo("threw")] };
+    assert.throws(
+      () => applyWidgetWrite(node, "fbx_file", bad, ACCEPT_UNREADABLE),
+      (err) => err instanceof WidgetWriteError && /NON-EMPTY STRING/.test(err.message),
+      `must stay refused even on the last resort: ${JSON.stringify(bad)}`,
+    );
+    assert.equal(node.widgets[0].value, "", "no mutation");
+  }
+  // An object was already refused as a non-scalar and stays so.
+  const objNode = { id: 5, type: "FbxRenderer", widgets: [unreadableCombo("threw")] };
+  assert.throws(() => applyWidgetWrite(objNode, "fbx_file", { p: "x" }, ACCEPT_UNREADABLE), WidgetWriteError);
+});
+
+test("#1126: a readable list wins first — the opt-in does not make every write unchecked", () => {
+  // A caller that passes the last-resort flag defensively must not lose the guard for a
+  // list the panel CAN read, nor be told the value went unvalidated when it did not.
+  const node = {
+    id: 6,
+    type: "FbxRenderer",
+    widgets: [{ name: "fbx_file", type: "combo", options: { values: () => ["a.fbx", "b.fbx"] }, value: "a.fbx" }],
+  };
+  const out = applyWidgetWrite(node, "fbx_file", "b.fbx", ACCEPT_UNREADABLE);
+  assert.equal(out.value, "b.fbx");
+  assert.equal(out.option_list_unreadable, undefined, "a listed value was validated normally");
+});
+
+test("#1126: the two acceptances are separate — neither implies the other", () => {
+  // acceptEmptyComboOptions must not admit an unreadable list (it may be hiding a real,
+  // non-empty one), and acceptUnreadableComboOptions must not admit an empty one (that
+  // case has its own server-declaration gate in set-widget.js).
+  const unreadable = { id: 7, type: "N", widgets: [unreadableCombo("threw")] };
+  assert.throws(
+    () => applyWidgetWrite(unreadable, "fbx_file", "x.fbx", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /option list could not be READ/.test(err.message),
+  );
+  const empty = { id: 8, type: "N", widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }] };
+  assert.throws(
+    () => applyWidgetWrite(empty, "model", "x", ACCEPT_UNREADABLE),
+    (err) => err instanceof WidgetWriteError && err.emptyOptions === true,
+  );
+});
+
+test("#1126: the unreadable acceptance ARMS the rail cross-check but NEVER adopts a rail label", () => {
+  // A promoted write assigns the same value to the parent's authoritative RAIL widget,
+  // whose own list can be real and closed — so the #507 cross-check must run here too, or
+  // an unvalidated value lands in the serialized parent graph.
+  //
+  // What it must NOT inherit is #667's label ADOPTION. That rule is justified by "the
+  // inner list was EMPTY, so any scalar was admissible and the rail's own option is at
+  // least as valid" — false when the inner list exists and merely could not be read.
+  // Adopting there would write the rail's NUMBER 4444 onto a widget whose real, unread
+  // list may not contain it, and would silently replace the string the caller sent.
+  const inner = { id: 301, type: "FbxRenderer", widgets: [unreadableCombo("threw")] };
+  inner.widgets[0].name = "model";
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: [4444] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      { name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "model_alias", "4444", { ...ACCEPT_UNREADABLE, resolveSource }),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /not a valid option for the parent subgraph/.test(err.message) &&
+      // The message must describe the INNER observation truthfully. The empty-list
+      // wording asserted "the inner widget's option list is empty" about a list nobody
+      // had read — a statement the reader cannot act on because it is false.
+      /inner widget's option list could not be READ/.test(err.message) &&
+      !/inner widget's option list is empty/.test(err.message),
+  );
+  assert.equal(railWidget.value, "", "rail untouched — refused before any mutation");
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+
+  // The same shape lands when the rail's own list DOES contain the value: the rail
+  // validated it, so the cross-check is satisfied rather than bypassed.
+  const inner2 = { id: 301, type: "FbxRenderer", widgets: [unreadableCombo("threw")] };
+  inner2.widgets[0].name = "model";
+  const rail2 = { name: "model_alias", type: "combo", options: { values: ["4444"] }, value: "" };
+  const parent2 = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph: { _nodes: [inner2], getNodeById: (id) => (String(id) === "301" ? inner2 : null) },
+    inputs: [
+      { name: "model_alias", _widget: rail2, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [rail2],
+  };
+  const out = applyWidgetWrite(parent2, "model_alias", "4444", { ...ACCEPT_UNREADABLE, resolveSource });
+  assert.equal(out.value, "4444");
+  assert.equal(rail2.value, "4444");
+  assert.equal(inner2.widgets[0].value, "4444", "the caller's STRING, never a rail number");
+  // …and that IS a validation, so it must be reported as one. See the dedicated test below.
+  assert.equal(out.promoted_rail_validated, true);
+});
+
+test("#1126: a rail that VALIDATED the value is reported as having done so — the disclosure must not over-claim", () => {
+  // The write is disclosed as "unvalidated" because the TARGET widget's own list could not
+  // be read. On a promoted write that is only half the story: the sibling cross-check
+  // compares the value against the parent rail's list when that list is readable and
+  // non-empty, and proceeds ONLY on membership. So in exactly the case where the most
+  // checking happened, a flat "nothing checked the value" is false — and on a change whose
+  // entire value is telling the truth about what was and was not validated, an over-claimed
+  // disclosure is worse than a missing one.
+  const mkInner = () => {
+    const w = unreadableCombo("threw");
+    w.name = "model";
+    return { id: 301, type: "FbxRenderer", widgets: [w] };
+  };
+  const mkParent = (inner, rail) => ({
+    id: 320,
+    type: "SubgraphNode",
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [
+      { name: "model_alias", _widget: rail, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [rail],
+  });
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+
+  // Rail list READ, NON-EMPTY, CONTAINS the value ⇒ it validated it.
+  const innerA = mkInner();
+  const railA = { name: "model_alias", type: "combo", options: { values: ["a.fbx", "b.fbx"] }, value: "" };
+  const outA = applyWidgetWrite(mkParent(innerA, railA), "model_alias", "b.fbx", {
+    ...ACCEPT_UNREADABLE,
+    resolveSource,
+  });
+  assert.equal(outA.option_list_unreadable, true, "the target widget's own list still could not be read");
+  assert.equal(outA.promoted_rail_validated, true, "but the rail's list DID vouch for the value");
+
+  // Rail list EMPTY ⇒ skipped by the cross-check, so it vouched for nothing. The field must
+  // be ABSENT, not false: a reader that does not know it sees exactly what it saw before.
+  const innerB = mkInner();
+  const railB = { name: "model_alias", type: "combo", options: { values: [] }, value: "" };
+  const outB = applyWidgetWrite(mkParent(innerB, railB), "model_alias", "b.fbx", {
+    ...ACCEPT_UNREADABLE,
+    resolveSource,
+  });
+  assert.equal(outB.option_list_unreadable, true);
+  assert.equal(outB.promoted_rail_validated, undefined, "an empty rail list validates nothing");
+
+  // A DIRECT (non-promoted) write has no rail at all — nothing checked it, and the
+  // unqualified disclosure is the correct one.
+  const direct = { id: 4, type: "FbxRenderer", widgets: [unreadableCombo("threw")] };
+  direct.widgets[0].name = "model";
+  const outC = applyWidgetWrite(direct, "model", "x.fbx", ACCEPT_UNREADABLE);
+  assert.equal(outC.option_list_unreadable, true);
+  assert.equal(outC.promoted_rail_validated, undefined, "no rail exists, so none validated anything");
+});
+
+test("#1126: a DISPLAY PROXY match does not claim the serializing RAIL validated the value", () => {
+  // #477: one host input can reference TWO authenticated widgets — the AUTHORITATIVE rail
+  // (`_widget`, what serializes at queue time) and a parent-facing DISPLAY proxy
+  // (`input.widget`, a read-only mirror). The cross-check walks both. If it credited ANY
+  // sibling match, a promotion whose rail list is empty but whose proxy list holds the value
+  // would emit promoted_rail_validated — and the reply and the activity summary would both
+  // say the serializing rail vouched for a value it never listed. Nothing that gets QUEUED
+  // was checked, so the honest disclosure is the unqualified one.
+  const inner = unreadableCombo("threw");
+  inner.name = "model";
+  const innerNode = { id: 301, type: "FbxRenderer", widgets: [inner] };
+  // Rail: readable but EMPTY ⇒ the cross-check skips it, so it validated nothing.
+  const rail = { name: "model_alias", type: "combo", options: { values: [] }, value: "" };
+  // Display proxy: readable, non-empty, and it DOES contain the value.
+  const proxy = { name: "model_alias", type: "combo", options: { values: ["b.fbx"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph: { _nodes: [innerNode], getNodeById: (id) => (String(id) === "301" ? innerNode : null) },
+    inputs: [{ name: "model_alias", _widget: rail, widget: proxy, _subgraphSlot: { name: "model_alias" } }],
+    // BOTH must be live members of node.widgets, or identity authentication rejects them.
+    widgets: [rail, proxy],
+  };
+  const out = applyWidgetWrite(parent, "model_alias", "b.fbx", {
+    ...ACCEPT_UNREADABLE,
+    resolveSource: (_n, si) =>
+      si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null,
+  });
+  // The write still lands and still syncs both projections — only the CLAIM is narrowed.
+  assert.equal(
+    out.promoted_from.display_widgets_synced,
+    1,
+    "the proxy is a real display projection, and was synced",
+  );
+  assert.equal(proxy.value, "b.fbx");
+  assert.equal(rail.value, "b.fbx");
+  assert.equal(out.option_list_unreadable, true);
+  assert.equal(
+    out.promoted_rail_validated,
+    undefined,
+    "a proxy match proves nothing about what gets queued — the rail listed nothing",
+  );
+});
+
+test("#1126: readComboOptions reports WHICH observation, and comboOptions is unchanged", () => {
+  // The verdict callers act on is data, not a prose match. `comboOptions` keeps its
+  // null-means-unreadable contract so every pre-existing caller is untouched.
+  const threw = unreadableCombo("threw");
+  assert.deepEqual(
+    { unreadable: readComboOptions(threw).unreadable, reason: readComboOptions(threw).reason },
+    { unreadable: true, reason: "threw" },
+  );
+  assert.equal(readComboOptions(unreadableCombo("not_a_list")).reason, "not_a_list");
+  assert.equal(readComboOptions(unreadableCombo("absent")).reason, "absent");
+  const real = { name: "c", type: "combo", options: { values: () => ["a", "b"] }, value: "a" };
+  assert.deepEqual(readComboOptions(real).options, ["a", "b"]);
+  assert.equal(readComboOptions(real).unreadable, false);
+  assert.equal(comboOptions(threw), null);
+  assert.deepEqual(comboOptions(real), ["a", "b"]);
 });
