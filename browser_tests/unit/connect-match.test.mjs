@@ -12,7 +12,8 @@
  *   #169 — auto-match never silently clobbers an OCCUPIED dynamic wildcard ("*")
  *          input when no free wildcard slot exists yet; an explicit to_input
  *          still replaces deliberately.
- * Plus the invariant that genuinely incompatible types stay refused (#204).
+ * Plus the invariant that genuinely incompatible types stay refused (#204),
+ * and the same-node loopback refusal diagnostic (#1266).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -24,6 +25,7 @@ import {
   isTypeCompatible,
   isWildcardSlotType,
   slotDiagnostic,
+  loopbackRefusalReason,
 } from "../../web/js/lib/connect-match.js";
 
 // VHS_LoadVideo-shaped origin: IMAGE output at index 0, plus non-IMAGE outputs.
@@ -381,4 +383,72 @@ test("#651: a comma multi-type input is matched by ANY of its declared segments 
   // Exact-tier hit on the multi-type slot means the wildcard is never consulted.
   assert.deepEqual(typeMatchedIndices(target.inputs, "MASK"), [0]);
   assert.deepEqual(typeMatchedIndices(target.inputs, "IMAGE"), [0]);
+});
+
+// ---- #1266: a SAME-NODE (loopback) refusal is not a type mismatch -----------
+//
+// Reported: panel_connect from subgraph node 78 output 1 (CONDITIONING) to the
+// SAME node's unconnected input 3 (positive, CONDITIONING) was refused with
+// "No input on node 78 accepts type CONDITIONING" — while the diagnostic's own
+// slot listing showed [3] positive (CONDITIONING). Routing through a Reroute
+// succeeded, proving the types are compatible. LiteGraph's connect() guards
+// loopback unconditionally (`if (target_node == this) return null`) BEFORE any
+// type check, so the falsy link carries no type verdict; the generic
+// slotDiagnostic tail was reading it as one.
+
+// The reported subgraph node: CONDITIONING output at slot 1, CONDITIONING
+// input "positive" at slot 3.
+function subgraphNode78() {
+  return {
+    id: 78,
+    type: "SubgraphNode",
+    outputs: [
+      { name: "images", type: "IMAGE" },
+      { name: "CONDITIONING", type: "CONDITIONING" },
+    ],
+    inputs: [
+      { name: "model", type: "MODEL", link: 11 },
+      { name: "clip", type: "CLIP", link: 12 },
+      { name: "latent", type: "LATENT", link: null },
+      { name: "positive", type: "CONDITIONING", link: null },
+    ],
+  };
+}
+
+test("#1266: the loopback reason names the slots and states the types ARE compatible", () => {
+  const reason = loopbackRefusalReason(subgraphNode78(), 1, 3);
+  assert.match(reason, /to ITSELF/);
+  assert.match(reason, /loopback guard, not a type mismatch/);
+  assert.match(reason, /output "CONDITIONING" \(CONDITIONING\)/);
+  assert.match(reason, /input "positive" \(CONDITIONING\)/);
+  assert.match(reason, /Reroute/);
+});
+
+test("#1266: with the reason override the diagnostic KEEPS the slot listing but drops the false type tail", () => {
+  const node = subgraphNode78();
+  const msg = slotDiagnostic(node, node, {
+    from_output: 1,
+    to_input: 3,
+    reason: loopbackRefusalReason(node, 1, 3),
+  });
+  // The full slot listing is preserved — it was the reporter's evidence.
+  assert.match(msg, /\[3\] "positive" \(CONDITIONING\)/);
+  // The false "no input accepts type CONDITIONING" claim is gone.
+  assert.doesNotMatch(msg, /No input on node 78 accepts type/);
+  assert.match(msg, /loopback guard, not a type mismatch/);
+});
+
+test("#1266: without the override the same refusal still shows the OLD (false) tail — the override is what fixes it", () => {
+  const node = subgraphNode78();
+  const msg = slotDiagnostic(node, node, { from_output: 1, to_input: 3 });
+  assert.match(msg, /No input on node 78 accepts type CONDITIONING/);
+});
+
+test("#1266: a genuinely incompatible same-node pair is not CALLED compatible — the guard verdict stays honest", () => {
+  const node = subgraphNode78();
+  // output 0 (IMAGE) → input 3 (CONDITIONING): LiteGraph would refuse on the
+  // loopback guard first, so the message must not claim a type verdict either way.
+  const reason = loopbackRefusalReason(node, 0, 3);
+  assert.match(reason, /refuses before any type check runs/);
+  assert.doesNotMatch(reason, /ARE type-compatible/);
 });

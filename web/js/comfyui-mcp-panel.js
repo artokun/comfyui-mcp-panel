@@ -353,7 +353,7 @@ import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
-import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
+import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
 import {
   snapshotGraphState,
@@ -11775,7 +11775,19 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     if (!link) {
-      throw new Error(slotDiagnostic(origin, target, { from_output, to_input }));
+      // #1266: LiteGraph's connect() refuses a node→ITSELF link unconditionally
+      // ("avoid loopback": `if (target_node == this) return null`) BEFORE any
+      // type check — so for a same-node request the computed slotDiagnostic tail
+      // ("No input on node N accepts type X") is a FALSE type mismatch: the
+      // refusal says nothing about the slots' types. Keep the full slot listing
+      // but override the tail with the actual restriction.
+      throw new Error(
+        slotDiagnostic(origin, target, {
+          from_output,
+          to_input,
+          ...(origin === target ? { reason: loopbackRefusalReason(origin, outIdx, inIdx) } : {}),
+        }),
+      );
     }
     // #397 CONNECT HONESTY: origin.connect() can return a truthy link that LiteGraph
     // does NOT persist — a WIDGET-backed target input (rgthree/Impact nodes expose
