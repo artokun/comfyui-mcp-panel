@@ -66,6 +66,7 @@
 // so that path threw ReferenceError rather than refusing cleanly (#1136 sweep).
 import { resolvePromotedInnerTarget } from "./lib/widget-write.js";
 import { describeVoiceError } from "./lib/voice-error.js";
+import { voiceRecognitionLang } from "./lib/voice-language.js";
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
@@ -33271,7 +33272,10 @@ function buildPanel() {
       return;
     }
     recognition = new SR();
-    recognition.lang = navigator.language || "en-US";
+    // Dictate in the language the PANEL is speaking (#1289): currentLocale() already
+    // encodes the explicit panel setting → ComfyUI locale → navigator precedence, so
+    // the browser's own language is only a fallback for an unresolved panel.
+    recognition.lang = voiceRecognitionLang({ panelLocale: currentLocale(), browserLang: navigator.language });
     recognition.continuous = true;
     recognition.interimResults = false;
     recognition.addEventListener("result", (ev) => {
