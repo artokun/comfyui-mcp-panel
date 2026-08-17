@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-17
+
+### Added
+- opening the panel can now START the local MCP orchestrator for you, with a chooser for the LLM provider. The companion launcher binds loopback-only behind a 32-byte token; the pack proxies it so the token never reaches the browser, and the proxy refuses a declared Origin that is not the Host the browser addressed — a plain cross-tab form post can no longer start the process on your behalf (#1243)
+- `panel_set_widget` can CREATE an rgthree `lora_N` slot: writing `lora_1` on a fresh node mints the row instead of being refused for a widget only the node's DOM-only "Add Lora" button could bring into existence. Keyed on node type, the `lora_<n>` name shape and a lora-slot-shaped value, so an ordinary typo cannot reach it (#757)
+
+### Fixed
+- a voice-dictation error now names the cause and the way out, not just the Web Speech code (#1288)
+- dictation listens in the panel's language, not the browser's (#1289)
+- the desktop app disables dictation with the reason, instead of failing on every click (#1290)
+- a search limit above the cap is disclosed as limit_cap, not silently honored (#1287)
+
+
 ## [0.14.44] - 2026-08-16
 
 ### Fixed
