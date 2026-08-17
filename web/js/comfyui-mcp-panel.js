@@ -215,6 +215,7 @@ import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/objec
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
 import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
+import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
@@ -12050,6 +12051,35 @@ const GRAPH_TOOL_EXECUTORS = {
     // seed keeps running, so a late response still establishes the baseline and the next
     // call authorizes normally — ordinary latency must never burn the session.
     await awaitObjectInfoHistorySeed();
+    // #757 — MINT an rgthree Power Lora Loader row when the write targets one that does not
+    // exist yet. Those rows are created only by the node's own "➕ Add Lora" button, a
+    // DOM-only control an agent cannot click, so every write to `lora_1` on a fresh node was
+    // refused for a widget no tool could bring into existence. Writing an EXISTING row
+    // already worked; this is the creation half.
+    //
+    // The classifier is keyed on node TYPE + the `lora_<n>` name shape + a lora-slot-shaped
+    // VALUE, all three. That is what keeps it away from the deliberate refusal to auto-press
+    // a control on an ordinary typo — see lib/rgthree-lora-row.js.
+    //
+    // NOT CREATED HERE. The row is minted by the `prepareWriteTarget` hook below, which
+    // runSetWidget invokes at its synchronous write boundary — after the history seed that
+    // makes the #458 authorization meaningful, after the fresh-/object_info await, after the
+    // workflow fence, immediately before applyWidgetWrite, with no await between the
+    // creation, the write and the undo. The now-present widget then resolves through the
+    // ordinary path, so the composite merge and the #240 verify are unchanged.
+    //
+    // Creating it at THIS point instead — before runSetWidget is even entered — is what
+    // produced every serious defect this feature has had, because it left a live graph
+    // mutation sitting across a network request: an undo transaction that could never be
+    // closed if the user switched tabs, a concurrent frame whose write got rolled back
+    // under it, and a user's own hand-edit exposed to a rollback that had nothing to do
+    // with them. Moving the mutation past the await removes the window rather than
+    // guarding it, so the guards those defects each needed are gone.
+    //
+    // It is still ONE undo step: ChangeTracker captures whole-graph SNAPSHOTS rather than
+    // deltas, and the pair runSetWidget opens for the write now closes with the row already
+    // present, so the single entry it records covers the creation and the assign together.
+    let createdLoraRow = null;
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
@@ -12064,6 +12094,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // #284/#304, keeping #240 strictness).
     // #1126 round-5 — bound to a name so the two cache entry points below can share the one
     // oracle body (`readObjectInfo`) instead of each keeping a copy that would drift.
+    //
+    // The options are HOISTED into a const so the call itself can sit inside the
+    // try/catch/finally below without re-indenting ~180 lines of unrelated option literal,
+    // and so the #757 transaction bookkeeping is readable AT the call rather than stranded
+    // past the end of a very long argument.
     const setWidgetOpts = {
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
@@ -12212,6 +12247,40 @@ const GRAPH_TOOL_EXECUTORS = {
       beforeChange: () => graph.beforeChange(),
       afterChange: () => graph.afterChange(),
       setDirty: () => graph.setDirtyCanvas(true, true),
+      // #757 — MINT a missing rgthree `lora_N` row, at the write boundary and nowhere else.
+      // runSetWidget calls this synchronously after its workflow fence and immediately
+      // before applyWidgetWrite, and calls the returned `undo` if the write refuses — so
+      // the creation, the write and its rollback are one uninterruptible stretch.
+      //
+      // Idempotent by construction, and RE-ENTERED PER ATTEMPT: runSetWidget's stale-combo
+      // and upload-asset recoveries undo this preparation before their await and call it
+      // again on the retry, so the classifier's requirement that the row be ABSENT is
+      // satisfied each time and no second row is ever minted.
+      //
+      // `createdLoraRow` therefore tracks the LAST attempt: set when the row really exists,
+      // cleared when an undo really removed it. The clearing is belt-and-braces today —
+      // every refusal in this command throws, so the disclosure below is only reached after
+      // an attempt that SUCCEEDED — and it is what keeps the field in step with the graph if
+      // a future path ever returns a result over an undone creation instead.
+      prepareWriteTarget: () => {
+        if (!isRgthreeLoraRowCreation(node, widget, value)) return null;
+        const made = createRgthreeLoraRow(node, widget, {
+          setDirty: () => graph.setDirtyCanvas(true, true),
+        });
+        createdLoraRow = made.created;
+        return {
+          // Returns the row-creation's own disclosure when the rollback was INCOMPLETE (the
+          // pack hides or freezes its counter, so the row name stayed spent), which
+          // runSetWidget appends to the refusal. A caller told only "that value is invalid"
+          // would retry the same `lora_N` and hit a differently-named row.
+          undo: () => {
+            const undone = made.remove();
+            if (undone.removed) createdLoraRow = null;
+            graph.setDirtyCanvas(true, true);
+            return undone.incomplete;
+          },
+        };
+      },
       // #718: the first command-handler fence ran before awaitObjectInfoHistorySeed()
       // and the fresh /object_info request. A user can switch workflows while either
       // promise is pending, so re-read the ACTIVE uuid at the exact shared write
@@ -12277,6 +12346,8 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       },
     };
+    // The creation and its rollback both live inside this call now, at the synchronous write
+    // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
     const result = await runSetWidget(node, widget, value, setWidgetOpts);
 
     // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
@@ -12310,10 +12381,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // than in `warning`. That channel is single-slot and priority-ordered (link-driven
     // outranks control_after_generate), so appending here would silently displace a warning
     // about what the write actually DOES — a strictly worse trade than a separate field.
+    // #757 — DISCLOSE that the row did not exist and was minted. The caller asked to set a
+    // widget and the panel also GREW the node, which is a structural change to the graph;
+    // reporting only the value write would hide it. Its own field, for the same reason the
+    // #1223 provenance note has one: `warning` is single-slot and priority-ordered.
+    const withCreation = (r) =>
+      createdLoraRow !== null && r && typeof r === "object"
+        ? { ...r, created_widget: createdLoraRow }
+        : r;
     if (setWidgetSchemaFromSnapshot !== null && result && typeof result === "object") {
-      return { ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) };
+      return withCreation({ ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) });
     }
-    return result;
+    return withCreation(result);
   },
 
   // artokun/comfyui-mcp#938: remove ONE dynamic widget row (rgthree Power Lora Loader

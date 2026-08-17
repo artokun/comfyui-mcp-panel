@@ -42,6 +42,23 @@ import {
   serverDeclaresEmptyComboOptions,
 } from "./input-asset.js";
 
+/**
+ * Fire an undo-history hook that can never escape.
+ *
+ * Mirrors widget-write.js's own `safeBefore`/`safeAfter`: history bookkeeping is best-effort,
+ * and a throwing `graph.onBeforeChange` / `onAfterChange` must never decide the outcome it is
+ * merely bracketing. Used around the created-target cleanup, where an escaping OPEN would
+ * skip the cleanup entirely (leaving the row and the row name it spent) and an escaping CLOSE
+ * would replace the refusal the caller actually needs to read.
+ */
+function safeHistoryHook(hook) {
+  try {
+    hook?.();
+  } catch {
+    /* history hook is best-effort */
+  }
+}
+
 /** A never-throwing rendering of an advisory failure. Used on the POST-WRITE path, where
  *  a second exception (a getter on `message`, a null throw) must not escape either. */
 function coerceAdvisoryMessage(err) {
@@ -129,6 +146,12 @@ export async function runSetWidget(
     // OUTCOME the ladder needs — a fresh answer — and leaves the cache to decide how to get
     // one without disturbing anybody else.
     refetchObjectInfoLive,
+    // #757 — SYNCHRONOUS target preparation. Some write targets do not exist until
+    // something creates them (an rgthree Power Lora Loader `lora_N` row is minted only by
+    // the node's own method), and the creation is a graph MUTATION. Injected here, rather
+    // than done by the caller before this function, so the mutation lands at the write
+    // boundary below where NO await follows it — see the note at `write`.
+    prepareWriteTarget,
   } = {},
 ) {
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
@@ -459,16 +482,106 @@ export async function runSetWidget(
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
     assertTargetStillCurrentNow();
-    return applyWidgetWrite(node, widgetName, value, {
-      resolveSource,
-      canvas,
-      beforeChange,
-      afterChange,
-      setDirty,
-      assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
-      promotedResolution,
-      ...extra,
-    });
+    // #757 — CREATE A MISSING TARGET HERE, INSIDE THE SAME SYNCHRONOUS STRETCH.
+    //
+    // A target that must be minted before it can be written (an rgthree `lora_N` row) used
+    // to be created by the CALLER, before `runSetWidget` was even entered. That put a live
+    // graph mutation on the far side of `await getFreshObjectInfo()`, and everything that
+    // went wrong with this feature came from that one gap:
+    //   - the row sat in the graph across a network request, so any ChangeTracker capture
+    //     in that window recorded a transient row and split the command's undo in two;
+    //   - a user hand-editing the node during the window could have their edit rolled back
+    //     by a failure that had nothing to do with them — losing a manual edit is worse
+    //     than the missing-widget refusal this feature exists to remove;
+    //   - a concurrent command frame could write the row and be told it succeeded, only
+    //     for the original call's rollback to delete it.
+    // Placed here, none of those windows exist: `applyWidgetWrite` is synchronous, so
+    // nothing — no other command frame, no user gesture, no user edit — can run between the
+    // creation, the write and the undo below. The guards those three defects each needed
+    // are removed rather than kept, because the interleaving they defended against is now
+    // unreachable. (The one thing that DOES happen in between is applyWidgetWrite's own
+    // history capture, which is the same one every ordinary write takes — see below.)
+    //
+    // AFTER the fence, so a workflow switch during the fetch refuses before the mutation.
+    // Called once per attempt and expected to be idempotent: the stale-combo and upload
+    // retries re-enter `write`, and by then the target it created already exists.
+    //
+    // THE CLEANUP GETS ITS OWN ENVELOPE, AND THE WRITE KEEPS ITS OWN VERIFICATION ORDER.
+    //
+    // An earlier version wrapped preparation, write and cleanup in ONE outer envelope so that
+    // a refused creating write took no capture until the very end. That inverted something
+    // load-bearing. `applyWidgetWrite` deliberately verifies AFTER its own afterChange has
+    // fired — see widget-write.js: "an afterChange hook can itself re-stale a widget or
+    // change the promotion topology, and that must be caught too". Nesting its envelope
+    // inside another one means its close never reaches zero, so the CAPTURE — and every pack
+    // `serializeValue` that the capture's serialization runs — happens after the last
+    // verification. An rgthree loader in Separate Model & Clip mode rewrites
+    // `strengthTwo: null` to 1 exactly there, and the creating path then reported plain
+    // success for a value an EXISTING-row write would have reported as normalized.
+    //
+    // THE ASYMMETRY WAS THE TELL. Creation must report whatever an ordinary write reports for
+    // the same value, and the only way it can is by being verified the same way. So
+    // applyWidgetWrite is called with nothing wrapped around it, exactly as every other write
+    // path calls it, and only the CLEANUP is bracketed.
+    //
+    // What the cleanup's own envelope buys is the sound half of that earlier finding: the
+    // NEWEST capture is the graph as it really finished, instead of a row-present snapshot of
+    // a command that was refused.
+    //
+    // WHAT IT DELIBERATELY DOES NOT BUY, because no write path can: a refused write is not a
+    // no-op in the undo history. applyWidgetWrite captures its write, then captures its
+    // rollback in a second envelope of its own, so an ORDINARY refused write already leaves
+    // two snapshots a Ctrl+Z can step back into. A refused creating write now leaves three and
+    // behaves the same way. Suppressing those intermediate captures is only reachable by
+    // holding one envelope across the verification — i.e. by reintroducing the defect above.
+    // Symmetry with the ordinary write is the property worth having; being better than the
+    // shared write path is not on offer, and pretending otherwise is what cost a round.
+    const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
+    try {
+      return applyWidgetWrite(node, widgetName, value, {
+        resolveSource,
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+        assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
+        promotedResolution,
+        ...extra,
+      });
+    } catch (err) {
+      // The write refused over a target this attempt had just created. Undo it in the same
+      // synchronous stretch, so the graph the refusal is reported over is the graph the
+      // command started from — and so a retry below starts from a clean node rather than
+      // finding a row it would then decline to create again.
+      if (prepared) {
+        // BOTH HOOKS ARE BEST-EFFORT, mirroring widget-write's own safeBefore/safeAfter. A
+        // graph whose onBeforeChange throws must not cost us the cleanup — the row AND the
+        // row name it spent would be left behind while an error was returned. And a throwing
+        // close must never replace the refusal that is the entire reason we are here: the
+        // caller needs to know why its write was rejected, not that a history hook failed.
+        safeHistoryHook(beforeChange);
+        try {
+          // An undo that could NOT put everything back RETURNS A STRING SAYING SO, and the
+          // refusal carries it. Without this the caller hears only why the value was
+          // rejected, while a resource the preparation consumed stays consumed — and the
+          // obvious next move, retrying the corrected value under the same name, fails a
+          // second time for a reason the first message never mentioned.
+          //
+          // Annotated IN PLACE rather than rethrown as a new error: the recovery paths below
+          // dispatch on `instanceof WidgetWriteError` and on `.combo` / `.emptyOptions`, and
+          // wrapping would strip all three and turn a retryable combo miss into a hard fail.
+          const note = prepared.undo?.();
+          if (typeof note === "string" && note && typeof err?.message === "string") {
+            err.message = `${err.message} ${note}`;
+          }
+        } catch {
+          /* an undo that fails must never replace the refusal that caused it */
+        } finally {
+          safeHistoryHook(afterChange);
+        }
+      }
+      throw err;
+    }
   };
 
   // #558: the value widget being written may be governed by a non-`fixed`
