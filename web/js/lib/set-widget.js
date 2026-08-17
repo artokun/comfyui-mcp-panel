@@ -15,6 +15,9 @@
 //      on a genuinely-resolved direct node (never a placeholder).
 //   3. applyWidgetWrite with the resolved-target registry guard, which runs
 //      BEFORE value coercion and any mutation/callback.
+// Post-write, inside the same synchronous boundary (#1282): refresh the node's
+// dynamic input slots via its own "Update inputs"-style control when it exposes
+// one — disclosed on the success result, never thrown over a verified write.
 
 import {
   applyWidgetWrite,
@@ -35,6 +38,7 @@ import {
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
+import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
@@ -538,7 +542,7 @@ export async function runSetWidget(
     // shared write path is not on offer, and pretending otherwise is what cost a round.
     const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
     try {
-      return applyWidgetWrite(node, widgetName, value, {
+      const set = applyWidgetWrite(node, widgetName, value, {
         resolveSource,
         canvas,
         beforeChange,
@@ -548,6 +552,44 @@ export async function runSetWidget(
         promotedResolution,
         ...extra,
       });
+      // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
+      // landed on, inside the SAME synchronous stretch (no await since the fence, so
+      // the press cannot interleave with a workflow switch or another command frame).
+      //
+      // The write already fired the widget's own callback the way an interactive edit
+      // does — with the canvas argument — and KJNodes' *Multi nodes take that exact
+      // argument as the deliberate tell to SKIP their slot rebuild (scrubbing a count
+      // must not reflow the node under the user's cursor; their `setupDynamicInputs`
+      // rebuilds only on a bare, canvas-less invocation). Their deferred rebuild lives
+      // behind the node's own "Update inputs" button, so a verified write to
+      // `inputcount` reported success while image_3… never came into existence and
+      // every follow-up read served the stale slot list. Pressing that control after
+      // the write is the same gesture the interactive user performs, it is idempotent
+      // (a no-op when the slots already match), and it is verified by its EFFECT —
+      // a control that accepts the call and changes nothing is never reported as a
+      // refresh. See lib/dynamic-inputs-refresh.js for the keying and why it is not
+      // a node-type list.
+      //
+      // Runs AFTER applyWidgetWrite's own verification, so the write's verdict never
+      // depends on the refresh; a refresh failure is DISCLOSED on the success result,
+      // never thrown over a verified write. The press runs inside its own
+      // before/afterChange bracket so the slot changes join the command's undo
+      // history.
+      const refresh = refreshDynamicInputsAfterWrite(resolvedTargetNode ?? node, {
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+      });
+      if (!refresh) return set;
+      if (refresh.failed) {
+        return {
+          ...set,
+          dynamic_inputs_refresh_failed: refresh.failed,
+          ...(refresh.inputs ? { dynamic_inputs: refresh.inputs } : {}),
+        };
+      }
+      return { ...set, dynamic_inputs_refreshed: true, dynamic_inputs: refresh.inputs };
     } catch (err) {
       // The write refused over a target this attempt had just created. Undo it in the same
       // synchronous stretch, so the graph the refusal is reported over is the graph the
