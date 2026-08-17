@@ -12099,7 +12099,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // try/catch/finally below without re-indenting ~180 lines of unrelated option literal,
     // and so the #757 transaction bookkeeping is readable AT the call rather than stranded
     // past the end of a very long argument.
-    const setWidgetOptions = {
+    const setWidgetOpts = {
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
@@ -12218,14 +12218,14 @@ const GRAPH_TOOL_EXECUTORS = {
       },
       // The ORDINARY entry: read through the #716 burst cache.
       getFreshObjectInfo: async () =>
-        setWidgetOptions.readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts)),
+        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts)),
       // #1126 — the LAST-RESORT entry: force a genuinely fresh read when the provenance is not
       // live. `readFresh` bypasses only the stored entry and coalesces concurrent rereads, so
       // two writes reaching this path together share one request instead of each globally
       // invalidating — which used to retire the other's just-issued request and refuse a write
       // that was perfectly valid.
       refetchObjectInfoLive: async () =>
-        setWidgetOptions.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
+        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
       // What the last oracle attempt observed, so a refusal can say which routes were
       // tried and what each one did instead of asserting an unreachable backend — then,
       // separately, why the last-observed schema could not stand in for them either.
@@ -12348,7 +12348,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
     // The creation and its rollback both live inside this call now, at the synchronous write
     // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
-    const result = await runSetWidget(node, widget, value, setWidgetOptions);
+    const result = await runSetWidget(node, widget, value, setWidgetOpts);
 
     // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
     // missing asset (or an invalid value) to a valid one drops the missing-asset
