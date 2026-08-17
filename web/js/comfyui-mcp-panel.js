@@ -65,6 +65,7 @@
 // Used by the unpack preflight's divergence scan. It was called without ever being imported,
 // so that path threw ReferenceError rather than refusing cleanly (#1136 sweep).
 import { resolvePromotedInnerTarget } from "./lib/widget-write.js";
+import { describeVoiceError } from "./lib/voice-error.js";
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
@@ -33283,8 +33284,10 @@ function buildPanel() {
     });
     recognition.addEventListener("error", (ev) => {
       // `ev.error` is the Web Speech API's own code ("no-speech", "network") — an
-      // identifier, not prose, so it rides in as a placeholder.
-      if (ev.error !== "aborted") appendSystem(tr("panel.voice_input_error", "Voice input error: {error}", { error: ev.error }));
+      // identifier, not prose. describeVoiceError turns it into actionable guidance
+      // (#1288) and returns null for "aborted", which just means the user stopped it.
+      const msg = describeVoiceError(ev.error);
+      if (msg) appendSystem(msg);
     });
     micBtn.classList.add("active");
     recognition.start();
