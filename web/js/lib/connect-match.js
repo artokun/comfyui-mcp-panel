@@ -12,6 +12,9 @@
 //   #169 — auto-match must never silently clobber an OCCUPIED dynamic wildcard
 //          ("*") input (rgthree Fast Bypasser / Power Lora) when no free
 //          wildcard slot is available yet.
+//   #1266 — a LiteGraph refusal on a SAME-NODE (loopback) connect is not a
+//          type mismatch: loopbackRefusalReason replaces the computed
+//          "no input accepts type X" tail that falsely blamed the slots' types.
 
 export const SLOT_RANK_EXACT = 2;
 export const SLOT_RANK_WILD = 1;
@@ -181,6 +184,31 @@ export function slotDiagnostic(origin, target, requested = {}) {
     `Node ${origin.id} outputs: ${outs || "none"}\n` +
     `Node ${target.id} inputs:  ${ins || "none"}\n` +
     tail
+  );
+}
+
+/** #1266 — the honest failure tail when LiteGraph refused a connection whose
+ *  ORIGIN and TARGET are the SAME node. LiteGraph's connect() guards loopback
+ *  unconditionally (`if (target_node == this) return null`) BEFORE any type
+ *  check runs, so slotDiagnostic's computed "no input accepts type X" tail is
+ *  a FALSE type mismatch here: the refusal says nothing about the slots'
+ *  types. Names the resolved slot pair, states the verdict the panel's OWN
+ *  predicate gives (without claiming LiteGraph agreed — it never looked), and
+ *  points at the Reroute workaround the reporter verified. Only a reason
+ *  string; the caller passes it as slotDiagnostic's `reason` override so the
+ *  full slot listing is kept. */
+export function loopbackRefusalReason(node, outIdx, inIdx) {
+  const out = node.outputs?.[outIdx];
+  const inp = node.inputs?.[inIdx];
+  const pair =
+    `output "${out?.name ?? outIdx}" (${renderSlotType(out?.type)}) → ` +
+    `input "${inp?.name ?? inIdx}" (${renderSlotType(inp?.type)})`;
+  const verdict = isTypeCompatible(out?.type, inp?.type)
+    ? "the slots ARE type-compatible — this is LiteGraph's loopback guard, not a type mismatch"
+    : "the loopback guard refuses before any type check runs, so this refusal is not a type verdict";
+  return (
+    `LiteGraph refuses a connection from a node to ITSELF (${pair}): ${verdict}. ` +
+    `Route through a Reroute node to wire the node's own output back to its input.`
   );
 }
 
