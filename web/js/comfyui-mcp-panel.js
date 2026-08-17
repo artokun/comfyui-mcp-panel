@@ -155,6 +155,7 @@ import {
   pruneGroundingIdentities,
   groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
+import { decideWorkflowSaveVerdict, workflowSaveRefusalError } from "./lib/save-path-guard.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
@@ -2888,6 +2889,101 @@ function installCreateBoundaryFork(appRef) {
     try {
       console.warn(
         "[comfyui-mcp] creation-boundary fork failed to install; unsaved-workflow resume disabled (fail-closed)",
+        err,
+      );
+    } catch {}
+  }
+}
+
+// #1667 P0 — SAVE-PATH GUARD. The creation-boundary fork above guards who ENTERS a
+// canvas; this guards who LEAVES it for disk. ComfyUI persists a tab's canvas through
+// `workflowStore.saveWorkflow` (autosave "after delay", Ctrl+S, the reconnect/session
+// restore flows all funnel there) and serializes `changeTracker.activeState` verbatim
+// to the tab's path WITHOUT checking the content belongs to that path. When a stale
+// canvas — another workflow's graph — is mounted under a tab (the crossed-identity
+// failure of #1639), that persist overwrites the tab's file with the foreign graph and
+// the original is destroyed (#1667: a user's saved workflow .json was replaced by a
+// different workflow's 15-node graph, unrecoverably, with no panel command involved).
+//
+// The guard refuses exactly ONE shape, the one the destroyed file itself evidenced:
+// the state about to be written is stamped `extra.comfyui_mcp.workflow_path` naming a
+// DIFFERENT workflow that still exists, while the destination is an existing on-disk
+// file. Everything else — no stamp, matching stamp, rename residue (stamped path gone),
+// a never-persisted destination (Save-As copy) — is allowed; see save-path-guard.js for
+// why each of those is not provable foreign. A refusal throws BEFORE the write, so the
+// disk is never touched, and the message names both readings and the re-bind recovery.
+//
+// Installed on the workflow STORE, not per ComfyWorkflow object: the store's
+// `saveWorkflow` is the single funnel the service, the autosave watcher, and the keymap
+// all call, and the store hands out Vue proxies of records created long after this
+// installs. The panel's own panel_save_workflow path passes through the same wrapper —
+// it reaches it already fenced by the #708 wrong-canvas guard, so a healthy panel save
+// satisfies the stamp check; a crossed one is refused here too, which is the point.
+let _savePathGuardInstalled = false;
+const _savePathGuardRefusalsLogged = new Set();
+function installSavePathGuard(appRef) {
+  try {
+    if (_savePathGuardInstalled) return;
+    const svc = appRef?.extensionManager?.workflow;
+    if (!svc || typeof svc.saveWorkflow !== "function") {
+      // The store is not there to wrap — saves proceed UNGUARDED. Say so, once, the
+      // same way the fork's install failure is surfaced: a silent absence here is the
+      // exact condition that let #1667 through.
+      console.warn(
+        "[comfyui-mcp] save-path guard NOT installed: workflow store saveWorkflow is unavailable " +
+          "on this frontend — frontend-initiated saves are not checked against the canvas identity stamp.",
+      );
+      return;
+    }
+    const orig = svc.saveWorkflow.bind(svc);
+    svc.saveWorkflow = async function (wf, ...rest) {
+      let verdict = { allow: true };
+      try {
+        // Verify the EXACT state the write serializes (ComfyWorkflow.save() stringifies
+        // `activeState`), not the live root — the two can differ, and the file gets
+        // this one. `getWorkflowByPath` answers existence from the store's own records;
+        // a lookup failure degrades to "not persisted"/"not owned" — ALLOW, never a
+        // guessed refusal.
+        const state = wf?.changeTracker?.activeState ?? wf?.activeState ?? null;
+        const stampedPath =
+          state?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_PATH_FIELD] ?? null;
+        const destRecord =
+          typeof svc.getWorkflowByPath === "function" && wf?.path ? svc.getWorkflowByPath(wf.path) : null;
+        const stampedRecord =
+          stampedPath && typeof svc.getWorkflowByPath === "function"
+            ? svc.getWorkflowByPath(stampedPath)
+            : null;
+        verdict = decideWorkflowSaveVerdict({
+          destinationPath: wf?.path ?? null,
+          destinationPersisted: Boolean(destRecord) && destRecord?.isTemporary !== true,
+          stampedPath: typeof stampedPath === "string" && stampedPath ? stampedPath : null,
+          stampedPathOwnedByOther: Boolean(stampedRecord) && !sameWorkflowObject(stampedRecord, wf),
+        });
+      } catch {
+        verdict = { allow: true }; // a guard that cannot read its evidence must never invent a refusal
+      }
+      if (!verdict.allow) {
+        const refusal = workflowSaveRefusalError(verdict);
+        // The autosave watcher logs a one-line "Auto save failed" for a thrown save;
+        // make the refusal itself unmistakable in the console — but once per crossing,
+        // not once per autosave retry.
+        const key = `${verdict.destinationPath}<-${verdict.stampedPath}`;
+        if (!_savePathGuardRefusalsLogged.has(key)) {
+          _savePathGuardRefusalsLogged.add(key);
+          try {
+            console.warn(`[comfyui-mcp] ${refusal.message}`);
+          } catch {}
+        }
+        throw refusal;
+      }
+      return orig(wf, ...rest);
+    };
+    _savePathGuardInstalled = true;
+  } catch (err) {
+    _savePathGuardInstalled = false;
+    try {
+      console.warn(
+        "[comfyui-mcp] save-path guard failed to install; frontend-initiated saves are NOT stamp-checked",
         err,
       );
     } catch {}
@@ -34888,6 +34984,13 @@ function registerExtensionWhenReady(tries = 0) {
     // never persist a raw value here. See panelSettingsList() above.
     settings: panelSettingsList(),
     async setup() {
+      // #1667 P0 — wrap the workflow store's saveWorkflow with the stale-canvas
+      // persist guard FIRST, before any of the below can trigger a graph change that
+      // the frontend autosave would persist unchecked. setup() runs post-app-init, so
+      // the pinia workflow store (app.extensionManager.workflow) exists here; if it
+      // does not, the installer says so loudly and saves proceed unguarded — disclosed,
+      // never silent.
+      installSavePathGuard(app);
       // FIRST: resolve the language and pull the catalog, before anything paints. Every
       // failure path inside resolves to an English panel rather than throwing, so this
       // cannot block startup — but it must be AWAITED, because a catalog that arrives
