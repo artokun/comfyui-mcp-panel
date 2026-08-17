@@ -433,6 +433,9 @@ import {
   canvasFileDivergenceNote,
 } from "./lib/canvas-file-divergence.js";
 import { mergeProviderSnapshots } from "./lib/provider-snapshot-merge.js";
+import { providerDiscoveryDecision } from "./lib/provider-autoselect.js";
+import { choiceModal } from "./cmcp-modal.js";
+import { migrateAutostartValue, panelOpenAction } from "./lib/mcp-autostart-policy.js";
 import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
@@ -3874,7 +3877,11 @@ const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 // ones, whose stale pre-single-port values (e.g. a migrated custom port) must not
 // leak in and make the panel dial a dead port.
 const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
-const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
+const LEGACY_SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
+const SETTING_AUTOSTART_MCP = "comfyui-mcp.autostartMcp";
+const AUTOSTART_MIGRATED_KEY = "comfyui-mcp.autostartMcpMigrated";
+const PROVIDER_CHOICE_CONFIRMED_KEY = "comfyui-mcp.providerChoiceConfirmed";
+const PROVIDER_CHOICE_MIGRATED_KEY = "comfyui-mcp.providerChoiceMigrated";
 // Panel language. "" means Detect, which defers to ComfyUI's own `Comfy.Locale` and only
 // then to the browser — so the default behaviour is to follow the language the user already
 // chose for ComfyUI rather than to compete with it. An explicit value overrides that.
@@ -4004,7 +4011,7 @@ const panelHooks = {
   applyModel: null, // (id)
   applyEffort: null, // (id|"")
   applyBridgeUrl: null, // (url)
-  applyAutoConnect: null, // (bool)
+  applyAutostartMcp: null, // (bool)
   applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
   applyAgentModelConfig: null, // () — push preferred models + ollama endpoint config
   applyMobileBeta: null, // (bool) — show/hide the header Remote-control (QR) button
@@ -4814,18 +4821,17 @@ function panelSettingsList() {
     // persisted by the orchestrator). chatScopeMode() is hard-wired to "panel";
     // a stored "workflow"/"ask" value from an older build is simply ignored.
     {
-      id: SETTING_AUTOCONNECT,
-      name: "Auto-connect on load",
-      get category() { return cat(tr("panel.general", "General"), "Auto-connect on load"); },
+      id: SETTING_AUTOSTART_MCP,
+      name: "Autostart MCP",
+      get category() { return cat(tr("panel.general", "General"), "Autostart MCP"); },
       sortOrder: 145,
       tooltip:
-        "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
-        "Off by default — the orchestrator is otherwise only started by an explicit Connect click.",
+        "When this panel opens, ask the explicitly installed companion launcher to open a terminal running MCP if it is not already running.",
       type: "boolean",
-      defaultValue: false,
+      defaultValue: true,
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAutoConnect?.(!!v);
+        panelHooks.applyAutostartMcp?.(!!v);
       },
     },
     {
@@ -18789,11 +18795,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // orchestrator is behind it. A handshake that ended no outage records nothing (see
     // the tracker in session-rebind.js).
     bridgeOutage.noteHandshake();
-    // Remember the user wants the agent connected, so we auto-reconnect after a
-    // ComfyUI reboot / panel reopen (until they explicitly Disconnect). Mirror it
-    // into the "Auto-connect on load" setting so the toggle reflects reality.
+    // Remember the user wants the agent connected, so bridge recovery can resume
+    // after a ComfyUI reboot / panel reopen until they explicitly Disconnect.
+    // This is connection intent only; Autostart MCP is an independent setting.
     lsSet(AUTOCONNECT_KEY, "1");
-    setSetting(SETTING_AUTOCONNECT, true);
     // The REAL handshake landed — this is the ONLY place patience resets. A bare
     // WS open must NOT reset it: an orchestrator that repeatedly opens-then-closes
     // before sending `models` (crash loop / agent boot failure / a wrong process
@@ -22652,13 +22657,27 @@ function buildPanel() {
     "display:flex;gap:0.375rem;flex-wrap:wrap;margin-bottom:0.5rem;";
   // The backend the user last picked (so the active chip is highlighted across
   // reopens). Defaults to claude for back-compat.
-  let selectedBackend = (() => {
+  const savedBackendAtMount = (() => {
     try {
-      return window.localStorage.getItem(STORAGE_KEY_BACKEND) || "claude";
+      return window.localStorage.getItem(STORAGE_KEY_BACKEND);
     } catch {
-      return "claude";
+      return null;
     }
   })();
+  let selectedBackend = savedBackendAtMount || "claude";
+  // One-time compatibility migration: an existing runtime/default counts as a
+  // prior choice, while a brand-new install remains unconfirmed until the user
+  // chooses (or the sole discovered provider is selected). The separate marker
+  // means dismissing the modal does not become an implicit choice next mount just
+  // because SETTINGS_SEEDED_KEY was created during this one.
+  if (!lsGet(PROVIDER_CHOICE_MIGRATED_KEY)) {
+    if (savedBackendAtMount || lsGet(SETTINGS_SEEDED_KEY)) {
+      lsSet(PROVIDER_CHOICE_CONFIRMED_KEY, "1");
+    }
+    lsSet(PROVIDER_CHOICE_MIGRATED_KEY, "1");
+  }
+  let hasSavedProviderChoice = !!lsGet(PROVIDER_CHOICE_CONFIRMED_KEY);
+  let providerDiscoveryHandled = false;
   // The backend we're actually CONNECTED to (set from the handshake). Used to
   // detect a real provider switch (vs. re-picking the current one).
   let connectedBackend = null;
@@ -22850,8 +22869,8 @@ function buildPanel() {
   urlInput.value = loadBridgeUrl();
   urlInput.placeholder = DEFAULT_BRIDGE_URL;
 
-  // Primary action: starts the background agent on demand (via ComfyUI's own
-  // server) and connects. Nothing is ever spawned without this click.
+  // Primary action: asks the explicitly installed companion to start MCP when
+  // needed, then connects. Panel-open autostart uses this same bounded path.
   const connectBtn = document.createElement("button");
   connectBtn.className = "cmcp-btn";
   connectBtn.type = "button";
@@ -22931,16 +22950,73 @@ function buildPanel() {
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
-  helpDiv.textContent = tr(
-    "panel.click_connect_to_start_an_autonomous_agent",
-    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:",
+  const autostartWrap = document.createElement("label");
+  autostartWrap.style.cssText = "display:flex;align-items:flex-start;gap:0.5rem;cursor:pointer;";
+  const autostartToggle = document.createElement("input");
+  autostartToggle.type = "checkbox";
+  autostartToggle.checked = getSetting(SETTING_AUTOSTART_MCP) !== false;
+  const autostartCopy = document.createElement("span");
+  autostartCopy.textContent = tr(
+    "panel.autostart_mcp_when_panel_opens",
+    "Autostart MCP when this panel opens",
   );
-  // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
-  // host on connect (browser-host targeting), so it drives whatever you're viewing
-  // — local or a remote pod. Offer the command per shell: PowerShell needs a
-  // `cmd /c "…"` wrapper to dodge the npx.ps1 execution-policy trap; cmd and
-  // bash/zsh take it bare.
-  helpDiv.appendChild(makeShellCommandBlock(connectCommand()));
+  autostartWrap.append(autostartToggle, autostartCopy);
+  let launcherStatus = null;
+
+  function renderConnectionGuidance() {
+    helpDiv.replaceChildren();
+    const copy = document.createElement("div");
+    if (!autostartToggle.checked) {
+      copy.textContent = tr(
+        "panel.autostart_off_start_mcp_manually",
+        "Autostart is off. Start MCP manually, then click Connect:",
+      );
+      helpDiv.append(copy, makeShellCommandBlock(connectCommand()));
+      return;
+    }
+    if (launcherStatus?.installed && launcherStatus?.running) {
+      copy.textContent = tr(
+        "panel.launcher_ready_mcp_starts_with_panel",
+        "The companion launcher is ready. MCP will open in a terminal when this panel needs it.",
+      );
+      helpDiv.append(copy);
+      return;
+    }
+    if (launcherStatus?.installed) {
+      copy.textContent = tr(
+        "panel.launcher_installed_but_unreachable",
+        "Autostart is on, but the companion launcher is not responding. Reinstall it or start MCP manually:",
+      );
+      helpDiv.append(
+        copy,
+        makeShellCommandBlock("npx -y comfyui-mcp@latest launcher install"),
+        makeShellCommandBlock(connectCommand()),
+      );
+      return;
+    }
+    copy.textContent = tr(
+      "panel.install_launcher_once_for_autostart",
+      "Autostart is on. Run this once to install the per-user companion launcher:",
+    );
+    helpDiv.append(copy, makeShellCommandBlock("npx -y comfyui-mcp@latest launcher install"));
+  }
+
+  async function refreshLauncherStatus() {
+    try {
+      const response = await api.fetchApi("/comfyui_mcp_panel/launcher/status");
+      launcherStatus = await response.json().catch(() => ({}));
+    } catch {
+      launcherStatus = { installed: false, running: false };
+    }
+    renderConnectionGuidance();
+    return launcherStatus;
+  }
+  renderConnectionGuidance();
+  autostartToggle.addEventListener("change", () => {
+    setSetting(SETTING_AUTOSTART_MCP, autostartToggle.checked);
+    renderConnectionGuidance();
+    if (autostartToggle.checked && !client.isConnected()) void startMcpThenConnect();
+  });
 
   // Bridge URL is now an ADVANCED/fallback control — the backend chips set the URL
   // for you. Keep it (collapsed) for manual/user-managed orchestrators.
@@ -22986,7 +23062,7 @@ function buildPanel() {
   // popup's PROVIDER section — see buildModelPop. The elements stay defined (so
   // renderBackendChips/loadBackends keep working as the data source) but are no
   // longer shown in settings.
-  settingsBody.append(btnRow, advToggle, advWrap, helpDiv);
+  settingsBody.append(autostartWrap, btnRow, advToggle, advWrap, helpDiv);
   settingsBox.appendChild(settingsBody);
   // Lives in the header as a dropdown anchored under the status pill.
   header.appendChild(settingsBox);
@@ -22995,7 +23071,10 @@ function buildPanel() {
     histPop.hidden = true;
     settingsBox.hidden = !settingsBox.hidden;
     // Refresh the backend chips (running status) each time settings open.
-    if (!settingsBox.hidden) void loadBackends();
+    if (!settingsBox.hidden) {
+      void loadBackends();
+      void refreshLauncherStatus();
+    }
   });
 
   // ---- Message log + empty state ----
@@ -23212,7 +23291,13 @@ function buildPanel() {
     // Persist readiness durably so it survives later renderBackendChips repaints
     // that only carry {backend, running}.
     for (const b of list) {
-      if (typeof b.ready === "boolean") backendReady[b.backend] = { cli: b.cli, auth: b.auth, ready: b.ready };
+      if (typeof b.ready === "boolean") backendReady[b.backend] = {
+        cli: b.cli,
+        auth: b.auth,
+        ready: b.ready,
+        available: b.available,
+        experimental: b.experimental,
+      };
     }
     if (!hasReadiness) {
       anyReady = true;
@@ -23228,6 +23313,11 @@ function buildPanel() {
     } else {
       onboard.hidden = true;
     }
+    // New orchestrators carry a completed live-discovery frame and are handled
+    // by the explicit one/many/none policy below. Keep this legacy fallback only
+    // for an older orchestrator; the ComfyUI-host probe is never authoritative
+    // enough to silently change providers.
+    if (!fromOrchestrator || data?.discovery_complete !== undefined) return;
     if (!anyReady || autoPickDone) return;
     const sel = list.find((b) => b.backend === selectedBackend);
     if (sel && sel.ready === false) {
@@ -23254,6 +23344,61 @@ function buildPanel() {
       // Saved pick is ready (or readiness unknown) — nothing to switch.
       autoPickDone = true;
     }
+  }
+
+  function persistDiscoveredProvider(id) {
+    selectedBackend = id;
+    hasSavedProviderChoice = true;
+    lsSet(PROVIDER_CHOICE_CONFIRMED_KEY, "1");
+    try {
+      window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
+    } catch {
+      // Selection remains valid for this mount when storage is unavailable.
+    }
+    renderBackendChips(knownBackends);
+    setAskPlaceholder(id);
+  }
+
+  async function applyDiscoveredProvider(id) {
+    if (id === selectedBackend) {
+      persistDiscoveredProvider(id);
+      return;
+    }
+    const switched = await connectBackend(id);
+    if (switched) hasSavedProviderChoice = true;
+  }
+
+  async function handleCompletedProviderDiscovery(data) {
+    if (providerDiscoveryHandled || data?.discovery_complete !== true) return;
+    providerDiscoveryHandled = true;
+    const decision = providerDiscoveryDecision({
+      backends: data.backends,
+      selectedBackend,
+      hasSavedChoice: hasSavedProviderChoice,
+      discoveryComplete: data.discovery_complete,
+      enabled: backendEnabled,
+    });
+    if (decision.action === "select") {
+      await applyDiscoveredProvider(decision.backend);
+      return;
+    }
+    if (decision.action !== "choose") return;
+    const picked = await choiceModal({
+      title: tr("panel.choose_agent_provider", "Choose an agent provider"),
+      message: tr(
+        "panel.multiple_ready_providers_found",
+        "Multiple ready providers were found. Choose which one this panel should use.",
+      ),
+      choices: decision.candidates.map((entry) => ({
+        value: entry.backend,
+        label: backendDisplayLabel(entry.backend, entry),
+        description: BACKEND_HINTS[entry.backend] || "",
+      })),
+      selected: decision.candidates.some((entry) => entry.backend === selectedBackend)
+        ? selectedBackend
+        : null,
+    });
+    if (picked) await applyDiscoveredProvider(picked);
   }
 
   // "Set up the other provider" — when one provider is signed in and the other
@@ -23846,6 +23991,18 @@ function buildPanel() {
 
   function seedFromSettings() {
     if (!app?.ui?.settings) return;
+    // Existing users keep the old Auto-connect value; genuinely new installs
+    // receive the new default-on Autostart MCP behavior. The marker makes this
+    // one-way and prevents later handshakes/disconnects from rewriting it.
+    if (!lsGet(AUTOSTART_MIGRATED_KEY)) {
+      const existingInstall = !!lsGet(SETTINGS_SEEDED_KEY);
+      const legacy = getSetting(LEGACY_SETTING_AUTOCONNECT);
+      setSetting(
+        SETTING_AUTOSTART_MCP,
+        migrateAutostartValue({ existingInstall, legacyValue: legacy }),
+      );
+      lsSet(AUTOSTART_MIGRATED_KEY, "1");
+    }
     // One-time: migrate the pre-grouping single Default-model/effort into the Claude
     // group (the default backend) so an upgrade never loses the saved choice. Runs
     // independently of SETTINGS_SEEDED_KEY; only fills an empty Claude-group value.
@@ -23897,7 +24054,6 @@ function buildPanel() {
         SETTING_BRIDGE_URL[selectedBackend],
         urlInput.value || defaultBridgeUrlFor(selectedBackend),
       );
-      setSetting(SETTING_AUTOCONNECT, !!lsGet(AUTOCONNECT_KEY));
       lsSet(SETTINGS_SEEDED_KEY, "1");
       return;
     }
@@ -23944,6 +24100,8 @@ function buildPanel() {
     }
   }
   seedFromSettings();
+  autostartToggle.checked = getSetting(SETTING_AUTOSTART_MCP) !== false;
+  renderConnectionGuidance();
   // Resolve only after ComfyUI's startup onChange volley has settled. Reload
   // restore and the initial connection both wait on this same boundary, so neither
   // can bind a thread/session using the default value before settings hydrate.
@@ -29418,6 +29576,7 @@ function buildPanel() {
       return tryAutoRespawn();
     },
     onModels(list, current, backend) {
+      void notifyLauncherHandshake();
       // The orchestrator's ACTIVE model for this backend (e.g. the Ollama default
       // gemma4:e4b, or COMFYUI_MCP_CODEX_MODEL). In Auto mode this is what
       // actually runs — remember it so the picker can check the real row.
@@ -29471,10 +29630,12 @@ function buildPanel() {
         selectedBackend = backend;
         connectedBackend = backend; // authoritative: update from the handshake (fix #4)
         setAskPlaceholder(backend); // authoritative placeholder per backend (fix #3)
-        try {
-          window.localStorage.setItem(STORAGE_KEY_BACKEND, backend);
-        } catch {
-          /* non-persistent is fine */
+        if (hasSavedProviderChoice) {
+          try {
+            window.localStorage.setItem(STORAGE_KEY_BACKEND, backend);
+          } catch {
+            /* non-persistent is fine */
+          }
         }
         renderBackendChips(
           Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
@@ -29522,6 +29683,7 @@ function buildPanel() {
       sdkCommands = Array.isArray(list) ? list : [];
     },
     onBackends(data) {
+      void notifyLauncherHandshake();
       // Capture the console URL/token for the "API Keys" credentials frame (see
       // cmcpOpenCredentialsFrame) — sent alongside backends/any_ready.
       if (data && typeof data.console_url === "string") cmcpConsoleUrl = data.console_url;
@@ -29573,6 +29735,7 @@ function buildPanel() {
       // entry with no way back that this whole issue is about.
       if (Array.isArray(data?.backends)) orchestratorBackends = data.backends;
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
+      void handleCompletedProviderDiscovery(data);
       // A sign-in/out that just landed pushes a fresh backends frame — nudge an
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
       cmcpOauthOnBackendsPush?.();
@@ -31394,6 +31557,103 @@ function buildPanel() {
     lastAutoUrl = secure;
   }
 
+  let launcherStartGeneration = 0;
+  let launcherHandshakeNotified = false;
+  let launcherHandshakeNotifying = false;
+
+  async function readOrchestratorStatus() {
+    try {
+      const response = await api.fetchApi("/comfyui_mcp_panel/status");
+      return await response.json().catch(() => ({}));
+    } catch {
+      return {};
+    }
+  }
+
+  async function notifyLauncherHandshake() {
+    if (launcherHandshakeNotified || launcherHandshakeNotifying) return;
+    launcherHandshakeNotifying = true;
+    try {
+      const response = await api.fetchApi("/comfyui_mcp_panel/launcher/handshake", { method: "POST" });
+      if (response.ok) launcherHandshakeNotified = true;
+    } catch {
+      // Missing/older launcher and unsupported terminal minimization are harmless.
+    } finally {
+      launcherHandshakeNotifying = false;
+    }
+  }
+
+  async function startMcpThenConnect() {
+    const generation = ++launcherStartGeneration;
+    const initial = await readOrchestratorStatus();
+    if (generation !== launcherStartGeneration) return;
+    if (initial?.running) {
+      void connectAgent();
+      return;
+    }
+    if (getSetting(SETTING_AUTOSTART_MCP) === false) {
+      // Autostart off means Connect only dials an already user-managed bridge.
+      void connectAgent();
+      return;
+    }
+    connectBtn.disabled = true;
+    connectBtn.textContent = tr("panel.starting_mcp", "Starting MCP…");
+    let start;
+    try {
+      const response = await api.fetchApi("/comfyui_mcp_panel/launcher/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      start = await response.json().catch(() => ({}));
+    } catch (error) {
+      start = { ok: false, installed: false, message: coerceMessageText(error?.message ?? error) };
+    }
+    if (generation !== launcherStartGeneration) return;
+    launcherStatus = start;
+    renderConnectionGuidance();
+    if (!start?.ok) {
+      connectBtn.disabled = false;
+      connectBtn.textContent = tr("panel.connect", "Connect");
+      settingsBox.hidden = false;
+      appendSystem(
+        start?.installed
+          ? tr(
+              "panel.launcher_could_not_start_mcp",
+              "The companion launcher could not start MCP. Reinstall it or use the manual command in Connect settings.",
+            )
+          : tr(
+              "panel.install_launcher_to_autostart_mcp",
+              "Install the companion launcher once to autostart MCP; the command is in Connect settings.",
+            ),
+      );
+      return;
+    }
+    const deadline = Date.now() + 90_000;
+    let delay = 500;
+    while (Date.now() < deadline && generation === launcherStartGeneration) {
+      const statusData = await readOrchestratorStatus();
+      if (generation !== launcherStartGeneration) return;
+      if (statusData?.running) {
+        connectBtn.disabled = false;
+        void connectAgent();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(2000, Math.round(delay * 1.5));
+    }
+    if (generation !== launcherStartGeneration) return;
+    connectBtn.disabled = false;
+    connectBtn.textContent = tr("panel.connect", "Connect");
+    settingsBox.hidden = false;
+    appendSystem(
+      tr(
+        "panel.mcp_did_not_open_in_time",
+        "MCP did not open within 90 seconds. Check the terminal for its startup error, then retry Connect.",
+      ),
+    );
+  }
+
   async function connectAgent(opts = {}) {
     // Entry awaits, grouped so NO async gap sits between the in-flight guard and
     // `connecting = true` (that gap would let two connects race). (1) hello reads
@@ -31515,7 +31775,7 @@ function buildPanel() {
     if (myGen !== connectGen) return;
     client.start();
   }
-  connectBtn.addEventListener("click", connectAgent);
+  connectBtn.addEventListener("click", () => void startMcpThenConnect());
 
   // Pick a backend chip → remember it, repaint the chips so it highlights, then
   // run the normal Connect flow (which now POSTs this backend and follows the
@@ -31608,6 +31868,8 @@ function buildPanel() {
       // connect; splitting them silently connects to the previous backend.
       commitSelection: (next) => {
         selectedBackend = next;
+        hasSavedProviderChoice = true;
+        lsSet(PROVIDER_CHOICE_CONFIRMED_KEY, "1");
         try {
           window.localStorage.setItem(STORAGE_KEY_BACKEND, next);
         } catch {
@@ -31971,9 +32233,10 @@ function buildPanel() {
   }
 
   disconnectBtn.addEventListener("click", async () => {
-    // Explicit Disconnect = opt out of sticky auto-reconnect (and the matching setting).
+    // Explicit Disconnect ends this bridge session and clears sticky reconnect
+    // intent. It deliberately does NOT change the independent Autostart MCP setting.
     lsSet(AUTOCONNECT_KEY, null);
-    setSetting(SETTING_AUTOCONNECT, false);
+    launcherStartGeneration += 1;
     // Latch the explicit opt-out (persistently, survives reload) so a later
     // ComfyUI restart does NOT auto-resume via the #278 session-resume path.
     // SESSION_KEY intentionally persists so a manual Reconnect can still resume —
@@ -34069,11 +34332,10 @@ function buildPanel() {
       appendSystem(tr("panel.bridge_url_reconnecting", "Bridge URL → {url} (reconnecting).", { url: redactBridgeUrl(u) }));
     }
   };
-  panelHooks.applyAutoConnect = (on) => {
-    const cur = !!lsGet(AUTOCONNECT_KEY);
-    if (on === cur) return;
-    lsSet(AUTOCONNECT_KEY, on ? "1" : null);
-    if (on && !client.isConnected()) connectAgent();
+  panelHooks.applyAutostartMcp = (on) => {
+    autostartToggle.checked = !!on;
+    renderConnectionGuidance();
+    if (on && !client.isConnected()) void startMcpThenConnect();
   };
   panelHooks.applyStallConfig = () => sendStallConfig();
   panelHooks.applyAgentModelConfig = () => sendAgentModelConfig(true);
@@ -34109,12 +34371,9 @@ function buildPanel() {
       .catch(() => {});
   };
 
-  // On load, only auto-connect if a bridge is already up (you started the
-  // orchestrator yourself, or another tab did). Otherwise sit idle behind the
-  // Connect button — we never start a process without an explicit click.
-  // Evaluate provider readiness on open (independent of the connect decision
-  // below): shows the onboarding card if NEITHER provider is signed in, and
-  // auto-picks a ready provider if the saved pick isn't usable.
+  // Evaluate host-side provider readiness while the companion/orchestrator path
+  // initializes independently. Final automatic selection waits for the
+  // orchestrator's completed live-discovery frame.
   void loadBackends();
 
   // #296/#291 — Learn the embedded local ComfyUI workspace path (read-only, from
@@ -34143,27 +34402,19 @@ function buildPanel() {
 
   (async () => {
     await historyRestoreReady;
-    // If a restart we triggered reloaded the page, finish the autonomous resume:
-    // respawn the orchestrator and let onStatus(connected) nudge the agent.
-    if (ssGet(REBOOT_KEY)) {
-      connectAgent();
+    const statusData = await readOrchestratorStatus();
+    const action = panelOpenAction({
+      orchestratorRunning: statusData?.running === true,
+      autostartEnabled: getSetting(SETTING_AUTOSTART_MCP) !== false,
+    });
+    if (action === "connect") {
+      void connectAgent();
       return;
     }
-    // Sticky auto-connect: the user connected before and didn't Disconnect, so
-    // reconnect on open — respawning the orchestrator if it died (e.g. ComfyUI
-    // was rebooted). This is what makes "open the panel after a reboot → it's
-    // back" work without a manual Connect click. The "Auto-connect on load" setting
-    // opts into the same behavior even for a user who hasn't manually connected yet.
-    if (lsGet(AUTOCONNECT_KEY) || getSetting(SETTING_AUTOCONNECT) === true) {
-      connectAgent();
-      return;
-    }
-    try {
-      const res = await api.fetchApi("/comfyui_mcp_panel/status");
-      const data = await res.json().catch(() => ({}));
-      if (data?.running) client.start();
-    } catch {
-      // No status route — leave the Connect button for the user to drive.
+    if (action === "start") {
+      void startMcpThenConnect();
+    } else {
+      void refreshLauncherStatus();
     }
   })();
 
@@ -34186,6 +34437,7 @@ function buildPanel() {
     },
     setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
+      launcherStartGeneration += 1;
       try {
         recognition?.stop();
       } catch {
@@ -34249,7 +34501,7 @@ function buildPanel() {
       panelHooks.applyModel = null;
       panelHooks.applyEffort = null;
       panelHooks.applyBridgeUrl = null;
-      panelHooks.applyAutoConnect = null;
+      panelHooks.applyAutostartMcp = null;
       panelHooks.applyStallConfig = null;
       panelHooks.applyAgentModelConfig = null;
       panelHooks.applyMobileBeta = null;

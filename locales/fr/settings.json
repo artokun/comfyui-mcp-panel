@@ -23,9 +23,9 @@
     "name": "Backend d'agent par défaut",
     "tooltip": "L'agent d'arrière-plan auquel le panneau se connecte par défaut. Claude tourne sur votre abonnement Claude ; ChatGPT sur votre compte Codex (ChatGPT) ; Gemini sur votre connexion Google (Gemini). Amorce le backend du panneau (et détermine quel groupe ci-dessous amorce le runtime) ; vous pouvez toujours changer à chaud dans le sélecteur de modèles (un changement à chaud ne vaut que pour la session et ne modifie PAS cette valeur par défaut)."
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "Connexion automatique au chargement",
-    "tooltip": "Connecte automatiquement l'agent (en démarrant l'orchestrateur local) à l'ouverture du panneau, sans cliquer sur Connecter. Désactivé par défaut — sinon l'orchestrateur n'est démarré que par un clic explicite sur Connecter."
+  "comfyui-mcp_autostartMcp": {
+    "name": "Démarrage automatique de MCP",
+    "tooltip": "À l'ouverture de ce panneau, demande au lanceur compagnon installé explicitement d'ouvrir un terminal exécutant MCP s'il n'est pas déjà lancé."
   },
   "comfyui-mcp_language": {
     "name": "Langue du panneau",

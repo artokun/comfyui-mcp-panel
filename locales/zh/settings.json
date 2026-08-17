@@ -23,9 +23,9 @@
     "name": "默认智能体后端",
     "tooltip": "面板默认连接的后台智能体。Claude 使用你的 Claude 订阅；ChatGPT 使用你的 Codex（ChatGPT）账号；Gemini 使用你的 Google（Gemini）登录。它决定面板的后端，以及下面哪个分组用于初始化运行时；你仍可在模型选择器中实时切换，实时切换只对当前会话生效，不会更改此默认值。"
   },
-  "comfyui-mcp_autoConnect": {
-    "name": "打开时自动连接",
-    "tooltip": "面板打开时自动连接智能体（并启动本地编排器），无需点击“连接”。默认关闭 —— 否则编排器只会在你明确点击“连接”时启动。"
+  "comfyui-mcp_autostartMcp": {
+    "name": "自动启动 MCP",
+    "tooltip": "打开此面板时，如果 MCP 尚未运行，则请求已明确安装的配套启动器打开一个运行 MCP 的终端。"
   },
   "comfyui-mcp_language": {
     "name": "面板语言",

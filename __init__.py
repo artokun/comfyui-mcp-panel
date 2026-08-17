@@ -5,7 +5,7 @@ This pack ships **no Python nodes**. It does two things:
 1. Serve the sidebar panel JS (``web/js/comfyui-mcp-panel.js``) to the ComfyUI
    frontend via ``WEB_DIRECTORY``.
 
-2. Expose a tiny **read-only** local API the panel uses to discover whether the
+2. Expose a tiny local API the panel uses to discover whether the
    panel **orchestrator** is already running, which provider/backend is ready,
    and the ComfyUI URL to target — so the sidebar can show the right onboarding
    state and the exact one-command start line.
@@ -23,9 +23,9 @@ packages at runtime (https://docs.comfy.org/registry/standards). Auto-spawning
 ``npx … comfyui-mcp`` is exactly that pattern, and the static (Ruff/Bandit)
 scanner flags it (B404 import_subprocess / B603 subprocess call) regardless of
 runtime guards. So the pack stays a pure frontend extension: it never imports or
-calls ``subprocess``. Starting the orchestrator is an explicit, out-of-band user
-action (run the one-liner in a terminal) — the panel then connects to the bridge
-automatically and keeps retrying until it's up.
+calls ``subprocess``. An explicitly installed ``comfyui-mcp launcher`` companion
+may expose one authenticated loopback action that opens the fixed MCP command;
+this pack can proxy that action but never supplies a command or starts a process.
 
 Env knobs:
 - ``COMFYUI_MCP_BRIDGE_PORT`` — panel bridge port to probe (default 9180).
@@ -62,6 +62,8 @@ __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
 _BRIDGE_HOST = "127.0.0.1"
 _BRIDGE_PORT = int(environ.get("COMFYUI_MCP_BRIDGE_PORT", "9180"))
+_LAUNCHER_PROTOCOL = 1
+_LAUNCHER_INSTALL_COMMAND = "npx -y comfyui-mcp@latest launcher install"
 
 # Backend -> bridge port map. "claude" is the default (9180); "codex"/"gemini"
 # have their own ports so an orchestrator per provider can run side by side.
@@ -92,6 +94,285 @@ _ADVERTISED_BRIDGE_URL = None
 
 def _log(msg):
     print("[comfyui-mcp-panel] " + msg)
+
+
+def _launcher_config_path():
+    return os.path.join(os.path.expanduser("~"), ".comfyui-mcp", "launcher.json")
+
+
+def _read_launcher_config():
+    """Read the companion endpoint without exposing its token to the browser."""
+    try:
+        with open(_launcher_config_path(), "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    port = value.get("port")
+    token = value.get("token")
+    if (
+        value.get("protocol") != _LAUNCHER_PROTOCOL
+        or value.get("host") != _BRIDGE_HOST
+        or not isinstance(port, int)
+        or isinstance(port, bool)
+        or port < 1
+        or port > 65535
+        or not isinstance(token, str)
+        or len(token) < 32
+    ):
+        return None
+    return {"host": _BRIDGE_HOST, "port": port, "token": token}
+
+
+# ---------------------------------------------------------------------------
+# SAME-ORIGIN GUARD for the launcher proxy routes (confused-deputy defense).
+#
+# WHY THIS EXISTS. Do not delete it to "simplify" the launcher handlers.
+#
+# The companion launcher is itself hardened: it binds 127.0.0.1 only, mints a
+# 32-byte random token, compares it in constant time, and opens ONE fixed
+# command. This pack proxies it so the token stays server-side and the browser
+# never sees it. That is the right call for the token — and it is exactly what
+# turns these routes into a confused deputy: the token stops authenticating the
+# CALLER and only authenticates the PROXY. Without the check below, any page in
+# any tab the user has open can post
+#
+#     <form method="POST" action="http://127.0.0.1:8188/comfyui_mcp_panel/launcher/start">
+#
+# and this pack attaches the secret token on that page's behalf. A form POST is
+# a "simple request" — no CORS preflight, nothing to approve — and the attacker
+# never needing to READ the reply is the point: the side effect (a process opens
+# on the user's machine) has already happened. The launcher's authentication is
+# laundered away by its own proxy.
+#
+# WHY AN ORIGIN CHECK RATHER THAN A CSRF TOKEN OR A REQUIRED CUSTOM HEADER.
+# Both of those defenses rest on an assumption this deployment breaks. ComfyUI
+# is commonly run with `--enable-cors-header`, which answers
+# `Access-Control-Allow-Origin: *` and permissive preflights. Under that flag a
+# foreign page CAN read a minted CSRF token straight out of a GET response, and
+# CAN have a preflight for `X-Requested-With` approved — so both evaporate. The
+# `Origin` REQUEST header does not: the browser sets it, page script cannot
+# forge it, and CORS headers govern only who may READ a response, never who may
+# CLAIM an origin. That is why the guard is here and not a token.
+#
+# THE ALLOW-RULE, part by part:
+#
+#  * Compare the declared origin against the request's own `Host` header — NOT
+#    against COMFYUI_URL / `_detect_comfyui_url()`. One ComfyUI answers on many
+#    authorities (127.0.0.1:8188, localhost:8188, a LAN IP, a tunnel hostname)
+#    and every one of them serves a legitimate panel. `Host` is the authority
+#    the browser actually addressed, so "Origin-authority == Host" states
+#    precisely the property we want: the page that called me was served by me.
+#
+#  * Compare AUTHORITY (host + port), not the whole origin string. A
+#    TLS-terminating reverse proxy leaves the page on `https://` while this
+#    server still sees plain HTTP, so a scheme-strict compare would 403 every
+#    remote deployment. Claiming `http://` for an `https://` page needs an
+#    active network attacker who could already inject script into that page, so
+#    scheme tolerance hands over nothing that was not already lost.
+#
+#  * `X-Forwarded-Host` is deliberately NOT consulted. It is a request header,
+#    and under `--enable-cors-header` a foreign page could get a preflight for
+#    it approved and then name itself — trusting it would hand the attacker the
+#    answer key. The cost is that a proxy which rewrites `Host` to an internal
+#    name gets 403s here; the launcher only ever exists on the ComfyUI machine,
+#    so that deployment loses a route it could not have used anyway.
+#
+#  * A non-http(s) origin is refused, including the literal `null` a sandboxed
+#    iframe or a `data:` document sends. `null` is not this origin; it is "no
+#    origin I am willing to vouch for".
+#
+#  * ABSENT `Origin` *and* absent `Referer` is ALLOWED, and that is load-bearing
+#    in both directions. A same-origin GET — the launcher status probe the panel
+#    polls — legitimately sends neither, so demanding a header would break the
+#    panel. And it concedes nothing: browsers attach `Origin` to every POST they
+#    issue, cross-origin form POSTs included, so a header-less caller is not a
+#    browser page. It is curl or a local script, which can already read
+#    ~/.comfyui-mcp/launcher.json and call the launcher directly. This guard
+#    defends the browser's ambient authority; it is not, and cannot be made
+#    into, local-process authentication.
+#
+# KNOWN LIMITS, stated so nobody "fixes" them by weakening the rule:
+#  - A page served BY this ComfyUI origin (an uploaded HTML file, an XSS in
+#    another pack) passes. Same-origin content is indistinguishable from the
+#    panel by construction; that is a different problem with a different fix.
+#  - DNS rebinding (a hostile name resolving to 127.0.0.1) makes Origin and
+#    Host agree. It also already exposes every other ComfyUI route, so it is a
+#    host-level concern, not one these three routes can settle alone.
+#  - A frontend dev server on another port talking to this API is cross-origin
+#    by definition and is refused here. That is the rule working, not a bug.
+# ---------------------------------------------------------------------------
+_BROWSER_ORIGIN_SCHEMES = ("http", "https")
+_CROSS_ORIGIN_REASON = "cross_origin_denied"
+_CROSS_ORIGIN_MESSAGE = (
+    "Refused: this endpoint only answers the ComfyUI page it was served from."
+)
+
+
+def _request_authority(value):
+    """``host[:port]``, lowercased, with a default HTTP(S) port dropped.
+
+    Accepts a full URL (an ``Origin`` or ``Referer``) or a bare ``Host`` header
+    value. Returns ``""`` when there is no parseable host — and ``""`` never
+    compares equal to a real authority, so the caller fails closed on garbage."""
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip().lower()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "//" + raw
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(raw)
+        host = parts.hostname or ""
+        port = parts.port
+    except (ValueError, TypeError):
+        return ""
+    if not host:
+        return ""
+    if port is None or port in (80, 443):
+        return host
+    return "{}:{}".format(host, port)
+
+
+def _cross_origin_denial(request):
+    """``None`` when the request may proceed, else a short refusal reason.
+
+    The allow-rule and the reasoning behind every clause are in the block
+    comment above — read it before changing anything here."""
+    headers = getattr(request, "headers", None) or {}
+    declared = headers.get("Origin")
+    if declared is None:
+        declared = headers.get("Referer")
+    if declared is None:
+        # No browser origin declared at all: not a cross-site page.
+        return None
+    scheme = declared.split("://", 1)[0].strip().lower() if "://" in declared else ""
+    if scheme not in _BROWSER_ORIGIN_SCHEMES:
+        # Covers the literal "null" and extension/data origins.
+        return _CROSS_ORIGIN_REASON
+    served = _request_authority(headers.get("Host"))
+    if not served or _request_authority(declared) != served:
+        return _CROSS_ORIGIN_REASON
+    return None
+
+
+# The launcher's reply is reflected into the browser, so it is copied field by
+# field through an ALLOWLIST instead of having known-bad keys removed. A denylist
+# (the `payload.pop("token", None)` this replaced) is only ever as current as the
+# last person who remembered to update it: the day the launcher grows a
+# `config_path`, an `auth_header`, or a second secret, a denylist ships it to
+# every page that can reach this route. Unknown keys are dropped by default;
+# adding one here is a deliberate act.
+_LAUNCHER_RESULT_KEYS = (
+    "ok",  # launcher-level success
+    "protocol",  # launcher protocol version
+    "orchestrator_running",  # GET /v1/status
+    "already_running",  # POST /v1/ensure-running
+    "started",
+    "start_in_progress",
+    "minimized",  # POST /v1/handshake-complete
+)
+
+
+def _launcher_error_code(value):
+    """A launcher ``error`` reduced to a short machine token.
+
+    The launcher's failure path returns ``error: <Error.message>``, free text
+    that can carry a filesystem path or a command line. The panel only ever
+    branches on the value, never renders it, so anything that is not already
+    code-shaped is collapsed rather than reflected."""
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token:
+        return None
+    if len(token) <= 40 and all(ch.isalnum() or ch in "_-" for ch in token):
+        return token
+    return "launcher_error"
+
+
+def _launcher_result(payload, status):
+    """Browser-facing view of a launcher response: allowlisted launcher fields
+    plus the fields this proxy owns."""
+    result = {}
+    if isinstance(payload, dict):
+        for key in _LAUNCHER_RESULT_KEYS:
+            if key in payload:
+                result[key] = payload[key]
+        code = _launcher_error_code(payload.get("error"))
+        if code:
+            result["error"] = code
+    result.update(
+        {
+            "installed": True,
+            "running": status < 400,
+            "status": status,
+            "install_command": _LAUNCHER_INSTALL_COMMAND,
+        }
+    )
+    return result
+
+
+def _launcher_request_spec(action, config):
+    endpoints = {
+        "status": ("GET", "/v1/status"),
+        "start": ("POST", "/v1/ensure-running"),
+        "handshake": ("POST", "/v1/handshake-complete"),
+    }
+    if action not in endpoints:
+        raise ValueError("unknown launcher action")
+    method, path = endpoints[action]
+    return {
+        "method": method,
+        "url": "http://{}:{}{}".format(config["host"], config["port"], path),
+        "headers": {"Authorization": "Bearer {}".format(config["token"])},
+    }
+
+
+async def _launcher_request(action):
+    """Proxy one fixed launcher action. No request data becomes a command/arg."""
+    config = _read_launcher_config()
+    if not config:
+        return {
+            "ok": False,
+            "installed": os.path.isfile(_launcher_config_path()),
+            "running": False,
+            "error": "launcher_not_installed",
+            "install_command": _LAUNCHER_INSTALL_COMMAND,
+        }
+    spec = _launcher_request_spec(action, config)
+    try:
+        from aiohttp import ClientSession, ClientTimeout  # type: ignore
+
+        timeout = ClientTimeout(total=3.0, connect=1.0)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.request(
+                spec["method"], spec["url"], headers=spec["headers"]
+            ) as response:
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception:
+                    payload = {}
+                # Allowlisted — never reflect the token/config or any field a
+                # future launcher version adds. See _LAUNCHER_RESULT_KEYS.
+                return _launcher_result(payload, response.status)
+    except Exception:
+        return {
+            "ok": False,
+            "installed": True,
+            "running": False,
+            "error": "launcher_unreachable",
+            # NOT str(error): aiohttp's connection errors quote the loopback
+            # host and the launcher's ephemeral port, and this payload is
+            # rendered in a web page. The panel branches on `error` and never
+            # on this text, so a fixed non-identifying reason costs nothing.
+            "message": "The companion launcher did not answer.",
+            "install_command": _LAUNCHER_INSTALL_COMMAND,
+        }
 
 
 def _backend_port(backend):
@@ -521,6 +802,60 @@ def _install_no_cache_middleware(web):
     return True
 
 
+def _register_launcher_routes(routes, web):
+    """Register the companion-launcher proxy routes on ``routes``.
+
+    Module-level and parameterised on purpose: browser_tests/unit/
+    test_launcher_proxy.py passes a route collector and a ``web`` double and
+    calls these REAL handlers, so the same-origin guard is exercised rather
+    than merely present in the source. A guard that can only be checked by
+    reading the file is a guard that regresses in silence."""
+
+    def _refuse_cross_origin(request):
+        """The 403 body for a refused request, or ``None`` to let it through."""
+        reason = _cross_origin_denial(request)
+        if reason is None:
+            return None
+        return web.json_response(
+            {
+                "ok": False,
+                "installed": False,
+                "running": False,
+                "error": reason,
+                "message": _CROSS_ORIGIN_MESSAGE,
+            },
+            status=403,
+        )
+
+    @routes.get("/comfyui_mcp_panel/launcher/status")
+    async def _launcher_status(request):
+        refused = _refuse_cross_origin(request)
+        if refused is not None:
+            return refused
+        return web.json_response(await _launcher_request("status"))
+
+    @routes.post("/comfyui_mcp_panel/launcher/start")
+    async def _launcher_start(request):
+        # The body is intentionally ignored. The companion owns one fixed command
+        # and this route cannot be used to pass executable text or arguments.
+        # The ORIGIN, however, is not ignored: holding the launcher token
+        # server-side makes this route a confused deputy for any page that can
+        # reach it, so a foreign origin is refused before the proxy call.
+        refused = _refuse_cross_origin(request)
+        if refused is not None:
+            return refused
+        result = await _launcher_request("start")
+        return web.json_response(result, status=200 if result.get("ok") else 503)
+
+    @routes.post("/comfyui_mcp_panel/launcher/handshake")
+    async def _launcher_handshake(request):
+        refused = _refuse_cross_origin(request)
+        if refused is not None:
+            return refused
+        result = await _launcher_request("handshake")
+        return web.json_response(result, status=200 if result.get("ok") else 503)
+
+
 def _register_routes():
     try:
         from server import PromptServer  # type: ignore
@@ -599,6 +934,8 @@ def _register_routes():
                 "start_command": _start_command(detected),
             }
         )
+
+    _register_launcher_routes(routes, web)
 
     @routes.post("/comfyui_mcp_panel/advertise_bridge")
     async def _advertise_bridge(_request):

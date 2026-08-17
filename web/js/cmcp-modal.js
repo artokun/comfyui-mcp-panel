@@ -98,6 +98,12 @@ function injectModalCss() {
   color:var(--p-text-color,#fafafa);font-weight:600;}
 .cmcp-btn.cmcp-mdl-danger{background:var(--p-red-500,#dc2626);border:1px solid transparent;color:#fff;}
 .cmcp-btn.cmcp-mdl-danger:hover{opacity:.9;}
+.cmcp-mdl-choices{display:flex;flex-direction:column;gap:.45rem;}
+.cmcp-mdl-choice{display:grid;grid-template-columns:auto 1fr;gap:.55rem;align-items:start;padding:.65rem;
+  border:1px solid var(--p-content-border-color,#3f3f46);border-radius:8px;cursor:pointer;background:var(--p-surface-900,#18181b);}
+.cmcp-mdl-choice:has(input:checked){border-color:var(--p-primary-color,#60a5fa);background:color-mix(in srgb,var(--p-primary-color,#60a5fa) 10%,var(--p-surface-900,#18181b));}
+.cmcp-mdl-choice-title{font-weight:650;line-height:1.25;}
+.cmcp-mdl-choice-desc{font-size:calc(var(--cmcp-fs, 0.8125rem) * .923);opacity:.72;margin-top:.15rem;line-height:1.35;}
 `;
   const style = document.createElement("style");
   style.textContent = css;
@@ -211,4 +217,63 @@ export function promptModal({
     cancelLabel,
     fields: [{ key: "value", label, value, placeholder, multiline }],
   }).then((v) => (v ? v.value : null));
+}
+
+/** Choose one item from a themed radio-card list. Resolves the selected value,
+ *  or null on Not now / backdrop / close. */
+export function choiceModal({
+  title = "",
+  message = "",
+  choices = [],
+  selected = null,
+  submitLabel = tr("panel.use_provider", "Use provider"),
+  cancelLabel = tr("panel.not_now", "Not now"),
+} = {}) {
+  injectModalCss();
+  return new Promise((resolve) => {
+    let settled = false;
+    let sheet;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+      sheet.close();
+    };
+    sheet = openSubModal(title, () => finish(null));
+    const form = el("form", "cmcp-mdl");
+    if (message) form.append(el("div", "cmcp-mdl-msg", message));
+    const list = el("div", "cmcp-mdl-choices");
+    const radios = [];
+    for (const [index, choice] of choices.entries()) {
+      const row = el("label", "cmcp-mdl-choice");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "cmcp-provider-choice";
+      radio.value = String(choice.value);
+      radio.checked = selected != null ? choice.value === selected : index === 0;
+      const copy = el("div");
+      copy.append(el("div", "cmcp-mdl-choice-title", choice.label));
+      if (choice.description) copy.append(el("div", "cmcp-mdl-choice-desc", choice.description));
+      row.append(radio, copy);
+      list.append(row);
+      radios.push(radio);
+    }
+    form.append(list);
+    const btns = el("div", "cmcp-mdl-btns");
+    const cancel = el("button", "cmcp-btn cmcp-mdl-secondary cmcp-mdl-cancel", cancelLabel);
+    cancel.type = "button";
+    const submit = el("button", "cmcp-btn primary cmcp-mdl-ok", submitLabel);
+    submit.type = "submit";
+    submit.disabled = radios.length === 0;
+    cancel.addEventListener("click", () => finish(null));
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const picked = radios.find((radio) => radio.checked);
+      finish(picked ? picked.value : null);
+    });
+    btns.append(cancel, submit);
+    form.append(btns);
+    sheet.body.append(form);
+    radios.find((radio) => radio.checked)?.focus();
+  });
 }
