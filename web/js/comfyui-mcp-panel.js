@@ -198,6 +198,10 @@ import {
   materializedValuesNote,
   findDivergentPromotedValues,
 } from "./lib/unpack-promoted-values.js";
+import {
+  snapshotExternalLinks,
+  verifyExternalLinks,
+} from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
@@ -16045,6 +16049,12 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     // unpackSubgraph wraps its own beforeChange/afterChange for undo, so don't
     // nest another pair here.
+    // comfyui-mcp#1665 — snapshot the subgraph's EXTERNAL links (endpoints resolved
+    // to slot NAMES, since indices shift during the unpack) so the rewire can be
+    // verified afterwards instead of trusted. litegraph's unpackSubgraph silently
+    // drops links whose targets are widget-converted or dynamic inputs and leaves
+    // one-sided ghosts behind; a bare success over that is silent graph corruption.
+    const externalLinks = snapshotExternalLinks(graph, node);
     try {
       graph.unpackSubgraph(node, { skipMissingNodes: true });
     } catch (err) {
@@ -16067,6 +16077,40 @@ const GRAPH_TOOL_EXECUTORS = {
           : `unpack_subgraph failed AFTER partially modifying the graph and the automatic rollback did not complete — undo (Ctrl+Z) to restore: ${reason}`,
       );
     }
+    // comfyui-mcp#1665 — the unpack returned without throwing, but that is NOT proof
+    // the external links survived: the measured failure threw nothing while dropping
+    // 3 of ~35 links into widget-converted / dynamic target slots. Re-resolve every
+    // expected link by NAME against the live link table; if any cannot be proven
+    // present, roll back and refuse with exactly what would have been lost rather
+    // than report a success over a graph that would render wrong.
+    const linkCheck = verifyExternalLinks(graph, externalLinks);
+    if (linkCheck.dropped.length) {
+      let rolledBack = false;
+      if (rollback && typeof app?.loadGraphData === "function") {
+        try {
+          const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+          await app.loadGraphData(...resolveLoadGraphArgs(rollback, activeWorkflow));
+          rolledBack = true;
+        } catch {
+          rolledBack = false;
+        }
+      }
+      const lost = linkCheck.dropped.map((d) => `  - ${d}`).join("\n");
+      throw new Error(
+        `unpack_subgraph refused: the unpack did not restore ${linkCheck.dropped.length} ` +
+          `external link(s):\n${lost}\n` +
+          `These are links litegraph's unpackSubgraph rewires by slot index and silently loses ` +
+          `when the target is a widget-converted or dynamic input (comfyui-mcp#1665). ` +
+          (rolledBack
+            ? `The workflow was reloaded from its pre-unpack snapshot, so the subgraph and all ` +
+              `its links are intact — nothing was lost. Unpack in the ComfyUI canvas and re-add ` +
+              `the named links by hand, or remove the dynamic/widget-converted targets from the ` +
+              `link set and retry.`
+            : `The pre-unpack snapshot could NOT be reloaded, so those links are gone from the ` +
+              `live graph and the source outputs may carry stale link ids — reconnect the named ` +
+              `targets with panel_connect, then save + panel_load_workflow to prune the ghosts.`),
+      );
+    }
     const newNodeIds = (graph._nodes ?? []).filter((n) => !before.has(n.id)).map((n) => n.id);
     graph.setDirtyCanvas?.(true, true);
     canvas?.setDirty?.(true, true);
@@ -16075,6 +16119,14 @@ const GRAPH_TOOL_EXECUTORS = {
         node_id,
         new_node_ids: newNodeIds,
         node_count: newNodeIds.length,
+        // #1665 — disclose the verification so a caller never has to take the rewire
+        // on trust: how many external links were checked and restored, and any whose
+        // pre-unpack state could not even be read (pre-existing corruption the unpack
+        // did not cause, disclosed rather than silently inherited).
+        ...(externalLinks.links.length
+          ? { external_links_verified: linkCheck.restored }
+          : {}),
+        ...(linkCheck.unverifiable.length ? { external_links_unverifiable: linkCheck.unverifiable } : {}),
         // #979 — disclose what was carried inward. An unpack cannot be undone from
         // this result, so a caller checking values afterwards needs to know which
         // ones this moved, and which widgets it could not match.
