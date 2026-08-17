@@ -14,6 +14,8 @@
 //
 // Pure: every input is observed by the caller and passed in.
 
+import { nodeInventoryLabel } from "./graph-node-inventory.js";
+
 /** Stable reason tokens for a node-def refresh that is NOT confirmed fresh. */
 export const NODE_DEF_REFRESH_REASONS = Object.freeze({
   APP_UNAVAILABLE: "app_unavailable",
@@ -23,6 +25,10 @@ export const NODE_DEF_REFRESH_REASONS = Object.freeze({
   REGISTER_API_ABSENT: "register_api_absent",
   COMBO_API_ABSENT: "combo_api_absent",
   COMBO_REFRESH_FAILED: "combo_refresh_failed",
+  // #1275 — the refresh itself deleted live-canvas nodes and they could not all
+  // be restored. A data-loss verdict: it overrides even a real phase failure,
+  // because the lost nodes are the fact the caller must act on first.
+  GRAPH_NODES_LOST: "graph_nodes_lost",
 });
 
 function detailSuffix(thrown) {
@@ -165,4 +171,78 @@ export function describeNodeDefRefresh({
     };
   }
   return { refreshed: true, reason: "refreshed" };
+}
+
+// ---------------------------------------------------------------------------
+// #1275 — the refresh deleted live-canvas nodes. Wording lives here, beside
+// the verdict it overrides, so the disclosure and the failure verdict cannot
+// drift apart. Both helpers take INVENTORY ENTRIES (lib/graph-node-inventory)
+// and both name the nodes: "some nodes disappeared" is the silent-loss bug
+// wearing a disclosure costume.
+// ---------------------------------------------------------------------------
+
+function labelList(entries, cap = 6) {
+  const labels = entries.map(nodeInventoryLabel);
+  const shown = labels.slice(0, cap).join(", ");
+  return labels.length > cap ? `${shown}, and ${labels.length - cap} more` : shown;
+}
+
+/**
+ * Disclosure for a refresh whose graph loss was fully ROLLED BACK: the panel
+ * restored the pre-refresh snapshot through the frontend's own workflow loader
+ * and re-verified every vanished node is present. `refreshed` stays true —
+ * the refresh did refresh, and the canvas is back — but the restore is said
+ * out loud, because an install that pruned the canvas once will do it again.
+ *
+ * Only node PRESENCE is re-verified. The restore replays the full serialized
+ * pre-refresh workflow, so positions, widgets, modes, links and ids are all
+ * rewritten from it — but claiming they were verified would be claiming a
+ * check that did not run, so the note tells the user to look.
+ */
+export function restoredLiveNodesNote(restoredEntries) {
+  const list = Array.isArray(restoredEntries) ? restoredEntries : [];
+  if (!list.length) return "";
+  return (
+    `The refresh REMOVED ${list.length} node${list.length === 1 ? "" : "s"} from the live canvas ` +
+    `while it ran (${labelList(list)}) — a refresh must be additive, and this one was not. ` +
+    "The panel restored the missing nodes from a snapshot taken immediately before the refresh " +
+    "ran, using the frontend's own workflow loader, and re-verified every one is present on the " +
+    "canvas again. Positions, widgets, links and ids were rewritten from that snapshot, but only " +
+    "their presence was re-verified — look at the canvas and save the workflow before relying on " +
+    "it. This install has demonstrated a refresh that prunes the live graph: prefer reloading the " +
+    "tab over panel_refresh_nodes until the pruning cause is identified."
+  );
+}
+
+/**
+ * FAIL-CLOSED verdict for a refresh whose graph loss could NOT be fully
+ * undone. Refreshed is FALSE whatever the refresh's phases accomplished —
+ * a reply that says "refreshed" over a canvas the user just lost work on is
+ * the bug being fixed. `lost_nodes` names what is gone; the remedy says what
+ * was tried (and its outcome, when a restore ran and failed) rather than
+ * guessing at the cause, which is not established.
+ */
+export function describeRefreshGraphLoss(lostEntries, { restoreAvailable = false, restoreThrew = null } = {}) {
+  const lost = Array.isArray(lostEntries) ? lostEntries : [];
+  const n = lost.length;
+  const restoreOutcome = !restoreAvailable
+    ? "This frontend exposes no loadGraphData, so the panel could not restore them. "
+    : restoreThrew
+      ? `The panel tried to restore them from the pre-refresh snapshot and the restore itself failed. `
+      : "The panel tried to restore them from the pre-refresh snapshot, but they are still missing. ";
+  return {
+    refreshed: false,
+    reason: NODE_DEF_REFRESH_REASONS.GRAPH_NODES_LOST,
+    lost_nodes: lost.map(nodeInventoryLabel),
+    ...(restoreThrew
+      ? { detail: `(restore failed: ${String(restoreThrew?.message ?? restoreThrew)})` }
+      : {}),
+    remedy:
+      `The refresh REMOVED ${n} node${n === 1 ? "" : "s"} from the live canvas: ${labelList(lost)}. ` +
+      restoreOutcome +
+      "The removed nodes were unsaved and are gone from the canvas: re-add them, or reload your " +
+      "last saved workflow to recover everything else the canvas held. Do NOT call " +
+      "panel_refresh_nodes again on this install — it pruned the live graph once and a retry has " +
+      "no reason to behave differently.",
+  };
 }

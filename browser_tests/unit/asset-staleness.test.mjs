@@ -1321,8 +1321,8 @@ test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's
   assert.match(code, /verdict\.empty_combo_lists = empties;/, "the verdict must carry the field");
   assert.match(
     code,
-    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos \};/,
-    "…and the refreshed:true branch must forward it",
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored \};/,
+    "…and the refreshed:true branch must forward it (…and #1275's restored disclosure rides the same branch)",
   );
   // The spread alone is not enough: `emptyCombos` could still be built without the list
   // itself, forwarding only the note. Pin BOTH fields of the mapping.

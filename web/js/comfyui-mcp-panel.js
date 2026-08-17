@@ -211,7 +211,17 @@ import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
-import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
+import {
+  describeNodeDefRefresh,
+  describeRefreshGraphLoss,
+  restoredLiveNodesNote,
+} from "./lib/node-def-refresh.js";
+import {
+  liveGraphNodeInventory,
+  vanishedLiveNodes,
+  missingInventoryIds,
+  nodeInventoryLabel,
+} from "./lib/graph-node-inventory.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
@@ -1133,6 +1143,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // clean one — misattributing the verdict and, worse, setting the shared
   // confirmed flag after a throw (codex gate r5).
   let didThrow = false;
+  // #1275 — the live-graph guard. Filled with {app, before, snapshot} immediately
+  // before the register phase runs, checked after the verdict is built below.
+  // Declared here because `a` is block-scoped to the try: the guard needs the
+  // app reference to survive into the post-verdict check.
+  let graphGuard = null;
   try {
     const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
     if (!a) return describeNodeDefRefresh({ appAvailable: false, defsObtained: false, defsRegistered: false, comboApiPresent: false, comboRan: false });
@@ -1293,6 +1308,29 @@ async function registerComfyNodeDefs(preloadedDefs) {
         whole: true,
       });
     }
+    // #1275 — snapshot the live graph BEFORE the first mutating phase. Everything
+    // from here to the combo phase calls into frontend and extension code
+    // (registerNodesFromDefs awaits the addCustomNodeDefs/beforeRegisterNodeDef
+    // hooks; refreshComboInNodes runs reloadNodeDefs and the refreshComboInNodes
+    // hook), and on the reporter's install that path silently DELETED newly added
+    // unconnected live-canvas nodes while the verdict said refreshed:true. The
+    // serialize is full-fidelity — nodes, links, ids, positions, modes, widgets,
+    // subgraphs — so the post-verdict guard can put back exactly what was there.
+    // In-memory and cheap against a run that already fetches a 4MB /object_info.
+    // Failures leave graphGuard null and the guard inert: a guard that throws
+    // must never break the refresh it only watches.
+    try {
+      const guardRoot = a.graph ?? a.canvas?.graph;
+      if (guardRoot && typeof guardRoot.serialize === "function") {
+        graphGuard = {
+          app: a,
+          before: liveGraphNodeInventory(guardRoot),
+          snapshot: guardRoot.serialize(),
+        };
+      }
+    } catch {
+      /* the guard is a witness, not a phase — it must never fail the refresh */
+    }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
     // is set ONLY when the registration call actually ran — a frontend without
@@ -1424,6 +1462,79 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
   const verdict = describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, didThrow, thrown });
+  // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
+  //
+  // The snapshot above was taken immediately before the register phase, so this
+  // diff measures exactly what the mutating phases did. On the reporter's install
+  // (ComfyUI 0.27.0 / frontend 1.45.20) those phases silently removed five of
+  // seven newly added, still-unconnected nodes and this function returned
+  // refreshed:true over the loss. Which hook pruned them is not established and
+  // runs inside frontend/extension code the panel does not control — so the
+  // panel's obligation is the one it can actually keep: never report a refresh
+  // over a graph it watched shrink.
+  //
+  // The restore goes through the frontend's OWN loader with the full serialized
+  // pre-refresh workflow — the same mechanism restoreSnapshot uses — never a
+  // hand-rolled partial re-add of just the missing nodes, which would have to
+  // re-invent link/id bookkeeping loadGraphData already gets right. A restore
+  // that leaves anything missing, or a frontend without loadGraphData, fails
+  // CLOSED: refreshed:false, the lost nodes named, no success claimed.
+  //
+  // One accepted false positive, stated rather than hidden: a node the USER
+  // deletes by hand inside the refresh window is indistinguishable from one the
+  // refresh pruned, and would be resurrected by the restore. The window is the
+  // register/combo await span, the failure mode is visible and reversible (the
+  // node is back — delete it again), and the bug this guards against is silent
+  // and is not.
+  if (graphGuard) {
+    try {
+      const guardApp = graphGuard.app;
+      const vanished = vanishedLiveNodes(graphGuard.before, guardApp.graph ?? guardApp.canvas?.graph);
+      if (vanished.length) {
+        let stillMissing = null;
+        let restoreThrew = null;
+        if (typeof guardApp.loadGraphData === "function") {
+          try {
+            await guardApp.loadGraphData(
+              graphGuard.snapshot,
+              true,
+              true,
+              // Reached through typeof: the workflow ref is panel bookkeeping, and a
+              // frontend state where it is unavailable must not block the restore.
+              typeof activeWorkflowRef === "function" ? activeWorkflowRef() : undefined,
+              { __cmcpNoFork: true },
+            );
+            // The restore REBUILDS the graph objects, so the graph references on
+            // the pre-restore entries are stale by design; the re-check is by node
+            // id across every graph reachable from the new root.
+            stillMissing = missingInventoryIds(graphGuard.before, guardApp.graph ?? guardApp.canvas?.graph);
+          } catch (e) {
+            restoreThrew = e;
+            stillMissing = vanished;
+          }
+        }
+        if (stillMissing && stillMissing.length === 0) {
+          // Restored and re-verified — disclosed, and refreshed stays true: the
+          // refresh did refresh, and the canvas is back to what it was before.
+          verdict.restored_nodes = vanished.map(nodeInventoryLabel);
+          verdict.restored_nodes_note = restoredLiveNodesNote(vanished);
+        } else {
+          // FAIL CLOSED. The node loss overrides even a real phase failure already
+          // on this verdict: the lost nodes are the fact the caller must act on
+          // first, and "refreshed" over a shrunk canvas is the bug being fixed.
+          Object.assign(
+            verdict,
+            describeRefreshGraphLoss(stillMissing ?? vanished, {
+              restoreAvailable: typeof guardApp.loadGraphData === "function",
+              restoreThrew,
+            }),
+          );
+        }
+      }
+    } catch {
+      /* the guard is a witness, not a phase — it must never fail the refresh */
+    }
+  }
   // #981 — a refresh that registered the definitions has NOT necessarily fixed the
   // canvas. MEASURED: after registering a formerly-missing class, an already-placed
   // node of that class keeps no definition, no widgets and no title — it stays a
@@ -9776,12 +9887,25 @@ const GRAPH_TOOL_EXECUTORS = {
           empty_combo_lists_note: verdict.empty_combo_lists_note,
         }
       : {};
-    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos };
+    // #1275 — same forwarding hole as #981/#1172, on the success branch this time
+    // for a RESTORE: the refresh pruned live nodes and the panel put them back.
+    // The caller has to know its canvas was rebuilt from a snapshot, or it will
+    // treat the reply as a no-op while node identities changed under it.
+    const restored = verdict != null && typeof verdict === "object" && verdict.restored_nodes?.length
+      ? {
+          restored_nodes: verdict.restored_nodes,
+          restored_nodes_note: verdict.restored_nodes_note,
+        }
+      : {};
+    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos, ...restored };
     return {
       ok: true,
       refreshed: false,
       ...stale,
       reason: verdict?.reason ?? "unknown",
+      // #1275 — the fail-closed graph-loss verdict names what is gone; dropping
+      // the list here would re-silence the exact loss the guard exists to say.
+      ...(verdict?.lost_nodes?.length ? { lost_nodes: verdict.lost_nodes } : {}),
       ...(verdict?.detail ? { detail: verdict.detail } : {}),
       remedy:
         verdict?.remedy ??
