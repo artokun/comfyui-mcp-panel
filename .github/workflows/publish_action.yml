@@ -225,7 +225,78 @@ jobs:
           PY
       # --------------------------------------------------------------------
 
+      # Every publish to the Registry has shipped with a BLANK changelog.
+      # `comfy node publish` accepts `--changelog-file <path>` — the Registry
+      # shows it in the pack's Updates section — but the wrapper action below
+      # never passed one. CHANGELOG.md is already curated per version, so it
+      # is the honest source. Same underlying gap as comfyui-mcp's GitHub
+      # Release fix (mcp#1138); this is its Registry twin.
+      #
+      # THIS STEP CANNOT FAIL THE JOB, BY CONSTRUCTION. Release notes are a
+      # nicety; the release itself is not. There is deliberately no `set -e`
+      # and the step ends in `exit 0`, so every way this can go wrong — no
+      # python, no tomllib, a pyproject without `[project].version`, a missing
+      # or empty CHANGELOG section — lands in the same place: `path=` empty,
+      # and the publish step below ships with no changelog.
+      #
+      # The previous shape had `set -euo pipefail` with the version read on a
+      # bare assignment. Only the `node scripts/changelog-section.mjs` call was
+      # fail-open (an `if` condition is exempt from errexit); a non-zero
+      # `python -c` would have aborted the job BEFORE the publish step ran, so
+      # a release could have been lost over notes it was not going to use.
+      - name: Extract this version's changelog for the Registry
+        id: changelog
+        run: |
+          set -uo pipefail
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null || true)"
+          if [ -n "$version" ] && node scripts/changelog-section.mjs "$version" > registry-changelog.md; then
+            echo "path=registry-changelog.md" >> "$GITHUB_OUTPUT"
+            echo "changelog for $version ($(wc -c < registry-changelog.md) chars):"
+            cat registry-changelog.md
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "::warning::No usable CHANGELOG section (version='${version}') — publishing with no changelog."
+          fi
+          exit 0
+
+      # Previously `uses: Comfy-Org/publish-node-action@main` — a thin wrapper
+      # over exactly these three steps with no way to pass --changelog-file
+      # through it (github.com/Comfy-Org/publish-node-action/blob/main/action.yml
+      # exposes only personal_access_token/skip_checkout). Inlined instead of
+      # relying on undocumented env-var propagation into a third-party
+      # composite action's internals.
+      #
+      # THE CHANGELOG MUST NEVER COST US THE RELEASE. Adding `--changelog-file`
+      # to a command that worked without it introduces new ways for that command
+      # to fail, and they are not hypothetical — in comfy-cli's own
+      # `resolve_publish_changelog` an unreadable or non-UTF-8 changelog file is
+      # `typer.Exit(code=1)`, and `pip install comfy-cli` is unpinned, so a
+      # version predating the flag would reject the argument outright. Either
+      # would have aborted the publish under the previous single-attempt shape.
+      #
+      # So: attempt WITH the notes, and on any failure retry WITHOUT them. The
+      # fallback is a genuine second `comfy node publish`, which is safe for the
+      # dominant failure modes above because they happen during argument parsing
+      # or file reading, before anything is uploaded. If the first attempt
+      # instead died *after* registering the version, the retry will fail on the
+      # duplicate and the job goes red — a loud, accurate "already published"
+      # rather than a silently skipped release.
+      #
+      # Note the secret and the path move into `env:` rather than being
+      # interpolated by `${{ }}` into the script body, so neither is expanded
+      # into the shell source that the runner echoes and parses.
       - name: Publish custom node
-        uses: Comfy-Org/publish-node-action@main
-        with:
-          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        env:
+          CHANGELOG_PATH: ${{ steps.changelog.outputs.path }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          pip install comfy-cli
+          comfy --skip-prompt --no-enable-telemetry env
+          if [ -n "$CHANGELOG_PATH" ]; then
+            if comfy node publish --changelog-file "$CHANGELOG_PATH" --token "$REGISTRY_TOKEN"; then
+              exit 0
+            fi
+            echo "::warning::Registry publish with --changelog-file failed — retrying WITHOUT the changelog so the release still ships."
+          fi
+          comfy node publish --token "$REGISTRY_TOKEN"
