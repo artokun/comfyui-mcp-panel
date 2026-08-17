@@ -67,6 +67,7 @@
 import { resolvePromotedInnerTarget } from "./lib/widget-write.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
+import { isEmbeddedDesktopShell, voiceInputSupport } from "./lib/voice-support.js";
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
@@ -33261,12 +33262,23 @@ function buildPanel() {
   // ---- voice dictation (browser speech recognition; Chrome) ----
   const SR = window.SpeechRecognition ?? window.webkitSpeechRecognition;
   let recognition = null;
-  if (!SR) {
+  // "Supported" means a speech SERVICE exists, not just the API object (#1290): the
+  // ComfyUI desktop app's Electron shell exposes webkitSpeechRecognition but has no
+  // backend behind it, so the button must say dictation is unavailable rather than
+  // fail on every click. Detected the way openExternalUrl already detects Electron.
+  const voiceSupport = voiceInputSupport({
+    SR,
+    desktopShell: isEmbeddedDesktopShell({
+      electronBridge: window.electronAPI ?? window.comfyAPI?.electron,
+      userAgent: navigator.userAgent,
+    }),
+  });
+  if (!voiceSupport.supported) {
     micBtn.disabled = true;
-    micBtn.title = tr("panel.voice_input_is_not_supported_in_this", "Voice input is not supported in this browser");
+    micBtn.title = voiceSupport.title;
   }
   micBtn.addEventListener("click", () => {
-    if (!SR) return;
+    if (!voiceSupport.supported) return;
     if (recognition) {
       recognition.stop();
       return;
