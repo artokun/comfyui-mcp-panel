@@ -574,10 +574,22 @@ export function matchesAllTerms(hay, terms) {
 }
 
 /**
+ * #1287 — the most `limit` panel_search_nodes will return. The orchestrator's input
+ * schema rejects anything above this (MCP -32602, `maximum: 40`) and the panel applies
+ * the same bound when it slices results. A request ABOVE the cap is not an error — the
+ * search itself is valid — but silently returning fewer rows than asked is how a caller
+ * ends up reasoning over a truncated list as if it were the whole answer, so the result
+ * DISCLOSES the clamp as `limit_cap` whenever it bit.
+ */
+export const SEARCH_LIMIT_CAP = 40;
+
+/**
  * Normalize a ComfyUI-Manager `/customnode/getmappings` payload into the
  * nodes_search result shape `{ count, results:[{id,title,description}] }`,
- * filtered by `query` and capped at `limit` (default 15, max 40). Pure so the
- * parse/filter is unit-testable away from the browser Manager client. Handles
+ * filtered by `query` and capped at `limit` (default 15, max SEARCH_LIMIT_CAP —
+ * a request above the cap is disclosed as `limit_cap`, never silently honored,
+ * #1287). Pure so the parse/filter is unit-testable away from the browser
+ * Manager client. Handles
  * both wire shapes: an ARRAY of pack objects, or the documented MAP keyed by
  * repo/url → [ [classNames…], { title, description, … } ]. Issues #251/#255.
  *
@@ -614,13 +626,18 @@ export function parseNodeMappings(data, query, limit) {
       push(meta?.id ?? meta?.reference ?? key, meta?.title, meta?.description);
     }
   }
-  const max = Math.min(Number(limit) || 15, 40);
+  const requested = Number(limit) || 15;
+  const max = Math.min(requested, SEARCH_LIMIT_CAP);
   // #808 — `catalogue_size` is how many packs the payload CONTAINED, before the query
   // filter. Without it, "the catalogue is empty" and "the catalogue is fine, your query
   // matched nothing" both arrive as `count: 0` — and the reader takes the first for the
   // second, concludes the pack does not exist, and goes on trying variations of a search
   // that cannot succeed. That conflation is the whole of #808.
-  return { count: out.length, results: out.slice(0, max), catalogue_size: catalogueSize(data) };
+  const result = { count: out.length, results: out.slice(0, max), catalogue_size: catalogueSize(data) };
+  // #1287 — the caller asked for more than the cap; say so, or the short list reads
+  // as the whole answer.
+  if (requested > SEARCH_LIMIT_CAP) result.limit_cap = SEARCH_LIMIT_CAP;
+  return result;
 }
 
 /**
@@ -646,7 +663,9 @@ export function catalogueSize(data) {
  * name → { display_name, category, description, ... } and is ALWAYS present on any
  * running ComfyUI, so an agent can still discover the nodes it can use RIGHT NOW.
  * Filters by `query` across class name / display_name / category / description and
- * caps at `limit` (default 15, max 40). Pure so it is unit-testable off-browser.
+ * caps at `limit` (default 15, max SEARCH_LIMIT_CAP — a request above the cap is
+ * disclosed as `limit_cap`, never silently honored, #1287). Pure so it is
+ * unit-testable off-browser.
  * `id` is the node class name (usable directly as a node type); these are already
  * installed, so no registry install id is needed.
  */
@@ -664,8 +683,12 @@ export function parseObjectInfoSearch(objectInfo, query, limit) {
       }
     }
   }
-  const max = Math.min(Number(limit) || 15, 40);
-  return { count: out.length, results: out.slice(0, max) };
+  const requested = Number(limit) || 15;
+  const max = Math.min(requested, SEARCH_LIMIT_CAP);
+  const result = { count: out.length, results: out.slice(0, max) };
+  // #1287 — same disclosure as the registry search: a clamped limit is named, not silent.
+  if (requested > SEARCH_LIMIT_CAP) result.limit_cap = SEARCH_LIMIT_CAP;
+  return result;
 }
 
 /**
@@ -686,7 +709,7 @@ export async function objectInfoSearchFallback(objectInfoGet, query, limit, err)
   }
   const parsed = parseObjectInfoSearch(info, query, limit);
   if (!parsed.count) return managerUnavailableResult(query, err);
-  return {
+  const result = {
     supported: true,
     managerReachable: false,
     source: "object_info",
@@ -701,6 +724,9 @@ export async function objectInfoSearchFallback(objectInfoGet, query, limit, err)
       "already available to use directly (add with panel_add_node). Searching/installing " +
       "NEW packs from the registry needs the built-in Manager (v4+) enabled.",
   };
+  // #1287 — the clamp disclosure must survive the fallback re-wrap too.
+  if (parsed.limit_cap) result.limit_cap = parsed.limit_cap;
+  return result;
 }
 
 /**

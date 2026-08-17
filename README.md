@@ -233,7 +233,7 @@ which receives `panel_*` by a different route.
 
 | Tool | Effect |
 |---|---|
-| `panel_search_nodes` | Search installable node packs (the Manager's own source) |
+| `panel_search_nodes` | Search installable node packs (the Manager's own source; `limit` defaults to 15, max 40) |
 | `panel_install_node` | Queue a pack install (registry id or git URL) |
 | `panel_node_queue_status` | Check the Manager's install / update queue |
 | `panel_restart_comfyui` | Restart ComfyUI to load new nodes — panel auto-reconnects and the agent resumes |

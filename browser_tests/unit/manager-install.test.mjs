@@ -30,6 +30,7 @@ const {
   searchNodesVia,
   parseObjectInfoSearch,
   objectInfoSearchFallback,
+  SEARCH_LIMIT_CAP,
 } = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol, plus author/repo shorthand (#301)", () => {
@@ -1451,6 +1452,62 @@ test("parseNodeMappings handles array + map shapes and caps the limit", () => {
   const many = Array.from({ length: 60 }, (_, i) => ({ id: `p/${i}`, title: `t${i}` }));
   assert.equal(parseNodeMappings(many, "", 999).results.length, 40);
   assert.equal(parseNodeMappings(many, "").results.length, 15);
+});
+
+test("#1287 a limit above the cap is DISCLOSED as limit_cap, not silently honored", () => {
+  // The tool's published description documented no maximum while the schema rejected
+  // limit>40 (MCP -32602) and the panel silently returned fewer rows than asked. The
+  // cap stays — but whenever it bites, the result must NAME it, so a truncated list
+  // can no longer read as the whole answer.
+  const many = Array.from({ length: 60 }, (_, i) => ({ id: `p/${i}`, title: `t${i}` }));
+
+  const clamped = parseNodeMappings(many, "", SEARCH_LIMIT_CAP + 10);
+  assert.equal(clamped.results.length, SEARCH_LIMIT_CAP);
+  assert.equal(clamped.limit_cap, SEARCH_LIMIT_CAP, "a clamped request must say what bound was applied");
+
+  // At or under the cap — and the default path — there is nothing to disclose, and
+  // the payload must not grow a field that claims a clamp that never happened.
+  for (const lim of [SEARCH_LIMIT_CAP, 5, undefined]) {
+    const r = parseNodeMappings(many, "", lim);
+    assert.equal("limit_cap" in r, false, `limit ${String(lim)} was not clamped and must not say it was`);
+  }
+
+  // The /object_info fallback search enforces the same bound and discloses it the
+  // same way.
+  const bigInfo = Object.fromEntries(
+    Array.from({ length: 60 }, (_, i) => [`Node${i}`, { display_name: `Node ${i}` }]),
+  );
+  const infoClamped = parseObjectInfoSearch(bigInfo, "", SEARCH_LIMIT_CAP + 10);
+  assert.equal(infoClamped.results.length, SEARCH_LIMIT_CAP);
+  assert.equal(infoClamped.limit_cap, SEARCH_LIMIT_CAP);
+  assert.equal("limit_cap" in parseObjectInfoSearch(bigInfo, "", SEARCH_LIMIT_CAP), false);
+});
+
+test("#1287 the object_info FALLBACK wrapper keeps the limit_cap disclosure", async () => {
+  // objectInfoSearchFallback re-wraps the parsed result; the disclosure must survive
+  // the re-wrap or the unreachable-Manager path silently loses it.
+  const UNREACHABLE_ERR = new Error("Manager customnode/getmappings: not reachable");
+  const bigInfo = Object.fromEntries(
+    Array.from({ length: 60 }, (_, i) => [`Node${i}`, { display_name: `Node ${i}` }]),
+  );
+  const res = await objectInfoSearchFallback(async () => bigInfo, "", SEARCH_LIMIT_CAP + 10, UNREACHABLE_ERR);
+  assert.equal(res.supported, true);
+  assert.equal(res.results.length, SEARCH_LIMIT_CAP);
+  assert.equal(res.limit_cap, SEARCH_LIMIT_CAP, "the fallback path must disclose the same clamp");
+});
+
+test("#1287 the README documents the same bound the search enforces", () => {
+  // The README tool table is the published description this repo owns — it carried no
+  // maximum while the search enforced one, the disagreement the issue reports. Pin
+  // the row to the enforced cap so the two cannot drift apart again.
+  const readme = readFileSync(fileURLToPath(new URL("../../README.md", import.meta.url)), "utf8");
+  const row = readme.split("\n").find((l) => l.includes("`panel_search_nodes`"));
+  assert.ok(row, "the tool table must list panel_search_nodes");
+  assert.match(
+    row,
+    new RegExp(`max ${SEARCH_LIMIT_CAP}\\b`),
+    "the documented limit bound must match the enforced SEARCH_LIMIT_CAP",
+  );
 });
 
 test("#394 parseNodeMappings MAP-shape id is INSTALLABLE (repo URL), never the display title", () => {
