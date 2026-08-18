@@ -117,9 +117,29 @@ export function saveReplyIdentity(identity, { savedAs = false } = {}) {
  * Establishing it as part of the save closes that gap at the only moment the panel knows
  * the new instance and the caller does not. Deliberately NOT widened to every save: an
  * in-place save keeps the same object, whose identity is already established, so there is
- * nothing to mint and no reason to touch it. Only the case that strands a caller.
+ * nothing to mint and no reason to touch it. Only the cases that strand a caller.
+ *
+ * #978 recurrence — a FIRST save is one of those cases too, and scoping this to Save-As
+ * left it standing. A first save (never-persisted tab saved under a name) swaps the active
+ * object exactly like a Save-As: the successor is brand new, and nothing has established
+ * an identity for it either. The #557 carry was supposed to cover that case by threading
+ * the predecessor's uuid onto the successor — and on a healthy run it does. But the carry
+ * is deliberately fail-safe: any proof gap (a tab switch landing in the save's awaits, an
+ * unreadable openWorkflows list, a token mismatch on an unverified frontend) aborts it,
+ * and then the reply found nothing established and reported `workflow_identity_unavailable`
+ * — while the fence, whose own read mints, refused the very next call with the identity
+ * the reply had declined to publish. Measured on panel 0.14.41 / frontend 1.48.7: a first
+ * save of a new tab succeeded with `workflow_identity_unavailable: true` and the session
+ * stayed fenced to the pre-save instance until a manual re-target.
+ *
+ * The #716 objection does not apply here for the same reason it did not apply to Save-As:
+ * this establishes an identity for the record the SAVE ITSELF produced (the token- or
+ * event-proven output of the save transaction), never for whatever canvas happens to be
+ * active — so it is the mutation reporting its own result, not a read deciding what the
+ * canvas is. And it cannot collide with the carry: a record the carry already seeded reads
+ * as `alreadyEstablished` and is left alone.
  */
-export function shouldEstablishIdentityAfterSave({ savedAs = false, alreadyEstablished = false } = {}) {
+export function shouldEstablishIdentityAfterSave({ savedAs = false, firstSave = false, alreadyEstablished = false } = {}) {
   if (alreadyEstablished) return false;
-  return savedAs === true;
+  return savedAs === true || firstSave === true;
 }

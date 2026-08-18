@@ -106,8 +106,9 @@ test("#747 WIRING: BOTH save handlers report the identity, and the FLAG follows 
   // #941 — and BOTH must establish the identity first, or the read above finds nothing for
   // a Save-As's brand-new object and reports `workflow_identity_unavailable` while the
   // fence, whose own read mints, refuses the next call with the identity it just declined
-  // to publish.
+  // to publish. #978 recurrence — the same holds for a FIRST save, whose successor is just
+  // as brand-new when the #557 carry fails safe; the firstSave flag must reach the rule.
   // …from the record the SAVE produced, not a later active-canvas read (#941, codex).
-  assert.match(saveBlock, /saveProducedIdentity\(producedRecord, !!outcome\.saved_as\)/);
-  assert.match(saveAsBlock, /saveProducedIdentity\(producedRecord, true\)/);
+  assert.match(saveBlock, /saveProducedIdentity\(producedRecord, \{ savedAs: !!outcome\.saved_as, firstSave: !!outcome\.first_save \}\)/);
+  assert.match(saveAsBlock, /saveProducedIdentity\(producedRecord, \{ savedAs: true, firstSave: !!outcome\.first_save \}\)/);
 });
