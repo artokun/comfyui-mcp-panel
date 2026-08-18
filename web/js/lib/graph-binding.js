@@ -622,17 +622,22 @@ function nodeIdentityKey(node) {
  * `unknown` either way, deliberately. It makes the DISCLOSURE say which of the two
  * it observed, because they send a reader to opposite places.
  *
- * Returns `{ comparable, sameNodeSet, cosmeticOnly, fields }`:
+ * Returns `{ comparable, sameNodeSet, cosmeticOnly, fields, propertyFields }`:
  *  - `sameNodeSet` — every loaded node is present with the same id AND type, and
  *    no extra ones appeared. Nothing was dropped, added or retyped.
  *  - `cosmeticOnly` — sameNodeSet AND every per-node difference is confined to
  *    COSMETIC_NODE_FIELDS. This is the "the frontend re-measured it" case.
  *  - `fields` — the per-node keys that actually differed, so the disclosure can
  *    name them instead of asking the reader to guess.
+ *  - `propertyFields` — when `properties` is one of those fields, the keys INSIDE
+ *    it that differed (#886). One field name covers both a pack-version stamp the
+ *    frontend rewrote and an extension's stored settings; the disclosure needs
+ *    the keys to tell the reader which. Empty when properties matched or its
+ *    shape was unreadable — no keys are named rather than guessed at.
  * Anything unreadable is `comparable:false` and asserts nothing.
  */
 export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
-  const NOT_COMPARABLE = { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [] };
+  const NOT_COMPARABLE = { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: [], propertyFields: [] };
   if (!Array.isArray(expectedNodes) || !Array.isArray(actualNodes)) return NOT_COMPARABLE;
   try {
     const byKey = (list) => {
@@ -683,18 +688,39 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
     const has = (node, field) =>
       Object.prototype.hasOwnProperty.call(node, field) && node[field] !== undefined;
     const fields = new Set();
+    // #886 — `properties` is one field name standing in for a whole bag of keys, and
+    // the difference between a benign one (a pack-version stamp the frontend rewrote)
+    // and a real one (an extension's stored settings) is WHICH KEYS moved. The open
+    // refusal names the field; name the keys too, so the reader can judge and the
+    // report carries the measurement a per-key account would need. Same discipline as
+    // the field comparison above: presence before value, `undefined` is absent. Only
+    // when BOTH sides are readable objects — anything else names no keys rather than
+    // guessing, exactly as an unreadable node set asserts nothing.
+    const propertyFields = new Set();
+    const readableProps = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
     for (const [key, expectedNode] of expected) {
       const actualNode = actual.get(key);
       const keys = new Set([...Object.keys(expectedNode), ...Object.keys(actualNode)]);
       for (const field of keys) {
-        if (has(expectedNode, field) !== has(actualNode, field)) {
-          fields.add(field);
-          continue;
-        }
+        const present = has(expectedNode, field) === has(actualNode, field);
         const a = JSON.stringify(canonicalizeShapeValue(expectedNode[field]));
         const b = JSON.stringify(canonicalizeShapeValue(actualNode[field]));
-        if (a !== b) fields.add(field);
+        if (present && a === b) continue;
+        fields.add(field);
+        if (field !== "properties") continue;
+        const before = expectedNode.properties;
+        const after = actualNode.properties;
+        if (!readableProps(before) || !readableProps(after)) continue;
+        for (const propKey of new Set([...Object.keys(before), ...Object.keys(after)])) {
+          if (has(before, propKey) !== has(after, propKey)) {
+            propertyFields.add(propKey);
+            continue;
+          }
+          const pa = JSON.stringify(canonicalizeShapeValue(before[propKey]));
+          const pb = JSON.stringify(canonicalizeShapeValue(after[propKey]));
+          if (pa !== pb) propertyFields.add(propKey);
+        }
       }
     }
     const list = [...fields].sort();
@@ -703,6 +729,7 @@ export function classifyNodeDifference({ expectedNodes, actualNodes } = {}) {
       sameNodeSet: true,
       cosmeticOnly: list.length > 0 && list.every((field) => COSMETIC_NODE_FIELDS.has(field)),
       fields: list,
+      propertyFields: [...propertyFields].sort(),
     };
   } catch {
     return NOT_COMPARABLE;
@@ -1644,6 +1671,21 @@ function nodeSurfaceClause(observed = {}) {
     );
   }
   const fields = (diff.fields ?? []).join(", ") || "no readable field";
+  // #886 — when `properties` is among the differing fields, name the KEYS that
+  // differ inside it. "properties" alone sends the reader to re-read the whole
+  // graph for what may be a rewritten pack-version stamp; the keys are the
+  // difference between that and an extension's stored settings, and naming them
+  // is what turns the next report of this shape into the measurement a per-key
+  // account could be written from. Capped, so a hostile properties bag cannot
+  // grow this clause without bound; the cap only trims the LIST, never the
+  // verdict, which this clause does not touch.
+  const propertyKeys = Array.isArray(diff.propertyFields) ? diff.propertyFields : [];
+  const namedKeys = propertyKeys.slice(0, 10).join(", ");
+  const keyDetail =
+    diff.fields?.includes("properties") && namedKeys
+      ? `; within properties, the keys that differ are: ${namedKeys}` +
+        (propertyKeys.length > 10 ? `, and ${propertyKeys.length - 10} more` : "")
+      : "";
   if (diff.cosmeticOnly) {
     // States the NODE observation and stops. The overall "nothing to redo"
     // conclusion is the headline's to draw, and only when `nodes` is the sole
@@ -1661,7 +1703,7 @@ function nodeSurfaceClause(observed = {}) {
   }
   return (
     ` — every node that was loaded IS on the canvas with the same id and type and nothing extra ` +
-    `appeared, so no node was lost; what differs is per-node (${fields}). A widget value is real ` +
+    `appeared, so no node was lost; what differs is per-node (${fields})${keyDetail}. A widget value is real ` +
     `content, so read it (panel_graph_outline) before assuming either way`
   );
 }
