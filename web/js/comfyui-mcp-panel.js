@@ -79,6 +79,7 @@ import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMess
 import { withTimeout } from "./lib/bounded-step.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
+import { installNodeConfigureIsolation, retryNodeRestores } from "./lib/load-restore-isolation.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import {
@@ -11809,7 +11810,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // current graph), so a ready pack/template graph lands without recreating it
   // node-by-node. Mirrors restoreSnapshot's app.loadGraphData(...) path.
   async graph_load({ graph: incoming } = {}) {
-    const { app, graph, rootGraph } = getGraphCtx();
+    const { app, graph, rootGraph, LG } = getGraphCtx();
     // This executor is also called directly by the CivitAI workflow picker,
     // bypassing bridge dispatch. Refuse before snapshot/load so that path cannot
     // report a successful load into a stale prior tab (#349).
@@ -11955,11 +11956,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // form then, so options lands in its proper 5th slot; a blank-canvas load (single arg) is
     // a genuine creation and takes the normal fresh-mint path.
     const loadArgs = resolveLoadGraphArgs(clone, activeWorkflow);
-    if (activeWorkflow && typeof activeWorkflow === "object") {
-      await app.loadGraphData(...loadArgs, { __cmcpKeepInstance: true });
-    } else {
-      await app.loadGraphData(...loadArgs);
+    // #1260 — contain a per-node configure throw to the node that threw. One
+    // node whose widgets are not all built yet (Impact-Pack's FaceDetailer,
+    // whose extension adds widgets asynchronously) otherwise aborts the
+    // frontend's whole restore sequence: every LATER node stays at
+    // construction defaults and links/groups are never applied, while the load
+    // reports a clean success. With the throw contained, the sequence
+    // completes and only the throwing node needs the post-load retry below.
+    const isolation = installNodeConfigureIsolation(LG);
+    try {
+      if (activeWorkflow && typeof activeWorkflow === "object") {
+        await app.loadGraphData(...loadArgs, { __cmcpKeepInstance: true });
+      } else {
+        await app.loadGraphData(...loadArgs);
+      }
+    } finally {
+      isolation?.restore();
     }
+    // Retry each contained node ONCE, now that the load has settled and its
+    // asynchronously-built widgets usually exist. A node that still throws is
+    // DISCLOSED below — never folded into a clean `loaded: true`.
+    const { restored: retriedNodes, failed: unrestoredNodes } = isolation?.failures?.length
+      ? retryNodeRestores(app?.graph, isolation.failures)
+      : { restored: [], failed: [] };
     // comfyui-mcp#1478 (defect 1) — REPORT THE IDENTITY THIS LOAD LANDED ON.
     //
     // `activeWorkflow` was captured before the load and passed to loadGraphData as the
@@ -11978,6 +11997,28 @@ const GRAPH_TOOL_EXECUTORS = {
       node_count: clone.nodes.length,
       ...(auxSanitized ? { aux_id_sanitized: auxSanitized } : {}),
       ...(loadedWorkflowUuid ? { workflow_uuid: loadedWorkflowUuid } : {}),
+      ...(retriedNodes.length ? { nodes_restored_on_retry: retriedNodes } : {}),
+      // #1260 — name every node whose saved state could NOT be applied, with
+      // the error its own configure raised. The rest of the graph — links,
+      // groups, and every other node — restored normally; only these are at
+      // construction defaults.
+      ...(unrestoredNodes.length
+        ? {
+            node_restore_failures: unrestoredNodes.map(({ id, type, error, retry }) => ({
+              id,
+              type,
+              error,
+              ...(retry ? { retry } : {}),
+            })),
+            warning:
+              `${unrestoredNodes.length} node(s) threw while their saved state was being applied ` +
+              `and are at CONSTRUCTION DEFAULTS (widgets, position): ` +
+              unrestoredNodes.map((f) => `${f.type ?? "node"} (id ${f.id})`).join(", ") +
+              `. Links, groups, and every other node restored normally. The throw came from each ` +
+              `node's own frontend code — fix or update that pack, then load again, or reconfigure ` +
+              `these nodes with panel_set_widget before queueing.`,
+          }
+        : {}),
     };
   },
 
