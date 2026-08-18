@@ -579,3 +579,150 @@ test("a duplicate on EITHER side alone is enough to refuse the comparison", () =
     assert.equal(out.sameNodeSet, false);
   }
 });
+
+// ── #886: a `properties` difference names the KEYS that moved ─────────────
+//
+// The last recurrences of #886 report opens refused on per-node `properties`
+// (and `widgets_values`) differences with the node set intact. `properties` is
+// one field name standing in for a whole bag of keys — a pack-version stamp the
+// frontend rewrote and an extension's stored settings read identically at the
+// field level, and the maintainer's per-key account of the rewrite cannot be
+// written until a report says WHICH keys moved. The verdict is deliberately
+// untouched; these pin that the disclosure now carries the keys.
+
+test("a properties difference names the differing keys inside it", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "KSampler", { properties: { ver: "v0.3.64", cnr_id: "comfy-core" } })],
+    actualNodes: [node(1, "KSampler", { properties: { ver: "0.3.64", cnr_id: "comfy-core" } })],
+  });
+  assert.equal(d.sameNodeSet, true);
+  assert.equal(d.cosmeticOnly, false, "properties is not cosmetic — the verdict is untouched");
+  assert.deepEqual(d.fields, ["properties"]);
+  assert.deepEqual(d.propertyFields, ["ver"], "the KEY that moved is named, not just the field");
+});
+
+test("property keys union across nodes, sorted, and a matched properties bag names none", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [
+      node(1, "A", { properties: { ver: "v1", models: [{ name: "m", extra: 1 }] } }),
+      node(2, "B", { properties: { ver: "1" } }),
+    ],
+    actualNodes: [
+      node(1, "A", { properties: { ver: "1", models: [{ name: "m" }] } }),
+      node(2, "B", { properties: { ver: "1" } }),
+    ],
+  });
+  assert.deepEqual(d.fields, ["properties"], "node 2's properties matched — only node 1 differs");
+  assert.deepEqual(d.propertyFields, ["models", "ver"]);
+});
+
+test("a key present-as-undefined inside properties reads as ABSENT, same as a field", () => {
+  // JSON.stringify drops undefined values, so no saved file can carry one — a live
+  // in-memory properties bag holds keys no disk state can reproduce (#1001's rule,
+  // one level down).
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "A", { properties: { ver: "1" } })],
+    actualNodes: [node(1, "A", { properties: { ver: "1", showAdvanced: undefined } })],
+  });
+  assert.deepEqual(d.fields, []);
+  assert.deepEqual(d.propertyFields, []);
+});
+
+test("an unreadable properties shape names the FIELD but no keys", () => {
+  // Fail closed in the direction that costs: a properties value the classifier
+  // cannot read keys out of must not invent a key list — and must not lose the
+  // field-level difference either.
+  for (const bad of [null, [1, 2], "string"]) {
+    const d = classifyNodeDifference({
+      expectedNodes: [node(1, "A", { properties: { ver: "1" } })],
+      actualNodes: [node(1, "A", { properties: bad })],
+    });
+    assert.deepEqual(d.fields, ["properties"], JSON.stringify(bad));
+    assert.deepEqual(d.propertyFields, [], "no keys are guessed at");
+  }
+});
+
+test("a wholly absent properties bag names no keys — absence is already the field difference", () => {
+  const d = classifyNodeDifference({
+    expectedNodes: [node(1, "A", { properties: { ver: "1" } })],
+    actualNodes: [node(1, "A")],
+  });
+  assert.deepEqual(d.fields, ["properties"]);
+  assert.deepEqual(d.propertyFields, []);
+});
+
+test("the open refusal names the differing property keys, so the report carries them", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: false,
+      fields: ["order", "properties", "size"],
+      propertyFields: ["ver"],
+    },
+  });
+  assert.match(msg, /no node was lost/i);
+  assert.match(msg, /order, properties, size/, "the fields are still named");
+  assert.match(msg, /within properties, the keys that differ are: ver/, "and now the keys are too");
+  assert.doesNotMatch(msg, /no missing work to redo/i, "the reassurance is NOT widened");
+});
+
+test("the key list is capped, and says how many were trimmed", () => {
+  const propertyFields = Array.from({ length: 14 }, (_, i) => `k${String(i).padStart(2, "0")}`);
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: false,
+      fields: ["properties"],
+      propertyFields,
+    },
+  });
+  assert.match(msg, /k00/, "the first keys are named");
+  assert.match(msg, /and 4 more/, "the trim is disclosed, not silent");
+  assert.doesNotMatch(msg, /k13/, "a hostile properties bag cannot grow the clause without bound");
+});
+
+test("an empty key list adds no empty clause — an unreadable shape reads exactly as before", () => {
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+    contentNodeDifference: {
+      comparable: true,
+      sameNodeSet: true,
+      cosmeticOnly: false,
+      fields: ["properties"],
+      propertyFields: [],
+    },
+  });
+  assert.match(msg, /what differs is per-node \(properties\)\. A widget value/);
+  assert.doesNotMatch(msg, /keys that differ/, "no keys were read, so none are claimed");
+});
+
+test("the key detail rides the real pipeline, not a hand-built shape", () => {
+  // describeGraphStateDifference -> contentNodeDifference -> the clause, with the
+  // classifier producing propertyFields itself.
+  const state = {
+    nodes: [node(1, "KSampler", { properties: { ver: "v0.3.64" }, widgets_values: [1] })],
+  };
+  const diff = describeGraphStateDifference({
+    rootGraph: rootOf([node(1, "KSampler", { properties: { ver: "0.3.64" }, widgets_values: [1] })]),
+    state,
+  });
+  assert.deepEqual(diff.nodeDifference?.propertyFields, ["ver"]);
+  const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
+    targetLabel: "origami.json",
+    contentComparable: diff.comparable,
+    contentSurfaces: diff.surfaces,
+    contentAccountedSurfaces: diff.accountedSurfaces,
+    contentNodeDifference: diff.nodeDifference,
+  });
+  assert.match(msg, /the keys that differ are: ver/);
+});

@@ -401,7 +401,7 @@ test("describeGraphStateDifference: names the surfaces that disagreed, and only 
     surfaces: ["nodes"],
     accountedSurfaces: [],
     // #825 — a DROPPED node: same-set must be false, and never "cosmetic".
-    nodeDifference: { comparable: true, sameNodeSet: false, cosmeticOnly: false, fields: [] },
+    nodeDifference: { comparable: true, sameNodeSet: false, cosmeticOnly: false, fields: [], propertyFields: [] },
   });
 
   const groupsDiffer = structuredClone(state);
