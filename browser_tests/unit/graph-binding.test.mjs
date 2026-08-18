@@ -1915,43 +1915,54 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
     /preSwapUuid = expectWf \? workflowObjectUuid\(expectWf\) \|\| workflowStableUuid\(expectWf\) : null/,
     "the pre-save identity must be captured from the pre-save object BEFORE the save",
   );
+  // #1263 — the carry is shared with grounding's per-turn auto-persist, which swaps
+  // the active object the same way: programmaticSave must delegate with the save's
+  // own evidence, and the shared carry must keep the whole proof bar.
   assert.match(
     body,
-    /preWfStillOpen =\s*!Array\.isArray\(openList\) \|\| openList\.some\(\(w\) => sameWorkflowObject\(w, expectWf\)\)/,
+    /carryIdentityAcrossSaveSwap\(\{\s*svc,\s*preWf: expectWf,\s*preSwapUuid,\s*savedAs: outcome\.saved_as,\s*savedRecord: details\?\.savedRecord \?\? null,?\s*\}\)/,
+    "the carry must be delegated with the save API's own PRODUCED record — never path occupancy (r10 P0)",
+  );
+  const carryStart = src.indexOf("function carryIdentityAcrossSaveSwap(");
+  assert.notEqual(carryStart, -1, "carryIdentityAcrossSaveSwap must exist");
+  const carry = src.slice(carryStart, src.indexOf("\n}\n", carryStart));
+  assert.match(
+    carry,
+    /preWfStillOpen =\s*!Array\.isArray\(openList\) \|\| openList\.some\(\(w\) => sameWorkflowObject\(w, preWf\)\)/,
     "a predecessor still present in the open tabs (a mid-save switch) must be detected",
   );
   assert.match(
-    body,
-    /postWfIsSaveProducedRecord = Boolean\(details\?\.savedRecord\) && sameWorkflowObject\(details\.savedRecord, postSwapWf\)/,
+    carry,
+    /postWfIsSaveProducedRecord = Boolean\(savedRecord\) && sameWorkflowObject\(savedRecord, postSwapWf\)/,
     "continuity must be threaded from the save API's own PRODUCED record — never path occupancy (r10 P0)",
   );
   assert.doesNotMatch(
-    body,
+    carry,
     /successorCarriesPreUuid|postWfIsSaveTargetRecord|targetRecord/,
     "static evidence (tracker state, path occupancy) is NOT continuity (r8/r10 P0) — it must not appear in the carry",
   );
   assert.match(
-    body,
-    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*postWfHasConflictingEstablishedIdentity,\s*postWfIsSaveProducedRecord,\s*\}\)/,
+    carry,
+    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf,\s*postWf: postSwapWf,\s*savedAs,\s*preWfStillOpen,\s*postWfHasConflictingEstablishedIdentity,\s*postWfIsSaveProducedRecord,?\s*\}\)/,
     "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch, never over an established conflict, never on static evidence)",
   );
   assert.doesNotMatch(
-    body,
+    carry,
     /successorInPreSlot|preSwapSlotIndex/,
     "tab-slot occupancy is NOT continuity evidence (r5 P0) — it must not appear in the carry",
   );
   assert.match(
-    body,
+    carry,
     /postWfHasConflictingEstablishedIdentity = Boolean\(\s*postSwapWf && workflowObjectUuid\(postSwapWf\) && workflowObjectUuid\(postSwapWf\) !== preSwapUuid,?\s*\)/,
     "an established conflicting WeakMap identity on the successor must veto the carry (r7 P0)",
   );
   assert.match(
-    body,
+    carry,
     /setWorkflowObjectUuid\(postSwapWf, preSwapUuid\)/,
     "the successor object cache must be seeded with the pre-save uuid",
   );
   assert.match(
-    body,
+    carry,
     /rememberWorkflowUuidOwner\(preSwapUuid, postSwapWf\)/,
     "the successor must be registered as the pre-save uuid's owner",
   );
@@ -1962,9 +1973,11 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
 // reconnect during the save). onSave performs the mid-save mutation of svc.
 function buildProgrammaticSaveHarness({ onSave } = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
-  const start = src.indexOf("async function programmaticSave(");
+  // #1263 — the slice starts at the shared carry: programmaticSave delegates to it,
+  // so both functions must be in the evaluated source.
+  const start = src.indexOf("function carryIdentityAcrossSaveSwap(");
   const end = src.indexOf("async function reconcileSavedWorkflowCopy(", start);
-  assert.notEqual(start, -1, "programmaticSave must exist");
+  assert.notEqual(start, -1, "carryIdentityAcrossSaveSwap must exist");
   assert.notEqual(end, -1, "programmaticSave boundary must exist");
   const saveSource = src.slice(start, end);
   const ownsTagSource = panelFunctionSource(src, "workflowOwnsRootUuidTag", "assertGraphBoundToActiveWorkflow");
