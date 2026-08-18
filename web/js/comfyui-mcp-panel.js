@@ -3623,13 +3623,23 @@ function loadLandedWorkflowUuid(appRef, targetedWorkflow) {
  * active, and it establishes for the object the SAVE ITSELF produced — never for whatever
  * happens to be active afterwards, which a tab switch during the save's awaits could make
  * a different workflow entirely (codex).
+ *
+ * #978 recurrence — `firstSave` extends the same licence to a first save. Its successor
+ * is just as brand-new as a Save-As copy; the #557 carry threads the predecessor's uuid
+ * onto it when every continuity proof passes, but that carry fails SAFE on any proof gap,
+ * and then an un-established successor reached this reply and was reported
+ * `workflow_identity_unavailable` while the fence's own minting read refused the next call
+ * with the very value the reply declined to publish (measured on 0.14.41 / frontend
+ * 1.48.7). A carry-seeded record reads as already established and is untouched, so the
+ * two paths never compete over the same object.
  */
-function saveProducedIdentity(savedRecord, savedAs) {
+function saveProducedIdentity(savedRecord, { savedAs = false, firstSave = false } = {}) {
   try {
     if (!savedRecord || typeof savedRecord !== "object") return null;
     if (
       !shouldEstablishIdentityAfterSave({
         savedAs,
+        firstSave,
         alreadyEstablished: Boolean(establishedWorkflowReplyIdentity(savedRecord)),
       })
     ) {
@@ -14379,7 +14389,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
     const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
-    const replyIdentity = saveProducedIdentity(producedRecord, !!outcome.saved_as);
+    // #978 recurrence — a FIRST save swaps the active object too, and the #557 carry
+    // that usually threads the identity across that swap fails SAFE on any proof gap,
+    // leaving the produced record un-established and the reply reporting
+    // `workflow_identity_unavailable` while the fence's own minting read refused the
+    // next call with that very identity. Establish from the save's own produced record
+    // for a first save exactly as for a Save-As (#941).
+    const replyIdentity = saveProducedIdentity(producedRecord, { savedAs: !!outcome.saved_as, firstSave: !!outcome.first_save });
     // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
     // first_save) so a rename-vs-copy is never silent (mcp#579).
     //
@@ -14403,7 +14419,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
-    const replyIdentity = saveProducedIdentity(producedRecord, true);
+    const replyIdentity = saveProducedIdentity(producedRecord, { savedAs: true, firstSave: !!outcome.first_save });
     // #978 — the DISCLOSURE follows what the save actually did, not this handler's name
     // (codex). Asked to save an unsaved tab, the adapter classifies it `first_save`: the
     // successor is identity-CONTINUOUS with the temporary predecessor, so the root's

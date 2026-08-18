@@ -33,12 +33,29 @@ test("#941: an already-established canvas is left alone", () => {
 
 test("#941: an in-place save never establishes", () => {
   // It keeps the same object, whose identity is already established; there is nothing to
-  // mint and no caller to strand. Deliberately not widened — measured, an in-place/first
-  // save already reports `workflow_uuid` correctly.
+  // mint and no caller to strand. An unknown save shape stays fail-closed: no save kind,
+  // no mint.
   assert.equal(shouldEstablishIdentityAfterSave({ savedAs: false, alreadyEstablished: false }), false);
   assert.equal(shouldEstablishIdentityAfterSave({ savedAs: false, alreadyEstablished: true }), false);
   assert.equal(shouldEstablishIdentityAfterSave({}), false, "unknown shape must not mint");
   assert.equal(shouldEstablishIdentityAfterSave(), false);
+});
+
+test("#978: a FIRST save with nothing established must establish too", () => {
+  // The recurrence: a first save swaps the active object exactly like a Save-As, and the
+  // #557 carry that usually threads the predecessor's identity across that swap fails
+  // SAFE on any proof gap. Scoped to Save-As, this rule then let the reply report
+  // `workflow_identity_unavailable` while the fence's own minting read refused the next
+  // call with the identity the reply had declined to publish (panel 0.14.41).
+  assert.equal(shouldEstablishIdentityAfterSave({ firstSave: true, alreadyEstablished: false }), true);
+  assert.equal(shouldEstablishIdentityAfterSave({ savedAs: false, firstSave: true, alreadyEstablished: false }), true);
+});
+
+test("#978: a first save the carry already seeded is left alone", () => {
+  // The healthy path: the #557 carry threaded the predecessor's uuid onto the successor,
+  // so the produced record reads as established and nothing is minted over it — the two
+  // paths never compete over the same object.
+  assert.equal(shouldEstablishIdentityAfterSave({ firstSave: true, alreadyEstablished: true }), false);
 });
 
 test("#941: once established, the reply carries what the fence compares against", () => {
