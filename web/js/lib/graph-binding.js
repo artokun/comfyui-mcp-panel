@@ -1340,6 +1340,100 @@ export function graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkf
 }
 
 /**
+ * #1187 — does the live root still CONTAIN the active workflow's whole structure?
+ * Every node the workflow's own current state carries is present with the same id
+ * and type, every one of its links survives, and each remaining structural surface
+ * (floating links, reroutes, groups, config, top-level subgraphs, definitions,
+ * content-bearing extra) is EQUAL. The live root may carry MORE — extra nodes and
+ * extra links — and that is the whole point:
+ *
+ * ChangeTracker captures on user-input events, so a structural HAND EDIT (a node
+ * added, a wire dropped) leaves `activeState` one capture behind the canvas while
+ * `isModified` has not flipped. In that window `graphRootStructureMatchesActive-
+ * Workflow` is false BY DEFINITION — the edit differs structurally — so the
+ * equality relaxation above can never rescue the read, and every graph tool
+ * refuses the workflow's own canvas until the tracker happens to capture. That
+ * window is exactly "the live root is the workflow's structure PLUS the edit",
+ * which this predicate proves from content alone.
+ *
+ * Why the addition-only direction, and why each clause is load-bearing:
+ *
+ *   CONTAINMENT, not intersection. An admitted canvas holds EVERY node and link
+ *   the workflow owns, unaltered — a read served from it can never under-report
+ *   the workflow (the count-short read is the #618 lesson, and a canvas missing
+ *   the workflow's content is what the whole guard exists to refuse). The mirror
+ *   relation — live ⊆ state, a hand REMOVAL still in the lag window — would admit
+ *   exactly that under-reporting canvas, so removals keep refusing here and
+ *   self-clear when the tracker captures. Deliberate, and disclosed in the PR.
+ *
+ *   Non-node/link surfaces stay EQUAL. Adding a node or a wire does not rewrite
+ *   groups, reroutes, subgraphs, definitions or extra, so a canvas that differs
+ *   there is not "A plus an edit" and stays refused, exactly as under the
+ *   equality relaxation.
+ *
+ *   Fail closed on an unreadable side, like every predicate in this module: a
+ *   comparison that could not run is not containment.
+ *
+ * IDENTITY IS STILL A SEPARATE CONJUNCT — this predicate is consulted only
+ * alongside `graphRootWorkflowUuidMatches`, so the stale-tag legs recorded in
+ * docs/design/graph-binding-tag-vs-tracker.md are answered the same way the
+ * equality relaxation answers them: the tag is never trusted alone, and the
+ * content proof demanded here is one no foreign canvas satisfies (a different
+ * workflow does not contain this one's node ids and links). The known residual
+ * is the seal's closed-duplicate gap, widened from "still structurally A" to
+ * "structurally A plus additions": a stranded duplicate canvas that already
+ * carries A's tag and then gains nodes keeps its reads. That is the same
+ * ambiguity `graphRootContentDriftOnBoundCanvas`'s comment accepts knowingly —
+ * the two canvases are observationally identical to every signal the panel has,
+ * and #1187 cannot be fixed without admitting the edit — while the bound still
+ * holds in the direction that matters: nothing A owns can be absent.
+ */
+export function graphRootStructureExtendsActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
+  try {
+    const expected = buildGraphStructureShape(activeWorkflowCurrentState(activeWorkflow));
+    if (expected == null) return false;
+    let actual = null;
+    try {
+      actual = buildGraphStructureShape(rootGraph?.serialize?.());
+    } catch {
+      return false;
+    }
+    if (actual == null) return false;
+    // Nodes: containment by identity (id + type), the same identity
+    // buildGraphStructureShape establishes — type-qualified, so numeric 1 and
+    // string "1" still cannot collide.
+    const actualNodes = new Set(actual.nodes.map((node) => JSON.stringify([node.id, node.type])));
+    for (const node of expected.nodes) {
+      if (!actualNodes.has(JSON.stringify([node.id, node.type]))) return false;
+    }
+    // Links: every link the workflow's state carries must survive on the live
+    // root; the live root may carry extra ones (a wire to the node just added).
+    // A links surface that is present but not an array is malformed — fail closed.
+    const linkSet = (surface) => {
+      if (!surface.present) return new Set();
+      if (!Array.isArray(surface.value)) return null;
+      return new Set(surface.value.map((link) => JSON.stringify(canonicalizeShapeValue(link))));
+    };
+    const expectedLinks = linkSet(expected.links);
+    const actualLinks = linkSet(actual.links);
+    if (expectedLinks == null || actualLinks == null) return false;
+    for (const link of expectedLinks) {
+      if (!actualLinks.has(link)) return false;
+    }
+    // Everything else that identifies a workflow must be EQUAL — an added node
+    // does not touch these surfaces, so a difference here is not the hand edit
+    // this relaxation exists for.
+    const restOf = (shape) => {
+      const { nodes, links, ...rest } = shape;
+      return JSON.stringify(canonicalizeShapeValue(rest));
+    };
+    return restOf(actual) === restOf(expected);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True only when a root graph carries a durable workflow UUID that conflicts
  * with the active workflow object's already-established UUID. Missing identity
  * on either side is inconclusive: older frontends and first observation must
@@ -2413,22 +2507,28 @@ export function resolveGraphBindingVerdict({
   // "a different graph" from "this graph, drifted, with no identity stamp", and
   // the old message resolved that ambiguity by asserting the worse one.
   //
-  // #1187 — BEFORE YOU RELAX THE `structureMatches` CONJUNCT BELOW, read
-  // docs/design/graph-binding-tag-vs-tracker.md. A structural hand edit makes
-  // `structureMatches` false by definition, so a matching tag cannot rescue the read,
-  // and that refusal is a real reported bug. Two fixes for it were built, reviewed and
-  // REJECTED P0 — dropping the conjunct (a stale tag then permits writes to a canvas
-  // this workflow does not own, see the seal's closed-duplicate gap above), and
-  // settling the tracker first (the capture flips `isModified`, which SUPPRESSES
-  // `graphRootMismatchesActiveWorkflow`'s comparison rather than satisfying it — that
-  // function returns false outright on a dirty tab). Both passed the full unit
-  // suite; one was mutation-verified. The suite does not cover either hazard.
+  // #1187 — the `structureMatches` conjunct alone cannot rescue a structural HAND
+  // EDIT: adding a node or a wire makes the structural comparison false by
+  // definition, so on a clean tab inside ChangeTracker's capture lag the
+  // workflow's own identity stamp never rescued the read and every graph tool
+  // refused the right canvas (docs/design/graph-binding-tag-vs-tracker.md records
+  // the two rejected fixes — dropping the conjunct, settling the tracker — and why
+  // both fail open). What rescues it instead is a CONTENT proof with the same
+  // conjunct discipline: the live root must still CONTAIN the workflow's whole
+  // structure (`graphRootStructureExtendsActiveWorkflow`), so nothing the workflow
+  // owns can be absent from a canvas this admits, and the identity tag is never
+  // trusted without it.
   const contentDiffers = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
   const structureMatches =
     contentDiffers && graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const structureExtends =
+    contentDiffers &&
+    structureMatches !== true &&
+    graphRootStructureExtendsActiveWorkflow({ rootGraph, activeWorkflow });
   const rootShapeMismatch =
     contentDiffers &&
-    !(structureMatches && graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
+    !((structureMatches || structureExtends) &&
+      graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   const baselineReadDesync =
     currentStateTrustworthy &&
