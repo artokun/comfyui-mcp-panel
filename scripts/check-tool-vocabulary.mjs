@@ -207,6 +207,12 @@ const NOT_TOOL_NAMES = [
     context: "panel_version: panelVersion",
     why: "same payload property key in the session-rebind frame, not a tool reference",
   },
+  {
+    name: "panel_version",
+    file: "web/js/lib/duplicate-panel-guard.js",
+    context: "no `panel_version` before 0.11.83",
+    why: "the hello payload field, named in the #1269 doc comment — not a tool reference",
+  },
 ];
 
 /**
