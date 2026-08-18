@@ -417,6 +417,63 @@ test("#1124 promptContentHash: rgthree's substitution is not drift, but an edit 
   );
 });
 
+// ---------------------------------------------------------------------------
+// #1273 — the THIRD volatility mechanism: cg-use-everywhere converts its
+// broadcasts to REAL links inside its own queuePrompt patch, so the stamp's
+// graphToPrompt and the dispatch's serialization of an UNTOUCHED graph differ
+// on exactly the pack's extra.ue_links record. The pair computation itself
+// (including the subgraph routing behind the field report's "103:48 anything"
+// tokens) is pinned in use-everywhere-links.test.mjs; these tests pin the
+// integration: collectVolatileInputs carries the pairs, and the two-channel
+// hash comparison of an untouched UE graph now MATCHES.
+// ---------------------------------------------------------------------------
+
+const ueGraph = () => ({
+  _nodes: [
+    { id: 4, inputs: [], outputs: [{ name: "CLIP", links: [] }] },
+    { id: 22, inputs: [{ name: "clip", link: null }, { name: "text", link: null }] },
+  ],
+  extra: {
+    ue_links: [{ downstream: 22, downstream_slot: 0, upstream: 4, upstream_slot: 0, controller: 48, type: "CLIP" }],
+  },
+});
+
+test("#1273 collectVolatileInputs: a UE broadcast target is volatile, its sibling input is not", () => {
+  const pairs = collectVolatileInputs(ueGraph());
+  assert.ok(pairs.has("22 clip"), "the input the injection will materialise");
+  assert.ok(!pairs.has("22 text"), "everything else keeps full drift coverage");
+  assert.equal(collectVolatileInputs({ _nodes: [], extra: {} }).size, 0,
+    "a graph without a ue_links record is untouched");
+});
+
+test("#1273 promptContentHash: an untouched UE graph stamps EQUAL to its dispatched body — and a real edit still refuses", () => {
+  // The pre-dispatch serialization has NO UE link; the post body carries the
+  // injected one. Before #1273 this pair of hashes always mismatched and every
+  // run-to-node on a UE graph was refused as "the graph CHANGED".
+  const volatileInputs = collectVolatileInputs(ueGraph());
+  const stamped = { "22": { class_type: "CLIPTextEncode", inputs: { text: "a cat" } }, "4": { class_type: "CheckpointLoaderSimple", inputs: {} } };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const dispatched = (inputs) =>
+    JSON.stringify({ prompt: { "22": { class_type: "CLIPTextEncode", inputs }, "4": { class_type: "CheckpointLoaderSimple", inputs: {} } } });
+  assert.equal(
+    promptContentHashFromBody(dispatched({ clip: ["4", 0], text: "a cat" }), volatileInputs),
+    atHash,
+    "UE's queue-time injection is the exclusion's purpose — the scoped run is no longer refused",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(dispatched({ clip: ["4", 0], text: "a dog" }), volatileInputs),
+    atHash,
+    "a mid-window edit to any OTHER input of the same node is still drift",
+  );
+  assert.equal(
+    promptContentHashFromBody(dispatched({ clip: ["5", 0], text: "a cat" }), volatileInputs),
+    atHash,
+    "a mid-window rewiring OF the excluded input itself is indistinguishable from the " +
+      "injection and is TOLERATED — the documented residual, disclosed via volatileInputs",
+  );
+});
+
+
 test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's own input — a seed edit is the documented residual, an edit to any OTHER input of the same node refuses", () => {
   const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
   const seed = { name: "seed", value: 111, linkedWidgets: [control] };
