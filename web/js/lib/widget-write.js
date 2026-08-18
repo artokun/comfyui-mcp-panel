@@ -37,6 +37,55 @@ function describeThrown(err) {
   }
 }
 
+/**
+ * #976: the first stack frame OUTSIDE this write path, as scrubbed data.
+ *
+ * `describeThrown` renders the message and nothing else, and the Error is caught
+ * inside this lib so it never reaches the console — so a callback's throw used to
+ * leave NO evidence of WHERE it threw, and the maintainer was reduced to asking
+ * reporters for a stack the panel itself made unobtainable. This emits the single
+ * most useful fact: the innermost frame that is not this module or its set-widget
+ * driver, which names the FILE the throw surfaced from.
+ *
+ * A frame is an OBSERVATION, not an attribution — unlike `write_warning_source` it
+ * claims nothing about which construct failed, so it is emitted for the
+ * unattributed branch too.
+ *
+ * Totality, same contract as describeThrown: `err.stack` may be a throwing accessor
+ * (a hostile Proxy), a non-Error throw has no stack at all, and a frame line may be
+ * any shape — so every read is guarded and any surprise yields null, never a throw
+ * from the path that exists to report one.
+ *
+ * Scrubbing, because this text is pasted into public issues: the frame's ORIGIN
+ * (scheme://host:port, which identifies the reporter's machine) is stripped, keeping
+ * only the URL path — `/extensions/<pack>/<file>.js:LINE:COL` is what a maintainer
+ * needs. Length is capped so a minified single-line bundle cannot make the envelope
+ * unwieldy.
+ */
+function describeThrownFrame(err) {
+  try {
+    const stack = err?.stack;
+    if (typeof stack !== "string" || !stack) return null;
+    for (const line of stack.split("\n")) {
+      const trimmed = line.trim();
+      // V8 ("at fn (url:line:col)") and SpiderMonkey ("fn@url:line:col") both carry
+      // the URL; the message header and anything else is skipped.
+      if (!trimmed.startsWith("at ") && !trimmed.includes("@")) continue;
+      // Frames from the write path itself say where the PANEL was, not where the
+      // throw surfaced — step past them to the first frame that is not ours.
+      if (trimmed.includes("widget-write.js") || trimmed.includes("set-widget.js")) continue;
+      // Strip the origin, keep the path. If the URL shape is not recognized the
+      // frame is still usable — the path is what carries the information.
+      let frame = trimmed.replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s)]+(?=\/)/g, "");
+      if (frame.length > 240) frame = frame.slice(0, 237) + "...";
+      return frame;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
 // RIGHT value and can be unit-tested by driving the SAME code path the handler
@@ -1493,9 +1542,12 @@ export function applyWidgetWrite(
   //
   // #639: a THROWN callback is deliberately NOT a verdict in this chain. The value
   // assignments above run BEFORE the callback fires, so when the callback throws the
-  // write may ALREADY be in effect (MiniMaxH3Director's `duration`: the extension's
-  // own callback throws on `options` of undefined on ANY programmatic invocation,
-  // which made the widget permanently unwritable when any throw forced a refusal).
+  // write may ALREADY be in effect — #976's MiniMaxH3Director `duration` write was
+  // verified present by read-back while its callback's throw was still reported.
+  // (An earlier draft of this note claimed that callback throws on ANY programmatic
+  // invocation; that was never measured — the only repro was a synthetic probe on a
+  // stock node — and the installed pack version has no `duration` widget at all, so
+  // the claim is withdrawn. `write_warning_frame` now carries the evidence instead.)
   // Rolling a VERIFIED write back and refusing would report failure for work that
   // succeeded and invite a destructive retry — so the structural checks below
   // decide. A throw on a verified write is DISCLOSED on the success result
@@ -1505,6 +1557,7 @@ export function applyWidgetWrite(
   let originalErr = null;
   let driftFailure = false;
   let writeWarning = null;
+  let threwFrame = null;
   // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
   // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
   // exactly its job (min 1 / step 2 snaps 4096 -> 4097) was reported as "did not
@@ -1639,6 +1692,13 @@ export function applyWidgetWrite(
   // An attribution that overshoots just relocates the wrong blame.
   if (didThrow) {
     const threwDetail = describeThrown(threw);
+    // #976: WHERE the throw surfaced, as scrubbed data — emitted for BOTH the
+    // attributed and the unattributed branch, because a stack frame is an
+    // observation (unlike `write_warning_source`, it claims nothing about which
+    // construct failed). Without it the Error is swallowed inside this lib and the
+    // one fact that could route the report — the file the throw came from — is
+    // destroyed.
+    threwFrame = describeThrownFrame(threw);
     // "ATTEMPT to invoke", uniformly (codex round 3). A class constructor and a
     // revoked Proxy both satisfy `typeof === "function"` and then throw before any
     // body runs, so any wording that says the callback RAN is false for them — and
@@ -1942,6 +2002,10 @@ export function applyWidgetWrite(
       ? {
           write_warning: writeWarning,
           ...(threwFromCallback ? { write_warning_source: "widget_callback" } : {}),
+          // #976: the innermost non-panel stack frame, scrubbed of origin — present
+          // whenever the throw cooperated, on either attribution branch. Its absence
+          // means "no readable stack", never "no throw".
+          ...(threwFrame ? { write_warning_frame: threwFrame } : {}),
         }
       : {}),
     // #805 — the write applied and the node quantized it. Report BOTH values so the

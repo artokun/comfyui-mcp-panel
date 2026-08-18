@@ -2483,6 +2483,229 @@ test("#639: a throwing callback on a verified write is DISCLOSED (write_warning)
   assert.match(set.write_warning, /invokes callbacks programmatically/, "names the one thing that could make it our doing");
 });
 
+// ---- #976 frame: until now the throw left NO evidence of where it surfaced. The
+//      Error was caught inside the lib, only its message was rendered, and nothing
+//      reached the console — so the maintainer twice had to ask the reporter for a
+//      stack the panel itself had destroyed, and the recurrence on 0.13.7 arrived
+//      with no more information than the first report. `write_warning_frame` carries
+//      the innermost non-panel frame as scrubbed DATA, on EITHER attribution branch
+//      (a stack frame is an observation, not an attribution claim). -----
+
+test("#976 frame: the envelope names the FILE the throw surfaced from, with the origin scrubbed", () => {
+  // A browser-shaped stack, as V8 renders it in ComfyUI — the reporter's own
+  // host:port included, which is exactly what must NOT survive into a public issue.
+  const packErr = new TypeError("Cannot read properties of undefined (reading 'options')");
+  packErr.stack =
+    "TypeError: Cannot read properties of undefined (reading 'options')\n" +
+    "    at Object.callback (http://127.0.0.1:8188/extensions/WhatDreamsCost-ComfyUI/js/minimax_h3_director.js:42:17)\n" +
+    "    at applyWidgetWrite (http://127.0.0.1:8188/extensions/comfyui-mcp-panel/js/lib/widget-write.js:1470:11)";
+  const node = {
+    id: 2693,
+    type: "MiniMaxH3Director",
+    widgets: [
+      {
+        name: "duration",
+        type: "INT",
+        value: 5,
+        callback() {
+          throw packErr;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "duration", 10, HOOKS);
+  assert.equal(set.write_warning_source, "widget_callback", "attribution unchanged");
+  assert.equal(
+    set.write_warning_frame,
+    "at Object.callback (/extensions/WhatDreamsCost-ComfyUI/js/minimax_h3_director.js:42:17)",
+    "the innermost frame, path kept, origin stripped",
+  );
+  assert.doesNotMatch(set.write_warning_frame, /127\.0\.0\.1|8188/, "nothing identifying the reporter's machine");
+});
+
+test("#976 frame: a REAL engine stack yields the callback's own frame — the mechanism is not fixture-shaped", () => {
+  // No crafted `stack` string: whatever V8 actually produces for a callback defined
+  // in THIS file must name THIS file (the pack stand-in), never the write path's.
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw new TypeError("boom-976-real-stack");
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(set.write_warning_source, "widget_callback");
+  assert.ok(
+    typeof set.write_warning_frame === "string" && set.write_warning_frame.includes("widget-write.test.mjs"),
+    `the innermost frame is the callback's own file, got: ${set.write_warning_frame}`,
+  );
+});
+
+test("#976 frame: frames inside the write path itself are stepped past", () => {
+  // A throw whose stack STARTS in the panel (a non-callable callback throws at the
+  // Reflect.apply site, inside widget-write.js) must not report the panel's own
+  // frame — that would name widget-write.js for every throw and say nothing.
+  const err = new TypeError("widgetCallback is not a function");
+  err.stack =
+    "TypeError: widgetCallback is not a function\n" +
+    "    at applyWidgetWrite (http://host:8188/extensions/comfyui-mcp-panel/js/lib/widget-write.js:1470:11)\n" +
+    "    at runSetWidget (http://host:8188/extensions/comfyui-mcp-panel/js/lib/set-widget.js:545:20)\n" +
+    "    at execute (http://host:8188/assets/index-BbD9p18C.js:90001:5)";
+  const node = {
+    id: 2,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw err;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(
+    set.write_warning_frame,
+    "at execute (/assets/index-BbD9p18C.js:90001:5)",
+    "both lib frames skipped; the first non-write-path frame reported",
+  );
+});
+
+test("#976 frame: the UNATTRIBUTED branch carries the frame too — an observation, not an attribution", () => {
+  // A throwing `node.pos` getter is NOT the callback failing (the boundary tests
+  // above pin that no source is claimed) — but the frame still says where the throw
+  // surfaced, because that fact claims nothing about which construct failed.
+  const posErr = new Error("pos boom");
+  posErr.stack =
+    "Error: pos boom\n" +
+    "    at LGraphNode.get pos (http://192.168.1.20:8188/assets/index-BbD9p18C.js:82519:11)\n" +
+    "    at applyWidgetWrite (http://192.168.1.20:8188/extensions/comfyui-mcp-panel/js/lib/widget-write.js:1468:40)";
+  const node = {
+    id: 1,
+    type: "N",
+    get pos() {
+      throw posErr;
+    },
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {},
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(set.write_warning_source, undefined, "still no attribution — the callback never ran");
+  assert.equal(
+    set.write_warning_frame,
+    "at LGraphNode.get pos (/assets/index-BbD9p18C.js:82519:11)",
+    "the observation is emitted anyway",
+  );
+});
+
+test("#976 frame: a throwing `stack` accessor yields no frame — and breaks nothing", () => {
+  // Same totality contract as describeThrown: the reporting path that exists to
+  // report a throw must not itself throw, whatever the thrown value does.
+  const weird = {
+    get message() {
+      return "odd boom";
+    },
+    get stack() {
+      throw new Error("stack boom");
+    },
+  };
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw weird;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.match(set.write_warning, /odd boom/, "the message still renders");
+  assert.equal(set.write_warning_frame, undefined, "no frame — and the report itself survived");
+});
+
+test("#976 frame: a non-Error throw has no stack — the warning stands, no frame claimed", () => {
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw "string boom"; // eslint-disable-line no-throw-literal — the point
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.match(set.write_warning, /string boom/);
+  assert.equal(set.write_warning_frame, undefined, "its absence means 'no readable stack', never 'no throw'");
+});
+
+test("#976 frame: SpiderMonkey's fn@url shape is accepted and scrubbed the same way", () => {
+  const err = new TypeError("ff boom");
+  err.stack = "callback@http://127.0.0.1:8188/extensions/pack/file.js:7:13";
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw err;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(set.write_warning_frame, "callback@/extensions/pack/file.js:7:13");
+});
+
+test("#976 frame: a minified single-line frame is capped, not emitted whole", () => {
+  const err = new Error("minified boom");
+  err.stack = `Error: minified boom\n    at ${"x".repeat(400)} (http://h:8188/extensions/p/b.js:1:1)`;
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          throw err;
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(set.write_warning_frame.length, 240, "capped");
+  assert.ok(set.write_warning_frame.endsWith("..."), "the truncation is visible");
+});
+
 // ---- #976 boundary: attribution is claimed ONLY for the invocation itself. The
 //      lookup of `w.callback` and the evaluation of the callback's arguments happen
 //      OUTSIDE the attributed span, because a throwing accessor and a throwing
