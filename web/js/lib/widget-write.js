@@ -1,5 +1,6 @@
 import { pressableWidgetHint } from "./pressable-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
+import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
 // property off the callback itself (a poisoned `.call` getter or a Proxy trap would
@@ -1037,6 +1038,39 @@ export function resolveWidgetWrite(
             ? [promotedParentWidget]
             : [];
       if (!promotedParentWidget) {
+        // #1181 — when the host input's OUTER link originates at a frontend-only
+        // VIRTUAL source (a canvas PrimitiveNode), the generic advice below is
+        // wrong in both directions: editing "the outermost subgraph node" cannot
+        // help (that IS this node, and its rail is non-authoritative because of
+        // the link), and the link itself carries NOTHING — the prompt compiler
+        // drops the virtual origin, so the inner node's STORED widget value is
+        // what executes. Say so, and point at the two repairs that work. The
+        // refusal itself stands: a write here would still report success over a
+        // rail nothing serializes from (#366's fail-closed posture is untouched).
+        if (promotedHostInput?.link != null) {
+          const links = node.graph?.links ?? {};
+          const l = links[promotedHostInput.link];
+          const originId = l ? (l.origin_id ?? l[1]) : null;
+          const origin =
+            originId != null && node.graph
+              ? (typeof node.graph.getNodeById === "function"
+                  ? node.graph.getNodeById(originId)
+                  : (node.graph._nodes ?? []).find((nd) => String(nd?.id) === String(originId)))
+              : null;
+          if (isNonSerializingValueSource(origin)) {
+            throw new WidgetWriteError(
+              `promoted widget "${widgetName}" on subgraph node ${node.id} is fed by ` +
+                `${origin.type ?? "a frontend-only virtual node"} #${originId}, which the prompt ` +
+                `compiler DROPS — the value on that link does NOT cross the subgraph boundary, so ` +
+                `no write to this rail can take effect and editing the outermost subgraph node ` +
+                `cannot help either. What executes is each INNER node's stored widget value: set ` +
+                `the widget on the inner node directly (enter the subgraph, then panel_set_widget ` +
+                `there), or replace the virtual source with a BACKEND node (e.g. ` +
+                `PrimitiveStringMultiline), whose value does cross (#1181). Refusing to write, ` +
+                `which would report success over a value that cannot serialize.`,
+            );
+          }
+        }
         throw new WidgetWriteError(
           `promoted widget "${widgetName}" on subgraph node ${node.id} resolves to an inner ` +
             `widget, but its AUTHORITATIVE parent rail widget could not be identified (the value ` +
