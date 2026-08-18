@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-08-18
+
+### Fixed
+- a virtual PrimitiveNode feeding a subgraph input is reported as the non-source it is (#1181)
+- a structural hand edit inside the tracker's capture lag no longer refuses the workflow's own canvas (#1187)
+- an open refused on a properties difference names the keys that differ (#886)
+- a first save publishes the identity it produced even when the swap carry fails safe (#978)
+- a widget callback's throw now names the file it surfaced from, origin scrubbed (#976)
+
+
 ## [0.15.1] - 2026-08-18
 
 ### Added
