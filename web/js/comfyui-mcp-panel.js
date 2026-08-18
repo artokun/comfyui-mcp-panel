@@ -5566,6 +5566,51 @@ function autoWorkflowName() {
   return `Untitled ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
+/** #557 — thread a save's pre-swap identity onto the successor the save itself
+ *  PRODUCED, with continuity verified HERE, at the seed point (postWf is read
+ *  from the service after the awaited save): the predecessor must be GONE from
+ *  the open tabs — a user/reconnect tab switch during the await keeps it open
+ *  and must abort the carry entirely — and the post-save ACTIVE object must be
+ *  the record the save API itself produced (details.savedRecord, threaded by the
+ *  save lib). STATIC evidence is never accepted: tab-slot occupancy can seat a
+ *  foreign tab in the predecessor's old slot (r5), a lagging tracker state
+ *  carrying the pre-save uuid can be residue (r8), and path occupancy is
+ *  satisfied by any close→reopen of the same file — which is a NEW identity,
+ *  not a successor (r10). A successor the event thread can't prove fails SAFE
+ *  (no carry); the lazy backstop / proven repaint heals the genuine case
+ *  afterward. Shared by programmaticSave (panel save tools) and grounding's
+ *  carryIdentity (the per-turn auto-persist, #1263) — both are first-save object
+ *  swaps with the same proof bar. */
+function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false, savedRecord = null } = {}) {
+  if (!preSwapUuid) return;
+  const postSwapWf = svc?.activeWorkflow;
+  const openList = svc?.openWorkflows;
+  const preWfStillOpen =
+    !Array.isArray(openList) || openList.some((w) => sameWorkflowObject(w, preWf));
+  // r7 P0 — even with continuity proven, never overwrite an established,
+  // DIFFERENT identity on the successor: that is a conflicting tab, not A's
+  // continuation, and seeding it would poison the owner map.
+  const postWfHasConflictingEstablishedIdentity = Boolean(
+    postSwapWf && workflowObjectUuid(postSwapWf) && workflowObjectUuid(postSwapWf) !== preSwapUuid
+  );
+  // r10 P0 — the save API's own produced record is the ONLY succession proof:
+  // a close→reopen of the same path is not what the save produced.
+  const postWfIsSaveProducedRecord = Boolean(savedRecord) && sameWorkflowObject(savedRecord, postSwapWf);
+  if (
+    shouldCarryIdentityAcrossSaveSwap({
+      preWf,
+      postWf: postSwapWf,
+      savedAs,
+      preWfStillOpen,
+      postWfHasConflictingEstablishedIdentity,
+      postWfIsSaveProducedRecord,
+    })
+  ) {
+    if (!workflowObjectUuid(postSwapWf)) setWorkflowObjectUuid(postSwapWf, preSwapUuid);
+    rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
+  }
+}
+
 /** Programmatically save the active workflow — NO Save/Rename dialog.
  *
  *  Delegates to the shared, unit-tested `saveActiveWorkflow` (web/js/lib/
@@ -5636,46 +5681,16 @@ async function programmaticSave(name) {
   });
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with
-  // CONTINUITY PROVEN FROM THE SAVE'S OWN REPLACEMENT EVENT, verified at the
-  // seed point (postWf is read from the service HERE, after the awaited save):
-  // the predecessor must be GONE from the open tabs — a user/reconnect tab
-  // switch during the await keeps it open and must abort the carry entirely —
-  // and the post-save ACTIVE object must be the record the save API itself
-  // PRODUCED (details.savedRecord, threaded by the save lib). STATIC evidence
-  // is never accepted: tab-slot occupancy can seat a foreign tab in the
-  // predecessor's old slot (r5), a lagging tracker state carrying the pre-save
-  // uuid can be residue (r8), and path occupancy is satisfied by any
-  // close→reopen of the same file — which is a NEW identity, not a successor
-  // (r10). A successor the event thread can't prove fails SAFE (no carry); the
-  // lazy backstop / proven repaint heals the genuine case afterward.
-  const postSwapWf = svc?.activeWorkflow;
-  if (preSwapUuid) {
-    const openList = svc?.openWorkflows;
-    const preWfStillOpen =
-      !Array.isArray(openList) || openList.some((w) => sameWorkflowObject(w, expectWf));
-    // r7 P0 — even with continuity proven, never overwrite an established,
-    // DIFFERENT identity on the successor: that is a conflicting tab, not A's
-    // continuation, and seeding it would poison the owner map.
-    const postWfHasConflictingEstablishedIdentity = Boolean(
-      postSwapWf && workflowObjectUuid(postSwapWf) && workflowObjectUuid(postSwapWf) !== preSwapUuid
-    );
-    // r10 P0 — the save API's own produced record is the ONLY succession proof:
-    // a close→reopen of the same path is not what the save produced.
-    const postWfIsSaveProducedRecord = Boolean(details?.savedRecord) && sameWorkflowObject(details.savedRecord, postSwapWf);
-    if (
-      shouldCarryIdentityAcrossSaveSwap({
-        preWf: expectWf,
-        postWf: postSwapWf,
-        savedAs: outcome.saved_as,
-        preWfStillOpen,
-        postWfHasConflictingEstablishedIdentity,
-        postWfIsSaveProducedRecord,
-      })
-    ) {
-      if (!workflowObjectUuid(postSwapWf)) setWorkflowObjectUuid(postSwapWf, preSwapUuid);
-      rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
-    }
-  }
+  // CONTINUITY PROVEN FROM THE SAVE'S OWN REPLACEMENT EVENT. The carry and its
+  // whole proof bar live in carryIdentityAcrossSaveSwap, shared with grounding's
+  // per-turn auto-persist (#1263), which swaps the active object the same way.
+  carryIdentityAcrossSaveSwap({
+    svc,
+    preWf: expectWf,
+    preSwapUuid,
+    savedAs: outcome.saved_as,
+    savedRecord: details?.savedRecord ?? null,
+  });
   // INDEPENDENT post-save verification (a second backstop, at the tool layer) for a
   // Save-As COPY: attest whether the REAL source file is still on disk. This reports
   // PATH PRESENCE (`original_on_disk`), not content identity — an honest, disk-checked
@@ -5942,6 +5957,22 @@ async function groundUnsavedWorkflow() {
       // routes on is enough — threads carry it as `workflowRouteKey`, which is what the
       // filter matches — and if none exists yet there is nothing to bridge anyway.
       identityProbe: (wf) => ({ routeId: (wf ? _tempWorkflowInstanceIds.get(wf) : null) ?? null }),
+      // #1263 — grounding is a FIRST SAVE, and a first save swaps the active
+      // ComfyWorkflow object. Without this carry the successor's next identity
+      // read re-minted the workflow uuid mid-session (no object cache on the new
+      // object, and the just-created file's embedded uuid fails the #557
+      // succession-proof for an unsaved tab whose embed omitted workflow_path),
+      // so the orchestrator's instance fence refused the next graph mutation
+      // until a re-hello landed. Thread the pre-save identity across the swap
+      // exactly as programmaticSave does for the panel's own save tools: the
+      // same predicate, the same fail-safe-on-any-proof-gap behaviour. Ownership
+      // here is known by CAUSATION (the panel called this save and awaited it —
+      // see the #847 note in workflow-chat-identity.js), which is what makes
+      // seeding safe rather than inferred.
+      carryIdentity: ({ svc: groundSvc, preWf, savedRecord }) => {
+        const preSwapUuid = preWf ? workflowObjectUuid(preWf) || workflowStableUuid(preWf) : null;
+        carryIdentityAcrossSaveSwap({ svc: groundSvc, preWf, preSwapUuid, savedAs: false, savedRecord });
+      },
       onGrounded: ({ savedName, identity }) => {
         // One implementation, shared with the tests (codex) — see groundedWorkflowPath.
         const path = groundedWorkflowPath(savedName);

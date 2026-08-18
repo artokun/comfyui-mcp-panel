@@ -271,10 +271,20 @@ const _groundingChain = new Map(); // svc -> tail Promise<void>
 /** One grounding attempt: probe the ACTIVE workflow's on-disk state, then save the
  *  EXACT SAME workflow it probed (`expect: wf` → saveActiveWorkflow refuses if the
  *  active workflow changed during the async probe, so we never authorize on tab A
- *  and write to tab B). Best-effort: any refusal/hiccup ⇒ null (leave ungrounded). */
+ *  and write to tab B). Best-effort: any refusal/hiccup ⇒ null (leave ungrounded).
+ *
+ *  `carryIdentity` is an OPTIONAL callback fired synchronously after a successful
+ *  grounding save, inside this serialized transaction, with the pre-save workflow
+ *  and the save's own PROVEN produced record (`details.savedRecord`). Grounding a
+ *  never-persisted tab is a first save, and a first save SWAPS the active
+ *  ComfyWorkflow object — without threading the pre-save identity onto the
+ *  produced successor, the successor's next identity read re-mints the workflow
+ *  uuid mid-session and the orchestrator's instance fence refuses the next graph
+ *  mutation (panel#1263). The callback owns the whole proof decision (it must
+ *  fail safe on any gap); this module only guarantees the timing and the inputs. */
 async function groundOnce(
   svc,
-  { existsOnDisk, autoWorkflowName, reconcileSavedCopy, canvasBinding, identityProbe, onGrounded } = {},
+  { existsOnDisk, autoWorkflowName, reconcileSavedCopy, canvasBinding, identityProbe, onGrounded, carryIdentity } = {},
 ) {
   try {
     const wf = svc?.activeWorkflow;
@@ -294,13 +304,30 @@ async function groundOnce(
       preIdentity = null; // bookkeeping must never stop a save that protects user work
     }
     if (!(await groundingIsSafe(wf, existsOnDisk))) return null;
+    // #1263 — thread the save's outcome sink so the identity carry below can work
+    // from the save's own PROVEN produced record, never a post-await active-tab read.
+    const details = {};
     const savedName = await saveActiveWorkflow(svc, undefined, {
       autoWorkflowName,
       existsOnDisk,
       reconcileSavedCopy,
       canvasBinding,
       expect: wf,
+      details,
     });
+    // The carry runs BEFORE onGrounded and inside the same serialized operation as
+    // the save: the successor it seeds is the live active object RIGHT NOW, and any
+    // later identity read (the 600ms poll, command dispatch) must already see the
+    // carried uuid rather than minting a fresh one. Best-effort like the rest of
+    // grounding bookkeeping — a carry failure must never un-report a save that
+    // already protected the user's work; the drift re-hello heals a missed carry.
+    if (savedName && typeof carryIdentity === "function") {
+      try {
+        carryIdentity({ svc, preWf: wf, savedRecord: details?.savedRecord ?? null });
+      } catch {
+        /* identity bookkeeping must never fail a save that protected user work */
+      }
+    }
     // The name the save ITSELF produced — never re-read from `svc.activeWorkflow`, which by
     // now may be a different tab entirely.
     if (savedName && preIdentity && typeof onGrounded === "function") {

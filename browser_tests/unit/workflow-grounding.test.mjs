@@ -160,3 +160,86 @@ test('groundActiveWorkflow does not double-save a turn that arrives during the c
   await Promise.all([p1, p2])
   assert.equal(copySaves, 1) // the pre-commit copy was NOT grounded a second time
 })
+
+// #1263 — grounding is a FIRST SAVE, and a first save SWAPS the active ComfyWorkflow
+// object. The identity carry must be handed the PRE-SAVE workflow and the save's own
+// PROVEN produced record, inside the grounding transaction — without it the
+// successor's next identity read re-mints the workflow uuid mid-session and the
+// orchestrator's instance fence refuses the next graph mutation.
+function groundingTrioSvc(A, disk) {
+  let active = A
+  return {
+    svc: {
+      get activeWorkflow() { return active },
+      set activeWorkflow(v) { active = v },
+      getWorkflowByPath: (p) => (disk.has(p) && p !== A.path ? { path: p, isPersisted: true } : (active && active.path === p ? active : null)),
+      saveAs: (wf, path) => ({ path, filename: path.split('/').pop(), directory: 'workflows', initialMode: 'default', isPersisted: false, isTemporary: true, changeTracker: { prepareForSave() {} } }),
+      openWorkflow: async (copy) => { active = copy },
+      saveWorkflow: async (copy) => { disk.add(copy.path); copy.isPersisted = true; copy.isTemporary = false }
+    },
+    getActive: () => active
+  }
+}
+
+test('groundActiveWorkflow invokes carryIdentity with the pre-save workflow and the produced record (#1263)', async () => {
+  const A = { isPersisted: false, isTemporary: true, path: 'workflows/Unsaved Workflow.json', filename: 'Unsaved Workflow', directory: 'workflows', initialMode: 'default' }
+  const disk = new Set([A.path])
+  const { svc, getActive } = groundingTrioSvc(A, disk)
+  const carries = []
+  const saved = await groundActiveWorkflow(svc, {
+    existsOnDisk: async () => false,
+    autoWorkflowName: () => 'Untitled X',
+    reconcileSavedCopy: async () => 'unknown',
+    carryIdentity: (args) => carries.push(args)
+  })
+  assert.equal(saved, 'Untitled X')
+  assert.equal(carries.length, 1)
+  assert.equal(carries[0].svc, svc)
+  assert.equal(carries[0].preWf, A)                 // the pre-save (consumed) tab
+  assert.equal(carries[0].savedRecord, getActive()) // the produced, now-active successor
+  assert.notEqual(carries[0].savedRecord, A)
+})
+
+test('groundActiveWorkflow does NOT invoke carryIdentity when nothing was grounded (#1263)', async () => {
+  const svc = { activeWorkflow: { isPersisted: true, isTemporary: false, path: 'workflows/MyFlow.json' } }
+  const carries = []
+  const result = await groundActiveWorkflow(svc, { existsOnDisk: async () => false, carryIdentity: (a) => carries.push(a) })
+  assert.equal(result, null)
+  assert.equal(carries.length, 0)
+})
+
+test('groundActiveWorkflow threads a NULL savedRecord when the produced record is unproven (#1263 fail-safe)', async () => {
+  const A = { isPersisted: false, isTemporary: true, path: 'workflows/Unsaved Workflow.json', filename: 'Unsaved Workflow', directory: 'workflows', initialMode: 'default' }
+  const disk = new Set([A.path])
+  const { svc } = groundingTrioSvc(A, disk)
+  // A tab switch lands during the awaited persist: the post-trio active tab is NOT
+  // the copy the trio wrote, so the adapter threads NO produced record — the carry
+  // must see that as null and fail safe, never seed a foreign tab.
+  const foreign = { path: 'workflows/Foreign.json', filename: 'Foreign', isPersisted: true, isTemporary: false }
+  const origSaveWorkflow = svc.saveWorkflow
+  svc.saveWorkflow = async (copy) => { await origSaveWorkflow(copy); svc.activeWorkflow = foreign }
+  const carries = []
+  const saved = await groundActiveWorkflow(svc, {
+    existsOnDisk: async () => false,
+    autoWorkflowName: () => 'Untitled X',
+    reconcileSavedCopy: async () => 'unknown',
+    carryIdentity: (args) => carries.push(args)
+  })
+  assert.ok(saved, "the save still happened and is reported")
+  assert.equal(carries.length, 1)
+  assert.equal(carries[0].preWf, A)
+  assert.equal(carries[0].savedRecord, null)
+})
+
+test('groundActiveWorkflow still reports the save when carryIdentity throws (#1263)', async () => {
+  const A = { isPersisted: false, isTemporary: true, path: 'workflows/Unsaved Workflow.json', filename: 'Unsaved Workflow', directory: 'workflows', initialMode: 'default' }
+  const disk = new Set([A.path])
+  const { svc } = groundingTrioSvc(A, disk)
+  const saved = await groundActiveWorkflow(svc, {
+    existsOnDisk: async () => false,
+    autoWorkflowName: () => 'Untitled X',
+    reconcileSavedCopy: async () => 'unknown',
+    carryIdentity: () => { throw new Error('boom') }
+  })
+  assert.equal(saved, 'Untitled X') // identity bookkeeping never un-reports a save
+})
