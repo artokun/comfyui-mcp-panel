@@ -5,6 +5,12 @@ import { tr } from "./i18n.js";
 // input its handler overwrites) already live in scoped-batch-seed.js; this file
 // imports the verdict rather than restating them.
 import { rgthreeQueueTimeSeedInput } from "./scoped-batch-seed.js";
+// #1273 — the THIRD volatility signal: cg-use-everywhere materialises its
+// broadcast links into the prompt inside its own queuePrompt patch, so the
+// inputs it will inject are queue-time volatile too. The measured facts about
+// the pack (the extra.ue_links record, the io-node ids, the subgraph routing)
+// live in use-everywhere-links.js; this file imports the verdict.
+import { ueQueueTimeLinkPairs } from "./use-everywhere-links.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -398,11 +404,13 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
 /**
  * The "execId inputName" pairs whose values MUTATE AT QUEUE TIME — after our
  * pre-dispatch stamp and before the POST body is built — collected from the live
- * root graph and every nested subgraph. TWO signals, because there are two
- * mechanisms (#1124): a widget-level `beforeQueued` hook, and an extension that
- * patches `api.queuePrompt` and rewrites the outgoing prompt directly. The
- * second is invisible to any widget scan, so it is matched by node identity
- * instead (rgthree's armed Seed node — see rgthreeQueueTimeSeedInput).
+ * root graph and every nested subgraph. THREE signals, one per mechanism: a
+ * widget-level `beforeQueued` hook (#572), an extension that patches
+ * `api.queuePrompt` and rewrites the outgoing prompt directly (rgthree's armed
+ * Seed node, #1124 — invisible to any widget scan, matched by node identity),
+ * and an extension that materialises virtual links into the prompt at queue
+ * time (cg-use-everywhere, #1273 — matched by the pack's own `extra.ue_links`
+ * record, see ueQueueTimeLinkPairs).
  * execId is the flattened prompt id: String(node.id) at root, the
  * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
@@ -493,6 +501,21 @@ export function collectVolatileInputs(rootGraph) {
     }
   };
   walk(rootGraph, "");
+  // #1273 — THE THIRD VOLATILITY SIGNAL. cg-use-everywhere's queuePrompt patch
+  // converts its broadcasts to REAL links before the post body is serialized
+  // and restores them after, so the stamp's graphToPrompt and the dispatch's
+  // serialization of an UNTOUCHED graph differ on exactly the pack's own
+  // `extra.ue_links` record. Every scoped run on a UE graph was refused as
+  // "the graph CHANGED", naming the broadcast targets (model/clip/vae/…), with
+  // the retry failing identically — the injection is deterministic, not a
+  // race. The pairs are exactly the inputs the injection can materialise
+  // (subgraph routing included — see use-everywhere-links.js); everything else
+  // keeps full drift coverage, and the set rides along in `volatileInputs`
+  // like the hook and rgthree pairs. This is its own walk, not a fold into
+  // the loop above: the output-panel routing needs the INSTANCE node a bare
+  // graph walk doesn't carry, and a shared subgraph definition must be walked
+  // once per instance prefix.
+  for (const pair of ueQueueTimeLinkPairs(rootGraph)) pairs.add(pair);
   return pairs;
 }
 
