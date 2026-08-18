@@ -167,7 +167,16 @@ function mergeWorkflowVersions(...maps) {
   for (const map of maps) {
     for (const [hash, version] of Object.entries(normalizeWorkflowVersions(map))) {
       const previous = combined[hash];
-      if (!previous || version.capturedAt >= previous.capturedAt) combined[hash] = version;
+      // A version carrying its restorable graph outranks bare metadata for the same
+      // capture (#861). The local shadow strips payloads from what canonical already
+      // holds, and the shadow merges AFTER canonical — without this guard the
+      // stripped copy would launder the durable payload away on the next load. The
+      // hash is content-addressed, so same hash is the same graph: keeping the
+      // payload-carrier loses nothing.
+      const dropsPayload = previous?.snapshot !== undefined && version.snapshot === undefined;
+      if (!previous || (version.capturedAt >= previous.capturedAt && !dropsPayload)) {
+        combined[hash] = version;
+      }
     }
   }
   return normalizeWorkflowVersions(combined);
@@ -1434,6 +1443,63 @@ export function boundShadowBytes(localSnapshot, { maxBytes, evictableIds, protec
 }
 
 /**
+ * Hashes of the workflow versions whose restorable graph payload a snapshot is PROVEN
+ * to hold, per thread id (#861 recurrence).
+ *
+ * A thread carries up to 20 versions x 300KB of serialized graph INSIDE its own
+ * record, and the live thread is protected from eviction — so while those payloads
+ * sit in the localStorage shadow, the byte bound above cannot hold. That is exactly
+ * the reported case: a long chat on a frequently edited graph re-wedged the shared
+ * origin quota even with the cap in place, and ComfyUI's saveDraft() failed again.
+ *
+ * The hash is content-addressed, so a hash present in the canonical record — WITH
+ * its snapshot — is the whole proof that the shadow's copy of that payload is a
+ * cache. This is the receipt that licenses stripping it there.
+ */
+function versionPayloadReceipts(snapshot) {
+  const receipts = new Map();
+  for (const thread of Array.isArray(snapshot?.threads) ? snapshot.threads : []) {
+    if (typeof thread?.id !== "string" || !thread.id) continue;
+    for (const [hash, version] of Object.entries(thread.workflowVersions || {})) {
+      if (version && typeof version === "object" && version.snapshot !== undefined) {
+        let held = receipts.get(thread.id);
+        if (!held) receipts.set(thread.id, (held = new Set()));
+        held.add(hash);
+      }
+    }
+  }
+  return receipts;
+}
+
+/**
+ * The shadow copy of a thread with its canonical-durable version payloads reduced to
+ * metadata (#861 recurrence). The version LIST survives — hash, capturedAt, node
+ * count, title — so startup paint and the history UI are unchanged; only the
+ * restorable graph leaves, and only for versions the receipt proves canonical holds.
+ * The in-memory thread is never touched: any later canonical write re-supplies every
+ * payload from it, so a stripped shadow cannot become the only copy. Versions with
+ * no receipt keep their payload — fail closed, exactly like an un-receipted legacy
+ * thread keeping its place in the shadow.
+ */
+function stripDurableVersionPayloads(thread, receipts) {
+  const held = receipts.get(thread?.id);
+  const versions = thread?.workflowVersions;
+  if (!held || !versions || typeof versions !== "object") return thread;
+  let changed = false;
+  const kept = Object.create(null);
+  for (const [hash, version] of Object.entries(versions)) {
+    if (held.has(hash) && version && typeof version === "object" && version.snapshot !== undefined) {
+      const { snapshot: _dropped, ...metadata } = version;
+      kept[hash] = metadata;
+      changed = true;
+    } else {
+      kept[hash] = version;
+    }
+  }
+  return changed ? { ...thread, workflowVersions: kept } : thread;
+}
+
+/**
  * Read every quarantined pre-v3 transcript out of the legacy store (#861).
  *
  * Returns `null` — NOT `[]` — when the store cannot be reached. The difference is
@@ -2164,7 +2230,18 @@ export class ChatHistoryStore {
       ...thread,
       msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES),
     }));
-    const shadow = [...boundedOrdinary, ...legacyThreads]
+    // #861 recurrence — shed workflow-version PAYLOADS the canonical record is proven
+    // to hold before the byte bound is measured. Without this the bound cannot hold:
+    // the versions ride inside the live thread, and the live thread is protected from
+    // eviction. When this write follows the canonical merge, the snapshot itself is
+    // the receipt; otherwise the last committed canonical state is. No receipt — the
+    // first persist of a session, or any install where IndexedDB is unavailable — and
+    // every payload stays, because then the shadow is still their only copy.
+    const payloadReceipts = versionPayloadReceipts(canonicalDurable ? snapshot : this._lastCommitted);
+    const shadow = [
+      ...boundedOrdinary.map((thread) => stripDurableVersionPayloads(thread, payloadReceipts)),
+      ...legacyThreads,
+    ]
       .sort((a, b) => finiteTs(a.updatedAt || a.ts) - finiteTs(b.updatedAt || b.ts));
     // #861 — the byte bound. Everything here is a CACHE of something durable except
     // legacy threads, which are durable only once the legacy store has accepted

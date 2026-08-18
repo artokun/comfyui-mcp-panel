@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   ChatHistoryStore,
   boundShadowBytes,
+  mergeHistorySnapshots,
   CHAT_HISTORY_SCHEMA,
   CHAT_HISTORY_DB_VERSION,
   CHAT_HISTORY_LEGACY_STORE,
@@ -1098,4 +1099,148 @@ test("the fence exists BEFORE the record stops existing", async () => {
   assert.ok(intentAt > 0, "the intent must be recorded up front");
   assert.ok(deleteAt > 0, "…and the record deleted after");
   assert.ok(intentAt < deleteAt, "the fence must exist before the record does not");
+});
+
+// ── the recurrence: version payloads ride INSIDE the protected thread ──────
+//
+// #861 shipped the byte bound, and the symptom came back anyway: a long chat on a
+// frequently edited graph captures a workflow version (up to 300KB of serialized
+// graph) on every user turn, twenty per thread, INSIDE the thread record. The live
+// thread is protected from eviction, so whole-thread eviction could never reclaim
+// those bytes — the shadow grew past the budget again, and ComfyUI's saveDraft()
+// failed again on the shared origin. The fix keeps the version LIST in the shadow
+// but strips the restorable payload once canonical is PROVEN to hold it — the same
+// receipt discipline as the legacy eviction, one level down.
+
+const ordinaryThreadWithVersions = (id, ts, versionCount, payloadSize) => ({
+  id,
+  schemaVersion: CHAT_HISTORY_SCHEMA,
+  ts,
+  updatedAt: ts,
+  msgs: [{ id: `${id}-m`, role: "user", text: "hi" }],
+  workflowVersions: Object.fromEntries(
+    Array.from({ length: versionCount }, (_, i) => [
+      `hash-${id}-${i}`,
+      {
+        hash: `hash-${id}-${i}`,
+        capturedAt: ts + i,
+        nodeCount: i + 1,
+        snapshot: { pad: "g".repeat(payloadSize) },
+      },
+    ]),
+  ),
+});
+
+test("version payloads leave the shadow once canonical holds them — the list stays", async () => {
+  const indexedDb = createFakeIndexedDb();
+  const storage = createMemoryStorage();
+  // Budget below the payload total: without the strip the thread could only be
+  // evicted whole or written oversized — the two failures this test must NOT see.
+  const store = new ChatHistoryStore({ storage, indexedDb, maxShadowBytes: 3000 });
+  const thread = ordinaryThreadWithVersions("T0", 1, 6, 800);
+  store.persist([thread], {});
+  await store._writePromise;
+
+  // Second persist: the canonical receipts now exist, so the shadow may shed payloads.
+  store.persist([thread], {});
+  await store._writePromise;
+
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  assert.ok(
+    JSON.stringify(written).length <= 3000,
+    "the shadow must respect the byte budget even with the live thread protected",
+  );
+  const shadowThread = (written.threads || []).find((t) => t.id === "T0");
+  assert.ok(shadowThread, "the thread itself must stay in the shadow");
+  const versions = Object.values(shadowThread.workflowVersions || {});
+  assert.equal(versions.length, 6, "the version LIST survives the strip");
+  for (const version of versions) {
+    assert.equal(version.snapshot, undefined, "a canonical-durable payload leaves the shadow");
+    assert.ok(version.hash && Number.isFinite(version.capturedAt), "the metadata stays");
+  }
+});
+
+test("version payloads STAY in the shadow while canonical has not accepted them", async () => {
+  // IndexedDB unavailable (private mode, blocked, quota): the shadow is the only
+  // copy of those graphs, and stripping them would be the data-loss path this whole
+  // change is built to avoid. Fail closed means the budget loses, not the data.
+  const storage = createMemoryStorage();
+  const store = new ChatHistoryStore({ storage, indexedDb: null, maxShadowBytes: 500 });
+  store.persist([ordinaryThreadWithVersions("T0", 1, 4, 800)], {});
+  await store._writePromise;
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  const versions = Object.values(written.threads[0].workflowVersions || {});
+  assert.equal(versions.length, 4);
+  for (const version of versions) {
+    assert.ok(version.snapshot, "no receipt, no strip — the only copy keeps its payload");
+  }
+});
+
+test("a stripped shadow cannot launder the payload out of canonical on reload", async () => {
+  // The strip makes the shadow metadata-only for durable versions, and the shadow
+  // merges AFTER canonical on every load. If the merge let a bare-metadata record
+  // displace the payload-carrier for the same hash, one reload would demote the
+  // in-memory copy, and the next persist would write that demotion INTO canonical —
+  // the durable graph gone, silently, exactly the failure a receipt exists to prevent.
+  const indexedDb = createFakeIndexedDb();
+  const storage = createMemoryStorage();
+  const writer = new ChatHistoryStore({ storage, indexedDb });
+  const thread = ordinaryThreadWithVersions("T0", 1, 3, 200);
+  writer.persist([thread], {});
+  await writer._writePromise;
+  writer.persist([thread], {});
+  await writer._writePromise;
+  const written = JSON.parse(storage.getItem("comfyui-mcp.panel.historySnapshot"));
+  assert.ok(
+    Object.values(written.threads[0].workflowVersions).every((v) => v.snapshot === undefined),
+    "precondition: the shadow really is stripped",
+  );
+
+  const reader = new ChatHistoryStore({ storage, indexedDb });
+  const read = await reader.readCanonical();
+  const restored = (read?.threads || []).find((t) => t.id === "T0");
+  assert.ok(restored, "the thread must reload");
+  for (const [hash, version] of Object.entries(thread.workflowVersions)) {
+    assert.deepEqual(
+      restored.workflowVersions?.[hash]?.snapshot,
+      version.snapshot,
+      `canonical's payload for ${hash} must survive the merge with the stripped shadow`,
+    );
+  }
+});
+
+test("a metadata-only version never displaces the payload-carrier for the same hash", () => {
+  // The merge guard on its own, both argument orders: the hash is content-addressed,
+  // so a record without the graph must never win over the record that has it.
+  const withPayload = {
+    threads: [{
+      id: "T",
+      schemaVersion: CHAT_HISTORY_SCHEMA,
+      ts: 1,
+      updatedAt: 1,
+      msgs: [],
+      workflowVersions: { h: { hash: "h", capturedAt: 10, nodeCount: 3, snapshot: { nodes: [] } } },
+    }],
+    meta: {},
+  };
+  const strippedThread = {
+    id: "T",
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    ts: 2,
+    updatedAt: 2,
+    msgs: [],
+    workflowVersions: { h: { hash: "h", capturedAt: 10, nodeCount: 3 } },
+  };
+  const shadowLast = mergeHistorySnapshots(withPayload, { threads: [strippedThread], meta: {} });
+  assert.deepEqual(
+    shadowLast.threads[0].workflowVersions.h.snapshot,
+    { nodes: [] },
+    "a stripped shadow merged after canonical must not drop the payload",
+  );
+  const shadowFirst = mergeHistorySnapshots({ threads: [strippedThread], meta: {} }, withPayload);
+  assert.deepEqual(
+    shadowFirst.threads[0].workflowVersions.h.snapshot,
+    { nodes: [] },
+    "…and the payload obviously survives the canonical-last order too",
+  );
 });
