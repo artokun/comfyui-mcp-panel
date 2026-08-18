@@ -11486,30 +11486,55 @@ const GRAPH_TOOL_EXECUTORS = {
         whole: true,
       });
     }
-    const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
+    let nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY
     // registered class; the resolver only refreshes absent classes, so
     // createNode would build the OLD shape — a new link input would not even
-    // get a slot and the node could never validate. Refuse before creating
-    // anything, with the remedy that actually updates the schema.
+    // get a slot and the node could never validate.
     //
-    // #852 — and that remedy is panel_refresh_nodes, not a tab reload. This text
-    // named the reload alone, so a user whose loader options had merely drifted
-    // (a model file moved between folders) was told to throw away their canvas
-    // state for a condition the panel can clear in place: refresh_nodes re-fetches
-    // /object_info and calls registerNodesFromDefs, which is precisely what updates
-    // the nodeData this check reads. Same class of defect as #663 — a refusal that
-    // sends the caller to the wrong recovery costs more than the refusal itself.
-    const drifted = driftedRequiredInputNames(currentDef, nodeData);
+    // #852 — the remedy that updates this schema is refresh_nodes, not a tab
+    // reload: it re-fetches /object_info and calls registerNodesFromDefs, which
+    // is precisely what updates the nodeData this check reads.
+    //
+    // #1242 — so RUN that recovery here, once, before refusing anything. The
+    // refusal used to send the caller away to call panel_refresh_nodes and retry
+    // by hand, and the retried identical add then succeeded — the panel was
+    // refusing a condition it could clear itself, in the same call, at the cost
+    // of one forced refresh the caller was going to pay anyway. The re-check
+    // below reads the registry the refresh rewrote — NOT the refresh's own
+    // verdict — so a refresh that only claims to have run cannot wave a stale
+    // schema through, and only a drift that survives a real re-registration is
+    // refused. nodeData is re-read too: the guards downstream must see the SAME
+    // schema the node is about to be built from.
+    let drifted = driftedRequiredInputNames(currentDef, nodeData);
+    let schemaAutoRefreshed = false;
+    let schemaRefreshIncompleteReason = null;
+    if (drifted.length) {
+      try {
+        const verdict = await refreshComfyNodeDefs(undefined, { force: true });
+        if (!(verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true))) {
+          schemaRefreshIncompleteReason =
+            (verdict != null && typeof verdict === "object" && verdict.reason) || "unknown";
+        }
+      } catch (e) {
+        schemaRefreshIncompleteReason = e?.message ?? String(e);
+      }
+      nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
+      drifted = driftedRequiredInputNames(currentDef, nodeData);
+      schemaAutoRefreshed = drifted.length === 0;
+    }
     if (drifted.length) {
       throw new Error(
         `"${class_type}" required input${drifted.length === 1 ? "" : "s"} ` +
           `${drifted.map((name) => `"${name}"`).join(", ")} ${drifted.length === 1 ? "was" : "were"} ` +
           "added or retyped since this page loaded its node schema, so creating it now would " +
-          "build the OLD shape. Call panel_refresh_nodes and retry — it re-fetches /object_info " +
-          "and re-registers the class in place, which is exactly what this refusal is waiting " +
-          "for, and it costs you no canvas state. Reloading the ComfyUI tab also works and is " +
-          "the fallback if the refresh reports it did not complete. NOTE: the refresh updates " +
+          "build the OLD shape. This add already ran the panel_refresh_nodes recovery itself — " +
+          "re-fetching /object_info and re-registering the class in place — and the drift " +
+          (schemaRefreshIncompleteReason != null
+            ? `persisted because the refresh reported it did not complete (reason: ${schemaRefreshIncompleteReason}). ` +
+              "Retrying the add runs the refresh again; if it keeps reporting incomplete, "
+            : "survived it, so the registered schema and the live backend genuinely disagree. ") +
+          "Reloading the ComfyUI tab is the fallback that remains. NOTE: the refresh updates " +
           "the CLASS, so the node you add next is correct; nodes ALREADY on the canvas keep the " +
           "shape they were created with.",
       );
@@ -11649,6 +11674,19 @@ const GRAPH_TOOL_EXECUTORS = {
         `That is a defect in the node pack, not in your graph. The kept value is a real ` +
         `member of the list; applying the declared default would have made the node ` +
         `unqueueable.`;
+    }
+    if (schemaAutoRefreshed) {
+      // #1242 — disclose the recovery the add performed on its own. The caller asked
+      // for one node; it got that node PLUS a whole-schema re-registration, and a
+      // silent schema change under their feet is exactly the stale-positive class of
+      // bug this path exists to refuse.
+      added.schema_refreshed = true;
+      added.warning =
+        `${added.warning ? `${added.warning} ` : ""}` +
+        `The registered node schema for "${class_type}" was stale (its pack changed since this ` +
+        "tab loaded), so the panel refreshed it in place — the panel_refresh_nodes recovery — " +
+        "before creating this node, and the node was built from the CURRENT definition. Nodes " +
+        "ALREADY on the canvas keep the shape they were created with.";
     }
     return { added };
   },

@@ -14,6 +14,13 @@ import { readFileSync } from "node:fs";
 // their canvas state for something the panel can fix without it is the same
 // class of defect as #663: a refusal that sends the caller to the wrong recovery
 // costs more than the refusal.
+//
+// #1242 — and sending the caller to run that recovery BY HAND was the same
+// defect one level down: the retried identical add succeeded, so the panel was
+// refusing a condition it could clear itself. The add now runs the forced
+// refresh once, re-checks the drift against the registry the refresh rewrote,
+// and only refuses when the drift survives — which is when this message, and
+// its reload fallback, are still the truth.
 
 const PANEL = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
@@ -79,12 +86,39 @@ test("the drift check reads the registry nodeData the refresh updates", () => {
   // The two halves have to be about the same thing, or the named recovery is a
   // coincidence rather than a fix.
   const site = PANEL.slice(
-    PANEL.indexOf("const drifted = driftedRequiredInputNames"),
+    PANEL.indexOf("let drifted = driftedRequiredInputNames"),
     PANEL.indexOf("added or retyped since this page loaded its node schema"),
   );
   assert.ok(site.includes("driftedRequiredInputNames(currentDef, nodeData)"));
   assert.ok(
-    PANEL.includes("const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;"),
+    PANEL.includes("let nodeData = LG?.registered_node_types?.[class_type]?.nodeData;"),
     "nodeData must come from the LiteGraph registry that registerNodesFromDefs writes",
   );
+});
+
+test("#1242: the add runs the refresh itself, then re-checks, BEFORE the refusal", () => {
+  // The whole point of the fix: the refusal is what remains AFTER the panel has
+  // already run the panel_refresh_nodes recovery once. Order is the claim, so
+  // pin it — refresh, re-read nodeData, re-check drift, and only then the throw.
+  const checkAt = PANEL.indexOf("let drifted = driftedRequiredInputNames");
+  const refusalAt = PANEL.indexOf("added or retyped since this page loaded its node schema");
+  assert.ok(checkAt > 0 && refusalAt > checkAt, "the drift check must precede the refusal");
+  const between = PANEL.slice(checkAt, refusalAt);
+  const refreshAt = between.indexOf("refreshComfyNodeDefs(undefined, { force: true })");
+  assert.ok(refreshAt > 0, "the drift branch must run the forced refresh itself");
+  const recheckAt = between.indexOf("drifted = driftedRequiredInputNames(currentDef, nodeData)", refreshAt);
+  assert.ok(recheckAt > refreshAt, "the drift must be re-checked AFTER the refresh");
+  assert.ok(
+    between.indexOf("nodeData = LG?.registered_node_types?.[class_type]?.nodeData;") > refreshAt,
+    "nodeData must be re-read from the registry the refresh rewrote",
+  );
+});
+
+test("#1242: a drift the refresh clears is NOT refused", () => {
+  // The refusal is gated on the POST-refresh drift, not the pre-refresh one — a
+  // refusal that fired on the stale reading would make the auto-refresh
+  // pointless.
+  const refusalAt = PANEL.indexOf("added or retyped since this page loaded its node schema");
+  const gate = PANEL.slice(PANEL.lastIndexOf("if (drifted.length) {", refusalAt), refusalAt);
+  assert.ok(gate.startsWith("if (drifted.length) {"), "the refusal must be gated on the re-checked drift");
 });
