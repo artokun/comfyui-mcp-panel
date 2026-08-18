@@ -204,3 +204,70 @@ test("#584 healer invariants: loop-guard read-back and bounded prime are present
     "the probe settles before the sidebar tab registers (no stale-capability window)",
   );
 });
+
+// The setup()-time heal cannot fire for the scenario this issue keeps
+// recurring with: a pack update + ComfyUI restart UNDER an already-open tab
+// (panel_restart_comfyui, Manager reboot) — no page load happens, the tab
+// keeps re-advertising its old version in every re-hello, and the write fence
+// refuses every mutation while reads keep working. The panel already detects
+// exactly that event (the "reconnected" listener invalidates the Manager
+// dialect cache and node defs for the same reason); the version re-probe must
+// ride the same signal.
+test("#584 reconnect trigger: the reconnected listener re-probes the pack version", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  // Anchor on the post-reconnect settle watch kick — unique to the listener
+  // that owns the backend-restart invalidations.
+  const kick = src.indexOf("kickPostReconnectSettleWatch(backendReconnectEpoch);");
+  assert.notEqual(kick, -1, "the reconnected listener kicks the settle watch");
+  const heal = src.indexOf("void healStaleBundleIfNeeded();", kick);
+  assert.ok(heal !== -1 && heal - kick < 2000, "the version re-probe rides the same reconnect signal");
+});
+
+// A reconnect-triggered heal navigates without a user at the keyboard, so the
+// healer's reload needs the same guards the commanded frontend reload got in
+// #701 — and one more, because its loop-guard marker is armed BEFORE the
+// navigation: a cancelled unload must not burn the tab's one heal attempt.
+test("#584 healer navigation guards: unsaved-work refusal, socket-down defer, cancelled-unload recovery", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const healStart = src.indexOf("async function healStaleBundleIfNeeded()");
+  assert.notEqual(healStart, -1);
+  const body = src.slice(healStart, src.indexOf("\n}\n", healStart));
+
+  // Unsaved work is detected BEFORE the marker is armed — a refused heal
+  // leaves the marker un-armed so a later load/reconnect can still heal.
+  const blockers = body.indexOf("unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows)");
+  assert.notEqual(blockers, -1, "the healer consults the unsaved-work blockers");
+  const arm = body.indexOf("ssSet(BUNDLE_HEAL_KEY, marker);");
+  assert.ok(arm !== -1 && blockers < arm, "blockers are checked before the loop-guard marker is armed");
+
+  // The probe + prime can span a NEW disconnect: a heal that finds the backend
+  // socket down defers its navigation and UN-ARMS the marker, or the next
+  // reconnect would read the attempt as spent and never retry.
+  const prime = body.indexOf("primeModuleCache({");
+  const socketDown = body.indexOf("if (comfyBackendSocketDown)", prime);
+  assert.ok(socketDown > prime, "the socket is re-checked after the prime, before navigating");
+  const deferUnarm = body.indexOf("ssSet(BUNDLE_HEAL_KEY, null);", socketDown);
+  assert.ok(
+    deferUnarm !== -1 && deferUnarm < body.indexOf("window.location.replace", socketDown),
+    "a deferred heal un-arms the marker so the next reconnect retries",
+  );
+
+  // The blocked-navigation notice is armed BEFORE navigating (same order as
+  // the commanded reload path), and its fire-path un-arms the marker —
+  // surviving the deadline proves the unload was cancelled, so the reload
+  // never happened and the heal attempt must not be counted as spent.
+  const notice = body.indexOf("armReloadBlockedNotice({");
+  const navigate = body.indexOf("window.location.replace");
+  assert.ok(notice !== -1 && notice < navigate, "the cancelled-navigation notice is armed before navigating");
+  const noticeBlock = body.slice(notice, navigate);
+  assert.ok(
+    noticeBlock.includes("ssSet(BUNDLE_HEAL_KEY, null);"),
+    "a provably-cancelled navigation returns the heal attempt",
+  );
+});

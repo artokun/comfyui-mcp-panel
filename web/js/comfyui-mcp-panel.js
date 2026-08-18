@@ -1674,6 +1674,19 @@ function setupListeners() {
       // The watch runs only the same safe heals a graph command runs lazily;
       // it never repaints the canvas from serialized state (#604).
       kickPostReconnectSettleWatch(backendReconnectEpoch);
+      // #584: this reconnect can ALSO be a backend restart that swapped the
+      // pack on disk (a panel update + panel_restart_comfyui / Manager reboot)
+      // under the live tab. The running bundle is then older than the
+      // installed one, advertises its old version in every re-hello, and the
+      // orchestrator's write fence refuses every mutation while reads keep
+      // working — and the setup()-time heal never fires for this tab, because
+      // nothing here reloads the page. Same "the backend restarted, my cached
+      // state is wrong" invalidation as the dialect cache / node defs above:
+      // re-probe the pack version against the backend that is answering NOW
+      // (the version route reads pyproject.toml at request time). The healer
+      // no-ops on "current"/"unknown", so a blip-reconnect costs one bounded
+      // loopback fetch and nothing else.
+      void healStaleBundleIfNeeded();
     });
   } catch {
     // api unavailable — graph_get_errors reports null.
@@ -35030,6 +35043,25 @@ async function healStaleBundleIfNeeded() {
       );
       return;
     }
+    // #584/#701 — the heal's navigation is not user-initiated, so it gets the
+    // same guard the commanded frontend reload got: with unsaved work open,
+    // ComfyUI's beforeunload cancels the navigation AFTER the browser has torn
+    // down this tab's socket, and nobody is at the keyboard to answer the
+    // dialog. Worse HERE than on the commanded path: the loop-guard marker is
+    // armed below, so a cancelled navigation would burn the tab's ONE heal
+    // attempt on a reload that never happened and misreport the reason on the
+    // next load. Detect the blockers up front and leave the marker UN-armed,
+    // so a later load or reconnect can still heal once the work is saved.
+    // (Fail-open on an unreadable workflow list is deliberate — same rule as
+    // reload-blocked.js: an unknown flag is not evidence of unsaved work.)
+    const healBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+    if (healBlockers.length) {
+      console.warn(
+        `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +
+          `installed ${installed}). ${reloadWouldBeBlockedMessage(healBlockers)}`,
+      );
+      return;
+    }
     ssSet(BUNDLE_HEAL_KEY, marker);
     if (ssGet(BUNDLE_HEAL_KEY) !== marker) {
       // codex gate round 3 — the loop guard is itself an operation that can
@@ -35065,9 +35097,39 @@ async function healStaleBundleIfNeeded() {
           `panel still reports ${PANEL_VERSION} afterwards, hard-refresh (Ctrl+Shift+R).`,
       );
     }
+    // #584 — the probe + prime above can span a NEW backend disconnect (a
+    // restart still in progress): reloading into a down server re-fetches
+    // whatever the half-restarted backend serves and strands the tab on the
+    // same stale evidence. The #646 gate refuses graph mutations while the
+    // socket is down, so none can be orphaned in flight here; defer instead,
+    // and UN-ARM the marker — this attempt never navigated, so the reconnect
+    // that follows the backend coming back must be allowed to retry the heal.
+    if (comfyBackendSocketDown) {
+      ssSet(BUNDLE_HEAL_KEY, null);
+      console.warn(
+        `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +
+          `installed ${installed}) but ComfyUI's backend is still reconnecting — deferring the ` +
+          `self-heal reload to the next reconnect or page load.`,
+      );
+      return;
+    }
     // Arm the sidebar reopen exactly like the frontend soft reload, then swap
     // the page URL so the reload also re-fetches the document itself.
     ssSet(SIDEBAR_REOPEN_KEY, "1");
+    // #584/#701 — the blockers check above is a SNAPSHOT: work can become
+    // unsaved during the prime, so the navigation below can still be cancelled
+    // by a beforeunload dialog after the socket is already torn down. Surviving
+    // the deadline is proof the unload was cancelled (a successful navigation
+    // destroys this document first), so the notice's fire-path also UN-ARMS the
+    // loop-guard marker: the reload never happened, and the next page load or
+    // reconnect must get its heal attempt back. Same arm-before-navigate order
+    // as the commanded reload path.
+    armReloadBlockedNotice({
+      notify: (m) => {
+        ssSet(BUNDLE_HEAL_KEY, null);
+        console.warn(`[comfyui-mcp-panel] ${m}`);
+      },
+    });
     try {
       const u = new URL(window.location.href);
       u.searchParams.set("cmcpReload", String(Date.now()));
