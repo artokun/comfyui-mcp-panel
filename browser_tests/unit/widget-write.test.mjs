@@ -1081,6 +1081,76 @@ test("#366 FAIL CLOSED: an EXTERNALLY-LINKED host input (nested/further promotio
   assert.equal(inner.widgets[0].value, 1280, "inner must not be written on fail-closed");
 });
 
+test("#1181 FAIL CLOSED with the CORRECTED advice: an outer link from a VIRTUAL PrimitiveNode carries nothing — write inner or use a backend node", () => {
+  // The #1181 configuration: the host input's outer link originates at a
+  // frontend-only PrimitiveNode, which the prompt compiler drops. The generic
+  // "edit from the outermost subgraph node" advice is wrong here — this IS the
+  // outermost node and its rail is non-authoritative BECAUSE of that link. The
+  // refusal must name the real repairs instead, and must still refuse (#366).
+  const inner = { id: 54, type: "CLIPTextEncode", widgets: [{ name: "text", type: "STRING", value: "OLD stored text" }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  const rail = { name: "text", type: "STRING", value: "OLD stored text" };
+  const primitiveSource = { id: 85, type: "PrimitiveNode", isVirtualNode: true, widgets: [{ name: "value", value: "a lantern" }] };
+  const parent = {
+    id: 66,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "text", link: 7, _widget: rail, _subgraphSlot: { name: "text" } }],
+    widgets: [rail],
+  };
+  const rootGraph = {
+    _nodes: [primitiveSource, parent],
+    links: { 7: { origin_id: 85, origin_slot: 0 } },
+    getNodeById: (id) => (String(id) === "85" ? primitiveSource : String(id) === "66" ? parent : null),
+  };
+  parent.graph = rootGraph;
+  const resolveSource = (_n, si) =>
+    si?.name === "text" ? { sourceNodeId: "54", sourceWidgetName: "text" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "text", "a lantern", { resolveSource }),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /does NOT cross the subgraph boundary/.test(err.message) &&
+      /PrimitiveNode #85/.test(err.message) &&
+      /inner node directly/.test(err.message) &&
+      /BACKEND node/.test(err.message),
+  );
+  assert.equal(rail.value, "OLD stored text", "rail untouched on refusal");
+  assert.equal(inner.widgets[0].value, "OLD stored text", "inner untouched on refusal");
+});
+
+test("#1181 the generic advice is KEPT when the outer link's origin is a REAL backend node", () => {
+  // Same linked host input, but the origin is a backend node whose value DOES
+  // cross the boundary — the #366 message ("edit from the outermost subgraph
+  // node") is the true one there and must not be displaced.
+  const inner = { id: 54, type: "CLIPTextEncode", widgets: [{ name: "text", type: "STRING", value: "old" }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  const rail = { name: "text", type: "STRING", value: "old" };
+  const backendSource = { id: 85, type: "PrimitiveStringMultiline", constructor: { nodeData: {} } };
+  const parent = {
+    id: 66,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "text", link: 7, _widget: rail, _subgraphSlot: { name: "text" } }],
+    widgets: [rail],
+  };
+  parent.graph = {
+    _nodes: [backendSource, parent],
+    links: { 7: { origin_id: 85, origin_slot: 0 } },
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "text" ? { sourceNodeId: "54", sourceWidgetName: "text" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "text", "new", { resolveSource }),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /parent rail widget could not be identified/.test(err.message) &&
+      !/does NOT cross the subgraph boundary/.test(err.message),
+  );
+});
+
 test("#366 SEVERE FAIL CLOSED: a NAME-ONLY `input.widget` stub + an unrelated same-named decoy is REFUSED (identity auth, never a name match)", () => {
   // The exact severe repro: the host input carries ONLY a `{ name }` stub (no
   // identity-linked projection), and the parent has ONE unrelated widget that

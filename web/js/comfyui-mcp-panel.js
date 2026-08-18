@@ -187,6 +187,12 @@ import {
   disabledOutputsInPrompt,
   disabledOutputsNote,
 } from "./lib/muted-subgraph-outputs.js";
+import {
+  collectVirtualSourceFeeds,
+  virtualFedInputs,
+  virtualSourceNote,
+  virtualSourceTag,
+} from "./lib/virtual-source-promotion.js";
 import { findStalePlaceholders, stalePlaceholderNote } from "./lib/stale-placeholders.js";
 import {
   findRepeatingControlWidgets,
@@ -9105,6 +9111,12 @@ function summarizeNode(node) {
   for (const w of node.widgets ?? []) {
     if (w && typeof w.name === "string") widgets[w.name] = w.value;
   }
+  // #1181: promoted inputs on a subgraph container whose link origin is a
+  // frontend-only VIRTUAL source (e.g. a canvas PrimitiveNode). graphToPrompt
+  // DROPS that source, so the link carries nothing at run time — the opposite
+  // of what `driven_by_link` asserts. Computed once and consulted by both the
+  // inputs[] annotation and the driven_by_link split below.
+  const virtualFed = virtualFedInputs(node);
   // #636: a user-RENAMED slot/widget keeps its programmatic NAME (what panel_set_widget
   // and panel_connect address) and gains a DISPLAY LABEL. Reporting only the name made
   // renames invisible, so the agent told the user their renames had not stuck when the
@@ -9123,6 +9135,9 @@ function summarizeNode(node) {
       ...(label != null ? { label } : {}),
       type: inp.type,
       connected_from: from,
+      // #1181: the link's origin is a virtual node the prompt compiler drops —
+      // the connection is real on the canvas but carries NOTHING at run time.
+      ...(from && virtualFed[inp.name] ? { source_not_serialized: true } : {}),
     };
   });
   const outputs = (node.outputs ?? []).map((out, i) => {
@@ -9167,7 +9182,17 @@ function summarizeNode(node) {
   // execution — the stored `w.value` is stale (e.g. a KSampler steps/cfg fed from a
   // Primitive/switch rail). Surface which widgets are overridden and by whom so the
   // read flags the stale value rather than reporting it as if it were effective.
-  const drivenByLink = drivenWidgetsFor(node, Object.keys(widgets));
+  const allDriven = drivenWidgetsFor(node, Object.keys(widgets));
+  // #1181: ...UNLESS the link's origin is a frontend-only VIRTUAL source feeding a
+  // promoted subgraph input. graphToPrompt drops that origin, so nothing arrives on
+  // the link and the stored value IS what executes — the #607 claim is exactly
+  // backwards for these. Split them out and report them under their own true claim.
+  const drivenByLink = {};
+  const fedByVirtual = {};
+  for (const [name, src] of Object.entries(allDriven)) {
+    if (virtualFed[name]) fedByVirtual[name] = { ...src, origin_type: virtualFed[name].origin_type };
+    else drivenByLink[name] = src;
+  }
   const summary = {
     id: node.id,
     type: node.type,
@@ -9195,6 +9220,12 @@ function summarizeNode(node) {
     // #607: names here are OVERRIDDEN by a link at run time — the value in `widgets`
     // is the stale stored value, NOT what executes. Each entry names the source.
     ...(Object.keys(drivenByLink).length ? { driven_by_link: drivenByLink } : {}),
+    // #1181: names here LOOK link-driven but the source is a frontend-only VIRTUAL
+    // node (e.g. a canvas PrimitiveNode) that the prompt compiler DROPS — the link
+    // carries NOTHING at run time, so the value in `widgets` IS what executes (the
+    // exact opposite of driven_by_link). To make the canvas value take effect,
+    // replace the source with a backend node or set the inner widget directly.
+    ...(Object.keys(fedByVirtual).length ? { fed_by_virtual_source: fedByVirtual } : {}),
     inputs,
     outputs,
   };
@@ -10334,6 +10365,10 @@ const GRAPH_TOOL_EXECUTORS = {
           );
           // #607: flag widgets overridden by a link so the stored value isn't read as effective.
           const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+          // #1181: a VIRTUAL source (e.g. PrimitiveNode) feeding a promoted subgraph input
+          // is dropped by the prompt compiler — the stored value IS what executes, so these
+          // get their own tag instead of drivenTag's "the stored value is stale".
+          const vFed = virtualFedInputs(n);
           // #636 — the DISPLAY name a user renamed this widget to. graph_query already
           // reports these (`widget_labels`), but the outline did not, and the outline is
           // the reader an agent reaches for first: the reporter was told their renames
@@ -10356,7 +10391,11 @@ const GRAPH_TOOL_EXECUTORS = {
               const withLabel = label ? `${base} [renamed "${tagText_(title_(label))}"]` : base;
               const mode = cagMode.get(w.name);
               const withMode = mode ? `${withLabel} [after_gen=${mode}]` : withLabel;
-              return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
+              return vFed[w.name]
+                ? `${withMode}${virtualSourceTag(vFed[w.name])}`
+                : driven[w.name]
+                  ? `${withMode}${drivenTag(driven[w.name])}`
+                  : withMode;
             })
             .join(" ");
         }
@@ -10823,6 +10862,9 @@ const GRAPH_TOOL_EXECUTORS = {
       } else {
         // #607: flag link-driven widgets in the compact line too.
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+        // #1181: virtually-fed promoted inputs get the tag that says the stored
+        // value executes — drivenTag would claim the opposite.
+        const vFed = virtualFedInputs(n);
         const w = Object.entries(widgetsOf(n))
           .map(([k, v]) => {
             // ONE cap across the row (see compactValueCap above). A per-widget cap that
@@ -10831,7 +10873,8 @@ const GRAPH_TOOL_EXECUTORS = {
             // raises", while raising `max_chars` demonstrably lifted them (gate).
             const c = clipCompactValue(v, compactValueCap);
             if (c.clipped) rowClips++;
-            return `${k}=${c.text}${driven[k] ? drivenTag(driven[k]) : ""}`;
+            const tag = vFed[k] ? virtualSourceTag(vFed[k]) : driven[k] ? drivenTag(driven[k]) : "";
+            return `${k}=${c.text}${tag}`;
           })
           .join(" ");
         const ins = [...(up.get(String(n.id)) ?? [])].join(",");
@@ -13980,6 +14023,28 @@ const GRAPH_TOOL_EXECUTORS = {
       } catch {
         /* a diagnostic must never take down the run it describes */
       }
+    }
+    // #1181 — a frontend-only VIRTUAL PrimitiveNode wired into a promoted subgraph
+    // input is DROPPED by the prompt compiler: the canvas shows the new value, the
+    // run serializes the inner node's STORED widget value, and the execution
+    // succeeds silently with the old prompt (the reporter's exact harm — canvas and
+    // execution disagreed, reused cached conditioning and all). Measured on ComfyUI
+    // 0.32.0 / frontend 1.48.7.
+    //
+    // Same posture as #985 above: the panel does not build this prompt and cannot
+    // carry the value across the boundary, but it can stop queueing in silence.
+    // Reported at QUEUE time so an agent can interrupt rather than learn it from
+    // the render. Scoped runs are NOT exempt — unlike #985 this is not about
+    // execution roots: a dropped source feeds nothing no matter how the run is
+    // scoped. The note states the read-from-graph caveat itself.
+    try {
+      const virtualFeeds = collectVirtualSourceFeeds(rootGraph);
+      if (virtualFeeds.length) {
+        accept.virtual_source_feeds = virtualFeeds;
+        accept.virtual_source_note = virtualSourceNote(virtualFeeds);
+      }
+    } catch {
+      /* a diagnostic must never take down the run it describes */
     }
     return accept;
   },
