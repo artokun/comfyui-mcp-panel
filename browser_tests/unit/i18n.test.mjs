@@ -267,7 +267,12 @@ test("the catalog is loaded at startup, before the panel paints", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
   const setupAt = src.indexOf("async setup() {");
   assert.notEqual(setupAt, -1, "registerExtension must still have a setup()");
-  const head = src.slice(setupAt, setupAt + 900);
+  // The window covers everything setup() does BEFORE the catalog load. It grew
+  // 900 → 1200 with #1269, whose duplicate-copy gate is itself mandated-first
+  // (a copy that lost the page arbitration must stop before anything wraps or
+  // connects); the pin's purpose — awaited, and before the first paint — is
+  // unchanged.
+  const head = src.slice(setupAt, setupAt + 1200);
   assert.match(head, /await applyPanelLocale\(\)/, "setup() must await the catalog load");
 
   // AWAITED, not fired-and-forgotten: an unawaited load resolves after the first render and
