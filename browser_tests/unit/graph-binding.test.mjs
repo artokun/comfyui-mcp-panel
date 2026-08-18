@@ -24,6 +24,7 @@ import {
   graphRootMidPopulation,
   graphRootMismatchesActiveWorkflow,
   graphRootContentDriftOnBoundCanvas,
+  graphRootStructureExtendsActiveWorkflow,
   graphRootProvenEmpty,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
@@ -850,6 +851,171 @@ test("#696: a CONFLICTING identity tag still refuses ahead of any content reason
     "the relaxation demands a MATCH, and a foreign tag is the #349 wrong-canvas case",
   );
   assert.equal(driftVerdict(fixture, { rootUuidMismatch: true })?.reason, "root-workflow-uuid-mismatch");
+});
+
+// ── #1187 — A STRUCTURAL HAND EDIT INSIDE THE TRACKER'S CAPTURE LAG ───────────
+//
+// ChangeTracker captures on USER INPUT events, so a node added or a wire dropped
+// by hand leaves `activeState` one capture behind the live canvas while
+// `isModified` has NOT flipped. In that window the equality relaxation above is
+// unreachable — the edit differs structurally by definition — and before this fix
+// every graph read and mutation refused the workflow's OWN canvas until the
+// tracker happened to capture. The rescue is containment, not equality: the live
+// root must still hold every node and link the workflow's own state carries, so
+// the admitted canvas can never be missing anything the workflow owns.
+test("#1187: a node ADDED by hand before the tracker captures is the right canvas, not a refusal", () => {
+  const fixture = driftFixture({
+    drift: (nodes) => {
+      nodes.push({ id: 4, type: "PreviewImage" }); // the hand edit: 3 -> 4 nodes
+    },
+  });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: fixture.rootGraph, activeWorkflow: fixture.activeWorkflow }),
+    true,
+    "the content comparator still sees the lag — that difference is real",
+  );
+  assert.equal(
+    graphRootStructureExtendsActiveWorkflow(fixture),
+    true,
+    "…but the live root still CONTAINS every node and link the workflow's own state carries",
+  );
+  assert.equal(
+    driftVerdict(fixture),
+    null,
+    "the reported case (saved 98, live 99, matching tag) must not refuse the read",
+  );
+});
+
+test("#1187: an added node WIRED into the graph is permitted — the state's links all survive", () => {
+  const fixture = driftFixture({
+    drift: (nodes, state) => {
+      nodes.push({ id: 4, type: "PreviewImage" });
+      state.links.push([2, 3, 2, 4, 0, "IMAGE"]); // the wire to the new node
+    },
+  });
+  assert.equal(graphRootStructureExtendsActiveWorkflow(fixture), true);
+  assert.equal(driftVerdict(fixture), null);
+});
+
+test("#1187: a wire added between two EXISTING nodes is permitted — links are containment, not equality", () => {
+  const fixture = driftFixture({
+    drift: (nodes, state) => {
+      state.links.push([2, 1, 0, 3, 3, "CLIP"]); // no new node, one new link
+    },
+  });
+  assert.equal(graphRootStructureExtendsActiveWorkflow(fixture), true);
+  assert.equal(driftVerdict(fixture), null);
+});
+
+test("#1187: a hand REMOVAL still refuses in the lag window — containment must never under-report", () => {
+  // The deliberate bound: live ⊆ state would admit a canvas MISSING content the
+  // workflow owns (the count-short read is the #618 lesson), so removals and
+  // link deletions keep refusing until the tracker captures and the refusal
+  // self-clears.
+  const nodeRemoved = driftFixture({
+    drift: (nodes, state) => {
+      state.nodes = nodes.slice(1);
+    },
+  });
+  assert.equal(graphRootStructureExtendsActiveWorkflow(nodeRemoved), false);
+  assert.equal(driftVerdict(nodeRemoved)?.reason, "root-shape-mismatch");
+
+  const linkRemoved = driftFixture({
+    drift: (nodes, state) => {
+      state.links = [];
+    },
+  });
+  assert.equal(graphRootStructureExtendsActiveWorkflow(linkRemoved), false);
+  assert.equal(driftVerdict(linkRemoved)?.reason, "root-shape-mismatch");
+});
+
+test("#1187: a difference in any OTHER structural surface is not the hand edit and still refuses", () => {
+  // Adding a node does not rewrite groups, reroutes, subgraphs, definitions or
+  // content-bearing extra — those surfaces stay EQUAL under the rescue, so the
+  // #696 structural refusals are untouched.
+  const cases = {
+    "a group changed": (nodes, state) => {
+      nodes.push({ id: 4, type: "PreviewImage" });
+      state.groups = [{ title: "OTHER", bounding: [0, 0, 10, 10] }];
+    },
+    "a reroute appeared": (nodes, state) => {
+      nodes.push({ id: 4, type: "PreviewImage" });
+      state.reroutes = [{ id: "r1", pos: [1, 2] }];
+    },
+    "a top-level subgraph appeared": (nodes, state) => {
+      nodes.push({ id: 4, type: "PreviewImage" });
+      state.subgraphs = [{ id: "s1", nodes: [{ id: 7, type: "SaveImage" }] }];
+    },
+  };
+  for (const [label, drift] of Object.entries(cases)) {
+    const fixture = driftFixture({ drift });
+    assert.equal(graphRootStructureExtendsActiveWorkflow(fixture), false, label);
+    assert.ok(driftVerdict(fixture), `${label} must still be refused`);
+  }
+});
+
+test("#1187: the rescue still demands POSITIVE identity — an untagged or foreign-tagged root refuses", () => {
+  // Same conjunct discipline as the equality relaxation: containment is never
+  // trusted without the workflow's own stamp, because two canvases can both
+  // contain a shared structure.
+  const additive = (nodes) => {
+    nodes.push({ id: 4, type: "PreviewImage" });
+  };
+  const untagged = driftFixture({ rootUuid: null, drift: additive });
+  assert.equal(graphRootStructureExtendsActiveWorkflow(untagged), true, "the content proof itself runs");
+  assert.equal(driftVerdict(untagged)?.reason, "root-shape-mismatch", "…but without identity it proves nothing");
+
+  const foreign = driftFixture({ rootUuid: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb", drift: additive });
+  assert.equal(driftVerdict(foreign)?.reason, "root-shape-mismatch");
+});
+
+test("#1187: a count-SHORT canvas is not containment — the mid-restore window stays refused", () => {
+  // The other direction of the bound: a restoring root holding a PREFIX of the
+  // workflow's nodes contains none of what the state carries beyond it, so this
+  // rescue cannot mask #618's mid-population signature.
+  const fixture = driftFixture({
+    drift: (nodes, state) => {
+      state.nodes = nodes.slice(0, 1);
+    },
+  });
+  fixture.rootGraph._nodes = [{ id: 1, type: "CheckpointLoaderSimple" }];
+  assert.equal(graphRootStructureExtendsActiveWorkflow(fixture), false);
+  assert.equal(driftVerdict(fixture, { postReconnectWindow: true })?.reason, "root-mid-population");
+});
+
+test("#1187: an unreadable comparison fails closed, never relaxes", () => {
+  const fixture = driftFixture({
+    drift: (nodes) => {
+      nodes.push({ id: 4, type: "PreviewImage" });
+    },
+  });
+  fixture.rootGraph = {
+    ...fixture.rootGraph,
+    serialize: () => {
+      throw new Error("serializer unavailable");
+    },
+  };
+  assert.equal(graphRootStructureExtendsActiveWorkflow(fixture), false);
+  assert.ok(driftVerdict(fixture), "an uncompleted comparison is not containment");
+  assert.equal(graphRootStructureExtendsActiveWorkflow(), false, "no arguments ⇒ no relaxation");
+  assert.equal(graphRootStructureExtendsActiveWorkflow({}), false);
+});
+
+test("#1187: the first node on a blank, tagged workflow is permitted — blank state is trivially contained", () => {
+  // The edge where the workflow's own state is EMPTY: every blank canvas
+  // satisfies containment, so identity alone separates this from any other
+  // blank-rooted tab — and #570 mints that identity at creation, including
+  // new-blank. With the tag matching, the user's first node must not refuse.
+  const fixture = driftFixture({
+    drift: (nodes, state) => {
+      state.nodes = [{ id: 1, type: "CheckpointLoaderSimple", widgets_values: ["anime.safetensors"] }];
+      state.links = [];
+      state.groups = [];
+    },
+  });
+  fixture.activeWorkflow = wf({ isModified: false, changeTracker: { activeState: { nodes: [] } } });
+  assert.equal(graphRootStructureExtendsActiveWorkflow(fixture), true);
+  assert.equal(driftVerdict(fixture), null);
 });
 
 test("#618: a mid-restore canvas is count-short, so the relaxation cannot mask it", () => {

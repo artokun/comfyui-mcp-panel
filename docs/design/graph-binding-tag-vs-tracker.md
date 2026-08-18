@@ -1,6 +1,7 @@
 # `root-shape-mismatch`: why the root tag cannot be trusted, and why settling the tracker cannot verify
 
-**Status:** NEGATIVE RESULT — no fix shipped · **Issue:** artokun/comfyui-mcp-panel#1187 ·
+**Status:** RESOLVED — third attempt shipped (additive structural containment + the identity
+conjunct, `graphRootStructureExtendsActiveWorkflow`) · **Issue:** artokun/comfyui-mcp-panel#1187 ·
 **Investigated on:** `fix/1187-root-tag-outranks-tracker` (PR #1212) · **Last re-verified:** 2026-08-14
 
 This records two fixes that were **built, reviewed and rejected**. It exists so the third
@@ -147,6 +148,48 @@ A narrower option that leg 3 above does **not** rule out: keep the structure con
 attack the *staleness of the comparison input* instead — but note that attempt 2 is the
 obvious form of that idea and it fails, so any variant has to show how it avoids flipping
 `isModified` before the comparison is re-read.
+
+## What shipped (the third attempt)
+
+`graphRootStructureExtendsActiveWorkflow`, consulted as a second disjunct beside
+`structureMatches` — still only ever as a **conjunct of the identity tag**:
+
+```js
+const rootShapeMismatch =
+  contentDiffers &&
+  !((structureMatches || structureExtends) &&
+    graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
+```
+
+The content proof is **containment, not equality**: every node and link the workflow's own
+current state carries must be present on the live root, and every other structural surface
+must be equal — while the live root may carry *more*. A hand edit inside the capture lag is
+exactly "the workflow's structure plus the edit", which equality can never see and
+containment can. Neither rejected mechanism is used: the tag is never trusted alone (the
+containment proof is demanded alongside it, and no foreign canvas satisfies it), and the
+tracker is never settled (nothing captures, `isModified` is never flipped by the check).
+
+The bounds, stated plainly:
+
+- **Additions only.** A hand *removal* in the lag window still refuses and self-clears on
+  the next capture, because the mirror relation (live ⊆ state) would admit a canvas
+  **missing** content the workflow owns — the under-reporting direction (#618's lesson).
+  An admitted canvas always holds everything the workflow owns.
+- **Leg 3's bound widens from "still structurally A" to "structurally A plus additions"**:
+  a sealed closed-duplicate's stranded canvas that then gains nodes keeps its reads. That
+  widening is not avoidable by any fix — *"the user added a node to A"* and *"the sealed
+  duplicate gained the same node"* are observationally identical to every signal the panel
+  has — and it is the same ambiguity the equality relaxation's own comment already accepts
+  knowingly for content drift, bounded in the direction that matters: nothing A owns can
+  be absent from an admitted canvas.
+- The #1014 dependency this document predicted does **not** block this fix: #1187's
+  reporter has a published UUID to anchor the identity conjunct. #1014 remains the
+  no-anchor case and is untouched by it.
+
+Verified by mutation, not only by the suite: deleting the disjunct, forcing containment
+true, dropping the link-containment clause, and dropping the surface-equality clause each
+turn targeted tests red (the pre-existing #696 structural-refusal test catches the last
+two as well).
 
 ## What the verification did and did not prove
 
