@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-08-18
+
+### Added
+- send this version's changelog to the Comfy Registry — every release has shipped blank (#810)
+
+### Fixed
+- the shadow sheds version payloads canonical holds, so the byte bound holds (#1318)
+- a backend restart under a live tab re-probes the pack version and self-heals (#1317)
+- panel_refresh_nodes can no longer report success over a pruned live canvas (#1316)
+- a stale-canvas tab can no longer persist its foreign graph over another workflow's file (#1315)
+- unpack_subgraph verifies external links survived and refuses loudly when any were dropped (#1314)
+- panel_set_widget refreshes a node's dynamic input slots after the write (#1313)
+- a same-node connect refusal is reported as LiteGraph's loopback guard, not a false type mismatch (#1311)
+
+
 ## [0.15.0] - 2026-08-17
 
 ### Added
