@@ -77,6 +77,13 @@ import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMess
 // #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
+import {
+  arbitratePanelCopy,
+  countExtensionsNamed,
+  describeDuplicatePanelCopies,
+  describeUnguardedDuplicatePanelCopy,
+  PANEL_EXTENSION_NAME,
+} from "./lib/duplicate-panel-guard.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { installNodeConfigureIsolation, retryNodeRestores } from "./lib/load-restore-isolation.js";
@@ -1716,6 +1723,24 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
 const PANEL_VERSION = "0.15.2";
+
+// #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
+// copy's registration polling can run. Two installs of this pack (a git clone at
+// custom_nodes/comfyui-mcp-panel AND a Manager install at custom_nodes/comfyui-agent-panel)
+// load two bundles into the same page; both connect and hello under the same
+// workflow tab ids, and whichever hello lands last owns the one connection the
+// bridge keeps per tab id. A stale copy winning that race is why a CURRENT
+// install sees graph writes refused as "this tab advertised NO panel version" —
+// and why a hard refresh cannot help (the stale copy is served from its own
+// stale directory). The orchestrator cannot tell a stale duplicate's hello from
+// a genuinely old panel's and must fail closed either way, so the arbitration
+// has to happen here: the NEWER bundle runs, the older one stands down loudly.
+// Consulted again inside setup() — a later-evaluated newer copy can stand this
+// one down after it has already registered.
+const panelCopyArbitration = arbitratePanelCopy({
+  registry: globalThis,
+  self: { version: PANEL_VERSION, url: import.meta.url },
+});
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -35333,6 +35358,43 @@ async function healStaleBundleIfNeeded() {
   }
 }
 
+// #1269 — the loud stand-down, shared by the registration gate and the setup()
+// re-check. `prior` names the copy that beat this one at arbitration;
+// `supersededBy()` names the newer copy that stood this one down afterwards.
+function notePanelCopyStandDown() {
+  console.error(
+    describeDuplicatePanelCopies({
+      outcome: panelCopyArbitration.outcome,
+      self: { version: PANEL_VERSION, url: import.meta.url },
+      prior: panelCopyArbitration.prior ?? panelCopyArbitration.supersededBy?.(),
+    }),
+  );
+}
+
+// #1269 — the setup()-time half of the duplicate-copy guard. True means setup
+// must NOT proceed: the arbitration moved after this copy registered (a later-
+// evaluated newer copy stood it down), so say so and stop before anything wraps,
+// probes, or connects. False still carries one duty: NAME a GUARDLESS duplicate —
+// a copy too old to arbitrate never writes the shared claim, but it registers
+// under the same extension name, and setup() runs after every registration.
+function panelCopyGuardBlocksSetup(comfyApp) {
+  if (!panelCopyArbitration.active()) {
+    notePanelCopyStandDown();
+    return true;
+  }
+  if (
+    panelCopyArbitration.outcome === "sole" &&
+    countExtensionsNamed(comfyApp?.extensions, PANEL_EXTENSION_NAME) > 1
+  ) {
+    console.error(
+      describeUnguardedDuplicatePanelCopy({
+        self: { version: PANEL_VERSION, url: import.meta.url },
+      }),
+    );
+  }
+  return false;
+}
+
 function registerExtensionWhenReady(tries = 0) {
   const comfyApp = window.comfyAPI?.app?.app || window.app;
   if (!comfyApp || typeof comfyApp.registerExtension !== "function") {
@@ -35347,6 +35409,10 @@ function registerExtensionWhenReady(tries = 0) {
   }
   app = comfyApp;
   api = window.comfyAPI?.api?.api || window.api || null;
+  // #1269 — a copy that LOST the module-scope arbitration never registers: no
+  // sidebar tab, no bridge socket, no hello. Loud, never silent — a page with
+  // no panel and no explanation is the worst outcome.
+  if (!panelCopyArbitration.active()) return notePanelCopyStandDown();
   // #570 P0 — wrap app.loadGraphData so every workflow CREATION (import/paste/duplicate/
   // new) mints a fresh per-instance uuid, so a copy can't inherit the source's session.
   installCreateBoundaryFork(app);
@@ -35361,6 +35427,10 @@ function registerExtensionWhenReady(tries = 0) {
     // never persist a raw value here. See panelSettingsList() above.
     settings: panelSettingsList(),
     async setup() {
+      // #1269 — the page arbitration can move AFTER registration (a later-
+      // evaluated newer copy stood this one down); honor it, and name a
+      // guardless duplicate, before anything wraps, probes, or connects.
+      if (panelCopyGuardBlocksSetup(app)) return;
       // #1667 P0 — wrap the workflow store's saveWorkflow with the stale-canvas
       // persist guard FIRST, before any of the below can trigger a graph change that
       // the frontend autosave would persist unchecked. setup() runs post-app-init, so
