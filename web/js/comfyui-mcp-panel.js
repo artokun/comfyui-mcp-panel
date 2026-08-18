@@ -285,6 +285,7 @@ import { boundExecFailurePayload } from "./lib/exec-error-bounds.js";
 import {
   drivenWidgetsFor,
   drivenTag,
+  liveLinkTargetInput,
   capSummaryWidgets,
   clipLine,
   fitDetailLine,
@@ -10477,7 +10478,21 @@ const GRAPH_TOOL_EXECUTORS = {
             const l = links[lid];
             if (!l) continue;
             const tgt = byId.get(l.target_id);
-            outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+            // #342: resolve the LIVE target slot through the target's own
+            // inputs[].link backlink. The link record's target_slot goes stale
+            // when the target's inputs are compacted (dynamic-combo rebuild,
+            // removed ref_video_N input), and rendering it then reports the link
+            // against whatever slot now occupies that index — an outline that
+            // "looks wired" over a graph whose connection is gone. An ORPHANED
+            // link (no input backlinks it) renders NOTHING, matching
+            // panel_query_graph's live read.
+            if (!tgt || !Array.isArray(tgt.inputs)) {
+              outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+              continue;
+            }
+            const live = liveLinkTargetInput(tgt, lid);
+            if (!live) continue;
+            outs.push(`${l.target_id}.${live.name ?? live.index}`);
           }
         }
         if (outs.length) out.push(`     → ${outs.join(", ")}`);
