@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.4] - 2026-08-19
 
 ### Fixed
+- a combo that cannot list its files is no authority on whether a file exists: an unreadable listing no longer reads as an empty one (#1357)
 - an abandoned combo refresh is reported as a missing confirmation rather than silently trusted: V2 and dynamic combo specs are rebuilt too, and a spec the panel cannot derive marks the run uncovered instead of suppressing a real missing-asset warning (#1193)
 - a caller-supplied link-exclusion Set is normalised instead of trusted, so a raw-number Set cannot silently lose the exclusion and credit a pre-existing link to the current call (#1272)
 - `panel_auto_layout` apply inside a subgraph no longer escapes to and rearranges the root graph (#1328)
