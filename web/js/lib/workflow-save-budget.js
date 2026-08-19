@@ -4,7 +4,7 @@
 // Field report: panel_save_workflow delivered workflow_save to the pinned tab and
 // got no acknowledgement for 15,000 ms (the orchestrator's ctx.call budget in
 // comfyui-mcp panel-tools.ts). panel_graph_outline and panel_list_workflows from
-// the SAME tab answered immediately afterward, and list_workflows still showed
+// the SAME tab answered immediately afterward, and panel_list_workflows still showed
 // persisted:true / modified:true. The tab was not backgrounded or frozen — the
 // save path's /userdata HEAD, GET and PUT are unbounded, and a server that
 // accepts those and never answers parks the reply for the whole browser timeout.
