@@ -37,6 +37,29 @@ function workflowExt(wf) {
   return wf?.initialMode === "app" ? APP_JSON_EXT : JSON_EXT;
 }
 
+/** True when a workflow NAME carries a path separator ("/" or "\"). A name is a
+ *  bare filename, not a path: every save/rename target is built by concatenating
+ *  the name onto the workflow's own directory (targetPath / the rename executor),
+ *  so a slashed name silently becomes a NESTED path — "My Workflow (A/B)" creates
+ *  a directory "My Workflow (A" holding "B).json" and reports only the trailing
+ *  segment as the saved name (comfyui-mcp#1721). Callers REFUSE such a name
+ *  rather than misfile the workflow. A name with no separator is untouched, so
+ *  workflows legitimately living in subfolders still save in place. */
+export function nameContainsPathSeparator(name) {
+  return /[\\/]/.test(String(name ?? ""));
+}
+
+/** The refusal both the save and rename paths raise for a slashed name
+ *  (comfyui-mcp#1721) — one wording so the remedy is stated once. */
+export function pathSeparatorNameError(name, verb) {
+  return new Error(
+    `refusing to ${verb}: the name ${JSON.stringify(String(name ?? ""))} contains a path ` +
+      `separator ("/" or "\\"), which would silently create a nested directory under the ` +
+      `workflows folder instead of one file (comfyui-mcp#1721). Pass a bare filename ` +
+      `(e.g. "My Workflow A-B"). Nothing was written.`,
+  );
+}
+
 /** The path ComfyUI would actually persist `base` to for this workflow — its own
  *  directory + the mode-correct extension (mirrors appendWorkflowJsonExt +
  *  workflow.directory). Used to classify a save as in-place vs Save-As by the
@@ -600,6 +623,13 @@ export async function saveActiveWorkflow(
   const explicit = typeof name === "string";
   if (explicit && !baseName(name)) {
     throw new Error("name must not be blank — pass a non-whitespace workflow name");
+  }
+  // comfyui-mcp#1721 — refuse a slashed EXPLICIT name BEFORE any probe or write.
+  // Only the caller-supplied name is checked: the current/auto-minted names are
+  // bare filenames by construction, and a workflow already living in a subfolder
+  // must keep saving in place.
+  if (explicit && nameContainsPathSeparator(name)) {
+    throw pathSeparatorNameError(name, "save");
   }
 
   const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
