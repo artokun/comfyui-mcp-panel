@@ -540,3 +540,71 @@ test("#1192: every step stalling at once still replies inside the command budget
   gate.resolve();
   await built.inFlightStarted?.catch(() => {});
 });
+
+// ---------------------------------------------------------------------------
+// 4. THE FIFTH WAIT: #1242's drift recovery is inside this command too.
+//
+// `graph_add_node` has FIVE waits, not four. The fifth is #1242's `force: true` refresh,
+// run when the registered schema has drifted from the backend's. The coalescer's forced
+// branch AWAITS ANY IN-FLIGHT RUN before queueing its own, so unbounded it is the same
+// term this issue is about — reached later, with the window already partly spent.
+//
+// Counting `budget.` call sites in the source cannot see this: the budget was threaded
+// through four awaits and the fifth simply was not one of them. Only a test that DRIVES
+// this path finds it, which is why this one holds a real in-flight run open and asserts
+// the add still answers at all.
+// ---------------------------------------------------------------------------
+
+test("#1192: the #1242 drift-recovery refresh is bounded by the command budget too", async () => {
+  // The class is ALREADY registered, so the resolver returns on its fast path and never
+  // calls refresh — the only refresh this add performs is #1242's. `driftedRequiredInput-
+  // Names` is forced non-empty so that recovery actually runs; that is the path under test.
+  const comfy = makeComfy();
+  comfy.app.registerNodesFromDefs({ ExistingNode: backendObjectInfo().ExistingNode });
+  const gate = deferred(); // a reconnect refresh that never lands
+  const built = realGraphAddNode({
+    comfy,
+    holdInFlight: gate.promise,
+    budgetMs: 400,
+    reserveMs: 120,
+    overrides: { driftedRequiredInputNames: () => ["seed"] },
+  });
+
+  const started = Date.now();
+  // UNBOUNDED, this call parks on the held-open run and the add never answers at all — the
+  // reported failure, reproduced. Bounded, it gives up and refuses in words about the drift.
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    (err) => {
+      assert.match(err.message, /required input/i, "the refusal is the drift one, worded");
+      return true;
+    },
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 3000,
+    `the drift recovery took ${elapsed}ms — it must give up at the command's bound, not ` +
+      "wait out a run started by something else",
+  );
+  gate.resolve();
+});
+
+test("#1192: an abandoned drift recovery is reported as a RETRY, not as 'unknown'", async () => {
+  // The generic branch turns any non-true verdict into reason "unknown". A Symbol lands
+  // there unless it is handled FIRST, and "unknown" is the shape of answer this repo keeps
+  // getting burned by: it cannot tell a refresh that FAILED from one this command simply
+  // stopped waiting for. Only the second is cleared by retrying.
+  const addBody = addNodeMatch[0];
+  assert.match(
+    addBody,
+    /force: true,\s*\n\s*joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,/,
+    "the #1242 drift refresh must draw its join bound from the command budget",
+  );
+  const at = addBody.indexOf("if (verdict === REFRESH_JOIN_ABANDONED)");
+  assert.ok(at > 0, "an abandoned drift recovery must be distinguished from a failed one");
+  assert.match(
+    addBody.slice(at, at + 700),
+    /retry/i,
+    "…and its reason must name the remedy that actually works",
+  );
+});

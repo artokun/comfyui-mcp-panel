@@ -11966,8 +11966,36 @@ const GRAPH_TOOL_EXECUTORS = {
     let schemaRefreshIncompleteReason = null;
     if (drifted.length) {
       try {
-        const verdict = await refreshComfyNodeDefs(undefined, { force: true });
-        if (!(verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true))) {
+        // #1192 — THE FIFTH WAIT, and the one the command budget did not reach.
+        //
+        // #1242's recovery is a `force: true` refresh, and the coalescer's forced branch
+        // AWAITS ANY RUN ALREADY IN FLIGHT before it queues its own. Unbounded, that is
+        // exactly the term this issue is about — a wait on a run started under someone
+        // else's deadline — arriving through the one await inside `graph_add_node` that
+        // named no bound. It sits AFTER the resolver, so it is reached with the window
+        // already partly spent, and on the reported scenario (a ComfyUI restart, whose
+        // reconnect refresh is still running) it could park here until the relay gave up
+        // and the user got the bare "did not reply" this whole change exists to replace.
+        //
+        // Same allowance as the resolver's join, and the same reserve held back, so a
+        // drift recovery cannot eat the window the widget-registration wait still needs.
+        const verdict = await refreshComfyNodeDefs(undefined, {
+          force: true,
+          joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
+        });
+        if (verdict === REFRESH_JOIN_ABANDONED) {
+          // A NAMED reason, not the "unknown" the generic branch below produces for a
+          // Symbol. NOTHING FAILED: the refresh is still running and still registering the
+          // schema this add wants, so the drift re-check may still clear — and if it does
+          // not, the refusal names a cause a retry actually clears. "unknown" would say
+          // the opposite by omission, and cannot tell a refresh that FAILED from one this
+          // command merely stopped waiting for.
+          schemaRefreshIncompleteReason =
+            "a node-def refresh started by something else was still running, and this " +
+            "command's time budget ran out waiting for it — nothing failed, so retry";
+        } else if (
+          !(verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true))
+        ) {
           schemaRefreshIncompleteReason =
             (verdict != null && typeof verdict === "object" && verdict.reason) || "unknown";
         }
