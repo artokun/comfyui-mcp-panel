@@ -35,7 +35,14 @@
  * set a lora basename while the dropdown was empty.
  */
 
+
 import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
+import {
+  parseAnnotatedFilepath,
+  splitInputAssetRef,
+  uploadConfigOf,
+  uploadInputAccepts,
+} from "./input-asset.js";
 
 /** Inputs whose combo lists name files on disk, rather than modes like
  *  `sampler_name: [euler, …]`. A value outside ANY combo's options is a genuine
@@ -63,12 +70,31 @@ export function optionsLookLikeFiles(options) {
  *   the class is absent (an `{}` body). null means UNKNOWN, never "no combos".
  */
 export function comboInputsOf(body, className) {
+  return parseClassCombos(body, className)?.options ?? null;
+}
+
+/**
+ * The CONFIG object each combo input carries, from the same body/parse as
+ * `comboInputsOf`. ComfyUI declares a combo as `[[...allowed], {opts}]`; `{opts}`
+ * is where an upload input announces itself (`{image_upload: true}`), and that
+ * flag is the only thing that distinguishes a list the server can fully enumerate
+ * from one it structurally cannot (see `scanComboAvailability`). null on an absent
+ * class, exactly like `comboInputsOf`.
+ *
+ * @returns {Map<string, object>|null} widget name -> config (`{}` when absent)
+ */
+export function comboConfigsOf(body, className) {
+  return parseClassCombos(body, className)?.configs ?? null;
+}
+
+function parseClassCombos(body, className) {
   if (!body || typeof body !== "object") return null;
   const spec = body[className];
   if (!spec || typeof spec !== "object") return null;
   const input = spec.input;
-  if (!input || typeof input !== "object") return new Map();
-  const out = new Map();
+  const options = new Map();
+  const configs = new Map();
+  if (!input || typeof input !== "object") return { options, configs };
   for (const group of ["required", "optional"]) {
     const entries = input[group];
     if (!entries || typeof entries !== "object") continue;
@@ -76,11 +102,12 @@ export function comboInputsOf(body, className) {
       // A combo is declared as `[[...allowed], {opts}]`; a typed input as
       // `["MODEL", {...}]`. Only the first form enumerates values.
       if (Array.isArray(def) && Array.isArray(def[0])) {
-        out.set(name, def[0].filter((v) => typeof v === "string"));
+        options.set(name, def[0].filter((v) => typeof v === "string"));
+        configs.set(name, def[1] && typeof def[1] === "object" ? def[1] : {});
       }
     }
   }
-  return out;
+  return { options, configs };
 }
 
 /**
@@ -129,10 +156,26 @@ export function linkDrivenWidgetNames(node) {
   return names;
 }
 
+/**
+ * #1357 — the wording for a value the combo has no jurisdiction over and the
+ * server could not be asked about. Kept in one place so "I could not check this"
+ * never drifts into reading like "I checked and it is fine".
+ */
+const UNENUMERABLE_PREFIX =
+  "not checked: this value names a file below the input root (or under an " +
+  "[output]/[temp] annotation), which /object_info's combo list cannot enumerate";
+
 export async function scanComboAvailability(
   nodes,
   fetchClassInfo,
-  { maxClasses = 80, budgetMs = 0, now = () => Date.now() } = {},
+  {
+    maxClasses = 80,
+    maxAssetProbes = 48,
+    budgetMs = 0,
+    now = () => Date.now(),
+    confirmServerAsset = null,
+    backslashIsSeparator = false,
+  } = {},
 ) {
   const unavailable = [];
   const unknown = [];
@@ -169,16 +212,83 @@ export async function scanComboAvailability(
     }
     let entry;
     try {
-      const combos = comboInputsOf(await fetchClassInfo(className), className);
+      const body = await fetchClassInfo(className);
+      const combos = comboInputsOf(body, className);
       entry = combos === null
         ? { reason: "node type not found in /object_info" }
-        : { combos };
+        : { combos, configs: comboConfigsOf(body, className) ?? new Map() };
     } catch {
       // A failed lookup is UNKNOWN, never "no combos".
       entry = { reason: "node type could not be looked up (/object_info call failed)" };
     }
     cache.set(className, entry);
     return entry;
+  };
+
+  // #1357 — an UPLOAD combo is the one option list the server cannot fully
+  // enumerate, so non-membership in it is NOT evidence of absence.
+  //
+  // ComfyUI's LoadImage.INPUT_TYPES lists only TOP-LEVEL files of the input dir
+  // (`os.listdir` + `isfile`), yet `folder_paths.get_annotated_filepath` happily
+  // resolves `AgentLibrary/HaReen/Main-9-1.png` — and an `x.png [output]` value
+  // resolves against a DIFFERENT root entirely. Such a value can therefore NEVER
+  // be a member of the combo, no matter how fresh the fetch. Calling it
+  // `missing_asset` is exactly the "could not look it up" / "looked it up and it
+  // is not there" collapse this module exists to prevent: the reporter's file was
+  // on disk, `panel_set_widget` had already server-confirmed it via the SAME
+  // /view probe (#387), and get_errors contradicted it in the next breath.
+  //
+  // So for those values the combo abstains and the SERVER is asked instead:
+  //   present  -> nothing to report
+  //   absent   -> a real answer; report it exactly as before
+  //   no answer (no probe injected, failed, capped, out of budget) -> UNKNOWN
+  //
+  // Everything else keeps the combo as the authority: a BARE root-level name IS
+  // enumerated, a non-upload combo (`ckpt_name`, whose folder_paths listing IS
+  // recursive) IS enumerated, and a value whose extension is not a loadable asset
+  // of this input's upload kind stays rejected on #240 strictness — a mere /view
+  // hit proves a file exists, not that LoadImage can load it.
+  const assetProbes = new Map();
+  let assetProbeCount = 0;
+  let assetProbeLimitHit = false;
+  const adjudicateUnenumerableAsset = async (config, value) => {
+    const cfg = uploadConfigOf(config);
+    if (!cfg) return null;
+    const { name: bare, type: root, annotated } = parseAnnotatedFilepath(value);
+    const { subfolder, filename } = splitInputAssetRef(bare, { backslashIsSeparator });
+    if (!filename) return null;
+    if (!annotated && !subfolder) return null;
+    if (!uploadInputAccepts(cfg, bare)) return null;
+    if (typeof confirmServerAsset !== "function") {
+      return { reason: `${UNENUMERABLE_PREFIX}, and no server file check was available` };
+    }
+    const key = `${root}:${subfolder}/${filename}`;
+    let probe = assetProbes.get(key);
+    if (!probe) {
+      if (assetProbeCount >= maxAssetProbes) {
+        assetProbeLimitHit = true;
+        return { reason: `${UNENUMERABLE_PREFIX}, and this call's ${maxAssetProbes}-file server-existence probe cap was reached` };
+      }
+      if (now() >= deadline) {
+        outOfBudget = true;
+        return { reason: `${UNENUMERABLE_PREFIX}, and get_errors ran out of its shared server-call budget` };
+      }
+      assetProbeCount += 1;
+      // The injected probe is TRI-state on purpose: `false` must mean "the server
+      // answered and the file is not there" and nothing else, or a flaky fetch
+      // would masquerade as a confirmed miss.
+      probe = Promise.resolve()
+        .then(() => confirmServerAsset(value, { filename, subfolder, type: root }))
+        .then(
+          (r) => (r === true ? "present" : r === false ? "absent" : "unknown"),
+          () => "unknown",
+        );
+      assetProbes.set(key, probe);
+    }
+    const verdict = await probe;
+    if (verdict === "present") return { present: true };
+    if (verdict === "absent") return null;
+    return { reason: `${UNENUMERABLE_PREFIX}, and the server file check did not answer` };
   };
 
   for (const node of nodes) {
@@ -227,6 +337,14 @@ export async function scanComboAvailability(
       const value = widget.value;
       if (typeof value !== "string" || value === "") continue;
       if (options.includes(value)) continue;
+      // #1357 — before calling it missing, check whether this combo could have
+      // listed it at all.
+      const asset = await adjudicateUnenumerableAsset(entry.configs?.get(name), value);
+      if (asset?.present) continue;
+      if (asset?.reason) {
+        unknown.push({ id: node.id, type: className, widget: name, value, reason: asset.reason });
+        continue;
+      }
       unavailable.push({
         id: node.id,
         type: className,
@@ -241,11 +359,13 @@ export async function scanComboAvailability(
       });
     }
   }
-  if (!truncated) return { unavailable, unknown };
+  if (!truncated && !outOfBudget && !assetProbeLimitHit) return { unavailable, unknown };
   return {
     unavailable,
     unknown,
-    ...(outOfBudget ? { unchecked_budget_exhausted: true } : { unchecked_class_limit: maxClasses }),
+    ...(outOfBudget ? { unchecked_budget_exhausted: true } : {}),
+    ...(truncated && !outOfBudget ? { unchecked_class_limit: maxClasses } : {}),
+    ...(assetProbeLimitHit ? { unchecked_asset_probe_limit: maxAssetProbes } : {}),
   };
 }
 
@@ -265,7 +385,34 @@ export function comboAvailabilityNote(unavailable) {
     `load-time missing-model scan it DOES see nodes added this session. It covers ` +
     `the graph level currently being viewed; nodes inside a subgraph you are not ` +
     `in are NOT scanned, so an empty list here is not proof about them. A node ` +
-    `whose type could not be resolved is listed under unchecked_nodes rather ` +
-    `than being reported as healthy.`
+    `whose type could not be resolved — or a value this scan has no authority ` +
+    `over — is listed under unchecked_nodes rather than being reported as healthy.`
+  );
+}
+
+/**
+ * Wording for `unchecked_nodes`, emitted whenever the scan abstained. Without it
+ * an abstention sits in the payload next to "no errors recorded" and reads as a
+ * clearance, which is the reading #1357 was harmed by — in the opposite
+ * direction, but from the same collapse of "unknown" into a verdict.
+ */
+export function uncheckedNodesNote(unknown) {
+  if (!Array.isArray(unknown) || unknown.length === 0) return "";
+  const values = unknown.filter((u) => typeof u?.widget === "string").length;
+  const types = unknown.length - values;
+  const parts = [];
+  if (types) parts.push(`${types} node(s) whose type this scan could not resolve`);
+  if (values) {
+    parts.push(
+      `${values} widget value(s) the server's combo list has no authority over ` +
+        `(an input file below the input root, or one carrying an [output]/[temp] ` +
+        `annotation, which /object_info never enumerates)`,
+    );
+  }
+  return (
+    `NOT CHECKED: ${parts.join(" and ")}. These are abstentions, not clearances: ` +
+    `each entry carries the reason it could not be judged. Nothing here is a ` +
+    `report that the value is missing, and nothing here is a report that it is ` +
+    `fine — confirm the file yourself if it matters.`
   );
 }
