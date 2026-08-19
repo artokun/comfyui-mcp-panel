@@ -22,6 +22,7 @@ import {
   syncNodeArea,
   syncGraphNodeAreas,
   moveGroupMembers,
+  holdGraphItemPositions,
   nodeAreaIsLive,
   nodeAreaOriginTracks,
 } from "../../web/js/lib/group-geometry.js";
@@ -953,4 +954,41 @@ test("#813 a node whose flags accessor THROWS is stuck, not repaired", () => {
   }, "a hostile accessor must never escape the mover");
   assert.deepEqual(r.moved, [], "an unreadable node is not reported moved");
   assert.deepEqual(r.stuck, [n]);
+});
+
+// ---- holdGraphItemPositions: pin the graph while a box-only write runs (#1306) ----
+
+test("#1306 holdGraphItemPositions puts nodes, nested boxes and reroutes back", () => {
+  const a = node(1, 100, 100);
+  const inner = groupBox([50, 50, 80, 80]);
+  const outer = groupBox([0, 0, 400, 400]);
+  const elbow = { id: 11, pos: [120, 120] };
+  const graph = {
+    _nodes: [a],
+    _groups: [outer, inner],
+    reroutes: [elbow],
+  };
+  const hold = holdGraphItemPositions(graph, outer);
+  a.pos = [999, 999];
+  inner._bounding = [1, 2, 3, 4];
+  elbow.pos = [0, 0];
+  outer._bounding = [200, 200, 500, 500];
+  hold.restore();
+  assert.deepEqual(a.pos, [100, 100], "the node is back");
+  assert.deepEqual(inner._bounding, [50, 50, 80, 80], "the nested box is back");
+  assert.deepEqual(elbow.pos, [120, 120], "the reroute is back");
+  assert.deepEqual(outer._bounding, [200, 200, 500, 500], "the excepted group is left at its new box");
+});
+
+test("#1306 holdGraphItemPositions never throws on a hostile walk", () => {
+  const graph = {
+    get _nodes() { throw new TypeError("revoked"); },
+    get _groups() { throw new TypeError("revoked"); },
+    get reroutes() { throw new TypeError("revoked"); },
+  };
+  let hold;
+  assert.doesNotThrow(() => {
+    hold = holdGraphItemPositions(graph, null);
+  });
+  assert.doesNotThrow(() => hold.restore());
 });

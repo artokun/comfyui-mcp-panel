@@ -194,7 +194,7 @@ which receives `panel_*` by a different route.
 | Tool | Effect |
 |---|---|
 | `panel_move_rail` | Move a subgraph's input / output rail so boundary wires stay short |
-| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor, or delete a labeled group box |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor/resize the box, or delete a labeled group box. `panel_edit_group({bounds})` writes the rectangle only — contained nodes stay put (`panel_move_group` translates them) |
 | `panel_screenshot` | Render the canvas to a PNG so the agent can verify its own layout |
 
 **Workflow tabs**

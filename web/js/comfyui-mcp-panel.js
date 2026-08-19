@@ -473,6 +473,7 @@ import {
   moveReroutePoints,
   rerouteWriteIsSound,
   groupBoxIsAt,
+  holdGraphItemPositions,
   describeItems,
   describeThrown,
 } from "./lib/group-geometry.js";
@@ -18172,6 +18173,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   // Edit a group's title / color / font_size / bounds — only the fields passed.
+  // bounds writes the BOX only. Contained nodes, nested groups and reroutes stay
+  // at their canvas coordinates (use panel_move_group to translate them). Some
+  // frontends couple a pos / _bounding write to LGraphGroup.move(), which would
+  // otherwise drag the cached children along with the box (#1306).
   graph_edit_group({ group_id, title, color, font_size, bounds }) {
     const { graph } = getGraphCtx();
     const g = resolveGroup(graph, group_id);
@@ -18179,12 +18184,32 @@ const GRAPH_TOOL_EXECUTORS = {
     // returned node_ids reflect the CURRENT layout, not a stale cached rect (the
     // exact "edit_group still reported the old members" symptom in the report).
     syncGraphNodeAreas(graph);
+    let wantBounds = null;
+    if (bounds != null) {
+      const badBounds = new Error(
+        "bounds must be [x, y, w, h] finite numbers — this edits the group box only; contained nodes stay put (use panel_move_group to translate them)",
+      );
+      if (!Array.isArray(bounds) || bounds.length !== 4) throw badBounds;
+      try {
+        wantBounds = [Number(bounds[0]), Number(bounds[1]), Number(bounds[2]), Number(bounds[3])];
+      } catch {
+        throw badBounds;
+      }
+      if (wantBounds.some((n) => !Number.isFinite(n))) throw badBounds;
+    }
+    // Pin every item on the graph BEFORE the box write. Snapshotting only current
+    // geometric members would miss a stale `_children` cache that move() still
+    // translates.
+    const hold = wantBounds ? holdGraphItemPositions(graph, g) : null;
     graph.beforeChange();
     try {
       if (typeof title === "string") g.title = title;
       if (color != null) g.color = String(color);
       if (Number.isFinite(font_size)) g.font_size = Number(font_size);
-      if (Array.isArray(bounds) && bounds.length === 4) setGroupBounds(g, bounds.map(Number));
+      if (wantBounds) {
+        setGroupBounds(g, wantBounds);
+        hold.restore();
+      }
       g.recomputeInsideNodes?.();
     } finally {
       graph.afterChange();
