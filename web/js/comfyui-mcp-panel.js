@@ -8808,11 +8808,18 @@ function collectMissingAssets(trustComboOverride) {
       // validation banner and the stale-red-flag adjudication cannot disagree about it —
       // this family recurred three times precisely because each call site decided
       // separately.
+      //
+      // Guarded on a non-empty list so the graph walk is not paid for at all in the
+      // common case. `clearStaleRedFlag` calls this collector once per linked neighbour
+      // after a subgraph conversion, and that is the one caller where a per-call walk
+      // would compound.
       try {
-        nodeTypes = withoutFrontendVirtualTypes(
-          nodeTypes,
-          collectAllGraphs(getGraphCtx().rootGraph).flatMap((g) => g?._nodes ?? []),
-        );
+        if (nodeTypes.length) {
+          nodeTypes = withoutFrontendVirtualTypes(
+            nodeTypes,
+            collectAllGraphs(getGraphCtx().rootGraph).flatMap((g) => g?._nodes ?? []),
+          );
+        }
       } catch {
         /* no readable graph → nothing is proven virtual → every type stays reported */
       }

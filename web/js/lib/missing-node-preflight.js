@@ -285,22 +285,30 @@ export function missingNodeRunRefusal(offenders) {
     );
   }
 
-  // Every offender's type IS registered here, so nothing is missing from this page and a
-  // reload changes nothing. Only what the serializer observed is asserted: it takes an
-  // entry's class_type from the node's own `comfyClass`, and it omits a node entirely when
-  // that node reports `isVirtualNode` — so an entry that arrived with neither came from a
+  // Every type this page WAS ASKED ABOUT is registered here, so a reload changes nothing
+  // for those. Only what the serializer observed is asserted: it takes an entry's
+  // class_type from the node's own `comfyClass`, and it omits a node entirely when that
+  // node reports `isVirtualNode` — so an entry that arrived with neither came from a
   // registered class that has no backend node behind it and does not declare itself
   // virtual. Nothing is claimed about which pack is at fault or how to repair it.
+  //
+  // SCOPED to the offenders the graph could name. A node the canvas could not name has an
+  // unknown type, so nothing was established about it and the sentence must not sweep it
+  // in — that would be a claim of "nothing is missing" built on a node never looked at.
+  const unnamed = all.length - observed.length;
   return (
     head +
-    `This page DOES have a node class registered for ${typeList(observed)} — so nothing is ` +
-    `missing here and reloading will not change it — but the serializer still emitted no ` +
-    `class_type for them, ` +
+    `This page DOES have a node class registered for ${typeList(observed)}, so reloading ` +
+    `will not change those — but the serializer still emitted no class_type for them, ` +
     tail +
     `An entry's class_type comes from the node's own comfyClass, and a node that reports ` +
     `isVirtualNode is left out of the prompt entirely; these did neither, so the registered ` +
     `class has no backend node behind it and does not declare itself virtual. That is a ` +
     `problem in the pack's own frontend node rather than anything this ComfyUI is missing. ` +
+    (unnamed
+      ? `The other ${unnamed} node${unnamed === 1 ? "" : "s"} could not be named from the ` +
+        `canvas, so nothing is established about ${unnamed === 1 ? "it" : "them"}. `
+      : "") +
     BYPASS_NOTE
   );
 }

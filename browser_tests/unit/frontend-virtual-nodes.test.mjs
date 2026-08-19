@@ -254,9 +254,24 @@ test("#1648 CALL SITE 3: a REGISTERED type is not sent to reload the tab", () =>
   // page, so "reload" would send the user round the same loop from the other side.
   const msg = missingNodeRunRefusal([{ id: "7", type: "SomeDisplayNode", registered: true }]);
   assert.match(msg, /DOES have a node class registered for SomeDisplayNode/);
-  assert.match(msg, /reloading will not change it/);
+  assert.match(msg, /reloading\s+will not change those/);
   assert.doesNotMatch(msg, /RELOAD the ComfyUI tab/);
   assert.doesNotMatch(msg, /install the pack that provides these types/);
+  // Nothing was left unnamed, so no leftover clause.
+  assert.doesNotMatch(msg, /could not be named from the/);
+});
+
+test("#1648 CALL SITE 3: an offender the canvas could not name is never swept into the claim", () => {
+  // `registered: null` is a node whose type the graph could not read. The "registered here"
+  // sentence must stay scoped to what was actually looked at — otherwise it asserts
+  // "nothing is missing" off a node nobody examined.
+  const msg = missingNodeRunRefusal([
+    { id: "7", type: "SomeDisplayNode", registered: true },
+    { id: "8", type: null, registered: null },
+  ]);
+  assert.match(msg, /DOES have a node class registered for SomeDisplayNode/);
+  assert.doesNotMatch(msg, /nothing is missing here/);
+  assert.match(msg, /The other 1 node could not be named from the canvas, so nothing is established about it/);
 });
 
 test("#1648 CALL SITE 3: one unregistered offender in a mixed set still gets the reload remedy", () => {
