@@ -56,52 +56,53 @@ export function workflowSaveTimeoutObservation(wf) {
 
 /**
  * The refusal a timed-out save throws. States that the tab is still live and what
- * the flags SAY — never what they imply about whether the write landed.
+ * the flags SAY — never what they imply about whether the write completed.
  *
- * #1455: `isModified === false` is also the state of a workflow that was never
- * dirty, so it cannot distinguish "the write landed" from "there was nothing to
- * write". The frontend's save() forces through the `isPersisted && !isModified`
+ * #1455, part 1: `isModified === false` is also the state of a workflow that was
+ * never dirty, so it cannot distinguish "the write landed" from "there was nothing
+ * to write". The frontend's save() forces through the `isPersisted && !isModified`
  * early return, so a persisted-and-clean workflow reaches a hanging PUT with the
  * flag already false. `panel_list_workflows` reports that same flag, so it cannot
  * settle it either. The honest terminal state is "could not determine".
  *
- * `subject` is the workflow the save TARGETED, captured before the save ran; the
- * /userdata HEAD probe can hang before any Save-As swap, so the workflow that is
- * active when the budget fires is not necessarily the one being saved.
+ * #1455, part 2 — WHICH workflow the reply is about. Three cases, kept apart:
+ *
+ *   · `requested` given (workflow_save_as, and any named save) — that IS the
+ *     destination, whatever the canvas is showing. The relocating routes call
+ *     `openWorkflow(copy)` BEFORE `saveWorkflow(copy)` (workflow-save.js:1353), so
+ *     the workflow active when the budget fires is normally the destination and the
+ *     workflow active *before* the save is the SOURCE — which this route never
+ *     writes. Naming either by position is a guess; the requested name is not.
+ *   · no `requested`, and the active workflow did not move — an in-place save; the
+ *     flags describe it.
+ *   · no `requested`, and the active workflow moved — first-save auto-naming. Which
+ *     file the hung write targets cannot be determined from here, and saying so is
+ *     the answer. It is NOT the same as "unchanged", and must not collapse into it.
  */
 export function describeWorkflowSaveTimeout({
   budgetMs = WORKFLOW_SAVE_COMMAND_BUDGET_MS,
   modified,
   persisted,
   filename,
-  subject,
-  subjectChanged = false,
+  requested,
+  previousActive,
 } = {}) {
   const total = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : WORKFLOW_SAVE_COMMAND_BUDGET_MS;
   const seconds = Math.max(1, Math.round(total / 1000));
-  // A direct caller may pass only `filename` (the pre-#1455 shape); fall back to it so
-  // the reply still names the workflow rather than degrading to "the active workflow".
-  const subjectName = typeof subject === "string" && subject ? subject : filename;
-  const target = typeof subjectName === "string" && subjectName ? `"${subjectName}"` : "the active workflow";
-  const nowActive = typeof filename === "string" && filename ? `"${filename}"` : "a different workflow";
+  const str = (v) => (typeof v === "string" && v ? v : null);
+  const dest = str(requested);
+  const active = str(filename);
+  const prior = str(previousActive);
 
-  // The active workflow moved during the budget, so the flags below describe some
-  // OTHER workflow. Reporting them against the target would be a wrong-target claim.
-  if (subjectChanged) {
-    return (
-      `workflow_save did not finish within ${seconds}s for ${target}. ` +
-      `The tab is still live — other commands from it still answer, so this is not a backgrounded or frozen tab. ` +
-      `The save may still complete in the background. The active workflow changed to ${nowActive} while the save was in flight, ` +
-      `so no dirty/persisted flag currently describes ${target} and this reply cannot say whether its write completed. ` +
-      `Confirm by reading the saved file itself before retrying — a re-issue may write twice.`
-    );
-  }
+  const head =
+    `The tab is still live — other commands from it still answer, so this is not a backgrounded or frozen tab. ` +
+    `The save may still complete in the background. `;
+  const retry = `Confirm by reading the saved file itself before retrying — a re-issue may write twice.`;
 
   const flags = [
     modified === true ? "modified:true" : modified === false ? "modified:false" : null,
     persisted === true ? "persisted:true" : persisted === false ? "persisted:false" : null,
   ].filter(Boolean);
-  const reads = flags.length ? `The same tab reports ${flags.join(" ")}. ` : "The tab's save flags could not be read. ";
 
   // modified:true is one-directional evidence: the canvas is still dirty, so nothing
   // has been acknowledged. modified:false proves nothing in either direction.
@@ -111,14 +112,34 @@ export function describeWorkflowSaveTimeout({
       : `These flags cannot show whether the write completed: modified:false is also the state of a workflow that was never dirty, ` +
         `and panel_list_workflows reports that same flag. Treat the outcome as UNDETERMINED. `;
 
-  return (
-    `workflow_save did not finish within ${seconds}s for ${target}. ` +
-    `The tab is still live — other commands from it still answer, so this is not a backgrounded or frozen tab. ` +
-    `The save may still complete in the background. ` +
-    reads +
-    verdict +
-    `Confirm by reading the saved file itself before retrying — a re-issue may write twice.`
-  );
+  // Case 3 — the target is genuinely unknown. Never dressed up as case 2.
+  if (!dest && prior && active && prior !== active) {
+    return (
+      `workflow_save did not finish within ${seconds}s. ` +
+      head +
+      `The active workflow changed from "${prior}" to "${active}" while the save was in flight, and no destination name was requested, ` +
+      `so which file the hung write targets cannot be determined from here. ` +
+      retry
+    );
+  }
+
+  const subject = dest ?? prior ?? active;
+  const who = subject ? `"${subject}"` : "the active workflow";
+
+  // Case 1 with a moved canvas: the destination is known, but the flags on screen
+  // belong to some other workflow. Report the target; withhold the foreign flags.
+  if (dest && active && active !== dest) {
+    return (
+      `workflow_save did not finish within ${seconds}s for ${who}. ` +
+      head +
+      `The active workflow is "${active}", not the save's destination, so its dirty/persisted flags do not describe ${who} ` +
+      `and this reply cannot say whether that write completed. ` +
+      retry
+    );
+  }
+
+  const reads = flags.length ? `The same tab reports ${flags.join(" ")}. ` : "The tab's save flags could not be read. ";
+  return `workflow_save did not finish within ${seconds}s for ${who}. ` + head + reads + verdict + retry;
 }
 
 /**
@@ -134,7 +155,7 @@ export function describeWorkflowSaveTimeout({
  */
 export async function runBoundedWorkflowSave(
   saveFn,
-  { budgetMs = WORKFLOW_SAVE_COMMAND_BUDGET_MS, now, withTimeout, observeWorkflow } = {},
+  { budgetMs = WORKFLOW_SAVE_COMMAND_BUDGET_MS, now, withTimeout, observeWorkflow, targetName } = {},
 ) {
   if (typeof saveFn !== "function") {
     throw new Error("runBoundedWorkflowSave requires a save function");
@@ -145,14 +166,15 @@ export async function runBoundedWorkflowSave(
     );
   }
   const budget = makeCommandBudget(budgetMs, now);
-  // #1455 — capture the save's TARGET before it runs. The /userdata HEAD probe can
-  // hang before any Save-As swap, so the workflow active when the budget fires is not
-  // necessarily the one being saved; naming that one blames the wrong file.
-  let target = {};
+  // #1455 — record which workflow was active BEFORE the save. This is NOT the target:
+  // the relocating routes activate the copy before the write they hang on, so it is the
+  // SOURCE. It is kept only to detect that the canvas moved, which is what makes an
+  // un-named save's destination undeterminable.
+  let priorActive = {};
   try {
-    target = typeof observeWorkflow === "function" ? observeWorkflow() || {} : {};
+    priorActive = typeof observeWorkflow === "function" ? observeWorkflow() || {} : {};
   } catch {
-    target = {};
+    priorActive = {};
   }
   const settled = await withTimeout(
     Promise.resolve()
@@ -171,23 +193,16 @@ export async function runBoundedWorkflowSave(
     } catch {
       observed = {};
     }
-    // Same workflow => its flags describe the target. Different (or unreadable)
-    // => they describe something else, and the reply must not attribute them.
-    const subject = typeof target.filename === "string" && target.filename ? target.filename : observed.filename;
-    const subjectChanged =
-      typeof subject === "string" &&
-      subject !== "" &&
-      typeof observed.filename === "string" &&
-      observed.filename !== "" &&
-      observed.filename !== subject;
     throw new Error(
       describeWorkflowSaveTimeout({
         budgetMs: budget.totalMs,
         modified: observed.modified,
         persisted: observed.persisted,
         filename: observed.filename,
-        subject,
-        subjectChanged,
+        // The requested name is the destination on every named route; the pre-save
+        // active workflow is only evidence that the canvas moved.
+        requested: targetName,
+        previousActive: priorActive.filename,
       }),
     );
   }

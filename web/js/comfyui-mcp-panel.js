@@ -16228,6 +16228,8 @@ const GRAPH_TOOL_EXECUTORS = {
         withTimeout,
         now: monotonicNow,
         observeWorkflow: observeActiveWorkflowSaveState,
+        // #1455 — the destination, not whatever the canvas shows when the budget fires.
+        targetName: name,
       },
     );
     // #978 recurrence — a FIRST save swaps the active object too, and the #557 carry
@@ -16266,6 +16268,8 @@ const GRAPH_TOOL_EXECUTORS = {
         withTimeout,
         now: monotonicNow,
         observeWorkflow: observeActiveWorkflowSaveState,
+        // #1455 — the destination, not whatever the canvas shows when the budget fires.
+        targetName: name,
       },
     );
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
