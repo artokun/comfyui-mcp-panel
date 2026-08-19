@@ -190,6 +190,13 @@ export function railSlotLinkIds(railSlot) {
  * and collapsing them into one "ids as strings" helper is precisely how a working
  * rail verdict became a 100% false negative. Keeping the string form to this
  * function, and reading the store only with raw ids, is what keeps them apart.
+ *
+ * Takes ANY iterable of ids — an array, or a Set a caller already built. Callers
+ * must NOT skip this on the grounds that they already hold a Set: a Set of RAW
+ * numbers passed straight through is a set whose `has(String(id))` never matches,
+ * so every exclusion silently evaporates and a PRE-EXISTING link gets credited to
+ * the current call. Normalising unconditionally is idempotent (a Set of strings
+ * re-normalises to itself) and costs one pass over a handful of ids.
  */
 export function linkIdExclusionSet(ids) {
   const set = new Set();
@@ -214,7 +221,7 @@ export function linkIdExclusionSet(ids) {
 export function findLandedInboundLink(graph, origin, outIdx, target, excludeIds) {
   const originId = origin?.id;
   if (originId == null || !target) return null;
-  const skip = excludeIds instanceof Set ? excludeIds : linkIdExclusionSet(excludeIds);
+  const skip = linkIdExclusionSet(excludeIds);
   const inputs = target.inputs ?? [];
   for (let i = 0; i < inputs.length; i++) {
     const linkId = inputs[i]?.link;
@@ -259,7 +266,7 @@ export function isRailLinkPersisted(graph, railSlot, node, slotIdx, side, link) 
  * wire is never credited to this call. Returns `{ linkId }`.
  */
 export function findLandedRailLink(graph, railSlot, node, slotIdx, side, excludeIds) {
-  const skip = excludeIds instanceof Set ? excludeIds : linkIdExclusionSet(excludeIds);
+  const skip = linkIdExclusionSet(excludeIds);
   for (const linkId of railSlotLinkIds(railSlot)) {
     // String() on the MEMBERSHIP side only — `linkId` itself stays raw for the
     // store read on the next line.
