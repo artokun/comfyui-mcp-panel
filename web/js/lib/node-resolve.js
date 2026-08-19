@@ -520,6 +520,35 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       ) {
         return;
       }
+      // #1296 — a type ON the frontend-only allowlist that is absent from the LIVE
+      // REGISTRY is refused correctly, but the generic refusal below misdiagnoses WHY:
+      // "not installed, its pack was removed, or its pack failed to import" sends the
+      // user to reinstall a pack they already have (the reported case: rgthree-comfy
+      // installed and verified, ComfyUI restarted — which does NOT reload the open
+      // tab). A pack's frontend JS is fetched once at PAGE LOAD, so a pack installed
+      // after this tab opened registers nothing here, and no /object_info refresh can
+      // fix that — a frontend-only class never comes from the backend. Nothing the
+      // server reports can confirm or deny a frontend-only type, so name the one
+      // action that changes the outcome: RELOAD the ComfyUI tab. Only the never-seen
+      // verdict may say this — a removed/unseeded/pending history keeps its own
+      // honest message above, and an allowlisted name whose REGISTERED class carries
+      // backend provenance (a name-collision husk) stays on the generic refusal.
+      if (
+        verdict === "never-seen" &&
+        FRONTEND_ONLY_NODE_TYPES.has(class_type) &&
+        !isRegisteredNodeType(readRegistry(), class_type)
+      ) {
+        throw new Error(
+          `Cannot add "${class_type}": it is a frontend-only node type — the ComfyUI backend ` +
+            `never provides it, so its absence from /object_info is expected — but it is NOT ` +
+            `registered in this tab's live node registry. A pack's frontend JS is loaded once ` +
+            `at page load, and restarting the ComfyUI server does NOT reload an already-open ` +
+            `tab, so a pack installed after this tab opened registers nothing here. RELOAD the ` +
+            `ComfyUI tab and retry. If it is still refused after a reload, the pack that provides ` +
+            `it is not installed (or its frontend JS failed to load). Refusing to add rather than ` +
+            `let LiteGraph mint an unresolved placeholder node (#458).`,
+        );
+      }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
       // #741: the pointer must be a tool that searches node CLASSES
