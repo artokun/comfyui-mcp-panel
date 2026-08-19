@@ -239,3 +239,22 @@ function railLinkJoins(stored, node, slotIdx, side) {
     side === "input" ? (stored.target_slot ?? stored[4]) : (stored.origin_slot ?? stored[2]);
   return String(nodeId) === String(node.id) && Number(nodeSlot) === Number(slotIdx);
 }
+
+/**
+ * The disclosure attached to a connect that THREW but whose link IS on the live
+ * graph. The verdict itself comes from the post-state check; this states that
+ * plainly, quotes the throw verbatim rather than hiding it, and tells the caller
+ * not to retry — the retry is what turns this false negative into duplicated or
+ * torn-down wiring. `extra` carries a site-specific observation (e.g. the node
+ * re-slotted the link) and is omitted when there is nothing extra to say.
+ */
+export function landedAfterThrowWarning(err, extra = "") {
+  return (
+    `the ComfyUI frontend threw while applying this connect (${err?.message ?? err}) but the live ` +
+    `graph shows the link IS present, so this is reported as connected (#1272). ` +
+    (extra ? `${extra} ` : "") +
+    `Do NOT retry this connect — a retry would duplicate or tear down wiring that is already ` +
+    `correct. The node that threw may have been left mid-reshape, so re-read it with ` +
+    `panel_query_graph before wiring anything else to it.`
+  );
+}
