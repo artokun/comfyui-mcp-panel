@@ -9742,8 +9742,32 @@ async function revertGraphSnapshotByMid(mid) {
  *  (positions, colors, internal state) to keep token cost low. */
 function summarizeNode(node) {
   const widgets = {};
-  for (const w of node.widgets ?? []) {
-    if (w && typeof w.name === "string") widgets[w.name] = w.value;
+  const namedWidgets = [];
+  const list = node.widgets ?? [];
+  for (let i = 0; i < list.length; i++) {
+    const w = list[i];
+    if (!w || typeof w.name !== "string") continue;
+    widgets[w.name] = w.value;
+    namedWidgets.push({ index: i, w });
+  }
+  // #1402: several widgets can legitimately share ONE name — every toggle row of
+  // rgthree's Fast Groups Bypasser/Muter is named `RGTHREE_TOGGLE_AND_NAV`. The
+  // name-keyed map above is LAST-WINS, so those rows collapse into a single entry
+  // and the read reports one row's state as if it were the whole node's, hiding
+  // duplicated or orphaned rows completely. Surface every occurrence, in canvas
+  // order, whenever a name repeats, so a collapsed row is visible instead of
+  // silently dropped.
+  const nameCounts = new Map();
+  for (const { w } of namedWidgets) nameCounts.set(w.name, (nameCounts.get(w.name) ?? 0) + 1);
+  const duplicateWidgets = {};
+  for (const { index, w } of namedWidgets) {
+    if ((nameCounts.get(w.name) ?? 0) < 2) continue;
+    const label = displayLabel(w);
+    (duplicateWidgets[w.name] ??= []).push({
+      index,
+      ...(label != null ? { label } : {}),
+      value: w.value,
+    });
   }
   // #1181: promoted inputs on a subgraph container whose link origin is a
   // frontend-only VIRTUAL source (e.g. a canvas PrimitiveNode). graphToPrompt
@@ -9851,6 +9875,9 @@ function summarizeNode(node) {
     // widgets only. Address widgets by the KEY (the name); `widget_labels` exists so a
     // rename is visible instead of looking like it did not stick.
     ...(Object.keys(widgetLabels).length ? { widget_labels: widgetLabels } : {}),
+    // #1402: names carried by MORE THAN ONE widget, with each occurrence's value/label.
+    // The name-keyed `widgets` map can only hold the last of them; this is every row.
+    ...(Object.keys(duplicateWidgets).length ? { duplicate_widgets: duplicateWidgets } : {}),
     // #607: names here are OVERRIDDEN by a link at run time — the value in `widgets`
     // is the stale stored value, NOT what executes. Each entry names the source.
     ...(Object.keys(drivenByLink).length ? { driven_by_link: drivenByLink } : {}),
