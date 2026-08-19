@@ -6,8 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-08-19
+
 ### Fixed
-- `duplicate_widgets` (the #1402 duplicate-widget report) no longer throws the whole detail read away on a widget named `__proto__`/`constructor`/`toString` — occurrences are accumulated prototype-safely — and is now bounded by the same `max_chars` budget as `widgets` (dropped occurrences are announced with the lever that lifts them, never silently lost), so a many-group Fast Groups Bypasser cannot push the detail line into a whole-row stub. `panel_graph_outline` also labels each same-named row from the widget itself rather than a last-wins name-keyed map, so two different group toggles are no longer both annotated with the last row's label (#1402)
+- `panel_query_graph` (fields:'detail') no longer last-wins-collapses widgets that share a name: when a name repeats (rgthree Fast Groups toggle rows), every occurrence is listed so a duplicate or orphaned row is visible (#1402) (#1406)
+- `duplicate_widgets` (the #1402 duplicate-widget report) no longer throws the whole detail read away on a widget named `__proto__`/`constructor`/`toString` — occurrences are accumulated prototype-safely — and is now bounded by the same `max_chars` budget as `widgets` (dropped occurrences are announced with the lever that lifts them, never silently lost), so a many-group Fast Groups Bypasser cannot push the detail line into a whole-row stub. `panel_graph_outline` also labels each same-named row from the widget itself rather than a last-wins name-keyed map, so two different group toggles are no longer both annotated with the last row's label (#1402) (#1405)
+
 
 ## [0.15.5] - 2026-08-19
 
@@ -16,7 +20,6 @@ All notable changes to this project are documented here. This project adheres to
 - `/record-skill` snapshots the open graph as a reusable skill file (`skills/<name>/SKILL.md`) so the agent can rebuild it (#350)
 
 ### Fixed
-- `panel_query_graph` (fields:'detail') no longer last-wins-collapses widgets that share a name: when a name repeats (rgthree Fast Groups toggle rows), every occurrence is listed so a duplicate or orphaned row is visible (#1402)
 - `workflow_open` no longer reports a false content mismatch on `definitions` when the frontend renumbered subgraph NODE ids during the load: the relabeling is proven (same nodes in the same order, links and promoted widgets patched through one injective map) rather than tolerated, and it still refuses when a root node promotes a widget from a node the relabeling touched (artokun/comfyui-mcp#1706)
 - a panel tab whose bridge ROUTE went stale re-advertises itself instead of waiting for a browser refresh: the 600 ms workflow poll now watches the route the orchestrator keys its tab registry on, not only the workflow-instance fence identity, so a re-hello that did not land after a switch, a first save or a rename is retried (bounded) rather than leaving every graph call addressed at a tab id nothing answers to (#1389)
 
