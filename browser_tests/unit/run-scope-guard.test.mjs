@@ -473,6 +473,205 @@ test("#1273 promptContentHash: an untouched UE graph stamps EQUAL to its dispatc
   );
 });
 
+// ---------------------------------------------------------------------------
+// #1331 — the FOURTH volatility mechanism: after reconnect, leftover values of
+// link-driven converted widgets (MiniMax H3 clip/vae/model/length, …) settle
+// between the pre-dispatch stamp and the POST body. The #1050 single retry
+// still races because serializeValue keeps flipping those leftovers. The
+// value that EXECUTES is the incoming link; the leftover is non-semantic.
+// A PURE SOCKET (connected input, no matching widget / no convert-to-input
+// marker) stays hashed — a KSampler.model rewire is still drift.
+// ---------------------------------------------------------------------------
+
+const minimaxH3Node = (id, { leftover = true } = {}) => ({
+  id,
+  type: "MiniMaxH3ReferenceToVideo",
+  widgets: [
+    { name: "clip", value: leftover ? "clip_l.safetensors" : ["4", 0] },
+    { name: "vae", value: leftover ? "ae.safetensors" : ["5", 0] },
+    { name: "length", value: leftover ? 81 : ["9", 0] },
+    { name: "prompt", value: "a cat" },
+  ],
+  inputs: [
+    { name: "clip", link: 11, widget: { name: "clip" } },
+    { name: "vae", link: 12, widget: { name: "vae" } },
+    { name: "length", link: 13, widget: { name: "length" } },
+    { name: "prompt", link: null },
+  ],
+});
+
+const hooklessControl = (value = "randomize") => ({
+  name: "control_after_generate",
+  value,
+  options: {
+    serialize: false,
+    canvasOnly: true,
+    values: ["fixed", "increment", "decrement", "randomize"],
+  },
+});
+
+test("#1331 collectVolatileInputs: a link-driven converted widget is volatile, its unlinked sibling is not", () => {
+  const graph = {
+    _nodes: [
+      minimaxH3Node(1000),
+      { id: 3, widgets: [{ name: "steps", value: 20 }], inputs: [{ name: "model", link: 1 }] },
+    ],
+  };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("1000 clip"), "converted clip leftover is the race");
+  assert.ok(pairs.has("1000 vae"), "converted vae leftover is the race");
+  assert.ok(pairs.has("1000 length"), "converted length leftover is the race");
+  assert.ok(!pairs.has("1000 prompt"), "an UNLINKED sibling widget stays drift-covered");
+  assert.ok(!pairs.has("3 model"), "a PURE SOCKET (no matching widget, no convert marker) stays hashed");
+  assert.ok(!pairs.has("3 steps"), "an unlinked widget on another node stays covered");
+});
+
+test("#1331 collectVolatileInputs: a same-name widget + linked input (no input.widget marker) is still the leftover", () => {
+  // Older frontends omit input.widget and just keep the widget next to a
+  // same-named connected input. That is still a converted leftover.
+  const graph = {
+    _nodes: [{
+      id: 110,
+      widgets: [{ name: "clip", value: "clip_l.safetensors" }, { name: "text", value: "hi" }],
+      inputs: [{ name: "clip", link: 7 }, { name: "text", link: null }],
+    }],
+  };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("110 clip"));
+  assert.ok(!pairs.has("110 text"));
+});
+
+test("#1331 collectVolatileInputs: the convert-to-input marker counts even when the widget was hidden", () => {
+  // After convert, some builds drop the widget from node.widgets but leave
+  // input.widget.name. graphToPrompt can still emit a leftover under that name
+  // while the frontend settles — exclude the name, not the socket's siblings.
+  const graph = {
+    _nodes: [{
+      id: 1100,
+      widgets: [{ name: "prompt", value: "a cat" }],
+      inputs: [
+        { name: "clip", link: 1, widget: { name: "clip" } },
+        { name: "model", link: 2 },
+      ],
+    }],
+  };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("1100 clip"), "hidden converted widget is still the leftover");
+  assert.ok(!pairs.has("1100 model"), "a pure socket on the same node stays hashed");
+  assert.ok(!pairs.has("1100 prompt"), "an unlinked live widget stays covered");
+});
+
+test("#1331 collectVolatileInputs: the link-driven exclusion reaches nested subgraphs with the colon-path execId", () => {
+  const root = {
+    _nodes: [{ id: 10, widgets: [], subgraph: { _nodes: [minimaxH3Node(15)] } }],
+  };
+  const pairs = collectVolatileInputs(root);
+  assert.ok(pairs.has("10:15 clip"), "nested leftover pairs line up with the flattened prompt keys");
+  assert.ok(!pairs.has("10:15 prompt"));
+});
+
+test("#1331 collectVolatileInputs: an unlinked converted-shaped widget is NOT volatile — a mid-window edit is still drift", () => {
+  const graph = {
+    _nodes: [{
+      id: 1000,
+      widgets: [{ name: "clip", value: "clip_l.safetensors" }],
+      inputs: [{ name: "clip", link: null, widget: { name: "clip" } }],
+    }],
+  };
+  assert.equal(collectVolatileInputs(graph).size, 0, "no live link ⇒ the widget value is still what executes");
+});
+
+test("#1331 promptContentHash: leftover widget values stamp EQUAL to the dispatched link form — and a real edit still refuses", () => {
+  const volatileInputs = collectVolatileInputs({ _nodes: [minimaxH3Node(1000)] });
+  const stamped = {
+    "4": { class_type: "CLIPLoader", inputs: { clip_name: "clip_l.safetensors" } },
+    "1000": {
+      class_type: "MiniMaxH3ReferenceToVideo",
+      inputs: { clip: "clip_l.safetensors", vae: "ae.safetensors", length: 81, prompt: "a cat" },
+    },
+    "223": { class_type: "VHS_VideoCombine", inputs: { images: ["1000", 0] } },
+  };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const dispatched = (inputs) =>
+    JSON.stringify({
+      prompt: {
+        "4": { class_type: "CLIPLoader", inputs: { clip_name: "clip_l.safetensors" } },
+        "1000": { class_type: "MiniMaxH3ReferenceToVideo", inputs },
+        "223": { class_type: "VHS_VideoCombine", inputs: { images: ["1000", 0] } },
+      },
+    });
+  assert.equal(
+    promptContentHashFromBody(
+      dispatched({ clip: ["4", 0], vae: ["5", 0], length: ["9", 0], prompt: "a cat" }),
+      volatileInputs,
+    ),
+    atHash,
+    "the leftover→link flip is the exclusion's purpose — the scoped run is no longer refused",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(
+      dispatched({ clip: ["4", 0], vae: ["5", 0], length: ["9", 0], prompt: "a dog" }),
+      volatileInputs,
+    ),
+    atHash,
+    "a mid-window edit to any OTHER input of the same node is still drift",
+  );
+  assert.equal(
+    promptContentHashFromBody(
+      dispatched({ clip: ["88", 0], vae: ["5", 0], length: ["9", 0], prompt: "a cat" }),
+      volatileInputs,
+    ),
+    atHash,
+    "a mid-window rewiring OF the excluded leftover itself is the documented residual",
+  );
+});
+
+test("#1331 collectVolatileInputs: hookless control_after_generate (reconnect) excludes the governed seed, not a sibling", () => {
+  // After reconnect the combo is present by OPTION SHAPE before beforeQueued
+  // is re-hung. The #572 hook scan finds nothing; the leftover seed still
+  // randomizes between stamp and dispatch.
+  const control = hooklessControl("randomize");
+  const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  for (const w of graph._nodes[0].widgets) {
+    assert.equal(typeof w.beforeQueued, "undefined", `${w.name} carries no beforeQueued`);
+  }
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(pairs.has("16 noise_seed"), "the governed seed is volatile without a hook");
+  assert.ok(pairs.has("16 control_after_generate"), "the carrier's own name is excluded too");
+  assert.ok(!pairs.has("16 steps"), "a sibling stays drift-covered");
+});
+
+test("#1331 collectVolatileInputs: a FIXED hookless control excludes nothing", () => {
+  const control = hooklessControl("fixed");
+  const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 16, widgets: [seed, control] }] };
+  assert.equal(collectVolatileInputs(graph).size, 0);
+});
+
+test("#1331 promptContentHash: hookless randomize seed churn is not drift — a sibling edit still is", () => {
+  const control = hooklessControl("randomize");
+  const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+  const volatileInputs = collectVolatileInputs({
+    _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }],
+  });
+  const atHash = promptContentHash(
+    { "16": { class_type: "RandomNoise", inputs: { noise_seed: 111, steps: 20 } } },
+    volatileInputs,
+  );
+  const body = (inputs) => JSON.stringify({ prompt: { "16": { class_type: "RandomNoise", inputs } } });
+  assert.equal(
+    promptContentHashFromBody(body({ noise_seed: 999983, steps: 20 }), volatileInputs),
+    atHash,
+    "reconnect seed churn without a re-hung hook is the exclusion's purpose",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(body({ noise_seed: 999983, steps: 25 }), volatileInputs),
+    atHash,
+    "a genuine mid-window edit to a non-excluded input of the same node refuses",
+  );
+});
+
 
 test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's own input — a seed edit is the documented residual, an edit to any OTHER input of the same node refuses", () => {
   const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
@@ -2291,6 +2490,161 @@ test("#1124 integration: the exclusion is ONE input — an armed rgthree Seed do
       // the refusal names the REAL change instead of the red herring the reporter
       // was handed.
       assert.doesNotMatch(result.error, /47 seed/, `${label}: the substituted seed is no longer blamed`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #1331 integration — the reporter's sequence, driven through dispatchScopedRun
+// (the SAME orchestration graph_run / panel_run runs).
+//
+// After reconnect a MiniMax H3 node still has leftover clip/vae/length widget
+// values; the live inputs are already linked. The stamp serializes the leftovers;
+// the deferred POST serializes the incoming links (or later leftovers). Before
+// #1331 that pair always mismatched and the #1050 retry failed identically.
+// ---------------------------------------------------------------------------
+
+const MINIMAX_STAMP = {
+  "4": { class_type: "CLIPLoader", inputs: { clip_name: "clip_l.safetensors" } },
+  "5": { class_type: "VAELoader", inputs: { vae_name: "ae.safetensors" } },
+  "1000": {
+    class_type: "MiniMaxH3ReferenceToVideo",
+    inputs: { clip: "clip_l.safetensors", vae: "ae.safetensors", length: 81, prompt: "a cat" },
+  },
+  "223": { class_type: "VHS_VideoCombine", inputs: { images: ["1000", 0] } },
+};
+
+function makeMinimaxReconnectFrontend({ apiTarget, alsoEdit = null } = {}) {
+  const app = {
+    queueItems: [],
+    posted: [],
+    graph: { _nodes: [minimaxH3Node(1000), { id: 223, widgets: [] }] },
+    graphToPrompt: async () => ({ output: structuredClone(MINIMAX_STAMP), workflow: {} }),
+    queuePrompt: async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const output = structuredClone(MINIMAX_STAMP);
+      // The reconnect race: dispatch serializes the incoming links, not the leftovers.
+      output["1000"].inputs.clip = ["4", 0];
+      output["1000"].inputs.vae = ["5", 0];
+      output["1000"].inputs.length = ["9", 0];
+      if (alsoEdit) alsoEdit(output);
+      const body = frontendBody({ output, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi(...promptPost(body));
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#1331 integration: leftover link-driven clip/vae/length after reconnect is OUR dispatch — the scoped run reaches ComfyUI instead of racing the stamp", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeMinimaxReconnectFrontend({ apiTarget });
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223,
+      verifyTimeoutMs: 500,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched", "the #556 graph-stamp refusal is gone");
+    assert.equal(result.verified, 1);
+    assert.deepEqual(ids, ["srv-1"]);
+    assert.equal(server.calls.length, 1, "the scoped prompt actually reached ComfyUI");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["223"]);
+    assert.deepEqual(
+      result.volatileInputs,
+      ["1000 clip", "1000 length", "1000 vae"],
+      "the gap is DISCLOSED, never silent: graph_run turns this into drift_coverage",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#1331 integration: the leftover exclusion does NOT let a real edit ride along", async () => {
+  const stop = keepAlive();
+  try {
+    for (const [label, edit] of [
+      ["an unlinked sibling widget", (o) => { o["1000"].inputs.prompt = "a dog"; }],
+      ["a pure-socket rewire elsewhere", (o) => { o["223"].inputs.images = ["5", 0]; }],
+      ["a node added", (o) => { o["77"] = { class_type: "SaveImage", inputs: {} }; }],
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeMinimaxReconnectFrontend({ apiTarget, alsoEdit: edit });
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", `${label} is still drift`);
+      assert.match(result.error, /graph CHANGED/i, label);
+      assert.equal(server.calls.length, 0, `${label}: the edited workflow never left the tab`);
+      assert.doesNotMatch(result.error, /1000 clip/, `${label}: the leftover is no longer blamed`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+test("#1331 integration: hookless RandomNoise seed churn after reconnect is OUR dispatch, a sibling edit is not", async () => {
+  const stop = keepAlive();
+  try {
+    const control = hooklessControl("randomize");
+    const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
+    const stamp = {
+      "16": { class_type: "RandomNoise", inputs: { noise_seed: 111, steps: 20 } },
+      "223": { class_type: "VHS_VideoCombine", inputs: { images: ["16", 0] } },
+    };
+    {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = {
+        graph: { _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }] },
+        graphToPrompt: async () => ({ output: structuredClone(stamp), workflow: {} }),
+        queuePrompt: async (number, _batch, arg) => {
+          const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+          const output = structuredClone(stamp);
+          output["16"].inputs.noise_seed = 999983;
+          await apiTarget.fetchApi(...promptPost(frontendBody({
+            output, number, targets: targets?.length ? targets : null,
+          })));
+          return true;
+        },
+      };
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "dispatched", "hookless seed churn is not a user edit");
+      assert.equal(server.calls.length, 1, "the scoped prompt reached ComfyUI");
+      assert.ok(result.volatileInputs.includes("16 noise_seed"));
+    }
+    {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = {
+        graph: { _nodes: [{ id: 16, widgets: [seed, control, { name: "steps", value: 20 }] }] },
+        graphToPrompt: async () => ({ output: structuredClone(stamp), workflow: {} }),
+        queuePrompt: async (number, _batch, arg) => {
+          const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+          const output = structuredClone(stamp);
+          output["16"].inputs.noise_seed = 999983;
+          output["16"].inputs.steps = 25;
+          await apiTarget.fetchApi(...promptPost(frontendBody({
+            output, number, targets: targets?.length ? targets : null,
+          })));
+          return true;
+        },
+      };
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", "a sibling edit is still drift");
+      assert.match(result.error, /16 steps/);
+      assert.equal(server.calls.length, 0);
     }
   } finally {
     stop();

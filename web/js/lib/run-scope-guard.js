@@ -11,6 +11,11 @@ import { rgthreeQueueTimeSeedInput } from "./scoped-batch-seed.js";
 // the pack (the extra.ue_links record, the io-node ids, the subgraph routing)
 // live in use-everywhere-links.js; this file imports the verdict.
 import { ueQueueTimeLinkPairs } from "./use-everywhere-links.js";
+// #1331 — after reconnect a converted widget's leftover value (clip/vae/model/…)
+// can still churn while the live input is already linked. control_after_generate
+// can also be present by OPTION SHAPE before its beforeQueued hook is re-hung.
+// Both detectors already live in their own modules; this file imports the verdict.
+import { controlAfterGenerateEntries } from "./control-after-generate.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -82,7 +87,9 @@ import { ueQueueTimeLinkPairs } from "./use-everywhere-links.js";
 //    at queue time (beforeQueued hooks: seed widgets re-rolled by their linked
 //    control_after_generate, and the hook widgets themselves; plus prompts
 //    rewritten by an extension's own api.queuePrompt patch, which carry no hook
-//    at all — rgthree's armed Seed node, #1124), which change
+//    at all — rgthree's armed Seed node, #1124; plus leftover values of
+//    link-driven converted widgets that settle from the widget default to the
+//    incoming link after reconnect — MiniMax H3 clip/vae/model, #1331), which change
 //    between any two serializations of the SAME graph by design (#572: the
 //    exclusion must reach the hook's serialized TARGET, not just the
 //    unserialized control the hook hangs on), and (b) inputs whose value the
@@ -404,13 +411,16 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
 /**
  * The "execId inputName" pairs whose values MUTATE AT QUEUE TIME — after our
  * pre-dispatch stamp and before the POST body is built — collected from the live
- * root graph and every nested subgraph. THREE signals, one per mechanism: a
+ * root graph and every nested subgraph. FOUR signals, one per mechanism: a
  * widget-level `beforeQueued` hook (#572), an extension that patches
  * `api.queuePrompt` and rewrites the outgoing prompt directly (rgthree's armed
  * Seed node, #1124 — invisible to any widget scan, matched by node identity),
- * and an extension that materialises virtual links into the prompt at queue
+ * an extension that materialises virtual links into the prompt at queue
  * time (cg-use-everywhere, #1273 — matched by the pack's own `extra.ue_links`
- * record, see ueQueueTimeLinkPairs).
+ * record, see ueQueueTimeLinkPairs), and a leftover widget value whose
+ * SAME-NAMED input is already link-connected (#1331 — after reconnect the
+ * serialized form flips from the stale widget default to the incoming link,
+ * or the leftover filename itself settles, while the canvas is idle).
  * execId is the flattened prompt id: String(node.id) at root, the
  * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
@@ -447,6 +457,32 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * run result's `drift_coverage` note so the caller knows which inputs were not
  * drift-covered for that run.
  */
+/**
+ * Widget names on `node` whose SAME-NAMED input is currently link-connected
+ * (#1331). The leftover widget value is non-semantic: execution reads the
+ * link. A connected input with no matching widget and no convert-to-input
+ * marker is a pure socket and is NOT returned — those stay drift-covered.
+ * Never throws: this runs on the stamp path.
+ */
+function linkDrivenWidgetInputNames(node) {
+  const names = new Set();
+  try {
+    const live = new Set();
+    for (const w of node?.widgets ?? []) {
+      if (w && typeof w.name === "string") live.add(w.name);
+    }
+    for (const input of node?.inputs ?? []) {
+      if (!input || input.link == null) continue;
+      const converted = typeof input.widget?.name === "string" ? input.widget.name : null;
+      if (converted) names.add(converted);
+      else if (typeof input.name === "string" && live.has(input.name)) names.add(input.name);
+    }
+  } catch {
+    /* a malformed node contributes no pairs — fail toward detecting drift */
+  }
+  return names;
+}
+
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
   const seen = new Set();
@@ -497,6 +533,34 @@ export function collectVolatileInputs(rootGraph) {
       // is call another extension's documented queue-time substitution a user edit.
       const rgthreeSeedInput = rgthreeQueueTimeSeedInput(node);
       if (rgthreeSeedInput != null) addPair(execId, rgthreeSeedInput);
+      // #1331 — THE FOURTH VOLATILITY SIGNAL. After a reconnect the frontend
+      // re-materialises converted widgets (clip/vae/model/length/…) while their
+      // SAME-NAMED input is already linked. graphToPrompt then serializes the
+      // leftover widget value on one pass and the incoming link (or a later
+      // leftover) on the next — 100+ `clip`/`vae`/`model` diffs on a large
+      // MiniMax H3 graph, every one of them link-driven, none of them a user
+      // edit. The #1050 single retry still races because serializeValue keeps
+      // settling those leftovers. The value that EXECUTES is the link; the
+      // leftover is non-semantic. Exclude exactly those widget names.
+      //
+      // NARROW BY CONSTRUCTION: a connected input with no matching widget and
+      // no convert-to-input marker (`input.widget`) is a PURE SOCKET and stays
+      // hashed — a rewire of KSampler.model is still drift. A converted widget
+      // (`input.widget.name`, or a live widget whose name matches a linked
+      // input) is the leftover that races.
+      for (const name of linkDrivenWidgetInputNames(node)) addPair(execId, name);
+      // #1331 (b) — after reconnect the stock control_after_generate combo
+      // can be present by OPTION SHAPE before its beforeQueued hook is
+      // re-hung. The hook scan above then finds nothing, and a randomize
+      // RandomNoise seed churns between stamp and dispatch the same way
+      // #572 already excluded when the hook WAS there. The shipped detector
+      // (controlAfterGenerateEntries) is hook-independent; a "fixed" mode
+      // still excludes nothing.
+      for (const entry of controlAfterGenerateEntries(node)) {
+        if (entry.mode === "fixed") continue;
+        addPair(execId, entry.widget);
+        if (entry.control !== entry.widget) addPair(execId, entry.control);
+      }
       if (node.subgraph) walk(node.subgraph, execId);
     }
   };
