@@ -36,7 +36,14 @@ test('a content-unverified open names the fence recovery, and it works', async (
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
     const LG = w.LiteGraph || w.comfyAPI?.litegraph?.LiteGraph
-    ;(app?.canvas?.graph ?? app?.graph).add(LG.createNode('EmptyLatentImage'))
+    const node = LG.createNode('EmptyLatentImage')
+    ;(app?.canvas?.graph ?? app?.graph).add(node)
+    // A NON-DEFAULT value, so the aborted restore below has something to fail to apply.
+    // With the node left at its construction defaults the payload and the post-load canvas
+    // are byte-identical even when configure throws, and the open is PROVEN — correctly,
+    // because nothing was lost. The content verdict this spec guards needs a real loss.
+    const widget = (node.widgets || []).find((x: any) => x.name === 'width')
+    if (widget) widget.value = 1337
   })
   await settleCanvas(page)
 
@@ -45,14 +52,51 @@ test('a content-unverified open names the fence recovery, and it works', async (
     listed.result?.active?.routing_key || listed.result?.active?.key || listed.result?.active?.path
   expect(target, 'an active workflow must be resolvable').toBeTruthy()
 
-  // Reopening the ALREADY-ACTIVE workflow is the CONTENT_UNVERIFIED path.
+  // panel#1283 — ARRANGE THE REAL CONTENT_UNVERIFIED CASE, rather than relying on a
+  // benign repaint difference.
+  //
+  // This spec used to reach CONTENT_UNVERIFIED by simply reopening the already-active
+  // tab: the repaint was not byte-identical and the panel had no way to say why. It has
+  // one now — it watches the restore — so a benign normalization is reported APPLIED with
+  // the fence published, which is the whole of panel#1283/#1285/#1307/#1330 and
+  // comfyui-mcp#1705.
+  //
+  // The verdict this spec guards is unchanged, and it is the case #702 was always about:
+  // a load that ABORTS part-way. `LGraph.configure` runs its node pass with no try/catch,
+  // so one node's `configure` throwing is exactly that shape — the panel records it,
+  // refuses the content, and must still name the fence-exempt recovery. Making a node
+  // throw is therefore a STRONGER arrangement than the old one, not a weaker one: it is
+  // the failure the disclosure exists for.
+  await page.evaluate(() => {
+    const w = window as any
+    const LG = w.LiteGraph || w.comfyAPI?.litegraph?.LiteGraph
+    const proto = LG?.LGraphNode?.prototype
+    const original = proto.configure
+    w.__cmcpRestoreConfigure = () => {
+      proto.configure = original
+      delete w.__cmcpRestoreConfigure
+    }
+    proto.configure = function (info: any) {
+      if (info?.type === 'EmptyLatentImage') throw new Error('pack widgets not built yet')
+      return original.call(this, info)
+    }
+  })
+
+  // Reopening the ALREADY-ACTIVE workflow, with one node's restore throwing, is the
+  // CONTENT_UNVERIFIED path.
   const reopened = await mockBridge.command('workflow_open', { path: target })
+  await page.evaluate(() => (window as any).__cmcpRestoreConfigure?.())
   const text = JSON.stringify(reopened)
   // Precondition: this must be the outcome the issue is about, not some other failure.
   expect(text, 'the reply must be the post-repaint content verdict').toContain(
     'workflow_open RAN, the canvas IS bound to'
   )
   expect(reopened.ok, 'content-unverified is ok:false by design').toBe(false)
+
+  // panel#1283 — and it must name WHAT aborted, so the reader is not left to guess
+  // between a normalization and a node that never got its values.
+  expect(text, 'an aborted restore must be named as such').toContain('DID NOT RUN TO COMPLETION')
+  expect(text, 'and the node that threw must be named').toContain('EmptyLatentImage')
 
   // It must SAY the fence was not refreshed, and name the call that refreshes it.
   // Without this the reply recommends the graph read that is about to be refused.
