@@ -22556,7 +22556,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // from the INNER widget, which clears instance STRING overrides.
             // Snapshot the parent rails before the mutation and write them back
             // after (rail only — never the shared inner widget).
-            const runExecutor = () => executor(msg);
             if (
               visibleMutationTarget?.graph &&
               visibleMutationTarget.rootGraph &&
@@ -22565,10 +22564,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               result = await withPreservedPromotedInstanceWidgets(
                 visibleMutationTarget.rootGraph,
                 visibleMutationTarget.graph,
-                runExecutor,
+                () => executor(msg),
               );
             } else {
-              result = await runExecutor();
+              result = await executor(msg);
             }
             // #1443 — the executor mutated LiteGraph (and outline will agree).
             // Tell the ACTIVE canvas, bump the revision Vue nodes paint from,
