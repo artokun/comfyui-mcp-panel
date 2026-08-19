@@ -197,6 +197,10 @@ import {
   PANEL_SRC as widenSrcForConsts,
   WIDEN_SOCKET_PROOF_TIMEOUT_MS,
   monotonicNow,
+  // #1192 — the command-budget bindings graph_add_node now names. Collected in one place
+  // because three harnesses rebuild that executor and would otherwise each need their own
+  // copy, which is how a harness acquires a stale one.
+  addNodeCommandBudgetDeps,
 } from "./_panel-constants.mjs";
 
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
@@ -266,6 +270,9 @@ function realGraphAddNode(comfy, overrides = {}) {
     monotonicNow,
     NODE_DEFS_FETCH_TIMEOUT_MS,
     withTimeout,
+    // #1192 — same rule, one issue later: the command budget and the constants its steps
+    // draw from are module scope in the real file, so this scope has to name them all.
+    ...addNodeCommandBudgetDeps(),
     ...overrides,
   };
 

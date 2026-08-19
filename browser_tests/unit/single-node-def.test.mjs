@@ -151,10 +151,13 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   // …with the CONSTANT, not a literal. withTimeout treats a non-positive ms as NO bound, so
   // passing 0 here silently restores the hang while every other assertion still holds —
   // verified: that mutation survived until this line existed.
+  // #1192 — …and that constant is now CAPPED by the command's remaining budget, because it
+  // is not the only bound on this path. A timed-out fast path falls through to the
+  // whole-schema fetch, so the two are additive.
   assert.match(
     body,
-    /fetchSingleNodeDef\(class_type[\s\S]{0,120}?NODE_DEFS_FETCH_TIMEOUT_MS/,
-    "the fast path must be bounded by the named constant, not an inline number",
+    /fetchSingleNodeDef\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
+    "the fast path must be bounded by the named constant, capped by the command budget",
   );
   assert.ok(guard > 0, "the registered-type gate must be present");
   assert.ok(call > guard, "…and the single-class fetch must sit INSIDE it");
@@ -163,7 +166,14 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   // bounded call rather than a bare `await api.getNodeDefs()`. What this pins is that the
   // WHOLE-schema fallback still exists behind the gate, which is the safety property; the
   // literal it used to match was incidental to that.
-  assert.match(body, /await boundedGetNodeDefs\(\)/, "the whole-schema fallback must still be there");
+  // #1192 — the fallback now takes the SAME 10s bound `graph_set_widget`'s oracle gives the
+  // identical request, capped by what the command has left. It used to take the default,
+  // which read as agreement with set_widget only by coincidence.
+  assert.match(
+    body,
+    /await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/,
+    "the whole-schema fallback must still be there, bounded by the command budget",
+  );
   assert.match(
     body,
     /NODE_DEFS_NO_ANSWER \? null :/,
@@ -394,39 +404,70 @@ test("#1180: the widen's bound fits INSIDE the registration deadline it runs und
   // DERIVED from that deadline, not picked, so the two cannot drift apart.
   assert.match(
     src,
-    /const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ \d+\)/,
+    /const WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(\s*CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ WIDEN_SOCKET_PROOF_DIVISOR,?\s*\)/,
     "the widen's bound must be derived from the registration deadline",
   );
   // READ the divisor from source. Computing it here makes the test agree with itself
   // rather than with the panel: changing the shipped `/ 2` to `/ 1` — which makes the
   // widen exactly as long as the wait it runs inside — survived until this did.
-  const divisor = Number(
-    (src.match(/WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/) || [])[1],
-  );
+  const divisor = Number((src.match(/const WIDEN_SOCKET_PROOF_DIVISOR = (\d+);/) || [])[1]);
   assert.ok(divisor >= 2, `the widen must get a FRACTION of its caller's deadline, saw /${divisor}`);
   const widen = Math.floor(registration / divisor);
   assert.ok(widen > 0 && widen < registration, `the widen bound must fit inside ${registration}ms, got ${widen}`);
 
+  // #1192 — the SAME fraction, of whatever deadline the wait actually got.
+  //
+  // The pin moved from a constant to a derivation because the constant stopped being the
+  // truth. Under a command budget the registration wait can be a few hundred ms, and a
+  // widen still taking a fixed 2500ms of it is this issue's own defect one level down: a
+  // bound sized against a number its caller no longer has. `widenSocketProofBudget` keeps
+  // the ratio; the ratio is what the paragraph above is actually about.
+  const share = src.slice(
+    src.indexOf("function widenSocketProofBudget("),
+    src.indexOf("\n}", src.indexOf("function widenSocketProofBudget(")),
+  );
+  assert.ok(share.length > 0, "the widen's share of its caller's deadline must be findable");
+  assert.match(
+    share,
+    /whole \/ WIDEN_SOCKET_PROOF_DIVISOR/,
+    "the widen must take the same FRACTION of the deadline it actually runs under",
+  );
+  assert.match(
+    share,
+    /Math\.max\(1,/,
+    "a spent budget must yield 1ms, never a non-positive ms that arms no bound at all",
+  );
+  assert.match(
+    share,
+    /CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS/,
+    "…and a caller that names no deadline must fall back to #580's own",
+  );
+
   // …and the widen must actually use it rather than the generic node-defs bound.
   assert.match(
     src,
-    /boundedGetNodeDefs\(WIDEN_SOCKET_PROOF_TIMEOUT_MS\)/,
-    "the widen must use its own bound, not the 10s single-call one",
+    /widened = await widenSocketProof\(widenSocketProofBudget\(wait\)\)/,
+    "the registration wait must hand the widen its share of the deadline it actually got",
+  );
+  assert.match(
+    src,
+    /boundedGetNodeDefs\(\s*widenMs > 0 \? widenMs : WIDEN_SOCKET_PROOF_TIMEOUT_MS,?\s*\)/,
+    "the widen must use the bound it was handed, not the 10s single-call one",
   );
 });
 
-test("#1180: graph_add_node's bounds are SEQUENTIAL, and their sum is tracked (#1192)", () => {
-  // This test used to assert `single + single + widen < 30000` and pass, which was wrong in
-  // both directions. It omitted the two terms that dominate — the refresh run, paid TWICE
-  // because makeRefreshCoalescer waits for the in-flight run before starting its own, and
-  // the custom-widget registration wait — so it certified an arithmetic the path does not
-  // perform. A budget test that models the wrong composition is worse than none: it reads
-  // as coverage.
+test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
+  // The predecessor of this test asserted the OPPOSITE — that this path exceeds the budget —
+  // and said so in its own failure message: "If that is genuinely fixed, close #1192 and
+  // replace this with the assertion that it FITS." This is that replacement.
   //
-  // The real worst case EXCEEDS the command budget, and that is filed as #1192 rather than
-  // fixed here. It is not a regression — before this issue these steps were unbounded, so
-  // the same path could hang forever. The purpose of this test is now to stop the sum
-  // GROWING while #1192 is open.
+  // WHAT CHANGED IS NOT THE ARITHMETIC, and that distinction is the whole fix. The
+  // individual bounds are UNCHANGED and their naive sum is still past the relay window. A
+  // fix that made them add up by shrinking each one would have bought the budget with false
+  // refusals on healthy installs — the direction this repo has regressed in before, and the
+  // direction the notes at every one of these constants warn about. What changed is that
+  // they no longer ADD: each is capped by ONE deadline taken at the top of the command, so
+  // the path costs that deadline rather than the sum.
   const src = readFileSync(PANEL_JS, "utf8");
   const num = (re, what) => {
     const m = src.match(re);
@@ -437,51 +478,184 @@ test("#1180: graph_add_node's bounds are SEQUENTIAL, and their sum is tracked (#
   const run = num(/const NODE_DEFS_RUN_BUDGET_MS = (\d+);/, "the refresh run budget");
   const floor = num(/const NODE_DEFS_COMBO_FLOOR_MS = (\d+);/, "the combo phase floor");
   const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/, "the registration deadline");
+  const seed = num(/const OBJECT_INFO_SEED_WAIT_MS = (\d+);/, "the baseline seed wait");
+  const budget = num(/const ADD_NODE_COMMAND_BUDGET_MS = (\d+);/, "the command budget");
 
-  // Two paths, and the branch that skips the fast path is the expensive one.
+  // The relay window this must fit inside. 30000 is what comfyui-mcp's `panel_add_node`
+  // passes as an explicit reply timeout (`OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS`), NOT the
+  // 20000 ui-bridge read default — which applies to neither this command nor refresh_nodes
+  // nor graph_set_widget, all three of which are relayed at 30000. It is NOT read from this
+  // repo, and saying so is more honest than a local mirror: the panel once carried a
+  // BRIDGE_READ_DEFAULT_MS copy that nothing consumed, so the assertion compared the panel
+  // against the panel and could never have caught the drift it appeared to guard.
+  const RELAY_WINDOW_MS = 30000;
+  assert.ok(budget > 0, "the command budget must be a positive number of milliseconds");
+  assert.ok(
+    budget < RELAY_WINDOW_MS,
+    `the command budget (${budget}ms) must fit inside the ${RELAY_WINDOW_MS}ms relay window`,
+  );
+  // …with real slack, not by a millisecond: the reply still has to be composed, serialized
+  // and pushed through the websocket after the last step returns.
+  assert.ok(
+    RELAY_WINDOW_MS - budget >= 5000,
+    `only ${RELAY_WINDOW_MS - budget}ms of slack between the command budget and the relay window`,
+  );
+
+  // The naive sum, still computed, because it is what the cap exists to defeat.
   //
-  // ALREADY REGISTERED: the fast path runs and, on a hang, times out and falls through to
-  // the whole-schema fetch — they compose rather than exclude each other, because a
-  // timeout is doubt and doubt takes the full fetch. No refresh: the type is registered.
-  const registeredPath = single + single + registration;
+  // ALREADY REGISTERED: the seed wait, then the fast path, which on a hang times out and
+  // falls through to the whole-schema fetch — they compose rather than exclude each other,
+  // because a timeout is doubt and doubt takes the full fetch. No refresh: the type is
+  // registered.
+  const registeredPath = seed + single + single + registration;
   // A run's worst-case WAITING is its budget plus the combo floor: #1193 lets a run
   // exceed NODE_DEFS_RUN_BUDGET_MS by up to the floor when a slow-but-successful fetch
   // spent the combo's remainder. That is the accepted cost of the floor, and it is
-  // counted here so this sum stays honest rather than reassuring.
+  // counted here so this sum stays honest rather than reassuring — the command budget caps
+  // what the add PAYS, not what a run inside it may cost.
   const runWait = run + floor;
   // NOT REGISTERED: no fast path (it is gated on already-registered), then the whole-schema
   // fetch, then the resolver hands the payload to refreshComfyNodeDefs — which waits for
-  // any in-flight run and then performs its own, so the run budget is paid twice.
-  const unregisteredPath = single + runWait + runWait + registration;
-  const worstCase = Math.max(registeredPath, unregisteredPath);
-
-  // The widen is INSIDE the registration wait, not added to it — that is what its divisor
-  // is for — so it must not appear as a separate term.
-  const widen = Math.floor(
-    registration /
-      num(
-        /WIDEN_SOCKET_PROOF_TIMEOUT_MS = Math\.floor\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS \/ (\d+)\)/,
-        "the widen divisor",
-      ),
-  );
-  assert.ok(widen < registration, "the widen is spent inside the registration wait, not alongside it");
-
-  // The known ceiling while #1192 is open. Not a target — a ratchet. Raised from
-  // 33000 to 45000 by #1193's combo floor: two serialized runs can now cost
-  // 2 x (budget + floor) in the case the floor exists for, and the issue records that
-  // trade explicitly.
-  const TRACKED_CEILING_MS = 45000;
+  // any in-flight run and then performs its own, so the run wait is paid twice.
+  const unregisteredPath = seed + single + runWait + runWait + registration;
+  const naiveSum = Math.max(registeredPath, unregisteredPath);
+  // The tracked-ceiling ratchet this replaces was scoped "while #1192 is open" and said to
+  // swap in the FITS assertion once the fix landed. This is that assertion: the naive sum
+  // must STILL exceed the budget (the bounds were capped, not shrunk — a sum under the
+  // budget would mean the cap is decorative and the shrink bought it with false refusals),
+  // and the assertions below pin that the cap is wired at every step.
   assert.ok(
-    worstCase <= TRACKED_CEILING_MS,
-    `one add's serialized bounds now sum to ${worstCase}ms, above the ${TRACKED_CEILING_MS}ms tracked while #1192 is open — ` +
-      "raising a bound on this path makes an already-over-budget command worse",
+    naiveSum > budget,
+    `the per-step bounds sum to ${naiveSum}ms, which no longer exceeds the ${budget}ms budget — ` +
+      "if that is because the bounds were SHRUNK rather than capped, the cap has become " +
+      "decorative and the shrink bought the budget with false refusals on healthy installs. " +
+      "Re-read the notes at each constant before changing this.",
   );
-  // …and the fact that it is over budget is stated, so nobody reads the pass above as fine.
-  const COMMAND_BUDGET_MS = 30000;
+
+  // No SINGLE step may be given more than the whole command. A step that could is one that
+  // reaches the relay window on its own, which is the condition this issue is about.
+  for (const [what, ms] of [
+    ["the baseline seed wait", seed],
+    ["the single-call fetch bound", single],
+    ["the refresh run budget", run],
+    // #1193 — a run may exceed its own budget by up to the combo floor, so the worst-case
+    // wait a step can cost is the pair, and the pair is what must fit under the command.
+    ["a refresh run's worst-case wait (budget + combo floor)", runWait],
+    ["the registration deadline", registration],
+  ]) {
+    assert.ok(ms <= budget, `${what} (${ms}ms) is larger than the whole command budget (${budget}ms)`);
+  }
+
+  // ── The cap is WIRED, at every step, read from the shipped source ─────────────
+  //
+  // These are the assertions that fail when the fix is removed. Everything above passes
+  // whether or not a single call site consults the budget.
+  const at = src.indexOf("  async graph_add_node({ class_type, pos, title }) {");
+  assert.ok(at > 0, "graph_add_node must be findable in the panel source");
+  const body = src.slice(at, src.indexOf("\n  async graph_", at + 10));
+
+  // Taken ONCE, before the first step, on the monotonic clock — like every other elapsed
+  // measurement in this panel. On the wall clock an NTP correction mid-command either
+  // refuses an add that did nothing wrong or extends it past the window it exists to fit.
+  assert.match(
+    body,
+    /const budget = makeCommandBudget\(ADD_NODE_COMMAND_BUDGET_MS, monotonicNow\);/,
+    "the command must take ONE deadline, before any step, on the monotonic clock",
+  );
+
+  // Every step draws from it. Named individually rather than counted, so adding a step
+  // cannot silently satisfy a total.
+  const wired = [
+    [/await awaitObjectInfoHistorySeed\(budget\.bounded\(OBJECT_INFO_SEED_WAIT_MS\)\)/, "the baseline seed wait"],
+    [
+      /fetchSingleNodeDef\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
+      "the single-class fast path",
+    ],
+    [/await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/, "the whole-schema fetch"],
+    [/joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS/, "the coalescer join"],
+    [/budget\.bounded\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS\)/, "the custom-widget registration wait"],
+  ];
+  for (const [re, what] of wired) {
+    assert.match(body, re, `${what} must draw its bound from the command budget`);
+  }
+
+  // …and NO step may still name one of those constants raw. This is what catches a bound
+  // added to this path LATER: the failure mode is not that an existing site regresses, it is
+  // that the sixth site nobody thought about is written the way the first five used to be.
+  const stripped = body.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  for (const name of [
+    "OBJECT_INFO_SEED_WAIT_MS",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
+    "CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS",
+  ]) {
+    const total = (stripped.match(new RegExp(name, "g")) ?? []).length;
+    const capped = (stripped.match(new RegExp(`budget\\.bounded\\(${name}\\)`, "g")) ?? []).length;
+    assert.equal(
+      total,
+      capped,
+      `${name} appears ${total} time(s) in graph_add_node but only ${capped} are capped by the command budget`,
+    );
+  }
+
+  // The reserve is DERIVED from the step it protects, not picked, so the two cannot drift.
+  assert.match(
+    src,
+    /const ADD_NODE_POST_REFRESH_RESERVE_MS = CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;/,
+    "the post-refresh reserve must be derived from the wait it holds time back for",
+  );
+
+  // The coalescer's join can only be bounded if the panel WIRED the bounding primitive into
+  // it. A one-line wiring omission is invisible to the coalescer's own unit tests — those
+  // inject their own — and silently restores the unbounded wait this issue is about.
+  const wiredAt = src.indexOf("const refreshComfyNodeDefs = makeRefreshCoalescer({");
+  assert.ok(wiredAt > 0, "the panel's coalescer construction must be findable");
+  const coalescer = src.slice(wiredAt, src.indexOf("});", wiredAt));
+  assert.match(coalescer, /\n\s*withTimeout,/, "the panel's coalescer must be wired with the bounding primitive");
+});
+
+test("#1192: an add that gave up waiting for someone else's refresh says so, and says retry", () => {
+  // The resolver SWALLOWS a refresh throw by design — its post-refresh registry re-check is
+  // what decides go/no-go — so the reason an add ran out of budget cannot reach the user
+  // through the resolver's own wording, which says "the node-def refresh failed — reload the
+  // ComfyUI tab and retry". That advice is wrong here in the expensive direction: the
+  // refresh did NOT fail, it is still running and about to register the very class being
+  // asked for. Same class of defect as #663 and #852 — a refusal naming a remedy that cannot
+  // work costs more than the refusal itself.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = src.indexOf("  async graph_add_node({ class_type, pos, title }) {");
+  const body = src.slice(at, src.indexOf("\n  async graph_", at + 10));
+
+  // Recovered through a FLAG and the live registry — two structured conditions — never by
+  // matching the resolver's prose. Reading a decision off an error message is how this repo
+  // authorizes things it should not.
+  assert.match(
+    body,
+    /if \(outcome === REFRESH_JOIN_ABANDONED\) refreshJoinAbandoned = true;/,
+    "the abandoned join must be recorded as a flag, not inferred from an error string",
+  );
+  assert.match(
+    body,
+    /if \(refreshJoinAbandoned && !isRegisteredNodeType\(LG\?\.registered_node_types \?\? \{\}, class_type\)\)/,
+    "…and re-worded only when the class is ALSO still unregistered — the in-flight run may have landed",
+  );
   assert.ok(
-    worstCase > COMMAND_BUDGET_MS,
-    `#1192 says this path exceeds the ${COMMAND_BUDGET_MS}ms command budget; it now sums to ` +
-      `${worstCase}ms. If that is genuinely fixed, close #1192 and replace this with the ` +
-      "assertion that it FITS.",
+    !/refreshJoinAbandoned[\s\S]{0,300}?err\?*\.message/.test(body),
+    "the budget refusal must never be decided by reading the resolver's message",
+  );
+
+  // The wording itself must state that nothing was added, and that a retry is the remedy.
+  //
+  // Anchored with `\r?\n`, not `\n`. The working tree is CRLF, so a bare `;\n` matches
+  // NOWHERE, `indexOf` returns -1, and `slice(at, -1)` silently hands back most of the file
+  // — which then contains "reload" for a hundred unrelated reasons and the assertion below
+  // fails on correct code. The mirror-image version of that mistake (an anchor that misses
+  // and reads as a caught mutation) is recorded in #1188.
+  const msg = (src.match(/const addNodeRefreshBusyMessage =[\s\S]*?;\r?\n/) || [])[0];
+  assert.ok(msg, "the busy refusal's wording must be findable");
+  assert.match(msg, /NOTHING WAS ADDED/, "the refusal must say the graph was not touched");
+  assert.match(msg, /RETRY/, "…and that a retry is the remedy, because the in-flight run is registering these defs");
+  assert.ok(
+    !/reload/i.test(msg),
+    "…and must NOT send the user to reload the tab, which throws away canvas state for a refresh that is working",
   );
 });
