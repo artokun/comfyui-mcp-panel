@@ -786,3 +786,78 @@ test("#1706 P0: an id whose only change is its TYPE is not a relabeling", () => 
   okLive.subgraphs[1].state = { lastLinkId: 11, lastNodeId: 40 };
   assert.equal(definitionsDifferOnlyByRenumber(payload, okLive, { rootNodes: [] }), true);
 });
+
+test("#1706 P0: a promoted widget id in a NON-CANONICAL dialect still refuses", () => {
+  // Gate finding, and the same class as a string/number key mismatch that made two
+  // tools fail 100% of the time on a real graph tonight. `remappedFrom` is keyed by
+  // `String(payloadId)`, so `"78.0"` / `" 78"` / `"+78"` are all "not in the set" to a
+  // text comparison while naming node 78 to anything that reads the id numerically.
+  // Measured end-to-end by the gate: `definitions` came back ACCOUNTED and the weaker
+  // completed-load ground flipped to normalizedOnly with
+  // `normalizedFields ["properties","widgets_values"]` — reassuring wording over a
+  // genuinely lost promoted widget. The verdict still refused, so no fence was
+  // published, but the sentence was wrong and this closes it.
+  const c = captured();
+  const movedFrom = c.payloadDefinitions.subgraphs[0].nodes[0].id;
+  assert.equal(typeof movedFrom, "number", "the fixture's ids are numeric, as the frontend writes them");
+  for (const dialect of [
+    `${movedFrom}.0`,
+    ` ${movedFrom}`,
+    `+${movedFrom}`,
+    `${movedFrom} `,
+    `0${movedFrom}`,
+    `${movedFrom}.00`,
+    `${movedFrom}abc`, // Number() says NaN; a leading-integer parse says it names the moved node
+    movedFrom, // the number itself, not a string — the schema says string, reality may not
+  ]) {
+    assert.equal(
+      definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, {
+        rootNodes: [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[dialect, "seed"]] } }],
+      }),
+      false,
+      `proxyWidgets id ${JSON.stringify(dialect)} names a relabeled node and must refuse`,
+    );
+  }
+});
+
+test("#1706 a NON-numeric promoted id that names nothing remapped still does not block", () => {
+  // The direction that costs something: the guard must not become "refuse whenever any
+  // root node promotes anything". A promoted widget naming a node the relabeling never
+  // touched is not evidence of loss, and the account stays available.
+  const c = captured();
+  for (const id of ["not-a-node", "999999", " 999999", "999999.0"]) {
+    assert.equal(
+      definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, {
+        rootNodes: [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[id, "seed"]] } }],
+      }),
+      true,
+      `proxyWidgets id ${JSON.stringify(id)} names nothing that moved`,
+    );
+  }
+});
+
+test("#1706 P0: a promoted widget id in HEX or EXPONENT form still refuses", () => {
+  // The two numeric readings are NOT redundant, and mutation is what showed it: with
+  // only the decimal dialects above, deleting the `Number()` clause killed no test,
+  // because a leading-integer parse already caught `"78.0"`, `" 78"`, `"078"`, `"78abc"`.
+  // These two are the inputs where the readings DISAGREE — `Number("0x4E")` is 78 while
+  // a leading-integer parse is 0, and `Number("7.8e1")` is 78 while the parse is 7 — so
+  // each clause is the only thing standing in front of one of them.
+  const c = captured();
+  const movedFrom = c.payloadDefinitions.subgraphs[0].nodes[0].id;
+  const hex = `0x${movedFrom.toString(16)}`;
+  const exponent = `${movedFrom / 10}e1`;
+  assert.equal(Number(hex), movedFrom, "the hex form must really name the moved node");
+  assert.equal(Number(exponent), movedFrom, "the exponent form must really name the moved node");
+  assert.notEqual(Number(/^\s*[+-]?\d+/.exec(hex)[0]), movedFrom, "and the leading-integer parse must NOT");
+  assert.notEqual(Number(/^\s*[+-]?\d+/.exec(exponent)[0]), movedFrom, "likewise");
+  for (const dialect of [hex, exponent]) {
+    assert.equal(
+      definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, {
+        rootNodes: [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[dialect, "seed"]] } }],
+      }),
+      false,
+      `proxyWidgets id ${JSON.stringify(dialect)} names a relabeled node and must refuse`,
+    );
+  }
+});

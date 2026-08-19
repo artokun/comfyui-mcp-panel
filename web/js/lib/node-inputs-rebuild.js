@@ -33,7 +33,7 @@
  * — a slot that disappeared, one that appeared from nowhere, a changed `link`,
  * any other key that moved — returns false, and the caller reads false as NOT
  * PROVEN rather than as "changed". Same contract as
- * `definitionsDifferOnlyByLinkRenumber` (#886), which is the precedent this
+ * `definitionsDifferOnlyByRenumber` (#886, comfyui-mcp#1706), which is the precedent this
  * follows: characterise a specific frontend rewrite, admit exactly that, refuse
  * everything else.
  *
