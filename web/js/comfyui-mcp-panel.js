@@ -317,7 +317,7 @@ import {
   GET_ERRORS_STEP_CAP_MS,
   getErrorsStepBudgetMs,
 } from "./lib/get-errors-budget.js";
-import { boundExecFailurePayload } from "./lib/exec-error-bounds.js";
+import { applyRuntimeExecFailure, boundExecFailurePayload } from "./lib/exec-error-bounds.js";
 import {
   drivenWidgetsFor,
   drivenTag,
@@ -16049,28 +16049,25 @@ const GRAPH_TOOL_EXECUTORS = {
     //    below. `exception_type` is carried because "PIL.UnidentifiedImageError"
     //    explains far more than the message; the traceback is dropped HERE to stay
     //    token-bounded (a capped traceback ships in `last_execution_error`, #664).
+    //
+    //    #1448: correlate against the CURRENT graph by node id AND node type.
+    //    ComfyUI reuses ids across workflows, so an id-only join attached
+    //    workflow A's RCAITKLoadPipeline ModuleNotFoundError to workflow B's
+    //    LoadImage at the same id. A stale/foreign error is omitted from
+    //    per-node reasons, `clean`, and last_execution_error together.
     let execFailure = null;
+    let execFailureDetail = null;
     try {
       let e = lastExecFailure;
       if (!e) {
         const store = getPiniaStore("executi" + "on" + "Error");
         e = store?.["lastExecuti" + "on" + "Error"] ?? null;
       }
-      if (e) {
-        const msg = coerceMessageText(e.exception_message ?? e.message ?? "").trim();
-        execFailure = {
-          node_id: e.node_id ?? null,
-          node_type: e.node_type ?? null,
-          ...(e.exception_type ? { exception_type: e.exception_type } : {}),
-          message: msg || null,
-        };
-        if (e.node_id != null) {
-          addReason(e.node_id, {
-            kind: "execution",
-            ...(e.exception_type ? { exception_type: e.exception_type } : {}),
-            message: msg || null,
-          });
-        }
+      const applied = applyRuntimeExecFailure(e, byId);
+      execFailureDetail = applied.detail;
+      execFailure = applied.failure;
+      if (applied.reason && e?.node_id != null) {
+        addReason(e.node_id, applied.reason);
       }
     } catch {
       /* optional */
@@ -16120,7 +16117,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // node fails on it at queue time whichever kind it is.
     const clean =
       !nodeErrors &&
-      !lastExecFailure &&
+      !execFailure &&
       !erroredNodes.length &&
       !missingModels.length &&
       !missingMedia.length &&
@@ -16210,7 +16207,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // --- backwards-compatible payloads (existing consumers read these) ---
       // Bounded at emission (#664): verbatim, this carried tensor-sized
       // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
-      last_execution_error: boundExecFailurePayload(lastExecFailure),
+      last_execution_error: boundExecFailurePayload(execFailureDetail),
       node_errors: nodeErrors,
       ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
     };

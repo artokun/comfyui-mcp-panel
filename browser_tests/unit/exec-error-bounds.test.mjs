@@ -22,6 +22,8 @@ import {
   EXEC_ERR_EXECUTED_CAP,
   EXEC_ERR_OUTPUTS_JSON_CAP,
   boundExecFailurePayload,
+  executionErrorMatchesCurrentGraph,
+  applyRuntimeExecFailure,
 } from "../../web/js/lib/exec-error-bounds.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -220,14 +222,123 @@ test("current_outputs omission note states the cap is fixed and names no phantom
 // EMITS through them. A revert to the verbatim emission — the exact #664
 // defect — must fail the build, not slip through (a fix on one branch was
 // once silently reverted by a later bulk rewrite; token presence ≠ wiring).
+// #1448: the argument is the correlated detail, not the raw lastExecFailure
+// capture — emitting lastExecFailure here re-joins a stale error by id alone.
 test("graph_get_errors emits the bounded payload and the verbatim emission is gone (#664)", () => {
   assert.match(
     PANEL_SOURCE,
-    /last_execution_error:\s*boundExecFailurePayload\(lastExecFailure\)/,
-    "graph_get_errors must emit lastExecFailure through boundExecFailurePayload",
+    /last_execution_error:\s*boundExecFailurePayload\(execFailureDetail\)/,
+    "graph_get_errors must emit the correlated execFailureDetail through boundExecFailurePayload",
   );
   assert.ok(
     !/last_execution_error:\s*lastExecFailure\b/.test(PANEL_SOURCE),
     "the verbatim `last_execution_error: lastExecFailure` emission must not reappear",
+  );
+  assert.ok(
+    !/last_execution_error:\s*boundExecFailurePayload\(lastExecFailure\)/.test(PANEL_SOURCE),
+    "emitting the raw lastExecFailure capture re-opens #1448 (id-only join across workflows)",
+  );
+});
+
+function nodesById(...nodes) {
+  return new Map(nodes.map((n) => [String(n.id), n]));
+}
+
+test("#1448 reporter: RCAITKLoadPipeline failure is not joined onto LoadImage id 2", () => {
+  // Measured: workflow A failed at node id 2 (RCAITKLoadPipeline,
+  // ModuleNotFoundError: No module named 'src.pipelines'). After switching to
+  // workflow B, node id 2 was LoadImage, and panel_get_errors still attached
+  // that exception to it because correlation was id-only.
+  const e = {
+    node_id: 2,
+    node_type: "RCAITKLoadPipeline",
+    exception_type: "ModuleNotFoundError",
+    exception_message: "No module named 'src.pipelines'",
+  };
+  const byId = nodesById({ id: 2, type: "LoadImage" });
+  const applied = applyRuntimeExecFailure(e, byId);
+  assert.equal(applied.detail, null, "last_execution_error must omit the foreign failure");
+  assert.equal(applied.failure, null, "clean must not be dirtied by the foreign failure");
+  assert.equal(applied.reason, null, "LoadImage must not receive an execution reason");
+  assert.equal(boundExecFailurePayload(applied.detail), null);
+  assert.equal(executionErrorMatchesCurrentGraph(e, byId), false);
+});
+
+test("#1448 a matching id AND type still reports the runtime failure", () => {
+  const e = {
+    node_id: 2,
+    node_type: "RCAITKLoadPipeline",
+    exception_type: "ModuleNotFoundError",
+    exception_message: "No module named 'src.pipelines'",
+  };
+  const byId = nodesById({ id: 2, type: "RCAITKLoadPipeline" });
+  const applied = applyRuntimeExecFailure(e, byId);
+  assert.equal(applied.detail, e);
+  assert.equal(applied.failure.node_id, 2);
+  assert.equal(applied.failure.node_type, "RCAITKLoadPipeline");
+  assert.equal(applied.failure.exception_type, "ModuleNotFoundError");
+  assert.equal(applied.failure.message, "No module named 'src.pipelines'");
+  assert.deepEqual(applied.reason, {
+    kind: "execution",
+    exception_type: "ModuleNotFoundError",
+    message: "No module named 'src.pipelines'",
+  });
+  const payload = boundExecFailurePayload(applied.detail);
+  assert.equal(payload.node_id, 2);
+  assert.equal(payload.node_type, "RCAITKLoadPipeline");
+});
+
+test("#1448 a reused id whose current node is absent from the viewed graph is omitted", () => {
+  const e = { node_id: 2, node_type: "RCAITKLoadPipeline", exception_message: "gone" };
+  const applied = applyRuntimeExecFailure(e, nodesById({ id: 9, type: "LoadImage" }));
+  assert.equal(applied.detail, null);
+  assert.equal(applied.reason, null);
+});
+
+test("#1448 missing type information fails OPEN so a genuine failure is not swallowed", () => {
+  const noErrorType = applyRuntimeExecFailure(
+    { node_id: 2, exception_message: "boom" },
+    nodesById({ id: 2, type: "LoadImage" }),
+  );
+  assert.equal(noErrorType.failure.node_id, 2);
+  assert.equal(noErrorType.reason.kind, "execution");
+
+  const noNodeType = applyRuntimeExecFailure(
+    { node_id: 2, node_type: "LoadImage", exception_message: "boom" },
+    nodesById({ id: 2 }),
+  );
+  assert.equal(noNodeType.failure.node_id, 2);
+});
+
+test("#1448 comfyClass is the type that execution_error.node_type names", () => {
+  const e = { node_id: 2, node_type: "LoadImage", exception_message: "bad image" };
+  const applied = applyRuntimeExecFailure(e, nodesById({ id: 2, type: "Load Image", comfyClass: "LoadImage" }));
+  assert.equal(applied.detail, e);
+  const mismatch = applyRuntimeExecFailure(e, nodesById({ id: 2, type: "LoadImage", comfyClass: "RCAITKLoadPipeline" }));
+  assert.equal(mismatch.detail, null);
+});
+
+test("#1448 a node-id-less failure stays graph-level — there is no node to mis-blame", () => {
+  const e = { exception_type: "RuntimeError", exception_message: "prompt failed" };
+  const applied = applyRuntimeExecFailure(e, nodesById({ id: 2, type: "LoadImage" }));
+  assert.equal(applied.detail, e);
+  assert.equal(applied.reason, null);
+  assert.equal(applied.failure.node_id, null);
+});
+
+test("graph_get_errors correlates runtime failures through applyRuntimeExecFailure (#1448)", () => {
+  assert.match(
+    PANEL_SOURCE,
+    /applyRuntimeExecFailure\(e,\s*byId\)/,
+    "graph_get_errors must correlate the captured error against the current graph's node map",
+  );
+  assert.match(
+    PANEL_SOURCE,
+    /const clean =\s*!nodeErrors &&\s*!execFailure &&/,
+    "clean must follow the correlated execFailure, not the raw lastExecFailure capture",
+  );
+  assert.ok(
+    !/const clean =\s*!nodeErrors &&\s*!lastExecFailure &&/.test(PANEL_SOURCE),
+    "clean must not be dirtied by a stale lastExecFailure from another workflow",
   );
 });
