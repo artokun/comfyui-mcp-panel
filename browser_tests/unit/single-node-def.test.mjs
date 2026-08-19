@@ -583,11 +583,23 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
     ],
     [/await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/, "the whole-schema fetch"],
     [/joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS/, "the coalescer join"],
+    // #1351 — …and the caller's OWN run, the term the join bound never reached. Both
+    // refresh call sites (the resolver's and the #1242 drift recovery's) must carry it:
+    // runMs is measured from the call inside the coalescer, so handing it the same
+    // remaining budget as joinMs bounds the TOTAL wait rather than doubling it.
+    [/runMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS/, "the coalescer's own-run wait"],
     [/budget\.bounded\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS\)/, "the custom-widget registration wait"],
   ];
   for (const [re, what] of wired) {
     assert.match(body, re, `${what} must draw its bound from the command budget`);
   }
+  // Both refresh call sites, not one: a site pinned by a single match would silently
+  // satisfy the assertion above while the other waited unbounded.
+  assert.equal(
+    (body.match(/runMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS/g) ?? []).length,
+    2,
+    "runMs must be wired at BOTH refresh call sites (the resolver's and the drift recovery's)",
+  );
 
   // …and NO step may still name one of those constants raw. This is what catches a bound
   // added to this path LATER: the failure mode is not that an existing site regresses, it is
@@ -621,6 +633,9 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   assert.ok(wiredAt > 0, "the panel's coalescer construction must be findable");
   const coalescer = src.slice(wiredAt, src.indexOf("});", wiredAt));
   assert.match(coalescer, /\n\s*withTimeout,/, "the panel's coalescer must be wired with the bounding primitive");
+  // #1351 — and with the monotonic clock runMs is measured on. Same failure shape as the
+  // withTimeout wiring: an omission here degrades the bound silently, so it is pinned.
+  assert.match(coalescer, /\n\s*now: monotonicNow,/, "the panel's coalescer must be wired with the monotonic clock");
 });
 
 test("#1192: an add that gave up waiting for someone else's refresh says so, and says retry", () => {
@@ -664,6 +679,56 @@ test("#1192: an add that gave up waiting for someone else's refresh says so, and
   assert.ok(msg, "the busy refusal's wording must be findable");
   assert.match(msg, /NOTHING WAS ADDED/, "the refusal must say the graph was not touched");
   assert.match(msg, /RETRY/, "…and that a retry is the remedy, because the in-flight run is registering these defs");
+  assert.ok(
+    !/reload/i.test(msg),
+    "…and must NOT send the user to reload the tab, which throws away canvas state for a refresh that is working",
+  );
+});
+
+test("#1351: an add that gave up waiting for its OWN refresh run says so, and says retry", () => {
+  // The mirror of the #1192 pins above, for the bound that issue never reached: a bounded
+  // join that SUCCEEDS is followed by the caller's own run, whose deliberately-unbounded
+  // local work summed with the join past the relay window. The abandoned own run is the
+  // friendlier case — the payload was NOT dropped, it is registering in the coalescer's
+  // slot — so it gets its own flag and its own wording, and both are pinned here.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = src.indexOf("  async graph_add_node({ class_type, pos, title }) {");
+  const body = src.slice(at, src.indexOf("\n  async graph_", at + 10));
+
+  assert.match(
+    body,
+    /if \(outcome === REFRESH_RUN_ABANDONED\) refreshRunAbandoned = true;/,
+    "the abandoned own run must be recorded as a flag, not inferred from an error string",
+  );
+  assert.match(
+    body,
+    /if \(refreshRunAbandoned && !isRegisteredNodeType\(LG\?\.registered_node_types \?\? \{\}, class_type\)\)/,
+    "…and re-worded only when the class is ALSO still unregistered — the add's own run may have landed",
+  );
+  assert.ok(
+    !/refreshRunAbandoned[\s\S]{0,300}?err\?*\.message/.test(body),
+    "the budget refusal must never be decided by reading the resolver's message",
+  );
+  // The #1242 drift recovery meets the sentinel on the coalescer's LEADING edge (no run in
+  // flight), where joinMs has nothing to bound — it must name that outcome too, not fall
+  // through to the generic branch's "unknown".
+  assert.match(
+    body,
+    /verdict === REFRESH_RUN_ABANDONED/,
+    "the drift-recovery refresh must name an abandoned own run, not report it as 'unknown'",
+  );
+
+  // The wording itself: same rules as the busy message — nothing was added, retry is the
+  // remedy, and never "reload the tab". Anchored with `\r?\n` for the CRLF reason above.
+  const msg = (src.match(/const addNodeRefreshSlowMessage =[\s\S]*?;\r?\n/) || [])[0];
+  assert.ok(msg, "the own-run refusal's wording must be findable");
+  assert.match(msg, /NOTHING WAS ADDED/, "the refusal must say the graph was not touched");
+  assert.match(msg, /RETRY/, "…and that a retry is the remedy, because the run is registering these defs");
+  assert.match(
+    msg,
+    /still running/,
+    "…and must say the refresh is STILL RUNNING — the payload was not dropped, unlike the join case",
+  );
   assert.ok(
     !/reload/i.test(msg),
     "…and must NOT send the user to reload the tab, which throws away canvas state for a refresh that is working",

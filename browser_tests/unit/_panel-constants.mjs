@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
-import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { REFRESH_JOIN_ABANDONED, REFRESH_RUN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 
 export const PANEL_SRC = readFileSync(
@@ -139,12 +139,19 @@ export function addNodeCommandBudgetDeps() {
     ADD_NODE_POST_REFRESH_RESERVE_MS: CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
     OBJECT_INFO_SEED_WAIT_MS,
     REFRESH_JOIN_ABANDONED,
+    // #1351 — the second sentinel, returned when the caller stopped waiting for its OWN
+    // run. Reached only when a harness's refresh stub resolves it; the real coalescer's
+    // behaviour is exercised in refresh-coalesce.test.mjs.
+    REFRESH_RUN_ABANDONED,
     widenSocketProofBudget,
     // A STUB, and labelled as one. These three harnesses are about #821/#1223/#620, none of
     // which reaches this branch. The shipped wording is pinned in single-node-def.test.mjs
     // and the behaviour that produces it is exercised in add-node-command-budget.test.mjs;
     // a hand-copied sentence here would just be a third place for it to drift.
     addNodeRefreshBusyMessage: (classType) =>
+      `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
+    // #1351 — the own-run refusal, a stub for the same reason as the busy message above.
+    addNodeRefreshSlowMessage: (classType) =>
       `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
   };
 }

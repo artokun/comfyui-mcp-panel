@@ -288,9 +288,15 @@ test("#1242: the reporter's add succeeds in one call — the panel refreshes fir
     Number.isFinite(refreshCalls[0].opts.joinMs) && refreshCalls[0].opts.joinMs > 0,
     "the drift recovery's wait must be bounded by what the command has left",
   );
+  // #1351 — and the run the recovery STARTS (the coalescer's leading edge, where joinMs
+  // has nothing to bound) is bounded by the same remaining budget.
+  assert.ok(
+    Number.isFinite(refreshCalls[0].opts.runMs) && refreshCalls[0].opts.runMs > 0,
+    "the drift recovery's OWN run must be bounded too — the term #1351 is about",
+  );
   assert.deepEqual(
     Object.keys(refreshCalls[0].opts).sort(),
-    ["force", "joinMs"],
+    ["force", "joinMs", "runMs"],
     "…and nothing else is passed",
   );
 });

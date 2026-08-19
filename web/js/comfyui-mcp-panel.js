@@ -241,7 +241,7 @@ import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
-import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
+import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED, REFRESH_RUN_ABANDONED } from "./lib/refresh-coalesce.js";
 import {
   describeNodeDefRefresh,
   describeRefreshGraphLoss,
@@ -1859,6 +1859,10 @@ const refreshComfyNodeDefs = makeRefreshCoalescer({
   // Safe is not the same as noticed, though: dropping it silently restores #1192, so the
   // CALL SITE is pinned by a test, not just the helper's behaviour.
   withTimeout,
+  // #1351 — the monotonic clock `opts.runMs` is measured on (the join's cost is subtracted
+  // from the run's allowance, so the two cannot sum to twice the caller's budget). Same
+  // wiring rule as withTimeout: omitting it degrades silently, so the test pins this too.
+  now: monotonicNow,
 });
 
 // #396: download ids already counted as done, so each COMPLETED model download
@@ -10365,6 +10369,25 @@ const addNodeRefreshBusyMessage = (classType) =>
   "happening, call panel_refresh_nodes once and wait for it to report, then retry the add.";
 
 /**
+ * #1351 — the refusal for an add whose budget went on the refresh THIS add started.
+ *
+ * Different cause from `addNodeRefreshBusyMessage`, and the wording must say so: nothing
+ * ELSE was running — this command's own run outlived what was left of its budget (the
+ * join ahead of it had already spent most of the window). The payload was NOT dropped:
+ * the run is in the coalescer's slot registering it now, so the retry is again the normal
+ * outcome rather than a hope. No "reload the tab" here either, for the same reason #1192
+ * gives: the refresh did not fail, and a reload throws away canvas state for nothing.
+ */
+const addNodeRefreshSlowMessage = (classType) =>
+  `Cannot add "${classType}" right now: this command started a node-def refresh to register ` +
+  "the class, and that refresh did not finish within what was left of this command's " +
+  `${Math.round(ADD_NODE_COMMAND_BUDGET_MS / 1000)}s budget. NOTHING WAS ADDED and nothing was ` +
+  "changed. The refresh is still running in the background and is registering exactly the " +
+  "definitions this add needs, so RETRY in a few seconds — this normally succeeds on the " +
+  "next attempt. If it keeps happening, call panel_refresh_nodes once and wait for it to " +
+  "report, then retry the add.";
+
+/**
  * #1180 — the widen runs INSIDE the registration wait above, so its bound has to fit
  * there. The generic 10s node-defs bound is TWICE this function's whole 5s deadline: a
  * timed-out widen would consume the entire wait and leave the poll loop nothing, so the
@@ -12191,6 +12214,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // reason never reaches the resolver's own wording, and matching on that wording to
     // recover it would be exactly the prose-parsing this repo refuses to authorize on.
     let refreshJoinAbandoned = false;
+    // #1351 — the run THIS add started is a wait too, and the one `refreshJoinAbandoned`
+    // never saw: a bounded join that SUCCEEDS is followed by the caller's own run, whose
+    // deliberately-unbounded local work (registerNodesFromDefs) sat outside every bound on
+    // this path. Set when this add stopped waiting for its own run; the run is still in
+    // the coalescer's slot registering this add's payload, which the retry then finds.
+    let refreshRunAbandoned = false;
     // A thunk rather than a bare `await`, so the call below can sit inside a try/catch
     // without re-indenting seventy lines of load-bearing comments in this file.
     const resolveAddNode = () =>
@@ -12276,11 +12305,20 @@ const GRAPH_TOOL_EXECUTORS = {
       // it a join finishing at the wire leaves the widget-registration wait milliseconds,
       // and the add then refuses by naming a widget that was never given time to appear —
       // a true statement about the wrong cause.
+      //
+      // #1351 — and the run that FOLLOWS a successful join is bounded by the same
+      // allowance, not by a second one. `runMs` is measured from this call's start inside
+      // the coalescer, so a join that lands at its bound leaves the run nothing and the
+      // two cannot sum to twice what is left. An abandoned OWN run is the friendlier case:
+      // the payload was not dropped — it is registering in the background right now — so
+      // the refusal below (`addNodeRefreshSlowMessage`) can say the retry finds it done.
       refresh: (defs) =>
         refreshComfyNodeDefs(defs, {
           joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
+          runMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
         }).then((outcome) => {
           if (outcome === REFRESH_JOIN_ABANDONED) refreshJoinAbandoned = true;
+          if (outcome === REFRESH_RUN_ABANDONED) refreshRunAbandoned = true;
           return outcome;
         }),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
@@ -12306,6 +12344,13 @@ const GRAPH_TOOL_EXECUTORS = {
       // the resolver returned successfully and this branch is not reached at all.
       if (refreshJoinAbandoned && !isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
         throw new Error(addNodeRefreshBusyMessage(class_type));
+      }
+      // #1351 — the same recovery for the run THIS add started. Kept a separate flag and a
+      // separate message because the cause is different: nothing else was running — this
+      // add's own refresh outlived the budget — and the payload is registering now, not
+      // dropped. Same registry re-check: the run may have landed while we gave up.
+      if (refreshRunAbandoned && !isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
+        throw new Error(addNodeRefreshSlowMessage(class_type));
       }
       throw err;
     }
@@ -12367,9 +12412,15 @@ const GRAPH_TOOL_EXECUTORS = {
         //
         // Same allowance as the resolver's join, and the same reserve held back, so a
         // drift recovery cannot eat the window the widget-registration wait still needs.
+        //
+        // #1351 — `runMs` covers the case the join never sees: NO run in flight, so the
+        // forced call is the coalescer's LEADING edge and starts its own run at once. That
+        // run's deliberately-unbounded local work sat outside the command budget exactly
+        // as it did on the resolver's path above.
         const verdict = await refreshComfyNodeDefs(undefined, {
           force: true,
           joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
+          runMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
         });
         if (verdict === REFRESH_JOIN_ABANDONED) {
           // A NAMED reason, not the "unknown" the generic branch below produces for a
@@ -12381,6 +12432,13 @@ const GRAPH_TOOL_EXECUTORS = {
           schemaRefreshIncompleteReason =
             "a node-def refresh started by something else was still running, and this " +
             "command's time budget ran out waiting for it — nothing failed, so retry";
+        } else if (verdict === REFRESH_RUN_ABANDONED) {
+          // #1351 — the leading-edge case: this command's OWN forced run is the one still
+          // running. Same rule as the join case — name it, say nothing failed, say retry.
+          schemaRefreshIncompleteReason =
+            "the node-def refresh this command started did not finish within this " +
+            "command's time budget — it is still running and still registering the " +
+            "schema this add wants, so retry";
         } else if (
           !(verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true))
         ) {

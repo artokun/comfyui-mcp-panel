@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED, REFRESH_RUN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 // #1192 — the REAL bounding primitive, so `opts.joinMs` is exercised rather than stubbed.
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
@@ -413,4 +413,197 @@ test("#1192: a bounded FORCED join that lands still forwards the trailing run's 
   gate.resolve();
   await inflight;
   assert.equal(await forced, true, "the trailing run's own verdict, not a stand-in");
+});
+
+// ── #1351: the caller's OWN run is a wait too, and runMs bounds it ──────────
+//
+// #1192 bounded the JOIN — the wait on a run someone else started. A join that SUCCEEDS is
+// where the unbounded term began: the caller's own run then costs the run budget's bounded
+// waiting PLUS the deliberately-unbounded registerNodesFromDefs local work, and the two
+// summed past the 30,000 ms relay window. `opts.runMs` bounds the wait on the caller's own
+// run, measured from the CALL so the join's cost is subtracted from it rather than added.
+
+test("#1351: an own run that outlives runMs is ABANDONED — but the run is NOT dropped", async () => {
+  // The shape the issue measured: the join succeeded, the caller's own run is the slow one.
+  // The caller must stop waiting AND the payload must still be registered — the slot is
+  // free once the join settles, so starting the run stampedes nothing, and the caller's
+  // retry is meant to find the class registered.
+  const { coalescer, registered, getInFlight } = makeHarness(
+    () => new Promise((r) => setTimeout(r, 200)), // the caller's own run is slow
+  );
+  const NEW_DEFS = { NewNode: {} };
+  const started = Date.now();
+
+  const outcome = await coalescer(NEW_DEFS, { runMs: 25 });
+
+  assert.equal(outcome, REFRESH_RUN_ABANDONED, "the caller stopped waiting and said so");
+  assert.ok(Date.now() - started < 1000, "…at the bound, not when the run eventually finishes");
+  assert.ok(getInFlight(), "the run is STILL IN THE SLOT — the payload was not dropped");
+
+  // The run completes in the background and registers the payload for the retry.
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(registered, [NEW_DEFS], "the abandoned run still registered the payload");
+  assert.equal(getInFlight(), null, "…and cleared the slot when it settled");
+});
+
+test("#1351: an own run that lands INSIDE runMs resolves to the run's own value", async () => {
+  // The bound must not become a way to lose verdicts on a healthy machine: a run that
+  // finishes in time resolves exactly as the unbounded path does.
+  const { coalescer } = makeHarnessReturning(() => true);
+  const NEW_DEFS = { NewNode: {} };
+  assert.equal(await coalescer(NEW_DEFS, { runMs: 5000 }), true, "the run's verdict, not a stand-in");
+});
+
+test("#1351: the JOIN's cost is SUBTRACTED from runMs — the two cannot sum to twice it", async () => {
+  // The composition the issue is about: joinMs and runMs handed the same remaining budget
+  // must not add up. Here the join takes ~60ms of a 100ms runMs, so the caller's own run
+  // gets only what is left (~40ms) and is abandoned — a runMs measured from the run's
+  // start would have let it wait the full 100ms on top.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) {
+      // The in-flight run someone else started: settles after ~60ms.
+      await new Promise((r) => setTimeout(r, 60));
+      return;
+    }
+    await gate.promise; // the caller's own run never lands within the test
+  });
+
+  const older = coalescer(); // in flight for ~60ms
+  const NEW_DEFS = { NewNode: {} };
+  const started = Date.now();
+  const outcome = await coalescer(NEW_DEFS, { joinMs: 5000, runMs: 100 });
+
+  assert.equal(outcome, REFRESH_RUN_ABANDONED, "the leftover after the join was not enough for the run");
+  const waited = Date.now() - started;
+  assert.ok(waited < 150, `total wait (${waited}ms) tracked runMs from the CALL, not joinMs + runMs`);
+  assert.ok(waited >= 55, "…and the join really did consume most of it first");
+
+  gate.resolve();
+  await older;
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(registered.includes(NEW_DEFS), "the payload still registered once the run settled");
+});
+
+test("#1351: a runMs of 0 or less starts the run but does not WAIT for it", async () => {
+  // graph_add_node computes runMs by subtraction and can legitimately reach a negative.
+  // `withTimeout` reads a non-positive ms as NO BOUND, so a spent budget expressed
+  // literally would restore the unbounded wait at exactly the moment it ran out — the
+  // #1188 trap, arriving through the run this time. The run still STARTS: the slot is
+  // free and the payload must not be dropped; only the wait is abandoned.
+  const { coalescer, registered } = makeHarness(() => new Promise((r) => setTimeout(r, 50)));
+
+  for (const runMs of [0, -1, -20000]) {
+    assert.equal(
+      await coalescer({ [`N${runMs}`]: {} }, { runMs }),
+      REFRESH_RUN_ABANDONED,
+      `runMs=${runMs} must abandon the wait at once, not wait forever`,
+    );
+    // Let this run settle before the next call, so each iteration meets the LEADING edge
+    // rather than joining the previous still-running one.
+    await new Promise((r) => setTimeout(r, 80));
+  }
+  assert.equal(registered.length, 3, "…and every one of those runs still started");
+});
+
+test("#1351: an own run that REJECTS inside runMs still rejects for its caller", async () => {
+  // A bound on the WAIT must not quietly turn a failed run into a success — only the
+  // abandonment is new. The run's rejection has always propagated (`return startRun(...)`
+  // did), and it still does.
+  const { coalescer } = makeHarness(async () => {
+    throw new Error("registerNodesFromDefs blew up");
+  });
+  await assert.rejects(coalescer({ A: {} }, { runMs: 5000 }), /blew up/);
+});
+
+test("#1351: an abandoned own run that LATER rejects does not go unhandled", async () => {
+  // The caller has stopped listening by the time this run fails. Without the coalescer's
+  // own catch that failure would be an unhandled rejection — which the node test runner
+  // turns into a failure of THIS test, so a green run here is the assertion.
+  let fail;
+  const { coalescer } = makeHarness(
+    () =>
+      new Promise((_, reject) => {
+        fail = reject;
+      }),
+  );
+  assert.equal(await coalescer({ A: {} }, { runMs: 25 }), REFRESH_RUN_ABANDONED);
+  fail(new Error("the abandoned run failed after the caller left"));
+  await new Promise((r) => setTimeout(r, 50));
+});
+
+test("#1351: a run that outlives runMs while a JOIN was abandoned never starts (stampede rule intact)", async () => {
+  // runMs also caps the JOIN (it bounds the call's TOTAL waiting). When the join is what
+  // runs out, the answer is still REFRESH_JOIN_ABANDONED and still NO run is started —
+  // the in-flight run holds the slot, and starting a second registerNodesFromDefs next to
+  // it is the stampede this coordinator exists to prevent.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await gate.promise;
+  });
+
+  const older = coalescer(); // holds the slot, gated open
+  const outcome = await coalescer({ NewNode: {} }, { runMs: 25 }); // no joinMs — runMs alone caps the join
+
+  assert.equal(outcome, REFRESH_JOIN_ABANDONED, "a total bound spent on the join is a join abandonment");
+  assert.deepEqual(registered, [undefined], "no competing run was started");
+
+  gate.resolve();
+  await older;
+});
+
+test("#1351: a coalescer with NO withTimeout wired ignores runMs, exactly as it does joinMs", async () => {
+  // The safe direction for a wiring mistake to fail in: an unwired panel keeps today's
+  // unbounded wait rather than abandoning every run at once.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(
+    async () => {
+      await gate.promise;
+    },
+    { wireTimeout: false },
+  );
+
+  const pending = coalescer({ A: {} }, { runMs: 10 });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.ok(registered.length === 1, "the run started…");
+
+  gate.resolve();
+  assert.notEqual(await pending, REFRESH_RUN_ABANDONED, "…and the wait was unbounded, as before");
+});
+
+test("#1351: a non-finite runMs is treated as NO bound, never as an armed one", async () => {
+  // Same guard as joinMs: a caller computing runMs from an unset budget can produce
+  // Infinity or NaN, and both must not silently arm (or silently fire) the bound.
+  const gate = deferred();
+  const { coalescer } = makeHarness(async () => {
+    await gate.promise;
+  });
+
+  const pending = [
+    coalescer({ A: {} }, { runMs: Number.POSITIVE_INFINITY }),
+    coalescer({ B: {} }, { runMs: Number.NaN }),
+  ];
+  await new Promise((r) => setTimeout(r, 40));
+
+  gate.resolve();
+  for (const p of pending) assert.notEqual(await p, REFRESH_RUN_ABANDONED);
+});
+
+test("#1351: a bounded FORCED caller on the LEADING edge stops waiting for its own run too", async () => {
+  // The #1242 drift recovery calls force:true with NO refresh necessarily in flight, so it
+  // lands here — the leading edge — where joinMs has nothing to bound. runMs is the bound
+  // that reaches it, and the forced run still happens for everyone else.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async () => {
+    await gate.promise;
+  });
+
+  const started = Date.now();
+  const outcome = await coalescer(undefined, { force: true, runMs: 25 });
+  assert.equal(outcome, REFRESH_RUN_ABANDONED, "the forced caller's wait on its own run is bounded");
+  assert.ok(Date.now() - started < 1000, "…at the bound");
+  assert.equal(registered.length, 1, "the forced run still started — only the wait ended");
+
+  gate.resolve();
+  await new Promise((r) => setTimeout(r, 20));
 });

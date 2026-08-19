@@ -108,8 +108,10 @@ test("#1242: the add runs the refresh itself, then re-checks, BEFORE the refusal
   // rather than one spelling of it. STRONGER than the literal it replaces: it pins that the
   // drift recovery is forced AND that its wait draws from the command budget, which is the
   // property #1192 needs and the literal could not express.
+  // #1351 — and its OWN run is bounded too (`runMs`), the term joinMs never reached; the
+  // shape now spans both options.
   const forced = between.match(
-    /refreshComfyNodeDefs\(undefined, \{\s*force: true,\s*joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,\s*\}\)/,
+    /refreshComfyNodeDefs\(undefined, \{\s*force: true,\s*joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,\s*runMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,\s*\}\)/,
   );
   assert.ok(
     forced,

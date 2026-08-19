@@ -22,7 +22,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
-import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED, REFRESH_RUN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import {
   applyCurrentDefWidgetValues,
@@ -78,6 +78,16 @@ const addNodeRefreshBusyMessage = new Function(
   "ADD_NODE_COMMAND_BUDGET_MS",
   `${busyMatch[0]}
    return addNodeRefreshBusyMessage;`,
+)(25000);
+
+// #1351 — the own-run refusal, built from source for the same reason: the harness must not
+// be able to pass against a paraphrase of the wording the panel actually ships.
+const slowMatch = panelSrc.match(/const addNodeRefreshSlowMessage = [\s\S]*?;\r?\n/);
+assert.ok(slowMatch, "could not locate addNodeRefreshSlowMessage in panel source");
+const addNodeRefreshSlowMessage = new Function(
+  "ADD_NODE_COMMAND_BUDGET_MS",
+  `${slowMatch[0]}
+   return addNodeRefreshSlowMessage;`,
 )(25000);
 
 /** A tiny deferred so a test can hold the in-flight refresh open until it chooses. */
@@ -163,6 +173,13 @@ function realGraphAddNode({
   // null for "no refresh is in flight". Held open, it is the reported scenario: a ComfyUI
   // restart, whose reconnect refresh is still running when the add arrives.
   holdInFlight = null,
+  // #1351 — what the HELD (payload-less) run registers when it lands, or null for the live
+  // backend schema. A refresh whose fetch PREDATES the install registers a stale schema —
+  // which is exactly why the add still needs its own payload run after joining it (#289).
+  inFlightSchema = null,
+  // #1351 — how long the add's OWN run (the payload one, after the join) takes. The
+  // deliberately-unbounded local work, registerNodesFromDefs, modelled as a delay.
+  ownRunMs = 0,
   budgetMs = 400,
   reserveMs = 120,
   registrationMs = 200,
@@ -195,10 +212,16 @@ function realGraphAddNode({
       runs.push(defs);
       // The reconnect run — the one with no payload — is the one a test can hold open.
       if (defs == null && holdInFlight) await holdInFlight;
-      app.registerNodesFromDefs(defs ?? (await api.getNodeDefs()));
+      // #1351 — the caller's OWN (payload) run can be made slow: the unbounded local work
+      // that sat outside the join's bound.
+      if (defs != null && ownRunMs) await sleep(ownRunMs);
+      app.registerNodesFromDefs(defs ?? inFlightSchema ?? (await api.getNodeDefs()));
       return true;
     },
     withTimeout,
+    // #1351 — the same clock the panel wires, so the harness measures runMs exactly as the
+    // shipped coalescer does.
+    now: monotonicNow,
   });
   // A refresh someone else started — a websocket reconnect, a finished install — already
   // holding the slot when the add arrives.
@@ -237,7 +260,9 @@ function realGraphAddNode({
     withTimeout,
     makeCommandBudget,
     REFRESH_JOIN_ABANDONED,
+    REFRESH_RUN_ABANDONED,
     addNodeRefreshBusyMessage,
+    addNodeRefreshSlowMessage,
     clearInheritedExecutionPreview,
     OBJECT_INFO_SEED_WAIT_MS: 8000,
     ADD_NODE_COMMAND_BUDGET_MS: budgetMs,
@@ -341,6 +366,61 @@ test("#1192: the abandoned add does NOT start a competing registration run", asy
 
   gate.resolve();
   await built.inFlightStarted?.catch(() => {});
+});
+
+// ---------------------------------------------------------------------------
+// 1b. #1351 — the join was bounded; the caller's OWN run was not.
+// ---------------------------------------------------------------------------
+
+test("#1351: a join that lands leaves the add's OWN run only what is left — and the refusal says so", async () => {
+  // The residual this issue is about, driven end to end: the in-flight run settles JUST
+  // inside the join's bound (the budget is respected at the join), and then the caller's
+  // own run — the deliberately-unbounded registerNodesFromDefs local work — outlives what
+  // little of runMs remains. Before this fix the add waited that run out: join (~260ms
+  // here) PLUS the full own run (~200ms), a sum no bound on this path reached.
+  const comfy = makeComfy();
+  const built = realGraphAddNode({
+    comfy,
+    // budget 400ms, reserve 120ms ⇒ joinMs = runMs ≈ 280ms. The join lands at 260ms,
+    // leaving the add's own run ~20ms against a 200ms registration. The in-flight run
+    // registers a STALE schema (its fetch predates the install), so the add still needs
+    // its own payload run after the join — the #289 shape.
+    holdInFlight: sleep(260),
+    inFlightSchema: { ExistingNode: backendObjectInfo().ExistingNode },
+    ownRunMs: 200,
+    budgetMs: 400,
+    reserveMs: 120,
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "NewNode" }),
+    (err) => {
+      // The SHIPPED own-run wording, not the busy one and not the resolver's "reload the
+      // tab": the cause is different (nothing ELSE was running), and the payload was not
+      // dropped.
+      assert.equal(err.message, addNodeRefreshSlowMessage("NewNode"));
+      return true;
+    },
+    "an add whose own run outlived the budget must refuse, in words",
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 400,
+    `refused in ${elapsed}ms — inside the command budget, not after join + the whole own run`,
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "the graph was not touched");
+
+  // The OWN RUN WAS NOT DROPPED, unlike the abandoned join's payload: it started when the
+  // join settled (the slot was free — no stampede), and it is registering the very class
+  // the add asked for, which is what makes the refusal's "retry" the normal outcome.
+  assert.equal(built.runs.length, 2, "the add's own run started");
+  await built.inFlightStarted?.catch(() => {});
+  await sleep(300); // let the abandoned run finish
+  assert.ok(
+    comfy.LG.registered_node_types.NewNode,
+    "the abandoned run still registered the class — the retry succeeds",
+  );
 });
 
 // ---------------------------------------------------------------------------
