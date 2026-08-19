@@ -6,7 +6,9 @@ import {
   saveActiveWorkflow,
   describeSaveOutcome,
   classifyOriginalOnDisk,
-  diskExistenceFromStatus
+  diskExistenceFromStatus,
+  nameContainsPathSeparator,
+  pathSeparatorNameError
 } from '../../web/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-service double that records what was called and
@@ -308,6 +310,92 @@ test('rejects an explicit whitespace-only name and leaves the source untouched (
   assert.deepEqual(svc.calls, [])
   assert.ok(svc.disk.has('workflows/Foo.json'))
   assert.equal(svc.disk.size, 1)
+})
+
+test('rejects an explicit name with a forward slash — never creates a nested directory (comfyui-mcp#1721)', async () => {
+  // The reported repro: "LTX-2.5 Inpaint HDR (EXR/VFX)" silently created a
+  // directory "LTX-2.5 Inpaint HDR (EXR" holding "VFX).json" and reported only
+  // the trailing segment as the saved name.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'LTX-2.5 Inpaint HDR (EXR/VFX)', {}),
+    /path separator/
+  )
+
+  // Nothing was written, moved, or nested — the source stands as-is.
+  assert.deepEqual(svc.calls, [])
+  assert.ok(svc.disk.has('workflows/Foo.json'))
+  assert.equal(svc.disk.size, 1)
+})
+
+test('rejects an explicit name with a BACKSLASH — a separator on Windows (comfyui-mcp#1721)', async () => {
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await assert.rejects(() => saveActiveWorkflow(svc, 'A\\B', {}), /path separator/)
+  assert.deepEqual(svc.calls, [])
+  assert.equal(svc.disk.size, 1)
+})
+
+test('a slashed name is refused even on a FIRST save of a never-persisted tab (comfyui-mcp#1721)', async () => {
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const svc = makeService({ files: [], active })
+
+  await assert.rejects(() => saveActiveWorkflow(svc, 'My Workflow (A/B)', {}), /path separator/)
+  assert.deepEqual(svc.calls, [])
+  assert.equal(svc.disk.size, 0)
+})
+
+test('a workflow legitimately living in a SUBFOLDER still saves in place (comfyui-mcp#1721)', async () => {
+  // The guard rejects separators in the caller-supplied NAME only — a tab whose
+  // own directory is a subfolder must not become unsaveable.
+  const active = {
+    path: 'workflows/sub/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows/sub',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  const saved = await saveActiveWorkflow(svc, undefined, {})
+
+  assert.equal(saved, 'Foo')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveWorkflow'), 'saved in place')
+  assert.deepEqual([...svc.disk], ['workflows/sub/Foo.json'])
+})
+
+test('nameContainsPathSeparator / pathSeparatorNameError (comfyui-mcp#1721)', () => {
+  assert.equal(nameContainsPathSeparator('My Workflow (A/B)'), true)
+  assert.equal(nameContainsPathSeparator('A\\B'), true)
+  assert.equal(nameContainsPathSeparator('My Workflow A-B'), false)
+  assert.equal(nameContainsPathSeparator(''), false)
+  assert.equal(nameContainsPathSeparator(undefined), false)
+
+  const err = pathSeparatorNameError('A/B', 'rename')
+  assert.match(err.message, /refusing to rename/)
+  assert.match(err.message, /"A\/B"/)
+  assert.match(err.message, /Nothing was written/)
 })
 
 test('double-extension Save-As to the base name still COPIES, never renames (#226)', async () => {

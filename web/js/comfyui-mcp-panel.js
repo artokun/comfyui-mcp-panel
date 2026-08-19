@@ -558,6 +558,8 @@ import {
   classifyOriginalOnDisk,
   diskExistenceFromStatus,
   normalizePath,
+  nameContainsPathSeparator,
+  pathSeparatorNameError,
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import {
@@ -17258,6 +17260,9 @@ const GRAPH_TOOL_EXECUTORS = {
     const target = path ? resolveWorkflowSelectorTarget("workflow_rename", s, path) : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     const clean = name.replace(/\.json$/i, "");
+    // comfyui-mcp#1721 — a slashed rename target would nest the file into a new
+    // subdirectory (the target is `${dir}${clean}.json`); refuse, never misfile.
+    if (nameContainsPathSeparator(clean)) throw pathSeparatorNameError(clean, "rename");
     const slash = target.path ? target.path.lastIndexOf("/") : -1;
     const dir = slash >= 0 ? target.path.slice(0, slash + 1) : "workflows/";
     try {
