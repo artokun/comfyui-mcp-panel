@@ -26,6 +26,9 @@ import {
   isPlaceholderNode,
   findStalePlaceholders,
   stalePlaceholderNote,
+  withoutClientRegisteredTypes,
+  anyRecordedTypeUnregistered,
+  adjudicateRecordedMissingNodeTypes,
 } from "../../web/js/lib/stale-placeholders.js";
 
 /** A node whose class WAS registered: ComfyUI attaches `nodeData` to the constructor. */
@@ -278,4 +281,139 @@ test("#981 (codex r2) source guard: the disclosure survives the SUCCESS path of 
   // the canvas, not about the refresh having failed.
   assert.ok(!/ok: false/.test(src.slice(src.indexOf("async refresh_nodes()"), src.indexOf("graph_serialize()"))),
     "requires_reload must not be turned into a failure");
+});
+
+// ── #1332 — get_errors must not keep a load-time missing-type list after a restart ──
+
+const ISSUE_RECORDED = ["easy stylesSelector", "easy showAnything", "GetImageSize+"];
+const issueRegistry = (...clientRegistered) => (type) => clientRegistered.includes(type);
+
+test("#1332 the reported case: Easy-Use types drop off missing once the client can construct them", () => {
+  // After restore + restart, panel_add_node of easy stylesSelector succeeded.
+  // GetImageSize+ was a genuinely uninstalled leftover and must stay reported.
+  const nodes = [
+    placeholder(12, "easy stylesSelector"),
+    realNode(40, "easy stylesSelector"),
+    placeholder(13, "easy showAnything"),
+    placeholder(7, "GetImageSize+"),
+  ];
+  const { stillMissing, stalePlaceholders } = adjudicateRecordedMissingNodeTypes(
+    ISSUE_RECORDED,
+    nodes,
+    issueRegistry("easy stylesSelector", "easy showAnything"),
+  );
+  assert.deepEqual(stillMissing, ["GetImageSize+"]);
+  assert.deepEqual(
+    stalePlaceholders.map((s) => `${s.node_id}:${s.type}`),
+    ["12:easy stylesSelector", "13:easy showAnything"],
+    "the leftover placeholders stay a finding; the freshly-added real node does not",
+  );
+});
+
+test("#1332 a now-registered type with no live instance is dropped, not kept as missing", () => {
+  // The load-time store outlived its nodes (or the agent removed the placeholders).
+  // The type is constructable on this page, so it is not missing.
+  const { stillMissing, stalePlaceholders } = adjudicateRecordedMissingNodeTypes(
+    ["easy stylesSelector", "GetImageSize+"],
+    [placeholder(7, "GetImageSize+")],
+    issueRegistry("easy stylesSelector"),
+  );
+  assert.deepEqual(stillMissing, ["GetImageSize+"]);
+  assert.deepEqual(stalePlaceholders, []);
+});
+
+test("#1332 a rebuilt node plus a stale store snapshot is not missing and not a placeholder", () => {
+  const { stillMissing, stalePlaceholders } = adjudicateRecordedMissingNodeTypes(
+    ["easy stylesSelector"],
+    [realNode(40, "easy stylesSelector")],
+    issueRegistry("easy stylesSelector"),
+  );
+  assert.deepEqual(stillMissing, []);
+  assert.deepEqual(stalePlaceholders, []);
+});
+
+test("#1332 a type the client still cannot instantiate stays missing", () => {
+  assert.deepEqual(
+    withoutClientRegisteredTypes(ISSUE_RECORDED, issueRegistry()),
+    ISSUE_RECORDED,
+  );
+  assert.equal(anyRecordedTypeUnregistered(ISSUE_RECORDED, issueRegistry()), true);
+  assert.equal(
+    anyRecordedTypeUnregistered(ISSUE_RECORDED, issueRegistry("easy stylesSelector", "easy showAnything", "GetImageSize+")),
+    false,
+    "no refresh needed once every recorded type is already in the client registry",
+  );
+});
+
+test("#1332 unknown registration status fails closed — the type stays reported", () => {
+  assert.deepEqual(withoutClientRegisteredTypes(["X"], null), ["X"]);
+  assert.deepEqual(withoutClientRegisteredTypes(["X"], undefined), ["X"]);
+  assert.deepEqual(
+    withoutClientRegisteredTypes(["X"], () => {
+      throw new Error("registry boom");
+    }),
+    ["X"],
+  );
+  assert.equal(anyRecordedTypeUnregistered(["X"], null), false, "cannot prove a refresh would help");
+  assert.equal(
+    anyRecordedTypeUnregistered(["X"], () => {
+      throw new Error("boom");
+    }),
+    true,
+    "a throwing lookup is treated as unregistered so a refresh is still attempted",
+  );
+  assert.deepEqual(withoutClientRegisteredTypes(null, () => true), []);
+  assert.deepEqual(withoutClientRegisteredTypes([], () => true), []);
+});
+
+test("#1332 source guard: get_errors adjudicates AFTER the node-def refresh, against the CLIENT registry", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const at = src.indexOf("async graph_get_errors() {");
+  assert.ok(at > 0, "graph_get_errors must still be recognisable");
+  const end = src.indexOf("async workflow_save(", at);
+  assert.ok(end > at, "the executor's end must still be recognisable");
+  const body = src.slice(at, end);
+  const refreshAt = body.indexOf("refreshComfyNodeDefs(undefined, { force: true })");
+  const adjudicateAt = body.indexOf("adjudicateRecordedMissingNodeTypes(");
+  const reasonsAt = body.indexOf("collectMissingNodeTypeReasons(nodes, missingNodeTypes)");
+  assert.ok(refreshAt > 0, "get_errors still force-refreshes node defs");
+  assert.ok(adjudicateAt > refreshAt, "adjudication must run AFTER the refresh so LiteGraph is current");
+  assert.ok(reasonsAt > adjudicateAt, "per-node missing_node_type blame uses the FILTERED list");
+  assert.match(
+    body,
+    /isRegisteredNodeType\(LiteGraph\?\.registered_node_types, type\)/,
+    "client registry, not /object_info — backend presence is a different fact",
+  );
+  assert.match(body, /kind: "stale_placeholder"/, "leftover placeholders become a per-node reason");
+  assert.match(body, /stale_placeholders: stalePlaceholders/);
+  assert.match(body, /requires_reload: true/);
+  assert.ok(
+    !/removeMissingNodesByType\s*\(/.test(src),
+    "the load-time store is still not cleared — #981's worse-answer hole",
+  );
+});
+
+test("#1332 source guard: the refresh trigger fires for an unregistered recorded type", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const at = src.indexOf("function hasRawMissingAssetCandidates() {");
+  assert.ok(at > 0, "the refresh trigger must still be recognisable");
+  const end = src.indexOf("\nfunction withRefreshTimeout", at);
+  assert.ok(end > at, "the trigger's end must still be recognisable");
+  const body = src.slice(at, end);
+  assert.match(body, /anyRecordedTypeUnregistered\(/);
+  assert.match(
+    body,
+    /isRegisteredNodeType\(LiteGraph\?\.registered_node_types, type\)/,
+    "same client-registry predicate as the adjudication",
+  );
+});
+
+test("#1332 source guard: the turn-start banner uses the same adjudication", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const at = src.indexOf("async function validationBanner() {");
+  assert.ok(at > 0, "the banner must still be recognisable");
+  const body = src.slice(at, src.indexOf("async graph_get_errors()", at));
+  assert.ok(body.length > 200, "the banner body must still sit before graph_get_errors");
+  assert.match(body, /adjudicateRecordedMissingNodeTypes\(/);
+  assert.match(body, /still PLACEHOLDERS after their class registered/);
 });

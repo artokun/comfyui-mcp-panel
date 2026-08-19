@@ -977,8 +977,8 @@ test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", 
   const cleanExpr = /const clean =([\s\S]{0,600}?);/.exec(panelSrc)?.[1] ?? "";
   assert.ok(cleanExpr.length > 0, "the `clean` expression must still exist to be checked");
   assert.match(cleanExpr, /!liveScan\?\.unavailable\?\.length/, "`clean` must account for the live scan (#984)");
-  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount"]) {
-    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399 surfaces must survive: ${surface}`);
+  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount", "stalePlaceholders"]) {
+    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399/#1332 surfaces must survive: ${surface}`);
   }
   // The summary now derives every count from the shared helper above, which is tested
   // BEHAVIOURALLY. This only pins that the label is wired to it — codex was right that
@@ -1009,6 +1009,30 @@ test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", ()
   assert.equal(graphErrorsResultIsClean({ node_errors: { 3: { errors: [] } } }), false);
   assert.equal(graphErrorsResultIsClean({ last_execution_error: { node_id: 5 } }), false);
   assert.equal(graphErrorsResultIsClean({ errored_count: 2 }), false);
+});
+
+test("#1332 graphErrorsResultIsClean: FALSE for leftover placeholders after a class registered", () => {
+  // The type is no longer missing, but the already-placed node is still dead.
+  // Labelling that "none" is the #981 lie this issue must not re-open.
+  assert.equal(
+    graphErrorsResultIsClean({
+      stale_placeholders: [{ node_id: "12", type: "easy stylesSelector" }],
+      requires_reload: true,
+    }),
+    false,
+  );
+  assert.equal(graphErrorsResultIsClean({ requires_reload: true }), false);
+});
+
+test("#1332 graphErrorsFindingCounts: stale placeholders count as findings, not as missing types", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_node_types: ["GetImageSize+"],
+    stale_placeholders: [
+      { node_id: "2", type: "easy stylesSelector" },
+      { node_id: "3", type: "easy showAnything" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 3, "the still-missing type AND the two leftovers");
 });
 
 // ---- #407: a subfolder-registered model resolves against the live combo -----
