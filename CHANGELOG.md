@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-08-19
+
 ### Added
 - converting a video-gen workflow to an app exposes LTX 2.3/Director, Wan, Bernini, Hunyuan and Easy-Use Media generation parameters, treats LoadVideo/VHS/easy loadVideo as video inputs, and collects SaveVideo/VHS_VideoCombine/easy saveVideo as video outputs (including ComfyUI history `videos[]`) instead of classifying them as stills (#428)
 - `/record-skill` snapshots the open graph as a reusable skill file (`skills/<name>/SKILL.md`) so the agent can rebuild it (#350)
@@ -13,6 +15,26 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - `workflow_open` no longer reports a false content mismatch on `definitions` when the frontend renumbered subgraph NODE ids during the load: the relabeling is proven (same nodes in the same order, links and promoted widgets patched through one injective map) rather than tolerated, and it still refuses when a root node promotes a widget from a node the relabeling touched (artokun/comfyui-mcp#1706)
 - a panel tab whose bridge ROUTE went stale re-advertises itself instead of waiting for a browser refresh: the 600 ms workflow poll now watches the route the orchestrator keys its tab registry on, not only the workflow-instance fence identity, so a re-hello that did not land after a switch, a first save or a rename is retried (bounded) rather than leaving every graph call addressed at a tab id nothing answers to (#1389)
+
+### Added
+- converting a video-gen workflow to an app exposes LTX/Wan/Bernini/Hunyuan params and video I/O (#1397)
+- /record-skill saves the open graph as a reusable skill (#1398)
+
+### Fixed
+- sweep a stolen preview by which node emitted, not by what its type could show (#1392)
+- a re-pended run completion re-arms the reconcile sweep (#1403)
+- a back-to-back graph command flushes the pending tracker snapshot before the fence (#1400)
+- the missing-node COUNT is filtered with the names it was counting (#1396)
+- graph_add_node still replies when its own refresh run would miss the window (#1399)
+- the promoted-widget guard reads every dialect of an id that MOVED, not one spelling (#1395)
+- the coalescer-join pin is checked at EVERY call site, not once over the body (#1393)
+- a stale ROUTE re-advertises itself, like a stale fence identity already does (#1391)
+- a subgraph node-id renumber is a relabeling the panel can PROVE, not lost content (#1388)
+- video previews can be disabled — placeholder keeps first frame, filename and lightbox access (#1386)
+- refuse workflow names with path separators instead of silently nesting (#1384)
+- a nested composite field inside a JSON widget validates against its own value's shape (#1382)
+- the load watch reports whether it was ENTERED, not just installed (#1387)
+
 
 ## [0.15.4] - 2026-08-19
 
