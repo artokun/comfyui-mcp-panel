@@ -100,7 +100,7 @@ export function isWidgetBackedInput(input) {
 // landed. That is not hypothetical: LiteGraph writes the link and only THEN
 // runs the nodes' hooks.
 //
-//   LGraphNode.connectSlots (ComfyUI_frontend 1.47.2, LGraphNode.ts ~2938+):
+//   LGraphNode.connectSlots (ComfyUI_frontend 1.48.7, LGraphNode.ts ~2938+):
 //     graph._links.set(link.id, link)
 //     output.links.push(link.id)
 //     targetInput.link = link.id
@@ -125,11 +125,21 @@ export function isWidgetBackedInput(input) {
 // ---------------------------------------------------------------------------
 
 /**
- * The link stored under `linkId`, or null. `graph.links` is an array in some
- * LiteGraph builds, a Map-backed Proxy with Record-style index access in
- * current ComfyUI ones; `graph.getLink(id)` exists on Subgraph/LGraph. All
- * three are tried, defensively — a reader that throws would turn a verdict
- * into a second failure.
+ * The link stored under `linkId`, or null.
+ *
+ * **`linkId` MUST be the RAW id, never stringified.** The live store is
+ * `_links: Map<LinkId, LLink>` with `LinkId = number`, wrapped in a Proxy whose
+ * methods are bound straight through — so `links.get` IS `Map.prototype.get`, and
+ * `Map.get("7")` MISSES a key of `7`. `graph.getLink(id)` is `_links.get(id)` and
+ * misses identically, so the fallback cannot rescue a stringified id either. A
+ * helper that normalised ids to strings before reaching here returned "no link"
+ * for every link on a real graph — a fully persisted wire read as absent. The
+ * ONLY place an id may be stringified is set membership, which is why that lives
+ * in `linkIdExclusionSet` below and nowhere else.
+ *
+ * `graph.links` is an array in some LiteGraph builds and the Map-backed Proxy in
+ * current ComfyUI ones; both, plus `getLink`, are tried defensively — a reader
+ * that throws would turn a verdict into a second failure.
  */
 export function readStoredLink(graph, linkId) {
   if (linkId == null || !graph) return null;
@@ -146,22 +156,45 @@ export function readStoredLink(graph, linkId) {
   return null;
 }
 
-/** Link ids currently back-referenced by `node`'s INPUT slots, as strings. */
+/**
+ * Link ids currently back-referenced by `node`'s INPUT slots — **RAW**, exactly as
+ * the slots hold them, so they stay usable as store keys (see `readStoredLink`).
+ */
 export function inputLinkIds(node) {
   const ids = [];
   for (const input of node?.inputs ?? []) {
-    if (input?.link != null) ids.push(String(input.link));
+    if (input?.link != null) ids.push(input.link);
   }
   return ids;
 }
 
-/** Link ids currently held by a subgraph boundary-rail slot, as strings. */
+/**
+ * Link ids currently held by a subgraph boundary-rail slot — **RAW**, for the same
+ * reason: `findLandedRailLink` iterates these and feeds each one to the link store,
+ * so stringifying here made every rail lookup miss.
+ */
 export function railSlotLinkIds(railSlot) {
   const ids = [];
   for (const id of railSlot?.linkIds ?? []) {
-    if (id != null) ids.push(String(id));
+    if (id != null) ids.push(id);
   }
   return ids;
+}
+
+/**
+ * The one place link ids are stringified: an exclusion SET for the "did THIS call
+ * add it?" question.
+ *
+ * Membership has to survive a number/string mismatch, while a store lookup must
+ * NOT — `Map.get("7")` misses a key of `7`. Those two requirements are opposites,
+ * and collapsing them into one "ids as strings" helper is precisely how a working
+ * rail verdict became a 100% false negative. Keeping the string form to this
+ * function, and reading the store only with raw ids, is what keeps them apart.
+ */
+export function linkIdExclusionSet(ids) {
+  const set = new Set();
+  for (const id of ids ?? []) if (id != null) set.add(String(id));
+  return set;
 }
 
 /**
@@ -181,7 +214,7 @@ export function railSlotLinkIds(railSlot) {
 export function findLandedInboundLink(graph, origin, outIdx, target, excludeIds) {
   const originId = origin?.id;
   if (originId == null || !target) return null;
-  const skip = excludeIds instanceof Set ? excludeIds : new Set(excludeIds ?? []);
+  const skip = excludeIds instanceof Set ? excludeIds : linkIdExclusionSet(excludeIds);
   const inputs = target.inputs ?? [];
   for (let i = 0; i < inputs.length; i++) {
     const linkId = inputs[i]?.link;
@@ -192,7 +225,7 @@ export function findLandedInboundLink(graph, origin, outIdx, target, excludeIds)
     const storedOriginSlot = stored.origin_slot ?? stored[2];
     if (String(storedOrigin) !== String(originId)) continue;
     if (Number(storedOriginSlot) !== Number(outIdx)) continue;
-    return { linkId: String(linkId), inputIndex: i };
+    return { linkId, inputIndex: i };
   }
   return null;
 }
@@ -211,8 +244,11 @@ export function findLandedInboundLink(graph, origin, outIdx, target, excludeIds)
 export function isRailLinkPersisted(graph, railSlot, node, slotIdx, side, link) {
   const linkId = link?.id;
   if (linkId == null) return false;
-  if (!railSlotLinkIds(railSlot).includes(String(linkId))) return false;
-  return railLinkJoins(readStoredLink(graph, linkId), node, slotIdx, side);
+  // Membership tolerates a number/string mismatch; the STORE read then uses the
+  // id the slot itself holds, raw.
+  const onSlot = railSlotLinkIds(railSlot).find((id) => String(id) === String(linkId));
+  if (onSlot == null) return false;
+  return railLinkJoins(readStoredLink(graph, onSlot), node, slotIdx, side);
 }
 
 /**
@@ -223,9 +259,11 @@ export function isRailLinkPersisted(graph, railSlot, node, slotIdx, side, link) 
  * wire is never credited to this call. Returns `{ linkId }`.
  */
 export function findLandedRailLink(graph, railSlot, node, slotIdx, side, excludeIds) {
-  const skip = excludeIds instanceof Set ? excludeIds : new Set(excludeIds ?? []);
+  const skip = excludeIds instanceof Set ? excludeIds : linkIdExclusionSet(excludeIds);
   for (const linkId of railSlotLinkIds(railSlot)) {
-    if (skip.has(linkId)) continue;
+    // String() on the MEMBERSHIP side only — `linkId` itself stays raw for the
+    // store read on the next line.
+    if (skip.has(String(linkId))) continue;
     if (railLinkJoins(readStoredLink(graph, linkId), node, slotIdx, side)) return { linkId };
   }
   return null;

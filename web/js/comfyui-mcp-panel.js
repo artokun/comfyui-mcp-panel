@@ -391,6 +391,7 @@ import {
   isWidgetBackedInput,
   inputLinkIds,
   railSlotLinkIds,
+  linkIdExclusionSet,
   findLandedInboundLink,
   findLandedRailLink,
   isRailLinkPersisted,
@@ -12125,7 +12126,7 @@ const GRAPH_TOOL_EXECUTORS = {
       if (existing && typeof existing.connect === "function") {
         // #1272 — the rail slot's own link ids BEFORE the mutation, so a wire that
         // pre-dated this call can never be credited to it on the throw path below.
-        const railLinkIdsBefore = new Set(railSlotLinkIds(existing));
+        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
         graph.beforeChange?.();
         let link;
         let railConnectErr = null;
@@ -12204,7 +12205,7 @@ const GRAPH_TOOL_EXECUTORS = {
       if (existing && typeof existing.connect === "function") {
         // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
         // excluded so the throw path cannot credit this call with someone else's wire.
-        const railLinkIdsBefore = new Set(railSlotLinkIds(existing));
+        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
         graph.beforeChange?.();
         let link;
         let railConnectErr = null;
@@ -12329,7 +12330,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // evidence that THIS call landed; without the exclusion, "threw and did
     // nothing" and "threw after wiring it" collapse into one indistinguishable
     // answer.
-    const inboundLinkIdsBefore = new Set(inputLinkIds(target));
+    const inboundLinkIdsBefore = linkIdExclusionSet(inputLinkIds(target));
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -12397,7 +12398,13 @@ const GRAPH_TOOL_EXECUTORS = {
           },
           type: origin.outputs?.[outIdx]?.type,
           ...(autoMatched.length ? { auto_matched: autoMatched } : {}),
-          ...(replacedLink ? { replaced_link: replacedLink } : {}),
+          // `replaced_link` claims THIS connect displaced that wire. On the throw
+          // path it may not have: when the node re-slotted the new link elsewhere,
+          // the original is often still on the requested input. Report the
+          // replacement only when the live graph shows the old link is gone.
+          ...(replacedLink && target.inputs?.[inIdx]?.link !== prevLinkId
+            ? { replaced_link: replacedLink }
+            : {}),
         },
         warning: landedAfterThrowWarning(
           connectErr,
@@ -16600,10 +16607,14 @@ const GRAPH_TOOL_EXECUTORS = {
       if (subgraphOutput && typeof subgraph.removeOutput === "function") {
         try {
           subgraph.removeOutput(subgraphOutput);
-          cleanedUp = true;
         } catch {
           /* best-effort: the honest failure below is reported either way */
         }
+        // OBSERVED, not "the call returned": LGraph.removeOutput dispatches a
+        // CANCELABLE "removing-output" event and returns without removing when a
+        // listener cancels it. A clean return is not a removal, and the message
+        // below claims one.
+        cleanedUp = !(subgraph.outputs ?? []).includes(subgraphOutput);
       }
       subgraph.setDirtyCanvas?.(true, true);
       throw new Error(
@@ -16693,10 +16704,12 @@ const GRAPH_TOOL_EXECUTORS = {
       if (subgraphInput && typeof subgraph.removeInput === "function") {
         try {
           subgraph.removeInput(subgraphInput);
-          cleanedUp = true;
         } catch {
           /* best-effort: the honest failure below is reported either way */
         }
+        // See the output twin: a cancelable "removing-input" event means a clean
+        // return is not evidence of a removal.
+        cleanedUp = !(subgraph.inputs ?? []).includes(subgraphInput);
       }
       subgraph.setDirtyCanvas?.(true, true);
       throw new Error(

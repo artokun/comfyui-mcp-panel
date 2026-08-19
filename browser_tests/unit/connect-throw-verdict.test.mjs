@@ -5,7 +5,8 @@
  * subgraph OUTPUT rail (`to_node_id: -20`). Both times `panel_query_graph` /
  * `panel_graph_outline` showed the wire afterwards.
  *
- * MECHANISM (read from ComfyUI_frontend 1.47.2, not inferred): every connect path
+ * MECHANISM (read from ComfyUI_frontend 1.48.7 — the reporter's own version — not
+ * inferred): every connect path
  * writes the link and only THEN runs the node hooks.
  *
  *   LGraphNode.connectSlots  — graph._links.set / output.links.push /
@@ -37,6 +38,7 @@ import {
   isWidgetBackedInput,
   inputLinkIds,
   railSlotLinkIds,
+  linkIdExclusionSet,
   findLandedInboundLink,
   findLandedRailLink,
   isRailLinkPersisted,
@@ -132,6 +134,7 @@ function buildExecutors(graph, canvas = {}) {
     "isWidgetBackedInput",
     "inputLinkIds",
     "railSlotLinkIds",
+    "linkIdExclusionSet",
     "findLandedInboundLink",
     "findLandedRailLink",
     "isRailLinkPersisted",
@@ -162,6 +165,7 @@ return GRAPH_TOOL_EXECUTORS;`,
     isWidgetBackedInput,
     inputLinkIds,
     railSlotLinkIds,
+    linkIdExclusionSet,
     findLandedInboundLink,
     findLandedRailLink,
     isRailLinkPersisted,
@@ -173,10 +177,57 @@ return GRAPH_TOOL_EXECUTORS;`,
 // LiteGraph-shaped doubles
 // ---------------------------------------------------------------------------
 
+/**
+ * The REAL link store shape, not a convenient one.
+ *
+ * `LGraph` holds `_links: Map<LinkId, LLink>` with `LinkId = number`, and exposes
+ * `links` as a Proxy over that Map whose methods are bound straight through — so
+ * `links.get` IS `Map.prototype.get`, and `links.get("7")` MISSES a key of `7`,
+ * while `links[7]` resolves through the numeric-key trap.
+ *
+ * The first version of this fixture used `links: {}`, a plain object whose keys are
+ * already strings, so `links["7"]` and `links[7]` coincided. That masked a helper
+ * that stringified every rail link id before looking it up: against a real graph it
+ * returned "no link landed" for a link that HAD landed, which made both
+ * expose_subgraph_* paths tear down the slot they had just correctly created — on
+ * the happy path, 100% of the time. Every fixture below now uses this shape, so a
+ * string/number confusion cannot pass again.
+ */
+function mkLinkStore() {
+  const isIndex = (prop) => typeof prop === "string" && /^(?:0|[1-9]\d*)$/.test(prop);
+  const map = new Map();
+  const proxy = new Proxy(map, {
+    get(target, prop) {
+      if (isIndex(prop)) return target.get(Number(prop));
+      const v = Reflect.get(target, prop, target);
+      // bindAllMethods: `get`/`set`/`delete` are the RAW Map methods, bound.
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+    has: (target, prop) => (isIndex(prop) ? target.has(Number(prop)) : Reflect.has(target, prop)),
+    deleteProperty: (target, prop) =>
+      isIndex(prop) ? target.delete(Number(prop)) : Reflect.deleteProperty(target, prop),
+    ownKeys: (target) => [...target.keys()].map(String),
+    getOwnPropertyDescriptor(target, prop) {
+      if (isIndex(prop) && target.has(Number(prop))) {
+        return {
+          value: target.get(Number(prop)),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
+  return { map, proxy };
+}
+
 function mkGraph({ subgraph = false } = {}) {
+  const store = mkLinkStore();
   const graph = {
     lastLinkId: 0,
-    links: {},
+    _links: store.map,
+    links: store.proxy,
     nodes: [],
     outputs: [],
     inputs: [],
@@ -203,7 +254,8 @@ function mkGraph({ subgraph = false } = {}) {
       const i = graph.inputs.indexOf(slot);
       if (i >= 0) graph.inputs.splice(i, 1);
     },
-    getLink: (id) => graph.links[id] ?? null,
+    // LGraph.getLink is `this._links.get(id)` — number-keyed, no coercion.
+    getLink: (id) => store.map.get(id) ?? null,
   };
   return graph;
 }
@@ -224,7 +276,7 @@ function attachConnect(node, afterWrite) {
     // LiteGraph drops the wire already on the input before making the new one.
     const prior = target.inputs[inIdx]?.link;
     if (prior != null) {
-      delete graph.links[prior];
+      graph._links.delete(prior);
       target.inputs[inIdx].link = null;
     }
     const id = ++graph.lastLinkId;
@@ -235,7 +287,7 @@ function attachConnect(node, afterWrite) {
       target_id: target.id,
       target_slot: inIdx,
     };
-    graph.links[id] = link;
+    graph._links.set(id, link);
     (node.outputs[outIdx].links ??= []).push(id);
     target.inputs[inIdx].link = id;
     afterWrite?.({ link, target, inIdx, graph });
@@ -249,7 +301,7 @@ function mkRailOutput(graph, name, type) {
     const outIdx = node.outputs.indexOf(outputSlot);
     const id = ++graph.lastLinkId;
     const link = { id, origin_id: node.id, origin_slot: outIdx, target_id: -20, target_slot: 0 };
-    graph.links[id] = link;
+    graph._links.set(id, link);
     slot.linkIds[0] = id;
     (outputSlot.links ??= []).push(id);
     slot.afterWrite?.({ link, graph });
@@ -264,7 +316,7 @@ function mkRailInput(graph, name, type) {
     const inIdx = node.inputs.indexOf(inputSlot);
     const id = ++graph.lastLinkId;
     const link = { id, origin_id: -10, origin_slot: 0, target_id: node.id, target_slot: inIdx };
-    graph.links[id] = link;
+    graph._links.set(id, link);
     slot.linkIds.push(id);
     inputSlot.link = id;
     slot.afterWrite?.({ link, graph });
@@ -304,7 +356,7 @@ test("#1272 node→node: a hook that throws AFTER the link is written reports CO
   assert.equal(res.connected.to.input, "input1");
   assert.equal(res.connected.to.input_index, 0);
   // The verdict came from the live graph, not from the return value.
-  assert.equal(dst.inputs[0].link, graph.links[1].id);
+  assert.equal(dst.inputs[0].link, graph._links.get(1).id);
   // The throw is disclosed, never swallowed, and the retry is named as harmful.
   assert.match(res.warning, /threw while applying this connect/);
   assert.match(res.warning, /reading 'slots'/);
@@ -331,7 +383,7 @@ test("#1272 node→node: a throw that leaves NOTHING on the graph still FAILS", 
       return true;
     },
   );
-  assert.deepEqual(Object.keys(graph.links), []);
+  assert.equal(graph._links.size, 0);
 });
 
 test("#1272 node→node: a throw AFTER the node re-slotted the link names the slot it landed on", () => {
@@ -361,12 +413,12 @@ test("#1272 node→node: a throw that DESTROYED the previous wire says the input
   const old = mkNode(graph, 100, [], [{ name: "IMAGE", type: "IMAGE", links: [7] }]);
   const src = mkNode(graph, 140, [], [{ name: "IMAGE", type: "IMAGE", links: [] }]);
   const dst = mkNode(graph, 143, [{ name: "input1", type: "IMAGE", link: 7 }], []);
-  graph.links[7] = { id: 7, origin_id: 100, origin_slot: 0, target_id: 143, target_slot: 0 };
+  graph._links.set(7, { id: 7, origin_id: 100, origin_slot: 0, target_id: 143, target_slot: 0 });
   graph.lastLinkId = 7;
   void old;
   // The replacement disconnect throws: old wire gone, new one never made.
   src.connect = (_outIdx, target, inIdx) => {
-    delete graph.links[target.inputs[inIdx].link];
+    graph._links.delete(target.inputs[inIdx].link);
     target.inputs[inIdx].link = null;
     throw new Error(SLOTS_THROW);
   };
@@ -397,7 +449,7 @@ test("#1272 node→node: a link that PRE-DATED the call is never credited to it"
     ],
     [],
   );
-  graph.links[7] = { id: 7, origin_id: 140, origin_slot: 0, target_id: 143, target_slot: 1 };
+  graph._links.set(7, { id: 7, origin_id: 140, origin_slot: 0, target_id: 143, target_slot: 1 });
   graph.lastLinkId = 7;
   src.connect = () => {
     throw new Error(SLOTS_THROW);
@@ -697,8 +749,9 @@ test("findLandedInboundLink: requires the input's OWN back-reference, not just a
   const orphaned = { id: 2, inputs: [{ name: "a", link: null }] };
   assert.equal(findLandedInboundLink(graph, { id: 1 }, 0, orphaned, []), null);
   const wired = { id: 2, inputs: [{ name: "a", link: 5 }] };
+  // The id comes back RAW — a stringified id fed back to the store would miss.
   assert.deepEqual(findLandedInboundLink(graph, { id: 1 }, 0, wired, []), {
-    linkId: "5",
+    linkId: 5,
     inputIndex: 0,
   });
 });
@@ -724,8 +777,12 @@ test("findLandedRailLink: excluded (pre-existing) ids are never credited to this
   };
   const rail = { linkIds: [4] };
   const node = { id: 9 };
-  assert.deepEqual(findLandedRailLink(graph, rail, node, 0, "output", null), { linkId: "4" });
+  assert.deepEqual(findLandedRailLink(graph, rail, node, 0, "output", null), { linkId: 4 });
+  // Exclusion is by STRING — the one place an id may be stringified — so a numeric
+  // id and its string form must both suppress it.
   assert.equal(findLandedRailLink(graph, rail, node, 0, "output", ["4"]), null);
+  assert.equal(findLandedRailLink(graph, rail, node, 0, "output", [4]), null);
+  assert.equal(findLandedRailLink(graph, rail, node, 0, "output", linkIdExclusionSet([4])), null);
 });
 
 test("isRailLinkPersisted: the rail slot must list THAT id and the link must join the node", () => {
@@ -737,4 +794,170 @@ test("isRailLinkPersisted: the rail slot must list THAT id and the link must joi
   assert.equal(isRailLinkPersisted(graph, { linkIds: [] }, node, 0, "output", { id: 4 }), false);
   assert.equal(isRailLinkPersisted(graph, { linkIds: [4] }, node, 1, "output", { id: 4 }), false);
   assert.equal(isRailLinkPersisted(graph, { linkIds: [4] }, { id: 8 }, 0, "output", { id: 4 }), false);
+});
+
+// ---------------------------------------------------------------------------
+// The raw-id contract, and the happy paths a stringified id destroyed.
+//
+// A first version of the rail helper normalised every link id to a string before
+// reading the store. Against the plain-object fixture that used to live above,
+// `links["7"]` and `links[7]` are the same key, so every test passed. Against the
+// real number-keyed Map the lookup MISSES, `findLandedRailLink` returns null for a
+// fully persisted link, and because it is the ONLY verdict on both expose paths,
+// panel_expose_subgraph_output / _input tore down the slot and link they had just
+// correctly created — on the happy path, every time.
+// ---------------------------------------------------------------------------
+
+test("readStoredLink: the store is number-keyed — a raw id resolves, a stringified one does NOT", () => {
+  const graph = mkGraph({ subgraph: true });
+  const link = { id: 7, origin_id: 1, origin_slot: 0, target_id: -20, target_slot: 0 };
+  graph._links.set(7, link);
+
+  // This asymmetry is the CONTRACT, not a defect: `links.get` is the raw bound
+  // Map.get and `getLink` is `_links.get`, so both miss "7". Callers must pass the
+  // id exactly as the slot holds it.
+  assert.equal(readStoredLink(graph, 7), link);
+  assert.equal(readStoredLink(graph, "7"), null);
+  // Record-shaped stores (older LiteGraph builds) still resolve by raw id.
+  assert.equal(readStoredLink({ links: { 7: link } }, 7), link);
+});
+
+test("findLandedRailLink: a persisted rail link is FOUND on the real number-keyed store", () => {
+  const graph = mkGraph({ subgraph: true });
+  const node = mkNode(graph, 12, [], [{ name: "IMAGE", type: "IMAGE", links: [] }]);
+  const rail = mkRailOutput(graph, "image", "IMAGE");
+  graph.outputs.push(rail);
+  rail.connect(node.outputs[0], node);
+  assert.equal(graph._links.size, 1);
+  assert.deepEqual(findLandedRailLink(graph, rail, node, 0, "output", null), { linkId: 1 });
+});
+
+test("#1272 expose output: a CLEAN, non-throwing expose keeps its slot and its link", () => {
+  const graph = mkGraph({ subgraph: true });
+  mkNode(graph, 12, [], [{ name: "IMAGE", type: "IMAGE", links: [] }]);
+  const executors = buildExecutors(graph);
+
+  const res = executors.graph_expose_subgraph_output({ from_node_id: 12, from_output: "IMAGE" });
+
+  assert.equal(res.exposed.name, "IMAGE");
+  assert.equal(res.exposed.slot, 0);
+  assert.equal(res.warning, undefined, "a successful expose discloses nothing");
+  assert.equal(graph.outputs.length, 1, "the slot this call created SURVIVES");
+  assert.equal(graph.outputs[0].linkIds.length, 1);
+  assert.equal(graph._links.size, 1, "and no link is orphaned");
+});
+
+test("#1272 expose input: a CLEAN, non-throwing expose keeps its slot and its link", () => {
+  const graph = mkGraph({ subgraph: true });
+  const node = mkNode(graph, 12, [{ name: "image", type: "IMAGE", link: null }], []);
+  const executors = buildExecutors(graph);
+
+  const res = executors.graph_expose_subgraph_input({ to_node_id: 12, to_input: "image" });
+
+  assert.equal(res.exposed.name, "image");
+  assert.equal(res.warning, undefined);
+  assert.equal(graph.inputs.length, 1, "the slot this call created SURVIVES");
+  assert.equal(graph.inputs[0].linkIds.length, 1);
+  assert.equal(node.inputs[0].link, graph.inputs[0].linkIds[0]);
+  assert.equal(graph._links.size, 1);
+});
+
+test("#1272 repro 2 end-to-end: connect to the output rail (to_node_id -20) that throws AFTER wiring", () => {
+  // The issue's second reproduction, verbatim: inside a subgraph, connect an
+  // ImpactSwitch output to the subgraph output rail. SubgraphOutput.connect
+  // persists the link, then node.onConnectionsChange throws.
+  const graph = mkGraph({ subgraph: true });
+  const impact = mkNode(graph, 143, [], [{ name: "selected_value", type: "IMAGE", links: [] }]);
+  const rail = mkRailOutput(graph, "image", "IMAGE");
+  graph.outputs.push(rail);
+  rail.afterWrite = () => {
+    throw new Error(SLOTS_THROW);
+  };
+  const executors = buildExecutors(graph);
+
+  const res = executors.graph_connect({
+    from_node_id: 143,
+    from_output: "selected_value",
+    to_node_id: -20,
+    to_input: "image",
+  });
+
+  assert.equal(res.connected.from.node_id, 143);
+  assert.equal(res.connected.to.subgraph_output, "image");
+  // panel_graph_outline would show `143 → -20.0`, exactly as the reporter saw.
+  assert.equal(rail.linkIds.length, 1);
+  assert.equal(graph._links.get(rail.linkIds[0]).origin_id, 143);
+  assert.equal(impact.outputs[0].links.length, 1);
+  assert.match(res.warning, /reading 'slots'/);
+  assert.match(res.warning, /Do NOT retry/);
+});
+
+test("#1272 expose output: cleanup is claimed only when the slot ACTUALLY went away", () => {
+  // LGraph.removeOutput dispatches a CANCELABLE "removing-output" event and
+  // returns without removing when a listener cancels it. A clean return is not a
+  // removal, so the message must not claim one.
+  const graph = mkGraph({ subgraph: true });
+  mkNode(graph, 12, [], [{ name: "IMAGE", type: "IMAGE", links: [] }]);
+  const nativeAddOutput = graph.addOutput.bind(graph);
+  graph.addOutput = (name, type) => {
+    const slot = nativeAddOutput(name, type);
+    slot.connect = () => {
+      throw new Error(SLOTS_THROW);
+    };
+    return slot;
+  };
+  graph.removeOutput = () => {
+    /* a listener cancelled the removal — returns cleanly, removes nothing */
+  };
+  const executors = buildExecutors(graph);
+  assert.throws(
+    () => executors.graph_expose_subgraph_output({ from_node_id: 12, from_output: "IMAGE" }),
+    (err) => {
+      assert.match(err.message, /the frontend threw/);
+      assert.doesNotMatch(err.message, /was removed/);
+      return true;
+    },
+  );
+  assert.equal(graph.outputs.length, 1, "the slot really is still there");
+});
+
+test("#1272 node→node: replaced_link is withheld when the original wire is still on the input", () => {
+  const graph = mkGraph();
+  const src = mkNode(graph, 140, [], [{ name: "IMAGE", type: "IMAGE", links: [] }]);
+  const dst = mkNode(
+    graph,
+    143,
+    [
+      { name: "input1", type: "IMAGE", link: 7 },
+      { name: "input2", type: "IMAGE", link: null },
+    ],
+    [],
+  );
+  graph._links.set(7, { id: 7, origin_id: 100, origin_slot: 0, target_id: 143, target_slot: 0 });
+  mkNode(graph, 100, [], [{ name: "IMAGE", type: "IMAGE", links: [7] }]);
+  graph.lastLinkId = 7;
+  // The node re-slots the NEW link onto input2 and leaves input1's wire alone,
+  // then throws — so nothing was replaced.
+  src.connect = (outIdx, target) => {
+    const id = ++graph.lastLinkId;
+    graph._links.set(id, {
+      id,
+      origin_id: 140,
+      origin_slot: outIdx,
+      target_id: target.id,
+      target_slot: 1,
+    });
+    target.inputs[1].link = id;
+    throw new Error(SLOTS_THROW);
+  };
+  const executors = buildExecutors(graph);
+  const res = executors.graph_connect({
+    from_node_id: 140,
+    from_output: "IMAGE",
+    to_node_id: 143,
+    to_input: "input1",
+  });
+  assert.equal(res.connected.to.input, "input2");
+  assert.equal(res.connected.replaced_link, undefined, "input1's wire was never displaced");
+  assert.equal(dst.inputs[0].link, 7);
 });
