@@ -32,6 +32,7 @@ import { inputAssetProbeVerdict } from "../../web/js/lib/input-asset.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
+const INPUT_ASSET_JS = join(HERE, "../../web/js/lib/input-asset.js");
 
 /** An /object_info/<class> body in the shape verified live in #745. */
 const classBody = (name, required) => ({ [name]: { input: { required } } });
@@ -51,6 +52,8 @@ const CKPT = classBody("CheckpointLoaderSimple", {
 });
 
 const NESTED = "AgentLibrary/HaReen/Main-9-1.png";
+/** The 17:40Z reproduction: ComfyUI paste names duplicates `image (N).png`. */
+const PASTED = "pasted/image (992).png";
 
 test("#1357 a server-CONFIRMED nested upload value is not reported at all", async () => {
   const probed = [];
@@ -69,6 +72,25 @@ test("#1357 a server-CONFIRMED nested upload value is not reported at all", asyn
   // Probed at the path LoadImage itself would resolve.
   assert.deepEqual(probed, [
     { value: NESTED, filename: "Main-9-1.png", subfolder: "AgentLibrary/HaReen", type: "input" },
+  ]);
+});
+
+test("#1357 a pasted LoadImage value with spaces is not reported when the server has it", async () => {
+  const probed = [];
+  const r = await scanComboAvailability(
+    [node(46, "LoadImage", [{ name: "image", value: PASTED }])],
+    async () => LOAD_IMAGE,
+    {
+      confirmServerAsset: (value, ref) => {
+        probed.push({ value, ...ref });
+        return true;
+      },
+    },
+  );
+  assert.deepEqual(r.unavailable, []);
+  assert.deepEqual(r.unknown, []);
+  assert.deepEqual(probed, [
+    { value: PASTED, filename: "image (992).png", subfolder: "pasted", type: "input" },
   ]);
 });
 
@@ -371,11 +393,26 @@ test("#1357 WIRING: get_errors' live scan really is given the server probe", () 
 
 test("#1357 WIRING: the probe is tri-state, and the media filter keeps its old floor", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(src, /return inputAssetProbeVerdict\(res\);/);
+  const lib = readFileSync(INPUT_ASSET_JS, "utf8");
+  assert.match(lib, /return inputAssetProbeVerdict\(res\);/);
   // The store-driven missing-media filter must still collapse "absent" and
   // "unknown" into "keep reporting" — it has a prior assertion the scan lacks,
   // and loosening it here would silently un-ship #513/#743.
   assert.match(src, /\(await probeInputAssetPresence\(ref, probeBudget\)\) === true/);
+});
+
+test("#1357 WIRING: both /view probes percent-encode the filename, not form-encode it", () => {
+  // URLSearchParams encodes a space as `+`. The #1368 probe used that, so
+  // `image (992).png` was asked as `image+(992).png` and 404ed as missing
+  // while `/view` with encodeURIComponent (ComfyUI's own getResourceURL)
+  // returned 200/206. get_errors goes through the lib probe; set_widget
+  // builds the same query string.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const lib = readFileSync(INPUT_ASSET_JS, "utf8");
+  assert.match(lib, /filename=\$\{encodeURIComponent\(String\(filename\)\)\}/);
+  assert.match(src, /probeAssetOnServer\(/);
+  assert.match(src, /inputAssetViewQuery\(\{ filename, subfolder, type: "input" \}\)/);
+  assert.doesNotMatch(src, /URLSearchParams\(\{ filename/);
 });
 
 test("#1357 WIRING: an abstention is disclosed, never left to read as clean", () => {
