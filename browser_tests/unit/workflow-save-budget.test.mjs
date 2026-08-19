@@ -155,8 +155,9 @@ test("#1434: the refusal NAMES a live tab and the dirty observation, never 'froz
   assert.match(text, /still live/);
   assert.match(text, /modified:true/);
   assert.match(text, /persisted:true/);
-  assert.match(text, /panel_list_workflows/);
   assert.match(text, /not a backgrounded or frozen tab/);
+  // #1455 — the reply must never resolve landed-ness from the dirty flag.
+  assert.doesNotMatch(text, /if modified is false the write landed/);
   // Same observation the reporter could read after the timeout.
   assert.deepEqual(
     workflowSaveTimeoutObservation({
@@ -280,4 +281,87 @@ test("#1434: BOTH save handlers wrap programmaticSave in the bound — the helpe
     /function observeActiveWorkflowSaveState\(\)/,
     "the timeout path must observe the live dirty flags, not invent them",
   );
+});
+
+// ---------------------------------------------------------------------------
+// #1455 — the reply reports OBSERVATIONS, never an inference the flags cannot support.
+// ---------------------------------------------------------------------------
+
+test("#1455: modified:false is reported, never resolved into 'the write landed'", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: true,
+    filename: "Clean.json",
+  });
+  // The flag is still surfaced — the caller should see what was read.
+  assert.match(text, /modified:false/);
+  assert.match(text, /persisted:true/);
+  // But it is never turned into a verdict. isModified === false is equally the state
+  // of a workflow that was never dirty, and the frontend's save() forces past the
+  // isPersisted && !isModified early return, so a clean workflow reaches a hanging PUT
+  // with the flag already false.
+  assert.doesNotMatch(text, /the write landed/);
+  assert.match(text, /UNDETERMINED/);
+  // The old remedy read the SAME flag, so it cannot settle the question.
+  assert.doesNotMatch(text, /Check panel_list_workflows before retrying/);
+});
+
+test("#1455: modified:true still carries its one-directional meaning", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: true,
+    persisted: true,
+    filename: "Dirty.json",
+  });
+  // true IS evidence: the canvas has not been marked clean, so nothing was acknowledged.
+  assert.match(text, /has not been acknowledged as landed/);
+  assert.doesNotMatch(text, /UNDETERMINED/);
+});
+
+test("#1455: a Save-As swap does not attribute the hung write to the previous file", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: false,
+    filename: "NewName.json",
+    subject: "Old.json",
+    subjectChanged: true,
+  });
+  // The subject is the save's TARGET, not whatever is active when the budget fires.
+  assert.match(text, /for "Old\.json"/);
+  assert.match(text, /active workflow changed to "NewName\.json"/);
+  // Flags belonging to a different workflow must not be reported as the target's.
+  assert.doesNotMatch(text, /modified:false/);
+  assert.match(text, /cannot say whether its write completed/);
+});
+
+test("#1455 WIRING: the target is captured BEFORE the save, not at timeout-fire time", async () => {
+  // The /userdata HEAD probe can hang before any swap, so an observer read at fire time
+  // can name a workflow that was never the target. Deleting the pre-capture makes this
+  // report "After.json" — the wrong file.
+  let call = 0;
+  const observeWorkflow = () => {
+    call += 1;
+    return call === 1
+      ? { modified: true, persisted: true, filename: "Before.json" }
+      : { modified: false, persisted: false, filename: "After.json" };
+  };
+  await assert.rejects(
+    () =>
+      runBoundedWorkflowSave(() => new Promise(() => {}), {
+        budgetMs: 40,
+        withTimeout: async (p, ms, onTimeout) => {
+          const t = new Promise((r) => setTimeout(() => r(onTimeout()), ms));
+          return Promise.race([p, t]);
+        },
+        observeWorkflow,
+      }),
+    (err) => {
+      assert.match(err.message, /for "Before\.json"/, "names the save's target");
+      assert.match(err.message, /changed to "After\.json"/, "discloses the swap");
+      return true;
+    },
+  );
+  assert.ok(call >= 2, "observed both before the save and at the budget");
 });

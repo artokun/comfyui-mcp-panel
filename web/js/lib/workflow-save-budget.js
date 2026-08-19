@@ -55,34 +55,69 @@ export function workflowSaveTimeoutObservation(wf) {
 }
 
 /**
- * The refusal a timed-out save throws. States that the tab is still live, what
- * the dirty flag currently says, and that the write may still land — never
- * "backgrounded or frozen", which is the orchestrator's guess this report
- * disproved.
+ * The refusal a timed-out save throws. States that the tab is still live and what
+ * the flags SAY — never what they imply about whether the write landed.
+ *
+ * #1455: `isModified === false` is also the state of a workflow that was never
+ * dirty, so it cannot distinguish "the write landed" from "there was nothing to
+ * write". The frontend's save() forces through the `isPersisted && !isModified`
+ * early return, so a persisted-and-clean workflow reaches a hanging PUT with the
+ * flag already false. `panel_list_workflows` reports that same flag, so it cannot
+ * settle it either. The honest terminal state is "could not determine".
+ *
+ * `subject` is the workflow the save TARGETED, captured before the save ran; the
+ * /userdata HEAD probe can hang before any Save-As swap, so the workflow that is
+ * active when the budget fires is not necessarily the one being saved.
  */
 export function describeWorkflowSaveTimeout({
   budgetMs = WORKFLOW_SAVE_COMMAND_BUDGET_MS,
   modified,
   persisted,
   filename,
+  subject,
+  subjectChanged = false,
 } = {}) {
   const total = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : WORKFLOW_SAVE_COMMAND_BUDGET_MS;
   const seconds = Math.max(1, Math.round(total / 1000));
-  const who = typeof filename === "string" && filename ? `"${filename}"` : "the active workflow";
-  const dirty =
+  // A direct caller may pass only `filename` (the pre-#1455 shape); fall back to it so
+  // the reply still names the workflow rather than degrading to "the active workflow".
+  const subjectName = typeof subject === "string" && subject ? subject : filename;
+  const target = typeof subjectName === "string" && subjectName ? `"${subjectName}"` : "the active workflow";
+  const nowActive = typeof filename === "string" && filename ? `"${filename}"` : "a different workflow";
+
+  // The active workflow moved during the budget, so the flags below describe some
+  // OTHER workflow. Reporting them against the target would be a wrong-target claim.
+  if (subjectChanged) {
+    return (
+      `workflow_save did not finish within ${seconds}s for ${target}. ` +
+      `The tab is still live — other commands from it still answer, so this is not a backgrounded or frozen tab. ` +
+      `The save may still complete in the background. The active workflow changed to ${nowActive} while the save was in flight, ` +
+      `so no dirty/persisted flag currently describes ${target} and this reply cannot say whether its write completed. ` +
+      `Confirm by reading the saved file itself before retrying — a re-issue may write twice.`
+    );
+  }
+
+  const flags = [
+    modified === true ? "modified:true" : modified === false ? "modified:false" : null,
+    persisted === true ? "persisted:true" : persisted === false ? "persisted:false" : null,
+  ].filter(Boolean);
+  const reads = flags.length ? `The same tab reports ${flags.join(" ")}. ` : "The tab's save flags could not be read. ";
+
+  // modified:true is one-directional evidence: the canvas is still dirty, so nothing
+  // has been acknowledged. modified:false proves nothing in either direction.
+  const verdict =
     modified === true
-      ? "still reports modified:true — the canvas has not been marked clean, so the write has not been acknowledged as landed"
-      : modified === false
-        ? "now reports modified:false — the write may have landed after this deadline; confirm with panel_list_workflows"
-        : "its modified flag could not be read";
-  const persist =
-    persisted === true ? " persisted:true." : persisted === false ? " persisted:false." : "";
+      ? `modified:true means the canvas has not been marked clean, so the write has not been acknowledged as landed. `
+      : `These flags cannot show whether the write completed: modified:false is also the state of a workflow that was never dirty, ` +
+        `and panel_list_workflows reports that same flag. Treat the outcome as UNDETERMINED. `;
+
   return (
-    `workflow_save did not finish within ${seconds}s for ${who}. ` +
+    `workflow_save did not finish within ${seconds}s for ${target}. ` +
     `The tab is still live — other commands from it still answer, so this is not a backgrounded or frozen tab. ` +
-    `The save may still complete in the background. The same tab ${dirty}.${persist} ` +
-    `Check panel_list_workflows before retrying: if modified is false the write landed; ` +
-    `if it stays true the save is still in flight or failed. Do not re-issue until you have seen that observation.`
+    `The save may still complete in the background. ` +
+    reads +
+    verdict +
+    `Confirm by reading the saved file itself before retrying — a re-issue may write twice.`
   );
 }
 
@@ -110,6 +145,15 @@ export async function runBoundedWorkflowSave(
     );
   }
   const budget = makeCommandBudget(budgetMs, now);
+  // #1455 — capture the save's TARGET before it runs. The /userdata HEAD probe can
+  // hang before any Save-As swap, so the workflow active when the budget fires is not
+  // necessarily the one being saved; naming that one blames the wrong file.
+  let target = {};
+  try {
+    target = typeof observeWorkflow === "function" ? observeWorkflow() || {} : {};
+  } catch {
+    target = {};
+  }
   const settled = await withTimeout(
     Promise.resolve()
       .then(() => saveFn())
@@ -127,12 +171,23 @@ export async function runBoundedWorkflowSave(
     } catch {
       observed = {};
     }
+    // Same workflow => its flags describe the target. Different (or unreadable)
+    // => they describe something else, and the reply must not attribute them.
+    const subject = typeof target.filename === "string" && target.filename ? target.filename : observed.filename;
+    const subjectChanged =
+      typeof subject === "string" &&
+      subject !== "" &&
+      typeof observed.filename === "string" &&
+      observed.filename !== "" &&
+      observed.filename !== subject;
     throw new Error(
       describeWorkflowSaveTimeout({
         budgetMs: budget.totalMs,
         modified: observed.modified,
         persisted: observed.persisted,
         filename: observed.filename,
+        subject,
+        subjectChanged,
       }),
     );
   }
