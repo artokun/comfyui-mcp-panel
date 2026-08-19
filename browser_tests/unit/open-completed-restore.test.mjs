@@ -563,9 +563,29 @@ test("panel#1283 wiring: the third ground gets its OWN reply key and its own not
   // Assigned from the ground that earned it, and from nothing else.
   const assignments = [...src.matchAll(/(?<!let )openContentNormalized = ([^;\n]+);/g)].map((m) => m[1]);
   assert.deepEqual(assignments, ["contentProof.normalizedFields"]);
-  const guardAt = src.indexOf("if (contentProof.normalizedOnly) {");
+  // Gated on the ground that earned it, AND on the stronger one not having earned it
+  // first: a cosmetic difference on a completed restore satisfies both, and two keys for
+  // one observation would make the reply say two different-sized things about the same
+  // fields.
+  const guardAt = src.indexOf("if (contentProof.normalizedOnly && !contentProof.presentationOnly) {");
   assert.notEqual(guardAt, -1);
   assert.ok(guardAt < src.indexOf("openContentNormalized = contentProof.normalizedFields;"));
+});
+
+test("panel#1283 a cosmetic difference keeps #1623's stronger disclosure, not this weaker one", () => {
+  // `pos`/`order` on a watched, completed restore: BOTH grounds are true. The reply must
+  // carry `presentation_rewritten` (every content-bearing field matched) and NOT also
+  // `content_normalized` (the panel observed the difference and not its cause).
+  const state = stateOf([node(1, "KSampler")]);
+  const live = stateOf([{ ...node(1, "KSampler"), pos: [40, 40], order: 3 }]);
+  const proof = graphRootReproducesStateContent({
+    rootGraph: rootOf(live),
+    state,
+    loadRanToCompletion: true,
+  });
+  assert.equal(proof.presentationOnly, true, "#1623's ground still fires");
+  assert.equal(proof.normalizedOnly, true, "and so does this one — which is why the call site picks");
+  assert.deepEqual(proof.fields, ["order", "pos"]);
 });
 
 test("panel#1283 wiring: a node the retry could not heal is still disclosed on the open path", () => {

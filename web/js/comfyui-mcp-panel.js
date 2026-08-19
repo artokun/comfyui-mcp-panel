@@ -16227,7 +16227,15 @@ const GRAPH_TOOL_EXECUTORS = {
               if (contentProof.presentationOnly) {
                 openPresentationRewritten = contentProof.fields;
               }
-              if (contentProof.normalizedOnly) {
+              // The STRONGER disclosure wins when both apply, and both DO apply often: a
+              // cosmetic-only difference on a watched, completed restore satisfies
+              // `presentationOnly` and `normalizedOnly` at once. Emitting two keys for one
+              // observation would ask the caller to reconcile "every content-bearing field
+              // matched" with "the panel observed the difference and not its cause" — the
+              // reply saying two different-sized things about the same fields, which is the
+              // contradiction #1623 was reported for. `proven` cannot collide: every branch
+              // that returns it returns `normalizedOnly: false`.
+              if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
                 openContentNormalized = contentProof.normalizedFields;
               }
               const verdict = resolveOpenRebindVerdict({
