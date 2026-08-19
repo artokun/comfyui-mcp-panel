@@ -435,7 +435,10 @@ import {
   describeInputLink,
   verifyDisconnect,
 } from "./lib/disconnect-verify.js";
-import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
+import {
+  deferChangeTrackerSnapshot,
+  flushPendingChangeTrackerSnapshot,
+} from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
@@ -21757,6 +21760,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 });
                 if (reconnectGate) throw reconnectRefusalError(reconnectGate);
               }
+              // comfyui-mcp#1723 — a successful command defers its tracker snapshot
+              // past the reply (#581); a back-to-back command from the same burst
+              // reaches the fence on the stale pre-command fingerprint and refuses
+              // the RIGHT canvas. Flush the capture already committed to (same
+              // tracker only — a different active tracker means the tab moved).
+              flushPendingChangeTrackerSnapshot(
+                app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null,
+              );
               const { graph, rootGraph } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
             }
