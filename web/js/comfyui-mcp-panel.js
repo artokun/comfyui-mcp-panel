@@ -10387,20 +10387,34 @@ const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 const ADD_NODE_COMMAND_BUDGET_MS = 25000;
 
 /**
- * #1404 — the same budget for `refresh_nodes`, the THIRD command relayed in the 30,000 ms
- * window and the last one that never took one.
+ * #1404 — a command budget for `refresh_nodes`.
+ *
+ * COUNTED, not guessed, because the first draft of this comment guessed and was wrong. SIX
+ * commands are relayed in the orchestrator's 30,000 ms window: `graph_get_object_info`,
+ * `graph_add_node`, `graph_set_widget`, `graph_remove_widget` and `refresh_nodes` through
+ * `OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS`, plus `nodes_install` at a literal 30000. Before this
+ * change only TWO of the six held a command budget — `graph_add_node` (#1192) and
+ * `nodes_install` (#671) — so "the last one that never took one" was false, and the false
+ * version of this sentence concealed a sibling: `graph_set_widget`'s stale-combo recovery
+ * awaits the coalescer with no bound of its own. Filed separately rather than folded in; the
+ * point for a future reader is that this is a RECURRING shape, not a last straggler.
  *
  * REPORTED: after a workflow switch and a successful re-target, `panel_refresh_nodes` got no
  * acknowledgement for 30 s while ComfyUI stayed healthy and idle; the identical call then
  * succeeded on the retry. That is not a lost reply — it is a reply that was never COMPOSED
- * inside the window, and the composition is written down two comments above this one:
- * `makeRefreshCoalescer` guarantees a forced call pays the in-flight run AND its own,
- * serially. Each of those runs is bounded by NODE_DEFS_RUN_BUDGET_MS, which bounds only the
- * WAITING it controls and deliberately stops its clock across `registerNodesFromDefs`
- * (3,972 ms measured) and `reapplyDefsToLiveNodes` — so a run is ~14.5 s wall clock on the
- * #610 install and TWO of them do not fit. `graph_add_node`'s own note says this out loud
- * ("~33 s against the 30 s relay window, with every per-step bound respected"); it fixed the
- * composition for the add and left the tool whose whole body IS that composition unbounded.
+ * inside the window.
+ *
+ * THE COMPOSITION IS ALREADY WRITTEN DOWN, two comments above this one, and that note is the
+ * evidence — not any arithmetic done here. NODE_DEFS_RUN_BUDGET_MS's own docstring says
+ * `makeRefreshCoalescer` "guarantees a forced `panel_refresh_nodes` pays the in-flight run
+ * AND its own, serially, so about 39.6s before a reply is composed. Past the bridge's 20s
+ * READ default and past the 30s command budget both." #1180 shrank the per-run WAITING that
+ * figure was computed from, but it explicitly did NOT bound `registerNodesFromDefs`
+ * (3,972 ms measured) or `reapplyDefsToLiveNodes`, so the composition that note describes
+ * survived it — which is what this issue reports. `graph_add_node`'s note says the same of
+ * its own path ("~33 s against the 30 s relay window, with every per-step bound respected").
+ * #1192/#1351 fixed the composition for the add and left the tool whose whole body IS that
+ * composition unbounded.
  *
  * WHY THE SECOND CALL SUCCEEDS, which is the part that identifies the cause rather than
  * merely fitting it: by then the queued trailing run has settled and the coalescer's slot is
