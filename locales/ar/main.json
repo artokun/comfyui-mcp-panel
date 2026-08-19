@@ -1027,6 +1027,7 @@
       "updated_to_you_were_on_what_changed": "تم التحديث إلى {version} (كنت على {lastSeen}) — ما الذي تغيّر:",
       "using": "جارٍ استخدام {tool}…",
       "video": "فيديو",
+      "video_preview_off_click_to_view": "معاينة الفيديو متوقفة — انقر للعرض",
       "view_full_size": "عرض بالحجم الكامل",
       "voice_input_error": "خطأ في الإدخال الصوتي: {error}",
       "voice_input_is_not_supported_in_this": "الإدخال الصوتي غير مدعوم في هذا المتصفح",

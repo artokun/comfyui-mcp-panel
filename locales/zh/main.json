@@ -832,6 +832,7 @@
       "updated_to_you_were_on_what_changed": "已更新到 {version}（你之前用的是 {lastSeen}）—— 更新内容：",
       "using": "正在使用 {tool}…",
       "video": "视频",
+      "video_preview_off_click_to_view": "视频预览已关闭 — 点击查看",
       "view_full_size": "查看原始尺寸",
       "voice_input_error": "语音输入出错：{error}",
       "voice_input_is_not_supported_in_this": "此浏览器不支持语音输入",

@@ -832,6 +832,7 @@
       "updated_to_you_were_on_what_changed": "{version} に更新しました（以前は {lastSeen}）— 変更点:",
       "using": "{tool} を使用中…",
       "video": "動画",
+      "video_preview_off_click_to_view": "動画プレビューはオフです — クリックで表示",
       "view_full_size": "原寸大で表示",
       "voice_input_error": "音声入力のエラー: {error}",
       "voice_input_is_not_supported_in_this": "このブラウザーでは音声入力に対応していません",

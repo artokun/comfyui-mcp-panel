@@ -47,6 +47,10 @@
     "name": "RunPod / Yerel'i göster",
     "tooltip": "Araç çubuğunda RunPod / Yerel sunucu düğmesini gösterir — bulut GPU podu oluştur/başlat/durdur/bağlan ya da yerele geri dön. Varsayılan olarak kapalı; bu seçenek bağlı bir mobil uygulamaya da iletilir."
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "Sohbette video önizlemeleri",
+    "tooltip": "Oluşturulan videoları sohbet içinde oynat. RAM'den tasarruf etmek için kapat: video, ilk karesi ve dosya adını gösteren bir yer tutucu olarak görünür; tıklamak videonun tamamını ışık kutusunda açar. Değişiklikten sonra oluşturulan videolar için geçerlidir; sohbette zaten bulunan kartlar oynatıcılarını korur."
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Beta uygulamayı edinin",
     "tooltip": "ComfyUI MCP mobil uygulamasının test sürümü indirmeleri. iOS, Apple TestFlight üzerinden; Android, Firebase App Distribution üzerinden kurulur. İki kanal da beta: sürümler sık güncellenir ve bu panelle yeniden eşleştirme gerekebilir."

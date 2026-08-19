@@ -871,6 +871,7 @@
       "updated_to_you_were_on_what_changed": "به {version} به‌روزرسانی شد (پیش‌تر روی {lastSeen} بودید) — چه چیزی عوض شد:",
       "using": "در حال استفاده از {tool}…",
       "video": "ویدیو",
+      "video_preview_off_click_to_view": "پیش‌نمایش ویدیو خاموش است — برای دیدن کلیک کنید",
       "view_full_size": "دیدن در اندازهٔ کامل",
       "voice_input_error": "خطای ورودی صوتی: {error}",
       "voice_input_is_not_supported_in_this": "ورودی صوتی در این مرورگر پشتیبانی نمی‌شود",

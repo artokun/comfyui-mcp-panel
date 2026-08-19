@@ -910,6 +910,7 @@
       "updated_to_you_were_on_what_changed": "Actualizado a {version} (estabas en {lastSeen}) — esto es lo que cambió:",
       "using": "Usando {tool}…",
       "video": "Video",
+      "video_preview_off_click_to_view": "Vista previa de video desactivada — haz clic para ver",
       "view_full_size": "Ver a tamaño completo",
       "voice_input_error": "Error de entrada de voz: {error}",
       "voice_input_is_not_supported_in_this": "Este navegador no admite la entrada por voz",

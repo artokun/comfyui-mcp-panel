@@ -47,6 +47,10 @@
     "name": "显示 RunPod / 本地",
     "tooltip": "在工具栏显示 RunPod / 本地主机按钮 —— 部署/启动/停止/连接云端 GPU Pod，或切回本地。默认关闭；该开关也会发送给已连接的手机应用。"
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "聊天中的视频预览",
+    "tooltip": "在聊天中内联播放生成的视频。关闭以节省内存：视频将显示为带有第一帧和文件名的占位符，点击即可在灯箱中打开完整视频。适用于更改后生成的视频；聊天中已有的卡片保留其播放器。"
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "获取测试版应用",
     "tooltip": "ComfyUI MCP 手机应用的测试者下载。iOS 通过 Apple TestFlight 安装，Android 通过 Firebase App Distribution 安装。两个渠道都是测试版：版本更新频繁，可能需要与此面板重新配对。"

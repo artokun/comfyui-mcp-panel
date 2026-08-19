@@ -910,6 +910,7 @@
       "updated_to_you_were_on_what_changed": "Mis à jour vers {version} (vous étiez en {lastSeen}) — ce qui a changé :",
       "using": "Utilisation de {tool}…",
       "video": "Vidéo",
+      "video_preview_off_click_to_view": "Aperçu vidéo désactivé — cliquez pour voir",
       "view_full_size": "Voir en taille réelle",
       "voice_input_error": "Erreur de saisie vocale : {error}",
       "voice_input_is_not_supported_in_this": "La saisie vocale n'est pas prise en charge par ce navigateur",
