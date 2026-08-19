@@ -54,6 +54,9 @@ function deferred() {
  */
 function realRefreshNodes({
   holdFirstRun = null,
+  // Whether the held run is started BEFORE the tool call (someone else's, holding the slot)
+  // or left for the tool call to start itself (nothing in flight — the uncontended case).
+  startInFlight = true,
   budgetMs = 150,
   verdicts = [{ refreshed: true, reason: "refreshed" }],
 } = {}) {
@@ -73,7 +76,8 @@ function realRefreshNodes({
     withTimeout,
   });
   // A refresh THIS PANEL started — not the tool call — already holding the slot.
-  const inFlightStarted = holdFirstRun ? refreshComfyNodeDefs(undefined, { force: true }) : null;
+  const inFlightStarted =
+    holdFirstRun && startInFlight ? refreshComfyNodeDefs(undefined, { force: true }) : null;
 
   const deps = {
     refreshComfyNodeDefs,
@@ -158,12 +162,24 @@ test("#1404: the reply NAMES the cause instead of collapsing it into 'unknown'",
   assert.equal(value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
   assert.notEqual(value.reason, "unknown", "an abandoned wait is not an unknown failure");
   assert.match(value.remedy, /RETRY/, "…and the remedy is a retry");
-  assert.ok(!/reload/i.test(value.remedy), "…not a tab reload, which throws away canvas state");
+  // A tab reload throws away canvas state, so it may only ever be the ESCALATION — named
+  // after the retry, and conditioned on the retry not working. #852/#663: a refusal that
+  // sends the caller to the wrong recovery costs more than the refusal itself.
+  assert.ok(
+    value.remedy.indexOf("RETRY") < value.remedy.search(/reload/i),
+    "reload must come after the retry, never instead of it",
+  );
+  assert.match(value.remedy, /keeps reporting this[\s\S]*reload/i, "…and only if retrying fails");
   assert.match(
     value.detail,
     /[Nn]othing failed/,
     "the caller must know nothing was left half-done before it retries",
   );
+  // BOTH runs. The coalescer returns one symbol whether the budget went on a run someone
+  // else started or on this command's own, so a detail naming only the first would be
+  // flatly wrong on an uncontended big install — the case with no concurrency at all.
+  assert.match(value.detail, /something else started/, "the contended case");
+  assert.match(value.detail, /own registration/, "…and this command's own run");
 
   gate.resolve();
   await built.inFlightStarted?.catch(() => {});
@@ -193,6 +209,29 @@ test("#1404: the abandoned run is NOT cancelled, and the retry it asks for succe
     "the retry the remedy prescribes never replied either",
   );
   assert.deepEqual(second.value, { ok: true, refreshed: true });
+});
+
+test("#1404: an UNCONTENDED run that outlives the budget lands on the same named verdict", async () => {
+  // The other half of the symbol, and the reason the detail names both runs. With nothing in
+  // flight the coalescer takes the last branch — `waitForRun(startRun(…), joinMs)` — so the
+  // budget can run out on a run this command started ITSELF, with no concurrency anywhere.
+  // That is a big install's ordinary case, and a reply that blamed "something else" for it
+  // would be a true-sounding statement about the wrong cause.
+  const gate = deferred();
+  // Held, but NOT pre-started: the slot is empty when the tool call arrives, so the run that
+  // outlives the bound is the one this command started itself.
+  const built = realRefreshNodes({ holdFirstRun: gate.promise, startInFlight: false, budgetMs: 150 });
+
+  const { value, elapsed } = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "an uncontended slow run never replied",
+  );
+  assert.equal(value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
+  assert.equal(built.runs.length, 1, "there was never a second run — nothing else was in flight");
+  assert.ok(elapsed < 1000, `replied in ${elapsed}ms — the bound must end this wait too`);
+
+  gate.resolve();
 });
 
 // ---------------------------------------------------------------------------

@@ -10770,16 +10770,24 @@ const GRAPH_TOOL_EXECUTORS = {
         ok: true,
         refreshed: false,
         reason: NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING,
+        // BOTH RUNS, because the value cannot tell them apart and neither may this sentence.
+        // The coalescer answers with one symbol whether the budget went on a run someone else
+        // started or on the one this command started itself (nothing in flight ⇒ the last
+        // branch of `refresh`), so a message naming only the first would be flatly wrong in
+        // the second case — and it is the case a big install hits without any concurrency at
+        // all. `graph_add_node`'s refusal names both for the same reason.
         detail:
-          `A node-def refresh started by something else — a ComfyUI reconnect, a finished ` +
-          `install or download, or this panel's own missing-asset check after an upload — ` +
-          `was still running, and this command's ` +
-          `${Math.round(REFRESH_NODES_COMMAND_BUDGET_MS / 1000)}s budget ran out waiting ` +
-          `for it. Nothing failed and nothing was changed.`,
+          `A node-def refresh was still running when this command's ` +
+          `${Math.round(REFRESH_NODES_COMMAND_BUDGET_MS / 1000)}s budget ran out waiting for ` +
+          `it — either one something else started (a ComfyUI reconnect, a finished install or ` +
+          `download, this panel's own missing-asset check after an upload) or this command's ` +
+          `own registration. Nothing failed and nothing was changed.`,
         remedy:
-          "That refresh is still running and is fetching exactly the /object_info this call " +
-          "wanted, so RETRY in a few seconds — this normally succeeds on the next attempt " +
-          "because the retry pays for one refresh instead of two.",
+          "That refresh was NOT cancelled — it is still running and still fetching exactly the " +
+          "/object_info this call wanted — so RETRY in a few seconds. A retry that lands after " +
+          "it settles pays for one refresh instead of two, which is normally enough; if it " +
+          "keeps reporting this, the refresh itself is slower than the budget and reloading " +
+          "the ComfyUI tab is the fallback that remains.",
       };
     }
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
