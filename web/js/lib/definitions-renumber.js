@@ -92,7 +92,7 @@ const RENUMBER_STATE_KEYS = new Set(["lastLinkId", "lastRerouteId"]);
 
 /** #1706 — `lastNodeId` is the counter `findNextAvailableId` allocates the new ids
  *  from, so a node relabeling cannot happen without it moving. It is admitted ONLY
- *  when a relabeling was actually found (see `anyNodeRenumber`), and only FORWARD:
+ *  when a relabeling was actually found (see `anyRelabel`), and only FORWARD:
  *  a counter that went backwards is not an allocation. */
 const RENUMBER_STATE_KEYS_WITH_NODE_IDS = new Set(["lastLinkId", "lastRerouteId", "lastNodeId"]);
 
@@ -269,6 +269,18 @@ function buildNodeIdMap(nodesA, nodesB) {
     // Type is REQUIRED and must match at the position: an id reused for a different
     // type is a different node however the count reads (#886's `nodeKey`), and a
     // relabeling never changes what a node IS.
+    //
+    // The two lines are NOT equivalent, and only the first can be killed by mutation.
+    // REQUIRING a type is load-bearing: without it two typeless nodes pair up, and a
+    // definition of typeless nodes whose ids moved would read as a relabeling (#886's
+    // "a node missing an id or type refuses" pins exactly that). The EQUALITY check
+    // deliberately overlaps `differsOnlyIn` in `nodesDifferOnlyInLinkRefs`, which
+    // compares `type` on every pair a few lines later and refuses first — measured by
+    // mutation: deleting this line kills no test. It stays because this function's
+    // answer is "is this pairing a relabeling at all", and that question has to be
+    // answerable here: `anyRelabel` is decided from these maps in pass 1 and widens
+    // what EVERY OTHER definition may differ in. A later change to the field
+    // comparison must not silently take that with it.
     if (typeof na.type !== "string" || !na.type) return null;
     if (na.type !== nb.type) return null;
     let keyFrom;
@@ -306,7 +318,7 @@ function mapRelabelsAnything(map) {
  *  reference — plus, when a relabeling is in play, its own `id` (already pinned by the
  *  map) and its recomputed `order`. Slot COUNTS and every other field must be
  *  identical. */
-function nodesDifferOnlyInLinkRefs(a, b, { map, relabeled } = {}) {
+function nodesDifferOnlyInLinkRefs(a, b, { relabeled } = {}) {
   if (!Array.isArray(a) || !Array.isArray(b)) return false;
   if (a.length !== b.length) return false;
   // ORDER matters, and review was right to insist: LiteGraph node order can carry
@@ -319,9 +331,15 @@ function nodesDifferOnlyInLinkRefs(a, b, { map, relabeled } = {}) {
     const na = a[i];
     const nb = b[i];
     if (!differsOnlyIn(na, nb, allowedNodeFields)) return false;
-    // The id is not waived: it must be EXACTLY what the map says, so a node whose id
-    // moved in some other way than the relabeling cannot ride in on the allowance.
-    if (!deepEqual(map?.get(String(na.id)), nb.id)) return false;
+    // `id` is in `allowedNodeFields` when relabeled, and needs no separate check here:
+    // the PAIRING IS THE MAP. `buildNodeIdMap` walked these same two arrays in this same
+    // order and recorded `String(na.id) -> nb.id` for this position, and refused if
+    // either side repeated an id — so `map.get(String(na.id)) === nb.id` holds by
+    // construction. A check restating it would assert nothing (measured by mutation:
+    // deleting one killed no test), and a check that asserts nothing is worse than no
+    // check, because it reads like a guard. What actually pins the id is the map itself,
+    // and the link/widget comparisons below, which are the only places the new ids are
+    // allowed to be USED.
     // Slot arrays may differ ONLY in the link ids they carry.
     for (const side of ["inputs", "outputs"]) {
       const sa = na[side];
@@ -398,7 +416,7 @@ function definitionDiffersOnlyByRenumber(a, b, map, relabeled) {
   if (!differsOnlyIn(a, b, fields)) return false;
   const mapNodeId = relabeled ? (id) => (map.has(String(id)) ? map.get(String(id)) : id) : undefined;
   if (!linksDifferOnlyById(a.links, b.links, mapNodeId)) return false;
-  if (!nodesDifferOnlyInLinkRefs(a.nodes ?? [], b.nodes ?? [], { map, relabeled })) return false;
+  if (!nodesDifferOnlyInLinkRefs(a.nodes ?? [], b.nodes ?? [], { relabeled })) return false;
   if (relabeled && !widgetsDifferOnlyByNodeId(a.widgets, b.widgets, map)) return false;
   if (!stateDiffersOnlyByCounters(a.state, b.state, relabeled)) return false;
   return true;

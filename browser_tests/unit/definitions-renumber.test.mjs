@@ -725,3 +725,30 @@ test("#1706 P1: a definition the map did not move is still compared in FULL", ()
   c.liveDefinitions.subgraphs[1].nodes[0].widgets_values = ["CHANGED"];
   assert.equal(verdict(c), false);
 });
+
+test("#1706 P0: two payload nodes COLLAPSING onto one live id is not a relabeling", () => {
+  // The injectivity refusal, isolated. Measured by mutation: the captured-fixture
+  // version of this refused for the WRONG reason (its links still named the old
+  // second id), so removing the `usedTargets` check killed no test. Here the links
+  // are collapsed consistently too, so the ONLY thing standing between this and a
+  // "relabeling" verdict is the requirement that the map be injective — and what it
+  // is standing in front of is a definition that lost a node.
+  const twoNodes = (idA, idB) => ({
+    subgraphs: [
+      {
+        id: "sub-1",
+        name: "Detailer",
+        state: { lastLinkId: 11, lastNodeId: Math.max(Number(idA), Number(idB)) },
+        links: [[11, idA, 0, idB, 0, "IMAGE"]],
+        nodes: [
+          { id: idA, type: "LoadImage", widgets_values: [], outputs: [{ links: [11] }] },
+          { id: idB, type: "LoadImage", widgets_values: [], inputs: [{ link: 11 }] },
+        ],
+      },
+    ],
+  });
+  // Sanity: a genuine, injective relabeling of the same definition IS accounted...
+  assert.equal(definitionsDifferOnlyByRenumber(twoNodes(3, 4), twoNodes(40, 41), { rootNodes: [] }), true);
+  // ...and the collapse is not, even though every other check passes under it.
+  assert.equal(definitionsDifferOnlyByRenumber(twoNodes(3, 4), twoNodes(40, 40), { rootNodes: [] }), false);
+});
