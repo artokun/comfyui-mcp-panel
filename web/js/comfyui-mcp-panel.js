@@ -531,6 +531,11 @@ import {
   normalizePath,
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
+import {
+  clearInheritedExecutionPreview,
+  clearStoredExecutionOutputs,
+  stripMisattachedExecutionPreviews,
+} from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { composeShowMediaReply } from "./lib/media-preview.js";
 import {
@@ -12058,6 +12063,12 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       graph.afterChange();
     }
+    // #1286 — a newly assigned id may still hold the previous occupant's
+    // execution images. Wipe that leftover so this node cannot inherit a preview.
+    clearInheritedExecutionPreview(node, {
+      nodeOutputs: comfyApp?.nodeOutputs,
+      nodePreviewImages: comfyApp?.nodePreviewImages,
+    });
     graph.setDirtyCanvas(true, true);
     const added = summarizeNode(node);
     const rejectedCorrections = correctionOut.rejected ?? [];
@@ -12146,9 +12157,15 @@ const GRAPH_TOOL_EXECUTORS = {
         `Node ${removedId} could not be removed (it may be protected / ignore_remove).`,
       );
     }
+    // #1286 — drop stored execution images for this id so a later add that
+    // reuses it cannot inherit the removed node's preview.
+    clearStoredExecutionOutputs(
+      { nodeOutputs: app?.nodeOutputs, nodePreviewImages: app?.nodePreviewImages },
+      removedId,
+    );
     graph.setDirtyCanvas(true, true);
     return {
-      removed: summary,
+      removed: summary;
       ...(cleaned && (cleaned.inputs.length || cleaned.outputs.length)
         ? { cleaned_boundary_slots: cleaned }
         : {}),
@@ -32162,6 +32179,18 @@ function buildPanel() {
     if (inlineImages.length || videos.length) {
       runCompletion.onExecuted(d.prompt_id, { images: inlineImages, videos });
     }
+    // #1286 — ComfyUI keys preview images by node id and will plant
+    // $$canvas-image-preview on whatever node now holds that id (a freshly
+    // added ConditioningConcat after a live-canvas edit). Keep the preview
+    // on the emitting image/output node.
+    if (media.length) {
+      stripMisattachedExecutionPreviews({
+        graph: app?.graph,
+        nodeOutputs: app?.nodeOutputs,
+        nodePreviewImages: app?.nodePreviewImages,
+        preferNodeId: nodeId,
+      });
+    }
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
@@ -32221,6 +32250,13 @@ function buildPanel() {
   // start→finish duration, and reliably wakes the agent on the real result.
   function onExecutionSuccess(ev) {
     runCompletion.onExecutionSuccess(ev?.detail?.prompt_id);
+    // #1286 — backstop for b_preview frames that never emit `executed` images
+    // (KSampler latent previews routed to a non-image node after an add).
+    stripMisattachedExecutionPreviews({
+      graph: app?.graph,
+      nodeOutputs: app?.nodeOutputs,
+      nodePreviewImages: app?.nodePreviewImages,
+    });
   }
   // Primary render-duration start signal: ComfyUI emits `execution_start` with the
   // prompt_id the instant a run begins — anchor the duration timer there and flush
