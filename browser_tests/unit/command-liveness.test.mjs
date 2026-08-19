@@ -824,9 +824,9 @@ test("#1095 codex P1: the canvas-tool disclosure is decided when the frame LEAVE
   assert.ok(closureAt !== -1 && planAt !== -1, "both the closure and the plan must exist");
   assert.ok(planAt > closureAt, "the disclosure must be planned INSIDE the deferred send");
   // …and everything derived from it must live there too, or the recompute is decorative.
-  const outTextAt = body.indexOf("const outText =");
+  const outContextAt = body.indexOf("const outContext =");
   const disclosedAt = body.indexOf("const disclosed =");
-  assert.ok(disclosedAt > closureAt && outTextAt > closureAt, "the decision and the text ride with it");
+  assert.ok(disclosedAt > closureAt && outContextAt > closureAt, "the decision and the context ride with it");
   // The one-shot context is the opposite case and must stay OUTSIDE: pendingContext is
   // consumed when the user presses send, and re-reading it at drain time would either lose
   // it or attach it to the wrong message.

@@ -21,9 +21,15 @@ test('renders a streamed agent reply into the last agent bubble', async ({
   const received = mockBridge.waitForUserMessage()
   await panel.sendMessage('say hello')
   const msg = await received
-  expect(msg.text).toContain('say hello')
+  expect(msg.text).toBe('say hello')
+  // #1310 — the LIVE-CANVAS block is for the agent. It may ride in context on
+  // an unestablished session, but it must not be the user-visible text.
+  expect(msg.text).not.toContain('LIVE-CANVAS')
+  await expect(panel.userBubbles.last()).toContainText('say hello')
+  await expect(panel.userBubbles.last()).not.toContainText('LIVE-CANVAS')
 
   mockBridge.replyStreamed('hello world')
 
   await expect(panel.agentBubbles.last()).toContainText('hello world')
+  await expect(panel.agentBubbles.last()).not.toContainText('LIVE-CANVAS')
 })

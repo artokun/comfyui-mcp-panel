@@ -6,7 +6,10 @@ import {
   buttonReplyText,
   isDroppedAgentReplay,
   serializeContext,
+  stripAgentDirectedBlocks,
 } from "../../web/js/lib/chat-serialize.js";
+
+import { CANVAS_TOOL_DISCLOSURE } from "../../web/js/lib/canvas-tool-disclosure.js";
 
 test("strings pass through unchanged", () => {
   assert.equal(coerceMessageText("hello"), "hello");
@@ -230,4 +233,65 @@ test("an unknown-shape object context degrades to JSON, never [object Object] (#
   assert.notEqual(out, "[object Object]");
   assert.ok(!out.includes("[object Object]"), `got: ${out}`);
   assert.equal(out, '{"foo":1,"bar":2}');
+});
+
+// --- #1310: agent-directed instruction blocks never render in the transcript --
+// The shipped painters (renderUserText / paintAgent / paintCard) run this
+// stripper on every bubble. These cases are the ones the issue named.
+
+test("#1310 LIVE-CANVAS TOOLS is stripped off a user turn, leaving the typed text", () => {
+  const typed = "make the sampler 20 steps";
+  const out = stripAgentDirectedBlocks(CANVAS_TOOL_DISCLOSURE + typed);
+  assert.equal(out, typed);
+  assert.doesNotMatch(out, /LIVE-CANVAS TOOLS/);
+  assert.doesNotMatch(out, /COMFYUI_MCP_TOOL_MODE/);
+});
+
+test("#1310 a user who types LIVE-CANVAS TOOLS mid-sentence is left alone", () => {
+  const typed = "what is this LIVE-CANVAS TOOLS warning?";
+  assert.equal(stripAgentDirectedBlocks(typed), typed);
+});
+
+test("#1310 MANUAL CANVAS CHANGES and ACTIVE WORKFLOW CHANGED strip as prefixes", () => {
+  assert.equal(
+    stripAgentDirectedBlocks(
+      "⟳ MANUAL CANVAS CHANGES since your last turn — the user edited the graph directly:\n  node 3 widget\nTreat the canvas as being in THIS state now.\n\nkeep going",
+    ),
+    "keep going",
+  );
+  assert.equal(
+    stripAgentDirectedBlocks(
+      "⟳ ACTIVE WORKFLOW CHANGED since your last turn. Re-read with panel_graph_outline.\n\nok",
+    ),
+    "ok",
+  );
+});
+
+test("#1310 stacked agent-directed prefixes all come off", () => {
+  const stacked =
+    CANVAS_TOOL_DISCLOSURE +
+    "⟳ MANUAL CANVAS CHANGES since your last turn — the user edited the graph directly:\n  x\nTreat the canvas as being in THIS state now.\n\n" +
+    "hello";
+  assert.equal(stripAgentDirectedBlocks(stacked), "hello");
+});
+
+test("#1310 hidden orchestrator notes and validation banners strip", () => {
+  assert.equal(
+    stripAgentDirectedBlocks(
+      "[The user cannot see this message — it is orchestrator status for you alone.]\n• lock error\n\nplease retry",
+    ),
+    "please retry",
+  );
+  assert.equal(
+    stripAgentDirectedBlocks(
+      "⚠️ GRAPH VALIDATION ERRORS — ComfyUI rejected the current graph at queue time;\n  node 1\nAddress these before running.\n\nfix it",
+    ),
+    "fix it",
+  );
+});
+
+test("#1310 empty / already-clean text is a no-op", () => {
+  assert.equal(stripAgentDirectedBlocks(""), "");
+  assert.equal(stripAgentDirectedBlocks("just a normal message"), "just a normal message");
+  assert.equal(stripAgentDirectedBlocks(null), "");
 });
