@@ -414,3 +414,108 @@ test("#1192: a bounded FORCED join that lands still forwards the trailing run's 
   await inflight;
   assert.equal(await forced, true, "the trailing run's own verdict, not a stand-in");
 });
+
+// ── #1351: joinMs bounds the invocation, not just the join ───────────────────
+//
+// #1192 capped the wait on a run someone else started. The residual is the run THIS
+// caller starts AFTER that join lands: `joinMs` used to ignore it, so a join that
+// succeeded near its bound still paid a full own run (~13 s of waiting + unbounded
+// local work) and missed the 30 s relay window with every per-step bound green.
+// Measured at 8.0× (2,251 ms against a 280 ms bound) during the #1342/#1349 gate.
+
+test("#1351: a join that lands still bounds the run that follows it", async () => {
+  const joinGate = deferred();
+  const ownGate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await joinGate.promise;
+    else await ownGate.promise; // this caller's own run never lands on its own
+  });
+
+  const older = coalescer();
+  const NEW_DEFS = { NewNode: {} };
+  const started = Date.now();
+  const withPayload = coalescer(NEW_DEFS, { joinMs: 80 });
+  // The join SUCCEEDS — the residual is not an abandoned join. The own run is what
+  // used to be waited out unbounded.
+  joinGate.resolve();
+  await older;
+
+  const outcome = await withPayload;
+  assert.equal(outcome, REFRESH_JOIN_ABANDONED, "the caller stopped waiting on its own run");
+  assert.ok(
+    Date.now() - started < 500,
+    "…at what joinMs had left, not when the own run eventually settles",
+  );
+  // The join settled, so starting the run is not a stampede. The payload is in the
+  // slot and will register; only this caller's wait ended.
+  assert.ok(registered.includes(NEW_DEFS), "the own run started after the join settled");
+
+  ownGate.resolve();
+});
+
+test("#1351: with nothing in flight, joinMs still bounds THIS run", async () => {
+  // The 8.0× measurement: no meaningful join, a 280 ms bound, a 2,251 ms own run.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async () => {
+    await gate.promise;
+  });
+
+  const NEW_DEFS = { NewNode: {} };
+  const started = Date.now();
+  const outcome = await coalescer(NEW_DEFS, { joinMs: 40 });
+
+  assert.equal(outcome, REFRESH_JOIN_ABANDONED, "a bound with no join to spend still expires");
+  assert.ok(Date.now() - started < 400, "…at the bound, not when the run eventually settles");
+  assert.ok(registered.includes(NEW_DEFS), "the run was started; only the wait ended");
+
+  gate.resolve();
+});
+
+test("#1351: an own run that lands INSIDE the remaining bound still registers (#289 P2 intact)", async () => {
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async (defs) => {
+    if (defs == null) await gate.promise;
+  });
+
+  const older = coalescer();
+  const NEW_DEFS = { NewNode: {} };
+  const withPayload = coalescer(NEW_DEFS, { joinMs: 5000 });
+  gate.resolve();
+  await older;
+  const outcome = await withPayload;
+
+  assert.notEqual(outcome, REFRESH_JOIN_ABANDONED, "a healthy own run is not abandoned");
+  assert.ok(registered.includes(NEW_DEFS), "the fresh payload was registered, bound or no bound");
+});
+
+test("#1351: abandoning the wait on an own run does not cancel it", async () => {
+  // withTimeout does not cancel. The run keeps occupying the slot and registering, so a
+  // retry joins work already in flight rather than starting a competing pass.
+  const ownGate = deferred();
+  const { coalescer, registered, getInFlight } = makeHarness(async (defs) => {
+    if (defs != null) await ownGate.promise;
+  });
+
+  const NEW_DEFS = { NewNode: {} };
+  assert.equal(await coalescer(NEW_DEFS, { joinMs: 40 }), REFRESH_JOIN_ABANDONED);
+  assert.ok(getInFlight(), "the own run is still in the slot after this caller gave up");
+
+  ownGate.resolve();
+  await getInFlight();
+  assert.ok(registered.includes(NEW_DEFS), "…and it still registered the payload");
+});
+
+test("#1351: a forced run with nothing in flight is bounded too", async () => {
+  const gate = deferred();
+  const { coalescer } = makeHarness(async () => {
+    await gate.promise;
+  });
+
+  const started = Date.now();
+  assert.equal(
+    await coalescer(undefined, { force: true, joinMs: 40 }),
+    REFRESH_JOIN_ABANDONED,
+  );
+  assert.ok(Date.now() - started < 400, "force:true is not a way around the bound");
+  gate.resolve();
+});

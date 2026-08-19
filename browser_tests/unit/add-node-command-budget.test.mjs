@@ -163,6 +163,15 @@ function realGraphAddNode({
   // null for "no refresh is in flight". Held open, it is the reported scenario: a ComfyUI
   // restart, whose reconnect refresh is still running when the add arrives.
   holdInFlight = null,
+  // #1351 — milliseconds the PAYLOAD run (this add's own registration) waits before it
+  // registers. The residual: joinMs used to ignore this wait, so a join that landed still
+  // paid the own run in full. Zero keeps every #1192 test on the same clock it had.
+  ownRunMs = 0,
+  // Defs the payload-less (reconnect) run registers once it lands. Default is a live
+  // fetch, which includes NewNode — the #1192 "lands in time" path. The #1351 residual
+  // is the older reconnect that did NOT see NewNode, so this add's own run is what
+  // registers it.
+  inFlightDefs = undefined,
   budgetMs = 400,
   reserveMs = 120,
   registrationMs = 200,
@@ -195,7 +204,10 @@ function realGraphAddNode({
       runs.push(defs);
       // The reconnect run — the one with no payload — is the one a test can hold open.
       if (defs == null && holdInFlight) await holdInFlight;
-      app.registerNodesFromDefs(defs ?? (await api.getNodeDefs()));
+      // #1351 — this add's own registration, after any join. Distinct from holdInFlight:
+      // that is someone else's run, this is ours.
+      if (defs != null && ownRunMs > 0) await sleep(ownRunMs);
+      app.registerNodesFromDefs(defs ?? inFlightDefs ?? (await api.getNodeDefs()));
       return true;
     },
     withTimeout,
@@ -609,4 +621,80 @@ test("#1192: an abandoned drift recovery is reported as a RETRY, not as 'unknown
     /retry/i,
     "…and its reason must name the remedy that actually works",
   );
+});
+
+// ---------------------------------------------------------------------------
+// 5. #1351: the join SUCCEEDING is not the end of the wait this command owns.
+//
+// `joinMs` bounded the wait on someone else's run. After that join landed, this add's
+// OWN run was awaited unbounded — 8.0× its bound in the gate measurement (2,251 ms
+// against 280 ms), and ~13 s on shipped numbers after a join that ended at 20 s, which
+// is the ~33 s worst case against the 30 s relay window. The failing path is the one
+// where every per-step bound is respected and the command still outlives the window.
+// ---------------------------------------------------------------------------
+
+test("#1351: a join that lands near its bound does not then wait out this add's own run", async () => {
+  // The join SUCCEEDS — the in-flight reconnect finishes inside joinMs. The own run is
+  // then what used to blow the window. Without the bound it would take landing + 2000 ms;
+  // with it the add refuses at what joinMs has left and names the retry.
+  const gate = deferred();
+  const comfy = makeComfy();
+  const built = realGraphAddNode({
+    comfy,
+    holdInFlight: gate.promise,
+    // Older reconnect: settled, but did not register NewNode. This add's own run is
+    // the one that would — and used to be waited out unbounded after the join.
+    inFlightDefs: { ExistingNode: backendObjectInfo().ExistingNode },
+    ownRunMs: 2000,
+    budgetMs: 280,
+    reserveMs: 40,
+  });
+
+  const started = Date.now();
+  const pending = built.graph_add_node({ class_type: "NewNode" });
+  // Land AFTER the add has reached the join, so this is the succeed-then-own-run path
+  // rather than a race against a timer started at harness construction.
+  await sleep(30);
+  gate.resolve();
+  await assert.rejects(
+    () => pending,
+    (err) => {
+      assert.equal(err.message, addNodeRefreshBusyMessage("NewNode"));
+      return true;
+    },
+    "an add whose own run would blow the remaining bound must refuse, in words",
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 1200,
+    `the add took ${elapsed}ms — it must give up at the remaining bound, not wait the own run's 2000ms`,
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "the graph was not touched");
+  await built.inFlightStarted?.catch(() => {});
+});
+
+test("#1351: with NO refresh in flight the add still stops waiting on its own run at the bound", async () => {
+  // The 8.0× measurement: no join to spend, a 280 ms bound, a multi-second own run.
+  const comfy = makeComfy();
+  const built = realGraphAddNode({
+    comfy,
+    ownRunMs: 2000,
+    budgetMs: 280,
+    reserveMs: 0,
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "NewNode" }),
+    (err) => {
+      assert.equal(err.message, addNodeRefreshBusyMessage("NewNode"));
+      return true;
+    },
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 1200,
+    `the add took ${elapsed}ms against a 280ms bound — the own run is unbounded again`,
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "the graph was not touched");
 });

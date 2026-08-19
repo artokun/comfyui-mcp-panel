@@ -1853,12 +1853,13 @@ const refreshComfyNodeDefs = makeRefreshCoalescer({
     nodeDefRefreshInFlight = p;
   },
   runRegister: registerComfyNodeDefs,
-  // #1192 — the repo's ONE bounding primitive, injected so a caller can bound its own WAIT
-  // on a run someone else started (`opts.joinMs`). Without it the coalescer waits
-  // unbounded, exactly as it always did — the safe direction for a wiring mistake to fail
-  // in, since the alternative would abandon every join on a panel that forgot this line.
-  // Safe is not the same as noticed, though: dropping it silently restores #1192, so the
-  // CALL SITE is pinned by a test, not just the helper's behaviour.
+  // #1192 / #1351 — the repo's ONE bounding primitive, injected so a caller can bound its
+  // own WAIT (`opts.joinMs`) on a run someone else started AND on the run this caller
+  // starts after that join. Without it the coalescer waits unbounded, exactly as it always
+  // did — the safe direction for a wiring mistake to fail in, since the alternative would
+  // abandon every join on a panel that forgot this line. Safe is not the same as noticed,
+  // though: dropping it silently restores #1192, so the CALL SITE is pinned by a test, not
+  // just the helper's behaviour.
   withTimeout,
 });
 
@@ -10348,7 +10349,8 @@ const ADD_NODE_COMMAND_BUDGET_MS = 25000;
 const ADD_NODE_POST_REFRESH_RESERVE_MS = CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
 
 /**
- * #1192 — the refusal for an add whose budget went on a refresh SOMEONE ELSE started.
+ * #1192 / #1351 — the refusal for an add whose budget went on a node-def refresh —
+ * someone else's in-flight run, or this command's own run after that join settled.
  *
  * RECOVERABLE BY CONSTRUCTION, and worded to say so. The in-flight run was not cancelled
  * (nothing here can cancel it) and it is registering the very definitions this add needs, so
@@ -10357,9 +10359,10 @@ const ADD_NODE_POST_REFRESH_RESERVE_MS = CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
  * payload while claiming success, not dropping one while refusing.
  */
 const addNodeRefreshBusyMessage = (classType) =>
-  `Cannot add "${classType}" right now: a node-def refresh started by something else — a ` +
-  "ComfyUI reconnect, a finished install, or another tool call — was still running, and " +
-  `waiting for it would have used up this command's ${Math.round(ADD_NODE_COMMAND_BUDGET_MS / 1000)}s ` +
+  `Cannot add "${classType}" right now: a node-def refresh — a ComfyUI reconnect, a ` +
+  "finished install, another tool call, or this command's own registration — was still " +
+  "running, and waiting for it would have used up this command's " +
+  `${Math.round(ADD_NODE_COMMAND_BUDGET_MS / 1000)}s ` +
   "budget before the node could be registered. NOTHING WAS ADDED and nothing was changed. " +
   "That refresh is still running and is registering exactly the definitions this add needs, " +
   "so RETRY in a few seconds — this normally succeeds on the next attempt. If it keeps " +
@@ -12257,21 +12260,26 @@ const GRAPH_TOOL_EXECUTORS = {
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
       },
-      // #1192 — THE TERM THAT CANNOT BE SHRUNK FROM HERE, bounded at the only thing this
-      // caller owns: its own WAIT.
+      // #1192 / #1351 — THE TERM THAT CANNOT BE SHRUNK FROM HERE is the in-flight run
+      // someone else started. This caller owns its own WAIT, including the run it starts
+      // after that join settles.
       //
       // `refreshComfyNodeDefs` is the coalescer. With a payload it waits for any in-flight
       // run and then starts its own, so on the scenario this add is most likely to meet —
       // a ComfyUI restart, which is exactly when a reconnect-triggered refresh is already
       // running — it pays a full run (about 9,000 ms of bounded waiting plus unbounded
       // local work) before its OWN registration begins. That first run started under
-      // someone else's deadline and no number passed from here can shorten it.
+      // someone else's deadline and no number passed from here can shorten it. The own
+      // run used to be unbounded from here too: a join landing at 20,000 ms then added
+      // ~13,000 ms of this caller's work, ~33 s against the 30 s relay window, with every
+      // per-step bound respected. `joinMs` is now a deadline for the whole invocation.
       //
       // So the wait is capped, and a cap needs a decision for when it fires. Proceeding
       // would mean adding a node whose class may not be registered — #458's fabricated
       // placeholder. Blocking is the reported bug. It REFUSES, in words, recoverably: see
       // `addNodeRefreshBusyMessage`, and `REFRESH_JOIN_ABANDONED` in refresh-coalesce.js
-      // for why the abandoned caller must not start a competing run instead.
+      // for why an abandoned JOIN must not start a competing run, and why an abandoned
+      // OWN RUN still starts (the slot is free; retry joins a registration already going).
       //
       // The reserve is held back so the join cannot eat the steps that follow it. Without
       // it a join finishing at the wire leaves the widget-registration wait milliseconds,

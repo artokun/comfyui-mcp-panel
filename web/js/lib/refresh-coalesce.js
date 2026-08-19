@@ -22,18 +22,22 @@
 // AFTER the current run settles. Multiple forced calls that arrive during one
 // in-flight run coalesce into a SINGLE trailing run (no /object_info stampede).
 //
-// #1192 — A CALLER MAY BOUND ITS OWN WAIT, and that is the only thing it may bound.
+// #1192 / #1351 — A CALLER MAY BOUND ITS OWN WAIT. That wait is the whole invocation,
+// not just the join.
 //
 // Every branch above begins with `await current` — a wait on a run that ALREADY STARTED,
 // under a deadline someone else took. A caller cannot retroactively shorten that run, and
-// nothing here pretends to: `opts.joinMs` bounds the CALLER'S WAIT and never the run. The
-// run keeps going, registers whatever it fetched, and clears the slot exactly as before.
+// nothing here pretends to: `opts.joinMs` never cancels work already in flight. The run
+// keeps going, registers whatever it fetched, and clears the slot exactly as before.
 //
-// This exists because the wait is a real term in a command's budget. `graph_add_node` meets
-// it on the scenario it is most likely to fail on — a ComfyUI restart, which is precisely
-// when a reconnect-triggered refresh is already in flight — and a full run costs ~9s of
-// bounded waiting plus ~4s of deliberately-unbounded local work. Unbounded, that single
-// term can consume most of the add's window before its own registration has begun.
+// #1192 bounded the JOIN. That was not enough. With a payload the join is followed by
+// THIS caller's own `startRun`, and `joinMs` used to ignore that second wait. Measured:
+// a 280 ms bound, join landing inside it, then the own run adding 2,251 ms (8.0×). With
+// shipped numbers a join can end at 20,000 ms and the own run then adds ~13,000 ms
+// (NODE_DEFS_RUN_BUDGET_MS plus the deliberately-unbounded local work) — ~33 s against
+// the 30 s relay window, with every per-step bound respected. So `joinMs` is a deadline
+// for this invocation: the join, then whatever remains for the run this caller starts.
+// The run is not cancelled (nothing here can cancel it); the caller stops WAITING.
 //
 // WHAT AN ABANDONED JOIN MUST NOT DO is start a run anyway. The whole reason this
 // coordinator exists is that two concurrent `registerNodesFromDefs` passes stampede; a
@@ -42,9 +46,15 @@
 // as a regression of #289 P2 until the caller's half is read with it: `graph_add_node` does
 // not proceed on that value, it REFUSES IN WORDS and says to retry. Dropping a payload
 // while refusing is safe; dropping one while claiming success is the bug #289 was about.
+//
+// An abandoned OWN RUN is the other half. The join already settled, so starting the run
+// is not a stampede — the slot is free and the payload is the one this caller brought.
+// The run is started, occupies the slot, and keeps registering; only this caller's wait
+// ends. Retry then joins a run that is already registering the class it asked for.
 
 /**
- * Returned when the caller stopped WAITING for a refresh someone else started.
+ * Returned when the caller stopped WAITING — either for a refresh someone else started,
+ * or for a run this caller started that did not finish inside what `joinMs` had left.
  *
  * A distinct value rather than `undefined`, because `undefined` is already what a
  * successful plain join resolves to and the two demand opposite handling — one means "the
@@ -85,6 +95,35 @@ async function joinBounded(current, joinMs, withTimeout) {
   );
 }
 
+/**
+ * Wait for a run THIS caller started (or a shared trailing run), for at most `ms`.
+ *
+ * Distinct from `joinBounded`: the run already belongs to this invocation (or to #396's
+ * trailing guarantee), so a timeout does not cancel it and does not prevent it occupying
+ * the slot. The caller stops waiting and says so. `ms <= 0` must not reach `withTimeout`,
+ * which reads a non-positive bound as NO BOUND.
+ *
+ * A rejecting run still rejects: #608 reads the verdict a forced refresh resolves, and a
+ * bound on the wait must not quietly turn that into a success. Only the abandonment is new.
+ */
+async function waitForRun(run, ms, withTimeout) {
+  if (ms === null) return run;
+  // An abandoned wait is not a reason to turn the run's failure into an unhandled rejection.
+  run.catch(() => {});
+  if (!(ms > 0)) return REFRESH_JOIN_ABANDONED;
+  const settled = await withTimeout(
+    Promise.resolve(run).then(
+      (value) => ({ value }),
+      (err) => ({ err }),
+    ),
+    ms,
+    () => null,
+  );
+  if (settled === null) return REFRESH_JOIN_ABANDONED;
+  if ("err" in settled) throw settled.err;
+  return settled.value;
+}
+
 //   getInFlight / setInFlight : accessors for the shared single-flight promise slot
 //                               (module-level in the panel).
 //   runRegister(preloadedDefs) : performs the actual (idempotent) registration; its
@@ -123,6 +162,10 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       opts && Number.isFinite(opts.joinMs) && typeof withTimeout === "function"
         ? opts.joinMs
         : null;
+    // #1351 — `joinMs` is a deadline for THIS invocation, taken once, so the join and the
+    // run that follows it COMPOSE rather than add. Wall clock, matching `withTimeout`.
+    const startedAt = joinMs === null ? 0 : Date.now();
+    const remaining = () => (joinMs === null ? null : joinMs - (Date.now() - startedAt));
     const current = getInFlight();
     if (current) {
       // No payload, not forced ⇒ joining the settled refresh is enough.
@@ -137,7 +180,10 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         // run here would put a second `registerNodesFromDefs` alongside one still going,
         // which is the stampede this coordinator exists to prevent. The caller refuses.
         if (!(await joinBounded(current, joinMs, withTimeout))) return REFRESH_JOIN_ABANDONED;
-        return startRun(preloadedDefs);
+        // #1351 — the join settled, so starting our own run is not a stampede. What remains
+        // of `joinMs` bounds the wait on THAT run. Wrapping join+run as one promise and
+        // bounding it once would start the run after an abandoned join — the stampede.
+        return waitForRun(startRun(preloadedDefs), remaining(), withTimeout);
       }
       // Forced, no payload ⇒ guarantee a fresh fetch AFTER the current run
       // settles; coalesce concurrent forced calls into ONE trailing run (#396).
@@ -146,6 +192,8 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       // nothing else. A second forced caller with a longer budget still gets the same run;
       // one that gives up does not cancel it, and does not stop it from being queued. That
       // asymmetry is deliberate: the run is #396's guarantee to whoever else is waiting.
+      // The queued promise already includes the trailing `startRun`, so this one bound
+      // covers join AND run — the shape #1351 brings to the payload path as well.
       if (!trailing) {
         trailing = (async () => {
           try {
@@ -157,29 +205,13 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           return startRun(undefined);
         })();
       }
-      const queued = trailing;
-      if (joinMs === null) return queued;
-      // The trailing promise must not go unhandled when this caller stops waiting on it:
-      // #396 guarantees the run to other waiters, and an abandoned wait is not a reason to
-      // turn its failure into an unhandled rejection.
-      queued.catch(() => {});
-      // A budget already spent abandons WITHOUT awaiting — see joinBounded.
-      if (!(joinMs > 0)) return REFRESH_JOIN_ABANDONED;
-      const settled = await withTimeout(
-        queued.then(
-          (value) => ({ value }),
-          (err) => ({ err }),
-        ),
-        joinMs,
-        () => null,
-      );
-      if (settled === null) return REFRESH_JOIN_ABANDONED;
-      // A forced refresh that REJECTS has always rejected for its caller (#608 reads the
-      // verdict it resolves), and a bound on the wait must not quietly turn that into a
-      // success. Only the abandonment is new.
-      if ("err" in settled) throw settled.err;
-      return settled.value;
+      return waitForRun(trailing, joinMs, withTimeout);
     }
-    return startRun(preloadedDefs);
+    // #1351 — nothing in flight, so `joinMs` has no join to bound. It still bounds THIS
+    // run: the 8.0× measurement was a 2,251 ms own run against a 280 ms bound with the
+    // join landing (or never starting) inside it. A bound already spent starts nothing —
+    // the same as an abandoned join, and for the same `withTimeout` trap.
+    if (joinMs !== null && !(joinMs > 0)) return REFRESH_JOIN_ABANDONED;
+    return waitForRun(startRun(preloadedDefs), joinMs, withTimeout);
   };
 }
