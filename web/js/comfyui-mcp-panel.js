@@ -240,6 +240,7 @@ import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } fro
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
+import { duplicateWidgetRows } from "./lib/widget-rows.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
 import {
@@ -9742,13 +9743,8 @@ async function revertGraphSnapshotByMid(mid) {
  *  (positions, colors, internal state) to keep token cost low. */
 function summarizeNode(node) {
   const widgets = {};
-  const namedWidgets = [];
-  const list = node.widgets ?? [];
-  for (let i = 0; i < list.length; i++) {
-    const w = list[i];
-    if (!w || typeof w.name !== "string") continue;
-    widgets[w.name] = w.value;
-    namedWidgets.push({ index: i, w });
+  for (const w of node.widgets ?? []) {
+    if (w && typeof w.name === "string") widgets[w.name] = w.value;
   }
   // #1402: several widgets can legitimately share ONE name — every toggle row of
   // rgthree's Fast Groups Bypasser/Muter is named `RGTHREE_TOGGLE_AND_NAV`. The
@@ -9756,19 +9752,11 @@ function summarizeNode(node) {
   // and the read reports one row's state as if it were the whole node's, hiding
   // duplicated or orphaned rows completely. Surface every occurrence, in canvas
   // order, whenever a name repeats, so a collapsed row is visible instead of
-  // silently dropped.
-  const nameCounts = new Map();
-  for (const { w } of namedWidgets) nameCounts.set(w.name, (nameCounts.get(w.name) ?? 0) + 1);
-  const duplicateWidgets = {};
-  for (const { index, w } of namedWidgets) {
-    if ((nameCounts.get(w.name) ?? 0) < 2) continue;
-    const label = displayLabel(w);
-    (duplicateWidgets[w.name] ??= []).push({
-      index,
-      ...(label != null ? { label } : {}),
-      value: w.value,
-    });
-  }
+  // silently dropped. Accumulated in a Map, not a plain object: a widget name is
+  // arbitrary third-party data, and `(out["__proto__"] ??= []).push(…)` reads
+  // Object.prototype back instead of a missing key and THROWS — taking the whole
+  // node's detail with it, which is strictly worse than the collapsed read.
+  const duplicateWidgets = duplicateWidgetRows(node);
   // #1181: promoted inputs on a subgraph container whose link origin is a
   // frontend-only VIRTUAL source (e.g. a canvas PrimitiveNode). graphToPrompt
   // DROPS that source, so the link carries nothing at run time — the opposite
@@ -11191,7 +11179,13 @@ const GRAPH_TOOL_EXECUTORS = {
           // "had not stuck" while the canvas plainly showed them, and only a screenshot
           // settled it. Renamed widgets ONLY, so an unrenamed graph's outline is
           // byte-identical to before and costs nothing against max_chars.
-          const renamed = widgetLabelMap(n);
+          //
+          // #1402: read the label off the WIDGET, not off a name-keyed map. The outline
+          // renders one token per widget in the array, so it already shows every row of
+          // a repeated name — but looking each row's label up by NAME is last-wins, so
+          // both rgthree `RGTHREE_TOGGLE_AND_NAV` rows were annotated with the LAST row's
+          // label and the outline stated, of two different group toggles, that they were
+          // the same one. Identical for every unique name, which is nearly all of them.
           widgets = (n.widgets ?? [])
             .filter((w) => w && typeof w.name === "string")
             .map((w) => {
@@ -11203,7 +11197,7 @@ const GRAPH_TOOL_EXECUTORS = {
               // same bracket idiom as [after_gen=…] and [bypass].
               // ESCAPED, not merely clipped (codex): `title_` bounds the SIZE, `tagText_`
               // stops a user-controlled label from closing this tag and forging the next.
-              const label = renamed[w.name];
+              const label = displayLabel(w);
               const withLabel = label ? `${base} [renamed "${tagText_(title_(label))}"]` : base;
               const mode = cagMode.get(w.name);
               const withMode = mode ? `${withLabel} [after_gen=${mode}]` : withLabel;

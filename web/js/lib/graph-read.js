@@ -170,8 +170,9 @@ function entrySize(key, value) {
   return JSON.stringify(String(key)).length + vLen + 2; // "key": value ,
 }
 
-/** Return a shallow clone of a summarizeNode() result whose `widgets` are bounded
- *  (#609): each value is clipped, AND the total serialized widgets size is kept under
+/** Return a shallow clone of a summarizeNode() result whose `widgets` (and
+ *  `duplicate_widgets`, #1402) are bounded (#609): each value is clipped, AND the
+ *  total serialized widgets size is kept under
  *  `totalCap` by DROPPING overflow widgets (keeping valid JSON) with an elision
  *  marker — so even a node with many oversized widgets can't blow the char budget.
  *  When a budget is set, the per-value cap is tightened to it so even the single
@@ -209,7 +210,56 @@ export function capSummaryWidgets(summary, cap = WIDGET_VALUE_CAP, totalCap = In
     widgets["…"] =
       `${omitted} more widget(s) cut by the \`max_chars\` budget; ` +
       raiseOrCeiling("max_chars", totalCap, MAX_CHARS_CEILING);
-  return changed ? { ...summary, widgets } : summary;
+  // #1402: `duplicate_widgets` carries a VALUE PER OCCURRENCE, so it is unbounded input
+  // on the very line #609 exists to bound — and the node class it exists for (a Fast
+  // Groups Bypasser over many groups) is precisely the one that repeats a row many
+  // times. Left uncapped it could push the detail past `max_chars`, and fitDetailLine
+  // would then degrade the WHOLE row to a stub: the read this field was added to
+  // improve would come back carrying LESS than before it existed. Bound it in the same
+  // clip-then-drop-with-a-marker idiom, against whatever budget the name-keyed map left
+  // — `widgets` is the addressable, back-compatible field and is served first.
+  const dup = summary.duplicate_widgets;
+  let duplicates = dup;
+  if (dup && typeof dup === "object" && Object.keys(dup).length) {
+    const budget = Number.isFinite(totalCap) ? Math.max(0, totalCap - used) : Infinity;
+    // A Map, then Object.fromEntries — a widget name is third-party data, and
+    // `bucket["__proto__"] ??= []` reads Object.prototype instead of a missing key and
+    // then throws on .push. See web/js/lib/widget-rows.js for the same reasoning.
+    const kept = new Map();
+    let dUsed = 0;
+    let dOmitted = 0;
+    let stopped = false;
+    for (const [rawKey, rows] of Object.entries(dup)) {
+      const k = capKey(rawKey);
+      if (k !== rawKey) changed = true;
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (stopped) { dOmitted++; continue; }
+        const value = capWidgetValue(row?.value, perValueCap, totalCap);
+        if (value !== row?.value) changed = true;
+        const entry = { ...row, value };
+        // Keep at least ONE occurrence, then stop once the total would exceed the
+        // budget — the same floor `widgets` keeps. A field that can silently render
+        // empty is the collapsed map's failure wearing a different key.
+        if (Number.isFinite(budget) && dUsed > 0 && dUsed + entrySize(k, entry) > budget) {
+          stopped = true;
+          dOmitted++;
+          changed = true;
+          continue;
+        }
+        if (!kept.has(k)) kept.set(k, []);
+        kept.get(k).push(entry);
+        dUsed += entrySize(k, entry);
+      }
+    }
+    if (dOmitted > 0)
+      kept.set(
+        "…",
+        `${dOmitted} more duplicate widget occurrence(s) cut by the \`max_chars\` budget; ` +
+          raiseOrCeiling("max_chars", totalCap, MAX_CHARS_CEILING),
+      );
+    duplicates = Object.fromEntries(kept);
+  }
+  return changed ? { ...summary, widgets, ...(dup ? { duplicate_widgets: duplicates } : {}) } : summary;
 }
 
 /** Hard-clip an assembled COMPACT (plain-string) line to `maxChars` (#609). The

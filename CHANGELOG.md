@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `duplicate_widgets` (the #1402 duplicate-widget report) no longer throws the whole detail read away on a widget named `__proto__`/`constructor`/`toString` — occurrences are accumulated prototype-safely — and is now bounded by the same `max_chars` budget as `widgets` (dropped occurrences are announced with the lever that lifts them, never silently lost), so a many-group Fast Groups Bypasser cannot push the detail line into a whole-row stub. `panel_graph_outline` also labels each same-named row from the widget itself rather than a last-wins name-keyed map, so two different group toggles are no longer both annotated with the last row's label (#1402)
+
 ## [0.15.5] - 2026-08-19
 
 ### Added

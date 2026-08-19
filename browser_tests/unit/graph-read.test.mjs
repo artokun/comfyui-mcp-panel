@@ -185,6 +185,62 @@ test("capSummaryWidgets tightens the per-value cap to a SMALL total budget (#609
   assert.match(capped.widgets.blob, /over the `max_chars` budget; raise `max_chars` \(up to 60000\)\)$/);
 });
 
+test("#1402: duplicate_widgets is bounded by the SAME budget, not exempt from it", () => {
+  // duplicate_widgets carries a value per OCCURRENCE, and the node it exists for (a Fast
+  // Groups Bypasser over many groups) is exactly the one that repeats a row many times.
+  // Left uncapped it would push the detail past max_chars and fitDetailLine would stub
+  // the WHOLE row — the field would make the read carry LESS than before it existed.
+  const rows = Array.from({ length: 40 }, (_, i) => ({
+    index: i,
+    label: `Enable GROUP ${i}`,
+    value: "z".repeat(500),
+  }));
+  const capped = capSummaryWidgets(
+    { id: 1, widgets: { RGTHREE_TOGGLE_AND_NAV: "z".repeat(500) }, duplicate_widgets: { RGTHREE_TOGGLE_AND_NAV: rows } },
+    WIDGET_VALUE_CAP,
+    3000,
+  );
+  assert.ok(JSON.stringify(capped).length < 3000 * 2, `line bounded, got ${JSON.stringify(capped).length}`);
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(capped)), "still valid JSON");
+  // Dropped occurrences are ANNOUNCED with the lever that lifts them, never silently
+  // lost — a silent drop here is the collapsed map's failure wearing a different key.
+  assert.match(
+    capped.duplicate_widgets["…"],
+    /more duplicate widget occurrence\(s\) cut by the `max_chars` budget; raise `max_chars` \(up to 60000\)/,
+  );
+  // At least one occurrence always survives, so the field never renders empty.
+  assert.ok(capped.duplicate_widgets.RGTHREE_TOGGLE_AND_NAV.length >= 1);
+  // The input is not mutated (the #609 contract for `widgets` holds here too).
+  assert.equal(rows.length, 40);
+  assert.equal(rows[0].value.length, 500);
+});
+
+test("#1402: a duplicate report that FITS is passed through untouched", () => {
+  // The common affected node — two rgthree toggle rows — is far under budget and must
+  // arrive exactly as summarizeNode built it, markers and clipping nowhere in sight.
+  const duplicate_widgets = {
+    RGTHREE_TOGGLE_AND_NAV: [
+      { index: 0, label: "Enable MODEL FL2", value: { toggled: true } },
+      { index: 1, label: "Enable MODEL REF", value: { toggled: false } },
+    ],
+  };
+  const summary = { id: 1, widgets: { RGTHREE_TOGGLE_AND_NAV: { toggled: false } }, duplicate_widgets };
+  const capped = capSummaryWidgets(summary, WIDGET_VALUE_CAP, 12000);
+  assert.deepEqual(capped.duplicate_widgets, duplicate_widgets);
+  assert.ok(!("…" in capped.duplicate_widgets), "nothing was cut, so nothing is announced");
+  // Nothing changed at all ⇒ the identical object comes back, as with an uncapped node.
+  assert.equal(capped, summary);
+});
+
+test("#1402: a summary with NO duplicates is untouched — the common node is unchanged", () => {
+  const summary = { id: 1, widgets: { seed: 1, steps: 20 } };
+  assert.equal(capSummaryWidgets(summary, WIDGET_VALUE_CAP, 12000), summary);
+  assert.ok(!("duplicate_widgets" in capSummaryWidgets(summary, WIDGET_VALUE_CAP, 12000)));
+  // A widgets-only clip must not invent the key either.
+  const clipped = capSummaryWidgets({ id: 1, widgets: { blob: "x".repeat(5000) } }, WIDGET_VALUE_CAP, 600);
+  assert.ok(!("duplicate_widgets" in clipped));
+});
+
 test("capSummaryWidgets stays bounded on ESCAPE-HEAVY content at a small budget (#609)", () => {
   // Every char JSON-escapes to two; halving the effective cap keeps the escaped line
   // near the budget rather than doubling past it.
