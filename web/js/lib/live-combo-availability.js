@@ -35,7 +35,6 @@
  * set a lora basename while the dropdown was empty.
  */
 
-
 import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
 import {
   parseAnnotatedFilepath,
@@ -163,7 +162,7 @@ export function linkDrivenWidgetNames(node) {
  */
 const UNENUMERABLE_PREFIX =
   "not checked: this value names a file below the input root (or under an " +
-  "[output]/[temp] annotation), which /object_info's combo list cannot enumerate";
+  "[output]/[temp]/[input] annotation), which /object_info's combo list cannot enumerate";
 
 export async function scanComboAvailability(
   nodes,
@@ -409,7 +408,7 @@ export function uncheckedNodesNote(unknown) {
   if (values) {
     parts.push(
       `${values} widget value(s) the server's combo list has no authority over ` +
-        `(an input file below the input root, or one carrying an [output]/[temp] ` +
+        `(an input file below the input root, or one carrying an [output]/[temp]/[input] ` +
         `annotation, which /object_info never enumerates)`,
     );
   }
