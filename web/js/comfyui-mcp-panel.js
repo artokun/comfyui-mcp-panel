@@ -10486,6 +10486,9 @@ const GRAPH_TOOL_EXECUTORS = {
             // "looks wired" over a graph whose connection is gone. An ORPHANED
             // link (no input backlinks it) renders NOTHING, matching
             // panel_query_graph's live read.
+            // Fail-open ONLY where there is nothing to check against: the target is
+            // not in this graph's node set (a dangling id the outline does not even
+            // list, so a reader can see it is dead) or it carries no inputs array.
             if (!tgt || !Array.isArray(tgt.inputs)) {
               outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
               continue;

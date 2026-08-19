@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { liveLinkTargetInput } from "../../web/js/lib/graph-read.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -244,4 +245,120 @@ test("#809 each rung is measured WITH its footer, and the counters reset inside"
   // The ladder loop must contain no post-hoc append of the note.
   const ladder = body.slice(body.indexOf("// Walk DOWN the ladder"));
   assert.doesNotMatch(ladder, /outline \+= outlineValueClipNote/, "no post-fit append");
+});
+
+// ---- #342: the OUTGOING render must resolve the link's LIVE target slot -----
+//
+// A link record's `target_slot` is captured at connect time and goes STALE when the
+// target node's inputs are compacted afterwards (a COMFY_DYNAMICCOMBO_V3 rebuilding
+// its slots, a removed dynamic `ref_video_N` input shifting the tail). The outline
+// then reported the link against whatever slot now OCCUPIES that index —
+// `VAEDecode → easy saveVideo.output_mode.save_metadata`, a BOOLEAN — while
+// panel_query_graph, which reads the live `inputs[].link` backlink, correctly showed
+// the connection was gone.
+//
+// These tests EXECUTE the render block lifted verbatim out of the handler, because a
+// helper-level test cannot see this call site: with the entire wiring hunk reverted,
+// all eight liveLinkTargetInput unit tests (and the other 5030) still pass. Reading
+// the source would not have caught that; running it does.
+
+/** The outgoing-link render block, taken VERBATIM from the graph_outline handler and
+ *  run against a synthetic graph. Free variables of the block are injected. */
+function renderOutgoing({ node, links, nodes }) {
+  const body = outline();
+  const start = body.indexOf("const outs = [];");
+  const end = body.indexOf("if (outs.length)", start);
+  assert.notEqual(start, -1, "the outgoing-link render block must be locatable");
+  assert.ok(end > start, "the outgoing-link render block must terminate at its emit");
+  assert.equal(body.lastIndexOf("const outs = [];"), start, "one outgoing render block only");
+  const block = body.slice(start, end);
+  // eslint-disable-next-line no-new-func -- running the real source IS the assertion
+  const run = new Function("n", "links", "byId", "liveLinkTargetInput", block + " return outs;");
+  return run(node, links, new Map(nodes.map((x) => [x.id, x])), liveLinkTargetInput);
+}
+
+test("#342 an ORPHANED outgoing link renders NOTHING, not the slot that took its index", () => {
+  // The repro: `easy saveVideo` after `input_mode` (COMFY_DYNAMICCOMBO_V3) collapsed.
+  // Link 7's recorded target_slot 1 was `input_mode.images`; slot 1 now holds the
+  // BOOLEAN `output_mode.save_metadata`, and NO input backlinks link 7 any more.
+  const target = {
+    id: 12,
+    type: "easy saveVideo",
+    inputs: [
+      { name: "input_mode", type: "COMBO", link: null },
+      { name: "output_mode.save_metadata", type: "BOOLEAN", link: null },
+      { name: "output_mode", type: "COMBO", link: null },
+      { name: "filename_prefix", type: "STRING", link: null },
+    ],
+  };
+  const origin = { id: 4, type: "VAEDecode", outputs: [{ name: "IMAGE", links: [7] }] };
+  const outs = renderOutgoing({
+    node: origin,
+    nodes: [origin, target],
+    links: { 7: { id: 7, origin_id: 4, origin_slot: 0, target_id: 12, target_slot: 1 } },
+  });
+  assert.deepEqual(outs, [], "a link no input backlinks must not appear in the outline");
+  // Named explicitly: this exact string is what #342 was filed about.
+  assert.ok(
+    !outs.includes("12.output_mode.save_metadata"),
+    "the outline must never attribute a dropped link to the slot that took its index",
+  );
+});
+
+test("#342 a link whose live slot SHIFTED renders the slot it actually feeds", () => {
+  // A removed dynamic `ref_video_0` compacted the tail: link 9 was recorded against
+  // slot 2, but the input that still backlinks it now sits at index 1. Slot 2 now
+  // holds `fps` — which is what the stale render reported.
+  const target = {
+    id: 5,
+    type: "Bernini r2v",
+    inputs: [
+      { name: "image", type: "IMAGE", link: null },
+      { name: "ref_video_1", type: "VIDEO", link: 9 },
+      { name: "fps", type: "FLOAT", link: null },
+    ],
+  };
+  const origin = { id: 2, type: "LoadVideo", outputs: [{ name: "VIDEO", links: [9] }] };
+  const outs = renderOutgoing({
+    node: origin,
+    nodes: [origin, target],
+    links: { 9: { id: 9, origin_id: 2, origin_slot: 0, target_id: 5, target_slot: 2 } },
+  });
+  assert.deepEqual(outs, ["5.ref_video_1"]);
+  assert.ok(!outs.includes("5.fps"), "the stale index must not name the input it now points at");
+});
+
+test("#342 an ordinary, uncompacted link still renders exactly as before", () => {
+  const target = {
+    id: 3,
+    type: "KSampler",
+    inputs: [
+      { name: "model", type: "MODEL", link: 4 },
+      { name: "positive", type: "CONDITIONING", link: null },
+    ],
+  };
+  const origin = { id: 1, type: "CheckpointLoaderSimple", outputs: [{ name: "MODEL", links: [4] }] };
+  const outs = renderOutgoing({
+    node: origin,
+    nodes: [origin, target],
+    links: { 4: { id: 4, origin_id: 1, origin_slot: 0, target_id: 3, target_slot: 0 } },
+  });
+  assert.deepEqual(outs, ["3.model"]);
+});
+
+test("#342 with no live inputs to verify against, the recorded slot renders as a bare index", () => {
+  // Fail-open is bounded to the case where there is nothing to check: the target is
+  // not in this graph's node set (a dead record naming an id the outline does not
+  // even list, so the reader can SEE it is dangling), or it carries no inputs array.
+  const origin = { id: 6, type: "VAEDecode", outputs: [{ name: "IMAGE", links: [11, 12] }] };
+  const inputless = { id: 8, type: "Note" };
+  const outs = renderOutgoing({
+    node: origin,
+    nodes: [origin, inputless],
+    links: {
+      11: { id: 11, origin_id: 6, origin_slot: 0, target_id: 99, target_slot: 2 },
+      12: { id: 12, origin_id: 6, origin_slot: 0, target_id: 8, target_slot: 0 },
+    },
+  });
+  assert.deepEqual(outs, ["99.2", "8.0"]);
 });
