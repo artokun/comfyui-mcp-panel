@@ -9,6 +9,12 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.4] - 2026-08-19
 
 ### Fixed
+- an abandoned combo refresh is reported as a missing confirmation rather than silently trusted: V2 and dynamic combo specs are rebuilt too, and a spec the panel cannot derive marks the run uncovered instead of suppressing a real missing-asset warning (#1193)
+- a caller-supplied link-exclusion Set is normalised instead of trusted, so a raw-number Set cannot silently lose the exclusion and credit a pre-existing link to the current call (#1272)
+- auto-layout apply stays inside the viewed subgraph instead of escaping to the root graph (#1328)
+- panel_get_errors drops missing node types the client can now construct (#1332)
+- agent-directed instruction blocks stay out of the user-facing chat (#1310)
+- panel_update_node surfaces the Manager update traceback instead of hiding it (#1320)
 - graph mutations no longer stay stuck in `[backend-reconnecting]` after a long Wan render: a busy `/prompt` poll is not a down socket, and binding status now distinguishes a readable canvas from a backend that is actually reconnecting (#1325)
 - dictation listens for the spoken language when the panel UI is the English catalog floor — a German (or other unshipped) speaker no longer gets an English recognizer (#1329)
 - panel_set_widget can author an LTXDirector timeline from the serialized widgets when the live timeline editor is not initialized (#1308)
