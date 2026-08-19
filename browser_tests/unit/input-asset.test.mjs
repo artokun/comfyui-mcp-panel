@@ -13,6 +13,8 @@ import {
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
   addComboOption,
+  inputAssetViewQuery,
+  probeInputAssetPresence,
 } from "../../web/js/lib/input-asset.js";
 
 const DEFS = {
@@ -417,4 +419,38 @@ test("addComboOption refuses to clobber a dynamic FUNCTION option source", () =>
   const w = { options: { values: fn } };
   assert.equal(addComboOption(w, "x.png"), false);
   assert.equal(w.options.values, fn, "function source left untouched");
+});
+
+function filenameParamOf(qs) {
+  const part = String(qs).split("&").find((p) => p.startsWith("filename="));
+  return part ? part.slice("filename=".length) : "";
+}
+
+test("#1357 a pasted filename with spaces decodes back to the file on disk", () => {
+  // The 17:40Z value. URLSearchParams would emit `image+%28992%29.png`;
+  // decodeURIComponent of that is `image+(992).png`, which is not on disk.
+  const ref = { filename: "image (992).png", subfolder: "pasted", type: "input" };
+  const qs = inputAssetViewQuery(ref);
+  assert.equal(decodeURIComponent(filenameParamOf(qs)), "image (992).png");
+  assert.notEqual(qs, new URLSearchParams(ref).toString());
+});
+
+test("#1357 the /view probe asks for the spaced pasted file, not a plus-encoded lookalike", async () => {
+  let route = "";
+  const verdict = await probeInputAssetPresence(
+    { filename: "image (992).png", subfolder: "pasted", type: "input" },
+    50,
+    async (r) => {
+      route = r;
+      return { ok: false, status: 206 };
+    },
+  );
+  assert.equal(verdict, true);
+  assert.match(route, /^\/view\?/);
+  assert.equal(decodeURIComponent(filenameParamOf(route.split("?")[1])), "image (992).png");
+});
+
+test("#1357 a plus in the real filename stays a plus, not a space", () => {
+  const qs = inputAssetViewQuery({ filename: "a+b.png", subfolder: "", type: "input" });
+  assert.equal(decodeURIComponent(filenameParamOf(qs)), "a+b.png");
 });

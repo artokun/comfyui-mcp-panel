@@ -72,6 +72,50 @@ export function inputAssetProbeVerdict(res) {
 }
 
 /**
+ * Query string for a ComfyUI `/view` existence probe.
+ *
+ * Do not build this with `URLSearchParams`. That encodes a space as `+`
+ * (application/x-www-form-urlencoded), and aiohttp/yarl on some ComfyUI
+ * versions treat `+` as a literal plus, so `image (992).png` is asked as
+ * `image+(992).png` and 404s. That is the #1357 regression after #1368 —
+ * the original test value had no spaces, so the probe looked fine. Percent-
+ * encoding matches ComfyUI's own `getResourceURL` (`filename=` +
+ * encodeURIComponent): decodeURIComponent of the filename param is the file
+ * on disk.
+ */
+export function inputAssetViewQuery({ filename, subfolder = "", type = "input" } = {}) {
+  if (!filename || !type) return "";
+  return (
+    `filename=${encodeURIComponent(String(filename))}` +
+    `&subfolder=${encodeURIComponent(String(subfolder ?? ""))}` +
+    `&type=${encodeURIComponent(String(type))}`
+  );
+}
+
+/**
+ * TRI-STATE `/view` existence probe. `fetchApi` is injected so this module
+ * stays free of the ComfyUI API client. See `inputAssetProbeVerdict`.
+ */
+export async function probeInputAssetPresence(ref, timeoutMs, fetchApi) {
+  try {
+    if (typeof fetchApi !== "function") return null;
+    const { filename, type } = ref ?? {};
+    if (!filename || !type) return null;
+    if (!(timeoutMs > 0)) return null;
+    const qs = inputAssetViewQuery(ref);
+    const res = await fetchApi(`/view?${qs}`, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return inputAssetProbeVerdict(res);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * `config` back, when it is an input spec's config object carrying at least one
  * UPLOAD flag; otherwise null. Callers that already hold the per-input config
  * (the live combo scan reads it straight out of `/object_info/<class>`) use this

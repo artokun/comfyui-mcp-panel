@@ -308,8 +308,9 @@ import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
-  inputAssetProbeVerdict,
+  inputAssetViewQuery,
   inputPathsUseWindowsSeparators,
+  probeInputAssetPresence as probeAssetOnServer,
 } from "./lib/input-asset.js";
 import {
   GET_ERRORS_TOTAL_BUDGET_MS,
@@ -9439,25 +9440,14 @@ async function filterServerConfirmedInputSubfolderMedia(
  * confirmed miss would manufacture the exact false positive that issue reports.
  */
 async function probeInputAssetPresence(ref, timeoutMs) {
-  try {
-    if (typeof api?.fetchApi !== "function") return null;
-    const { subfolder, filename, type } = ref ?? {};
-    if (!filename || !type) return null;
-    if (!(timeoutMs > 0)) return null;
-    const qs = new URLSearchParams({ filename, subfolder: subfolder ?? "", type }).toString();
-    const res = await api.fetchApi(`/view?${qs}`, {
-      method: "GET",
-      cache: "no-store",
-      headers: { Range: "bytes=0-0" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    // ComfyUI's /view 404s a path it resolved but did not find. Every OTHER
-    // status (400 traversal refusal, 403, 5xx, a proxy's error page) means the
-    // question was not answered, NOT that the file is absent.
-    return inputAssetProbeVerdict(res);
-  } catch {
-    return null;
-  }
+  // ComfyUI's /view 404s a path it resolved but did not find. Every OTHER
+  // status (400 traversal refusal, 403, 5xx, a proxy's error page) means the
+  // question was not answered, NOT that the file is absent.
+  return probeAssetOnServer(
+    ref,
+    timeoutMs,
+    typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
+  );
 }
 
 /** True when EITHER missing-asset store holds a RAW candidate (isMissing !== false),
@@ -14236,7 +14226,7 @@ const GRAPH_TOOL_EXECUTORS = {
           const subfolder = i >= 0 ? v.slice(0, i) : "";
           const filename = i >= 0 ? v.slice(i + 1) : v;
           if (!filename) return false;
-          const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
+          const qs = inputAssetViewQuery({ filename, subfolder, type: "input" });
           // #1418 — the LAST network step in a command relayed at 30,000 ms, and until now
           // the only unbounded one: reached after a SUCCESSFUL refresh (the abandoned-join
           // refusal fires before it), so #1413's joinMs never covered it. It draws what the

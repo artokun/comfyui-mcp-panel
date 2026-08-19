@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_get_errors` no longer flags a pasted LoadImage file like `pasted/image (992).png` as missing when the file is on disk and `/view` serves it (#1357)
+
 ## [0.15.13] - 2026-08-19
 
 ### Fixed
