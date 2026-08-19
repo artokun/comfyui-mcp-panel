@@ -30,7 +30,9 @@ import {
   TRANSPORT_OUTCOME,
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
+  OBJECT_INFO_DEADLINE_MS,
 } from "../../web/js/lib/object-info-oracle.js";
+import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
 
 const SCHEMA = { KSampler: { input: {} }, H3Keyframes: { input: {} } };
@@ -508,6 +510,15 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "epochDuringFetch",
     "comfyBackendSocketDown",
     "objectInfoOracleFailureNote",
+    // #1418 — the shipped body now caps the oracle deadline with the command budget
+    // (`deadlineMs: budget.bounded(OBJECT_INFO_DEADLINE_MS)`), so both names have to
+    // exist in this scope or the extracted body throws ReferenceError before it runs.
+    // REAL, not doubled: a stub `budget` would let this harness pass against a call
+    // site whose bound had been deleted. The bound itself is proven in
+    // set-widget-budget-composition.test.mjs — the wrapper below overrides deadlineMs
+    // to 20 so these #1223 cases run fast, which is why they cannot prove it here.
+    "budget",
+    "OBJECT_INFO_DEADLINE_MS",
     // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
     // extracted body, because the panel's is module state the body re-reads. An earlier
     // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
@@ -552,6 +563,8 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     epochDuringFetch,
     socketDown,
     objectInfoOracleFailureNote,
+    makeCommandBudget(25000, () => performance.now()),
+    OBJECT_INFO_DEADLINE_MS,
   );
 }
 
