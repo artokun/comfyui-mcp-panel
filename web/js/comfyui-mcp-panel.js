@@ -7236,6 +7236,21 @@ function fixedCapNote(what, shown, total, targeted) {
   );
 }
 
+/**
+ * The LiteGraph global, resolved exactly as `getGraphCtx()` resolves it — and WITHOUT
+ * its refusals. `getGraphCtx()` is the authoritative viewing-scope source and throws on
+ * a canvas/root divergence by design; a caller that only needs the LiteGraph namespace
+ * (to wrap a prototype, say) must not inherit that, or it moves a refusal earlier than
+ * the destructive step it was written to survive.
+ *
+ * Lives at module scope on purpose: `globalThis.LiteGraph` inside a handler that has
+ * aliased the workflow service reads to the #268 contract scanner as a new
+ * workflow-SERVICE dependency (it captures members off an unanchored `s\.` pattern).
+ */
+function liteGraphGlobal() {
+  return window.LiteGraph ?? globalThis.LiteGraph;
+}
+
 function getGraphCtx() {
   // app.canvas.graph is the graph the user is LOOKING at — the root graph or an
   // opened subgraph — so reads and edits target what's on screen. But after a
@@ -16103,7 +16118,14 @@ const GRAPH_TOOL_EXECUTORS = {
             // later node. The graph wrap only observes — it re-throws — because changing
             // what `loadGraphData` sees would make the observation describe something
             // other than production.
-            const { LG: LGForOpen } = getGraphCtx();
+            // Read off the global, NOT through `getGraphCtx()`. That helper is the
+            // authoritative viewing-scope source and it THROWS on a canvas/root
+            // divergence by design — calling it here would move a refusal from after the
+            // load to before it, cancelling the #442 disk re-read that heals exactly that
+            // state. This wants one thing, `LiteGraph`, and an absent one is already
+            // handled: both wraps answer null, the fold answers UNKNOWN, and the open
+            // behaves exactly as it did before this change.
+            const LGForOpen = liteGraphGlobal();
             const nodeIsolation = installNodeConfigureIsolation(LGForOpen);
             const graphWatch = installGraphConfigureWatch(LGForOpen);
             // The load is INSIDE the try whose finally strips the marker: the payload

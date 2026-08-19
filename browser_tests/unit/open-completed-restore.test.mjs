@@ -166,6 +166,31 @@ test("panel#1283 a changed node SET refuses however complete the restore was", (
   }
 });
 
+test("panel#1283 the SET check is not redundant with the field list — this predicate is exported", () => {
+  // MEASURED by mutation: deleting the `sameNodeSet`/`comparable` line above killed no
+  // test, because `classifyNodeDifference` only computes `fields` once the sets match, so
+  // everything IT produces arrives with an empty list and the field check catches it.
+  // This function is EXPORTED, though, so it must refuse an INCONSISTENT shape rather
+  // than let a set difference through on a field list somebody else built — the same
+  // lesson #1623's own predicate had to learn.
+  for (const diff of [
+    { comparable: true, sameNodeSet: false, cosmeticOnly: false, fields: ["widgets_values"] },
+    { comparable: false, sameNodeSet: true, cosmeticOnly: false, fields: ["widgets_values"] },
+    { comparable: false, sameNodeSet: false, cosmeticOnly: false, fields: ["size", "outputs"] },
+  ]) {
+    assert.equal(
+      openContentDifferenceIsCompletedLoadNormalization({
+        comparable: true,
+        surfaces: ["nodes"],
+        nodeDifference: diff,
+        loadRanToCompletion: true,
+      }),
+      false,
+      `${JSON.stringify(diff)} is inconsistent and must refuse`,
+    );
+  }
+});
+
 test("panel#1283 any surface but `nodes` refuses — a completed node pass explains nothing else", () => {
   for (const surfaces of [
     ["links"],
