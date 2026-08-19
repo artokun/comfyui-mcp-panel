@@ -153,17 +153,56 @@ export function unserializableGraphRefusal(types) {
  * The serialized entry has lost the type — that is precisely why it is unrunnable — so
  * the canvas is consulted for LABELS ONLY, never to decide whether to refuse. A node
  * the graph cannot name still counts; it is reported by id.
+ *
+ * comfyui-mcp#1648 — `registry` (this page's `LiteGraph.registered_node_types`) is
+ * consulted for the DIAGNOSIS only, never for the refusal. The refusal is still decided
+ * entirely by the serialized prompt, exactly as before; this only lets the message tell
+ * apart two states it used to collapse (see `missingNodeRunRefusal`).
+ *
+ * Each entry gains `registered: true | false` when a registry was supplied, and the key
+ * is OMITTED entirely when it was not — a caller that cannot read the registry says
+ * nothing about registration rather than claiming `false` for everything. A registry
+ * object with no own keys is treated the same way: a page that registered NOTHING has
+ * not observed anything about this type either.
  */
-export function describeUnrunnable(ids, liveNodes) {
+export function describeUnrunnable(ids, liveNodes, registry) {
   const byId = new Map();
   for (const n of Array.isArray(liveNodes) ? liveNodes : []) {
     if (n && n.id != null) byId.set(String(n.id), n);
   }
+  let reg = null;
+  try {
+    if (registry && typeof registry === "object" && Object.keys(registry).length > 0) {
+      reg = registry;
+    }
+  } catch {
+    reg = null; // an unreadable registry is "unknown", never "not registered"
+  }
   return ids.map((id) => {
     const n = byId.get(id);
     const type = typeof n?.type === "string" && n.type ? n.type : null;
-    return { id, type };
+    if (!reg) return { id, type };
+    return {
+      id,
+      type,
+      // A node the graph could not even name tells us nothing about registration.
+      registered: type == null ? null : Object.prototype.hasOwnProperty.call(reg, type),
+    };
   });
+}
+
+/** The escape hatch, kept identical in every branch: a caller with deliberately-optional
+ *  nodes must never be stuck, and a bypassed node is dropped during serialization. */
+const BYPASS_NOTE =
+  `If you expected these nodes to be optional, delete or bypass them first — a bypassed ` +
+  `node is dropped during serialization and will not trip this check.`;
+
+/** Up to six distinct type names from a set of offenders, for a sentence. */
+function typeList(offenders) {
+  const types = [...new Set(offenders.map((o) => o?.type).filter((t) => typeof t === "string" && t))];
+  if (!types.length) return "them";
+  const shown = types.slice(0, 6).join(", ");
+  return types.length > 6 ? `${shown}, and ${types.length - 6} more` : shown;
 }
 
 /**
@@ -171,23 +210,97 @@ export function describeUnrunnable(ids, liveNodes) {
  *
  * Prefixed `NOT queued:` so the caller can tell a refusal from an incidental error in
  * the same block, and so it is unmistakable that nothing was sent.
+ *
+ * ## comfyui-mcp#1648 — the refusal was right and the remedy was wrong
+ *
+ * The reporter installed KJNodes, restarted ComfyUI, and was told by this message to
+ * install the pack and restart ComfyUI. They had. The refusal itself was correct — their
+ * companion report (panel#1284, same rig) shows ComfyUI's OWN missing-nodes store naming
+ * `GetNode`/`SetNode`, so those nodes really were placeholders and the run really would
+ * have failed validation. What was wrong is that this text named ONE cause for a state
+ * that has two, and named the one they had already ruled out:
+ *
+ *   1. the pack is not installed; or
+ *   2. the pack IS installed and the SERVER is fine, but THIS BROWSER TAB never loaded
+ *      the pack's frontend JS — those scripts are fetched when the ComfyUI page loads, so
+ *      a server restart does not put new node classes into an already-open tab.
+ *
+ * Case 2 is the whole story for a FRONTEND-ONLY node type (the Get/Set bus, rgthree's
+ * canvas-only toggles): it never appears in /object_info at all, so no amount of asking
+ * the server distinguishes "not installed" from "installed, tab is stale". The one thing
+ * that does distinguish them is THIS PAGE's own litegraph registry, which is what
+ * `describeUnrunnable` now reads. When it has no class for the type, "reload the tab"
+ * is a remedy the old text never offered.
+ *
+ * With no registry reading available the message is byte-identical to before — an
+ * unobserved registry must not become a claim about one.
  */
 export function missingNodeRunRefusal(offenders) {
-  const list = (Array.isArray(offenders) ? offenders : []).map((o) =>
-    o?.type ? `${o.type} (node ${o.id})` : `node ${o.id}`,
-  );
+  const all = Array.isArray(offenders) ? offenders : [];
+  const list = all.map((o) => (o?.type ? `${o.type} (node ${o.id})` : `node ${o.id}`));
   const shown = list.slice(0, 12);
   const more = list.length > shown.length ? `, and ${list.length - shown.length} more` : "";
   const plural = list.length === 1 ? "" : "s";
-  return (
+  const head =
     `NOT queued: ${list.length} node${plural} in this workflow cannot be executed by the ` +
-    `server — ${shown.join(", ")}${more}. Their node types are not registered on this ` +
-    `ComfyUI, so the prompt was built with no class_type for them and would have failed ` +
+    `server — ${shown.join(", ")}${more}. `;
+  const tail =
+    `so the prompt was built with no class_type for them and would have failed ` +
     `validation after being queued (comfyui-mcp#1460). Nothing was sent and the queue is ` +
-    `untouched. This usually means a custom-node pack is missing or failed to load: ` +
-    `install the pack that provides these types (list_packs / install_custom_node), ` +
-    `restart ComfyUI so the frontend registers them, then run again. If you expected ` +
-    `these nodes to be optional, delete or bypass them first — a bypassed node is ` +
-    `dropped during serialization and will not trip this check.`
+    `untouched. `;
+
+  const observed = all.filter((o) => typeof o?.registered === "boolean");
+  const unregistered = observed.filter((o) => o.registered === false);
+
+  // Nothing was observed about this page's registry — say exactly what was said before.
+  if (!observed.length) {
+    return (
+      head +
+      `Their node types are not registered on this ComfyUI, ` +
+      tail +
+      `This usually means a custom-node pack is missing or failed to load: ` +
+      `install the pack that provides these types (list_packs / install_custom_node), ` +
+      `restart ComfyUI so the frontend registers them, then run again. ` +
+      BYPASS_NOTE
+    );
+  }
+
+  if (unregistered.length) {
+    return (
+      head +
+      `This page has no node class registered for ${typeList(unregistered)}, ` +
+      tail +
+      `TWO different things produce that, and they need different fixes. ` +
+      `(1) The pack is not installed — install it (list_packs / install_custom_node) and ` +
+      `restart ComfyUI. ` +
+      `(2) The pack IS installed and the server is fine, but THIS BROWSER TAB never loaded ` +
+      `its frontend JS: a pack's scripts are fetched when the ComfyUI page loads, so ` +
+      `installing a pack and restarting the server does NOT add its node classes to a tab ` +
+      `that was already open — RELOAD the ComfyUI tab. If you have already installed the ` +
+      `pack and restarted ComfyUI, do that first. ` +
+      `Case (2) is the only possibility for a FRONTEND-ONLY node type (KJNodes' Get/Set ` +
+      `bus, rgthree's Label and Fast Groups toggles): those never appear in /object_info ` +
+      `at all, so nothing the server reports can confirm or deny them. ` +
+      BYPASS_NOTE
+    );
+  }
+
+  // Every offender's type IS registered here, so nothing is missing from this page and a
+  // reload changes nothing. Only what the serializer observed is asserted: it takes an
+  // entry's class_type from the node's own `comfyClass`, and it omits a node entirely when
+  // that node reports `isVirtualNode` — so an entry that arrived with neither came from a
+  // registered class that has no backend node behind it and does not declare itself
+  // virtual. Nothing is claimed about which pack is at fault or how to repair it.
+  return (
+    head +
+    `This page DOES have a node class registered for ${typeList(observed)} — so nothing is ` +
+    `missing here and reloading will not change it — but the serializer still emitted no ` +
+    `class_type for them, ` +
+    tail +
+    `An entry's class_type comes from the node's own comfyClass, and a node that reports ` +
+    `isVirtualNode is left out of the prompt entirely; these did neither, so the registered ` +
+    `class has no backend node behind it and does not declare itself virtual. That is a ` +
+    `problem in the pack's own frontend node rather than anything this ComfyUI is missing. ` +
+    BYPASS_NOTE
   );
 }

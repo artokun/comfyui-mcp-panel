@@ -35,6 +35,8 @@
  * set a lora basename while the dropdown was empty.
  */
 
+import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
+
 /** Inputs whose combo lists name files on disk, rather than modes like
  *  `sampler_name: [euler, …]`. A value outside ANY combo's options is a genuine
  *  problem, but only these are missing ASSETS, and calling a bad scheduler a
@@ -182,6 +184,24 @@ export async function scanComboAvailability(
   for (const node of nodes) {
     const className = typeof node?.type === "string" ? node.type : null;
     if (!className || !Array.isArray(node.widgets)) continue;
+    // comfyui-mcp#1657 / panel#1284 — a FRONTEND VIRTUAL node is skipped BEFORE the
+    // lookup, not reported as unchecked after it.
+    //
+    // These have no /object_info entry by design and never reach the server, so there is
+    // no combo for the server to judge their widget values against. Sending them through
+    // the scan produced `{reason: "node type not found in /object_info"}` on a working
+    // canvas — a sentence that reads as an accusation about a missing pack, on nodes whose
+    // pack is installed and functioning. On the reported 422-node workflow that filled the
+    // error surface (GetNode, SetNode, MarkdownNote, Label (rgthree), Fast Bypasser).
+    //
+    // "Skipped" here means NOTHING IS CLAIMED, which is honest rather than lenient: there
+    // was never a judgement available to withhold. It costs no coverage — a virtual node's
+    // widget value is not a server-side asset — and it saves a wasted round trip plus a
+    // slot in the class cap, so a large canvas spends its budget on nodes that can fail.
+    //
+    // A node whose pack is NOT loaded is a defless placeholder, carries no `isVirtualNode`,
+    // and is still scanned and still reported (see frontend-virtual-nodes.js).
+    if (isFrontendVirtualNode(node)) continue;
     const entry = await comboMapFor(className);
     if (!entry.combos) {
       // Unjudgeable. Report the node once, with the REASON it was skipped — a

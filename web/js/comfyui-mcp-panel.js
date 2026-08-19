@@ -326,6 +326,7 @@ import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-lo
 import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
+import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
 import {
   unrunnableNodeIds,
   describeUnrunnable,
@@ -8787,6 +8788,34 @@ function collectMissingAssets(trustComboOverride) {
           ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
           : [];
       nodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
+      // comfyui-mcp#1657 / panel#1284 — a FRONTEND VIRTUAL node is not a missing one.
+      //
+      // `missingNodesError` is a LOAD-TIME snapshot the frontend never re-evaluates
+      // (stale-placeholders.js measured exactly that), so it keeps naming a type after the
+      // page learned to resolve it. On a canvas whose packs ARE loaded that surfaced
+      // GetNode/SetNode/MarkdownNote/Label (rgthree) as missing on a workflow whose most
+      // recent run had succeeded.
+      //
+      // The live graph is the only thing that can say which of the two happened, and it
+      // says it POSITIVELY: a type is dropped only when every instance of it on the canvas
+      // declares `isVirtualNode === true`, the flag ComfyUI's own serializer reads to skip
+      // a node. A pack that is NOT loaded leaves defless placeholders that carry no such
+      // flag, so panel#1284's own GetNode/SetNode — same rig as comfyui-mcp#1648, where the
+      // tab had never loaded KJNodes' JS — stay reported, and the run that would have
+      // failed is still refused. A name allowlist gets that case backwards.
+      //
+      // Filtered HERE, in the shared collector, so graph_get_errors, the turn-start
+      // validation banner and the stale-red-flag adjudication cannot disagree about it —
+      // this family recurred three times precisely because each call site decided
+      // separately.
+      try {
+        nodeTypes = withoutFrontendVirtualTypes(
+          nodeTypes,
+          collectAllGraphs(getGraphCtx().rootGraph).flatMap((g) => g?._nodes ?? []),
+        );
+      } catch {
+        /* no readable graph → nothing is proven virtual → every type stays reported */
+      }
     }
   } catch {
     /* optional */
@@ -14025,7 +14054,27 @@ const GRAPH_TOOL_EXECUTORS = {
       const badIds = unrunnableNodeIds(built);
       if (badIds.length) {
         const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
-        throw new Error(missingNodeRunRefusal(describeUnrunnable(badIds, liveNodes)));
+        // comfyui-mcp#1648 — hand the refusal THIS PAGE's litegraph registry so it can
+        // tell "the pack is not installed" apart from "the pack is installed and this TAB
+        // never loaded its frontend JS". The reporter had already done everything the old
+        // message asked for; only the registry distinguishes their case, and for a
+        // frontend-only type (Get/Set bus, rgthree toggles) nothing else can — those never
+        // appear in /object_info at all. DIAGNOSIS ONLY: the refusal is still decided by
+        // the serialized prompt above, unchanged.
+        //
+        // Read the same way the #1582 branch does — `LG` is a local in other functions and
+        // is NOT in scope here; the panel-scope gate caught that as a live ReferenceError.
+        // Passed possibly-undefined ON PURPOSE: an unreadable registry must stay UNKNOWN
+        // and reproduce the previous message, never assert "not registered".
+        throw new Error(
+          missingNodeRunRefusal(
+            describeUnrunnable(
+              badIds,
+              liveNodes,
+              (window.LiteGraph ?? globalThis.LiteGraph)?.registered_node_types,
+            ),
+          ),
+        );
       }
     } catch (err) {
       // Only OUR refusal propagates. Anything else (a broken fetch, a frontend
