@@ -6,12 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_refresh_nodes` no longer times out with no acknowledgement when a node-def refresh is already running: of the six commands relayed in the orchestrator's 30 s window only `graph_add_node` and `nodes_install` held a command budget, and `refresh_nodes` — whose whole body IS a wait on the node-def refresh — did not, so a forced call waited unbounded on the in-flight run AND on its own trailing run — past the window, so the reply the panel's bounds exist to produce never left the tab and the user got `did not reply … the ComfyUI tab may be backgrounded or frozen` about a healthy, idle tab. It now bounds that wait at 25 s (the same budget `graph_add_node` and `nodes_install` hold against the same window) and answers `refreshed:false` with `reason:"refresh_still_running"` and a retry that works — the abandoned run is not cancelled, so it is still registering the definitions the call asked for (#1404)
+
 ## [0.15.6] - 2026-08-19
 
 ### Fixed
 - `panel_query_graph` (fields:'detail') no longer last-wins-collapses widgets that share a name: when a name repeats (rgthree Fast Groups toggle rows), every occurrence is listed so a duplicate or orphaned row is visible (#1402) (#1406)
 - `duplicate_widgets` (the #1402 duplicate-widget report) no longer throws the whole detail read away on a widget named `__proto__`/`constructor`/`toString` — occurrences are accumulated prototype-safely — and is now bounded by the same `max_chars` budget as `widgets` (dropped occurrences are announced with the lever that lifts them, never silently lost), so a many-group Fast Groups Bypasser cannot push the detail line into a whole-row stub. `panel_graph_outline` also labels each same-named row from the widget itself rather than a last-wins name-keyed map, so two different group toggles are no longer both annotated with the last row's label (#1402) (#1405)
-
 
 ## [0.15.5] - 2026-08-19
 

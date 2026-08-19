@@ -245,6 +245,7 @@ import { duplicateWidgetRows } from "./lib/widget-rows.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
 import {
+  NODE_DEF_REFRESH_REASONS,
   describeNodeDefRefresh,
   describeRefreshGraphLoss,
   restoredLiveNodesNote,
@@ -10386,6 +10387,68 @@ const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 const ADD_NODE_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1404 — a command budget for `refresh_nodes`.
+ *
+ * COUNTED, not guessed, because the first draft of this comment guessed and was wrong. SIX
+ * commands are relayed in the orchestrator's 30,000 ms window: `graph_get_object_info`,
+ * `graph_add_node`, `graph_set_widget`, `graph_remove_widget` and `refresh_nodes` through
+ * `OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS`, plus `nodes_install` at a literal 30000. Before this
+ * change only TWO of the six held a command budget — `graph_add_node` (#1192) and
+ * `nodes_install` (#671) — so "the last one that never took one" was false, and the false
+ * version of this sentence concealed a sibling: `graph_set_widget`'s stale-combo recovery
+ * awaits the coalescer with no bound of its own. Filed separately rather than folded in; the
+ * point for a future reader is that this is a RECURRING shape, not a last straggler.
+ *
+ * REPORTED: after a workflow switch and a successful re-target, `panel_refresh_nodes` got no
+ * acknowledgement for 30 s while ComfyUI stayed healthy and idle; the identical call then
+ * succeeded on the retry. That is not a lost reply — it is a reply that was never COMPOSED
+ * inside the window.
+ *
+ * THE COMPOSITION IS ALREADY WRITTEN DOWN, two comments above this one, and that note is the
+ * evidence — not any arithmetic done here. NODE_DEFS_RUN_BUDGET_MS's own docstring says
+ * `makeRefreshCoalescer` "guarantees a forced `panel_refresh_nodes` pays the in-flight run
+ * AND its own, serially, so about 39.6s before a reply is composed. Past the bridge's 20s
+ * READ default and past the 30s command budget both." #1180 shrank the per-run WAITING that
+ * figure was computed from, but it explicitly did NOT bound `registerNodesFromDefs`
+ * (3,972 ms measured) or `reapplyDefsToLiveNodes`, so the composition that note describes
+ * survived it — which is what this issue reports. `graph_add_node`'s note says the same of
+ * its own path ("~33 s against the 30 s relay window, with every per-step bound respected").
+ * #1192/#1351 fixed the composition for the add and left the tool whose whole body IS that
+ * composition unbounded.
+ *
+ * WHY THE SECOND CALL SUCCEEDS, which is the part that identifies the cause rather than
+ * merely fitting it: by then the queued trailing run has settled and the coalescer's slot is
+ * free, so the retry pays ONE run instead of two. Nothing about the tab, the socket or the
+ * fence differs between the two calls — only the number of runs in front of them.
+ *
+ * WHAT STARTS THE FIRST RUN is not a coincidence of timing either. Two forced,
+ * fire-and-forget refreshes are keyed on `hasRawMissingAssetCandidates()` — the validation
+ * banner's and `graph_get_errors`' — and a just-uploaded input file is exactly what makes
+ * that predicate true. The upload that gives an agent a reason to call this tool is the same
+ * event that makes the panel start its own refresh, so the two race BY CONSTRUCTION.
+ *
+ * 25,000 ms, mirroring ADD_NODE_COMMAND_BUDGET_MS and NODES_INSTALL_COMMAND_BUDGET_MS
+ * against the same 30,000 ms window for the same reason: 5,000 ms of slack for composing the
+ * reply, serialising it, and the websocket hop.
+ *
+ * WHAT IT COSTS, stated rather than left to be discovered. A single UNCONTENDED run that
+ * would have taken between 25 s and 30 s used to reply `refreshed:true` and now reports
+ * `refresh_still_running` instead. That window is 5 s wide, it is past twice the #610
+ * measurement, and the run is not cancelled — it keeps going and keeps the slot, so the
+ * retry the reply asks for joins a registration already in progress. In exchange every
+ * CONTENDED call — the reported bug, which today produces a bare `did not reply … the
+ * ComfyUI tab may be backgrounded or frozen` about a demonstrably healthy tab — gets a
+ * worded verdict that names the cause and a remedy that clears it.
+ *
+ * NOT a `makeCommandBudget`, and that is deliberate rather than an oversight. A command
+ * budget exists so SEVERAL bounded steps compose; `refresh_nodes` has exactly one await and
+ * takes it on its first line, so the coalescer's own `joinMs` deadline — taken at invocation
+ * and spanning the join AND the run that follows it (#1351) — already is that budget. A
+ * second clock here would only be able to disagree with it.
+ */
+const REFRESH_NODES_COMMAND_BUDGET_MS = 25000;
+
+/**
  * #1192 — what an add still has to do AFTER the node-def refresh, held back so the join
  * cannot spend it.
  *
@@ -10694,8 +10757,53 @@ const GRAPH_TOOL_EXECUTORS = {
   // #635: a non-fresh verdict now says WHY (reason) and what to do about it
   // (remedy) — a bare {ok:true, refreshed:false} was indistinguishable from a
   // no-op and left the caller guessing whether the call did anything.
+  // #1404: BOUNDED. This one await is the whole command, and unbounded it is the
+  // composition `graph_add_node`'s budget note describes — a forced call pays an in-flight
+  // run AND its own, serially, which does not fit the 30,000 ms window this command is
+  // relayed in. See REFRESH_NODES_COMMAND_BUDGET_MS.
   async refresh_nodes() {
-    const verdict = await refreshComfyNodeDefs(undefined, { force: true });
+    const verdict = await refreshComfyNodeDefs(undefined, {
+      force: true,
+      joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
+    });
+    // #1404 — a NAMED verdict, before the generic branch below can call it "unknown".
+    //
+    // NOTHING FAILED and nothing was left half-done: the coalescer does not cancel the run
+    // it stopped waiting for (`waitForRun` in refresh-coalesce.js says so), the run keeps
+    // registering the very definitions this call asked for, and it keeps the slot — so the
+    // retry this reply asks for joins work already in progress rather than starting a
+    // stampede. "unknown" would collapse that into the same answer as a fetch that threw,
+    // which is the one distinction a caller deciding whether to retry actually needs.
+    //
+    // Returned as a STRUCTURED `reason` token, not as wording. A caller must never have to
+    // parse prose to decide it may re-issue a command, and the whole argument for retrying
+    // this one — that `refresh_nodes` re-registers defs and rebuilds combo option lists,
+    // changes no graph and is undo-neutral — rests on the field, not on the sentence.
+    if (verdict === REFRESH_JOIN_ABANDONED) {
+      return {
+        ok: true,
+        refreshed: false,
+        reason: NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING,
+        // BOTH RUNS, because the value cannot tell them apart and neither may this sentence.
+        // The coalescer answers with one symbol whether the budget went on a run someone else
+        // started or on the one this command started itself (nothing in flight ⇒ the last
+        // branch of `refresh`), so a message naming only the first would be flatly wrong in
+        // the second case — and it is the case a big install hits without any concurrency at
+        // all. `graph_add_node`'s refusal names both for the same reason.
+        detail:
+          `A node-def refresh was still running when this command's ` +
+          `${Math.round(REFRESH_NODES_COMMAND_BUDGET_MS / 1000)}s budget ran out waiting for ` +
+          `it — either one something else started (a ComfyUI reconnect, a finished install or ` +
+          `download, this panel's own missing-asset check after an upload) or this command's ` +
+          `own registration. Nothing failed and nothing was changed.`,
+        remedy:
+          "That refresh was NOT cancelled — it is still running and still fetching exactly the " +
+          "/object_info this call wanted — so RETRY in a few seconds. A retry that lands after " +
+          "it settles pays for one refresh instead of two, which is normally enough; if it " +
+          "keeps reporting this, the refresh itself is slower than the budget and reloading " +
+          "the ComfyUI tab is the fallback that remains.",
+      };
+    }
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
     // #981: the stale-placeholder disclosure has to survive BOTH paths. The producer
     // runs the scan whatever the verdict says — a refresh that failed at the combo phase

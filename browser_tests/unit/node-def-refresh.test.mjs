@@ -26,6 +26,7 @@ import {
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
   NODE_DEFS_RUN_BUDGET_MS,
+  REFRESH_NODES_EXECUTOR_DEPS,
   monotonicNow,
   nodeDefsBudgetLeft,
 } from "./_panel-constants.mjs";
@@ -277,11 +278,16 @@ function buildRefreshNodes(refreshImpl) {
   }
   assert.notEqual(end, -1, "could not bound the refresh_nodes executor body");
   const body = SRC.slice(start, end + 1);
+  // #1404 — every OTHER module binding the executor closes over, from the one place that
+  // holds them (REFRESH_NODES_EXECUTOR_DEPS), so a new one is added once for all three
+  // harnesses rather than three times.
+  const extra = Object.entries(REFRESH_NODES_EXECUTOR_DEPS);
   const factory = new Function(
     "refreshComfyNodeDefs",
+    ...extra.map(([name]) => name),
     `return (${body.replace(/^async refresh_nodes\(\)/, "async function refresh_nodes()")});`,
   );
-  return factory(refreshImpl);
+  return factory(refreshImpl, ...extra.map(([, value]) => value));
 }
 
 test("#635: the shipping executor returns reason + remedy when the refresh is not fresh", async () => {

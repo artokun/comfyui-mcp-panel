@@ -73,7 +73,9 @@ test("refresh_nodes really does re-register the class this check reads", () => {
   // chain: refresh_nodes -> refreshComfyNodeDefs(force) -> getNodeDefs +
   // registerNodesFromDefs.
   const fn = PANEL.slice(PANEL.indexOf("async refresh_nodes() {"), PANEL.indexOf("graph_serialize() {"));
-  assert.ok(fn.includes("refreshComfyNodeDefs(undefined, { force: true })"));
+  // #1404 gave the call a `joinMs`, so it no longer fits on one line. Matched as the chain
+  // this test is about — a FORCED call into the coalescer — rather than as a formatting.
+  assert.match(fn, /refreshComfyNodeDefs\(undefined, \{[\s\S]*?force: true,?[\s\S]*?\}\)/);
   const register = PANEL.slice(
     PANEL.indexOf("async function registerComfyNodeDefs"),
     PANEL.indexOf("const refreshComfyNodeDefs = makeRefreshCoalescer"),
