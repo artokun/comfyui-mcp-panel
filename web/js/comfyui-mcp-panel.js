@@ -7452,8 +7452,15 @@ function getGraphCtx() {
   // #1328 — remember a live subgraph identity here so an auto-layout APPLY that
   // later sees a canvas escaped to root can still resolve the graph enter_subgraph
   // put the user in. Root observations do NOT clear this: escape looks like root.
+  // Capture is a SIDE-EFFECT of a proven subgraph scope: a helper miss must not
+  // refuse the graph the user is looking at. bindAutoLayoutGraph still sees the
+  // live subgraph on apply if remember does not land.
   if (scope.scope === "subgraph") {
-    rememberAutoLayoutScope(layoutScopeFingerprint(graph, app.graph));
+    try {
+      rememberAutoLayoutScope(layoutScopeFingerprint(graph, app.graph));
+    } catch {
+      // Viewing scope is already proven; do not turn a capture miss into a refusal.
+    }
   }
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
