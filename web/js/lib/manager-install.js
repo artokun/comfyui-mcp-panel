@@ -1407,11 +1407,16 @@ export function taskHistoryBlindNote(dialect) {
  *   3. "unverified"— no terminal task record yet (still running, history not
  *                    served by a legacy Manager, or a shape we don't recognize).
  *                    Honest "queued, could not confirm" — NEVER a failure.
- * @param {{ item?:unknown, status?:unknown, target:string, dialect?:string }} input
+ * @param {{ item?:unknown, status?:unknown, target:string, dialect?:string, traceback?:string }} input
  */
-export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
+export function classifyUpdateOutcome({ item, status, target, dialect, traceback } = {}) {
   const reason = taskFailureReason(item);
   if (reason) {
+    // #1320 — Manager's do_update stores only "An error occurred while updating
+    // 'X'." and prints the real traceback to the server log. When the caller
+    // managed to read that log, the tool result IS the traceback; do not also
+    // send the reader to the log they can no longer see from here.
+    const tb = typeof traceback === "string" && traceback.trim() ? traceback.trim() : "";
     return {
       state: "failed",
       status,
@@ -1419,8 +1424,10 @@ export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
         `Update of "${target}" FAILED: the ComfyUI-Manager task terminated with an ` +
         `error` +
         (dialect ? ` (dialect ${dialect})` : "") +
-        `: ${reason}. The pack was NOT updated — check the ComfyUI server log for the ` +
-        `full traceback.`,
+        `: ${reason}. The pack was NOT updated` +
+        (tb
+          ? `. Manager traceback:\n${tb}`
+          : ` — check the ComfyUI server log for the full traceback.`),
     };
   }
   if (taskSucceeded(item)) {
