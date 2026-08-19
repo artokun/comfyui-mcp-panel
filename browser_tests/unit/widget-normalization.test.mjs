@@ -90,7 +90,13 @@ test("#805 WIRING: normalization suppresses the failure AND is disclosed on the 
   )
   assert.match(src, /import \{ explainNumericNormalization, normalizationNote \} from "\.\/widget-normalization\.js"/)
   // The failure branch must be gated on it — otherwise a normalized write still errors.
-  assert.match(src, /if \(!matchesExpected\(w\.value\) && !normalization\) \{/)
+  // `valueWidget` is the widget the write ASSIGNED (comfyui-mcp#1707): the node's own
+  // widget, the promoted inner widget, or — on an instance-scoped promoted write — the
+  // wrapper's own rail. The read-back and the normalization explanation must be taken
+  // from the SAME widget, or a normalizing rail is reported as a failed write.
+  assert.match(src, /const normalization = matchesExpected\(valueWidget\.value\)/)
+  assert.match(src, /explainNumericNormalization\(expected, valueWidget\.value, valueWidget\)/)
+  assert.match(src, /if \(!matchesExpected\(valueWidget\.value\) && !normalization\) \{/)
   // …and the caller must be TOLD, or a silently-changed value is its own defect.
   assert.match(src, /normalized: true/)
   assert.match(src, /requested_value: expected/)

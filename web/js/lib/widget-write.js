@@ -836,6 +836,59 @@ export function resolveHostPromotedWidget(subgraphNode, hostInput) {
 }
 
 /**
+ * comfyui-mcp#1707 — WHERE a promoted subgraph widget's value actually lives.
+ *
+ * A `Subgraph` DEFINITION object is SHARED by every instance placed on the canvas:
+ * `SubgraphNode.subgraph` is the same object for wrappers 279, 293 and 300 of one
+ * reusable subgraph, and so is every node inside it. So an assignment to the inner
+ * widget is an assignment to the DEFINITION — a write aimed at one wrapper that
+ * every sibling wrapper inherits.
+ *
+ * The ComfyUI frontend does NOT store a promoted value there. It gives each host
+ * input a `widgetId` — `"<rootGraphId>:<encoded nodeId>:<encoded input name>"` —
+ * and keeps the value in a per-widgetId store. Both projections it can build for
+ * the rail read and write through that key: the plain store-backed projection
+ * (`get/set value` → the store) and the app-layer promoted DOM widget (whose
+ * `options.getValue/setValue` do the same). It is also the ONLY value the queue
+ * compiler reads for an unlinked promoted input — `ExecutableNodeDTO.resolveInput`
+ * returns `store.getWidget(input.widgetId)?.value` and never looks at the inner
+ * widget. And an on-canvas edit of the promoted control writes ONLY that entry.
+ *
+ * The node id is IN the key, so the key itself proves the scope: when the key's
+ * node segment is THIS wrapper's id, no sibling wrapper can read the entry this
+ * write lands in — the scope is established from the data, not assumed from a
+ * frontend version. Parsed the way the frontend's own `parseWidgetId` parses it
+ * (exactly three colon-separated segments; the id builder percent-encodes the
+ * node id and the name, so neither can introduce a colon).
+ *
+ * Anything else — no `widgetId` at all (an older frontend, where the rail is a live
+ * VIEW of the inner widget and there is no per-instance home to write) or a key that
+ * does not name this wrapper (an unknown keying whose sharing we cannot establish) —
+ * is reported as `"subgraph_definition"`. That is a statement about where the write
+ * then goes, not a prediction about siblings, and the caller is told which one it got.
+ *
+ * @returns {"instance"|"subgraph_definition"}
+ */
+export function promotedValueScope(subgraphNode, hostInput) {
+  let id;
+  try {
+    id = hostInput?.widgetId;
+  } catch {
+    return "subgraph_definition";
+  }
+  if (typeof id !== "string" || id === "") return "subgraph_definition";
+  const parts = id.split(":");
+  if (parts.length !== 3) return "subgraph_definition";
+  let own;
+  try {
+    own = encodeURIComponent(String(subgraphNode?.id));
+  } catch {
+    return "subgraph_definition";
+  }
+  return parts[1] === own ? "instance" : "subgraph_definition";
+}
+
+/**
  * Classify a widget request on `subgraphNode` against `widgetName` and, when it
  * is a PROMOTED subgraph widget, resolve it to the ACTUAL inner (node, widget)
  * AND the authoritative parent rail widget (via the promotion relationship).
@@ -1279,6 +1332,31 @@ export function applyWidgetWrite(
       ? promotedParentWidgets.filter((dw) => dw && dw !== w && dw !== parentWidget)
       : [];
 
+  // comfyui-mcp#1707 — WHICH STORE THIS WRITE OWNS.
+  //
+  // The promoted rail and the inner widget are not two views of one value: in a
+  // frontend that gives the host input a `widgetId`, the rail is this WRAPPER's own
+  // store entry and the inner widget is the SHARED DEFINITION, read by every sibling
+  // instance of the subgraph. Writing both therefore turned a write aimed at wrapper
+  // 293 into a write every sibling inherits (279 and 300 both went to 1024x1024) —
+  // and the definition write is one the UI itself never performs: an on-canvas edit
+  // of a promoted control writes the store entry and nothing else.
+  //
+  // So on the instance-scoped path this write owns the RAIL, and the shared
+  // definition is left exactly as it was — which is also VERIFIED below, because
+  // "the rail is instance-scoped" is a claim about the frontend's plumbing that this
+  // module must not take on trust: if the rail turns out to forward to the inner
+  // widget after all, the definition changes, and that is a failure, not a success.
+  const valueScope = promotedFrom ? promotedValueScope(node, promotedHostInput) : null;
+  const instanceScoped = valueScope === "instance";
+  // The widget this write's VALUE lands on, and the node that OWNS that widget.
+  // Everything downstream — the bound-property binding, the widget callback, the
+  // read-back verification, normalization and the reported result — keys on these,
+  // so each one describes the write that actually happened. On every non-promoted
+  // and every definition-scoped write they are the inner/own target, unchanged.
+  const valueWidget = instanceScoped ? parentWidget : w;
+  const valueNode = instanceScoped ? node : targetNode;
+
   // #507 (codex round-3, MODERATE): coerceWidgetValue validated the value against the
   // IMMEDIATE inner widget's option list only — but a promoted write assigns the SAME
   // value to the parent's authoritative RAIL widget and to every display proxy, whose
@@ -1489,7 +1567,13 @@ export function applyWidgetWrite(
   // (`node.setProperty` mutates `properties`, so a second classification taken later
   // would describe the state this write already produced). See widget-bound-property.js
   // for the two litegraph paths that make the binding load-bearing.
-  const boundProperty = boundPropertyState(targetNode, w);
+  // comfyui-mcp#1707 — taken on the widget this write actually assigns, and on the
+  // node that owns it. On an instance-scoped promoted write that is the RAIL on the
+  // WRAPPER: litegraph's `BaseWidget.setValue` calls `setProperty` on the node whose
+  // widget is being edited, and the inner node's property is definition state this
+  // write deliberately does not touch. Every other write passes the same pair it
+  // always did.
+  const boundProperty = boundPropertyState(valueNode, valueWidget);
   const previousPropertyClone = boundProperty?.reachable ? deepClone(boundProperty.previous) : undefined;
   // The ACTUAL serialization binding for an unlinked subgraph input is its
   // `widgetId` (the widget-value STORE key that queue compilation reads). A callback
@@ -1561,13 +1645,20 @@ export function applyWidgetWrite(
   let widgetCallback = null;
   safeBefore();
   try {
-    // Assign BOTH values first. The parent's projected promoted widget is a VIEW of
-    // the inner widget; its own callback typically FORWARDS to the inner one, so we
-    // fire the SEMANTIC widget callback exactly ONCE (the inner target's), NOT the
-    // rail's — otherwise a forwarding view would double-invoke the side effect. The
-    // rail's value serializes directly from `parentWidget.value`, which we set here,
-    // so it needs no callback of its own.
-    w.value = coerced;
+    // Assign BOTH values first — EXCEPT on an instance-scoped promoted write, where
+    // the inner widget is not a second copy of this value but the SHARED SUBGRAPH
+    // DEFINITION every sibling instance reads (comfyui-mcp#1707). There the rail IS
+    // the store, so assigning the inner widget would not make this write land — it
+    // would only broadcast it to wrappers the caller never addressed.
+    //
+    // On the definition-scoped path (a frontend that gives the host input no
+    // per-instance key) nothing changes: the parent's projected promoted widget is a
+    // VIEW of the inner widget; its own callback typically FORWARDS to the inner one,
+    // so we fire the SEMANTIC widget callback exactly ONCE (the inner target's), NOT
+    // the rail's — otherwise a forwarding view would double-invoke the side effect.
+    // The rail's value serializes directly from `parentWidget.value`, which we set
+    // here, so it needs no callback of its own.
+    if (!instanceScoped) w.value = coerced;
     if (parentWidget) parentWidget.value = coerced;
     // #477: sync the parent-facing DISPLAY proxies too. They are VIEWS of the same
     // promoted value (no semantic callback of their own — the inner target's fires
@@ -1596,16 +1687,25 @@ export function applyWidgetWrite(
     // A throw from here is captured by the same catch as everything else in this envelope
     // and stays UNATTRIBUTED — `onPropertyChanged` is a node's own code and this is not
     // the widget-callback invocation #976 can name.
-    if (boundProperty?.reachable) targetNode.setProperty(boundProperty.property, coerced);
-    // Fire the inner widget's own callback so combo/number side effects run — the
+    if (boundProperty?.reachable) valueNode.setProperty(boundProperty.property, coerced);
+    // Fire the WRITTEN widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
+    //
+    // comfyui-mcp#1707: on an instance-scoped promoted write that is the RAIL's
+    // callback on the WRAPPER, not the inner definition widget's. This is not a
+    // preference — it is the only coherent choice once the definition is left alone:
+    // invoking the inner node's callback would announce a new value for a widget
+    // whose value did not change, and would run that shared node's side effects for
+    // an edit made on ONE instance. It is also what the UI does, for the same reason:
+    // a canvas edit of a promoted control runs the projection's callback (which
+    // writes the store) and never reaches the inner widget's.
     //
     // #976: the flagged span contains the INVOCATION and nothing else, because the
     // flag is an attribution and an attribution that can be raised by anything but
     // the callback body is a lie. Hoisted out of it, in order:
-    //   - the `w.callback` LOOKUP: it may be a throwing accessor, which is not the
-    //     callback failing (it never ran)
-    //   - the ARGUMENTS, including `targetNode.pos`, which may be a throwing getter
+    //   - the `valueWidget.callback` LOOKUP: it may be a throwing accessor, which is
+    //     not the callback failing (it never ran)
+    //   - the ARGUMENTS, including `valueNode.pos`, which may be a throwing getter
     //   - and they are built INSIDE the nullish guard, because the original
     //     `w.callback?.(…)` short-circuited: with no callback, `pos` was never read,
     //     and a node with a throwing `pos` getter and no callback must keep the clean
@@ -1620,11 +1720,11 @@ export function applyWidgetWrite(
     // non-callable callback still throws a TypeError exactly as before, and it takes
     // the argument list without spreading — no `Symbol.iterator` to poison either.
     // `reflectApply` is captured at module load for the same reason.
-    widgetCallback = w.callback;
+    widgetCallback = valueWidget.callback;
     if (widgetCallback !== null && widgetCallback !== undefined) {
-      const callbackArgs = [coerced, canvas, targetNode, targetNode.pos, undefined];
+      const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
       threwFromCallback = true;
-      reflectApply(widgetCallback, w, callbackArgs);
+      reflectApply(widgetCallback, valueWidget, callbackArgs);
       threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
     }
   } catch (err) {
@@ -1676,7 +1776,7 @@ export function applyWidgetWrite(
   const readBoundProperty = () => {
     if (!boundProperty) return UNREADABLE_PROPERTY;
     try {
-      const props = targetNode.properties;
+      const props = valueNode.properties;
       if (!props || typeof props !== "object") return UNREADABLE_PROPERTY;
       return props[boundProperty.property];
     } catch {
@@ -1696,20 +1796,46 @@ export function applyWidgetWrite(
   // Only an EXACTLY reproducible snap counts. If the config does not explain the
   // observed value, this stays the failure it was — no tolerance, because a
   // tolerance would eventually swallow a real revert that landed nearby.
-  const normalization = matchesExpected(w.value)
+  const normalization = matchesExpected(valueWidget.value)
     ? null
-    : explainNumericNormalization(expected, w.value, w);
-  if (!matchesExpected(w.value) && !normalization) {
+    : explainNumericNormalization(expected, valueWidget.value, valueWidget);
+  // comfyui-mcp#1707 — the SHARED DEFINITION must be exactly as it was.
+  //
+  // This is the check that makes the scope classification safe rather than merely
+  // hopeful. `promotedValueScope` reads the frontend's own store key and concludes
+  // the rail is this wrapper's alone; if that plumbing is not what this frontend
+  // actually does — a rail that still forwards to the inner widget — the inner value
+  // moves, and the write silently becomes the cross-instance write this change
+  // exists to stop. Observed, not assumed: a definition that moved is a FAILURE, so
+  // the write rolls back and says so instead of reporting an instance-scoped write it
+  // did not perform. Compared structurally against the pre-mutation clone, so a
+  // callback mutating a captured object in place is caught too.
+  const definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
+  if (!matchesExpected(valueWidget.value) && !normalization) {
     failure =
-      `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
-      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.` +
+      `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) did not retain the ` +
+      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(valueWidget.value)}.` +
       // #698 — "did not retain" reads as a transient failure worth retrying. For a
       // non-value-bearing DOM widget it is STRUCTURAL: the widget is a view, its
       // real state lives on the node, and no number of retries will change that.
       // Appended ONLY here, in the branch where the revert has already been
       // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
       // that would have worked. Diagnosis, never a gate.
-      describeNonValueBearingWidget(w, targetNode);
+      describeNonValueBearingWidget(valueWidget, valueNode);
+  } else if (definitionMoved) {
+    // comfyui-mcp#1707 — the rail took the value AND the shared definition moved, so
+    // the two are not independent after all and this write did reach every sibling
+    // instance. Reported as a failure and rolled back: the alternative is a success
+    // result whose `value_scope: "instance"` would be false, which is the exact class
+    // of claim this change exists to remove.
+    failure =
+      `Promoted widget "${valueWidget.name}" on subgraph node ${node.id} is backed by a ` +
+      `per-instance value store (widgetId ${JSON.stringify(promotedHostWidgetId)}), but writing it ` +
+      `ALSO changed the shared subgraph definition's inner widget "${w.name}" on node ` +
+      `${targetNode.id} (${JSON.stringify(previous)} → ${JSON.stringify(w.value)}). That value is ` +
+      `read by every other instance of this subgraph, so the write is not scoped to the ` +
+      `instance it was addressed to. Rolled back rather than report an instance-scoped write ` +
+      `that was not one (comfyui-mcp#1707).`;
   } else if (boundProperty?.reachable && !matchesExpected(boundPropertyActual)) {
     // #1268 / comfyui-mcp#1658 — the widget kept the value and the node's own bound
     // property did NOT. This is the read the old verification never took: `w.value` came
@@ -1727,13 +1853,20 @@ export function applyWidgetWrite(
     // as the abort signal and honours by restoring the previous value.
     failure = boundPropertyFailure({
       property: boundProperty.property,
-      widgetName: w.name,
-      nodeId: targetNode.id,
+      widgetName: valueWidget.name,
+      nodeId: valueNode.id,
       expected,
       actual: boundPropertyActual,
       unreadable: boundPropertyActual === UNREADABLE_PROPERTY,
     });
-  } else if (parentWidget && !matchesExpected(parentWidget.value)) {
+  } else if (parentWidget && parentWidget !== valueWidget && !matchesExpected(parentWidget.value)) {
+    // comfyui-mcp#1707 — `parentWidget !== valueWidget` because on an instance-scoped
+    // promoted write the rail IS the widget this write assigned, and the branch above
+    // has already verified it — with the #805 normalization allowance this one does not
+    // have. Checking it a second time by strict equality would fail a rail that did
+    // exactly what a numeric widget is supposed to do, reporting "did not retain" for a
+    // write that applied. Nothing is verified less: it is the same object, checked once,
+    // by the check that knows about grids.
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
       `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
@@ -1965,15 +2098,24 @@ export function applyWidgetWrite(
       // widget ends on its own captured value either way.
       if (boundProperty?.reachable) {
         try {
-          targetNode.setProperty(boundProperty.property, boundProperty.previous);
+          valueNode.setProperty(boundProperty.property, boundProperty.previous);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
       }
-      try {
-        w.value = previous;
-      } catch {
-        /* restore best-effort; read-back below is authoritative */
+      // comfyui-mcp#1707 — restore the inner definition widget only when this write
+      // could have moved it: it was written (the definition-scoped path), or it moved
+      // anyway (the instance-scoped path's own failure branch above). An instance-scoped
+      // write that left it alone must not assign it here either — the assignment is a
+      // no-op for a plain widget but a side effect for a DOM one, and rolling back a
+      // write this path never made is exactly the shared-definition touch it avoided.
+      // The read-back below still compares it against the captured clone either way.
+      if (!instanceScoped || definitionMoved) {
+        try {
+          w.value = previous;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
       }
       if (parentWidget) {
         try {
@@ -2118,7 +2260,7 @@ export function applyWidgetWrite(
     setDirty?.();
     if (rollbackFailed) {
       throw new WidgetWriteError(
-        `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) write failed: ${failure} ` +
+        `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) write failed: ${failure} ` +
           `Rollback of ${rollbackFailed} did not take effect (a value setter or history hook ` +
           `rejected/overrode it) — the graph may be in a partial state; re-set the widget or undo.`,
         // The one WidgetWriteError raised AFTER the graph was mutated and NOT cleanly
@@ -2145,11 +2287,19 @@ export function applyWidgetWrite(
   // #976: `write_warning_source` carries the attribution as DATA, so a caller does not
   // have to pattern-match prose to render it. Present ONLY for the establishable case;
   // its absence means "not attributable", never "the panel's fault".
+  // comfyui-mcp#1707 — `node_id`/`widget`/`value` name the widget this write ACTUALLY
+  // assigned. For an instance-scoped promoted write that is the wrapper the caller
+  // addressed and its promoted widget — not the inner definition widget, which this
+  // path deliberately leaves untouched, and which the panel's own activity line would
+  // otherwise announce as "Set width = 1024 on node 54" for a node whose value did not
+  // change. Provenance is not lost: `promoted_from.inner_node_id` still names the inner
+  // node and `inner_previous` still reports its (unchanged) value. Every definition-scoped
+  // and non-promoted write reports exactly the fields it always did.
   return {
-    node_id: targetNode.id,
-    widget: w.name,
+    node_id: valueNode.id,
+    widget: valueWidget.name,
     previous: parentWidget ? previousParent : previous,
-    value: w.value,
+    value: valueWidget.value,
     // #1126 — the COERCION-TIME verdict, so the caller reports WHAT HAPPENED instead of
     // inferring it from the rejection that led here. `options.values` is a callback and
     // can answer differently per call: the final attempt may well have been admitted by
@@ -2223,9 +2373,9 @@ export function applyWidgetWrite(
           requested_value: expected,
           normalization_rule: normalization.rule,
           normalization_note: normalizationNote({
-            name: w.name,
+            name: valueWidget.name,
             requested: expected,
-            actual: w.value,
+            actual: valueWidget.value,
             rule: normalization.rule,
           }),
         }
@@ -2237,6 +2387,23 @@ export function applyWidgetWrite(
             ...promotedFrom,
             parent_widget_synced: parentWidget != null,
             ...(displayWidgets.length ? { display_widgets_synced: displayWidgets.length } : {}),
+            // comfyui-mcp#1707 — WHOSE value this changed, as DATA rather than something
+            // a caller has to infer from the shape of the reply:
+            //
+            //   "instance"            the wrapper's own promoted-value store entry was
+            //                         written and the shared subgraph definition was
+            //                         verified UNCHANGED, so sibling instances of the same
+            //                         subgraph keep their own values.
+            //   "subgraph_definition" this frontend exposes no per-instance store for this
+            //                         promoted widget, so the value was written into the
+            //                         subgraph DEFINITION's inner widget — which every
+            //                         instance of this subgraph reads.
+            //
+            // Always present on a promoted write, so "the field is missing" can never be
+            // read as either verdict, and never emitted for a write that took the other
+            // path — the failure branch above rolls back rather than let "instance" stand
+            // for a write that moved the definition.
+            value_scope: valueScope,
           },
         }
       : {}),
