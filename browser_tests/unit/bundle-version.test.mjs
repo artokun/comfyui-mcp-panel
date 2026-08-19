@@ -250,7 +250,7 @@ test("#584 healer navigation guards: unsaved-work refusal, socket-down defer, ca
   // socket down defers its navigation and UN-ARMS the marker, or the next
   // reconnect would read the attempt as spent and never retry.
   const prime = body.indexOf("primeModuleCache({");
-  const socketDown = body.indexOf("if (comfyBackendSocketDown)", prime);
+  const socketDown = body.indexOf("if (comfyBackendIsDown())", prime);
   assert.ok(socketDown > prime, "the socket is re-checked after the prime, before navigating");
   const deferUnarm = body.indexOf("ssSet(BUNDLE_HEAL_KEY, null);", socketDown);
   assert.ok(

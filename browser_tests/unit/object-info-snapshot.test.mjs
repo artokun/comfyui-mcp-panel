@@ -517,6 +517,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
      let oracleFailures = [];
      let snapshotIneligibility = "";
      let setWidgetSchemaFromSnapshot = null;
+     const comfyBackendIsDown = () => comfyBackendSocketDown;
      const historyRecorded = [];
      const recordObjectInfoTypes = (defs) => { historyRecorded.push(defs); return defs; };
      // Declared HERE so it closes over the mutable epoch above and can move it the moment

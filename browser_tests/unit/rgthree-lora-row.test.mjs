@@ -1310,6 +1310,7 @@ const EXECUTOR_DEPS = [
   "recordObjectInfoTypes",
   "objectInfoOracleFailureNote",
   "comfyBackendSocketDown",
+  "comfyBackendIsDown",
   "objectInfoHistory",
   "sourceForSubgraphInput",
   "refreshComboOptionsFromDefs",
@@ -1448,6 +1449,7 @@ function executor(node, overrides = {}) {
     runSetWidget: overrides.runSetWidget ?? stubRunSetWidget(),
     clearStaleRedFlag: () => {},
     objectInfoHistory: { wasTypeEverDefined: () => true },
+    comfyBackendIsDown: () => false,
     ...overrides,
   };
   const factory = new Function(
