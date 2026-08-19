@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_open_workflow` reports the fence uuid from the same active-workflow observation as the binding fields beside it, instead of a second live read that could disagree (#1014)
+
 ## [0.15.8] - 2026-08-19
 
 ### Fixed
