@@ -430,13 +430,18 @@ test("#1192: a registration wait cut short by the budget SAYS it was, and says r
     comfy,
     budgetMs: 260,
     reserveMs: 0,
-    registrationMs: 200,
+    // 400, not 200: the wait must end at the BUDGET's remainder (~60ms after the fetch), so
+    // the standalone timeout has to sit far enough past it that a wait which ignores the
+    // budget and takes its full window is unambiguously late — 180ms of fetch plus 400ms of
+    // wait is more than double the whole command.
+    registrationMs: 400,
     getNodeDefs: async () => {
       await sleep(180); // most of the command spent before the wait even begins
       return schema;
     },
   });
 
+  const started = Date.now();
   await assert.rejects(
     () => built.graph_add_node({ class_type: "NewNode" }),
     (err) => {
@@ -445,6 +450,15 @@ test("#1192: a registration wait cut short by the budget SAYS it was, and says r
       assert.match(err.message, /RETRY FIRST/, "…and the retry must outrank the reload advice");
       return true;
     },
+  );
+  // The MESSAGE assertions above pass even when the wait ignores the budget it was handed —
+  // `cutShort` is computed from the same `wait` the mutation bypasses — so the truncation
+  // itself is asserted on the clock: the refusal must land near the budget's remainder, not
+  // after the wait's full standalone window. A wait that took its own 400ms after a 180ms
+  // fetch has spent more than two command budgets.
+  assert.ok(
+    Date.now() - started < 400,
+    "the wait must end at the budget's remainder, not run out its full standalone window",
   );
 });
 
