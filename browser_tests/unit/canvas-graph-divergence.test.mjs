@@ -53,6 +53,10 @@ import {
   SUBGRAPH_OUTPUT_RAIL_ID,
 } from "../../web/js/lib/subgraph-scope.js";
 import {
+  rememberAutoLayoutScope,
+  layoutScopeFingerprint,
+} from "../../web/js/lib/auto-layout-scope.js";
+import {
   graphBindingRefusalMessage,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
@@ -103,8 +107,10 @@ function buildGetGraphCtx(app) {
     "app",
     "window",
     "resolveScope",
+    "rememberAutoLayoutScope",
+    "layoutScopeFingerprint",
     `${source}\nreturn getGraphCtx;`,
-  )(app, { LiteGraph: {} }, resolveScope);
+  )(app, { LiteGraph: {} }, resolveScope, rememberAutoLayoutScope, layoutScopeFingerprint);
 }
 
 function nodes(n, offset = 0) {
