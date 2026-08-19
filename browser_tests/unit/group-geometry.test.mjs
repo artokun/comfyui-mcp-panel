@@ -23,6 +23,7 @@ import {
   syncGraphNodeAreas,
   moveGroupMembers,
   nodeAreaIsLive,
+  nodeAreaOriginTracks,
 } from "../../web/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
@@ -822,11 +823,15 @@ test("#813 a rect exposed by a COPYING getter is not reported moved (review P2)"
   assert.deepEqual(real, [100, 70, 80, 30], "and the underlying rect really was never updated");
 });
 
-test("#813 an EXPANDED node's authoritative extents are not overwritten (review P2)", () => {
+test("#813/#1300 an EXPANDED node's authoritative extents are not overwritten (review P2)", () => {
   // A custom node whose updateArea() computes visible bounds reaching past `size` — a
   // legitimate engine answer that differs from the panel's generic footprint model. The
   // collapsed repair must not fire here: overwriting the engine's rect and reporting
   // success would make later rect-first membership wrong.
+  //
+  // #813 left this node STUCK rather than overwrite. That is the #1300 false
+  // refusal: the position DID land, the origin DID track, only the extent model
+  // disagreed. The node must MOVE, and the engine's extents must survive.
   const n = {
     id: 31,
     pos: [100, 100],
@@ -840,12 +845,91 @@ test("#813 an EXPANDED node's authoritative extents are not overwritten (review 
 
   const r = moveGroupMembers([n], 10, 10);
 
-  assert.deepEqual(r.stuck, [n], "an expanded node with a non-generic rect is still stuck");
+  assert.deepEqual(r.stuck, [], "an expanded node whose origin tracked is not stuck");
+  assert.deepEqual(r.moved, [n], "…it moved");
+  assert.deepEqual(n.pos, [110, 110]);
   assert.deepEqual(
     [...n.boundingRect],
     [110, 80, 400, 300],
     "and its authoritative extents survive — never replaced by the 200x130 generic model",
   );
+});
+
+test("#1300 a Label (rgthree)-shaped member moves even though its rect is not the generic footprint", () => {
+  // The reporter's nodes 579/594/606: frontend-only Label (rgthree). Their
+  // updateArea() writes font-scaled visual bounds that are much larger than
+  // size, so nodeAreaIsLive is false by construction. pinned is not the
+  // discriminator — 579 was unpinned, 594 and 606 were pinned, all three
+  // refused. panel_edit_node moved each of them.
+  const label = (id, pinned) => ({
+    id,
+    type: "Label (rgthree)",
+    pos: [100, 100],
+    size: [210, 56],
+    flags: { pinned },
+    boundingRect: [100, 70, 420, 180],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, 420, 180];
+    },
+  });
+  const unpinned = label(579, false);
+  const pinned = label(594, true);
+
+  const r = moveGroupMembers([unpinned, pinned], 50, 25);
+
+  assert.deepEqual(r.stuck, [], "neither pinned nor unpinned Label is stuck");
+  assert.deepEqual(r.moved, [unpinned, pinned]);
+  assert.deepEqual(unpinned.pos, [150, 125]);
+  assert.deepEqual(pinned.pos, [150, 125]);
+  assert.deepEqual([...unpinned.boundingRect], [150, 95, 420, 180], "engine extents survive");
+  assert.deepEqual([...pinned.boundingRect], [150, 95, 420, 180]);
+});
+
+test("#1300 an expanded copying-getter rect is still stuck (#408 preserved)", () => {
+  // Same copying-getter shape as the #813 collapsed test, but expanded: the
+  // origin-tracks check must re-read, not trust a throwaway write, or a Label
+  // whose boundingRect getter returns a copy would report moved and then vanish
+  // from the group on the next rect-first membership read.
+  const real = [100, 70, 420, 180];
+  const n = {
+    id: 606,
+    type: "Label (rgthree)",
+    pos: [100, 100],
+    size: [210, 56],
+    get boundingRect() {
+      return [...real];
+    },
+    updateArea() { /* writes to a copy, dropped */ },
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "a rect whose writes cannot be observed is not 'moved'");
+  assert.deepEqual(r.stuck, [n]);
+  assert.deepEqual(real, [100, 70, 420, 180], "and the underlying rect really was never updated");
+});
+
+test("#1300 an expanded frozen rect is still stuck (#408 preserved)", () => {
+  const n = {
+    id: 607,
+    type: "Label (rgthree)",
+    pos: [100, 100],
+    size: [210, 56],
+    boundingRect: Object.freeze([100, 70, 420, 180]),
+  };
+
+  const r = moveGroupMembers([n], 50, 25);
+
+  assert.deepEqual(r.moved, [], "an uncorrectable rect still refuses");
+  assert.deepEqual(r.stuck, [n]);
+});
+
+test("#1300 nodeAreaOriginTracks: origin shifted by the delta, extents ignored", () => {
+  const n = { boundingRect: [110, 80, 420, 180] };
+  assert.equal(nodeAreaOriginTracks(n, [100, 70], 10, 10), true);
+  assert.equal(nodeAreaOriginTracks(n, [100, 70], 0, 0), false, "wrong delta");
+  assert.equal(nodeAreaOriginTracks({ boundingRect: null }, [100, 70], 10, 10), true, "no cached rect");
+  assert.equal(nodeAreaOriginTracks({ get boundingRect() { throw new TypeError("gone"); } }, [100, 70], 10, 10), false);
 });
 
 test("#813 a node whose flags accessor THROWS is stuck, not repaired", () => {

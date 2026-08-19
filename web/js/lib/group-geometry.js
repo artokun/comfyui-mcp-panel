@@ -360,6 +360,50 @@ export function nodeAreaIsLive(node) {
   }
 }
 
+/**
+ * Did this node's cached boundingRect ORIGIN shift by (dx, dy)?
+ *
+ * Distinct from `nodeAreaIsLive`, which asks whether the WHOLE rect matches the
+ * panel's generic `[x, y-30, w, h+30]` model. A custom node (Label (rgthree) and
+ * anything else whose `updateArea()` draws past `size`) has a live, engine-
+ * authoritative rect whose extents will NEVER match that model. Demanding the
+ * generic footprint made `panel_move_group` refuse a group of those nodes after
+ * their positions had already been written, while `panel_edit_node` — which never
+ * asks this question — moved the same nodes fine (#1300).
+ *
+ * Membership is still rect-first: if the origin did not track the move, the next
+ * geometric read would leave the node in the group it has actually left, so this
+ * returns false and the caller treats the node as stuck (#408). Re-reads
+ * `boundingRect` so a copying getter (writes to a throwaway) cannot fake a pass.
+ *
+ * `originBefore` is the `[x, y]` origin SNAPSHOTTED before the position write.
+ * Null/missing means there was no cached rect to compare: a missing rect means
+ * membership reads use live pos/size, and a rect that only appeared after the
+ * write is the engine's answer for the NEW position. Either way the origin cannot
+ * be stale from the old one, so a finite origin (or no rect at all) is enough.
+ */
+export function nodeAreaOriginTracks(node, originBefore, dx, dy) {
+  try {
+    const br = node?.boundingRect;
+    if (!br || br.length !== 4) return true; // nothing cached ⇒ reads use live pos
+    const f32 = isFloat32(br);
+    if (!originBefore || originBefore.length !== 2) {
+      const x = Number(br[0]);
+      const y = Number(br[1]);
+      return Number.isFinite(x) && Number.isFinite(y);
+    }
+    const ox = Number(originBefore[0]);
+    const oy = Number(originBefore[1]);
+    if (!Number.isFinite(ox) || !Number.isFinite(oy)) return false;
+    const wantDx = Number(dx);
+    const wantDy = Number(dy);
+    if (!Number.isFinite(wantDx) || !Number.isFinite(wantDy)) return false;
+    return samePoint(Number(br[0]), ox + wantDx, f32) && samePoint(Number(br[1]), oy + wantDy, f32);
+  } catch {
+    return false; // an unreadable rect cannot be shown to have tracked
+  }
+}
+
 export function syncNodeArea(node, forceCollapsed = false) {
   try {
     // Read the live geometry FIRST, even when there is no cached rect to write.
@@ -511,6 +555,26 @@ export function moveGroupMembers(members, dx, dy) {
       continue;
     }
     attempted.push([n, px, py]);
+    // Snapshot the cached origin BEFORE the write so the #1300 origin-tracks
+    // check can delta-compare afterwards. A throwing accessor is "unreadable",
+    // not "no rect": we cannot prove the origin tracked a value we never captured.
+    let originBefore = null;
+    let originReadable = false;
+    try {
+      const br = n?.boundingRect;
+      if (br && br.length === 4) {
+        const ox = Number(br[0]);
+        const oy = Number(br[1]);
+        if (Number.isFinite(ox) && Number.isFinite(oy)) {
+          originBefore = [ox, oy];
+          originReadable = true;
+        }
+      } else {
+        originReadable = true; // no cached rect ⇒ membership reads use live pos
+      }
+    } catch {
+      originReadable = false;
+    }
     let landedExactly = false;
     try {
       landedExactly = writePoint(n, "pos", px + dx, py + dy);
@@ -553,17 +617,14 @@ export function moveGroupMembers(members, dx, dy) {
       // left. The question changes from "does the rect already agree" to "can the rect be
       // MADE to agree", which is the one the caller actually needs answered.
       //
-      // TWO THINGS THE CORRECTION IS DELIBERATELY NOT (both found in review):
+      // TWO THINGS THE COLLAPSED CORRECTION IS DELIBERATELY NOT (both found in review):
       //
-      // 1. IT IS NOT UNGATED. Only a COLLAPSED node gets it. An expanded node's
-      //    `updateArea()` may authoritatively compute extents that legitimately differ from
-      //    the generic `[x, y-30, size0, size1+30]` model — visible bounds that reach past
-      //    `size`, on a custom node that draws outside its box. Forcing the generic
-      //    footprint there would overwrite the engine's own answer and then report success,
-      //    and rect-first membership would be wrong afterwards. The reported defect is
-      //    specifically the collapsed-PILL disagreement, so that is all this repairs; an
-      //    expanded node with an uncorrectable rect is still stuck, exactly as before.
-      //    A `flags` accessor that THROWS reads as not-collapsed, so it fails closed.
+      // 1. IT IS NOT UNGATED. Only a COLLAPSED node gets the pill-force. An expanded
+      //    node's `updateArea()` may authoritatively compute extents that legitimately
+      //    differ from the generic `[x, y-30, size0, size1+30]` model — visible bounds
+      //    that reach past `size`, on a custom node that draws outside its box. Forcing
+      //    the generic footprint there would overwrite the engine's own answer and then
+      //    report success, and rect-first membership would be wrong afterwards.
       //
       // 2. IT DOES NOT TRUST `syncNodeArea`'s OWN VERDICT ALONE. `boundingRect` can be an
       //    accessor whose getter returns a FRESH array on every read — a shape this file
@@ -573,20 +634,42 @@ export function moveGroupMembers(members, dx, dy) {
       //    node's real rect never changed: the move would report the node moved while the
       //    next membership read still saw the old rect and dropped it from the group. So the
       //    verdict is re-read through `nodeAreaIsLive`, which fetches the property again.
+      //
+      // panel#1300 — AN EXPANDED MEMBER WITH CUSTOM EXTENTS IS NOT STUCK EITHER.
+      //
+      // The #813 review left expanded custom-extent nodes stuck rather than overwrite
+      // their engine rect. That is the #1300 false refusal: `Label (rgthree)` (and any
+      // decorative node that draws past `size`) lands the position write, `updateArea()`
+      // shifts the origin by the same delta, and `nodeAreaIsLive` still fails because
+      // width/height are not the generic model. `panel_edit_node` never asks that
+      // question, so the same node moves fine one-by-one. The remedy is not to force
+      // the generic footprint (that is the overwrite #813 correctly refused) — it is
+      // to accept a rect whose ORIGIN tracked the move, extents and all.
       let isCollapsed = false;
+      let flagsReadable = true;
       try {
         isCollapsed = !!n?.flags?.collapsed;
       } catch {
-        // Unreadable flags ⇒ not eligible for the collapsed repair. Mutation reports
-        // flipping this to `true` as a SURVIVOR, and it is an equivalent mutant rather than
-        // a gap: `syncNodeArea` reads the same `flags` accessor through `wantedNodeArea`,
-        // so it throws, is caught there, and returns false — the node is stuck either way.
-        // Stated here so the next run does not re-chase it; the BEHAVIOUR is pinned by
-        // "a node whose flags accessor THROWS is stuck, not repaired".
+        // Unreadable flags ⇒ not eligible for the collapsed repair AND not eligible
+        // for the #1300 origin-tracks path. We cannot tell a collapsed pill from a
+        // custom-extent Label, so we cannot choose a verdict. Mutation reports
+        // flipping this to `true` as a SURVIVOR, and it is an equivalent mutant rather
+        // than a gap: `syncNodeArea` reads the same `flags` accessor through
+        // `wantedNodeArea`, so it throws, is caught there, and returns false — the
+        // node is stuck either way. Stated here so the next run does not re-chase
+        // it; the BEHAVIOUR is pinned by "a node whose flags accessor THROWS is
+        // stuck, not repaired".
+        flagsReadable = false;
         isCollapsed = false;
       }
-      if (!nodeAreaIsLive(n) && !(isCollapsed && syncNodeArea(n) && nodeAreaIsLive(n))) {
-        landedExactly = false;
+      if (isCollapsed) {
+        if (!nodeAreaIsLive(n) && !(syncNodeArea(n) && nodeAreaIsLive(n))) {
+          landedExactly = false;
+        }
+      } else if (!nodeAreaIsLive(n)) {
+        if (!flagsReadable || !originReadable || !nodeAreaOriginTracks(n, originBefore, dx, dy)) {
+          landedExactly = false;
+        }
       }
     } catch {
       landedExactly = false;
