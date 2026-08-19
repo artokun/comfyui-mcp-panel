@@ -78,11 +78,6 @@ export const NODE_DEFS_FETCH_SHARE = (() => {
   return Number(m[1]) / Number(m[2]);
 })();
 
-export const NODE_DEFS_COMBO_FLOOR_MS = readPanelNumber(
-  /const NODE_DEFS_COMBO_FLOOR_MS = (\d+);/,
-  "the combo phase's guaranteed floor",
-);
-
 /**
  * The panel's sentinel for "this call did not answer", mirrored so a rebuilt executor
  * compares against the same value its injected `boundedGetNodeDefs` resolves.

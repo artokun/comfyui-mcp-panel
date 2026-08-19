@@ -22,7 +22,6 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
-  NODE_DEFS_COMBO_FLOOR_MS,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -62,6 +61,7 @@ import {
   describeNodeDefRefresh,
   NODE_DEF_REFRESH_REASONS,
 } from "../../web/js/lib/node-def-refresh.js";
+import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -335,9 +335,21 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   assert.match(body, /return describeNodeDefRefresh\(\{/, "the run verdict is returned");
   assert.match(
     body,
-    /nodeDefsRefreshConfirmed = !didThrow && !!defs && comboRan;/,
-    "the shared global stays a strict boolean (concurrent-run trust gate unchanged)",
+    /nodeDefsRefreshConfirmed = !didThrow && !!defs && \(comboRan \|\| comboAbandonedAfterRebuild\);/,
+    "the shared global stays a strict boolean, and #1193 admits the panel's OWN completed " +
+      "combo rebuild as the second way the live lists became current",
   );
+  // #1193 — the two inputs must stay SEPARATE all the way to the verdict. Merging them
+  // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
+  // a confirmed one, which is the distinction the disclosure exists to carry.
+  assert.match(body, /comboRebuiltLocally: comboAbandonedAfterRebuild,/, "the verdict is told which one held");
+  // #1193 — the disclosure is gated on the sweep having COVERED the graph, never on it
+  // merely having finished. `comboRebuild.completed` alone is true for a sweep that walked
+  // past every V2 combo on the graph, and granting the claim there suppresses a genuine
+  // missing asset. The predicate lives beside the sweep so both readers ask it the same way.
+  assert.match(body, /if \(comboAbandoned && comboRebuildCovered\(comboRebuild\)\) \{/, "the disclosure demands a COVERED sweep");
+  assert.doesNotMatch(body, /comboAbandoned && comboRebuild\.completed/, "…never `completed` on its own");
+  assert.match(body, /comboRan,/, "the frontend call's own outcome is still passed separately");
 });
 
 // ---------------------------------------------------------------------------
@@ -400,6 +412,7 @@ function buildRegisterComfyNodeDefs({
     "api",
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
+    "comboRebuildCovered",
     "describeNodeDefRefresh",
     // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
     // a harness that substituted a pass-through would stop proving what this file exists to
@@ -412,7 +425,6 @@ function buildRegisterComfyNodeDefs({
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
-    "NODE_DEFS_COMBO_FLOOR_MS",
     "nodeDefsBudgetLeft",
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -444,6 +456,7 @@ function buildRegisterComfyNodeDefs({
     apiValue,
     recordObjectInfoTypes,
     reapplyDefsToLiveNodes,
+    comboRebuildCovered,
     describeNodeDefRefresh,
     // No real waiting: the delays are the shipped ones, the sleep is not.
     // #1180 — the SHIPPED options, not just the shipped helper. Omitting `delays` let the
@@ -459,8 +472,7 @@ function buildRegisterComfyNodeDefs({
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
-    NODE_DEFS_COMBO_FLOOR_MS,
-    // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
+      // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
     // helper reads the REAL monotonicNow; a fake-clock deadline measured against it is a
     // different bound than the one the panel arms (its own nodeDefsBudgetLeft shares the
     // panel's clock). Without the override the shared helper is passed through unchanged.
@@ -727,11 +739,11 @@ test("#1180: a real backend error outranks a synthesized timeout in the verdict"
 });
 
 test("#1180 EXECUTED: which error survives the retry, across every ordering", async () => {
-  // MIRRORS the panel's loop rather than driving it, which is worth being plain about:
-  // its value is enumerating many orderings cheaply, and the structural test above is what
-  // ties the mirror to the source. The ordering that drives the SHIPPED executor is "a REAL
-  // error survives a later stall" at the end of this file, on virtual timers.
-  //
+  // MIRRORS the panel's loop rather than driving it, which is worth being plain about:
+  // its value is enumerating many orderings cheaply, and the structural test above is what
+  // ties the mirror to the source. The ordering that drives the SHIPPED executor is "a REAL
+  // error survives a later stall" at the end of this file, on virtual timers.
+  //
   // This one runs the real
   // retry loop and shows what a user would actually be told, because "the last error wins"
   // plus "a timeout can be an error" silently changes the verdict for orderings nobody
@@ -753,7 +765,7 @@ test("#1180 EXECUTED: which error survives the retry, across every ordering", as
             if (o === "falsy") throw null; // a real failure whose VALUE is falsy
             result = o === "timeout" ? NO_ANSWER : { KSampler: {} };
           } catch (err) {
-            sawRealError = true;
+            sawRealError = true;
             lastRealError = err;
             throw err;
           }
@@ -932,11 +944,9 @@ test("#1180 the combo phase arms a bound, using the panel's constant", async () 
   // phase ran first and its cost comes out of the same total. So the assertion is a band,
   // and both edges matter — 0 or less arms nothing at all (withTimeout's non-positive
   // contract, which silently restores the hang), and anything above the run budget means
-  // the phase is spending time the run has not got. #1193's FLOOR sits under that
-  // remainder but does not bind here: this fetch answered instantly, so the remainder is
-  // the whole budget, which is larger than the floor. The floor cases — armed exactly
-  // when the remainder runs out, still bounding, and not shrinking a healthy remainder —
-  // are the #1193 tests below.
+  // the phase is spending time the run has not got. #1193 left this REMAINDER alone — it
+  // moved the abandonment's VERDICT instead of topping the remainder up — so the band
+  // below is still the whole property.
   assert.ok(
     armed[0].ms > 0 && armed[0].ms <= NODE_DEFS_RUN_BUDGET_MS,
     `the combo bound must be the run's REMAINING budget, saw ${armed[0].ms}ms against a ${NODE_DEFS_RUN_BUDGET_MS}ms run`,
@@ -972,108 +982,210 @@ test("#1180 a combo refresh that never answers is NOT reported as a refresh", as
   );
 });
 
-test("#1193: a slow-but-healthy fetch leaves the combo phase its FLOOR, and the healthy combo completes", async () => {
-  // The issue's failing row, run against the SHIPPED executor with a clock the test
-  // controls: the fetch takes 5500ms of its 6000ms share and SUCCEEDS, leaving a pure
-  // remainder of 3500ms for a combo phase whose measured cost is 4846ms — abandoned
-  // before the floor, reporting combo_refresh_failed over a refresh that would have
-  // completed (and leaving the next panel_set_widget refusing the value the refresh
-  // was for).
-  //
-  // Both waits are VIRTUAL: the deadline arithmetic runs on the injected clock, the
-  // combo's own 4846ms on the injected timers. fireUpTo(4846) lets the combo finish
-  // only when the armed bound is LARGER than that — pre-floor it was 3500ms and fired
-  // first, so this test fails on the pre-fix code for the right reason.
-  let now = 0;
+// ---------------------------------------------------------------------------
+// #1193 — the combo phase's remainder can be too thin for a HEALTHY refresh.
+//
+// MEASURED, on a live rig (848 node types, ComfyUI frontend 1.48.7): getNodeDefs 211ms /
+// refreshComboInNodes 555ms unthrottled; with every /object_info delayed 3000ms, 3156ms /
+// 3318ms. `refreshComboInNodes()` RE-FETCHES /object_info, so its cost tracks the
+// backend's latency — and the only case that starves its remainder is a fetch slow enough
+// to spend its share, i.e. that same slow backend. No constant sized from the warm figure
+// covers the case it fires in, which is why the fix is not a bigger number.
+//
+// What it is instead: since #1172 the reapply sweep rebuilds every live combo's
+// options.values from the payload this run fetched, so an ABANDONED frontend call is a
+// missing confirmation, not stale dropdowns.
+// ---------------------------------------------------------------------------
+
+/** The reapply sweep's contract, as `reapplyDefsToLiveNodes` fills it in: counts as it
+ *  goes, `combosSkipped` for every combo whose list it could not derive, and `completed`
+ *  only after every graph was walked. `asset-staleness.test.mjs` pins the REAL sweep
+ *  against this same shape — including a V2 `["COMBO", {options}]` spec and the remote /
+ *  dynamic shapes it must refuse — so these doubles cannot drift into a contract the
+ *  shipped sweep does not honour. */
+function sweepThatCompletes(combosRebuilt = 3) {
+  return (_graph, _defs, stats) => {
+    if (stats) {
+      stats.nodesSwept = 2;
+      stats.combosRebuilt = combosRebuilt;
+      stats.combosSkipped = 0;
+      stats.completed = true;
+    }
+    return 0;
+  };
+}
+/** A sweep that stopped part way: it counted what it touched and never reached the flag. */
+function sweepThatStopsPartWay() {
+  return (_graph, _defs, stats) => {
+    if (stats) stats.nodesSwept = 1;
+    return 0;
+  };
+}
+/** A sweep that FINISHED and still left combo lists untouched — a remote V2, a dynamic V3,
+ *  or any shape published after this panel was written. `completed` is true; the graph is
+ *  not covered. This is the state that made the first version of #1193 unsafe. */
+function sweepThatFinishesButSkips(combosSkipped = 1) {
+  return (_graph, _defs, stats) => {
+    if (stats) {
+      stats.nodesSwept = 2;
+      stats.combosRebuilt = 1;
+      stats.combosSkipped = combosSkipped;
+      stats.completed = true;
+    }
+    return 0;
+  };
+}
+
+const APP_WITH_GRAPH = {
+  // No `serialize`, so #1275's graph guard stays inert — this test is about the combo
+  // phase, and a guard needs collaborators the harness does not inject.
+  graph: { _nodes: [] },
+  registerNodesFromDefs: async () => {},
+  refreshComboInNodes: () => new Promise(() => {}),
+};
+
+test("#1193: an ABANDONED combo refresh over a completed local rebuild is disclosed, not failed", async () => {
   const timers = virtualTimers();
   const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
-    appValue: {
-      graph: null,
-      registerNodesFromDefs: async () => {},
-      refreshComboInNodes: () => new Promise((resolve) => { timers.setTimer(resolve, 4846); }),
-    },
-    apiValue: {
-      getNodeDefs: async () => {
-        now += 5500;
-        return { SomeNode: {} };
-      },
-    },
-    timers,
-    now: () => now,
-  });
-  const running = registerComfyNodeDefs(undefined);
-  await drainMicrotasks();
-  timers.fireUpTo(4846);
-  const verdict = await orFail(running, "the combo phase never settled");
-
-  assert.deepEqual(verdict, { refreshed: true, reason: "refreshed" });
-  assert.equal(getConfirmed(), true, "the combo ACTUALLY completed inside its floor, so the trust gate may open");
-});
-
-test("#1193: the floor is ARMED exactly when the remainder runs out — and it still BOUNDS", async () => {
-  // The other half of the floor: it must not become "no bound". Same starved remainder
-  // as above, but the combo never answers — the bound that fires must be the floor
-  // itself, and the run must still give up and say so.
-  let now = 0;
-  const timers = virtualTimers();
-  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
-    appValue: {
-      graph: null,
-      registerNodesFromDefs: async () => {},
-      refreshComboInNodes: () => new Promise(() => {}), // never settles
-    },
-    apiValue: {
-      getNodeDefs: async () => {
-        now += 5500;
-        return { SomeNode: {} };
-      },
-    },
-    timers,
-    now: () => now,
-  });
-  const running = registerComfyNodeDefs(undefined);
-  await drainMicrotasks();
-  const armed = timers.armed();
-  assert.equal(armed.length, 1, "the fetch's bound is cleared by its answer; only the combo's remains");
-  assert.equal(
-    armed[0].ms,
-    NODE_DEFS_COMBO_FLOOR_MS,
-    `the fetch spent 5500ms of a ${NODE_DEFS_RUN_BUDGET_MS}ms run; the combo phase gets the floor, not the 3500ms remainder`,
-  );
-  timers.fireAll();
-  const verdict = await orFail(running, "the floor removed the bound entirely — registerComfyNodeDefs is still awaiting refreshComboInNodes");
-
-  assert.equal(verdict.refreshed, false);
-  assert.equal(verdict.reason, "combo_refresh_failed");
-  assert.equal(getConfirmed(), false, "a combo that never answered must not be trusted, floor or not");
-});
-
-test("#1193: the floor is a FLOOR, not a new allowance — a fast fetch leaves the whole remainder in charge", async () => {
-  // If the remainder ever SHRANK to the floor the fix would have traded one starvation
-  // for another: a healthy run's combo phase gets the whole remaining budget here and
-  // must keep it.
-  const timers = virtualTimers();
-  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
-    appValue: {
-      graph: null,
-      registerNodesFromDefs: async () => {},
-      refreshComboInNodes: () => new Promise(() => {}), // never settles
-    },
+    appValue: APP_WITH_GRAPH,
     apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
     timers,
-    now: () => 0, // no time passes: the remainder is the whole budget
+    reapplyDefsToLiveNodes: sweepThatCompletes(),
   });
   const running = registerComfyNodeDefs(undefined);
   await drainMicrotasks();
-  const armed = timers.armed();
-  assert.equal(armed.length, 1);
+  timers.fireAll(); // the combo bound fires; refreshComboInNodes never answers
+  const verdict = await orFail(running, "the combo phase never gave up");
+
   assert.equal(
-    armed[0].ms,
-    NODE_DEFS_RUN_BUDGET_MS,
-    "the remainder exceeds the floor, so the bound must stay the remainder",
+    verdict.refreshed,
+    true,
+    "the dropdowns were rebuilt from this run's authoritative payload, so the reply must not " +
+      "report them stale just because the frontend's own repeat of that work had not answered",
   );
+  assert.equal(verdict.reason, "refreshed");
+  assert.equal(
+    verdict.combo_refresh_confirmed,
+    false,
+    "the missing confirmation is still SAID — refreshed:true alone would collapse it into a " +
+      "run where refreshComboInNodes actually answered",
+  );
+  assert.match(verdict.combo_refresh_note, /had not answered when this run stopped waiting/);
+  assert.match(verdict.combo_refresh_note, /it was given \d+ms/, "the bound it was given is named");
+  assert.equal(
+    getConfirmed(),
+    true,
+    "the trust flag stands for 'an authoritative payload was obtained AND the live lists were " +
+      "rebuilt from it' — the panel's own completed sweep satisfies exactly that, and leaving it " +
+      "false is what put the missing-asset scan back into over-report-safe mode (#610)",
+  );
+});
+
+test("#1193: a combo refresh abandoned with NO completed rebuild still fails, and names the bound it was given", async () => {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+    reapplyDefsToLiveNodes: sweepThatStopsPartWay(),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
   timers.fireAll();
-  await orFail(running, "the combo phase never gave up");
+  const verdict = await orFail(running, "the combo phase never gave up");
+
+  assert.equal(verdict.refreshed, false, "nothing is known to have rebuilt the lists, so nothing may claim they are current");
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  assert.equal(getConfirmed(), false);
+  // Distinguishability: the refusal has to separate "starved down to a sliver by a slow
+  // fetch" from "given the whole budget and hung anyway". Both used to produce the same
+  // sentence, so neither the user nor a later reader could tell which had happened.
+  assert.match(
+    verdict.detail,
+    new RegExp(`did not answer within the \\d+ms this refresh had left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget`),
+    "the refusal names the bound this phase was actually given, and the budget it came out of",
+  );
+});
+
+test("#1193: a sweep that FINISHED but skipped a combo does NOT license the disclosure", async () => {
+  // The gate's finding, at the level that grants the trust. `refreshComboOptionsFromDefs`
+  // handles the shapes it can derive a list from; a remote V2 or a dynamic V3 is walked
+  // past — and `completed` is set either way, because the WALK finished. Reading only
+  // `completed` claimed `refreshed: true` and set nodeDefsRefreshConfirmed over combo
+  // lists that had never been touched, which SUPPRESSES a genuine missing model whose
+  // deleted file is still sitting in the stale list (asset-staleness.test.mjs drives that
+  // consequence end to end).
+  //
+  // So the panel asks `comboRebuildCovered`, which needs finished AND skipped-nothing.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+    reapplyDefsToLiveNodes: sweepThatFinishesButSkips(),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  timers.fireAll();
+  const verdict = await orFail(running, "the combo phase never gave up");
+
+  assert.equal(verdict.refreshed, false, "an uncovered graph must not be reported as refreshed");
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  assert.equal(verdict.combo_refresh_confirmed, undefined, "and it must not carry the disclosure either");
+  assert.equal(
+    getConfirmed(),
+    false,
+    "trusting the live combos here is what suppresses a genuine missing asset — the one direction this must never fail in",
+  );
+});
+
+test("#1193: a combo refresh that THREW is still a failure, whatever the local rebuild did", async () => {
+  // The guard is on ABANDONMENT, not on "the combo phase did not succeed". A throw is the
+  // frontend reporting that something is wrong — evidence — where a timeout is only the
+  // absence of an answer. Broadening this to every non-success would swallow the first.
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: { _nodes: [] },
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: async () => {
+        throw new Error("reloadNodeDefs blew up");
+      },
+    },
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    reapplyDefsToLiveNodes: sweepThatCompletes(),
+  });
+  const verdict = await orFail(registerComfyNodeDefs(undefined), "the combo phase never settled");
+
+  assert.equal(verdict.refreshed, false, "a throw is not a missing confirmation");
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  assert.match(verdict.detail, /reloadNodeDefs blew up/);
+  assert.equal(getConfirmed(), false);
+});
+
+test("#1193: the disclosure survives the refresh_nodes reply's field whitelist", async () => {
+  // #981/#1172/#1275 each lost a verdict field here, because the refreshed:true branch is
+  // a fixed object literal. A verdict-level test cannot see that: it passes while the
+  // agent receives nothing.
+  const refresh_nodes = buildRefreshNodes(async () => ({
+    refreshed: true,
+    reason: "refreshed",
+    combo_refresh_confirmed: false,
+    combo_refresh_note: "the frontend call had not answered",
+  }));
+  const reply = await refresh_nodes();
+  assert.equal(reply.refreshed, true);
+  assert.equal(reply.combo_refresh_confirmed, false, "dropped by the whitelist — the agent is told nothing");
+  assert.equal(reply.combo_refresh_note, "the frontend call had not answered");
+});
+
+test("#1193: a confirmed run says nothing about a confirmation it did not miss", async () => {
+  const refresh_nodes = buildRefreshNodes(async () => ({ refreshed: true, reason: "refreshed" }));
+  const reply = await refresh_nodes();
+  assert.equal(reply.refreshed, true);
+  assert.ok(
+    !("combo_refresh_confirmed" in reply),
+    "the disclosure must appear only when there is something to disclose, or it becomes noise on every reply",
+  );
 });
 
 test("#1180: a REAL error survives a later stall — the synthesized timeout must not speak for it", async () => {

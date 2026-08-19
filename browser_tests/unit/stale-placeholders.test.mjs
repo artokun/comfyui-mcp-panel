@@ -262,18 +262,20 @@ test("#981 (codex r2) source guard: the disclosure survives the SUCCESS path of 
   // success path the warning existed and no caller could ever see it. Found by tracing
   // the consumers of the verdict, not by reading the producer.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  // #1172 added a SECOND disclosure that rides the same branch, and #1275 a THIRD (the
-  // restored-after-loss disclosure). The hole is the branch's fixed object literal, so the
-  // guard now names every field that must survive it — adding a fourth disclosure without
-  // extending this line is the same bug again.
+  // #1172 added a SECOND disclosure that rides the same branch, #1275 a THIRD (the
+  // restored-after-loss disclosure), and #1193 a FOURTH (the frontend combo call that was
+  // still running when the run stopped waiting for it). The hole is the branch's fixed
+  // object literal, so the guard names every field that must survive it — adding a fifth
+  // disclosure without extending this line is the same bug again.
   assert.match(
     src,
-    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored \};/,
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored, \.\.\.comboUnconfirmed \};/,
     "forwarded on success",
   );
   assert.match(src, /stale_placeholders_note: verdict\.stale_placeholders_note/, "and the note with it");
   assert.match(src, /empty_combo_lists_note: verdict\.empty_combo_lists_note/, "…and #1172's note too");
   assert.match(src, /restored_nodes_note: verdict\.restored_nodes_note/, "…and #1275's restore note too");
+  assert.match(src, /combo_refresh_note: verdict\.combo_refresh_note/, "…and #1193's unconfirmed-combo note too");
   // #1275 — the FAIL side of the same guard: an unrestored loss names its nodes, and a
   // whitelist that dropped lost_nodes would re-silence exactly what the guard exists to say.
   assert.match(src, /verdict\?\.lost_nodes\?\.length \? \{ lost_nodes: verdict\.lost_nodes \}/, "lost_nodes forwarded on failure");

@@ -41,7 +41,6 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
-  NODE_DEFS_COMBO_FLOOR_MS,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -49,6 +48,8 @@ import {
   monotonicNow,
   nodeDefsBudgetLeft,
 } from "./_panel-constants.mjs";
+
+import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
 
 const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
 
@@ -225,6 +226,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "api",
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
+    "comboRebuildCovered",
     "describeNodeDefRefresh",
     "fetchNodeDefsWithRetry",
     "withTimeout",
@@ -234,7 +236,6 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
-    "NODE_DEFS_COMBO_FLOOR_MS",
     "nodeDefsBudgetLeft",
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -269,6 +270,10 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     apiValue,
     () => ({}),
     () => {},
+    // #1193 — the REAL predicate, not a stub: it is the guard that decides whether the
+    // panel may claim the live combo lists were rebuilt, and a stub would let this harness
+    // agree with itself about it.
+    comboRebuildCovered,
     describeNodeDefRefresh,
     (getDefs, opts) => fetchNodeDefsWithRetry(getDefs, { ...opts, sleep: async () => {} }),
     withTimeout,
@@ -278,8 +283,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
-    NODE_DEFS_COMBO_FLOOR_MS,
-    nodeDefsBudgetLeft,
+      nodeDefsBudgetLeft,
     monotonicNow,
     NODE_DEFS_RETRY_DELAYS_MS,
     { invalidate: () => {}, read: async (f) => f() },

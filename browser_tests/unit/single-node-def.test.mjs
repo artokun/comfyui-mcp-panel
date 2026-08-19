@@ -312,7 +312,7 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
     record > localStart && record < giveBack,
     "the payload walk is local work and must be inside the excluded window",
   );
-  const reapply = src.indexOf("reapplyDefsToLiveNodes(rootGraph, defs)", localStart);
+  const reapply = src.indexOf("reapplyDefsToLiveNodes(rootGraph, defs, comboRebuild)", localStart);
   assert.ok(reapply > localStart && reapply < giveBack, "…and so is the live-node reapply");
   assert.ok(
     giveBack < src.indexOf('phase = "combo";', localStart),
@@ -323,10 +323,22 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
     /boundedGetNodeDefs\(nodeDefsBudgetLeft\(runDeadline, NODE_DEFS_FETCH_SHARE\)\)/,
     "the fetch phase must draw its bound from the run deadline",
   );
+  // #1193 read the bound into a variable so the refusal can name it. The property this
+  // pins is unchanged and now pinned in two halves: the bound is COMPUTED from what the
+  // fetch phase left, and that computed value is the one actually ARMED — a constant
+  // substituted at either end fails here.
   assert.match(
     src,
-    /Math\.max\(nodeDefsBudgetLeft\(runDeadline\), NODE_DEFS_COMBO_FLOOR_MS\),\s*\(\) => COMBO_NO_ANSWER/,
-    "the combo phase must draw from what the fetch phase left — with #1193's floor under it — not from a private allowance",
+    /comboWaitMs = nodeDefsBudgetLeft\(runDeadline\);/,
+    "the combo phase must draw from what the fetch phase left, not from a constant",
+  );
+  assert.match(
+    src,
+    // `\s*`, never `\n\s*`: this reads the WORKING copy, which is CRLF on a Windows
+    // checkout and LF on CI, and a pattern anchored to a bare \n passes on one and fails
+    // on the other for no behavioural reason.
+    /\s*comboWaitMs,\s*\(\) => COMBO_NO_ANSWER/,
+    "…and the value it computed is the bound it arms",
   );
   // A monotonic clock, like every other elapsed measurement in this panel: a wall-clock
   // jump mid-run must not hand a phase a negative or enormous remainder.
@@ -360,19 +372,17 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
     `the combo phase is left ${Math.round(comboLeft)}ms of a ${run}ms run — too little to answer in`,
   );
 
-  // #1193 — the FLOOR under that remainder. A fetch may spend its whole share and still
-  // succeed, leaving `comboLeft` for a phase measured at 4846ms; a pure remainder
-  // abandoned that healthy call. The floor must RAISE the worst-case remainder or it is
-  // decorative, and it must not exceed the run budget or it is a second budget, not a
-  // floor.
-  const floor = num(/const NODE_DEFS_COMBO_FLOOR_MS = (\d+);/, "the combo phase floor");
-  assert.ok(
-    floor > comboLeft,
-    `the floor (${floor}ms) must beat the remainder a full-share fetch leaves (${Math.round(comboLeft)}ms) — closing that gap is the #1193 fix`,
-  );
-  assert.ok(
-    floor <= run,
-    `the floor (${floor}ms) is a floor under one phase of a ${run}ms run, not a budget of its own`,
+  // #1193 — this remainder is NOT topped up by a floor, and that is deliberate. A floor
+  // fires only when the fetch was slow, and `refreshComboInNodes()` re-fetches
+  // /object_info from that same slow backend (measured: +3000ms per /object_info took the
+  // combo phase from 555ms to 3318ms), so a floor sized from a WARM measurement does not
+  // cover the case it fires in — while one sized to cover it would put two serialized runs
+  // past the bridge's 20s read. The combo phase's ABANDONMENT is disclosed instead.
+  assert.doesNotMatch(
+    src,
+    /NODE_DEFS_COMBO_FLOOR_MS/,
+    "a floor under the combo remainder lets a run exceed NODE_DEFS_RUN_BUDGET_MS, which breaks " +
+      "the 2-runs-inside-the-20s-read property this budget is sized on",
   );
 
   // #954's SCHEDULE, SHARED not forked — read from the retry module, never restated.
@@ -476,7 +486,6 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   };
   const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/, "the single-call fetch bound");
   const run = num(/const NODE_DEFS_RUN_BUDGET_MS = (\d+);/, "the refresh run budget");
-  const floor = num(/const NODE_DEFS_COMBO_FLOOR_MS = (\d+);/, "the combo phase floor");
   const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/, "the registration deadline");
   const seed = num(/const OBJECT_INFO_SEED_WAIT_MS = (\d+);/, "the baseline seed wait");
   const budget = num(/const ADD_NODE_COMMAND_BUDGET_MS = (\d+);/, "the command budget");
@@ -508,12 +517,12 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   // because a timeout is doubt and doubt takes the full fetch. No refresh: the type is
   // registered.
   const registeredPath = seed + single + single + registration;
-  // A run's worst-case WAITING is its budget plus the combo floor: #1193 lets a run
-  // exceed NODE_DEFS_RUN_BUDGET_MS by up to the floor when a slow-but-successful fetch
-  // spent the combo's remainder. That is the accepted cost of the floor, and it is
-  // counted here so this sum stays honest rather than reassuring — the command budget caps
-  // what the add PAYS, not what a run inside it may cost.
-  const runWait = run + floor;
+  // A run's worst-case WAITING is its budget, full stop. It was `run + floor` while the
+  // combo phase carried NODE_DEFS_COMBO_FLOOR_MS; #1193 removed that floor on measurement
+  // (it fires only when the fetch was slow, and refreshComboInNodes re-fetches from that
+  // same slow backend), so this term shrinks rather than grows. The command budget caps
+  // what the add PAYS either way, not what a run inside it may cost.
+  const runWait = run;
   // NOT REGISTERED: no fast path (it is gated on already-registered), then the whole-schema
   // fetch, then the resolver hands the payload to refreshComfyNodeDefs — which waits for
   // any in-flight run and then performs its own, so the run wait is paid twice.
@@ -538,9 +547,10 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
     ["the baseline seed wait", seed],
     ["the single-call fetch bound", single],
     ["the refresh run budget", run],
-    // #1193 — a run may exceed its own budget by up to the combo floor, so the worst-case
-    // wait a step can cost is the pair, and the pair is what must fit under the command.
-    ["a refresh run's worst-case wait (budget + combo floor)", runWait],
+    // #1193 — a run's worst-case wait IS its budget now that the combo phase carries no
+    // floor over it. Kept as its own row anyway: it is the term a future floor would grow,
+    // and this is the place that growth has to be seen.
+    ["a refresh run's worst-case wait", runWait],
     ["the registration deadline", registration],
   ]) {
     assert.ok(ms <= budget, `${what} (${ms}ms) is larger than the whole command budget (${budget}ms)`);

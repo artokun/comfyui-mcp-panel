@@ -47,6 +47,16 @@ function detailSuffix(thrown) {
  *                              // remedy claim registration happened (codex r2 P1)
  *   comboApiPresent: boolean,  // app.refreshComboInNodes exists on this build
  *   comboRan: boolean,         // refreshComboInNodes completed this run
+ *   comboRebuiltLocally?: boolean, // #1193 — the panel's OWN reapply sweep finished and
+ *                              // rebuilt every live combo's option list from THIS run's
+ *                              // /object_info payload (#1172). Distinct from comboRan:
+ *                              // one is the frontend's call answering, the other is work
+ *                              // this panel did and counted. Both false is "stale";
+ *                              // collapsing them into one flag is what made an abandoned
+ *                              // frontend call read as stale combos it had already fixed.
+ *   comboWaitMs?: number|null, // the bound the combo phase was actually given, so an
+ *                              // abandoned phase can say whether it was STARVED by a slow
+ *                              // fetch or given its whole allowance and still hung
  *   phase?: string,            // "fetch" | "record" | "register" | "reapply" | "combo" | "done" — where a throw happened
  *   didThrow?: boolean,        // a throw happened at all — tracked independently of
  *                              // the caught VALUE, which can be falsy (throw null)
@@ -60,6 +70,8 @@ export function describeNodeDefRefresh({
   defsRegistered = false,
   comboApiPresent,
   comboRan,
+  comboRebuiltLocally = false,
+  comboWaitMs = null,
   phase = "done",
   didThrow,
   thrown = null,
@@ -157,9 +169,35 @@ export function describeNodeDefRefresh({
     };
   }
   if (!comboRan) {
-    // Defensive: a present combo API that did not run without a throw should be
-    // unreachable — but "could not determine" is not "refreshed", so fail closed
-    // with the honest token rather than claim success.
+    // #1193 — the frontend's `refreshComboInNodes()` was still running when this run
+    // stopped waiting for it, but the panel's OWN sweep already rebuilt every live
+    // combo's option list from the /object_info payload this run fetched (#1172). The
+    // dropdowns are current; what is missing is a confirmation from a call that is
+    // largely a REPEAT of work already done — it issues its own /object_info and
+    // re-registers every def, which `registerNodesFromDefs` did moments earlier.
+    //
+    // So this is neither "refreshed and confirmed" nor "stale". Said as its own answer,
+    // because collapsing it into `combo_refresh_failed` reported stale dropdowns that
+    // had in fact just been rebuilt, and — through the shared trust flag — put the
+    // missing-asset scan back into over-report-safe mode (#610's false "model still
+    // missing") for a refresh that succeeded.
+    if (comboRebuiltLocally) {
+      return {
+        refreshed: true,
+        reason: "refreshed",
+        combo_refresh_confirmed: false,
+        combo_refresh_note:
+          `${registrationClause}, and the panel rebuilt every combo widget's option list ` +
+          "on the live graph from that same payload. The frontend's own refreshComboInNodes() " +
+          "had not answered when this run stopped waiting for it" +
+          (comboWaitMs ? ` (it was given ${comboWaitMs}ms)` : "") +
+          " — it is still running and will re-apply the same definitions when it finishes. " +
+          "The dropdown lists are current; only that call's completion is unconfirmed.",
+      };
+    }
+    // Nothing rebuilt the lists — neither the frontend's call nor this panel's sweep
+    // (no live graph, no payload, or the sweep stopped early). "Could not determine" is
+    // not "refreshed", so fail closed with the honest token rather than claim success.
     return {
       refreshed: false,
       reason: NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED,

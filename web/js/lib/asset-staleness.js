@@ -768,7 +768,52 @@ export function collectAllGraphs(rootGraph) {
  * map supplies the concrete-def key to look its options up under (#458×#366). Widgets
  * not in the map fall back to their own name.
  */
-export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap, mergedInputs) {
+/**
+ * The authoritative option list a def spec publishes, or NULL when this spec does not
+ * carry one. Never guesses: a caller that gets null has learned that it cannot rebuild
+ * this widget, which is a different thing from a widget that is not a combo.
+ *
+ * MEASURED against a live ComfyUI 0.33 /object_info (848 types), because the V1 shape was
+ * the only one this file handled and it is now the MINORITY:
+ *
+ *     [[opt, ...], config?]                    V1, 61 inputs   — the historical shape
+ *     ["COMBO", { options: [opt, ...] }]       V2, 467 inputs  — silently skipped before
+ *     ["COMBO", { remote: { route } }]         V2 remote, 1    — the list is a separate
+ *                                              fetch; the frontend shows "Loading…" until
+ *                                              it lands, so there is nothing to copy
+ *     ["COMFY_DYNAMICCOMBO_V3", { options: [{ key, inputs }] }]   120 inputs — the keys
+ *                                              select SUB-INPUTS to materialize; copying
+ *                                              the keys alone would publish a list this
+ *                                              file cannot honour
+ *
+ * The last two return null on purpose. `refreshComboOptionsFromDefs` counts them as
+ * SKIPPED rather than treating "I did not rebuild it" as "there was nothing to rebuild".
+ */
+export function authoritativeComboValues(spec) {
+  if (!Array.isArray(spec)) return null;
+  // V1 — the first element IS the option array.
+  if (Array.isArray(spec[0])) return spec[0];
+  // V2 — a "COMBO" type string, options under the config object.
+  if (spec[0] === "COMBO" && Array.isArray(spec[1]?.options)) return spec[1].options;
+  return null;
+}
+
+/**
+ * Whether this input is a COMBO whose list this file could not derive — a remote V2, a
+ * dynamic V3, or a shape published after this was written. Asked only when
+ * `authoritativeComboValues` already returned null.
+ *
+ * TWO independent signals, because neither sees the whole set. A remote V2 arrives before
+ * its list does, so the live widget's `options.values` is `undefined` and only the SPEC
+ * betrays it; a shape this file has never heard of may not say "COMBO" anywhere, and only
+ * the live widget — already presenting an array of options — betrays that.
+ */
+function isUnrebuiltComboWidget(spec, widget) {
+  const declaredCombo = Array.isArray(spec) && typeof spec[0] === "string" && /COMBO/.test(spec[0]);
+  return declaredCombo || Array.isArray(widget?.options?.values);
+}
+
+export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap, mergedInputs, stats = null) {
   let refreshed = 0;
   if (!node || !defsByType) return refreshed;
   try {
@@ -785,14 +830,22 @@ export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widget
       const defKey = (widgetNameMap && widgetNameMap[w.name]) ?? w.name;
       const spec = inputs[defKey];
       if (!spec) continue;
-      // A combo's spec is `[[opt, ...], config?]` — the first element is the option
-      // array. Anything else (a type string like "INT"/"STRING") is not a combo.
-      const first = Array.isArray(spec) ? spec[0] : undefined;
-      if (!Array.isArray(first)) continue;
-      // Never clobber a dynamic (function) option source — it derives its own list.
+      // Never clobber a dynamic (function) option source — it derives its own list, and
+      // `assetCandidateResolvesLive` invokes it, so nothing here is stale for want of a
+      // rebuild. Not counted as skipped for the same reason.
       if (typeof w.options?.values === "function") continue;
+      const values = authoritativeComboValues(spec);
+      if (values === null) {
+        // NOT SILENTLY. A combo whose list this file cannot derive is the case #1193's
+        // disclosure must not claim: the caller decides whether the lists are current
+        // from this count, and a skip that went unrecorded read as "nothing to do".
+        if (stats && isUnrebuiltComboWidget(spec, w)) {
+          stats.combosSkipped = (stats.combosSkipped ?? 0) + 1;
+        }
+        continue;
+      }
       if (!w.options || typeof w.options !== "object") w.options = {};
-      w.options.values = first.slice();
+      w.options.values = values.slice();
       refreshed++;
     }
   } catch {
@@ -890,7 +943,39 @@ export function emptyComboNote(empties) {
   );
 }
 
-export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
+/**
+ * Whether a sweep's stats amount to "every live combo list on this graph is now the one
+ * `/object_info` just published". #1193's disclosure and the shared combo-trust flag both
+ * ask this, so they cannot drift apart by asking it differently.
+ *
+ * THREE ways to be false, and the third is the one that bit: no stats at all (the sweep
+ * never ran — no payload, no graph), `completed` false (it stopped part way), or
+ * `combosSkipped` non-zero (it finished, and left combo lists it could not derive exactly
+ * as stale as it found them). Reading only `completed` granted the claim over a graph of
+ * V2 combos that were never touched — and on ComfyUI 0.33 V2 is 467 of 529 combo inputs,
+ * so that was the normal case, not an edge one.
+ */
+export function comboRebuildCovered(stats) {
+  if (!stats || stats.completed !== true) return false;
+  return (stats.combosSkipped ?? 0) === 0;
+}
+
+/**
+ * Stamp fresh defs onto live node INSTANCES, rebuild their combo option lists, and repair
+ * UNKNOWN widget names. Returns the number of nodes whose widget names were repaired.
+ *
+ * `stats`, when given, is filled in with what this sweep OBSERVABLY did — `nodesSwept`,
+ * `combosRebuilt`, `combosSkipped` (combo widgets whose authoritative list this file could
+ * not derive: a remote V2, a dynamic V3, a shape published after this was written), and
+ * `completed` (set only after every graph was walked to the end).
+ *
+ * #1193 reads it, and reads BOTH: a caller may treat the live combo lists as rebuilt from
+ * `defsByType` only when the sweep it ran actually finished AND skipped nothing. Those are
+ * separate facts — a finished sweep that skipped a combo has left that widget's list
+ * exactly as stale as it found it — so they are reported separately rather than folded
+ * into one boolean the caller cannot take apart.
+ */
+export function reapplyDefsToLiveNodes(rootGraph, defsByType, stats = null) {
   let repaired = 0;
   if (!defsByType) return repaired;
   try {
@@ -920,7 +1005,21 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
         // It is safe to run alongside the frontend call: `refreshComboOptionsFromDefs`
         // skips a dynamic (function) option source and writes the same values
         // `/object_info` just published.
-        refreshComboOptionsFromDefs(node, defsByType, type, undefined, mergedInputsFor(def, mergedCache, type));
+        const rebuilt = refreshComboOptionsFromDefs(
+          node,
+          defsByType,
+          type,
+          undefined,
+          mergedInputsFor(def, mergedCache, type),
+          // #1193 — the same object, so a combo this file could not rebuild is counted
+          // into `combosSkipped` at the widget that was skipped rather than inferred
+          // later from a total.
+          stats,
+        );
+        if (stats) {
+          stats.nodesSwept = (stats.nodesSwept ?? 0) + 1;
+          stats.combosRebuilt = (stats.combosRebuilt ?? 0) + rebuilt;
+        }
         // Stamp only onto a TYPE-SPECIFIC constructor (already carries nodeData
         // for this type) — never onto a shared generic/unknown fallback class,
         // which would corrupt every other unknown node.
@@ -935,6 +1034,12 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
         if (reconcileUnknownWidgetNames(node, def)) repaired++;
       }
     }
+    // #1193 — the LAST statement inside the try, so `completed` means every graph was
+    // walked to the end. The sweep is best-effort and swallows its own throw below; a
+    // caller that treats a PARTIAL sweep as authoritative would be trusting combo lists
+    // that were never rebuilt. Set here, the flag cannot say "yes" for a sweep that
+    // stopped early — and stays absent, which is neither yes nor no, when it did.
+    if (stats) stats.completed = true;
   } catch {
     /* best-effort sweep */
   }
