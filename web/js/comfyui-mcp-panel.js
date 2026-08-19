@@ -517,6 +517,11 @@ import {
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { composeShowMediaReply } from "./lib/media-preview.js";
+import {
+  bindSourcePlayback,
+  sourceMediaDuration,
+  storyboardSampleTimes,
+} from "./lib/media-duration.js";
 import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
@@ -6970,8 +6975,6 @@ const STORYBOARD = {
   GAP: 6, // px gap between cells
   PAD: 8, // px outer padding
   LABEL: true, // draw a small frame-index label in each cell
-  HEAD: 0.05, // skip the first 5% (likely black/fade-in)
-  TAIL: 0.95, // stop at 95% (likely black/fade-out)
   SEEK_TIMEOUT_MS: 4000, // per-frame seek guard
   META_TIMEOUT_MS: 15000, // loadedmetadata guard
 };
@@ -6999,7 +7002,7 @@ function awaitMediaEvent(el, name, timeoutMs) {
 
 /**
  * Build a contact-sheet/storyboard PNG from a same-origin video URL by sampling
- * N frames evenly across HEAD..TAIL of its duration and tiling them into a grid.
+ * N frames evenly across the SOURCE duration and tiling them into a grid.
  * Same-origin /view means the canvas is NOT tainted, so toBlob works. Returns a
  * PNG Blob, or null if the video can't be decoded/sampled. Never throws.
  */
@@ -7051,15 +7054,17 @@ async function buildVideoStoryboard(url) {
 
   try {
     await awaitMediaEvent(video, "loadedmetadata", STORYBOARD.META_TIMEOUT_MS);
-    const duration = Number(video.duration);
+    // #1270 — `video.duration` on a concat / edit-list MP4 is often the FIRST
+    // clip, not the container. The storyboard samples the source duration.
+    const duration = sourceMediaDuration(video);
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    if (!isFinite(duration) || duration <= 0 || !vw || !vh) {
+    if (!duration || !vw || !vh) {
       // #1493 — say WHICH. A caller that only sees `null` cannot tell a codec
       // the browser will not decode from a frame it could not paint, and the
       // two need different advice.
       return storyboardFailure(
-        !isFinite(duration) || duration <= 0
+        !duration
           ? "the browser reported no usable duration for it (its codec may not be decodable here — VP9/AV1 .webm is the usual case)"
           : "the browser reported zero video dimensions for it (its codec may not be decodable here)",
       );
@@ -7081,14 +7086,13 @@ async function buildVideoStoryboard(url) {
     ctx.fillStyle = "#111114";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Evenly-spaced timestamps across HEAD..TAIL (skip likely-black head/tail).
-    const lo = duration * STORYBOARD.HEAD;
-    const hi = duration * STORYBOARD.TAIL;
-    const span = Math.max(0, hi - lo);
+    // Evenly-spaced timestamps across the SOURCE duration (#1270). The old
+    // 5%–95% default skipped title/end cards on a concat file.
+    const sampleAt = storyboardSampleTimes(duration, n);
 
     let painted = 0;
     for (let i = 0; i < n; i += 1) {
-      const t = n === 1 ? duration / 2 : lo + (span * i) / (n - 1);
+      const t = sampleAt[i];
       try {
         video.currentTime = Math.min(Math.max(0, t), Math.max(0, duration - 0.01));
         await awaitMediaEvent(video, "seeked", STORYBOARD.SEEK_TIMEOUT_MS);
@@ -26892,6 +26896,10 @@ function buildPanel() {
     // Release any decoded <video> before it leaves the DOM (memory + stop audio).
     const releaseVideo = () => {
       try {
+        mediaWrap._releasePlayback?.();
+      } catch { /* best-effort */ }
+      mediaWrap._releasePlayback = null;
+      try {
         const v = mediaWrap.querySelector("video");
         if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
       } catch { /* best-effort */ }
@@ -26913,8 +26921,10 @@ function buildPanel() {
       if (it.type === "video") {
         const v = document.createElement("video");
         v.src = it.url; v.controls = true; v.autoplay = true; v.loop = true;
-        v.playsInline = true; v.className = "cmcp-lightbox-el";
+        v.playsInline = true; v.preload = "auto"; v.className = "cmcp-lightbox-el";
         mediaWrap.appendChild(v);
+        // #1270 — same source-duration loop as the chat player.
+        mediaWrap._releasePlayback = bindSourcePlayback(v, { loop: true });
         v.play?.().catch(() => {}); // opened by a user gesture; ignore if blocked
       } else {
         const img = document.createElement("img");
@@ -27190,13 +27200,18 @@ function buildPanel() {
     v.loop = true;
     v.playsInline = true;
     v.controls = true;
-    v.preload = "metadata";
+    // #1270 — metadata-only preload is what reports the first clip of a concat
+    // MP4 as the whole duration. Load enough of the source that seekable covers it.
+    v.preload = "auto";
     v.src = holder.dataset.src;
     v.style.cssText = "width:100%;display:block;border-radius:6px;";
     v.addEventListener("loadedmetadata", () => {
       // Learn the real aspect ratio so the placeholder (and layout) match exactly.
       if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
     });
+    // Native `loop` restarts at the (possibly truncated) `duration`. Bind
+    // playback to the source length so a title/end card past that number plays.
+    holder._releasePlayback = bindSourcePlayback(v, { loop: true });
     // #909 — SAY SO when the browser cannot decode it. `show_media` reports the DOM
     // dispatch, not the decode, so an MP4 the browser refuses (the report: MPEG-4 Part 2,
     // `mpeg4`/`mp4v`) answered ok:true and rendered a blank card — indistinguishable from
@@ -27230,6 +27245,12 @@ function buildPanel() {
       // not deterministic release, and unmount will skip this element once `_video` is
       // null, so this is the last chance to do it (codex).
       try {
+        holder._releasePlayback?.();
+      } catch {
+        /* best-effort */
+      }
+      holder._releasePlayback = null;
+      try {
         v.removeAttribute("src");
         v.load();
       } catch {
@@ -27249,6 +27270,12 @@ function buildPanel() {
   function unmountHolderVideo(holder) {
     const v = holder._video;
     if (!v) return;
+    try {
+      holder._releasePlayback?.();
+    } catch {
+      /* best-effort */
+    }
+    holder._releasePlayback = null;
     try {
       v.pause();
       v.removeAttribute("src");
