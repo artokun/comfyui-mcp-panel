@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
+import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -133,6 +134,10 @@ export function addNodeCommandBudgetDeps() {
     // #1286 — graph_add_node now names this after graph.add. The shipped
     // implementation is a no-op when the new id has no leftover store entries.
     clearInheritedExecutionPreview,
+    // #1411 — graph_add_node now sanitizes the fresh node's aux_id after
+    // graph.add. The REAL helper: a valid hint passes through untouched, an
+    // invalid one is dropped, and either way the add proceeds.
+    sanitizeNodeAuxId,
     makeCommandBudget,
     ADD_NODE_COMMAND_BUDGET_MS,
     // Derived exactly as the panel derives it.
