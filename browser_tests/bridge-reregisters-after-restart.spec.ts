@@ -164,8 +164,6 @@ test('a ComfyUI restart under a LIVE bridge re-advertises the tab route', async 
   })
   const socketsAtStart = mockBridge.connectionsOpened
 
-  /** ComfyUI's backend socket goes away for `downMs` and comes back. The BRIDGE
-   *  is deliberately untouched — that is the whole point of this shape. */
   const fireComfyApiEvent = async (name: string) => {
     // The SAME resolution the panel itself uses to find the api singleton
     // (`window.comfyAPI?.api?.api || window.api`). Reaching for `app.api`
@@ -183,6 +181,8 @@ test('a ComfyUI restart under a LIVE bridge re-advertises the tab route', async 
     expect(delivered, `ComfyUI's api singleton must accept the ${name} event`).toBe(true)
   }
 
+  /** ComfyUI's backend socket goes away for `downMs` and comes back. The BRIDGE
+   *  is deliberately untouched — that is the whole point of this shape. */
   const bounceComfyBackend = async (downMs: number) => {
     await fireComfyApiEvent('reconnecting')
     await page.waitForTimeout(downMs)
