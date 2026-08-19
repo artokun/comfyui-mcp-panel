@@ -239,10 +239,12 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot, currentGraph
  * even true of the panel's own tool surface.
  *
  * WHAT IS AND IS NOT CLAIMED. It says what the id is, that this operation works on
- * ordinary nodes, and what does work today. It does NOT promise a removal path,
- * because there is none: `expose_subgraph_input`/`expose_subgraph_output`/`move_rail`
- * exist and no unexpose does. Naming the invasive workaround is honest; inventing a
- * tool name would send the caller to a command that does not exist.
+ * ordinary nodes, and what does work today. Removal now exists —
+ * `panel_unexpose_subgraph_input`/`panel_unexpose_subgraph_output` take a slot's
+ * NAME (artokun/comfyui-mcp#1294) — but a RAIL id is refused there too, because it
+ * names the whole rail, not a slot on it; the message must not read as "pass -20 to
+ * unexpose". The interior-node workaround stays named for the caller who wants the
+ * slot and its source gone together.
  *
  * @param {number|string} nodeId
  * @param {"input"|"output"} rail
@@ -257,10 +259,11 @@ export function describeRailNodeTarget(nodeId, rail) {
     `panel_move_node DOES accept a rail id, but only to reposition it (pos only — a ` +
     `rail has nothing else to set); panel_move_rail addresses the same rail by SIDE ` +
     `("${rail}") rather than by id. ` +
-    `There is currently NO unexpose/remove-boundary operation: expose_subgraph_input, ` +
-    `expose_subgraph_output and panel_move_rail are the whole boundary surface. To ` +
-    `REMOVE an exposed slot today, remove or replace the interior node feeding it and ` +
-    `the boundary slot is cleaned up automatically. ` +
+    `To REMOVE one slot from this rail, panel_unexpose_subgraph_input / ` +
+    `panel_unexpose_subgraph_output take the slot's NAME as panel_query_graph lists ` +
+    `it under rails.${rail} — a rail id is refused there too, because it names the ` +
+    `whole rail, not a slot on it. Removing or replacing the interior node feeding ` +
+    `a slot also cleans the slot up automatically. ` +
     // The one thing this CANNOT rule out, stated rather than glossed over: node ids
     // are arbitrary integers, so an ordinary node may once have held this id and been
     // removed. Then the id really is stale and re-reading is right — which is why the

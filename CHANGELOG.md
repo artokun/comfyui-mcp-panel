@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- `graph_unexpose_subgraph_input` / `graph_unexpose_subgraph_output` remove a subgraph boundary slot by name — the inverse of the expose pair; dropped interior/host wires are counted and reported (artokun/comfyui-mcp#1294)
+
 ### Fixed
 - `panel_get_errors` no longer flags a pasted LoadImage file like `pasted/image (992).png` as missing when the file is on disk and `/view` serves it (#1357)
 

@@ -80,3 +80,68 @@ export function findExistingRailSlot(slots, ref) {
   // Whichever matched; they cannot disagree by the time we are here.
   return byName ?? byIndex;
 }
+
+/**
+ * #1294 — resolving a boundary-rail slot for REMOVAL (unexpose).
+ *
+ * Removal is destructive — the interior wire and every parent-graph wire on the
+ * host node's matching slot go with the slot — so the failure mode that matters
+ * here is removing the WRONG one. This refuses rather than guesses:
+ *
+ *  - an unknown name/index is a refusal naming what IS on the rail, not a no-op
+ *    "removed" (the pre-#930 failure shape: report a miss as something else);
+ *  - an ambiguous digit-named slot throws out of findExistingRailSlot, same as a
+ *    connect;
+ *  - a NEGATIVE number is a rail_node_id (e.g. -20) — the synthetic id of the
+ *    whole RAIL, never of a slot on it. It is rejected BY NAME, because silently
+ *    indexing with it would remove an unrelated slot.
+ */
+export function resolveRailSlotForRemoval(slots, ref, side) {
+  const list = slots ?? [];
+  // A negative INTEGER, in either arrival form — MCP argument coercion flattens
+  // the number -20 and the string "-20" to the same string before this is reached,
+  // so the string form is the one that actually arrives over the wire.
+  if ((typeof ref === "number" && ref < 0) || /^-\d+$/.test(String(ref))) {
+    throw new Error(
+      `"${ref}" is a rail_node_id — the synthetic id of the WHOLE ${side} RAIL, not of a ` +
+        `slot on it (the rail node itself is not a removable slot). Pass the slot's NAME or ` +
+        `index as panel_query_graph lists it under rails.${side}. Nothing was removed.`,
+    );
+  }
+  // findExistingRailSlot throws the ambiguity refusal itself; a null here is a
+  // clean miss.
+  const slot = findExistingRailSlot(list, ref);
+  if (slot) return slot;
+  const names = list.map((s) => s?.name).filter(Boolean);
+  throw new Error(
+    `No ${side} boundary slot "${ref}" on this subgraph — nothing was removed. ` +
+      `Available ${side} slots: ${names.join(", ") || "(none)"} ` +
+      `(as panel_query_graph lists them under rails.${side}).`,
+  );
+}
+
+/**
+ * #1294 — how many PARENT-graph wires a boundary-slot removal takes with it:
+ * the links on every host SubgraphNode's slot at `slotIndex` (one .link per
+ * host input, a .links array per host output). Counted BEFORE the removal so
+ * the reply can say what was dropped; the same subgraph can be instanced by
+ * several host nodes (and nested), so the walk collects ALL of them.
+ */
+export function countHostRailLinks(rootGraph, subgraph, side, slotIndex) {
+  if (!rootGraph || !subgraph) return 0;
+  let count = 0;
+  const stack = [...(rootGraph._nodes ?? [])];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node) continue;
+    if (node.subgraph === subgraph) {
+      if (side === "input") {
+        if (node.inputs?.[slotIndex]?.link != null) count++;
+      } else {
+        count += node.outputs?.[slotIndex]?.links?.length ?? 0;
+      }
+    }
+    if (node.subgraph?._nodes?.length) stack.push(...node.subgraph._nodes);
+  }
+  return count;
+}

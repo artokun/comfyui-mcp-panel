@@ -700,6 +700,8 @@
       "remove_attachment": "移除附件",
       "remove_from_recently_used": "從最近使用中移除",
       "remove_this_key_from_the_orchestrator_s": "從協調器的儲存區移除這把金鑰",
+      "removed_boundary_slot": "已移除 {side} 邊界插槽「{name}」",
+      "removed_boundary_slot_dropped_other": " —— 已切斷跨越邊界的 {count} 條連線",
       "removed_group": "已移除群組「{title}」",
       "removed_node": "已移除 {type}（id {id}）",
       "removed_node_cleaned_slots_other": " —— 已清掉孤立的邊界插槽 {slots}",

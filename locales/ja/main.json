@@ -700,6 +700,8 @@
       "remove_attachment": "添付を削除",
       "remove_from_recently_used": "最近使用したものから削除",
       "remove_this_key_from_the_orchestrator_s": "このキーをオーケストレーターの保管場所から削除",
+      "removed_boundary_slot": "{side} 境界スロット「{name}」を削除しました",
+      "removed_boundary_slot_dropped_other": " — 境界をまたぐワイヤー {count} 本を切断しました",
       "removed_group": "グループ「{title}」を削除しました",
       "removed_node": "{type} を削除しました（id {id}）",
       "removed_node_cleaned_slots_other": " — 孤立した境界スロット {slots} を整理しました",
