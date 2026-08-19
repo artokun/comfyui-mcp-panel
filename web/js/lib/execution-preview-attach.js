@@ -22,8 +22,22 @@
  * positive evidence -- the very same entry object, under a different node object of
  * a different type. Anything weaker (a replaced entry from a new run or a restored
  * history payload, a same-type recreate/undo whose preview ComfyUI means to restore)
- * falls back to the type gate, so the ledger can only ever strip MORE precisely,
- * never more eagerly.
+ * is not judged at all and falls back to the type gate.
+ *
+ * That WIDENS who the sweep looks at (image-capable hosts are no longer exempt), so
+ * it deliberately NARROWS what it does to them. An image-capable host owns image
+ * state of its own -- LoadImage hydrates `node.imgs` from its filename widget and
+ * carries the same `$$canvas-image-preview` widget -- and none of that belongs to the
+ * inherited entry. Only state ComfyUI derived FROM the stolen entry is evicted, which
+ * is decidable: `unsafeUpdatePreviews` assigns `this.images = output.images` by
+ * reference, so `node.images === record.output.images` is exactly "what is on screen
+ * is the stolen entry". When that does not hold, only the leftover store entry goes.
+ *
+ * Known gap, deliberately not closed here: ownership is seeded from `executed`, so a
+ * node whose only output is `b_preview` latent frames (a KSampler mid-run) never
+ * enters the ledger and is still judged by type alone. Seeding that would mean
+ * attributing on `executing` -- ownership from "started" rather than "emitted" -- which
+ * is a different rule than this issue asks for.
  */
 
 export const CANVAS_IMAGE_PREVIEW_WIDGET = "$$canvas-image-preview";
@@ -95,15 +109,14 @@ export function recordExecutionPreviewOwner(owners, node, stores) {
     node,
     type: String(node.type || ""),
     output: storeEntry(stores?.nodeOutputs, node.id),
-    preview: storeEntry(stores?.nodePreviewImages, node.id),
   });
   return true;
 }
 
 /**
- * True only when the store entry at this node's id is the SAME object we watched a
- * different node -- of a different type -- receive. That is a stolen preview: the id
- * was reused (ComfyUI's own paste/undo/load, paths the panel does not hook) while the
+ * The ownership record proving this node's id holds an entry a DIFFERENT node -- of a
+ * different type -- was credited with, or null. That is a stolen preview: the id was
+ * reused (ComfyUI's own paste/undo/load, paths the panel does not hook) while the
  * emitter's entry stayed behind.
  *
  * Deliberately silent when the evidence is weaker:
@@ -112,16 +125,52 @@ export function recordExecutionPreviewOwner(owners, node, stores) {
  *   - the new occupant has the SAME type     -> a recreate/undo whose preview ComfyUI
  *                                               means to re-plant from the store
  */
-export function holdsStolenExecutionPreview(owners, node, stores) {
-  if (!owners || !node || node.id == null) return false;
+function stolenExecutionPreviewRecord(owners, node, stores) {
+  if (!owners || !node || node.id == null) return null;
   const record = owners.get(String(node.id));
-  if (!record || record.node === node) return false;
-  if (record.type === String(node.type || "")) return false;
-  const output = storeEntry(stores?.nodeOutputs, node.id);
-  if (output !== undefined && output === record.output) return true;
-  const preview = storeEntry(stores?.nodePreviewImages, node.id);
-  if (preview !== undefined && preview === record.preview) return true;
-  return false;
+  if (!record || record.node === node) return null;
+  if (record.type === String(node.type || "")) return null;
+  if (record.output === undefined) return null;
+  return storeEntry(stores?.nodeOutputs, node.id) === record.output ? record : null;
+}
+
+/** Boolean form of {@link stolenExecutionPreviewRecord}. */
+export function holdsStolenExecutionPreview(owners, node, stores) {
+  return stolenExecutionPreviewRecord(owners, node, stores) != null;
+}
+
+/**
+ * Evict a preview this node inherited with a reused id -- WITHOUT touching image state
+ * that is its own. `stripNodeExecutionPreview` is wrong here: it wipes `node.imgs`
+ * unconditionally, which for a LoadImage sitting on a reused id would delete the
+ * thumbnail it hydrated from its own filename widget and collapse the node. That is the
+ * same invariant `clearInheritedExecutionPreview` already protects.
+ *
+ * `node.images` is assigned `output.images` BY REFERENCE by `unsafeUpdatePreviews`, and
+ * `node.imgs` is rendered from it, so array identity decides whether what is on screen
+ * came from the stolen entry. If it did not, the entry is merely leftover in the store
+ * and dropping it is the whole job.
+ */
+function evictInheritedExecutionPreview(node, stores, record) {
+  const rendered =
+    Array.isArray(record?.output?.images) && node.images === record.output.images;
+  let changed = false;
+  if (rendered) {
+    if (node.imgs != null) {
+      node.imgs = undefined;
+      changed = true;
+    }
+    node.images = undefined;
+    if (node.preview != null) {
+      node.preview = undefined;
+      changed = true;
+    }
+    if (removePreviewWidget(node)) changed = true;
+    changed = true;
+    restoreCompactSize(node);
+  }
+  if (clearStoredExecutionOutputs(stores, node.id)) changed = true;
+  return changed;
 }
 
 /**
@@ -135,7 +184,6 @@ function refreshExecutionPreviewOwners(owners, nodesById, stores) {
   for (const [key, record] of owners) {
     if (nodesById.get(key) !== record.node) continue;
     record.output = storeEntry(stores.nodeOutputs, key);
-    record.preview = storeEntry(stores.nodePreviewImages, key);
   }
 }
 
@@ -144,7 +192,6 @@ function pruneExecutionPreviewOwners(owners, nodesById, stores) {
   for (const key of [...owners.keys()]) {
     if (nodesById.has(key)) continue;
     if (storeEntry(stores.nodeOutputs, key) !== undefined) continue;
-    if (storeEntry(stores.nodePreviewImages, key) !== undefined) continue;
     owners.delete(key);
   }
 }
@@ -341,9 +388,16 @@ export function stripMisattachedExecutionPreviews({
   for (const node of nodes) {
     if (!node) continue;
     // A type that COULD show an image is exempt only while nothing proves the image
-    // it is showing belongs to someone else (#1374).
-    const stolen = owners ? holdsStolenExecutionPreview(owners, node, stores) : false;
-    if (!stolen && nodeAcceptsExecutionImagePreview(node)) continue;
+    // it is showing belongs to someone else (#1374) -- and when something does, only
+    // the inherited state goes, never the node's own.
+    const stolen = owners ? stolenExecutionPreviewRecord(owners, node, stores) : null;
+    if (stolen) {
+      if (evictInheritedExecutionPreview(node, stores, stolen)) stripped += 1;
+      // The entry is gone; the record can no longer describe anything.
+      owners.delete(String(node.id));
+      continue;
+    }
+    if (nodeAcceptsExecutionImagePreview(node)) continue;
     const hasPreview =
       node.imgs != null ||
       node.images != null ||
@@ -354,8 +408,6 @@ export function stripMisattachedExecutionPreviews({
       storeHasImages(nodePreviewImages, node.id);
     if (!hasPreview) continue;
     if (stripNodeExecutionPreview(node, stores)) stripped += 1;
-    // The entry is gone; the record can no longer describe anything.
-    if (stolen) owners.delete(String(node.id));
   }
   if (owners) pruneExecutionPreviewOwners(owners, nodesById, stores);
   return { stripped, rehomed };

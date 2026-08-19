@@ -225,7 +225,13 @@ function outputEntry(filename = "ComfyUI_00001_.png") {
   return { images: [{ filename, type: "output", subfolder: "" }] };
 }
 
-function imageCapableNode(type, id) {
+/**
+ * A node showing a preview the frontend planted from `entry`. `unsafeUpdatePreviews`
+ * does `this.images = output.images` BY REFERENCE and renders `imgs` from it, so the
+ * fixture shares the array rather than copying it — that identity is what tells a
+ * stolen render apart from a node's own image state.
+ */
+function imageCapableNode(type, id, entry) {
   const outputs =
     type === "EmptyLatentImage" ? [{ name: "LATENT", type: "LATENT" }] : [{ name: "IMAGE", type: "IMAGE" }];
   return {
@@ -233,10 +239,24 @@ function imageCapableNode(type, id) {
     type,
     size: [210, 266],
     widgets: [previewWidget()],
-    imgs: [{ src: "/view?filename=ComfyUI_00001_.png" }],
-    images: [{ filename: "ComfyUI_00001_.png", type: "output" }],
+    imgs: entry ? entry.images.map((m) => ({ src: `/view?filename=${m.filename}` })) : undefined,
+    images: entry ? entry.images : undefined,
     outputs,
     computeSize() { return [210, 46]; },
+    setSize(size) { this.size = size; },
+  };
+}
+
+/** LoadImage hydrates `imgs` from its OWN filename widget — never from the store. */
+function loadImageNode(id) {
+  return {
+    id,
+    type: "LoadImage",
+    size: [315, 314],
+    widgets: [{ name: "image", value: "portrait.png" }, previewWidget()],
+    imgs: [{ src: "/view?filename=portrait.png&type=input" }],
+    outputs: [{ name: "IMAGE", type: "IMAGE" }],
+    computeSize() { return [315, 58]; },
     setSize(size) { this.size = size; },
   };
 }
@@ -267,7 +287,7 @@ for (const victimType of ["VAEDecode", "ImageScale", "EmptyLatentImage"]) {
 
     // ComfyUI's own paste / undo / load reuses id 9 for a DIFFERENT node. The panel
     // never sees that edit, so the store entry SaveImage emitted is still sitting there.
-    const victim = imageCapableNode(victimType, 9);
+    const victim = imageCapableNode(victimType, 9, entry);
     const graph = { _nodes: [victim] };
     const { stripped } = stripMisattachedExecutionPreviews({
       graph,
@@ -282,6 +302,7 @@ for (const victimType of ["VAEDecode", "ImageScale", "EmptyLatentImage"]) {
     assert.equal(nodeOutputs["9"], undefined);
     assert.deepEqual(victim.size, [210, 46]);
     assert.equal(entry.images.length, 1, "the emitter's own entry object is not mutated");
+    assert.equal(victim.images, undefined);
   });
 }
 
@@ -327,7 +348,7 @@ test("#1374: a REPLACED store entry is not judged — restored /history outputs 
   // repopulates app.nodeOutputs from the job payload: brand-new node objects AND
   // brand-new entry objects. Nothing here is evidence of a steal.
   nodeOutputs["9"] = outputEntry("restored_00007_.png");
-  const restored = imageCapableNode("VAEDecode", 9);
+  const restored = imageCapableNode("VAEDecode", 9, nodeOutputs["9"]);
   const graph = { _nodes: [restored] };
   const { stripped } = stripMisattachedExecutionPreviews({
     graph,
@@ -343,8 +364,9 @@ test("#1374: a REPLACED store entry is not judged — restored /history outputs 
 
 test("#1374: with no emission on record an image-capable node is left alone", () => {
   const owners = new Map();
-  const decode = imageCapableNode("VAEDecode", 9);
-  const nodeOutputs = { "9": outputEntry() };
+  const entry = outputEntry();
+  const decode = imageCapableNode("VAEDecode", 9, entry);
+  const nodeOutputs = { "9": entry };
   const { stripped } = stripMisattachedExecutionPreviews({
     graph: { _nodes: [decode] },
     nodeOutputs,
@@ -353,39 +375,6 @@ test("#1374: with no emission on record an image-capable node is left alone", ()
   });
   assert.equal(stripped, 0);
   assert.ok(decode.imgs?.length);
-});
-
-test("#1374: a stolen b_preview frame is swept too, not just executed outputs", () => {
-  const owners = new Map();
-  const ksampler = {
-    id: 4,
-    type: "KSampler",
-    outputs: [{ name: "LATENT", type: "LATENT" }],
-    widgets: [],
-    computeSize() { return [270, 262]; },
-    setSize(size) { this.size = size; },
-  };
-  const frame = ["data:image/png;base64,AAAA"];
-  const nodePreviewImages = { "4": frame };
-  stripMisattachedExecutionPreviews({
-    graph: { _nodes: [ksampler] },
-    nodeOutputs: {},
-    nodePreviewImages,
-    preferNodeId: 4,
-    owners,
-  });
-
-  const victim = imageCapableNode("ImageScale", 4);
-  victim.imgs = undefined;
-  victim.images = undefined;
-  const { stripped } = stripMisattachedExecutionPreviews({
-    graph: { _nodes: [victim] },
-    nodeOutputs: {},
-    nodePreviewImages,
-    owners,
-  });
-  assert.equal(stripped, 1);
-  assert.equal(nodePreviewImages["4"], undefined);
 });
 
 test("#1374: the ledger stays graph-sized — records for vanished ids are pruned", () => {
@@ -414,12 +403,12 @@ test("#1374: holdsStolenExecutionPreview only fires on positive evidence", () =>
 
   assert.equal(holdsStolenExecutionPreview(owners, save, stores), false, "the owner itself");
   assert.equal(
-    holdsStolenExecutionPreview(owners, imageCapableNode("VAEDecode", 9), stores),
+    holdsStolenExecutionPreview(owners, imageCapableNode("VAEDecode", 9, entry), stores),
     true,
     "a different node of a different type on the same entry",
   );
   assert.equal(
-    holdsStolenExecutionPreview(owners, imageCapableNode("VAEDecode", 11), stores),
+    holdsStolenExecutionPreview(owners, imageCapableNode("VAEDecode", 11, entry), stores),
     false,
     "a different id",
   );
@@ -449,7 +438,7 @@ test("#1374: the PANEL's own call shape (no ledger argument) reaches the fix", (
     nodePreviewImages: {},
   });
 
-  const victim = imageCapableNode("VAEDecode", 9);
+  const victim = imageCapableNode("VAEDecode", 9, entry);
   const { stripped } = stripMisattachedExecutionPreviews({
     graph: { _nodes: [victim] },
     nodeOutputs,
@@ -459,6 +448,65 @@ test("#1374: the PANEL's own call shape (no ledger argument) reaches the fix", (
   assert.equal(stripped, 1);
   assert.equal(nodeOutputs["9"], undefined);
   executionPreviewOwnerLedger().clear();
+});
+
+test("#1374: a LoadImage on a reused id keeps the thumbnail it hydrated itself", () => {
+  const owners = new Map();
+  const { nodeOutputs } = runOneEmission(9, owners);
+
+  // LoadImage is image-capable (test above), so the ledger CAN reach it — and its
+  // imgs/pseudo-widget are its own file thumbnail, not the entry it inherited.
+  // stripNodeExecutionPreview would delete both and collapse the node to 58px.
+  const loader = loadImageNode(9);
+  const ownImgs = loader.imgs;
+  const { stripped } = stripMisattachedExecutionPreviews({
+    graph: { _nodes: [loader] },
+    nodeOutputs,
+    nodePreviewImages: {},
+    owners,
+  });
+
+  assert.equal(stripped, 1, "the leftover store entry must still go");
+  assert.equal(nodeOutputs["9"], undefined, "the inherited entry is dropped");
+  assert.equal(loader.imgs, ownImgs, "the LoadImage thumbnail is not its inheritance");
+  assert.equal(loader.widgets.some((w) => w.name === CANVAS_IMAGE_PREVIEW_WIDGET), true);
+  assert.deepEqual(loader.size, [315, 314], "the node must not collapse");
+});
+
+test("#1374: an entry written after the executed sweep is still attributed", () => {
+  // ComfyUI registers its own `executed` listener during app.setup(), before extension
+  // setup, so the panel's sweep can run with the store not yet written. The record is
+  // seeded there and caught up by the execution_success sweep — without that refresh
+  // the emitter's real entry is never attributed and the id can be stolen silently.
+  const owners = new Map();
+  const save = saveImageNode(9);
+  const nodeOutputs = {};
+  stripMisattachedExecutionPreviews({
+    graph: { _nodes: [save] },
+    nodeOutputs,
+    nodePreviewImages: {},
+    preferNodeId: 9,
+    owners,
+  });
+
+  const entry = outputEntry();
+  nodeOutputs["9"] = entry; // ComfyUI writes it a tick later
+  stripMisattachedExecutionPreviews({
+    graph: { _nodes: [save] },
+    nodeOutputs,
+    nodePreviewImages: {},
+    owners,
+  });
+
+  const victim = imageCapableNode("VAEDecode", 9, entry);
+  const { stripped } = stripMisattachedExecutionPreviews({
+    graph: { _nodes: [victim] },
+    nodeOutputs,
+    nodePreviewImages: {},
+    owners,
+  });
+  assert.equal(stripped, 1);
+  assert.equal(nodeOutputs["9"], undefined);
 });
 
 test("#1374: onExecuted still hands the sweep the id that emitted", () => {
