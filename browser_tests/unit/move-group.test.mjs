@@ -2210,6 +2210,47 @@ test("moveReroutePoints skips malformed points and never throws", () => {
   assert.doesNotThrow(() => moveReroutePoints(undefined, 1, 1));
 });
 
+test("#1300 the reported move: a group enclosing rgthree Label nodes moves, whole, with no partial", () => {
+  // The reporter's groups 7 and 15: each enclosed one or more Label (rgthree)
+  // nodes whose updateArea() writes font-scaled visual bounds far past `size`.
+  // panel_move_group classified them stuck AFTER writing their positions
+  // ("would not accept a new position (node 594, node 606)") and rolled back;
+  // panel_edit_node moved the same ids. pinned is not the discriminator — 579
+  // was unpinned, 594/606 were pinned.
+  const label = (id, pos, pinned) => ({
+    id,
+    type: "Label (rgthree)",
+    pos: [...pos],
+    size: [210, 56],
+    flags: { pinned },
+    boundingRect: [pos[0], pos[1] - 30, 420, 180],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, 420, 180];
+    },
+  });
+  const sampler = node(1, [80, 200], [200, 100]);
+  const unpinned = label(579, [100, 100], false);
+  const pinnedA = label(594, [120, 140], true);
+  const pinnedB = label(606, [140, 160], true);
+  const g = group(15, [50, 50, 500, 400], "LTX column");
+  const graph = makeGraph({ nodes: [sampler, unpinned, pinnedA, pinnedB], groups: [g] });
+
+  const res = realMoveGroup(graph)({ group_id: 15, pos: [1500, -40] });
+
+  assert.equal(res.moved.nodes, 4, "sampler + three Labels moved — no refusal, no partial");
+  assert.deepEqual(sampler.pos, [1530, 110]);
+  assert.deepEqual(unpinned.pos, [1550, 10]);
+  assert.deepEqual(pinnedA.pos, [1570, 50]);
+  assert.deepEqual(pinnedB.pos, [1590, 70]);
+  assert.deepEqual(g._bounding, [1500, -40, 500, 400]);
+  assert.deepEqual(
+    res.group.node_ids.sort((a, b) => a - b),
+    [1, 579, 594, 606],
+    "and every enclosed node is still reported as a member at the new box",
+  );
+  assert.deepEqual([...unpinned.boundingRect], [1550, -20, 420, 180], "Label extents stay the engine's, not the generic model");
+});
+
 test("#813 the reported move: a group of COLLAPSED members moves, whole, with no partial", () => {
   // The reporter's group 6 ("Face Detail & Output"): four collapsed size:[225,0] nodes,
   // moved to [1500,-40]. Every one was called "would not accept a new position" — after its
