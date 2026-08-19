@@ -64,6 +64,12 @@
  * (absent flag, unreadable node, no live instance at all) keeps the node reported,
  * which is the direction that costs noise rather than a missed diagnosis.
  *
+ * The one input that would defeat this is a placeholder that somehow arrives WITH the
+ * flag, which would need a workflow file to carry it. It cannot: enumerated across the
+ * shipped 1.48.7 bundle there are 11 occurrences of `isVirtualNode`, and every one is a
+ * class declaration or a read — the graph serializer does not emit it, so no saved
+ * workflow can put it on a node whose class was never registered.
+ *
  * ## Why the write guards' extra clause is not required here
  *
  * `node-resolve.js` additionally demands no backend provenance on the class, because it
