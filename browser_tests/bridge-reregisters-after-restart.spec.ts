@@ -31,6 +31,7 @@
  */
 import { test, expect, deleteSavedWorkflow } from './fixtures/panelTest'
 import { MockBridge } from './fixtures/MockBridge'
+import { routeWorktreeSource } from './fixtures/worktreeSource'
 
 test.setTimeout(180_000)
 
@@ -107,4 +108,127 @@ test('the tab re-registers after the bridge dies and respawns', async ({
   } finally {
     await cleanup()
   }
+})
+
+/**
+ * #654, the shape the spec above cannot reach: THE BRIDGE SURVIVES THE RESTART.
+ *
+ * The spec above reproduces a bridge that dies with ComfyUI and comes back on the
+ * same port. That was the deployment when it was written; it no longer is. The
+ * pack is pure-frontend and can no longer spawn the orchestrator
+ * (`externalOrchestratorMode()` is hardcoded true), so the orchestrator now runs
+ * out-of-band and ALWAYS survives a ComfyUI restart. The bridge socket therefore
+ * never closes, no socket `open` handler fires, and `connectAgent()` early-returns
+ * on an already-OPEN socket — so nothing sent the `hello` that is the only thing
+ * which re-registers this tab's route.
+ *
+ * What that produces is the report verbatim: the restart confirms its down/up
+ * cycle, the orchestrator's post-restart watch waits for a strictly NEWER hello
+ * generation that never arrives, and every graph tool answers `Connected: none`
+ * until the browser tab is reloaded by hand.
+ *
+ * The restart is driven through ComfyUI's OWN api events, which is exactly what
+ * the panel sees during a real one — the frontend socket goes away
+ * (`reconnecting`) and comes back (`reconnected`) while the page stays loaded.
+ * Killing the real ComfyUI would prove the same thing and take the whole suite's
+ * backend with it.
+ *
+ * The CONTROL half is the load-bearing one. ComfyUI fires `reconnected` for
+ * benign blips too — viewing an asset, checking an image, a tab refocus — and a
+ * hello is a full re-greeting that bumps the agent-session epoch and draws a
+ * fresh ready ack. A fix that re-advertised on those would be #1138's
+ * false-nudge-into-a-live-session harm wearing this issue's clothes, so the short
+ * bounce asserts SILENCE before the long one asserts recovery.
+ */
+test('a ComfyUI restart under a LIVE bridge re-advertises the tab route', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  // Serve THIS checkout's web/js tree. Not optional and not a nicety: the dev
+  // ComfyUI loads the pack from a git-linked checkout on another branch, and
+  // without this the spec measures that branch. Verified by running it exactly
+  // once without the route — the panel produced no re-advertise at all, which is
+  // this issue reproducing in the browser rather than the test passing.
+  await routeWorktreeSource(page.context())
+
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+  await expect(panel.statusPill).toHaveText(/connected/i, { timeout: 20_000 })
+
+  const hellos: Record<string, unknown>[] = []
+  mockBridge.onFrame((f) => {
+    if (f.type === 'hello') hellos.push(f)
+  })
+  const socketsAtStart = mockBridge.connectionsOpened
+
+  const fireComfyApiEvent = async (name: string) => {
+    // The SAME resolution the panel itself uses to find the api singleton
+    // (`window.comfyAPI?.api?.api || window.api`). Reaching for `app.api`
+    // instead finds an object the panel never listened on, and the control half
+    // of this test would then pass for the wrong reason — silence because the
+    // event went nowhere. Assert the dispatch was accepted so that failure mode
+    // is loud rather than green.
+    const delivered = await page.evaluate((event) => {
+      const w = window as any
+      const api = w.comfyAPI?.api?.api || w.api
+      if (!api || typeof api.dispatchEvent !== 'function') return false
+      api.dispatchEvent(new CustomEvent(event))
+      return true
+    }, name)
+    expect(delivered, `ComfyUI's api singleton must accept the ${name} event`).toBe(true)
+  }
+
+  /** ComfyUI's backend socket goes away for `downMs` and comes back. The BRIDGE
+   *  is deliberately untouched — that is the whole point of this shape. */
+  const bounceComfyBackend = async (downMs: number) => {
+    await fireComfyApiEvent('reconnecting')
+    await page.waitForTimeout(downMs)
+    await fireComfyApiEvent('reconnected')
+  }
+
+  // CONTROL: a sub-second blip is not a restart and must produce no greeting.
+  await bounceComfyBackend(600)
+  await page.waitForTimeout(3_000)
+  expect(
+    hellos.length,
+    'a benign WS blip must NOT re-greet the agent — that is the #1138 harm'
+  ).toBe(0)
+
+  // THE INVARIANT: a restart-length outage re-advertises the route, with no page
+  // reload and no reconnect.
+  await bounceComfyBackend(7_000)
+  await expect
+    .poll(() => hellos.length, {
+      timeout: 30_000,
+      message: 'the tab must re-advertise its route after a restart the bridge survived'
+    })
+    .toBeGreaterThan(0)
+
+  expect(
+    mockBridge.connectionsOpened,
+    'and it must do so on the SAME socket — no drop, no redial, no page reload'
+  ).toBe(socketsAtStart)
+
+  const route = String(hellos[hellos.length - 1]?.tab_id ?? '')
+  expect(route, 'the re-advertise must carry a real route, never a bare path').toMatch(
+    /^(wf:[^:]+:|tmp:)/
+  )
+
+  // The hello is only the ANNOUNCEMENT. #654's symptom is that graph tools stay
+  // unusable afterwards, so drive one: that is what "Connected: none" was about.
+  const outline = await mockBridge.command('graph_outline', {})
+  expect(
+    outline.ok,
+    'a graph command must route after the re-advertise — announcing is not being usable'
+  ).toBe(true)
+
+  // ONE-SHOT: `reconnected` repeats, and each repeat is another full re-greeting
+  // if the claim is not stamped. A second event with no new outage adds nothing.
+  const afterRestart = hellos.length
+  await fireComfyApiEvent('reconnected')
+  await page.waitForTimeout(3_000)
+  expect(hellos.length, 'a repeated `reconnected` must not re-greet again').toBe(afterRestart)
 })
