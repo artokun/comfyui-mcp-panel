@@ -271,7 +271,11 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  OBJECT_INFO_DEADLINE_MS,
+} from "./lib/object-info-oracle.js";
 import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
@@ -10584,6 +10588,25 @@ const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
  */
 const SET_WIDGET_POST_REFRESH_RESERVE_MS = 4000;
 
+/**
+ * #1418 — the bound on the #387 upload-asset `/view` probe, drawn from the reserve above.
+ *
+ * The reserve exists to leave the retry write, this probe and the reply something to spend;
+ * it does not by itself STOP the probe spending all of it and more, because the probe held
+ * no bound of its own. One ranged GET (`Range: bytes=0-0`) is a header exchange, so this is
+ * generous by any measure of the request — it is sized against the RESERVE, deliberately
+ * smaller than it, so composing and relaying the reply still has room after a probe that
+ * used its whole allowance.
+ *
+ * PICKED, not derived, like the reserve: there is no measured figure for a one-byte ranged
+ * GET in this repo, and inventing one in a comment is how #1413's "reassurance-shaped
+ * claim" trap gets sprung again. What IS load-bearing and is stated rather than assumed:
+ * this is a CAP, not a grant — `budget.bounded()` hands over the smaller of this and what
+ * the command has left, so a probe reached with a nearly-spent budget waits the remainder
+ * and not this number.
+ */
+const SET_WIDGET_ASSET_PROBE_MS = 3000;
+
 async function awaitRequiredCustomWidgetRegistration(
   nodeData,
   comfyApp,
@@ -12455,10 +12478,25 @@ const GRAPH_TOOL_EXECUTORS = {
         // than parking.
         // #1223 — read the epoch HERE, immediately before the whole request is issued.
         addNodeObservedAtEpoch = backendReconnectEpoch;
-        // #1192 — the same request `graph_set_widget`'s oracle allows 10,000 ms, allowed
-        // 10,000 ms here too, and BOTH now capped by their caller's remaining budget. The
-        // two paths agreeing about how long one /object_info may take is what stops a
-        // "set_widget works but add_node fails" asymmetry appearing on a slow install.
+        // #1192 — this request gets NODE_DEFS_FETCH_TIMEOUT_MS (10,000 ms), capped by what
+        // the command has left.
+        //
+        // #1418 — AND THE TWO PATHS DO NOT AGREE ABOUT THAT NUMBER. An earlier revision of
+        // this comment said "the same request `graph_set_widget`'s oracle allows 10,000 ms"
+        // and that the agreement "stops a 'set_widget works but add_node fails' asymmetry";
+        // both halves were false when written. `graph_set_widget` reads /object_info
+        // through `fetchWholeObjectInfo`, whose OBJECT_INFO_DEADLINE_MS is 20,000 ms — so
+        // the asymmetry that sentence claimed to have closed was the live behaviour, in the
+        // direction it ruled out, and nothing capped that 20,000 ms until #1418 either.
+        //
+        // The two numbers are LEFT DIFFERENT, because they bound different things and each
+        // is argued where it lives: this one bounds `api.getNodeDefs()`, one call; the
+        // oracle's bounds TWO transports plus the fallback's body, split 10s/5s/5s, and
+        // object-info-oracle.js sets out that arithmetic at length. Equalising them to make
+        // a sentence true would be the tail wagging the dog. What both paths now genuinely
+        // share is the property that matters: each takes the SMALLER of its own constant
+        // and its caller's remaining command budget, so neither can outlive the 30,000 ms
+        // relay window however it is reached.
         const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
         freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
@@ -13711,7 +13749,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // fails CLOSED for this call only, with a TEMPORARY "retry in a moment" refusal. The
     // seed keeps running, so a late response still establishes the baseline and the next
     // call authorizes normally — ordinary latency must never burn the session.
-    await awaitObjectInfoHistorySeed();
+    //
+    // #1418 — …and CAPPED BY THE COMMAND, the way `graph_add_node` has capped its own copy
+    // since #1192. This is the FIRST of the waits on this path and it held a flat 8,000 ms,
+    // so #1413's budget bounded the LAST step while the two ahead of it could still spend
+    // 28,000 ms between them (8,000 seed + 20,000 `OBJECT_INFO_DEADLINE_MS`) against a
+    // 25,000 ms budget inside a 30,000 ms relay window — measured, and the joinMs the
+    // recovery then computed was -7,000. Capping both brings the worst case before the
+    // recovery to the budget itself, which is what makes the reply land inside the window.
+    await awaitObjectInfoHistorySeed(budget.bounded(OBJECT_INFO_SEED_WAIT_MS));
     // #757 — MINT an rgthree Power Lora Loader row when the write targets one that does not
     // exist yet. Those rows are created only by the node's own "➕ Add Lora" button, a
     // DOM-only control an agent cannot click, so every write to `lora_1` on a fresh node was
@@ -13815,6 +13861,16 @@ const GRAPH_TOOL_EXECUTORS = {
             return fetchWholeObjectInfo({
               getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
               fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+              // #1418 — the oracle's own 20,000 ms deadline is sized for the operation it
+              // bounds (see OBJECT_INFO_DEADLINE_MS: half to the client route, then a
+              // quarter each to the fallback's response and body). It is NOT sized for the
+              // command it runs inside, and it never was: alone it already exceeds the
+              // 25,000 ms budget once the 8,000 ms seed wait ahead of it is counted. It
+              // keeps its own number and takes the smaller of that and what the command has
+              // left. The oracle normalises non-finite budgets itself and obeys a small
+              // one — `bounded()` never yields a non-positive value, so this can shorten
+              // the deadline but can never remove it.
+              deadlineMs: budget.bounded(OBJECT_INFO_DEADLINE_MS),
             });
           },
           { stamp: () => backendReconnectEpoch },
@@ -14000,6 +14056,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // resolves the nested path). Confirm the file EXISTS in the server's input
       // directory via /view?type=input; a 2xx means it is a valid, loadable asset and
       // set-widget.js accepts it. Range-limited so we do not download the whole file.
+      //
+      // #1418 — BOUNDED BY THE COMMAND, and it is the last thing on this path that was not.
+      // #1416's PR body claimed the abandoned-refresh refusal fired "before the unbounded
+      // upload-asset probe so a spent budget is not followed by another unbounded wait",
+      // and that is true only of the ABANDONED arm. When the refresh COMPLETES and the
+      // retry write still misses — the #387 case this probe exists for, a subfolder-nested
+      // LoadImage image — the ladder reaches it anyway; measured by driving the shipped
+      // runSetWidget with a refreshCombos that resolves normally and a value the refreshed
+      // list still lacks. A `/view` on a half-open connection then parked the last network
+      // step of a command relayed at 30,000 ms with no bound at all.
+      //
+      // A BOUND HERE CANNOT ADMIT A VALUE IT SHOULD REFUSE, which is why it is safe against
+      // #240 strictness: the probe already answers `false` for every error, so the only
+      // thing a timeout can change is `true` → `false`. It refuses a genuine nested asset
+      // on a stalled connection — where the alternative was the whole command missing the
+      // relay window and refusing it with a message that names nothing.
       confirmServerAsset: async (assetValue) => {
         try {
           const v = String(assetValue ?? "").replace(/\\/g, "/");
@@ -14008,11 +14080,18 @@ const GRAPH_TOOL_EXECUTORS = {
           const filename = i >= 0 ? v.slice(i + 1) : v;
           if (!filename) return false;
           const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
-          const res = await api.fetchApi(`/view?${qs}`, {
-            method: "GET",
-            cache: "no-store",
-            headers: { Range: "bytes=0-0" },
-          });
+          // withTimeout never rejects and never cancels the request — the fetch keeps
+          // going, this stops waiting on it. A timeout resolves the same NO-ANSWER
+          // sentinel a thrown fetch is caught into below, so both take one branch.
+          const res = await withTimeout(
+            api.fetchApi(`/view?${qs}`, {
+              method: "GET",
+              cache: "no-store",
+              headers: { Range: "bytes=0-0" },
+            }),
+            budget.bounded(SET_WIDGET_ASSET_PROBE_MS),
+            () => null,
+          );
           return !!res && (res.ok || res.status === 206);
         } catch {
           return false;

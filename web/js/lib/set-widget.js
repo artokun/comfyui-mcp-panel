@@ -77,28 +77,56 @@ function coerceAdvisoryMessage(err) {
 }
 
 /**
- * #1413 — the refusal for a stale-combo recovery whose authoritative refresh was still
- * running when the command's budget ran out.
+ * #1413 — the refusal for a stale-combo recovery whose authoritative refresh did not
+ * complete inside the command's budget.
  *
  * RECOVERABLE BY CONSTRUCTION, and worded to say so — the same shape as #1192's
- * addNodeRefreshBusyMessage. The in-flight refresh was NOT cancelled (the coalescer never
- * cancels work someone else started) and it is registering the very list this write needs,
- * so the retry this text asks for is the normal outcome, not a hope. What it must NOT say
- * is "not a valid option": the revalidation never completed, so this refusal cannot tell a
- * genuinely-invalid value from one the refresh would have accepted — and claiming the
- * former is how a retryable busy reads as a permanent rejection.
+ * addNodeRefreshBusyMessage. What it must NOT say is "not a valid option": the revalidation
+ * never completed, so this refusal cannot tell a genuinely-invalid value from one the
+ * refresh would have accepted — and claiming the former is how a retryable busy reads as a
+ * permanent rejection.
+ *
+ * #1418 — IT MUST NAME BOTH STATES, because `REFRESH_JOIN_ABANDONED` comes back in two and
+ * the first draft of this text asserted only one ("That refresh is still running and is
+ * registering exactly the list this write needs"). `refresh-coalesce.js` returns the token
+ * from an EMPTY slot with a non-positive `joinMs` too:
+ *
+ *     if (joinMs !== null && !(joinMs > 0)) return REFRESH_JOIN_ABANDONED;
+ *
+ * — measured reachable with NO concurrency at all, by driving the shipped `refreshCombos`
+ * over the real coalescer: 0 runs started, slot empty afterwards, token returned. On that
+ * arm every clause about a run that "is still running" was flatly false, and the retry
+ * advice ("this normally succeeds on the next attempt") rested on it.
+ *
+ * THIS IS THE SHAPE #1409 ALREADY CORRECTED ONCE, in `refresh_nodes`' own refusal — a
+ * detail naming only the first of two runs was wrong on an uncontended big install. Same
+ * remedy: name both states, and rest the retry advice on what is true in EITHER. The one
+ * fact that holds on both arms is that this command's budget is what ran out, and a retry
+ * re-enters the recovery with a fresh one — so that, not a promise about somebody else's
+ * run, is what the caller is told to act on. Which state produced the token is deliberately
+ * NOT reconstructed here: the coalescer returns one value for both, and a caller that
+ * guessed from `budget.exhausted()` would be asserting a cause it never established, which
+ * is the defect class this whole thread is about.
+ *
+ * The escalation is not decoration either. On the second arm a bare retry can meet the same
+ * slow `/object_info` and land in the same place, so the text says so and names the call
+ * (`panel_refresh_nodes`) that resolves it instead of implying the next attempt must work.
  */
 function staleComboRefreshBusyMessage() {
   return (
     "the value is not in this combo's current option list, and the authoritative refresh " +
-    "that would have re-read the list — a node-def refresh started by a ComfyUI reconnect, " +
-    "a finished install, or another tool call — was still running when this command's time " +
-    "budget ran out waiting for it, so the revalidation did NOT complete. This refusal " +
-    "cannot tell a genuinely-invalid value from one the refresh would have accepted. " +
-    "NOTHING WAS WRITTEN and nothing was changed. That refresh is still running and is " +
-    "registering exactly the list this write needs, so RETRY in a few seconds — this " +
-    "normally succeeds on the next attempt. If it keeps happening, call panel_refresh_nodes " +
-    "once and wait for it to report, then retry the write."
+    "that would have re-read the list did NOT complete inside this command's time budget, " +
+    "so the revalidation never happened. This refusal cannot tell a genuinely-invalid " +
+    "value from one the refresh would have accepted. NOTHING WAS WRITTEN and nothing was " +
+    "changed. TWO situations produce this and the remedy is the same for both: either a " +
+    "node-def refresh started by a ComfyUI reconnect, a finished install, or another tool " +
+    "call was still running when the budget ran out waiting for it — that run was NOT " +
+    "cancelled and is still registering the list this write needs — or the budget was " +
+    "already spent by the steps ahead of this recovery, in which case no refresh was " +
+    "started for this write at all. RETRY: the retry re-enters this recovery with a FRESH " +
+    "budget, and joins the running refresh if there is one. If a slow /object_info is what " +
+    "spent the budget, a bare retry can meet the same wall — so if it keeps happening, " +
+    "call panel_refresh_nodes once and wait for it to report, then retry the write."
   );
 }
 

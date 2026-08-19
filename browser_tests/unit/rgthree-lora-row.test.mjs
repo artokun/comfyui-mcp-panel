@@ -1324,6 +1324,13 @@ const EXECUTOR_DEPS = [
   "SET_WIDGET_COMMAND_BUDGET_MS",
   "SET_WIDGET_POST_REFRESH_RESERVE_MS",
   "monotonicNow",
+  // #1418 — the capped seed wait, the capped authorization deadline and the bounded
+  // #387 /view probe. Supplied by setWidgetCommandBudgetDeps(); named here because a
+  // free identifier the rebuilt body reaches is a ReferenceError, not a failed assert.
+  "OBJECT_INFO_SEED_WAIT_MS",
+  "OBJECT_INFO_DEADLINE_MS",
+  "SET_WIDGET_ASSET_PROBE_MS",
+  "withTimeout",
 ];
 
 /**

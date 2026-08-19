@@ -18,6 +18,8 @@ import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -154,6 +156,15 @@ export const OBJECT_INFO_SEED_WAIT_MS = readPanelNumber(
   "the baseline seed wait",
 );
 
+/** #1418 — the cap on the #387 upload-asset /view probe, drawn from the post-refresh reserve. */
+export const SET_WIDGET_ASSET_PROBE_MS = readPanelNumber(
+  /const SET_WIDGET_ASSET_PROBE_MS = (\d+);/,
+  "the set_widget upload-asset probe bound",
+);
+
+/** #1418 — re-exported so a harness reads the oracle's OWN number, never a copy of it. */
+export { OBJECT_INFO_DEADLINE_MS };
+
 /**
  * #1192 — every module binding the command budget added to `graph_add_node`, in ONE place.
  *
@@ -206,5 +217,13 @@ export function setWidgetCommandBudgetDeps() {
     SET_WIDGET_COMMAND_BUDGET_MS,
     SET_WIDGET_POST_REFRESH_RESERVE_MS,
     monotonicNow,
+    // #1418 — the three bindings the two capped waits and the bounded #387 probe added.
+    // REAL, not stubbed: `withTimeout` is the repo's one bounding primitive and a double
+    // would let a harness pass against a probe that bounds nothing, and both numbers are
+    // read from the panel source for the reason at the top of this file.
+    withTimeout,
+    OBJECT_INFO_DEADLINE_MS,
+    SET_WIDGET_ASSET_PROBE_MS,
+    OBJECT_INFO_SEED_WAIT_MS,
   };
 }
