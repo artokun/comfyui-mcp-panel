@@ -335,6 +335,8 @@ import {
   // #1634: the pinpoint per-value cap for an explicit-`ids` read is derived from these.
   WIDGET_VALUE_CAP,
   COMPACT_VALUE_CLIP,
+  // #1748: which frontend node types carry on-canvas prose as a widget value.
+  NOTE_NODE_TYPES,
   OUTLINE_DETAIL_LEVELS,
   clampOutlineMaxChars,
   outlineDegradeBanner,
@@ -11216,6 +11218,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // raises these clips, so the footer must not pretend one does.
     let outlineClipped = 0;
     let outlineTitlesClipped = 0;
+    // #1748: WHICH clipped values were on-canvas note text (Note/MarkdownNote). A bare
+    // count cannot tell the reader that one of them was the workflow's INSTRUCTIONS
+    // (trigger words, download paths) rather than a seed it can re-query, so the footer
+    // names the note nodes whose text the 60-char clip hid. Render order, deduped.
+    let outlineClippedNoteIds = [];
     /**
      * clipOutlineTitle, counting — every title in the outline goes through here.
      *
@@ -11285,9 +11292,18 @@ const GRAPH_TOOL_EXECUTORS = {
      * quote/backslash-dense value can render slightly longer than 60; that costs a few
      * characters against max_chars and cannot reintroduce a forgeable tag (codex).
      */
-    const fmtVal = (v) => {
+    const fmtVal = (v, node) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
-      const clipped = s.length <= 60 ? s : (outlineClipped++, s.slice(0, 57) + "…");
+      let clipped = s;
+      if (s.length > 60) {
+        outlineClipped++;
+        // #1748: a clipped NOTE value is lost instructions, not a re-queryable detail —
+        // remember the node so the footer can name it (the row's own 60-char clip reads
+        // as the whole note otherwise).
+        if (NOTE_NODE_TYPES.has(node?.type) && !outlineClippedNoteIds.includes(node.id))
+          outlineClippedNoteIds.push(node.id);
+        clipped = s.slice(0, 57) + "…";
+      }
       if (!/[[\]]/.test(clipped)) return clipped;
       // Escape backslashes first, then quotes, so the escape introduced for a quote is
       // not doubled — and the closing quote cannot be swallowed by a trailing backslash.
@@ -11350,7 +11366,7 @@ const GRAPH_TOOL_EXECUTORS = {
             .map((w) => {
               // At "no_values" the widget NAMES still tell an agent what is configurable;
               // the VALUES are the bulk of the bytes, so they go first.
-              const base = level === "full" ? `${w.name}=${fmtVal(w.value)}` : w.name;
+              const base = level === "full" ? `${w.name}=${fmtVal(w.value, n)}` : w.name;
               // The NAME stays the addressable key and stays first — panel_set_widget
               // takes the name, not the label — with the label annotated beside it in the
               // same bracket idiom as [after_gen=…] and [bypass].
@@ -11463,6 +11479,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const assemble = (level) => {
       outlineClipped = 0;
       outlineTitlesClipped = 0;
+      outlineClippedNoteIds = [];
       const banner = outlineDegradeBanner({
         level,
         nodeCount: nodes.length,
@@ -11489,7 +11506,7 @@ const GRAPH_TOOL_EXECUTORS = {
         (banner ? `${banner}\n\n` : "") +
         head +
         bodyText +
-        outlineValueClipNote(outlineClipped, outlineTitlesClipped)
+        outlineValueClipNote(outlineClipped, outlineTitlesClipped, outlineClippedNoteIds)
       );
     };
 
