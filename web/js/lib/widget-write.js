@@ -1545,8 +1545,18 @@ export function applyWidgetWrite(
     // reads back clean and is overwritten by the node's next `setProperty`.
     //
     // Inside the SAME undo envelope as the value assignments, so this cannot land while
-    // the widget write rolls back. `setProperty` copies the value into the bound widget as
-    // its last step; `w.value` is already `coerced`, so that copy is a no-op assignment.
+    // the widget write rolls back.
+    //
+    // WHAT THE COPY-BACK COSTS, stated rather than waved at. `setProperty`'s last step
+    // assigns the value into the bound widget. On a plain data-property widget that is a
+    // no-op — `w.value` already holds `coerced`. On a widget whose `value` is an ACCESSOR
+    // (ComfyUI's DOM widgets are: `set value(v) { options.setValue?.(v); callback?.(…) }`)
+    // it runs that setter a second time, so a bound DOM widget's callback fires once more
+    // than it would for an unbound one. That is not a regression introduced here: it is
+    // exactly what `BaseWidget.setValue` does on an on-canvas edit of the same widget —
+    // assign, `setProperty`, then the callback. Matching the interactive path is the whole
+    // point, and the alternative (assigning `properties` and invoking `onPropertyChanged`
+    // by hand) would skip a `setProperty` a pack has overridden.
     //
     // A throw from here is captured by the same catch as everything else in this envelope
     // and stays UNATTRIBUTED — `onPropertyChanged` is a node's own code and this is not
@@ -1629,6 +1639,7 @@ export function applyWidgetWrite(
   // rolls back rather than being reported as verified.
   const UNREADABLE_PROPERTY = Symbol("bound property unreadable");
   const readBoundProperty = () => {
+    if (!boundProperty) return UNREADABLE_PROPERTY;
     try {
       const props = targetNode.properties;
       if (!props || typeof props !== "object") return UNREADABLE_PROPERTY;
