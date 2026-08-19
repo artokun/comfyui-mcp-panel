@@ -835,3 +835,29 @@ test("#1706 a NON-numeric promoted id that names nothing remapped still does not
     );
   }
 });
+
+test("#1706 P0: a promoted widget id in HEX or EXPONENT form still refuses", () => {
+  // The two numeric readings are NOT redundant, and mutation is what showed it: with
+  // only the decimal dialects above, deleting the `Number()` clause killed no test,
+  // because a leading-integer parse already caught `"78.0"`, `" 78"`, `"078"`, `"78abc"`.
+  // These two are the inputs where the readings DISAGREE — `Number("0x4E")` is 78 while
+  // a leading-integer parse is 0, and `Number("7.8e1")` is 78 while the parse is 7 — so
+  // each clause is the only thing standing in front of one of them.
+  const c = captured();
+  const movedFrom = c.payloadDefinitions.subgraphs[0].nodes[0].id;
+  const hex = `0x${movedFrom.toString(16)}`;
+  const exponent = `${movedFrom / 10}e1`;
+  assert.equal(Number(hex), movedFrom, "the hex form must really name the moved node");
+  assert.equal(Number(exponent), movedFrom, "the exponent form must really name the moved node");
+  assert.notEqual(Number(/^\s*[+-]?\d+/.exec(hex)[0]), movedFrom, "and the leading-integer parse must NOT");
+  assert.notEqual(Number(/^\s*[+-]?\d+/.exec(exponent)[0]), movedFrom, "likewise");
+  for (const dialect of [hex, exponent]) {
+    assert.equal(
+      definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, {
+        rootNodes: [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[dialect, "seed"]] } }],
+      }),
+      false,
+      `proxyWidgets id ${JSON.stringify(dialect)} names a relabeled node and must refuse`,
+    );
+  }
+});
