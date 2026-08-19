@@ -47,6 +47,10 @@
     "name": "Mostrar RunPod / Local",
     "tooltip": "Mostra o botão de host RunPod / Local na barra de ferramentas — criar/iniciar/parar/conectar um pod com GPU na nuvem, ou voltar para o local. Desligado por padrão; a flag também é enviada a um app de celular conectado."
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "Prévias de vídeo no chat",
+    "tooltip": "Reproduz os vídeos gerados embutidos no chat. Desative para economizar RAM: o vídeo aparece então como um placeholder com o primeiro quadro e o nome do arquivo, e clicar nele abre o vídeo completo no lightbox. Aplica-se aos vídeos gerados após a mudança; os cartões já presentes no chat mantêm o player."
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Baixar o app beta",
     "tooltip": "Downloads para testadores do app de celular do ComfyUI MCP. No iOS a instalação é pelo Apple TestFlight; no Android, pelo Firebase App Distribution. Os dois canais são beta: as builds mudam com frequência e podem exigir um novo pareamento com este painel."

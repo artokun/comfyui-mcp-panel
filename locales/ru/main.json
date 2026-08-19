@@ -949,6 +949,7 @@
       "updated_to_you_were_on_what_changed": "Обновлено до {version} (у вас было {lastSeen}) — что изменилось:",
       "using": "Используется {tool}…",
       "video": "Видео",
+      "video_preview_off_click_to_view": "Превью видео отключено — нажмите, чтобы посмотреть",
       "view_full_size": "Открыть в полном размере",
       "voice_input_error": "Ошибка голосового ввода: {error}",
       "voice_input_is_not_supported_in_this": "Голосовой ввод не поддерживается в этом браузере",

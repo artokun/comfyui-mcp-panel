@@ -832,6 +832,7 @@
       "updated_to_you_were_on_what_changed": "已更新到 {version}（你原本用的是 {lastSeen}） —— 變更內容：",
       "using": "正在使用 {tool}…",
       "video": "影片",
+      "video_preview_off_click_to_view": "影片預覽已關閉 — 點擊檢視",
       "view_full_size": "查看原尺寸",
       "voice_input_error": "語音輸入錯誤：{error}",
       "voice_input_is_not_supported_in_this": "這個瀏覽器不支援語音輸入",

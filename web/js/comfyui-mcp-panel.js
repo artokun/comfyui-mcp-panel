@@ -586,6 +586,7 @@ import {
   sourceMediaDuration,
   storyboardSampleTimes,
 } from "./lib/media-duration.js";
+import { videoPreviewsEnabled } from "./lib/video-previews.js";
 import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
@@ -4462,6 +4463,11 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 const SETTING_FLAG_APPS = "comfyui-mcp.featureFlag.apps";
 const SETTING_FLAG_TRAINING = "comfyui-mcp.featureFlag.training";
 const SETTING_FLAG_RUNPOD = "comfyui-mcp.featureFlag.runpod";
+// #1280 — inline chat videos autoplay+loop and hold decoded frames while on
+// screen. On by default; off paints a metadata-only placeholder (first frame +
+// filename) and leaves the full decode to the lightbox. Read at PAINT time, so
+// it needs no live-apply hook — cards already in the log are untouched.
+const SETTING_VIDEO_PREVIEWS = "comfyui-mcp.videoPreviews";
 // RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
 // boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
 // conversation is always panel-owned now; stored values under these ids are
@@ -5477,6 +5483,18 @@ function panelSettingsList() {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyFlagRunpod?.(!!v);
       },
+    },
+    {
+      id: SETTING_VIDEO_PREVIEWS,
+      name: "Video previews in chat",
+      get category() { return cat(tr("panel.general", "General"), "Video previews in chat"); },
+      sortOrder: 150,
+      tooltip:
+        "Play generated videos inline in the chat. Turn off to save RAM: a video then appears as a placeholder with " +
+        "its first frame and filename, and clicking it opens the full video in the lightbox. Applies to videos " +
+        "generated after the change; cards already in the chat keep their player.",
+      type: "boolean",
+      defaultValue: true,
     },
     {
       // Link rows — same custom-HTMLElement trick as "Star on GitHub"; no
@@ -28683,6 +28701,55 @@ function buildPanel() {
     holder._video = null; // holder keeps its learned aspect-ratio → gray placeholder fills it
   }
 
+  // #1280 — the placeholder a video card gets when "Video previews in chat" is
+  // off. The element loads METADATA ONLY: no autoplay, no loop, no controls, so
+  // the browser fetches the headers and the first frame and stops — the decode
+  // this setting exists to avoid is never paid until the user asks for it.
+  // Clicking the card opens the same lightbox the ⛶ button does, so the video
+  // is one gesture away rather than gone.
+  //
+  // WHAT THE PLACEHOLDER CAN HONESTLY SAY. Metadata yields the source duration
+  // (via sourceMediaDuration, so a concat file's truncated `duration` is not
+  // quoted as the truth — #1270). A FRAME COUNT it does not yield: that lives in
+  // the container's track headers, which no web API surfaces, so the card
+  // carries filename + duration and no invented frame number.
+  function paintVideoPlaceholder(holder, card, url, name) {
+    holder.style.position = "relative";
+    holder.style.cursor = "pointer";
+    const label = tr("panel.video_preview_off_click_to_view", "Video preview off — click to view");
+    holder.title = label;
+    holder.setAttribute("aria-label", label);
+    const v = document.createElement("video");
+    v.muted = true;
+    v.setAttribute("muted", "");
+    v.preload = "metadata"; // headers + first frame; never the full decode
+    v.src = url;
+    v.playsInline = true;
+    // Clicks belong to the holder (→ lightbox), not the inert first frame.
+    v.style.cssText = "width:100%;display:block;border-radius:6px;pointer-events:none;";
+    // Facts line over the bottom of the frame: the filename at once, the
+    // duration filled in when the metadata lands.
+    const facts = document.createElement("div");
+    facts.style.cssText =
+      "position:absolute;left:0;right:0;bottom:0;padding:0.25rem 0.5rem;box-sizing:border-box;" +
+      "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.7692);color:#fff;background:rgba(0,0,0,0.55);" +
+      "border-radius:0 0 6px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+    facts.textContent = name || tr("panel.video", "Video");
+    v.addEventListener("loadedmetadata", () => {
+      if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
+      const seconds = sourceMediaDuration(v);
+      const d = seconds == null ? null : formatDuration(seconds * 1000);
+      const line = [name, d].filter(Boolean).join(" · ");
+      if (line) facts.textContent = line;
+    });
+    // No error listener: a source whose even METADATA fails keeps the filename
+    // on a gray box, and the click still opens the lightbox — which is where a
+    // decode verdict belongs, not on a card that never promised to play.
+    holder.appendChild(v);
+    holder.appendChild(facts);
+    holder.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
+  }
+
   function paintVideo(url, name) {
     // Coerce the caption at the painter boundary — see paintImage (#276).
     name = name == null ? name : coerceMessageText(name);
@@ -28727,7 +28794,16 @@ function buildPanel() {
       card.appendChild(cap);
     }
     log.appendChild(card);
-    videoObserver().observe(holder);
+    // #1280 — previews OFF: paint a metadata-only placeholder (first frame +
+    // filename) instead of mounting the live player. The ⛶ button, the collapse
+    // toggle and the persisted record above are unaffected — only the decode is
+    // deferred to the lightbox. Read at paint time, so already-painted cards
+    // keep whichever surface they were painted with.
+    if (videoPreviewsEnabled(getSetting(SETTING_VIDEO_PREVIEWS))) {
+      videoObserver().observe(holder);
+    } else {
+      paintVideoPlaceholder(holder, card, url, name);
+    }
     scrollLog();
     // Persist servable videos so they survive reload / thread switch (#177).
     recordMedia("video", url, name);

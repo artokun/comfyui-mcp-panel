@@ -47,6 +47,10 @@
     "name": "RunPod / 로컬 표시",
     "tooltip": "툴바에 RunPod / 로컬 호스트 버튼을 표시합니다 — 클라우드 GPU 파드를 배포·시작·중지·연결하거나 로컬로 되돌립니다. 기본값은 꺼짐이며, 이 설정은 연결된 모바일 앱에도 전달됩니다."
   },
+  "comfyui-mcp_videoPreviews": {
+    "name": "채팅 내 동영상 미리보기",
+    "tooltip": "생성된 동영상을 채팅에서 인라인으로 재생합니다. RAM을 절약하려면 끄세요: 동영상이 첫 프레임과 파일 이름이 표시된 자리 표시자로 나타나며, 클릭하면 라이트박스에서 전체 동영상이 열립니다. 변경 후 생성된 동영상에 적용되며, 이미 채팅에 있는 카드는 플레이어를 유지합니다."
+  },
   "comfyui-mcp_mobileAppLinks": {
     "name": "베타 앱 받기",
     "tooltip": "ComfyUI MCP 모바일 앱의 테스터용 다운로드입니다. iOS는 Apple TestFlight로, Android는 Firebase App Distribution으로 설치합니다. 두 채널 모두 베타이며, 빌드가 자주 갱신되고 이 패널과 다시 페어링해야 할 수 있습니다."

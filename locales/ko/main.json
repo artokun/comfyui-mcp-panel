@@ -832,6 +832,7 @@
       "updated_to_you_were_on_what_changed": "{version}(으)로 업데이트되었습니다 (이전 버전: {lastSeen}) — 변경 사항:",
       "using": "{tool} 사용 중…",
       "video": "동영상",
+      "video_preview_off_click_to_view": "동영상 미리보기 꺼짐 — 클릭하여 보기",
       "view_full_size": "원본 크기로 보기",
       "voice_input_error": "음성 입력 오류: {error}",
       "voice_input_is_not_supported_in_this": "이 브라우저에서는 음성 입력을 지원하지 않습니다",
