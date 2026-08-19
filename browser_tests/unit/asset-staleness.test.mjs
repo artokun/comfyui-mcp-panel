@@ -27,6 +27,8 @@ import {
   reconcileUnknownWidgetNames,
   collectAllGraphs,
   reapplyDefsToLiveNodes,
+  comboRebuildCovered,
+  authoritativeComboValues,
   emptyComboListsOnGraph,
   emptyComboNote,
   collectMissingNodeTypeReasons,
@@ -643,6 +645,227 @@ test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (fi
   assert.deepEqual(node.widgets.map((w) => w.name), ["lora_name", "strength_model"]);
 });
 
+// ── #1193 — the sweep must rebuild the shape the backend actually ships ────────
+//
+// MEASURED against a live ComfyUI 0.33 /object_info (848 types): 61 combo inputs use the
+// V1 `[[opt,...], config]` shape this file was written for, and 467 use V2
+// `["COMBO", {options:[...]}]`. V2 is the MAJORITY, not an edge case — and it was walked
+// past in silence while `completed` was still set, which granted #1193's disclosure and
+// the shared combo-trust flag over lists that had never been touched.
+
+/** V2, as ComfyUI 0.33 publishes it — confirmed against a live payload and against the
+ *  widget the frontend builds from it (`options.values` is the array under `options`). */
+const CKPT_DEF_V2 = (values) => ({
+  input: { required: { ckpt_name: ["COMBO", { multiselect: false, options: values }] } },
+});
+/** V2 whose list is a SEPARATE fetch: the frontend shows "Loading…" and `options.values`
+ *  is not an array at all. Nothing here can copy a list that has not arrived. */
+const REMOTE_DEF_V2 = {
+  input: { required: { image: ["COMBO", { image_upload: true, remote: { route: "/internal/files/output" } }] } },
+};
+/** V3 dynamic: the "options" are `{key, inputs}` objects that select SUB-INPUTS to
+ *  materialize. The live widget does present the keys as its values, which is exactly why
+ *  a naive rebuild here would look right and publish a list this file cannot honour. */
+const DYNAMIC_DEF_V3 = {
+  input: {
+    required: {
+      format: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png", inputs: {} }, { key: "exr", inputs: {} }] }],
+    },
+  },
+};
+
+test("#1193 authoritativeComboValues reads V1 and V2, and refuses to guess at the rest", () => {
+  assert.deepEqual(authoritativeComboValues([["a", "b"], {}]), ["a", "b"]);
+  assert.deepEqual(authoritativeComboValues(["COMBO", { options: ["x", "y"] }]), ["x", "y"]);
+  // Not a list this file can derive — each must be null, which is what makes the caller
+  // count it as SKIPPED instead of as "nothing to do".
+  assert.equal(authoritativeComboValues(["COMBO", { remote: { route: "/internal/files/output" } }]), null);
+  assert.equal(authoritativeComboValues(["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png" }] }]), null);
+  assert.equal(authoritativeComboValues(["INT", { default: 20 }]), null);
+  assert.equal(authoritativeComboValues("STRING"), null);
+  assert.equal(authoritativeComboValues(null), null);
+});
+
+test("#1193 END TO END: a V2 combo is rebuilt, so a deleted model is still REPORTED missing", () => {
+  // The failure this exists to stop, driven the whole way to its consequence. The user
+  // deleted anime.safetensors; the backend no longer lists it; the live widget still does
+  // because it was populated at page load. If the sweep walks past a V2 combo while the
+  // panel claims the lists were rebuilt, `assetCandidateResolvesLive` finds the file in
+  // that stale list and the missing-model candidate is SUPPRESSED — the user loses the
+  // warning. Fails on the pre-fix code at both the rebuild and the suppression.
+  const node = {
+    id: 1,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", value: "anime.safetensors", options: { values: ["anime.safetensors", "sd15.ckpt"] } }],
+    constructor: {},
+  };
+  const graph = graphOf([node]);
+  const stats = {};
+  reapplyDefsToLiveNodes(graph, { CheckpointLoaderSimple: CKPT_DEF_V2(["sd15.ckpt"]) }, stats);
+
+  assert.equal(stats.combosRebuilt, 1, "a V2 combo must be rebuilt, not walked past");
+  assert.equal(stats.combosSkipped ?? 0, 0);
+  assert.equal(comboRebuildCovered(stats), true);
+  assert.deepEqual(node.widgets[0].options.values, ["sd15.ckpt"], "the deleted file is gone from the live list");
+
+  const candidate = { nodeId: 1, name: "anime.safetensors", widgetName: "ckpt_name", isMissing: true };
+  assert.equal(
+    assetCandidateResolvesLive(graph, 1, "anime.safetensors", "ckpt_name"),
+    false,
+    "the rebuilt list must no longer offer the deleted file",
+  );
+  assert.equal(
+    isStaleAssetCandidate(graph, candidate, { trustCombo: true }),
+    false,
+    "a genuinely missing model must survive the scan — suppressing it is the one direction this must never fail in",
+  );
+});
+
+test("#1193 a combo the sweep CANNOT rebuild is counted, and withdraws the claim", () => {
+  // Remote V2 and dynamic V3: real shapes from the same live payload (1 and 120 inputs
+  // across 848 types). Neither can be rebuilt from the payload alone, so the sweep must
+  // say so rather than finish quietly — `completed` is true in both cases, and it is
+  // `combosSkipped` that keeps `comboRebuildCovered` false.
+  const remote = {
+    id: 1,
+    type: "LoadImageOutput",
+    // The frontend leaves `values` undefined until the separate fetch lands, so the LIVE
+    // widget gives no signal at all here — only the spec does. That is why the skip test
+    // asks two independent questions instead of one.
+    widgets: [{ name: "image", value: "Loading...", options: {} }],
+    constructor: {},
+  };
+  const remoteStats = {};
+  reapplyDefsToLiveNodes(graphOf([remote]), { LoadImageOutput: REMOTE_DEF_V2 }, remoteStats);
+  assert.equal(remoteStats.completed, true, "the walk did finish");
+  assert.equal(remoteStats.combosSkipped, 1, "…and it must record the combo it could not rebuild");
+  assert.equal(comboRebuildCovered(remoteStats), false, "a finished sweep that skipped a combo has NOT covered the graph");
+
+  const dynamic = {
+    id: 2,
+    type: "SaveImageAdvanced",
+    widgets: [{ name: "format", value: "png", options: { values: ["png", "exr"] } }],
+    constructor: {},
+  };
+  const dynamicStats = {};
+  reapplyDefsToLiveNodes(graphOf([dynamic]), { SaveImageAdvanced: DYNAMIC_DEF_V3 }, dynamicStats);
+  assert.equal(dynamicStats.combosSkipped, 1);
+  assert.equal(comboRebuildCovered(dynamicStats), false);
+  assert.deepEqual(dynamic.widgets[0].options.values, ["png", "exr"], "and it is left alone, not half-rebuilt");
+});
+
+test("#1193 a combo the SPEC does not announce is still caught by the live widget", () => {
+  // The forward-compatible arm of the skip test, and the only one with no example on the
+  // installs sampled for this fix — every unrebuildable shape there (remote V2, dynamic
+  // V3) says COMBO in its type string. That is exactly why it is pinned: the arm exists
+  // for the shape published AFTER this was written, and a shape nobody has seen yet cannot
+  // be relied on to name itself. Deleting it is invisible to every other test here.
+  //
+  // The failure it prevents is the silent one: a widget presenting a stale option list,
+  // walked past, and the graph then reported as covered.
+  const node = {
+    id: 1,
+    type: "SomePack.FutureLoader",
+    widgets: [{ name: "model_name", value: "deleted.safetensors", options: { values: ["deleted.safetensors"] } }],
+    constructor: {},
+  };
+  const stats = {};
+  reapplyDefsToLiveNodes(
+    graphOf([node]),
+    { "SomePack.FutureLoader": { input: { required: { model_name: ["MODEL_NAME_V4", { options_url: "/x" }] } } } },
+    stats,
+  );
+  assert.equal(stats.combosSkipped, 1, "a live widget presenting an option array is a combo, whatever the spec calls itself");
+  assert.equal(comboRebuildCovered(stats), false);
+  assert.deepEqual(node.widgets[0].options.values, ["deleted.safetensors"], "and it is left alone rather than guessed at");
+
+  // …while a genuine non-combo input is NOT a skip: an INT widget carries min/max/step and
+  // no values array, and counting it would withdraw the claim on every graph in existence.
+  const plain = {
+    id: 2,
+    type: "KSampler",
+    widgets: [{ name: "steps", value: 20, options: { min: 1, max: 100 } }],
+    constructor: {},
+  };
+  const plainStats = {};
+  reapplyDefsToLiveNodes(graphOf([plain]), { KSampler: { input: { required: { steps: ["INT", { default: 20 }] } } } }, plainStats);
+  assert.equal(plainStats.combosSkipped ?? 0, 0);
+  assert.equal(comboRebuildCovered(plainStats), true);
+});
+
+test("#1193 a function-valued option source is NOT a skip", () => {
+  // It derives its own list and `assetCandidateResolvesLive` INVOKES it, so it is never
+  // stale for want of a rebuild. Counting it would withdraw the claim on every graph that
+  // has one, which is how a safety counter turns into a permanently-off switch.
+  const node = {
+    id: 1,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", value: "a", options: { values: () => ["live.safetensors"] } }],
+    constructor: {},
+  };
+  const stats = {};
+  reapplyDefsToLiveNodes(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF_V2(["live.safetensors"]) }, stats);
+  assert.equal(stats.combosSkipped ?? 0, 0);
+  assert.equal(comboRebuildCovered(stats), true);
+  assert.equal(typeof node.widgets[0].options.values, "function", "the dynamic source is left intact");
+});
+
+test("#1193 comboRebuildCovered needs BOTH facts, and treats absence as unknown", () => {
+  assert.equal(comboRebuildCovered({ completed: true, combosSkipped: 0 }), true);
+  assert.equal(comboRebuildCovered({ completed: true }), true, "nothing skipped is the absence of the counter");
+  assert.equal(comboRebuildCovered({ completed: true, combosSkipped: 1 }), false);
+  assert.equal(comboRebuildCovered({ completed: false, combosSkipped: 0 }), false);
+  assert.equal(comboRebuildCovered({}), false);
+  assert.equal(comboRebuildCovered(null), false, "a sweep that never ran has covered nothing");
+  // Never truthy-by-accident: a stats object that reports completion some other way must
+  // not slip through.
+  assert.equal(comboRebuildCovered({ completed: "yes", combosSkipped: 0 }), false);
+});
+
+test("#1193 the sweep REPORTS what it rebuilt, and only claims completion after the whole walk", () => {
+  // The contract #1193's combo phase reads. `completed` is what licenses the panel to say
+  // the live lists are current without waiting for the frontend's own refreshComboInNodes,
+  // so it must be set by the sweep itself — never inferred from the fact that it was called.
+  const nodes = [
+    { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", value: "a", options: { values: [] } }], constructor: {} },
+    { id: 2, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", value: "a", options: { values: [] } }], constructor: {} },
+  ];
+  const stats = {};
+  reapplyDefsToLiveNodes(graphOf(nodes), { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors", "b.safetensors"]) }, stats);
+  assert.equal(stats.completed, true);
+  assert.equal(stats.nodesSwept, 2);
+  assert.equal(stats.combosRebuilt, 2, "one combo widget rebuilt per node");
+  assert.deepEqual(nodes[0].widgets[0].options.values, ["a.safetensors", "b.safetensors"]);
+
+  // A sweep that stops part way must NOT claim completion. `_nodes` is a getter that
+  // throws on the second graph, which is a failure the sweep swallows by design — the
+  // point is that swallowing it cannot look like success to the caller.
+  const good = graphOf([{ id: 3, type: "CheckpointLoaderSimple", widgets: [], constructor: {} }]);
+  const exploding = { get _nodes() { throw new Error("graph went away mid-sweep"); } };
+  const root = {
+    _nodes: [{ id: 4, type: "Sub", subgraph: exploding }, ...good._nodes],
+    getNodeById: () => null,
+  };
+  const partial = {};
+  reapplyDefsToLiveNodes(root, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }, partial);
+  assert.notEqual(partial.completed, true, "a sweep that threw part way must leave completion unclaimed");
+
+  // No stats object at all is still supported — the argument is optional and every other
+  // caller passes two arguments.
+  assert.doesNotThrow(() => reapplyDefsToLiveNodes(good, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }));
+
+  // #1193 — NO PAYLOAD is not a completed sweep. The panel's only call site sits inside
+  // `if (defs)`, so this early return is unreachable from production today; it is pinned
+  // anyway because that is a property of the CALL SITE, one refactor from changing, and
+  // the failure it would cause is the silent one: `completed` claimed over a graph the
+  // sweep never looked at. A mutation setting the flag above this return survived the
+  // gate's run for exactly that reason.
+  const noDefs = {};
+  reapplyDefsToLiveNodes(good, null, noDefs);
+  assert.notEqual(noDefs.completed, true, "a sweep with no payload has not covered anything");
+  assert.equal(comboRebuildCovered(noDefs), false);
+});
+
 test("reapplyDefsToLiveNodes stamps fresh nodeData onto a type-specific constructor", () => {
   const oldDef = { input: { required: { seed: {} } } };
   const newDef = { input: { required: { seed: {}, box_toggle_max_frames: {} } } };
@@ -896,6 +1119,37 @@ test("#984 (codex): `unchecked` is reported but is never a finding", () => {
   assert.equal(counts.erroredNodes, 0);
 });
 
+test("#1357: `unchecked` counts NODES, because that is what the pill says", () => {
+  // Since #1357 one node can contribute several entries — a widget value the
+  // server's combo has no authority over is abstained on per VALUE. The pill reads
+  // "{count} nodes could not be checked", so three nested LoadImage paths on node 4
+  // must not render as "3 nodes".
+  const counts = graphErrorsFindingCounts({
+    unchecked_nodes: [
+      { id: 4, type: "LoadImage", widget: "image", value: "a/1.png", reason: "not checked: x" },
+      { id: 4, type: "LoadImage", widget: "image2", value: "a/2.png", reason: "not checked: x" },
+      { id: 4, type: "LoadImage", widget: "image3", value: "a/3.png", reason: "not checked: x" },
+      { id: 9, type: "SomePackNode", reason: "node type not found in /object_info" },
+    ],
+  });
+  assert.equal(counts.unchecked, 2, "node 4 once, node 9 once");
+  assert.equal(counts.unavailable, 0, "an abstention is still never a finding");
+});
+
+test("#1357: an id-less unchecked entry is counted, never merged away", () => {
+  // Collapsing every `{id: undefined}` into one bucket would UNDER-report, which is
+  // the wrong direction for a count whose whole job is to say "I did not look here".
+  const counts = graphErrorsFindingCounts({
+    unchecked_nodes: [{ reason: "a" }, { reason: "b" }, { id: null, reason: "c" }],
+  });
+  assert.equal(counts.unchecked, 3);
+  // A numeric and a string id for the same node are one node, not two.
+  assert.equal(
+    graphErrorsFindingCounts({ unchecked_nodes: [{ id: 7 }, { id: "7" }] }).unchecked,
+    1,
+  );
+});
+
 test("#984: the overlap join is injective — a concatenation collision cannot swallow a finding", () => {
   // Without a field separator, (node "1", file "23") and (node "12", file "3") produce
   // the same key, and a real live-scan finding is silently deduped away as a phantom
@@ -977,8 +1231,8 @@ test("#984 source guard: graph_get_errors' own `clean` folds in the live scan", 
   const cleanExpr = /const clean =([\s\S]{0,600}?);/.exec(panelSrc)?.[1] ?? "";
   assert.ok(cleanExpr.length > 0, "the `clean` expression must still exist to be checked");
   assert.match(cleanExpr, /!liveScan\?\.unavailable\?\.length/, "`clean` must account for the live scan (#984)");
-  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount"]) {
-    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399 surfaces must survive: ${surface}`);
+  for (const surface of ["missingModels", "missingMedia", "missingNodeTypes", "missingNodeCount", "stalePlaceholders"]) {
+    assert.match(cleanExpr, new RegExp(`!${surface}`), `the #399/#1332 surfaces must survive: ${surface}`);
   }
   // The summary now derives every count from the shared helper above, which is tested
   // BEHAVIOURALLY. This only pins that the label is wired to it — codex was right that
@@ -1009,6 +1263,30 @@ test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", ()
   assert.equal(graphErrorsResultIsClean({ node_errors: { 3: { errors: [] } } }), false);
   assert.equal(graphErrorsResultIsClean({ last_execution_error: { node_id: 5 } }), false);
   assert.equal(graphErrorsResultIsClean({ errored_count: 2 }), false);
+});
+
+test("#1332 graphErrorsResultIsClean: FALSE for leftover placeholders after a class registered", () => {
+  // The type is no longer missing, but the already-placed node is still dead.
+  // Labelling that "none" is the #981 lie this issue must not re-open.
+  assert.equal(
+    graphErrorsResultIsClean({
+      stale_placeholders: [{ node_id: "12", type: "easy stylesSelector" }],
+      requires_reload: true,
+    }),
+    false,
+  );
+  assert.equal(graphErrorsResultIsClean({ requires_reload: true }), false);
+});
+
+test("#1332 graphErrorsFindingCounts: stale placeholders count as findings, not as missing types", () => {
+  const counts = graphErrorsFindingCounts({
+    missing_node_types: ["GetImageSize+"],
+    stale_placeholders: [
+      { node_id: "2", type: "easy stylesSelector" },
+      { node_id: "3", type: "easy showAnything" },
+    ],
+  });
+  assert.equal(counts.missingAssets, 3, "the still-missing type AND the two leftovers");
 });
 
 // ---- #407: a subfolder-registered model resolves against the live combo -----
@@ -1321,8 +1599,9 @@ test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's
   assert.match(code, /verdict\.empty_combo_lists = empties;/, "the verdict must carry the field");
   assert.match(
     code,
-    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored \};/,
-    "…and the refreshed:true branch must forward it (…and #1275's restored disclosure rides the same branch)",
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored, \.\.\.comboUnconfirmed \};/,
+    "…and the refreshed:true branch must forward it (#1275's restored disclosure and #1193's " +
+      "unconfirmed-combo disclosure ride the same branch)",
   );
   // The spread alone is not enough: `emptyCombos` could still be built without the list
   // itself, forwarding only the note. Pin BOTH fields of the mapping.

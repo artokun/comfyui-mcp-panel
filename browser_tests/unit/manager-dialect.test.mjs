@@ -21,6 +21,7 @@ const {
   legacyUpdateBody,
   assertBatchOk,
   classifyUpdateOutcome,
+  taskFailureReason,
 } = ManagerInstall;
 
 const UNREACHABLE = "ComfyUI-Manager not reachable (is the built-in Manager enabled?)";
@@ -609,6 +610,11 @@ function graphUpdateDeps(overrides) {
       status: QUEUE_STATUS,
     }),
     classifyUpdateOutcome,
+    // #1320 — finalizeUpdate reads the log only on a generic Manager failure.
+    // Dialect tests stub waitForUpdateResult to a success, so these stay quiet.
+    isGenericManagerUpdateError: () => false,
+    readUpdateTraceback: async () => null,
+    taskFailureReason,
     ...overrides,
   };
 }

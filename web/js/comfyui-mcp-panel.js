@@ -173,6 +173,7 @@ import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, 
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
+  comboRebuildCovered,
   reapplyDefsToLiveNodes,
   emptyComboListsOnGraph,
   emptyComboNote,
@@ -194,7 +195,11 @@ import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
-import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
+import {
+  scanComboAvailability,
+  comboAvailabilityNote,
+  uncheckedNodesNote,
+} from "./lib/live-combo-availability.js";
 import {
   collectDisabledAncestorOutputs,
   disabledOutputsInPrompt,
@@ -206,7 +211,12 @@ import {
   virtualSourceNote,
   virtualSourceTag,
 } from "./lib/virtual-source-promotion.js";
-import { findStalePlaceholders, stalePlaceholderNote } from "./lib/stale-placeholders.js";
+import {
+  findStalePlaceholders,
+  stalePlaceholderNote,
+  anyRecordedTypeUnregistered,
+  adjudicateRecordedMissingNodeTypes,
+} from "./lib/stale-placeholders.js";
 import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
@@ -224,6 +234,7 @@ import {
   verifyExternalLinks,
 } from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
+import { isGenericManagerUpdateError, readUpdateTraceback } from "./lib/manager-update-traceback.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
@@ -283,10 +294,17 @@ import {
   resolveRunToNodeTarget,
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
+import {
+  bindAutoLayoutGraph,
+  rememberAutoLayoutScope,
+  clearAutoLayoutScope,
+  layoutScopeFingerprint,
+} from "./lib/auto-layout-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
+  inputAssetProbeVerdict,
   inputPathsUseWindowsSeparators,
 } from "./lib/input-asset.js";
 import {
@@ -419,7 +437,7 @@ import {
 } from "./lib/disconnect-verify.js";
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
-import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
+import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
@@ -958,10 +976,8 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * A run therefore carries a DEADLINE, and each bounded phase gets what is left of it
  * rather than a private allowance. Two serialized runs then cost 2 x this, and that is the
  * number sized against the read default — 18,000ms against 20,000ms — because that product
- * is what the user actually waits through. ONE exception, added for #1193: the combo phase
- * has a FLOOR under its remainder (NODE_DEFS_COMBO_FLOOR_MS), so a run whose fetch spent
- * the combo's share can exceed this budget by up to that floor. The floor pays out only
- * when the fetch was slow but healthy — the case a pure remainder got wrong.
+ * is what the user actually waits through, and #1193 kept it that way rather than buying
+ * the combo phase a floor on top of it — see the note there.
  *
  * WHAT THE DEADLINE DOES NOT COVER, said plainly so this is not read as a total. Two calls
  * run INSIDE the window without drawing from it: `registerNodesFromDefs` and
@@ -997,18 +1013,25 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * COMPLETELY HEALTHY machine, reporting `combo_refresh_failed` on every refresh. That was
  * measured, not reasoned about — the unit suite passed either way.
  *
- * Second, the margin that remains is thinner than this number suggests — and that case,
- * #1193, is now handled rather than merely recorded. The fetch may use its full 6000 ms
- * share and still succeed, which leaves a pure remainder of 3000 ms against the measured
- * 4846 ms need and abandoned a HEALTHY combo phase: `combo_refresh_failed` on a refresh
- * that would have completed, `nodeDefsRefreshConfirmed` stuck false (which is what reopens
- * #610's false "model still missing"), and the loader combo the refresh was FOR still
- * refusing the new value on the next panel_set_widget. The combo phase therefore has a
- * FLOOR — see NODE_DEFS_COMBO_FLOOR_MS — and a run may exceed this budget by up to that
- * floor. The alternative #1193 weighed, not waiting for the combo phase at all, was
- * rejected: it fixes only the verdict's wording while leaving every symptom in place for
- * the seconds the refresh actually takes — the combos are still stale when the reply
- * lands, and the write that prompted the refresh is still refused.
+ * Second, the margin that remains is thinner than this number suggests. The fetch may use
+ * its full 6000 ms share and still succeed, which would leave the combo phase 3000 ms
+ * against a measured 4846 ms need. That case is #1193 — and it is NOT fixed by giving the
+ * combo phase a bigger number, for a reason that had to be measured to be seen:
+ *
+ *     unthrottled, 848 types    getNodeDefs 211 ms   refreshComboInNodes  555 ms
+ *     +3000 ms per /object_info getNodeDefs 3156 ms  refreshComboInNodes 3318 ms
+ *
+ * `refreshComboInNodes()` RE-FETCHES /object_info, so its cost tracks the backend's
+ * latency. The only case a starved remainder occurs in is a fetch slow enough to spend its
+ * share — which is the same backend, so the combo phase then needs roughly that latency
+ * AGAIN plus its local work. A floor sized from the warm 4846 ms figure would not have
+ * covered the case it was written for, and one sized to cover it would break the property
+ * this budget exists for (two serialized runs inside the bridge's 20 s read default).
+ *
+ * So the budget is unchanged and the COMBO PHASE'S VERDICT moved instead: since #1172 the
+ * reapply sweep rebuilds every live combo's option list from the payload this run already
+ * fetched, so an abandoned frontend call is a missing confirmation rather than stale
+ * dropdowns. See the combo phase below.
  */
 const NODE_DEFS_RUN_BUDGET_MS = 9000;
 /**
@@ -1019,28 +1042,6 @@ const NODE_DEFS_RUN_BUDGET_MS = 9000;
  * A share, not a second constant, so the two cannot be changed into disagreement.
  */
 const NODE_DEFS_FETCH_SHARE = 2 / 3;
-
-/**
- * #1193 — a FLOOR under the combo phase's allowance, not a share of the run.
- *
- * The combo phase draws what the fetch left of the run deadline, and the fetch may spend
- * its whole share and still succeed — leaving 3000 ms for a phase measured at 4846 ms
- * (the table above). A pure remainder abandons a HEALTHY `refreshComboInNodes()` in
- * exactly the conditions this budget was written for — a congested or remote backend —
- * reporting `combo_refresh_failed` over a refresh that would have completed, while the
- * abandoned call keeps running and mutates the graph AFTER the verdict declared it stale.
- *
- * SIZED FROM THE MEASUREMENT, not picked: 4846 ms on a 4320-type install, so 6000 ms is
- * the measured cost plus a quarter.
- *
- * THE COST, stated rather than left to be discovered in review: a run can now exceed
- * NODE_DEFS_RUN_BUDGET_MS by up to this floor. One run's worst-case bounded waiting was
- * 9000 ms and becomes 15,000 ms; two serialized runs — a forced refresh behind an
- * in-flight one — were 18,000 ms against the bridge's 20s read default and become
- * 30,000 ms, over it, in exactly the case the floor exists for. #1192 already tracks that
- * path's arithmetic; its ratchet test in browser_tests carries the new number.
- */
-const NODE_DEFS_COMBO_FLOOR_MS = 6000;
 //
 // #954's SCHEDULE, UNFORKED. An earlier pass here cut it to a single 200ms delay, reasoning
 // that a bound which does not cancel lets three abandoned attempts download the whole
@@ -1245,10 +1246,13 @@ const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
 async function registerComfyNodeDefs(preloadedDefs) {
-  // Trust the live combos for suppressing missing-asset candidates ONLY once the
-  // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
-  // this ComfyUI build (or throws), the combos are still whatever page-load left them
-  // — possibly stale — so we must stay in over-report-safe mode (finding #4).
+  // Trust the live combos for suppressing missing-asset candidates ONLY once they have
+  // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
+  // do that and the trust flag accepts either (#1193): `refreshComboInNodes()` answering,
+  // or this run's OWN reapply sweep finishing with nothing skipped. If refreshComboInNodes
+  // is absent or throws AND the sweep did not cover the graph, the combos are still
+  // whatever page-load left them — possibly stale — so we must stay in over-report-safe
+  // mode (finding #4).
   //
   // #635: the run's outcome is a VERDICT (lib/node-def-refresh.js), not a bare
   // boolean — {refreshed:false} alone was indistinguishable from a no-op, so the
@@ -1263,6 +1267,20 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // Whether the combo phase FAILED, tracked apart from the value it failed with — see the
   // note at the assignment. A falsy rejection is still a failure.
   let comboFailed = false;
+  // #1193 — what the panel's OWN reapply sweep did, filled in by the sweep itself rather
+  // than assumed from the fact that it was called. `completed` is set only after every
+  // graph was walked to the end, so a sweep that threw half way cannot authorise the
+  // disclosure below. Kept separate from `comboRan`: one is the frontend's call
+  // answering, the other is work this panel performed and counted.
+  const comboRebuild = { nodesSwept: 0, combosRebuilt: 0, combosSkipped: 0, completed: false };
+  // #1193 — the bound the combo phase was actually given, so a refusal can name it. Null
+  // until the phase arms one, which is itself the distinction between "never reached the
+  // combo phase" and "reached it and was given N ms".
+  let comboWaitMs = null;
+  // #1193 — the frontend's combo call was ABANDONED at its bound while this run's own
+  // sweep had already rebuilt the lists. Narrower than `comboRebuild.completed`, and
+  // deliberately so: see the note where it is set.
+  let comboAbandonedAfterRebuild = false;
   let phase = "fetch";
   // #1180 — ONE deadline for this whole run. Every bounded phase below draws from what is
   // left of it, so the run's cost is this budget rather than the sum of numbers that each
@@ -1511,7 +1529,9 @@ async function registerComfyNodeDefs(preloadedDefs) {
     phase = "reapply";
     if (defs) {
       const rootGraph = a.graph ?? a.canvas?.graph;
-      if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
+      // #1193 — the third argument records what this sweep OBSERVABLY did (#1172 made it
+      // rebuild every combo's option list from `defs`). The combo phase below reads it.
+      if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs, comboRebuild);
     }
     // Hand back the time the unbounded local work took. After this, what remains of the
     // deadline is what remains of the WAITING allowance, which is what the phase below
@@ -1547,25 +1567,63 @@ async function registerComfyNodeDefs(preloadedDefs) {
       //
       // Accepted, because the alternative is the reported bug. The mutation it eventually
       // performs is the CORRECT one — fresher defs than the verdict claimed — so the run's
-      // report is pessimistic rather than wrong, and `nodeDefsRefreshConfirmed` staying
-      // false keeps the caller in over-report-safe mode either way. The unbounded version
-      // did the same mutation at the same moment; the only thing the bound changes is that
-      // the panel stops waiting for it.
+      // report is pessimistic rather than wrong. The unbounded version did the same
+      // mutation at the same moment; the only thing the bound changes is that the panel
+      // stops waiting for it. (What an abandoned call means for the SHARED trust flag is
+      // no longer "always false": see the #1193 note below and at the assignment.)
+      //
+      // #1193 — the bound is READ INTO A VARIABLE rather than computed inline, because the
+      // refusal has to be able to say how much time this phase was actually given. Without
+      // it, "did not answer in time" is the same sentence for a phase starved down to
+      // 3000ms by a slow fetch and for one handed the whole budget that hung anyway, and
+      // those two have different causes and different remedies.
+      comboWaitMs = nodeDefsBudgetLeft(runDeadline);
       const comboSettled = await withTimeout(
         Promise.resolve()
           .then(() => a.refreshComboInNodes())
           .then(() => COMBO_OK, (err) => ({ err })),
-        // #1193 — the fetch's remainder, with a FLOOR under it. A fetch that spent its
-        // whole share and still succeeded leaves 3000ms for a phase measured at 4846ms,
-        // and a pure remainder abandoned that HEALTHY call: combo_refresh_failed over a
-        // refresh that would have completed, with the abandoned call mutating the graph
-        // anyway after the verdict declared it stale. The run may exceed its budget by
-        // up to the floor; that trade is recorded at NODE_DEFS_COMBO_FLOOR_MS.
-        Math.max(nodeDefsBudgetLeft(runDeadline), NODE_DEFS_COMBO_FLOOR_MS),
+        comboWaitMs,
         () => COMBO_NO_ANSWER,
       );
       comboRan = comboSettled === COMBO_OK;
-      if (!comboRan) {
+      // #1193 — ABANDONED IS NOT FAILED, when this panel already did the work itself.
+      //
+      // `refreshComboInNodes()` is largely a REPEAT of the phases above: it issues its own
+      // /object_info and re-registers every def, which `registerNodesFromDefs` did moments
+      // earlier. What the panel needs from it — every live combo widget's `options.values`
+      // rebuilt from the authoritative payload — the reapply sweep above already performed
+      // from `defs`, and counted (#1172).
+      //
+      // MEASURED, which is why this is a design change and not a bigger constant: the combo
+      // phase's cost tracks the BACKEND's latency, because it re-fetches. On a live rig
+      // (848 types) it is 555ms with the fetch at 211ms; delay every /object_info by 3000ms
+      // and it becomes 3318ms — it pays the latency a second time. So in the only case a
+      // starved remainder occurs — a fetch slow enough to spend its share — the phase needs
+      // ROUGHLY THE FETCH'S OWN COST AGAIN plus its local work, and no floor sized from a
+      // warm measurement (#1193 measured 4846ms on a 4320-type install) covers it. Growing
+      // the budget to cover it would also break the property it is sized on: two serialized
+      // runs must fit the bridge's 20s read default.
+      //
+      // So this run stops waiting and says so, rather than reporting stale dropdowns it has
+      // already rebuilt. A THROW still fails: that is the frontend reporting something
+      // wrong, which is evidence, where a timeout is only the absence of an answer.
+      const comboAbandoned = comboSettled === COMBO_NO_ANSWER;
+      if (comboAbandoned && comboRebuildCovered(comboRebuild)) {
+        // The ONE state this disclosure covers, recorded as its own flag rather than
+        // re-derived downstream from the sweep's stats. The combo phase reifies its
+        // outcome instead of throwing, so `didThrow` is FALSE even when the frontend call
+        // REJECTED — a trust gate reading the sweep's flag directly would therefore credit
+        // a rejected refresh too, which is a broader guard than this fix argues for. (Not
+        // hypothetical: it is what the first version of this change did, and the "a combo
+        // refresh that THREW is still a failure" test below is what caught it.)
+        comboAbandonedAfterRebuild = true;
+        console.warn(
+          `[comfyui-mcp-panel] refreshComboInNodes() had not answered within ${comboWaitMs}ms; ` +
+            `not waiting further — this run's own sweep rebuilt ${comboRebuild.combosRebuilt} combo ` +
+            `option list(s) across ${comboRebuild.nodesSwept} node(s) from the payload it fetched, ` +
+            "skipping none.",
+        );
+      } else if (!comboRan) {
         // A SEPARATE FLAG, for the third time on this path and the same reason each time:
         // `throw null` and `throw undefined` are failures a backend can really produce, so
         // a falsy `thrown` cannot mean "nothing failed". Reading the phase guard below off
@@ -1576,10 +1634,13 @@ async function registerComfyNodeDefs(preloadedDefs) {
         comboFailed = true;
         // `thrown` is provably null here: a throw inside this try would have jumped to the
         // catch. The `?? ` that used to guard this assignment could never fire.
-        thrown =
-          comboSettled === COMBO_NO_ANSWER
-            ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget or its floor")
-            : comboSettled.err;
+        thrown = comboAbandoned
+          ? new Error(
+              `refreshComboInNodes() did not answer within the ${comboWaitMs}ms this refresh had ` +
+                `left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget, and this run's own combo rebuild ` +
+                "did not complete either, so the dropdown lists are NOT known to be current",
+            )
+          : comboSettled.err;
         // WARN HERE, because reifying the outcome took this failure off the throwing path
         // and the catch below is the only place that logged one. The browser console was
         // the sole record of a failed combo refresh for anyone not reading a tool reply,
@@ -1606,10 +1667,28 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // lists were refreshed from it. refreshComboInNodes resolving alone is not proof —
     // without a fetched `defs`, combos may still be the stale page-load snapshot, and
     // trusting them could suppress a genuine miss (finding #4 / codex #2). Failing to
-    // the FALSE side keeps us in over-report-safe mode. The shared global keeps the
-    // pre-#635 semantics exactly: true only when this run completed with an
-    // authoritative payload AND a completed combo refresh.
-    nodeDefsRefreshConfirmed = !didThrow && !!defs && comboRan;
+    // the FALSE side keeps us in over-report-safe mode.
+    //
+    // #1193 — WHAT MAKES THE LIVE COMBOS TRUSTWORTHY IS THE REBUILD, NOT WHICH CODE RAN
+    // IT. Since #1172 the reapply sweep above rewrites every live combo's `options.values`
+    // from THIS run's authoritative `defs`, and returns a count of what it touched — work
+    // the panel performs and observes, where `refreshComboInNodes()` resolving is a call
+    // answering whose per-node effect the panel never sees. So a completed local rebuild
+    // satisfies the same predicate this flag has always stood for: an authoritative
+    // payload was obtained AND the lists were rebuilt from it.
+    //
+    // WHAT "REBUILT" REQUIRES, and the first version of this got it wrong: not that the
+    // sweep RAN, but that it covered the graph. `comboRebuildCovered` demands both that it
+    // finished (`completed`, its last statement, so a sweep that threw part way cannot
+    // claim it) and that it skipped NOTHING (`combosSkipped === 0`). Reading `completed`
+    // alone granted this flag over combo lists the sweep had walked past without touching
+    // — a V2 `["COMBO", {options}]` spec, which on ComfyUI 0.33 is 467 of 529 combo inputs
+    // — and a missing model whose loader combo was never rebuilt would then have been
+    // SUPPRESSED as stale. That is the one direction this flag must never fail in.
+    //
+    // The two inputs are kept apart rather than merged into one boolean: the verdict words
+    // them differently, and a caller must be able to see which one held.
+    nodeDefsRefreshConfirmed = !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -1617,7 +1696,20 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  const verdict = describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, didThrow, thrown });
+  const verdict = describeNodeDefRefresh({
+    appAvailable,
+    defsObtained: !!defs,
+    defsRegistered,
+    comboApiPresent,
+    comboRan,
+    // #1193 — the panel's own sweep, reported separately from the frontend's call so the
+    // verdict can say which one made the dropdowns current.
+    comboRebuiltLocally: comboAbandonedAfterRebuild,
+    comboWaitMs,
+    phase,
+    didThrow,
+    thrown,
+  });
   // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
   //
   // The snapshot above was taken immediately before the register phase, so this
@@ -1737,9 +1829,8 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // path. Disclosure, not failure.
     //
     // Read from `defs`, which is already in hand, and NOT by re-reading widgets after
-    // `app.refreshComboInNodes()` resolves: the combo phase is bounded and can still be
-    // abandoned past its floor (#1193), and a disclosure that depended on it would report
-    // nothing in that case.
+    // `app.refreshComboInNodes()` resolves: #1193 stopped waiting on that call past its
+    // bound, and a disclosure that depended on it would report nothing when it is abandoned.
     const empties = emptyComboListsOnGraph(getGraphCtx().rootGraph, defs);
     if (empties.length) {
       verdict.empty_combo_lists = empties;
@@ -7437,6 +7528,19 @@ function getGraphCtx() {
   if (!graph) {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
+  // #1328 — remember a live subgraph identity here so an auto-layout APPLY that
+  // later sees a canvas escaped to root can still resolve the graph enter_subgraph
+  // put the user in. Root observations do NOT clear this: escape looks like root.
+  // Capture is a SIDE-EFFECT of a proven subgraph scope: a helper miss must not
+  // refuse the graph the user is looking at. bindAutoLayoutGraph still sees the
+  // live subgraph on apply if remember does not land.
+  if (scope.scope === "subgraph") {
+    try {
+      rememberAutoLayoutScope(layoutScopeFingerprint(graph, app.graph));
+    } catch {
+      // Viewing scope is already proven; do not turn a capture miss into a refusal.
+    }
+  }
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
 
@@ -9218,25 +9322,46 @@ async function filterServerConfirmedInputSubfolderMedia(
   if (!(probeBudget > 0)) return media;
   return filterServerConfirmedInputSubfolderCandidates(
     media,
-    async (assetValue, ref) => {
-      try {
-        if (typeof api?.fetchApi !== "function") return false;
-        const { subfolder, filename, type } = ref ?? {};
-        if (!filename || !type) return false;
-        const qs = new URLSearchParams({ filename, subfolder, type }).toString();
-        const res = await api.fetchApi(`/view?${qs}`, {
-          method: "GET",
-          cache: "no-store",
-          headers: { Range: "bytes=0-0" },
-          signal: AbortSignal.timeout(probeBudget),
-        });
-        return !!res && (res.ok || res.status === 206);
-      } catch {
-        return false;
-      }
-    },
+    async (assetValue, ref) => (await probeInputAssetPresence(ref, probeBudget)) === true,
     { backslashIsSeparator },
   );
+}
+
+/**
+ * TRI-STATE `/view` existence probe for a parsed `{filename, subfolder, type}` ref:
+ *
+ *   true  — the server served the file: it is there.
+ *   false — the server ANSWERED and said it is not there (404).
+ *   null  — could not be determined (no api client, malformed ref, timeout,
+ *           network failure, or any other status).
+ *
+ * The third state is the whole point (#1357). Callers that only ever over-report
+ * (the missing-media filter above) collapse `false` and `null` into "keep the
+ * candidate", which is safe there because a STORE already asserted the miss. The
+ * live combo scan has no such prior assertion — its only other evidence is a combo
+ * list that structurally cannot contain the value — so treating a flaky fetch as a
+ * confirmed miss would manufacture the exact false positive that issue reports.
+ */
+async function probeInputAssetPresence(ref, timeoutMs) {
+  try {
+    if (typeof api?.fetchApi !== "function") return null;
+    const { subfolder, filename, type } = ref ?? {};
+    if (!filename || !type) return null;
+    if (!(timeoutMs > 0)) return null;
+    const qs = new URLSearchParams({ filename, subfolder: subfolder ?? "", type }).toString();
+    const res = await api.fetchApi(`/view?${qs}`, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    // ComfyUI's /view 404s a path it resolved but did not find. Every OTHER
+    // status (400 traversal refusal, 403, 5xx, a proxy's error page) means the
+    // question was not answered, NOT that the file is absent.
+    return inputAssetProbeVerdict(res);
+  } catch {
+    return null;
+  }
 }
 
 /** True when EITHER missing-asset store holds a RAW candidate (isMissing !== false),
@@ -9262,6 +9387,27 @@ function hasRawMissingAssetCandidates() {
   } catch {
     /* optional */
   }
+  // #1332 — the load-time missing-node-type store is the same kind of snapshot as
+  // the model/media stores: after a ComfyUI restart that registered the class, it
+  // still names it. A forced /object_info refresh is how this page learns the new
+  // registry; without it get_errors would adjudicate against the PRE-restart
+  // LiteGraph and keep reporting a type panel_add_node can already construct.
+  // Only when a recorded type is still absent from the CLIENT registry — a
+  // genuine miss, or a restart whose refresh has not landed yet. Types already
+  // in LiteGraph are dropped at report time without another fetch.
+  try {
+    const recorded = collectMissingAssets(false).nodeTypes;
+    if (
+      anyRecordedTypeUnregistered(
+        recorded,
+        (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
+      )
+    ) {
+      return true;
+    }
+  } catch {
+    /* store / registry unreadable → do not spend the 14s refresh on a guess */
+  }
   return false;
 }
 
@@ -9279,7 +9425,9 @@ function hasRawMissingAssetCandidates() {
 // call.
 // Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs' verdict
 // is refreshed:true only when it authoritatively fetched /object_info, registered
-// the defs, AND refreshed combos), or FALSE if the refresh errored or the timeout
+// the defs, AND the live combo lists were rebuilt from that payload — by
+// refreshComboInNodes answering, or by this run's own sweep covering the graph, #1193),
+// or FALSE if the refresh errored or the timeout
 // wins first. get_errors
 // trusts the combo on this returned value — NOT the shared nodeDefsRefreshConfirmed
 // global, which a concurrent refresh can overwrite mid-await against a stale combo
@@ -9343,7 +9491,32 @@ async function validationBanner() {
   ) {
     return "";
   }
-  missing.any = !!(missing.models.length || missing.media.length || missing.nodeTypes.length || missing.nodeCount);
+  // #1332 — same re-evaluation as graph_get_errors, so the turn-start banner
+  // cannot keep saying "node types not installed" after a restart that registered
+  // them. Placeholders of those types stay a warning (they still fail at queue
+  // time) rather than being dropped as if the canvas were clean.
+  let bannerStalePlaceholders = [];
+  try {
+    const { rootGraph: bannerRoot } = getGraphCtx();
+    const allNodes = collectAllGraphs(bannerRoot).flatMap((g) => g?._nodes ?? []);
+    const adjudicated = adjudicateRecordedMissingNodeTypes(
+      missing.nodeTypes,
+      allNodes,
+      (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
+    );
+    missing.nodeTypes = adjudicated.stillMissing;
+    bannerStalePlaceholders = adjudicated.stalePlaceholders;
+    if (!missing.nodeTypes.length) missing.nodeCount = 0;
+  } catch {
+    bannerStalePlaceholders = [];
+  }
+  missing.any = !!(
+    missing.models.length ||
+    missing.media.length ||
+    missing.nodeTypes.length ||
+    missing.nodeCount ||
+    bannerStalePlaceholders.length
+  );
   // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
   // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
   // asset the banner still calls missing, OR a since-deleted asset a prior-confirmed
@@ -9384,6 +9557,7 @@ async function validationBanner() {
         missing.media.map((x) => `${x.node_id}:${x.file}`),
         missing.nodeTypes,
         missing.nodeCount,
+        bannerStalePlaceholders.map((s) => `${s.node_id}:${s.type}`),
       ],
     });
   } catch {
@@ -9448,6 +9622,14 @@ async function validationBanner() {
       lines.push(`node types not installed: ${missing.nodeTypes.slice(0, 12).map((t) => coerceMessageText(t)).join(", ")}`);
     } else if (missing.nodeCount) {
       lines.push(`${missing.nodeCount} node type(s) not installed on this ComfyUI`);
+    }
+    if (bannerStalePlaceholders.length) {
+      const types = [...new Set(bannerStalePlaceholders.map((s) => coerceMessageText(s.type)).filter(Boolean))];
+      lines.push(
+        `${bannerStalePlaceholders.length} node(s) still PLACEHOLDERS after their class registered ` +
+          `(${types.slice(0, 6).join(", ")}): SAVE then reopen the saved workflow — registering a class ` +
+          `does not rehydrate nodes created while it was unknown (#1332/#981)`,
+      );
     }
     out +=
       `⚠️ MISSING ASSETS — the user's canvas has RED nodes RIGHT NOW because the workflow ` +
@@ -10429,8 +10611,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // completed download already triggers automatically. GLOBAL (not tied to the active
   // graph, so it carries no workflow_path and skips the pinned-target guard),
   // undo-neutral, idempotent. Resolves to the refresh's OWN freshness verdict —
-  // refreshed:true only when it authoritatively fetched /object_info AND refreshed
-  // combos — so the tool reply reflects a real fetch, not just a no-op.
+  // refreshed:true only when it authoritatively fetched /object_info AND the live combo
+  // lists were rebuilt from it (by refreshComboInNodes, or by the run's own sweep with
+  // nothing skipped — #1193 discloses which) — so the tool reply reflects a real fetch,
+  // not just a no-op.
   // #635: a non-fresh verdict now says WHY (reason) and what to do about it
   // (remedy) — a bare {ok:true, refreshed:false} was indistinguishable from a
   // no-op and left the caller guessing whether the call did anything.
@@ -10472,7 +10656,21 @@ const GRAPH_TOOL_EXECUTORS = {
           restored_nodes_note: verdict.restored_nodes_note,
         }
       : {};
-    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos, ...restored };
+    // #1193 — the FOURTH field to have to be forwarded through this same whitelist, and
+    // the reason the note above exists: the success branch below is a fixed object
+    // literal, so a disclosure the verdict carries and this does not name is dropped on
+    // exactly the path it is about. This one says the frontend's refreshComboInNodes()
+    // was still running when the run stopped waiting — the dropdowns were rebuilt by the
+    // panel's own sweep, so `refreshed` is true, but that call's completion is not
+    // confirmed and the caller is entitled to know which of the two made them current.
+    const comboUnconfirmed =
+      verdict != null && typeof verdict === "object" && verdict.combo_refresh_confirmed === false
+        ? {
+            combo_refresh_confirmed: false,
+            combo_refresh_note: verdict.combo_refresh_note,
+          }
+        : {};
+    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos, ...restored, ...comboUnconfirmed };
     return {
       ok: true,
       refreshed: false,
@@ -14058,7 +14256,10 @@ const GRAPH_TOOL_EXECUTORS = {
     groups = "preserve",
     dry_run = false,
   } = {}) {
-    const { graph } = getGraphCtx();
+    const ctx = getGraphCtx();
+    // #1328 — resolve against the captured viewing-scope identity, not a canvas
+    // that the mutation dispatch/preflight may have walked back to root.
+    const { graph, viewing } = bindAutoLayoutGraph(ctx, { apply: !dry_run });
     // #429: resync live rects before deriving group membership for clustering, so a
     // non-panel move can't cluster the wrong nodes (or drop members) during layout.
     syncGraphNodeAreas(graph);
@@ -14205,6 +14406,7 @@ const GRAPH_TOOL_EXECUTORS = {
         node_count: moved.length,
         columns: layout.columns,
         moved,
+        viewing,
         ...(groupResults.length ? { groups: groupResults } : {}),
         ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
       };
@@ -14240,6 +14442,7 @@ const GRAPH_TOOL_EXECUTORS = {
       node_count: moved.length,
       columns: layout.columns,
       moved,
+      viewing,
       ...(groupResults.length ? { groups: groupResults } : {}),
       ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
     };
@@ -15140,12 +15343,40 @@ const GRAPH_TOOL_EXECUTORS = {
     // worse than the omission this closes.
     let liveScan = null;
     try {
+      // #1357 — the scan's combo lists cannot enumerate an input file below the
+      // input root (LoadImage.INPUT_TYPES is `os.listdir` + `isfile`, top level
+      // only, nodes.py) nor an `[output]`/`[temp]`/`[input]`-annotated value, so
+      // for those it asks the server directly rather than calling a present file
+      // missing. The same /view EVIDENCE panel_set_widget accepts the very same
+      // value on (#387) — the two must not confirm and deny one value in one
+      // session. NOT byte-for-byte the same probe, and it diverges BOTH ways:
+      //   - `sub\a.png` on a POSIX server — set_widget normalises the backslash
+      //     and would clear it; this declines to split, so the value stays
+      //     reported. STRICTER.
+      //   - `x.png [output]` — set_widget always asks the `input` root and would
+      //     404; this parses the annotation and asks `output`, which is the root
+      //     `folder_paths.get_annotated_filepath` actually resolves. LOOSER, and
+      //     correct — that is the #743 false positive.
+      // An unknown platform keeps POSIX semantics, so a backslash is never
+      // re-read as a separator the server would not honour (#513). Read
+      // BEFORE the scan's own budget is taken, so a slow /system_stats shortens
+      // the scan rather than letting it start with a full step it no longer has
+      // (it is cached for the session, and the media probe above normally warms
+      // it, so this is free in the common case).
+      const statsBudget = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
+      const backslashIsSeparator =
+        statsBudget > 0 ? await inputAssetServerUsesWindowsPaths(statsBudget) : false;
       const scanBudgetMs = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
       if (scanBudgetMs > 0) {
         liveScan = await scanComboAvailability(
           nodes,
           (cls) => fetchSingleNodeDef(cls, (route) => api?.fetchApi?.(route)),
-          { budgetMs: scanBudgetMs },
+          {
+            budgetMs: scanBudgetMs,
+            backslashIsSeparator,
+            confirmServerAsset: (_value, ref) =>
+              probeInputAssetPresence(ref, errorsStepBudget(GET_ERRORS_STEP_CAP_MS)),
+          },
         );
       }
     } catch {
@@ -15171,6 +15402,27 @@ const GRAPH_TOOL_EXECUTORS = {
           "with the server, so this read's graph snapshot and asset verdicts now belong to " +
           "DIFFERENT workflows. Retry panel_get_errors — it re-reads the now-active workflow.",
       );
+    }
+    // #1332 — the missing-node-type store is a LOAD-TIME snapshot. After a
+    // ComfyUI restart that registered the class (a fresh panel_add_node of that
+    // type succeeds), it still names it. Re-evaluate against this page's client
+    // registry so a now-constructable type is not reported as missing. Leftover
+    // placeholders of those types stay a finding — they are not missing, they
+    // need a save+reopen (#981). The store is not cleared.
+    let stalePlaceholders = [];
+    try {
+      const allNodes = collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []);
+      const adjudicated = adjudicateRecordedMissingNodeTypes(
+        assets.nodeTypes,
+        allNodes,
+        (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
+      );
+      assets.nodeTypes = adjudicated.stillMissing;
+      stalePlaceholders = adjudicated.stalePlaceholders;
+      if (!assets.nodeTypes.length) assets.nodeCount = 0;
+    } catch {
+      /* unreadable registry → keep the load-time list (fail closed) */
+      stalePlaceholders = [];
     }
     assets.any = !!(assets.models.length || assets.media.length || assets.nodeTypes.length || assets.nodeCount);
     const missingModels = assets.models.map((m) => ({ ...m, kind: "missing_model" }));
@@ -15209,6 +15461,13 @@ const GRAPH_TOOL_EXECUTORS = {
     //    identical to how a subgraph-hosted missing model behaves here.
     for (const { nodeId, type } of collectMissingNodeTypeReasons(nodes, missingNodeTypes)) {
       addReason(nodeId, { kind: "missing_node_type", type });
+    }
+    // Placeholders of a NOW-registered type on the currently viewed graph. Types
+    // nested in an un-entered subgraph stay on the top-level stale_placeholders
+    // list (same scope split as missing_node_types above).
+    for (const s of stalePlaceholders) {
+      if (s?.node_id == null || !byId.has(String(s.node_id))) continue;
+      addReason(s.node_id, { kind: "stale_placeholder", type: s.type });
     }
 
     // 3) Per-node VALIDATION errors from the last queue attempt. `app.lastNodeErrors`
@@ -15324,6 +15583,7 @@ const GRAPH_TOOL_EXECUTORS = {
       !missingMedia.length &&
       !missingNodeTypes.length &&
       !missingNodeCount &&
+      !stalePlaceholders.length &&
       !liveScan?.unavailable?.length;
     return {
       viewing: describeActiveGraph(graph),
@@ -15380,14 +15640,29 @@ const GRAPH_TOOL_EXECUTORS = {
             unavailable_widget_values_note: comboAvailabilityNote(liveScan.unavailable),
           }
         : {}),
-      ...(liveScan?.unknown?.length ? { unchecked_nodes: liveScan.unknown } : {}),
+      ...(liveScan?.unknown?.length
+        ? {
+            unchecked_nodes: liveScan.unknown,
+            unchecked_nodes_note: uncheckedNodesNote(liveScan.unknown),
+          }
+        : {}),
       ...(liveScan?.unchecked_budget_exhausted ? { unchecked_budget_exhausted: true } : {}),
       ...(liveScan?.unchecked_class_limit ? { unchecked_class_limit: liveScan.unchecked_class_limit } : {}),
+      ...(liveScan?.unchecked_asset_probe_limit
+        ? { unchecked_asset_probe_limit: liveScan.unchecked_asset_probe_limit }
+        : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
       ...(missingNodeCount && !missingNodeTypes.length
         ? { missing_node_count: missingNodeCount }
+        : {}),
+      ...(stalePlaceholders.length
+        ? {
+            requires_reload: true,
+            stale_placeholders: stalePlaceholders.slice(0, MAX_STATE_NODES),
+            stale_placeholders_note: stalePlaceholderNote(stalePlaceholders),
+          }
         : {}),
       // --- backwards-compatible payloads (existing consumers read these) ---
       // Bounded at emission (#664): verbatim, this carried tensor-sized
@@ -19233,6 +19508,11 @@ const GRAPH_TOOL_EXECUTORS = {
           `subgraph, retry, or leave it on the ComfyUI canvas (its breadcrumb, or double-click out).`,
       );
     }
+    // #1328 — an explicit exit is the one root observation that MAY drop the
+    // captured subgraph identity. Escape (canvas jumped to root without this
+    // call) must keep it so auto-layout apply can still find the subgraph.
+    if (parentGraph === rootGraph) clearAutoLayoutScope();
+    else rememberAutoLayoutScope(layoutScopeFingerprint(parentGraph, rootGraph));
     let viewing = null;
     try {
       viewing = describeActiveGraph(getGraphCtx().graph);
@@ -19735,7 +20015,16 @@ const GRAPH_TOOL_EXECUTORS = {
         };
       }
       const { item, status } = await waitForUpdateResult(ui_id);
-      const outcome = classifyUpdateOutcome({ item, status, target: id, dialect });
+      // #1320 — Manager's do_update records only "An error occurred while
+      // updating 'X'." and prints the real traceback to the server log. When
+      // the stored reason is that generic sentence, fetch the log and attach
+      // the traceback so the tool result is the evidence, not a pointer to it.
+      let traceback;
+      const failReason = taskFailureReason(item);
+      if (isGenericManagerUpdateError(failReason)) {
+        traceback = await readUpdateTraceback(id, api);
+      }
+      const outcome = classifyUpdateOutcome({ item, status, target: id, dialect, traceback });
       if (outcome.state === "failed") throw new Error(outcome.message);
       if (outcome.state === "updated") {
         return {
@@ -22297,13 +22586,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         disclosedEpoch: canvasToolDisclosedEpoch,
       });
       const disclosed = disclosure.disclose && typeof text === "string";
-      const outText = disclosed ? CANVAS_TOOL_DISCLOSURE + text : text;
+      // #1310 — the disclosure is agent-directed. It rides in `context` so the
+      // orchestrator still prepends it for the model, but user_message.text stays
+      // what the user (or resume nudge) wrote. Prepending it to `text` made the
+      // block appear in the visible transcript whenever that field was rendered
+      // (history replay, an echo, a quoted say) and users read it as a warning
+      // their install was broken.
+      const outContext = disclosed
+        ? [CANVAS_TOOL_DISCLOSURE.trimEnd(), mergedContext].filter(Boolean).join("\n\n")
+        : mergedContext;
       try {
         sock.send(
           JSON.stringify({
             type: "user_message",
-            text: outText,
-            ...(mergedContext ? { context: mergedContext } : {}),
+            text,
+            ...(outContext ? { context: outContext } : {}),
             ...(images?.length ? { images: normalizeImageList(images) } : {}),
             // Client message id — the orchestrator echoes it in the "working"
             // ack so the panel can mark this exact bubble delivered ("Seen").
@@ -23991,6 +24288,28 @@ function describeCommand(cmd, msg, reply) {
             // Raw validation output — the machine's words, deliberately untranslated.
             detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
+    case "graph_outline":
+      // #1310 — a user-facing count only. The outline's budget_overrun / degraded
+      // prose is for the agent and must not land in the activity card.
+      return {
+        icon: "pi-sitemap",
+        text: tr(
+          "panel.read_graph_nodes",
+          { one: "Read graph — {count} node", other: "Read graph — {count} nodes" },
+          { count: r.node_count },
+        ),
+      };
+    case "graph_query":
+      // Same rule: shown/total is what the user can read; groups_omitted and
+      // max_chars accounting stay in the tool result the agent already has.
+      return {
+        icon: "pi-search",
+        text: tr(
+          "panel.found_nodes",
+          { one: "Found {found} of {count} node", other: "Found {found} of {count} nodes" },
+          { count: r.total, found: `${r.shown ?? r.matched ?? r.count ?? 0}${r.truncated ? "+" : ""}` },
+        ),
+      };
     case "graph_find_nodes":
       // The TOTAL drives the plural; the match count carries its own "+" truncation marker,
       // so it is interpolated as text rather than as a second count.
@@ -24069,9 +24388,10 @@ function describeCommand(cmd, msg, reply) {
     case "workflow_save_as":
       return { icon: "pi-save", text: tr("panel.workflow_saved_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
     default:
-      // `cmd` is the raw tool name (an identifier) and the detail is the raw reply payload —
-      // neither is prose, so neither is translated.
-      return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
+      // `cmd` is the raw tool name (an identifier). #1310 — do NOT dump the raw
+      // reply payload: that is how graph_query's budget_overrun / groups_omitted
+      // accounting (and every other agent-only field) rendered in the transcript.
+      return { icon: "pi-bolt", text: cmd };
   }
 }
 
@@ -27767,7 +28087,7 @@ function buildPanel() {
   // Surrounding text renders verbatim too. Tokens with no matching attachment
   // content fall back to their literal text. Never throws into the render.
   function renderUserText(container, text, atts) {
-    const raw = coerceMessageText(text);
+    const raw = stripAgentDirectedBlocks(coerceMessageText(text));
     try {
       const byId = new Map();
       if (Array.isArray(atts)) {
@@ -27872,7 +28192,7 @@ function buildPanel() {
     // isDroppedAgentReplay) — a genuinely-empty STRING record is valid stored
     // input and must still render its empty bubble (#241).
     if (isDroppedAgentReplay(text)) return;
-    const safeText = coerceMessageText(text);
+    const safeText = stripAgentDirectedBlocks(coerceMessageText(text));
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble agent";
@@ -27884,8 +28204,8 @@ function buildPanel() {
   function paintCard({ icon, text, detail, error }) {
     // Coerce both slots: a structured error/detail (e.g. reply.error object) must
     // never reach textContent as "[object Object]" — live OR on card replay (#276).
-    text = coerceMessageText(text);
-    detail = detail == null ? detail : coerceMessageText(detail);
+    text = stripAgentDirectedBlocks(coerceMessageText(text));
+    detail = detail == null ? detail : stripAgentDirectedBlocks(coerceMessageText(detail));
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card" + (error ? " error" : "");
@@ -29483,8 +29803,8 @@ function buildPanel() {
   function commitStream(id, text) {
     const s = streamBubbles.get(id);
     if (!s) return false;
-    s.commitText = text;
-    s.replyTarget = text; // authoritative — guarantees the typewriter reaches the end
+    s.commitText = stripAgentDirectedBlocks(text);
+    s.replyTarget = s.commitText; // authoritative — guarantees the typewriter reaches the end
     // CRITICAL: the typewriter (pumpStreams) runs on requestAnimationFrame, which
     // the browser PAUSES in a hidden/background tab. If the user switched away
     // during the turn (common on long pipeline runs), the reply would never paint
@@ -31352,7 +31672,7 @@ function buildPanel() {
       // debounced fit so the view still settles.
       if (reply.ok) {
         const followed = focusFollowOnCommand(cmd, msg, reply);
-        if (!followed && AUTOFIT_CMDS.has(cmd)) scheduleAutoFit();
+        if (!followed && AUTOFIT_CMDS.has(cmd) && msg?.dry_run !== true) scheduleAutoFit();
       }
       // The agent restarted ComfyUI — arm the auto-resume so we reconnect and
       // nudge it to continue once ComfyUI is back (install→restart→continue).
@@ -35814,25 +36134,26 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    const context = {
-      workflow: getWorkflowTitle(),
-      ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
-    };
-    // Surface any MANUAL canvas edits the user made since the agent's last turn,
-    // prepended to the agent-facing text only (the visible `text` is untouched).
-    // Orchestrator status the user must not see (failed panel auto-sync, lock
-    // recovery, …). Delivered the same way as the banners below — prepended to the
-    // agent-facing text only, so the visible bubble stays what the user typed.
+    // Agent-directed banners ride in `context`, never in user_message.text (#1310).
+    // The visible bubble is the typed `text`; the orchestrator prepends string
+    // context above it for the model. Putting these in `text` is how LIVE-CANVAS
+    // TOOLS / MANUAL CANVAS CHANGES rendered in the user's chat.
     const hiddenNotes = takeHiddenAgentNotes();
-    if (hiddenNotes) sendText = hiddenNotes + sendText;
     const changeBanner = manualChangeBanner();
-    if (changeBanner) sendText = changeBanner + sendText;
     // Surface ComfyUI's own pre-run validation errors (missing models,
     // value_not_in_list, broken links) the instant they appear — the same data the
     // user sees in the frontend's error panel — so the agent isn't blind to a broken
     // graph until it independently re-runs. Conditional + deduped (event-driven).
     const valBanner = await validationBanner();
-    if (valBanner) sendText = valBanner + sendText;
+    const context = [
+      hiddenNotes,
+      changeBanner,
+      valBanner,
+      serializeContext({
+        workflow: getWorkflowTitle(),
+        ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
+      }),
+    ].filter(Boolean).join("\n\n") || undefined;
     // The target conversation is decided at DISPATCH, not at type time (gate
     // P0-5): if the shared selection moved while we awaited above, relocate the
     // optimistically recorded prompt into the conversation the backend will

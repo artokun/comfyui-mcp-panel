@@ -217,7 +217,7 @@ test("#745 WIRING: get_errors actually calls the scan, inside its budget", async
   const here = dirname(fileURLToPath(import.meta.url))
   const src = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8")
 
-  assert.match(src, /import \{ scanComboAvailability, comboAvailabilityNote \} from "\.\/lib\/live-combo-availability\.js"/)
+  assert.match(src, /import \{[\s\S]{0,200}?scanComboAvailability,[\s\S]{0,200}?comboAvailabilityNote,[\s\S]{0,200}?\} from "\.\/lib\/live-combo-availability\.js"/)
   // It must draw from the SHARED budget, not run unbounded.
   assert.match(src, /errorsStepBudget\(GET_ERRORS_STEP_CAP_MS\)[\s\S]{0,400}scanComboAvailability/)
   // …and it must be emitted, with the unchecked list alongside it.

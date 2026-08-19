@@ -25,6 +25,12 @@
  * fails at queue time. The reporter's own second option is the correct one — do not
  * claim a complete refresh when the placeholders did not come back — and this module
  * establishes exactly that condition.
+ *
+ * #1332 is the other half of the same measurement. After a restart that really did
+ * register the class (a fresh `panel_add_node` of that type succeeds), `panel_get_errors`
+ * must not keep listing it under `missing_node_types`. The type is not missing. Leftover
+ * placeholders stay a finding — they move to `stale_placeholders` / `requires_reload` —
+ * so the canvas is never declared clean over a dead node. The store is still not cleared.
  */
 
 /**
@@ -139,7 +145,7 @@ export function stalePlaceholderNote(stale) {
     // than asserted of every node in the list.
     `does not rehydrate nodes that were created while it was unknown. Each of these carries no ` +
     `class definition; on the instance measured for #981 that also meant no widgets and no ` +
-    `title. They will still be reported as missing, and they were never ` +
+    `title. They were never ` +
     `rebuilt against the class, so do not rely on ${stale.length === 1 ? "it" : "them"} ` +
     // "Reload" alone is ambiguous (codex) — a browser refresh restores whatever the
     // frontend last autosaved, which is not reliably the graph on screen. The remedy is
@@ -155,4 +161,75 @@ export function stalePlaceholderNote(stale) {
     `a plain browser refresh restores whatever the frontend last autosaved rather than the ` +
     `graph in front of you.`
   );
+}
+
+/**
+ * #1332 — drop types the live CLIENT registry can instantiate from a load-time
+ * missing-node-type list.
+ *
+ * The store is never re-evaluated after a ComfyUI restart that registered the class
+ * (stale-placeholders.js measured that). A type that is NOW in `LiteGraph.registered_node_types`
+ * is not missing — `panel_add_node` of that class succeeds — so leaving it on
+ * `missing_node_types` is the stale answer. Unknown registration status keeps the type
+ * reported (fail closed). Order-preserving. A missing/non-function lookup is treated as
+ * "cannot prove registered" and returns the input list unchanged.
+ */
+export function withoutClientRegisteredTypes(types, isClientRegistered) {
+  if (!Array.isArray(types) || !types.length) return Array.isArray(types) ? types : [];
+  if (typeof isClientRegistered !== "function") return types;
+  const out = [];
+  for (const t of types) {
+    let registered = false;
+    try {
+      registered = !!isClientRegistered(t);
+    } catch {
+      registered = false;
+    }
+    if (!registered) out.push(t);
+  }
+  return out;
+}
+
+/**
+ * True when at least one recorded missing type is NOT in the client registry — the
+ * condition that makes a forced `/object_info` refresh worth paying for before
+ * `panel_get_errors` adjudicates. All-registered (or an unreadable lookup) is false:
+ * the filter above can drop those types without a fetch, and a 14s refresh on a
+ * permanently-missing type is the same cost the missing-model path already accepts,
+ * but only while something is still actually unregistered.
+ */
+export function anyRecordedTypeUnregistered(types, isClientRegistered) {
+  if (!Array.isArray(types) || !types.length) return false;
+  if (typeof isClientRegistered !== "function") return false;
+  for (const t of types) {
+    try {
+      if (!isClientRegistered(t)) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * #1332 — one decision for the two answers `panel_get_errors` must not mix:
+ *
+ *   stillMissing       — types the client registry still cannot instantiate
+ *   stalePlaceholders  — already-placed nodes of a NOW-registered type that
+ *                        were never rehydrated (#981)
+ *
+ * The recorded list is the load-time snapshot (after the virtual-node filter).
+ * Placeholders are detected against that full snapshot, not against `stillMissing`,
+ * because a type that just registered is exactly the one whose leftover nodes
+ * need the save+reopen disclosure.
+ */
+export function adjudicateRecordedMissingNodeTypes(recordedTypes, nodes, isClientRegistered) {
+  const recorded = Array.isArray(recordedTypes) ? recordedTypes : [];
+  return {
+    stillMissing: withoutClientRegisteredTypes(recorded, isClientRegistered),
+    stalePlaceholders: findStalePlaceholders(nodes, {
+      recordedMissingTypes: recorded,
+      isClientRegistered,
+    }),
+  };
 }

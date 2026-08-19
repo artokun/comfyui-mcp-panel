@@ -440,6 +440,9 @@ function buildExitSubgraph(doubles) {
     "describeActiveGraph",
     "assertGraphBoundToActiveWorkflow",
     "coerceMessageText",
+    "clearAutoLayoutScope",
+    "rememberAutoLayoutScope",
+    "layoutScopeFingerprint",
     `return (${body});`,
   );
   return factory(
@@ -449,6 +452,9 @@ function buildExitSubgraph(doubles) {
     doubles.describeActiveGraph,
     doubles.assertGraphBoundToActiveWorkflow,
     doubles.coerceMessageText ?? ((v) => String(v)),
+    doubles.clearAutoLayoutScope ?? (() => {}),
+    doubles.rememberAutoLayoutScope ?? (() => {}),
+    doubles.layoutScopeFingerprint ?? (() => ({ scope: "root" })),
   );
 }
 

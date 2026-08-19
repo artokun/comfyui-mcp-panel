@@ -120,3 +120,44 @@ export function buttonReplyText(component, fields = []) {
   }
   return base;
 }
+
+/**
+ * Agent-directed instruction blocks that must never appear in the user-visible
+ * transcript (#1310). They are written for the model — the LIVE-CANVAS tool
+ * check, manual-edit banners, hidden orchestrator notes, validation injection —
+ * and users read the shouty grammar as a warning their install is broken.
+ *
+ * Each pattern matches ONE block at the start of the string. The stripper
+ * applies them in a loop so stacked prefixes (disclosure + manual changes)
+ * all come off. Anchored at ^ so a user who types the same words is left
+ * alone.
+ */
+const AGENT_DIRECTED_PREFIXES = [
+  /^(?:⚙\s*)?LIVE-CANVAS TOOLS[\s\S]*?(?:\n\n|$)/i,
+  /^⟳\s*MANUAL CANVAS CHANGES[\s\S]*?(?:\n\n|$)/,
+  /^⟳\s*ACTIVE WORKFLOW CHANGED[\s\S]*?(?:\n\n|$)/,
+  /^\[The user cannot see this message[\s\S]*?(?:\n\n|$)/,
+  /^⚠️\s*GRAPH VALIDATION ERRORS[\s\S]*?(?:\n\n|$)/,
+  /^⚠️\s*MISSING ASSETS[\s\S]*?(?:\n\n|$)/,
+  /^⚠️\s*LAST RUN FAILED[\s\S]*?(?:\n\n|$)/,
+];
+
+/** Remove agent-only prefixes from text that is about to be shown to the user. */
+export function stripAgentDirectedBlocks(text) {
+  let out = coerceMessageText(text);
+  if (!out) return out;
+  let prev;
+  do {
+    prev = out;
+    let next = out.replace(/^\s+/, "");
+    for (const re of AGENT_DIRECTED_PREFIXES) {
+      const stripped = next.replace(re, "");
+      if (stripped !== next) {
+        next = stripped;
+        break;
+      }
+    }
+    out = next;
+  } while (out !== prev);
+  return out.replace(/^\s+/, "");
+}
