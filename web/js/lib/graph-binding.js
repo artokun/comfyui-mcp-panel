@@ -2015,10 +2015,12 @@ function abortedRestoreClause(observed = {}) {
 }
 
 /** The only surfaces this file has a written account of. `definitions` differs on a
- *  faithful open because loading a saved workflow regenerates link ids inside subgraph
- *  definitions (#886, measured: state.lastLinkId 2092 -> 2106), and
- *  `definitionsDifferOnlyByRenumber` decides per-case whether THIS difference is
- *  only that. Nothing else has such an account, so nothing else may be waved through. */
+ *  faithful open because loading a saved workflow regenerates ids inside subgraph
+ *  definitions — LINK ids (#886, measured: state.lastLinkId 2092 -> 2106) and, when they
+ *  collide with the payload's own root node ids, NODE ids (comfyui-mcp#1706, measured:
+ *  78/77/76 -> 182/183/184 with the definition's links patched through the same map).
+ *  `definitionsDifferOnlyByRenumber` decides per-case whether THIS difference is only
+ *  those. Nothing else has such an account, so nothing else may be waved through. */
 const ACCOUNTABLE_CONTENT_SURFACES = new Set(["definitions"]);
 
 /**
@@ -2103,11 +2105,17 @@ function openRebindPartClause(part, observed = {}) {
         `the graph on the canvas differs from what was loaded on: ${named}` +
         nodeSurfaceClause(observed) +
         abortedRestoreClause(observed) +
+        // comfyui-mcp#1706 — this sentence used to name LINK renumbering as "the whole
+        // difference". There are TWO measured rewrites on this surface now (link ids,
+        // #886; subgraph node ids, #1706), and the predicate does not report which one
+        // it matched — so naming one would state a mechanism this reply never observed.
+        // It says instead exactly what the predicate PROVED, which covers both.
         (accounted.length
           ? `. Its \`${accounted.join("`, `")}\` also differ, and that one IS accounted for: the ` +
-            `whole difference is link RENUMBERING — loading a saved workflow regenerates link ids ` +
-            `inside subgraph definitions while the wiring stays identical — so it is not a content ` +
-            `change and is not part of what is unconfirmed here`
+            `whole difference is the frontend RENUMBERING its own ids on load — link ids, and the ` +
+            `node ids inside subgraph definitions when they collide — with the same nodes in the ` +
+            `same order, the same values, and every connection still joining the same two slots, ` +
+            `so it is not a content change and is not part of what is unconfirmed here`
           : "")
       );
     default:

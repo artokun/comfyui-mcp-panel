@@ -20,7 +20,7 @@
 // alone, not any observation about the graph, decided which paragraph the reader got.
 //
 // The content VERDICT already knew better: `graphRootReproducesStateContent` admits a
-// `definitions` surface when `definitionsDifferOnlyByLinkRenumber` accounts for the
+// `definitions` surface when `definitionsDifferOnlyByRenumber` accounts for the
 // whole of it. That judgement simply never reached the sentence.
 //
 // #825's narrowness is deliberate and is KEPT: a second surface that is genuinely
@@ -84,14 +84,22 @@ test("the accounted surface is EXPLAINED, not silently dropped", () => {
   });
 
   assert.match(msg, /definitions/);
-  assert.match(msg, /link RENUMBERING/i);
+  // comfyui-mcp#1706 — the sentence may not name ONE mechanism. There are two measured
+  // rewrites on this surface (link ids, #886; subgraph node ids, #1706) and the
+  // predicate does not report which it matched, so a reply that said "link renumbering"
+  // would be stating a cause it never observed. It must name renumbering and BOTH kinds
+  // of id, and it must say what was actually proven about the graph.
+  assert.match(msg, /RENUMBERING/i);
+  assert.match(msg, /link ids/i);
+  assert.match(msg, /node ids inside subgraph definitions/i);
+  assert.match(msg, /same nodes in the same order/i);
   assert.match(msg, /not a content change/i);
 });
 
 // ── the direction that costs something ───────────────────────────────────────
 
 test("a definitions difference that is NOT accounted for still blocks the reassurance", () => {
-  // `definitionsDifferOnlyByLinkRenumber` fails closed, so anything it cannot fully
+  // `definitionsDifferOnlyByRenumber` fails closed, so anything it cannot fully
   // explain arrives here with an empty accounted list — and must read exactly as it
   // did before this change.
   const msg = describeOpenRebindOutcome(CONTENT_ONLY, {
@@ -235,7 +243,7 @@ test("producer: a renumber-only definitions difference is reported as ACCOUNTED"
 
 test("producer: a RE-WIRED definitions difference is NOT accounted for", () => {
   // The direction that must fail closed. Same link count, different endpoints — a
-  // re-wire, not a renumber, and `definitionsDifferOnlyByLinkRenumber` refuses it.
+  // re-wire, not a renumber, and `definitionsDifferOnlyByRenumber` refuses it.
   const state = stateWith(definitions(2092, [7]));
   const live = stateWith(definitions(2106, [21]));
   live.definitions.subgraphs[0].links = [[21, 2, 0, 1, 0, "IMAGE"]];

@@ -16808,8 +16808,9 @@ const GRAPH_TOOL_EXECUTORS = {
                     contentComparable: contentDiff.comparable,
                     contentSurfaces: contentDiff.surfaces,
                     // #1588 — which of those the panel has already fully characterised
-                    // (today: a `definitions` difference that is pure link renumbering,
-                    // which every load of a workflow containing subgraphs produces).
+                    // (today: a `definitions` difference that is pure RENUMBERING — link ids,
+                    // and comfyui-mcp#1706 subgraph node ids — which a load of a workflow
+                    // containing subgraphs routinely produces).
                     // Without this the disclosure counts an explained surface as a
                     // second unexplained one and drops to the maximal-alarm wording.
                     contentAccountedSurfaces: contentDiff.accountedSurfaces,
