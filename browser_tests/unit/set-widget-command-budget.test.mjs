@@ -375,11 +375,27 @@ test("#1413 the #387 upload-asset probe answers false instead of parking the com
 // Wiring pins — the parts a behavioural test cannot see
 // ---------------------------------------------------------------------------
 
+/**
+ * `graph_set_widget`'s body alone.
+ *
+ * SCOPED, because a body-wide `PANEL_SRC` match is satisfied by a SIBLING call site:
+ * `graph_add_node` bounds its own copy of the baseline-seed wait, so a pin that searched the
+ * whole file stayed green with THIS command's bound deleted. Found by mutating the panel and
+ * watching the pin pass.
+ */
+const SET_WIDGET_BODY = (() => {
+  const start = PANEL_SRC.indexOf("async graph_set_widget({ node_id, widget, value, workflow_uuid }) {");
+  assert.ok(start > 0, "graph_set_widget's signature has changed — update this harness");
+  const end = PANEL_SRC.indexOf("async graph_remove_widget(", start);
+  assert.ok(end > start, "graph_remove_widget no longer follows it — update this harness");
+  return PANEL_SRC.slice(start, end);
+})();
+
 test("#1413 the budget is taken on graph_set_widget's FIRST line", () => {
   // Placement is the fix, not an incidental. The recovery is reached after the baseline seed
   // and the authorization /object_info, so a clock started later would hand it time the
   // command had already spent.
-  const m = PANEL_SRC.match(/async graph_set_widget\(\{ node_id, widget, value, workflow_uuid \}\) \{([\s\S]{0,2400}?)const \{ app, graph, LG, rootGraph \} = getGraphCtx\(\);/);
+  const m = SET_WIDGET_BODY.match(/^async graph_set_widget\(\{ node_id, widget, value, workflow_uuid \}\) \{([\s\S]{0,2400}?)const \{ app, graph, LG, rootGraph \} = getGraphCtx\(\);/);
   assert.ok(m, "graph_set_widget's opening no longer looks like this — update this pin");
   assert.match(
     m[1],
@@ -391,7 +407,7 @@ test("#1413 the budget is taken on graph_set_widget's FIRST line", () => {
 test("#1413 the recovery's joinMs is DERIVED from the budget, never a constant of its own", () => {
   // The distinction the issue asked for. A fresh constant here could only disagree with what
   // the command had already spent; the remainder is the only honest number.
-  const m = PANEL_SRC.match(/return refreshComfyNodeDefs\(undefined, \{\s*joinMs: ([^\r\n]+),/);
+  const m = SET_WIDGET_BODY.match(/return refreshComfyNodeDefs\(undefined, \{\s*joinMs: ([^\r\n]+),/);
   assert.ok(m, "the stale-combo fallback no longer passes a joinMs — #1413 has regressed");
   assert.match(m[1], /budget\.remaining\(\) - SET_WIDGET_POST_REFRESH_RESERVE_MS/);
 });
@@ -400,14 +416,20 @@ test("#1413 the seed wait and the authorization fetch draw from the same budget"
   // Without these the budget's clock would be running while the two largest waits in the
   // command ignored it, and `budget.remaining()` at the recovery would be a true statement
   // about a window nothing else respected.
-  assert.match(PANEL_SRC, /await awaitObjectInfoHistorySeed\(budget\.bounded\(OBJECT_INFO_SEED_WAIT_MS\)\);/);
-  assert.match(PANEL_SRC, /deadlineMs: budget\.bounded\(OBJECT_INFO_DEADLINE_MS\),/);
+  assert.match(SET_WIDGET_BODY, /await awaitObjectInfoHistorySeed\(budget\.bounded\(OBJECT_INFO_SEED_WAIT_MS\)\);/);
+  assert.match(SET_WIDGET_BODY, /deadlineMs: budget\.bounded\(OBJECT_INFO_DEADLINE_MS\),/);
+  // The UNBOUNDED forms must be gone from THIS body. An added bound that leaves the old call
+  // beside it reads as fixed and is not — and the positive match above cannot see that.
+  assert.ok(
+    !/await awaitObjectInfoHistorySeed\(\);/.test(SET_WIDGET_BODY),
+    "an unbounded baseline-seed wait is back in graph_set_widget",
+  );
 });
 
 test("#1413 the token the panel emits is the one the reasons map publishes", () => {
   // Read from the SOURCE, not from the import, so a panel that starts emitting a hand-typed
   // string fails here rather than agreeing with a test that imports the map it stopped using.
-  assert.match(PANEL_SRC, /comboRefreshUnavailable = NODE_DEF_REFRESH_REASONS\.REFRESH_STILL_RUNNING;/);
+  assert.match(SET_WIDGET_BODY, /comboRefreshUnavailable = NODE_DEF_REFRESH_REASONS\.REFRESH_STILL_RUNNING;/);
   assert.equal(NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING, "refresh_still_running");
 });
 
