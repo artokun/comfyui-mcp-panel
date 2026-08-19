@@ -21,12 +21,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
-import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { makeRefreshCoalescer } from "../../web/js/lib/refresh-coalesce.js";
 import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import {
   PANEL_SRC,
   ADD_NODE_COMMAND_BUDGET_MS,
   REFRESH_NODES_COMMAND_BUDGET_MS,
+  REFRESH_NODES_EXECUTOR_DEPS,
 } from "./_panel-constants.mjs";
 
 const refreshNodesMatch = PANEL_SRC.match(/\n {2}async refresh_nodes\(\) \{[\s\S]*?\n {2}\},/);
@@ -76,8 +77,9 @@ function realRefreshNodes({
 
   const deps = {
     refreshComfyNodeDefs,
-    REFRESH_JOIN_ABANDONED,
-    NODE_DEF_REFRESH_REASONS,
+    // Every other binding from the one place that holds them, so this harness picks up a
+    // new one automatically — then the budget, injected small, LAST so it wins.
+    ...REFRESH_NODES_EXECUTOR_DEPS,
     REFRESH_NODES_COMMAND_BUDGET_MS: budgetMs,
   };
   const names = Object.keys(deps);

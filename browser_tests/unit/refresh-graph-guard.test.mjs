@@ -38,6 +38,7 @@ import {
 } from "../../web/js/lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { REFRESH_NODES_EXECUTOR_DEPS } from "./_panel-constants.mjs";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
@@ -442,11 +443,16 @@ function buildRefreshNodes(refreshImpl) {
   }
   assert.notEqual(end, -1, "could not bound the refresh_nodes executor body");
   const body = SRC.slice(start, end + 1);
+  // #1404 — every OTHER module binding the executor closes over, from the one place that
+  // holds them (REFRESH_NODES_EXECUTOR_DEPS), so a new one is added once for all three
+  // harnesses rather than three times.
+  const extra = Object.entries(REFRESH_NODES_EXECUTOR_DEPS);
   const factory = new Function(
     "refreshComfyNodeDefs",
+    ...extra.map(([name]) => name),
     `return (${body.replace(/^async refresh_nodes\(\)/, "async function refresh_nodes()")});`,
   );
-  return factory(refreshImpl);
+  return factory(refreshImpl, ...extra.map(([, value]) => value));
 }
 
 test("#1275: restored_nodes survive the executor's success-branch whitelist", async () => {

@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 
@@ -67,6 +68,25 @@ export const REFRESH_NODES_COMMAND_BUDGET_MS = readPanelNumber(
   /const REFRESH_NODES_COMMAND_BUDGET_MS = (\d+);/,
   "the refresh_nodes command budget",
 );
+
+/**
+ * #1404 — every module binding the `refresh_nodes` executor closes over, BESIDES the
+ * `refreshComfyNodeDefs` each harness supplies its own double for.
+ *
+ * THREE harnesses rebuild that executor in a synthetic scope (node-def-refresh,
+ * refresh-graph-guard, refresh-nodes-command-budget), so a new free identifier in it throws
+ * `ReferenceError` in all three at once — which is exactly how adding the budget was found.
+ * Collected here for the same reason `addNodeCommandBudgetDeps` exists: so the next binding
+ * is added once rather than three times.
+ *
+ * The REAL values — the symbol and the reason vocabulary are imported and the number is read
+ * from the panel source — so no harness can pass against a value the panel no longer holds.
+ */
+export const REFRESH_NODES_EXECUTOR_DEPS = Object.freeze({
+  REFRESH_JOIN_ABANDONED,
+  NODE_DEF_REFRESH_REASONS,
+  REFRESH_NODES_COMMAND_BUDGET_MS,
+});
 
 export const NODE_DEFS_FETCH_TIMEOUT_MS = readPanelNumber(
   /const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/,
