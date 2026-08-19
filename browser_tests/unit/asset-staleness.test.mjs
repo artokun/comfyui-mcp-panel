@@ -27,6 +27,8 @@ import {
   reconcileUnknownWidgetNames,
   collectAllGraphs,
   reapplyDefsToLiveNodes,
+  comboRebuildCovered,
+  authoritativeComboValues,
   emptyComboListsOnGraph,
   emptyComboNote,
   collectMissingNodeTypeReasons,
@@ -641,6 +643,144 @@ test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (fi
   const repaired = reapplyDefsToLiveNodes(graphOf([node]), defs);
   assert.equal(repaired, 1);
   assert.deepEqual(node.widgets.map((w) => w.name), ["lora_name", "strength_model"]);
+});
+
+// ── #1193 — the sweep must rebuild the shape the backend actually ships ────────
+//
+// MEASURED against a live ComfyUI 0.33 /object_info (848 types): 61 combo inputs use the
+// V1 `[[opt,...], config]` shape this file was written for, and 467 use V2
+// `["COMBO", {options:[...]}]`. V2 is the MAJORITY, not an edge case — and it was walked
+// past in silence while `completed` was still set, which granted #1193's disclosure and
+// the shared combo-trust flag over lists that had never been touched.
+
+/** V2, as ComfyUI 0.33 publishes it — confirmed against a live payload and against the
+ *  widget the frontend builds from it (`options.values` is the array under `options`). */
+const CKPT_DEF_V2 = (values) => ({
+  input: { required: { ckpt_name: ["COMBO", { multiselect: false, options: values }] } },
+});
+/** V2 whose list is a SEPARATE fetch: the frontend shows "Loading…" and `options.values`
+ *  is not an array at all. Nothing here can copy a list that has not arrived. */
+const REMOTE_DEF_V2 = {
+  input: { required: { image: ["COMBO", { image_upload: true, remote: { route: "/internal/files/output" } }] } },
+};
+/** V3 dynamic: the "options" are `{key, inputs}` objects that select SUB-INPUTS to
+ *  materialize. The live widget does present the keys as its values, which is exactly why
+ *  a naive rebuild here would look right and publish a list this file cannot honour. */
+const DYNAMIC_DEF_V3 = {
+  input: {
+    required: {
+      format: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png", inputs: {} }, { key: "exr", inputs: {} }] }],
+    },
+  },
+};
+
+test("#1193 authoritativeComboValues reads V1 and V2, and refuses to guess at the rest", () => {
+  assert.deepEqual(authoritativeComboValues([["a", "b"], {}]), ["a", "b"]);
+  assert.deepEqual(authoritativeComboValues(["COMBO", { options: ["x", "y"] }]), ["x", "y"]);
+  // Not a list this file can derive — each must be null, which is what makes the caller
+  // count it as SKIPPED instead of as "nothing to do".
+  assert.equal(authoritativeComboValues(["COMBO", { remote: { route: "/internal/files/output" } }]), null);
+  assert.equal(authoritativeComboValues(["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png" }] }]), null);
+  assert.equal(authoritativeComboValues(["INT", { default: 20 }]), null);
+  assert.equal(authoritativeComboValues("STRING"), null);
+  assert.equal(authoritativeComboValues(null), null);
+});
+
+test("#1193 END TO END: a V2 combo is rebuilt, so a deleted model is still REPORTED missing", () => {
+  // The failure this exists to stop, driven the whole way to its consequence. The user
+  // deleted anime.safetensors; the backend no longer lists it; the live widget still does
+  // because it was populated at page load. If the sweep walks past a V2 combo while the
+  // panel claims the lists were rebuilt, `assetCandidateResolvesLive` finds the file in
+  // that stale list and the missing-model candidate is SUPPRESSED — the user loses the
+  // warning. Fails on the pre-fix code at both the rebuild and the suppression.
+  const node = {
+    id: 1,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", value: "anime.safetensors", options: { values: ["anime.safetensors", "sd15.ckpt"] } }],
+    constructor: {},
+  };
+  const graph = graphOf([node]);
+  const stats = {};
+  reapplyDefsToLiveNodes(graph, { CheckpointLoaderSimple: CKPT_DEF_V2(["sd15.ckpt"]) }, stats);
+
+  assert.equal(stats.combosRebuilt, 1, "a V2 combo must be rebuilt, not walked past");
+  assert.equal(stats.combosSkipped ?? 0, 0);
+  assert.equal(comboRebuildCovered(stats), true);
+  assert.deepEqual(node.widgets[0].options.values, ["sd15.ckpt"], "the deleted file is gone from the live list");
+
+  const candidate = { nodeId: 1, name: "anime.safetensors", widgetName: "ckpt_name", isMissing: true };
+  assert.equal(
+    assetCandidateResolvesLive(graph, 1, "anime.safetensors", "ckpt_name"),
+    false,
+    "the rebuilt list must no longer offer the deleted file",
+  );
+  assert.equal(
+    isStaleAssetCandidate(graph, candidate, { trustCombo: true }),
+    false,
+    "a genuinely missing model must survive the scan — suppressing it is the one direction this must never fail in",
+  );
+});
+
+test("#1193 a combo the sweep CANNOT rebuild is counted, and withdraws the claim", () => {
+  // Remote V2 and dynamic V3: real shapes from the same live payload (1 and 120 inputs
+  // across 848 types). Neither can be rebuilt from the payload alone, so the sweep must
+  // say so rather than finish quietly — `completed` is true in both cases, and it is
+  // `combosSkipped` that keeps `comboRebuildCovered` false.
+  const remote = {
+    id: 1,
+    type: "LoadImageOutput",
+    // The frontend leaves `values` undefined until the separate fetch lands, so the LIVE
+    // widget gives no signal at all here — only the spec does. That is why the skip test
+    // asks two independent questions instead of one.
+    widgets: [{ name: "image", value: "Loading...", options: {} }],
+    constructor: {},
+  };
+  const remoteStats = {};
+  reapplyDefsToLiveNodes(graphOf([remote]), { LoadImageOutput: REMOTE_DEF_V2 }, remoteStats);
+  assert.equal(remoteStats.completed, true, "the walk did finish");
+  assert.equal(remoteStats.combosSkipped, 1, "…and it must record the combo it could not rebuild");
+  assert.equal(comboRebuildCovered(remoteStats), false, "a finished sweep that skipped a combo has NOT covered the graph");
+
+  const dynamic = {
+    id: 2,
+    type: "SaveImageAdvanced",
+    widgets: [{ name: "format", value: "png", options: { values: ["png", "exr"] } }],
+    constructor: {},
+  };
+  const dynamicStats = {};
+  reapplyDefsToLiveNodes(graphOf([dynamic]), { SaveImageAdvanced: DYNAMIC_DEF_V3 }, dynamicStats);
+  assert.equal(dynamicStats.combosSkipped, 1);
+  assert.equal(comboRebuildCovered(dynamicStats), false);
+  assert.deepEqual(dynamic.widgets[0].options.values, ["png", "exr"], "and it is left alone, not half-rebuilt");
+});
+
+test("#1193 a function-valued option source is NOT a skip", () => {
+  // It derives its own list and `assetCandidateResolvesLive` INVOKES it, so it is never
+  // stale for want of a rebuild. Counting it would withdraw the claim on every graph that
+  // has one, which is how a safety counter turns into a permanently-off switch.
+  const node = {
+    id: 1,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", value: "a", options: { values: () => ["live.safetensors"] } }],
+    constructor: {},
+  };
+  const stats = {};
+  reapplyDefsToLiveNodes(graphOf([node]), { CheckpointLoaderSimple: CKPT_DEF_V2(["live.safetensors"]) }, stats);
+  assert.equal(stats.combosSkipped ?? 0, 0);
+  assert.equal(comboRebuildCovered(stats), true);
+  assert.equal(typeof node.widgets[0].options.values, "function", "the dynamic source is left intact");
+});
+
+test("#1193 comboRebuildCovered needs BOTH facts, and treats absence as unknown", () => {
+  assert.equal(comboRebuildCovered({ completed: true, combosSkipped: 0 }), true);
+  assert.equal(comboRebuildCovered({ completed: true }), true, "nothing skipped is the absence of the counter");
+  assert.equal(comboRebuildCovered({ completed: true, combosSkipped: 1 }), false);
+  assert.equal(comboRebuildCovered({ completed: false, combosSkipped: 0 }), false);
+  assert.equal(comboRebuildCovered({}), false);
+  assert.equal(comboRebuildCovered(null), false, "a sweep that never ran has covered nothing");
+  // Never truthy-by-accident: a stats object that reports completion some other way must
+  // not slip through.
+  assert.equal(comboRebuildCovered({ completed: "yes", combosSkipped: 0 }), false);
 });
 
 test("#1193 the sweep REPORTS what it rebuilt, and only claims completion after the whole walk", () => {

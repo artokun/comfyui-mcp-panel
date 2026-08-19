@@ -61,6 +61,7 @@ import {
   describeNodeDefRefresh,
   NODE_DEF_REFRESH_REASONS,
 } from "../../web/js/lib/node-def-refresh.js";
+import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -342,6 +343,12 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
   // a confirmed one, which is the distinction the disclosure exists to carry.
   assert.match(body, /comboRebuiltLocally: comboAbandonedAfterRebuild,/, "the verdict is told which one held");
+  // #1193 — the disclosure is gated on the sweep having COVERED the graph, never on it
+  // merely having finished. `comboRebuild.completed` alone is true for a sweep that walked
+  // past every V2 combo on the graph, and granting the claim there suppresses a genuine
+  // missing asset. The predicate lives beside the sweep so both readers ask it the same way.
+  assert.match(body, /if \(comboAbandoned && comboRebuildCovered\(comboRebuild\)\) \{/, "the disclosure demands a COVERED sweep");
+  assert.doesNotMatch(body, /comboAbandoned && comboRebuild\.completed/, "…never `completed` on its own");
   assert.match(body, /comboRan,/, "the frontend call's own outcome is still passed separately");
 });
 
@@ -405,6 +412,7 @@ function buildRegisterComfyNodeDefs({
     "api",
     "recordObjectInfoTypes",
     "reapplyDefsToLiveNodes",
+    "comboRebuildCovered",
     "describeNodeDefRefresh",
     // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
     // a harness that substituted a pass-through would stop proving what this file exists to
@@ -448,6 +456,7 @@ function buildRegisterComfyNodeDefs({
     apiValue,
     recordObjectInfoTypes,
     reapplyDefsToLiveNodes,
+    comboRebuildCovered,
     describeNodeDefRefresh,
     // No real waiting: the delays are the shipped ones, the sleep is not.
     // #1180 — the SHIPPED options, not just the shipped helper. Omitting `delays` let the
@@ -989,14 +998,17 @@ test("#1180 a combo refresh that never answers is NOT reported as a refresh", as
 // ---------------------------------------------------------------------------
 
 /** The reapply sweep's contract, as `reapplyDefsToLiveNodes` fills it in: counts as it
- *  goes, `completed` only after every graph was walked. `asset-staleness.test.mjs` pins
- *  the REAL sweep against this same shape, so these doubles cannot drift into a contract
- *  the shipped sweep does not honour. */
+ *  goes, `combosSkipped` for every combo whose list it could not derive, and `completed`
+ *  only after every graph was walked. `asset-staleness.test.mjs` pins the REAL sweep
+ *  against this same shape — including a V2 `["COMBO", {options}]` spec and the remote /
+ *  dynamic shapes it must refuse — so these doubles cannot drift into a contract the
+ *  shipped sweep does not honour. */
 function sweepThatCompletes(combosRebuilt = 3) {
   return (_graph, _defs, stats) => {
     if (stats) {
       stats.nodesSwept = 2;
       stats.combosRebuilt = combosRebuilt;
+      stats.combosSkipped = 0;
       stats.completed = true;
     }
     return 0;
@@ -1006,6 +1018,20 @@ function sweepThatCompletes(combosRebuilt = 3) {
 function sweepThatStopsPartWay() {
   return (_graph, _defs, stats) => {
     if (stats) stats.nodesSwept = 1;
+    return 0;
+  };
+}
+/** A sweep that FINISHED and still left combo lists untouched — a remote V2, a dynamic V3,
+ *  or any shape published after this panel was written. `completed` is true; the graph is
+ *  not covered. This is the state that made the first version of #1193 unsafe. */
+function sweepThatFinishesButSkips(combosSkipped = 1) {
+  return (_graph, _defs, stats) => {
+    if (stats) {
+      stats.nodesSwept = 2;
+      stats.combosRebuilt = 1;
+      stats.combosSkipped = combosSkipped;
+      stats.completed = true;
+    }
     return 0;
   };
 }
@@ -1078,6 +1104,38 @@ test("#1193: a combo refresh abandoned with NO completed rebuild still fails, an
     verdict.detail,
     new RegExp(`did not answer within the \\d+ms this refresh had left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget`),
     "the refusal names the bound this phase was actually given, and the budget it came out of",
+  );
+});
+
+test("#1193: a sweep that FINISHED but skipped a combo does NOT license the disclosure", async () => {
+  // The gate's finding, at the level that grants the trust. `refreshComboOptionsFromDefs`
+  // handles the shapes it can derive a list from; a remote V2 or a dynamic V3 is walked
+  // past — and `completed` is set either way, because the WALK finished. Reading only
+  // `completed` claimed `refreshed: true` and set nodeDefsRefreshConfirmed over combo
+  // lists that had never been touched, which SUPPRESSES a genuine missing model whose
+  // deleted file is still sitting in the stale list (asset-staleness.test.mjs drives that
+  // consequence end to end).
+  //
+  // So the panel asks `comboRebuildCovered`, which needs finished AND skipped-nothing.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+    reapplyDefsToLiveNodes: sweepThatFinishesButSkips(),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  timers.fireAll();
+  const verdict = await orFail(running, "the combo phase never gave up");
+
+  assert.equal(verdict.refreshed, false, "an uncovered graph must not be reported as refreshed");
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  assert.equal(verdict.combo_refresh_confirmed, undefined, "and it must not carry the disclosure either");
+  assert.equal(
+    getConfirmed(),
+    false,
+    "trusting the live combos here is what suppresses a genuine missing asset — the one direction this must never fail in",
   );
 });
 

@@ -168,6 +168,7 @@ import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, 
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
+  comboRebuildCovered,
   reapplyDefsToLiveNodes,
   emptyComboListsOnGraph,
   emptyComboNote,
@@ -1177,10 +1178,13 @@ const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
 async function registerComfyNodeDefs(preloadedDefs) {
-  // Trust the live combos for suppressing missing-asset candidates ONLY once the
-  // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
-  // this ComfyUI build (or throws), the combos are still whatever page-load left them
-  // — possibly stale — so we must stay in over-report-safe mode (finding #4).
+  // Trust the live combos for suppressing missing-asset candidates ONLY once they have
+  // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
+  // do that and the trust flag accepts either (#1193): `refreshComboInNodes()` answering,
+  // or this run's OWN reapply sweep finishing with nothing skipped. If refreshComboInNodes
+  // is absent or throws AND the sweep did not cover the graph, the combos are still
+  // whatever page-load left them — possibly stale — so we must stay in over-report-safe
+  // mode (finding #4).
   //
   // #635: the run's outcome is a VERDICT (lib/node-def-refresh.js), not a bare
   // boolean — {refreshed:false} alone was indistinguishable from a no-op, so the
@@ -1200,7 +1204,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // graph was walked to the end, so a sweep that threw half way cannot authorise the
   // disclosure below. Kept separate from `comboRan`: one is the frontend's call
   // answering, the other is work this panel performed and counted.
-  const comboRebuild = { nodesSwept: 0, combosRebuilt: 0, completed: false };
+  const comboRebuild = { nodesSwept: 0, combosRebuilt: 0, combosSkipped: 0, completed: false };
   // #1193 — the bound the combo phase was actually given, so a refusal can name it. Null
   // until the phase arms one, which is itself the distinction between "never reached the
   // combo phase" and "reached it and was given N ms".
@@ -1536,9 +1540,9 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // already rebuilt. A THROW still fails: that is the frontend reporting something
       // wrong, which is evidence, where a timeout is only the absence of an answer.
       const comboAbandoned = comboSettled === COMBO_NO_ANSWER;
-      if (comboAbandoned && comboRebuild.completed) {
+      if (comboAbandoned && comboRebuildCovered(comboRebuild)) {
         // The ONE state this disclosure covers, recorded as its own flag rather than
-        // re-derived downstream from `comboRebuild.completed`. The combo phase reifies its
+        // re-derived downstream from the sweep's stats. The combo phase reifies its
         // outcome instead of throwing, so `didThrow` is FALSE even when the frontend call
         // REJECTED — a trust gate reading the sweep's flag directly would therefore credit
         // a rejected refresh too, which is a broader guard than this fix argues for. (Not
@@ -1548,7 +1552,8 @@ async function registerComfyNodeDefs(preloadedDefs) {
         console.warn(
           `[comfyui-mcp-panel] refreshComboInNodes() had not answered within ${comboWaitMs}ms; ` +
             `not waiting further — this run's own sweep rebuilt ${comboRebuild.combosRebuilt} combo ` +
-            `option list(s) across ${comboRebuild.nodesSwept} node(s) from the payload it fetched.`,
+            `option list(s) across ${comboRebuild.nodesSwept} node(s) from the payload it fetched, ` +
+            "skipping none.",
         );
       } else if (!comboRan) {
         // A SEPARATE FLAG, for the third time on this path and the same reason each time:
@@ -1604,11 +1609,17 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // satisfies the same predicate this flag has always stood for: an authoritative
     // payload was obtained AND the lists were rebuilt from it.
     //
-    // `comboRebuild.completed` is set by the sweep as its last statement, so a sweep that
-    // threw part way — or never ran, for want of a graph or a payload — leaves it false
-    // and this flag falls back to the frontend's call, exactly as before. The two inputs
-    // are kept apart rather than merged into one boolean: the verdict words them
-    // differently, and a caller must be able to see which one held.
+    // WHAT "REBUILT" REQUIRES, and the first version of this got it wrong: not that the
+    // sweep RAN, but that it covered the graph. `comboRebuildCovered` demands both that it
+    // finished (`completed`, its last statement, so a sweep that threw part way cannot
+    // claim it) and that it skipped NOTHING (`combosSkipped === 0`). Reading `completed`
+    // alone granted this flag over combo lists the sweep had walked past without touching
+    // — a V2 `["COMBO", {options}]` spec, which on ComfyUI 0.33 is 467 of 529 combo inputs
+    // — and a missing model whose loader combo was never rebuilt would then have been
+    // SUPPRESSED as stale. That is the one direction this flag must never fail in.
+    //
+    // The two inputs are kept apart rather than merged into one boolean: the verdict words
+    // them differently, and a caller must be able to see which one held.
     nodeDefsRefreshConfirmed = !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
@@ -9185,7 +9196,9 @@ function hasRawMissingAssetCandidates() {
 // call.
 // Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs' verdict
 // is refreshed:true only when it authoritatively fetched /object_info, registered
-// the defs, AND refreshed combos), or FALSE if the refresh errored or the timeout
+// the defs, AND the live combo lists were rebuilt from that payload — by
+// refreshComboInNodes answering, or by this run's own sweep covering the graph, #1193),
+// or FALSE if the refresh errored or the timeout
 // wins first. get_errors
 // trusts the combo on this returned value — NOT the shared nodeDefsRefreshConfirmed
 // global, which a concurrent refresh can overwrite mid-await against a stale combo
@@ -10335,8 +10348,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // completed download already triggers automatically. GLOBAL (not tied to the active
   // graph, so it carries no workflow_path and skips the pinned-target guard),
   // undo-neutral, idempotent. Resolves to the refresh's OWN freshness verdict —
-  // refreshed:true only when it authoritatively fetched /object_info AND refreshed
-  // combos — so the tool reply reflects a real fetch, not just a no-op.
+  // refreshed:true only when it authoritatively fetched /object_info AND the live combo
+  // lists were rebuilt from it (by refreshComboInNodes, or by the run's own sweep with
+  // nothing skipped — #1193 discloses which) — so the tool reply reflects a real fetch,
+  // not just a no-op.
   // #635: a non-fresh verdict now says WHY (reason) and what to do about it
   // (remedy) — a bare {ok:true, refreshed:false} was indistinguishable from a
   // no-op and left the caller guessing whether the call did anything.
