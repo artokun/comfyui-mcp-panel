@@ -397,7 +397,18 @@ import {
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
-import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
+import {
+  isLinkPersisted,
+  removePhantomLink,
+  isWidgetBackedInput,
+  inputLinkIds,
+  railSlotLinkIds,
+  linkIdExclusionSet,
+  findLandedInboundLink,
+  findLandedRailLink,
+  isRailLinkPersisted,
+  landedAfterThrowWarning,
+} from "./lib/connect-verify.js";
 import {
   snapshotGraphState,
   describeInputLink,
@@ -12614,26 +12625,67 @@ const GRAPH_TOOL_EXECUTORS = {
         ? null
         : findExistingRailSlot(graph.outputs, to_input);
       if (existing && typeof existing.connect === "function") {
+        // #1272 — the rail slot's own link ids BEFORE the mutation, so a wire that
+        // pre-dated this call can never be credited to it on the throw path below.
+        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
         graph.beforeChange?.();
         let link;
+        let railConnectErr = null;
         try {
           link = existing.connect(outputSlot, node);
+        } catch (err) {
+          // #1272 — SubgraphOutput.connect writes subgraph._links, the rail slot's
+          // linkIds and the node output's links, and only THEN calls
+          // node.onConnectionsChange. So a throw carries no information about
+          // whether the wire exists. This is the issue's SECOND repro
+          // (to_node_id: -20): it threw, and panel_graph_outline then showed the
+          // link. Decide on the observed post-state instead of on the exception.
+          railConnectErr = err;
         } finally {
           graph.afterChange?.();
         }
-        if (!link) {
+        graph.setDirtyCanvas?.(true, true);
+        // #397 adopted at THIS call site — it had only ever been applied to the
+        // node-to-node branch, so this branch reported success on LiteGraph's
+        // truthy return alone. Ask the live graph on BOTH paths: with the link
+        // connect() returned when there is one, by scanning the rail slot for a
+        // NEW link when it threw instead.
+        const railLanded = railConnectErr
+          ? findLandedRailLink(graph, existing, node, outIdx, "output", railLinkIdsBefore)
+          : isRailLinkPersisted(graph, existing, node, outIdx, "output", link)
+            ? { linkId: String(link.id) }
+            : null;
+        if (!railLanded) {
+          if (railConnectErr) {
+            throw new Error(
+              `panel_connect from node ${node.id} output "${outputSlot?.name ?? outIdx}" to subgraph ` +
+                `output "${existing.name}" threw and NOTHING landed (#1272): ` +
+                `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
+                `this call left no new link from that output on the rail slot. Re-read with ` +
+                `panel_graph_outline ` +
+                `before retrying.`,
+            );
+          }
+          if (!link) {
+            throw new Error(
+              `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
+                `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
+            );
+          }
           throw new Error(
-            `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
-              `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
+            `panel_connect reported no persisted link: node ${node.id} output ` +
+              `"${outputSlot?.name ?? outIdx}" (${outputSlot?.type}) → subgraph output ` +
+              `"${existing.name}" (${existing.type}). LiteGraph accepted the connection but the rail ` +
+              `slot does not carry it, so refusing to report a false success (#397).`,
           );
         }
-        graph.setDirtyCanvas?.(true, true);
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
         return {
           connected: {
             from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
             to: { subgraph_output: existing.name },
           },
+          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
         };
       }
       return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
@@ -12652,26 +12704,61 @@ const GRAPH_TOOL_EXECUTORS = {
         ? null
         : findExistingRailSlot(graph.inputs, from_output);
       if (existing && typeof existing.connect === "function") {
+        // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
+        // excluded so the throw path cannot credit this call with someone else's wire.
+        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
         graph.beforeChange?.();
         let link;
+        let railConnectErr = null;
         try {
           link = existing.connect(inputSlot, node);
+        } catch (err) {
+          // #1272 — SubgraphInput.connect has the same ordering as its output
+          // twin: the link is written to subgraph._links / linkIds / slot.link
+          // before node.onConnectionsChange runs, so a throw does not mean the
+          // wire is absent.
+          railConnectErr = err;
         } finally {
           graph.afterChange?.();
         }
-        if (!link) {
+        graph.setDirtyCanvas?.(true, true);
+        // #397 adopted at THIS call site too (see the output rail above).
+        const railLanded = railConnectErr
+          ? findLandedRailLink(graph, existing, node, inIdx, "input", railLinkIdsBefore)
+          : isRailLinkPersisted(graph, existing, node, inIdx, "input", link)
+            ? { linkId: String(link.id) }
+            : null;
+        if (!railLanded) {
+          if (railConnectErr) {
+            throw new Error(
+              `panel_connect from subgraph input "${existing.name}" to node ${node.id} input ` +
+                `"${inputSlot?.name ?? inIdx}" threw and NOTHING landed (#1272): ` +
+                `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
+                `this call left no new link to that input on the rail slot. Re-read with ` +
+                `panel_graph_outline ` +
+                `before retrying.`,
+            );
+          }
+          if (!link) {
+            throw new Error(
+              `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
+                `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
+            );
+          }
           throw new Error(
-            `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
-              `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
+            `panel_connect reported no persisted link: subgraph input "${existing.name}" ` +
+              `(${existing.type}) → node ${node.id} input "${inputSlot?.name ?? inIdx}" ` +
+              `(${inputSlot?.type}). LiteGraph accepted the connection but the rail slot does not ` +
+              `carry it, so refusing to report a false success (#397).`,
           );
         }
-        graph.setDirtyCanvas?.(true, true);
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
         return {
           connected: {
             from: { subgraph_input: existing.name },
             to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
           },
+          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
         };
       }
       return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
@@ -12739,14 +12826,97 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     }
 
+    // #1272 — what the target's inputs ALREADY reference, captured BEFORE the
+    // mutation. On the throw path below, a link that was there beforehand is not
+    // evidence that THIS call landed; without the exclusion, "threw and did
+    // nothing" and "threw after wiring it" collapse into one indistinguishable
+    // answer.
+    const inboundLinkIdsBefore = linkIdExclusionSet(inputLinkIds(target));
     graph.beforeChange();
     let link;
+    let connectErr = null;
     try {
       link = origin.connect(outIdx, target, inIdx);
+    } catch (err) {
+      // #1272 — do NOT let this escape. LiteGraph's connectSlots writes
+      // graph._links, output.links and input.link and only THEN runs the nodes'
+      // onConnectionsChange hooks (ordering documented in connect-verify.js), so
+      // a hook that throws — Impact-Pack's ImpactSwitch materialising `input2`,
+      // reproduced twice inside a subgraph — leaves a FULLY PERSISTED wire and
+      // still propagates. Reporting the exception told the caller the connect
+      // failed for a link that was already on the graph, and the retry that
+      // follows duplicates or tears down correct wiring. The verdict is decided
+      // on the observed post-state below; nothing is swallowed — when nothing
+      // landed the failure is raised, louder than before.
+      connectErr = err;
     } finally {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
+    if (connectErr) {
+      const landed = findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore);
+      if (!landed) {
+        // Observed, not assumed: LiteGraph drops the old wire BEFORE creating the
+        // new one, so a throw in between can leave the input empty. Say so only
+        // when the live graph actually shows it.
+        const priorWireGone = prevLinkId != null && target.inputs?.[inIdx]?.link == null;
+        // The scan above EXCLUDES ids that pre-dated this call, so "nothing landed"
+        // means "this call added nothing" — NOT "no such wire exists". Re-run it
+        // without the exclusion so an older wire from the same output is DISCLOSED
+        // rather than implicitly denied by the sentence below.
+        const preexisting = findLandedInboundLink(graph, origin, outIdx, target, null);
+        throw new Error(
+          `panel_connect threw and NOTHING landed (#1272): node ${origin.id} output ` +
+            `"${origin.outputs?.[outIdx]?.name ?? outIdx}" → node ${target.id} input ` +
+            `"${target.inputs?.[inIdx]?.name ?? inIdx}" — ${connectErr?.message ?? connectErr}. ` +
+            `Observed post-state of the live graph: this call left NO new link from that ` +
+            `output on node ${target.id}` +
+            (priorWireGone
+              ? `, and the wire that was on that input before this call (from node ` +
+                `${replacedLink?.node_id ?? "?"} output "${replacedLink?.output ?? "?"}") is GONE — ` +
+                `the input is now EMPTY and must be rewired`
+              : "") +
+            (preexisting
+              ? `. A link from that same output was ALREADY on input ` +
+                `"${target.inputs?.[preexisting.inputIndex]?.name ?? preexisting.inputIndex}" ` +
+                `before this call and is untouched — do not tear it down`
+              : "") +
+            `. Re-read with panel_graph_outline before retrying.`,
+        );
+      }
+      const landedSlot = target.inputs?.[landed.inputIndex];
+      return {
+        connected: {
+          from: {
+            node_id: origin.id,
+            output: origin.outputs?.[outIdx]?.name ?? outIdx,
+            output_index: outIdx,
+          },
+          to: {
+            node_id: target.id,
+            input: landedSlot?.name ?? landed.inputIndex,
+            input_index: landed.inputIndex,
+          },
+          type: origin.outputs?.[outIdx]?.type,
+          ...(autoMatched.length ? { auto_matched: autoMatched } : {}),
+          // `replaced_link` claims THIS connect displaced that wire. On the throw
+          // path it may not have: when the node re-slotted the new link elsewhere,
+          // the original is often still on the requested input. Report the
+          // replacement only when the live graph shows the old link is gone.
+          ...(replacedLink && target.inputs?.[inIdx]?.link !== prevLinkId
+            ? { replaced_link: replacedLink }
+            : {}),
+        },
+        warning: landedAfterThrowWarning(
+          connectErr,
+          landed.inputIndex !== inIdx
+            ? `The node re-slotted it: the link landed on input ` +
+                `"${landedSlot?.name ?? landed.inputIndex}" (index ${landed.inputIndex}), not the ` +
+                `requested "${target.inputs?.[inIdx]?.name ?? inIdx}" (index ${inIdx}).`
+            : "",
+        ),
+      };
+    }
     if (!link) {
       // #1266: LiteGraph's connect() refuses a node→ITSELF link unconditionally
       // ("avoid loopback": `if (target_node == this) return null`) BEFORE any
@@ -17129,22 +17299,56 @@ const GRAPH_TOOL_EXECUTORS = {
     const outputType = String(outputSlot?.type ?? "*");
     subgraph.beforeChange?.();
     let subgraphOutput;
-    let link;
+    let exposeConnectErr = null;
     try {
       subgraphOutput = subgraph.addOutput(outputName, outputType);
       subgraphOutput.label = outputSlot?.label;
-      link =
-        typeof subgraphOutput.connect === "function"
-          ? subgraphOutput.connect(outputSlot, node)
-          : null;
-      if (!link) {
-        subgraph.removeOutput?.(subgraphOutput);
-        throw new Error(
-          `Could not link node ${node.id} output "${outputSlot?.name ?? outIdx}" (${outputType}) to a new subgraph output`,
-        );
-      }
+      // The RETURN value is deliberately not kept: it is no longer the verdict.
+      // The live rail slot is (findLandedRailLink below) — the only reading that
+      // survives a throw, where there IS no return value.
+      if (typeof subgraphOutput.connect === "function") subgraphOutput.connect(outputSlot, node);
+    } catch (err) {
+      // #1272 — the removeOutput cleanup used to live INSIDE this try, on the
+      // `!link` branch only, so a THROW from connect() skipped it and left the
+      // rail slot addOutput had just created stranded on the subgraph — a junk
+      // boundary output on every failed expose, also visible as a junk slot on
+      // the parent SubgraphNode. The throw itself is not a verdict either:
+      // SubgraphOutput.connect writes the link before it calls the node's
+      // onConnectionsChange hook, which is the issue's second repro.
+      exposeConnectErr = err;
     } finally {
       subgraph.afterChange?.();
+    }
+    // The slot was created by THIS call, so any link on it is necessarily ours —
+    // no pre-existing ids to exclude.
+    const exposeLanded = subgraphOutput
+      ? findLandedRailLink(subgraph, subgraphOutput, node, outIdx, "output", null)
+      : null;
+    if (!exposeLanded) {
+      let cleanedUp = false;
+      if (subgraphOutput && typeof subgraph.removeOutput === "function") {
+        try {
+          subgraph.removeOutput(subgraphOutput);
+        } catch {
+          /* best-effort: the honest failure below is reported either way */
+        }
+        // OBSERVED, not "the call returned": LGraph.removeOutput dispatches a
+        // CANCELABLE "removing-output" event and returns without removing when a
+        // listener cancels it. A clean return is not a removal, and the message
+        // below claims one.
+        cleanedUp = !(subgraph.outputs ?? []).includes(subgraphOutput);
+      }
+      subgraph.setDirtyCanvas?.(true, true);
+      throw new Error(
+        `Could not link node ${node.id} output "${outputSlot?.name ?? outIdx}" (${outputType}) to a new subgraph output` +
+          (exposeConnectErr
+            ? ` — the frontend threw: ${exposeConnectErr?.message ?? exposeConnectErr}`
+            : "") +
+          (cleanedUp
+            ? `. The subgraph output slot this call created was removed, so the rail carries ` +
+              `no slot from this call.`
+            : `.`),
+      );
     }
     findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
     subgraph.setDirtyCanvas?.(true, true);
@@ -17157,6 +17361,7 @@ const GRAPH_TOOL_EXECUTORS = {
         on_host_subgraph_node: true,
         from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
       },
+      ...(exposeConnectErr ? { warning: landedAfterThrowWarning(exposeConnectErr) } : {}),
     };
   },
 
@@ -17198,20 +17403,47 @@ const GRAPH_TOOL_EXECUTORS = {
     const inputType = String(inputSlot?.type ?? "*");
     subgraph.beforeChange?.();
     let subgraphInput;
-    let link;
+    let exposeConnectErr = null;
     try {
       subgraphInput = subgraph.addInput(inputName, inputType);
       subgraphInput.label = inputSlot?.label;
-      link =
-        typeof subgraphInput.connect === "function" ? subgraphInput.connect(inputSlot, node) : null;
-      if (!link) {
-        subgraph.removeInput?.(subgraphInput);
-        throw new Error(
-          `Could not link a new subgraph input to node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputType})`,
-        );
-      }
+      // See the output twin: the return value is not the verdict, the rail slot is.
+      if (typeof subgraphInput.connect === "function") subgraphInput.connect(inputSlot, node);
+    } catch (err) {
+      // #1272 — same leak as the output twin: the removeInput cleanup was inside
+      // the try on the `!link` branch, so a throw stranded the slot addInput had
+      // just created. And the throw is not a verdict — SubgraphInput.connect
+      // writes the link before running the node's onConnectionsChange hook.
+      exposeConnectErr = err;
     } finally {
       subgraph.afterChange?.();
+    }
+    const exposeLanded = subgraphInput
+      ? findLandedRailLink(subgraph, subgraphInput, node, inIdx, "input", null)
+      : null;
+    if (!exposeLanded) {
+      let cleanedUp = false;
+      if (subgraphInput && typeof subgraph.removeInput === "function") {
+        try {
+          subgraph.removeInput(subgraphInput);
+        } catch {
+          /* best-effort: the honest failure below is reported either way */
+        }
+        // See the output twin: a cancelable "removing-input" event means a clean
+        // return is not evidence of a removal.
+        cleanedUp = !(subgraph.inputs ?? []).includes(subgraphInput);
+      }
+      subgraph.setDirtyCanvas?.(true, true);
+      throw new Error(
+        `Could not link a new subgraph input to node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputType})` +
+          (exposeConnectErr
+            ? ` — the frontend threw: ${exposeConnectErr?.message ?? exposeConnectErr}`
+            : "") +
+          (cleanedUp
+            ? `. The subgraph input slot this call created was removed, so the rail carries ` +
+              `no slot from this call.`
+            : `.`),
+      );
     }
     findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
     subgraph.setDirtyCanvas?.(true, true);
@@ -17224,6 +17456,7 @@ const GRAPH_TOOL_EXECUTORS = {
         on_host_subgraph_node: true,
         to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
       },
+      ...(exposeConnectErr ? { warning: landedAfterThrowWarning(exposeConnectErr) } : {}),
     };
   },
 
