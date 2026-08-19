@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_refresh_nodes` no longer times out with no acknowledgement when a node-def refresh is already running: `refresh_nodes` was the one command relayed in the orchestrator's 30 s window that never took a command budget, so a forced call waited unbounded on the in-flight run AND on its own trailing run — past the window, so the reply the panel's bounds exist to produce never left the tab and the user got `did not reply … the ComfyUI tab may be backgrounded or frozen` about a healthy, idle tab. It now bounds that wait at 25 s (the same budget `graph_add_node` and `nodes_install` hold against the same window) and answers `refreshed:false` with `reason:"refresh_still_running"` and a retry that works — the abandoned run is not cancelled, so it is still registering the definitions the call asked for (#1404)
+
 ## [0.15.6] - 2026-08-19
 
 ### Fixed
