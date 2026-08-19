@@ -1,6 +1,7 @@
 // cmcp-a2ui-lit-adapter.js — routes a scoped set of A2UI leaf components
-// (Text, Button, Divider, Image) through the vendored @a2ui/lit
-// basic catalog (web/js/vendor/a2ui-lit.bundle.js), per Task 1's GO decision.
+// (Text, Divider, Image) through the vendored @a2ui/lit basic catalog
+// (web/js/vendor/a2ui-lit.bundle.js), per Task 1's GO decision.
+// Button is a native <button> in cmcp-a2ui.js (#1407).
 //
 // SCOPE (see task-3-report.md "deviations" for the full rationale):
 //   - Row/Column/Card containers stay hand-rolled in cmcp-a2ui.js. The
@@ -19,16 +20,16 @@
 //   - Heading stays hand-rolled (reviewer fix): the catalog maps it to
 //     Text{variant:hN}, which needs a markdown renderer and otherwise
 //     renders literal "#" prefixes. A plain <hN> is strictly better.
-//   - Text, Button, Divider, Image have no children to interleave
-//     and no read-back requirement, so each mounts as its own tiny
+//   - Text, Divider, Image have no children to interleave and no
+//     read-back requirement, so each mounts as its own tiny
 //     single-component a2ui-surface, wrapped in a plain <span> the
 //     hand-rolled container tree slots in like any other child.
+//   - Button is native HTML in cmcp-a2ui.js. The catalog's Shadow DOM
+//     action callback does not fire on ComfyUI frontend 1.49.6 (#1407).
 //
 // The vendor bundle is dynamically imported INSIDE a function, never at
 // module top level, so this file (and cmcp-a2ui.js, which imports it) stays
 // importable under `node --test` with no DOM/browser present.
-
-import { buttonReplyText } from "./lib/chat-serialize.js";
 
 let _bundlePromise = null;
 function loadBundle() {
@@ -39,9 +40,8 @@ function loadBundle() {
 let _surfaceSeq = 0;
 
 /** v0.9 component messages for ONE leaf, id "root" (a2ui-surface always
- *  renders starting from "root"). `disabled` strips a Button's action —
- *  a protocol-level inert with no Shadow DOM reach-in needed. */
-function leafMessages(c, disabled) {
+ *  renders starting from "root"). */
+function leafMessages(c) {
   switch (c.type) {
     case "Text":
       return [{ id: "root", component: "Text", text: c.text }];
@@ -50,19 +50,6 @@ function leafMessages(c, disabled) {
     case "Image":
       // Catalog prop names are `url`/`description`, not `src`/`alt`.
       return [{ id: "root", component: "Image", url: c.src, description: c.caption || "" }];
-    case "Button": {
-      const label = { id: "label", component: "Text", text: c.label };
-      const btn = {
-        id: "root",
-        component: "Button",
-        child: "label",
-        variant: c.style === "primary" ? "primary" : "default",
-      };
-      // A mini-surface hosts exactly one Button, so the action payload's
-      // content is unused (see onFire()) — the event just needs to fire.
-      if (!disabled) btn.action = { event: { name: "reply" } };
-      return [label, btn];
-    }
     default:
       throw new Error("cmcp-a2ui-lit-adapter: unmapped leaf type " + c.type);
   }
@@ -72,15 +59,11 @@ function leafMessages(c, disabled) {
  * Mount ONE leaf component as its own tiny a2ui-surface. Returns a plain
  * <span> wrapper synchronously (empty); it fills in once the vendor bundle
  * resolves (cached after the first call across all leaves/cards).
- *
- * onFire(): called when a Button's action fires. No payload is passed —
- * the caller already knows which spec component `c` this wrapper is for.
  */
-export function mountA2uiLeaf(c, { onFire } = {}) {
+export function mountA2uiLeaf(c) {
   const wrap = document.createElement("span");
   wrap.className = "cmcp-a2ui-lit-leaf";
   wrap.dataset.a2uiType = c.type;
-  wrap._a2uiWantsDisabled = false;
 
   loadBundle().then(({ basicCatalog, MessageProcessor }) => {
     // Stale-mount guard (reviewer fix): a superseded update() paint (or a
@@ -89,56 +72,27 @@ export function mountA2uiLeaf(c, { onFire } = {}) {
     if (!wrap.isConnected) return;
     const surfaceId = `leaf-${++_surfaceSeq}`;
     const surfaceEl = document.createElement("a2ui-surface");
-    const processor = new MessageProcessor([basicCatalog], () => onFire?.());
+    const processor = new MessageProcessor([basicCatalog]);
     processor.onSurfaceCreated((s) => {
       surfaceEl.surface = s;
     });
     processor.processMessages([
       { version: "v0.9", createSurface: { surfaceId, catalogId: basicCatalog.id } },
-      // Mount already-inert if resolve() raced ahead of this promise (e.g.
-      // the card was dismissed before the bundle finished loading).
-      { version: "v0.9", updateComponents: { surfaceId, components: leafMessages(c, wrap._a2uiWantsDisabled) } },
+      { version: "v0.9", updateComponents: { surfaceId, components: leafMessages(c) } },
     ]);
     wrap.appendChild(surfaceEl);
     wrap._a2uiProcessor = processor;
     wrap._a2uiSurfaceId = surfaceId;
   });
 
-  // Card lifecycle hook (called from cmcp-a2ui.js's resolve()): make this
-  // leaf inert. No-op for non-Button leaves (Text/Divider/Image
-  // have no interaction to disable).
-  wrap._a2uiDisable = () => {
-    wrap._a2uiWantsDisabled = true;
-    if (c.type !== "Button" || !wrap._a2uiProcessor) return;
-    wrap._a2uiProcessor.processMessages([
-      { version: "v0.9", updateComponents: { surfaceId: wrap._a2uiSurfaceId, components: leafMessages(c, true) } },
-    ]);
-  };
-
   return wrap;
 }
 
 /**
- * Entry point cmcp-a2ui.js's mountComponents() calls for the four leaf types
- * routed through Lit (Text, Button, Divider, Image). `ctx` is the same lifecycle context renderA2UICard()
- * builds (buttons/inputs/fields/choose/isResolved) — Button wiring mirrors
- * the hand-rolled Button case exactly (reply text, submit serialization via
- * ctx.fields, ctx.choose()) so resolve()/update() behave identically
- * regardless of which path rendered a given card.
+ * Entry point cmcp-a2ui.js's mountComponents() calls for the leaf types
+ * routed through Lit (Text, Divider, Image). Button is a native <button>
+ * in that file so a click reaches ctx.choose() on frontend 1.49.6 (#1407).
  */
-export function mountStandardComponent(c, ctx) {
-  if (c.type === "Button") {
-    const wrap = mountA2uiLeaf(c, {
-      onFire: () => {
-        if (ctx.isResolved()) return;
-        // buttonReplyText coerces an object reply to a string BEFORE the submit
-        // fields template interpolates it, so a malformed spec can't bake
-        // "[object Object]" into the outgoing message (#219).
-        ctx.choose(wrap, buttonReplyText(c, ctx.fields));
-      },
-    });
-    ctx.buttons.push(wrap);
-    return wrap;
-  }
+export function mountStandardComponent(c) {
   return mountA2uiLeaf(c);
 }

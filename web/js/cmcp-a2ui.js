@@ -6,7 +6,7 @@
 // Component types and attributes come from the enums validated here. See
 // docs/superpowers/specs/2026-07-10-a2ui-chat-design.md.
 
-import { coerceMessageText } from "./lib/chat-serialize.js";
+import { buttonReplyText, coerceMessageText } from "./lib/chat-serialize.js";
 
 export const A2UI_CAPS = Object.freeze({
   maxComponents: 64,
@@ -215,17 +215,19 @@ export function validateA2UISpec(raw) {
 // Part 2: renderer + card lifecycle. document is touched only inside calls.
 //
 // GO branch (Task 1 spike decided GO — see .superpowers/sdd/task-1-report.md):
-// Text/Button/Divider/Image mount through the vendored @a2ui/lit
-// basic catalog via cmcp-a2ui-lit-adapter.js. Row/Column/Card containers,
-// TextField/Select/Checkbox form fields, and Heading stay hand-rolled here —
-// see the scope note at the top of cmcp-a2ui-lit-adapter.js and
-// task-3-report.md for why (container interleaving with comfy:graph/chart;
-// reliable synchronous read-back for submit serialization; Heading would
-// render literal "#" without a markdown renderer). comfy:graph/comfy:chart
-// are always hand-rolled: we draw those SVGs from data, which IS the custom
-// catalog. This static import is DOM-free at module scope (the adapter
-// lazy-imports the vendor bundle inside a function), so this file stays
-// importable under `node --test`.
+// Text/Divider/Image mount through the vendored @a2ui/lit basic catalog via
+// cmcp-a2ui-lit-adapter.js. Button is a native <button> whose click handler
+// calls buttonReplyText + ctx.choose (#1407 — the Lit Shadow DOM action
+// callback does not fire on ComfyUI frontend 1.49.6). Row/Column/Card
+// containers, TextField/Select/Checkbox form fields, and Heading stay
+// hand-rolled here — see the scope note at the top of
+// cmcp-a2ui-lit-adapter.js and task-3-report.md for why (container
+// interleaving with comfy:graph/chart; reliable synchronous read-back for
+// submit serialization; Heading would render literal "#" without a
+// markdown renderer). comfy:graph/comfy:chart are always hand-rolled: we
+// draw those SVGs from data, which IS the custom catalog. This static
+// import is DOM-free at module scope (the adapter lazy-imports the vendor
+// bundle inside a function), so this file stays importable under `node --test`.
 // ---------------------------------------------------------------------------
 
 import { mountStandardComponent } from "./cmcp-a2ui-lit-adapter.js";
@@ -455,10 +457,11 @@ function buildChartSVG(c) {
 
 /**
  * Mount one validated spec into a container element. Internal seam: standard
- * leaf types (Text/Button/Divider/Image) delegate to the Lit adapter;
- * Heading, containers (Row/Column/Card), form fields (TextField/Select/
- * Checkbox), and comfy:* stay hand-rolled here (see cmcp-a2ui-lit-adapter.js's
- * scope note; Heading is hand-rolled so it never shows raw "#" markdown).
+ * leaf types (Text/Divider/Image) delegate to the Lit adapter; Button is a
+ * native <button> (#1407); Heading, containers (Row/Column/Card), form
+ * fields (TextField/Select/Checkbox), and comfy:* stay hand-rolled here
+ * (see cmcp-a2ui-lit-adapter.js's scope note; Heading is hand-rolled so it
+ * never shows raw "#" markdown).
  * Returns nothing; ctx.fields collects { name, read() } for submit serialization.
  */
 function mountComponents(container, spec, ctx) {
@@ -470,10 +473,24 @@ function mountComponents(container, spec, ctx) {
     const c = byId.get(id);
     switch (c.type) {
       case "Text":
-      case "Button":
       case "Divider":
       case "Image":
         return mountStandardComponent(c, ctx);
+      case "Button": {
+        // Native HTML, not the Lit a2ui-surface. Frontend 1.49.6 never
+        // delivers the catalog's Shadow DOM action callback, so a Button
+        // mounted there looks clickable and does nothing (#1407).
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "cmcp-a2ui-btn" + (c.style === "primary" ? " primary" : "");
+        btn.textContent = c.label;
+        btn.addEventListener("click", () => {
+          if (ctx.isResolved()) return;
+          ctx.choose(btn, buttonReplyText(c, ctx.fields));
+        });
+        ctx.buttons.push(btn);
+        return btn;
+      }
       case "Heading": {
         // Hand-rolled (reviewer fix): the Lit catalog's Text{variant:hN}
         // renders literal "#" prefixes without a markdown renderer. A plain
@@ -582,7 +599,7 @@ export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = 
       // a submit-serialized object) can arrive as a non-string here. Normalize
       // at this single chokepoint so an object never reaches resolve()'s
       // choiceText.split() or the outgoing user_message as "[object Object]"
-      // (#219). Both the hand-rolled and Lit Button paths flow through choose().
+      // (#219). The native Button click path flows through choose().
       const reply = coerceMessageText(text);
       handle.resolve(reply, btn);
       onAction?.(reply);
@@ -633,9 +650,9 @@ export function renderA2UICard(spec, { onAction, onDismiss, cardId: reuseId } = 
       el.classList.add("resolved");
       el.querySelector(".cmcp-a2ui-x")?.remove();
       for (const b of ctx.buttons) {
-        b.disabled = true; // harmless on the Lit wrapper <span>; real effect if ever a native <button>
+        b.disabled = true;
         b.classList?.add("cmcp-a2ui-lit-inert");
-        b._a2uiDisable?.(); // Lit path: strip the Button's action at the protocol level
+        b._a2uiDisable?.();
       }
       if (chosenBtn) chosenBtn.classList.add("chosen");
       for (const i of ctx.inputs) i.disabled = true;
