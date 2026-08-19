@@ -33,11 +33,18 @@
  * reference, so `node.images === record.output.images` is exactly "what is on screen
  * is the stolen entry". When that does not hold, only the leftover store entry goes.
  *
- * Known gap, deliberately not closed here: ownership is seeded from `executed`, so a
- * node whose only output is `b_preview` latent frames (a KSampler mid-run) never
- * enters the ledger and is still judged by type alone. Seeding that would mean
- * attributing on `executing` -- ownership from "started" rather than "emitted" -- which
- * is a different rule than this issue asks for.
+ * Known gaps, deliberately not closed here. Both leave an image-capable victim to the
+ * pre-existing type gate, which is where it already was, so neither is a regression:
+ *
+ *   - Ownership is seeded from `executed`, so a node whose only output is `b_preview`
+ *     latent frames (a KSampler mid-run) never enters the ledger and is judged by type
+ *     alone. Seeding it would mean attributing on `executing` -- ownership from
+ *     "started" rather than "emitted" -- a different rule than this issue asks for.
+ *   - A gifs/videos-only emitter (VHS_VideoCombine) has no `output.images` for the
+ *     frontend to alias, so there is no identity to test and `rendered` is false: the
+ *     inherited entry is dropped but a stale animation on an image-capable victim is
+ *     not. Deciding that one needs content matching, which is weaker evidence than
+ *     anything else here rests on.
  */
 
 export const CANVAS_IMAGE_PREVIEW_WIDGET = "$$canvas-image-preview";
@@ -396,26 +403,30 @@ export function stripMisattachedExecutionPreviews({
   for (const node of nodes) {
     if (!node) continue;
     // A type that COULD show an image is exempt only while nothing proves the image
-    // it is showing belongs to someone else (#1374) -- and when something does, only
-    // the inherited state goes, never the node's own.
+    // it is showing belongs to someone else (#1374). Eviction is what that proof buys,
+    // and it is deliberately NARROWER than the type gate's strip -- so it must not
+    // replace it. A node that can never host a preview still falls through and gets
+    // stripped in full; otherwise proving a ConditioningConcat's entry stolen would
+    // leave it holding the very preview #1286 exists to remove.
     const stolen = owners ? stolenExecutionPreviewRecord(owners, node, stores) : null;
+    let changed = false;
     if (stolen) {
-      if (evictInheritedExecutionPreview(node, stores, stolen)) stripped += 1;
+      changed = evictInheritedExecutionPreview(node, stores, stolen);
       // The entry is gone; the record can no longer describe anything.
       owners.delete(String(node.id));
-      continue;
     }
-    if (nodeAcceptsExecutionImagePreview(node)) continue;
-    const hasPreview =
-      node.imgs != null ||
-      node.images != null ||
-      node.preview != null ||
-      (Array.isArray(node.widgets) &&
-        node.widgets.some((w) => w?.name === CANVAS_IMAGE_PREVIEW_WIDGET)) ||
-      storeHasImages(nodeOutputs, node.id) ||
-      storeHasImages(nodePreviewImages, node.id);
-    if (!hasPreview) continue;
-    if (stripNodeExecutionPreview(node, stores)) stripped += 1;
+    if (!nodeAcceptsExecutionImagePreview(node)) {
+      const hasPreview =
+        node.imgs != null ||
+        node.images != null ||
+        node.preview != null ||
+        (Array.isArray(node.widgets) &&
+          node.widgets.some((w) => w?.name === CANVAS_IMAGE_PREVIEW_WIDGET)) ||
+        storeHasImages(nodeOutputs, node.id) ||
+        storeHasImages(nodePreviewImages, node.id);
+      if (hasPreview && stripNodeExecutionPreview(node, stores)) changed = true;
+    }
+    if (changed) stripped += 1;
   }
   if (owners) pruneExecutionPreviewOwners(owners, nodesById, stores);
   return { stripped, rehomed };

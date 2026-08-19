@@ -473,6 +473,51 @@ test("#1374: a LoadImage on a reused id keeps the thumbnail it hydrated itself",
   assert.deepEqual(loader.size, [315, 314], "the node must not collapse");
 });
 
+test("#1374: proving a NON-host's entry stolen still strips it in full (#1286 stays fixed)", () => {
+  const owners = new Map();
+  const { nodeOutputs } = runOneEmission(73, owners);
+
+  // ComfyUI's own paste/undo hands id 73 to a ConditioningConcat — #1286's victim, and
+  // a type that can never host a preview. A preview-only run then plants imgs and the
+  // pseudo-widget on it from a b_preview frame, so nothing it shows was aliased from
+  // the inherited entry: the narrow eviction alone would leave the whole symptom on
+  // screen while still reporting a strip.
+  const concat = concatNode(73);
+  const live = ["data:image/png;base64,AAAA"];
+  const nodePreviewImages = { "73": live };
+  const widget = concat.widgets[0];
+
+  const { stripped } = stripMisattachedExecutionPreviews({
+    graph: { _nodes: [concat] },
+    nodeOutputs,
+    nodePreviewImages,
+    owners,
+  });
+
+  assert.equal(stripped, 1);
+  assert.equal(concat.imgs, undefined, "the concat must not keep the preview");
+  assert.equal(concat.images, undefined);
+  assert.equal(concat.widgets.length, 0, "the pseudo-widget must go");
+  assert.equal(widget.removed, true);
+  assert.deepEqual(concat.size, [153, 46], "the node must collapse back");
+  assert.equal(nodeOutputs["73"], undefined);
+  assert.equal(nodePreviewImages["73"], undefined, "a non-host keeps no frame at all");
+});
+
+test("#1374: a non-host is counted once, not twice, when both paths fire", () => {
+  const owners = new Map();
+  const { entry, nodeOutputs } = runOneEmission(73, owners);
+  const concat = concatNode(73);
+  concat.images = entry.images; // rendered from the stolen entry AND a non-host
+  const { stripped } = stripMisattachedExecutionPreviews({
+    graph: { _nodes: [concat] },
+    nodeOutputs,
+    nodePreviewImages: {},
+    owners,
+  });
+  assert.equal(stripped, 1);
+});
+
 test("#1374: eviction does not take a live b_preview frame with it", () => {
   const owners = new Map();
   const { entry, nodeOutputs } = runOneEmission(9, owners);
