@@ -123,9 +123,10 @@ URL lives under **Advanced**).
 
 Type `/` in the composer for commands — panel ones like **`/reload`** (pick up
 new code, keep the chat), **`/reload-ui`** (reload just the panel), **`/revert`**
-(undo the last turn's graph edits), and **`/restart`** (recover an unresponsive
-agent — kills the orchestrator and its child tree, starts fresh). On the Claude
-backend, provider slash commands (`/compact`, `/loop`, …) are available too.
+(undo the last turn's graph edits), **`/record-skill`** (save the open graph as a
+reusable skill), and **`/restart`** (recover an unresponsive agent — kills the
+orchestrator and its child tree, starts fresh). On the Claude backend, provider
+slash commands (`/compact`, `/loop`, …) are available too.
 
 ## What the agent can do
 

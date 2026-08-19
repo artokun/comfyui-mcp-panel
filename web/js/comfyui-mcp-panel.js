@@ -253,6 +253,7 @@ import {
   missingInventoryIds,
   nodeInventoryLabel,
 } from "./lib/graph-node-inventory.js";
+import { recordSkillFromGraph, persistRecordedSkill } from "./lib/record-skill.js";
 // #1192 — ONE deadline for a whole COMMAND, which every bounded step inside it draws from.
 // A module because the defect is a COMPOSITION property: each of graph_add_node's bounds
 // was individually correct and their sum was not, and a sum cannot be asserted against the
@@ -34753,15 +34754,16 @@ function buildPanel() {
    *  /revert now awaits an async graph load — normalizing through Promise.resolve
    *  keeps a rejection from escaping as an unhandled promise, and surfaces it in the
    *  transcript instead of only the console. */
-  function runSlashCommand(entry) {
+  function runSlashCommand(entry, raw) {
     // `cmd` is the literal command the user typed ("/revert") — a placeholder, never
-    // translated prose.
+    // translated prose. `raw` is the full composer line so commands that take a name
+    // (`/record-skill portrait-look`) can read it; commands that ignore args stay the same.
     const failed = (err) =>
       appendSystem(
         tr("panel.slash_command_failed", "{cmd} failed: {error}", { cmd: entry.cmd, error: coerceMessageText(err?.message ?? err) }),
       );
     try {
-      Promise.resolve(entry.run()).catch(failed);
+      Promise.resolve(entry.run(raw ?? entry.cmd)).catch(failed);
     } catch (err) {
       failed(err);
     }
@@ -34823,6 +34825,61 @@ function buildPanel() {
       icon: "pi-info-circle",
       get hint() { return tr("panel.show_the_last_execution_errors", "show the last execution errors"); },
       run: () => runLocalCommand("graph_get_errors", {}),
+    },
+    {
+      cmd: "/record-skill",
+      icon: "pi-bookmark",
+      get hint() { return tr("panel.record_the_open_graph_as_a_skill", "record the open graph as a reusable skill"); },
+      run: async (raw) => {
+        let graph;
+        try {
+          ({ graph } = getGraphCtx());
+        } catch (err) {
+          appendSystem(
+            tr("panel.record_skill_canvas_unavailable", "Cannot record a skill — {error}", {
+              error: coerceMessageText(err?.message ?? err),
+            }),
+          );
+          return;
+        }
+        const recorded = recordSkillFromGraph(graph, {
+          title: getWorkflowTitle(),
+          commandText: raw,
+        });
+        if (!recorded.ok) {
+          appendSystem(
+            recorded.reason === "empty"
+              ? tr("panel.nothing_to_record_the_canvas_has_no_nodes", "Nothing to record — the canvas has no nodes.")
+              : tr("panel.record_skill_canvas_unavailable", "Cannot record a skill — {error}", {
+                  error: recorded.reason,
+                }),
+          );
+          return;
+        }
+        const saved = await persistRecordedSkill({
+          fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
+          path: recorded.path,
+          markdown: recorded.markdown,
+        });
+        if (!saved.ok) {
+          appendSystem(
+            tr(
+              "panel.recorded_skill_could_not_save",
+              "Recorded “{name}” ({nodes} nodes) but could not save it: {error}. The skill markdown is in this chat.",
+              { name: recorded.slug, nodes: recorded.nodeCount, error: saved.error },
+            ),
+          );
+          appendSystem(recorded.markdown);
+          return;
+        }
+        appendSystem(
+          tr(
+            "panel.recorded_skill_saved_as",
+            "Recorded skill “{name}” ({nodes} nodes) at {path}. Ask the agent to follow this skill to rebuild the graph.",
+            { name: recorded.slug, nodes: recorded.nodeCount, path: saved.path },
+          ),
+        );
+      },
     },
     {
       cmd: "/docs",
@@ -34937,7 +34994,7 @@ function buildPanel() {
       appendUser(item.ref.cmd);
       // Some slash commands (/revert) are async now. Normalize so a rejection can
       // never surface as an unhandled promise from a sync UI handler.
-      runSlashCommand(item.ref);
+      runSlashCommand(item.ref, item.ref.cmd);
       return;
     }
     const { start, end } = menuToken ?? { start: input.value.length, end: input.value.length };
@@ -36171,7 +36228,7 @@ function buildPanel() {
         appendUser(text);
         input.value = "";
         input.style.height = "auto";
-        runSlashCommand(c);
+        runSlashCommand(c, text);
         return;
       }
     }

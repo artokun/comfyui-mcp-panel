@@ -705,11 +705,13 @@ test("#604 wiring: async slash commands cannot leave a floating promise", () => 
   // /revert's run() is async now. Both entry points (the slash menu and typing the
   // command) must go through the normalizing runner rather than calling run()
   // bare, or a rejection surfaces as an unhandled promise from a sync UI handler.
-  assert.match(src, /function runSlashCommand\(entry\) \{[\s\S]*?Promise\.resolve\(entry\.run\(\)\)\.catch\(/);
+  // The runner may pass the typed line as a second arg (`/record-skill name`); the
+  // invariant is that run() is always wrapped in Promise.resolve(...).catch.
+  assert.match(src, /function runSlashCommand\(entry(?:, raw)?\) \{[\s\S]*?Promise\.resolve\(entry\.run\([^)]*\)\)\.catch\(/);
   // POSITIVE assertions: forbidding the bare form alone would also pass if a call
   // site were deleted, or replaced with some other unguarded invocation.
-  assert.match(src, /\n\s*runSlashCommand\(item\.ref\);/, "the slash menu must route through the runner");
-  assert.match(src, /\n\s*runSlashCommand\(c\);/, "so must the typed-command path");
+  assert.match(src, /\n\s*runSlashCommand\(item\.ref(?:, item\.ref\.cmd)?\);/, "the slash menu must route through the runner");
+  assert.match(src, /\n\s*runSlashCommand\(c(?:, text)?\);/, "so must the typed-command path");
   assert.doesNotMatch(src, /\n\s*item\.ref\.run\(\);/, "and neither may call run() bare");
   assert.doesNotMatch(src, /\n\s*c\.run\(\);/);
   assert.match(src, /rewindLastTurn\(\)\.catch\(/, "the double-Esc rewind is fire-and-forget with a catch");
