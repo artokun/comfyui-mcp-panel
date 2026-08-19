@@ -42,6 +42,13 @@ function errorText(err) {
  * (or the frontend) may have chained on top, and restoring over that would
  * silently drop THEIR wrapper. A deactivated wrapper left in a chain is a
  * pass-through, so every restore order stays correct.
+ *
+ * The handle also reports `entered`: how many times the wrapper actually RAN
+ * while active. Installed is not entered — a frontend whose nodes do not resolve
+ * `configure` through `LGraphNode.prototype` leaves this at 0 while every field
+ * above still reads like a clean load. It is a DIAGNOSTIC here and nothing gates
+ * on it; `loadRestoreCompleted` explains why the graph-level count is the one
+ * that licenses the verdict and this one must not.
  */
 export function installNodeConfigureIsolation(LG) {
   const proto = LG?.LGraphNode?.prototype;
@@ -49,8 +56,10 @@ export function installNodeConfigureIsolation(LG) {
   const original = proto.configure;
   const failures = [];
   let active = true;
+  let entered = 0;
   const wrapped = function (info) {
     if (!active) return original.call(this, info);
+    entered += 1;
     try {
       return original.call(this, info);
     } catch (err) {
@@ -66,6 +75,9 @@ export function installNodeConfigureIsolation(LG) {
   proto.configure = wrapped;
   return {
     failures,
+    get entered() {
+      return entered;
+    },
     restore() {
       active = false;
       if (proto.configure === wrapped) proto.configure = original;
@@ -175,6 +187,23 @@ export function retryNodeRestores(graph, failures) {
  * configure). The caller must read null as UNKNOWN — never as "nothing threw" —
  * because a frontend this cannot instrument is exactly one whose restore it cannot
  * vouch for.
+ *
+ * ## INSTALLED is not ENTERED — why the handle counts `entered`
+ *
+ * Wrapping a prototype method proves the method exists. It does NOT prove the
+ * restore went THROUGH it. On a frontend where the root graph stops resolving
+ * `configure` via `LGraph.prototype` — an own-property `configure` on the graph
+ * instance, or a subclass whose `configure` does not call `super` — the wrap
+ * installs, is never entered, and `throws` stays empty for the whole load. An
+ * empty `throws` then means either "nothing threw" or "nothing was watched", and
+ * those are the two states this module exists to keep apart. A genuinely partial
+ * load would be waved through as normalization, which is precisely the harm the
+ * observation was added to prevent.
+ *
+ * So `entered` counts every call that reached the ACTIVE wrapper (a deactivated
+ * one is a pass-through and counts nothing — an entry after `restore()` is not
+ * evidence about the load). `entered === 0` means the question was never asked,
+ * and `loadRestoreCompleted` folds it to UNKNOWN.
  */
 export function installGraphConfigureWatch(LG) {
   const proto = LG?.LGraph?.prototype;
@@ -182,8 +211,13 @@ export function installGraphConfigureWatch(LG) {
   const original = proto.configure;
   const throws = [];
   let active = true;
+  let entered = 0;
   const wrapped = function (...args) {
     if (!active) return original.apply(this, args);
+    // BEFORE the try. This counts ENTRY, not success: a call that throws was
+    // still watched, and a counter incremented on the way out would read 0 for
+    // exactly the aborted load this watch exists to see.
+    entered += 1;
     try {
       return original.apply(this, args);
     } catch (err) {
@@ -196,6 +230,9 @@ export function installGraphConfigureWatch(LG) {
   proto.configure = wrapped;
   return {
     throws,
+    get entered() {
+      return entered;
+    },
     restore() {
       active = false;
       // Only when this wrapper is still the installed one — the same rule
@@ -209,19 +246,53 @@ export function installGraphConfigureWatch(LG) {
 /**
  * Fold the two observations into ONE answer with THREE states.
  *
- * `true`  — every wrap was installed AND nothing threw: the restore ran to the end.
+ * `true`  — the graph restore RAN THROUGH the watch and nothing threw: it ran to
+ *           the end.
  * `false` — something threw. The partial-load hypothesis is LIVE for this load.
- * `null`  — at least one wrap could not be installed, so the question was never
- *           asked. Unknown, and the caller must treat it as such: a load that
- *           could not be watched proves nothing about whether it completed.
+ * `null`  — the question was never asked. Either a wrap could not be installed, or
+ *           it was installed on a method the restore never called. Unknown, and the
+ *           caller must treat it as such: a load that could not be watched proves
+ *           nothing about whether it completed.
  *
  * The null case is the point. Collapsing "nothing threw" and "nobody looked" into
  * one boolean is the exact defect this whole family is about, one level down.
+ *
+ * ## Why `graphWatch.entered` gates the verdict
+ *
+ * The first cut of this fold asked only whether both handles EXIST and neither
+ * recorded anything. Existence is an answer about the prototype, not about the
+ * load: install on a method nothing calls and both records stay empty, which is
+ * byte-identical to a clean restore. That is the same two-states-one-answer fold
+ * one level further down, and no test could see it, because a test that drives the
+ * wrappers always enters them.
+ *
+ * An ABSENT or non-numeric count is unknown too, not a pass. A handle that cannot
+ * say whether it ran has not established that it ran.
+ *
+ * ## Why `nodeIsolation.entered` does NOT, and must not
+ *
+ * Two reasons, and they point the same way.
+ *
+ * 1. Zero node configures is a LEGITIMATE completed restore — an empty workflow,
+ *    or one whose nodes all failed to construct. Gating on it would answer UNKNOWN
+ *    for loads that demonstrably ran to the end: a false negative manufactured by
+ *    the guard, which is the fix being worse than the bug.
+ * 2. It is not needed. The node wrapper is a CONTAINMENT, and the graph watch is
+ *    the backstop underneath it: a node whose `configure` never routes through
+ *    `LGraphNode.prototype` still throws INTO `LGraph.prototype.configure`'s node
+ *    loop, which has no try/catch of its own — so the abort escapes into the graph
+ *    watch and is recorded there. An unentered node wrapper loses containment for
+ *    that node; it does not lose the OBSERVATION. An unentered graph watch loses
+ *    the observation outright, which is why only that one may answer null.
  */
 export function loadRestoreCompleted({ nodeIsolation, graphWatch } = {}) {
   if (!nodeIsolation || !graphWatch) return null;
   const nodeFailures = Array.isArray(nodeIsolation.failures) ? nodeIsolation.failures : null;
   const graphThrows = Array.isArray(graphWatch.throws) ? graphWatch.throws : null;
   if (!nodeFailures || !graphThrows) return null;
+  // INSTALLED IS NOT ENTERED. An empty `throws` off a watch the restore never
+  // reached is "nobody looked", and it must not read as "nothing threw".
+  const graphEntered = graphWatch.entered;
+  if (typeof graphEntered !== "number" || graphEntered < 1) return null;
   return nodeFailures.length === 0 && graphThrows.length === 0;
 }
