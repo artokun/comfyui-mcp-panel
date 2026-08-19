@@ -20,6 +20,7 @@ import {
   POWER_LORA_LOADER_TYPE,
 } from "../../web/js/lib/rgthree-lora-row.js";
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { setWidgetCommandBudgetDeps } from "./_panel-constants.mjs";
 
 const SLOT = { on: true, lora: "x.safetensors", strength: 0.5, strengthTwo: null };
 
@@ -1317,6 +1318,12 @@ const EXECUTOR_DEPS = [
   "refreshComfyNodeDefs",
   "clearStaleRedFlag",
   "snapshotAuthorizationNote",
+  // #1413 — the handler's first line is now a command budget. The REAL pieces, collected in
+  // _panel-constants.mjs so no harness keeps its own copy of the numbers.
+  "makeCommandBudget",
+  "SET_WIDGET_COMMAND_BUDGET_MS",
+  "SET_WIDGET_POST_REFRESH_RESERVE_MS",
+  "monotonicNow",
 ];
 
 /**
@@ -1450,6 +1457,9 @@ function executor(node, overrides = {}) {
     clearStaleRedFlag: () => {},
     objectInfoHistory: { wasTypeEverDefined: () => true },
     comfyBackendIsDown: () => false,
+    // #1413 — the handler now takes a command budget on its first line. The real pieces,
+    // with the shipped numbers, from the shared harness constants.
+    ...setWidgetCommandBudgetDeps(),
     ...overrides,
   };
   const factory = new Function(
