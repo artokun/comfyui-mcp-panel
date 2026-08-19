@@ -16694,14 +16694,17 @@ const GRAPH_TOOL_EXECUTORS = {
             content_normalized_note:
               `Every node in this workflow came back with the same id and type, nothing extra ` +
               `appeared, and the panel WATCHED this load: no node's configure threw and the graph ` +
-              `restore ran to completion, so nothing was dropped by a load that stopped early — ` +
-              `which is the one way a load can silently lose values. What differs from the file is ` +
-              `per-node ${openContentNormalized.join(", ")}. The panel observed the difference and ` +
-              `NOT its cause: these are fields the ComfyUI frontend rewrites while loading (widget ` +
-              `values are migrated, input and output slots are rebuilt from the node definition), ` +
-              `but this reply does NOT establish that each value still means what the file meant. ` +
-              `If an exact widget value matters, read it with panel_graph_outline. Saving from ` +
-              `here writes the live values, not the file's.`,
+              `restore ran to completion. So the load did not stop part-way — the failure mode ` +
+              `that leaves a full node set over nodes that lost their values — and that is why ` +
+              `the open is reported APPLIED and the workflow_uuid published rather than refused. ` +
+              `What differs from the file is per-node ${openContentNormalized.join(", ")}. The ` +
+              `panel observed that difference and NOT its cause. It is NOT established that each ` +
+              `value still means what the file meant: a completed load can still hand a node ` +
+              `different values than the file held — the frontend migrates widget values and ` +
+              `rebuilds slot arrays from the node definition, and a node whose definition changed ` +
+              `since the file was saved is remapped without anything throwing. If an exact widget ` +
+              `value matters, read it with panel_graph_outline. Saving from here writes the live ` +
+              `values, not the file's.`,
           }
         : {}),
       modified: !!target.isModified,

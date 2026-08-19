@@ -146,6 +146,20 @@ export function retryNodeRestores(graph, failures) {
  * first, for #1260. This records the second. Together they answer the question the
  * comment says cannot be answered: **did any part of this restore abort?**
  *
+ * ## Why the pair is exhaustive and the node wrap alone is not
+ *
+ * `installNodeConfigureIsolation` wraps `LGraphNode.prototype.configure`, and the
+ * frontend's `ComfyNode.prototype.configure` runs BEFORE it and calls `super`. A
+ * ComfyNode configure that throws before reaching super therefore never enters that
+ * wrapper — it escapes the node loop instead, which aborts `LGraph.prototype.configure`
+ * itself. That is the throw THIS wrap records. The same holds one level down: a
+ * `Subgraph.configure` that throws before `super.configure` aborts the ROOT
+ * `LGraph.configure` call that invoked it, which is wrapped.
+ *
+ * So every abort lands in exactly one of the two records: contained by the node
+ * wrapper, or observed escaping into the graph one. Neither alone would be enough to
+ * license anything.
+ *
  * That is a POSITIVE observation, not a widened tolerance. It never says a
  * difference is benign; it says the load did not stop early, which is the one
  * hypothesis the refusal rests on.
