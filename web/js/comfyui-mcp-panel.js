@@ -224,6 +224,7 @@ import {
   verifyExternalLinks,
 } from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
+import { isGenericManagerUpdateError, readUpdateTraceback } from "./lib/manager-update-traceback.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
@@ -19735,7 +19736,16 @@ const GRAPH_TOOL_EXECUTORS = {
         };
       }
       const { item, status } = await waitForUpdateResult(ui_id);
-      const outcome = classifyUpdateOutcome({ item, status, target: id, dialect });
+      // #1320 — Manager's do_update records only "An error occurred while
+      // updating 'X'." and prints the real traceback to the server log. When
+      // the stored reason is that generic sentence, fetch the log and attach
+      // the traceback so the tool result is the evidence, not a pointer to it.
+      let traceback;
+      const failReason = taskFailureReason(item);
+      if (isGenericManagerUpdateError(failReason)) {
+        traceback = await readUpdateTraceback(id, api);
+      }
+      const outcome = classifyUpdateOutcome({ item, status, target: id, dialect, traceback });
       if (outcome.state === "failed") throw new Error(outcome.message);
       if (outcome.state === "updated") {
         return {
