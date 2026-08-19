@@ -593,6 +593,11 @@ import {
   nameContainsPathSeparator,
   pathSeparatorNameError,
 } from "./lib/workflow-save.js";
+import {
+  WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+  runBoundedWorkflowSave,
+  workflowSaveTimeoutObservation,
+} from "./lib/workflow-save-budget.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import {
   clearInheritedExecutionPreview,
@@ -6109,6 +6114,11 @@ async function programmaticSave(name) {
   // the Save-As copy the adapter PROVED active; `savedRecord` covers the first-save path.
   // Either way it is the save transaction's own output, never a later active-canvas read.
   return { name: saved || getWorkflowTitle(), producedRecord: details?.activatedRecord || details?.savedRecord || null, ...outcome };
+}
+
+/** #1434 — dirty/persisted snapshot for a save that did not settle in time. */
+function observeActiveWorkflowSaveState() {
+  return workflowSaveTimeoutObservation(app?.extensionManager?.workflow?.activeWorkflow);
 }
 
 /** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
@@ -16216,7 +16226,19 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_save({ name } = {}) {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
-    const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
+    // #1434 — userdata HEAD/GET/PUT on this path can hang while the tab stays
+    // live (other RPCs still answer). Bound the save so the reply leaves the
+    // tab inside the orchestrator's 15 s window instead of a bare
+    // `did not reply to "workflow_save"` that claims the tab is frozen.
+    const { name: workflow, producedRecord, ...outcome } = await runBoundedWorkflowSave(
+      () => programmaticSave(name),
+      {
+        budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+        withTimeout,
+        now: monotonicNow,
+        observeWorkflow: observeActiveWorkflowSaveState,
+      },
+    );
     // #978 recurrence — a FIRST save swaps the active object too, and the #557 carry
     // that usually threads the identity across that swap fails SAFE on any proof gap,
     // leaving the produced record un-established and the reply reporting
@@ -16244,7 +16266,17 @@ const GRAPH_TOOL_EXECUTORS = {
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
-    const { name: workflow, producedRecord, ...outcome } = await programmaticSave(name);
+    // #1434 — same bound as workflow_save: both go through programmaticSave, both
+    // are relayed at 15 s, and a hung copy trio is the same silence.
+    const { name: workflow, producedRecord, ...outcome } = await runBoundedWorkflowSave(
+      () => programmaticSave(name),
+      {
+        budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+        withTimeout,
+        now: monotonicNow,
+        observeWorkflow: observeActiveWorkflowSaveState,
+      },
+    );
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
     // that strands a caller. Report the new instance identity here.
     const replyIdentity = saveProducedIdentity(producedRecord, { savedAs: true, firstSave: !!outcome.first_save });
