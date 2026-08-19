@@ -90,3 +90,152 @@ export function removePhantomLink(graph, target, inIdx, link) {
 export function isWidgetBackedInput(input) {
   return !!(input && input.widget);
 }
+
+// ---------------------------------------------------------------------------
+// #1272 — the SAME question asked on the THROW path.
+//
+// `isLinkPersisted` above needs the link object `connect()` RETURNED. When
+// `connect()` THROWS there is no return value, and the panel used to let the
+// exception escape — reporting failure for a connect whose link had already
+// landed. That is not hypothetical: LiteGraph writes the link and only THEN
+// runs the nodes' hooks.
+//
+//   LGraphNode.connectSlots (ComfyUI_frontend 1.47.2, LGraphNode.ts ~2938+):
+//     graph._links.set(link.id, link)
+//     output.links.push(link.id)
+//     targetInput.link = link.id
+//     graph.trigger("node:slot-links:changed", …)   <-- can throw
+//     this.onConnectionsChange?.(OUTPUT, …)          <-- can throw
+//     inputNode.onConnectionsChange?.(INPUT, …)      <-- can throw
+//
+//   SubgraphOutput.connect / SubgraphInput.connect (subgraph/*.ts): identical
+//   ordering — `subgraph._links.set` + `linkIds` + `slot.link` are written
+//   first, `node.onConnectionsChange?.()` runs last.
+//
+// So EVERY hook that can throw runs AFTER the link is fully persisted. A throw
+// therefore carries no information about whether the wire exists, and the only
+// honest verdict comes from reading the live graph back. These helpers do that
+// with the SAME fail-closed strength as `isLinkPersisted`: a link counts only
+// when the store holds it AND the slot that should own it back-references that
+// exact id.
+//
+// They deliberately do NOT promise permanence — like `isLinkPersisted`, they
+// describe the instant right after the call (see #992). "Did it land at all"
+// is the question here, and that one they can answer.
+// ---------------------------------------------------------------------------
+
+/**
+ * The link stored under `linkId`, or null. `graph.links` is an array in some
+ * LiteGraph builds, a Map-backed Proxy with Record-style index access in
+ * current ComfyUI ones; `graph.getLink(id)` exists on Subgraph/LGraph. All
+ * three are tried, defensively — a reader that throws would turn a verdict
+ * into a second failure.
+ */
+export function readStoredLink(graph, linkId) {
+  if (linkId == null || !graph) return null;
+  try {
+    const links = graph.links;
+    if (links) {
+      const stored = typeof links.get === "function" ? links.get(linkId) : links[linkId];
+      if (stored != null) return stored;
+    }
+    if (typeof graph.getLink === "function") return graph.getLink(linkId) ?? null;
+  } catch {
+    /* an unreadable store is "no link", never a thrown verdict */
+  }
+  return null;
+}
+
+/** Link ids currently back-referenced by `node`'s INPUT slots, as strings. */
+export function inputLinkIds(node) {
+  const ids = [];
+  for (const input of node?.inputs ?? []) {
+    if (input?.link != null) ids.push(String(input.link));
+  }
+  return ids;
+}
+
+/** Link ids currently held by a subgraph boundary-rail slot, as strings. */
+export function railSlotLinkIds(railSlot) {
+  const ids = [];
+  for (const id of railSlot?.linkIds ?? []) {
+    if (id != null) ids.push(String(id));
+  }
+  return ids;
+}
+
+/**
+ * The link that a node→node connect actually left behind, or null.
+ *
+ * Scans `target`'s inputs (NOT just the requested one — a dynamic-input node
+ * may re-slot the link to the slot it materialised, which is exactly what
+ * #1272's ImpactSwitch does) for a slot whose `link` back-reference resolves to
+ * a stored link originating at `origin` output `outIdx`.
+ *
+ * `excludeIds` are the ids observed BEFORE the mutation. A link already present
+ * beforehand is NOT evidence this call landed — without that exclusion a connect
+ * that threw before doing anything would be credited with a wire someone else
+ * made, which is the "two states, one answer" defect this whole check exists to
+ * remove. Returns `{ linkId, inputIndex }`.
+ */
+export function findLandedInboundLink(graph, origin, outIdx, target, excludeIds) {
+  const originId = origin?.id;
+  if (originId == null || !target) return null;
+  const skip = excludeIds instanceof Set ? excludeIds : new Set(excludeIds ?? []);
+  const inputs = target.inputs ?? [];
+  for (let i = 0; i < inputs.length; i++) {
+    const linkId = inputs[i]?.link;
+    if (linkId == null || skip.has(String(linkId))) continue;
+    const stored = readStoredLink(graph, linkId);
+    if (stored == null) continue;
+    const storedOrigin = stored.origin_id ?? stored[1];
+    const storedOriginSlot = stored.origin_slot ?? stored[2];
+    if (String(storedOrigin) !== String(originId)) continue;
+    if (Number(storedOriginSlot) !== Number(outIdx)) continue;
+    return { linkId: String(linkId), inputIndex: i };
+  }
+  return null;
+}
+
+/**
+ * True only when `link` (the object a rail `connect()` RETURNED) is persisted on
+ * `railSlot`: the rail slot lists that exact id AND the stored link joins it to
+ * `node` at `slotIdx`. The rail-branch analogue of `isLinkPersisted` — #397 was
+ * adopted at the node→node call site only, so the two rail branches reported
+ * success on LiteGraph's truthy return alone.
+ *
+ * `side` is "output" for the OUTPUT rail (node output → rail; the link's ORIGIN
+ * is the node) and "input" for the INPUT rail (rail → node input; the link's
+ * TARGET is the node).
+ */
+export function isRailLinkPersisted(graph, railSlot, node, slotIdx, side, link) {
+  const linkId = link?.id;
+  if (linkId == null) return false;
+  if (!railSlotLinkIds(railSlot).includes(String(linkId))) return false;
+  return railLinkJoins(readStoredLink(graph, linkId), node, slotIdx, side);
+}
+
+/**
+ * The NEW link a rail connect left behind, or null — the throw-path counterpart
+ * of `isRailLinkPersisted` (no returned link to key on). Same fail-closed
+ * strength: the id must be on the rail slot, resolve in the store, and join
+ * `node`/`slotIdx`; ids present before the mutation are excluded so a pre-existing
+ * wire is never credited to this call. Returns `{ linkId }`.
+ */
+export function findLandedRailLink(graph, railSlot, node, slotIdx, side, excludeIds) {
+  const skip = excludeIds instanceof Set ? excludeIds : new Set(excludeIds ?? []);
+  for (const linkId of railSlotLinkIds(railSlot)) {
+    if (skip.has(linkId)) continue;
+    if (railLinkJoins(readStoredLink(graph, linkId), node, slotIdx, side)) return { linkId };
+  }
+  return null;
+}
+
+/** Does `stored` join `node` at `slotIdx` on the given rail `side`? */
+function railLinkJoins(stored, node, slotIdx, side) {
+  if (stored == null || node?.id == null) return false;
+  const nodeId = side === "input" ? (stored.target_id ?? stored[3]) : (stored.origin_id ?? stored[1]);
+  const nodeSlot =
+    side === "input" ? (stored.target_slot ?? stored[4]) : (stored.origin_slot ?? stored[2]);
+  return String(nodeId) === String(node.id) && Number(nodeSlot) === Number(slotIdx);
+}
