@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-08-19
+
+### Fixed
+- a second panel bundle in the page stands down instead of fighting for the tab (#1269)
+- one node's configure throw no longer aborts the rest of a graph load (#1260)
+- a grounding auto-persist keeps the workflow's identity across its object swap (#1263)
+- a cg-use-everywhere graph's broadcast targets are queue-time volatile, so run-to-node's graph stamp matches on an untouched canvas (#1273)
+- panel_add_node refreshes a drifted node schema itself, then re-checks — the refusal is what survives (#1242)
+
+
 ## [0.15.2] - 2026-08-18
 
 ### Fixed
