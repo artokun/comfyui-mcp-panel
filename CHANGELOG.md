@@ -12,6 +12,7 @@ All notable changes to this project are documented here. This project adheres to
 - `graph_unexpose_subgraph_input` / `graph_unexpose_subgraph_output` remove a subgraph boundary slot by name — the inverse of the expose pair; dropped interior/host wires are counted and reported (artokun/comfyui-mcp#1294)
 
 ### Fixed
+- entering a copied subgraph, editing its inner graph, and exiting no longer clears promoted widget values on the parent instances (artokun/comfyui-mcp#1827)
 - `panel_get_errors` no longer flags a pasted LoadImage file like `pasted/image (992).png` as missing when the file is on disk and `/view` serves it (#1357)
 
 ### Added

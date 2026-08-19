@@ -230,6 +230,7 @@ import {
   materializedValuesNote,
   findDivergentPromotedValues,
 } from "./lib/unpack-promoted-values.js";
+import { withPreservedPromotedInstanceWidgets } from "./lib/subgraph-instance-widgets.js";
 import {
   snapshotExternalLinks,
   verifyExternalLinks,
@@ -22477,7 +22478,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               const { graph, rootGraph, canvas } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
               if (graphCommandMayMutateWorkflow(msg.cmd)) {
-                visibleMutationTarget = { graph, canvas };
+                visibleMutationTarget = { graph, canvas, rootGraph };
               }
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
@@ -22550,7 +22551,25 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 );
               }
             }
-            result = await executor(msg);
+            // #1827 — copied subgraph instances share one definition. An inner
+            // add/rewire reconfigures every wrapper and reseeds promoted rails
+            // from the INNER widget, which clears instance STRING overrides.
+            // Snapshot the parent rails before the mutation and write them back
+            // after (rail only — never the shared inner widget).
+            const runExecutor = () => executor(msg);
+            if (
+              visibleMutationTarget?.graph &&
+              visibleMutationTarget.rootGraph &&
+              visibleMutationTarget.graph !== visibleMutationTarget.rootGraph
+            ) {
+              result = await withPreservedPromotedInstanceWidgets(
+                visibleMutationTarget.rootGraph,
+                visibleMutationTarget.graph,
+                runExecutor,
+              );
+            } else {
+              result = await runExecutor();
+            }
             // #1443 — the executor mutated LiteGraph (and outline will agree).
             // Tell the ACTIVE canvas, bump the revision Vue nodes paint from,
             // and disclose if that canvas never acknowledged. A miss is not a
