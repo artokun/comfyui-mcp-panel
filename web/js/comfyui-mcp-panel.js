@@ -12820,57 +12820,139 @@ const GRAPH_TOOL_EXECUTORS = {
     return { added };
   },
 
-  graph_remove_node({ node_id }) {
+  // #841: one command removes N nodes in one beforeChange/afterChange pair.
+  // `node_id` keeps the historical single-node reply; `node_ids` is the batch
+  // form. Known-upfront failures (missing, duplicate, ignore_remove) refuse
+  // the whole list before the envelope opens. A mid-batch no-op or throw is
+  // reported as a precise leftover manifest rather than rolled back — link
+  // teardown is not reversible from here.
+  graph_remove_node(args = {}) {
     const { graph, rootGraph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
-    const summary = summarizeNode(node);
-    const removedId = node.id;
+    const own = (key) => Object.prototype.hasOwnProperty.call(args, key);
+    const hasNodeId = own("node_id");
+    const hasNodeIds = own("node_ids");
+    if (hasNodeId === hasNodeIds) throw new Error("provide exactly one of node_id or node_ids");
+    const ids = hasNodeId ? [args.node_id] : args.node_ids;
+    if (!Array.isArray(ids) || ids.length === 0) throw new Error("node_ids must be a non-empty array");
+    if (new Set(ids.map((id) => String(id))).size !== ids.length) {
+      throw new Error("node_ids must not contain duplicates");
+    }
+
+    const nodes = ids.map((id) => resolveNode(graph, id));
+    if (new Set(nodes).size !== nodes.length) throw new Error("node_ids must not contain duplicates");
+
+    const protectedNodes = nodes.filter((n) => n?.ignore_remove);
+    if (protectedNodes.length) {
+      const label = protectedNodes.map((n) => n.id).join(", ");
+      throw new Error(
+        hasNodeId
+          ? `Node ${label} could not be removed (it may be protected / ignore_remove).`
+          : `Node(s) ${label} could not be removed (protected / ignore_remove). Nothing was removed.`,
+      );
+    }
+
+    const summaries = nodes.map(summarizeNode);
     // #234: inside a subgraph, snapshot the boundary→interior link model BEFORE
     // removal so we can prune any exposed input/output slot the removal orphans
     // (whose only interior consumer/producer was this node) — otherwise a dangling
     // `text` slot lingers on the parent SubgraphNode and re-exposing mints `text_1`.
     const inSubgraph = graph !== rootGraph;
     const boundaryModel = inSubgraph ? subgraphBoundaryModel(graph) : null;
+    const stillOnGraph = (node) =>
+      Array.isArray(graph._nodes)
+        ? graph._nodes.includes(node)
+        : graph.getNodeById?.(node?.id) === node;
+
     // Node removal AND the orphan-boundary prune run inside ONE
     // beforeChange/afterChange pair, so a single Ctrl+Z restores BOTH (otherwise
-    // one undo would resurrect only the slot and leave the node deleted).
+    // one undo would resurrect only the slot and leave the node deleted). A
+    // multi-id call is the same envelope — N independent panel_remove_node
+    // calls used to be N undo steps.
     let cleaned = null;
-    let removedOk = false;
+    const removeErrors = [];
     graph.beforeChange();
     try {
-      // #420: robust against the intermittent litegraph link-disconnect crash
-      // ("t.findInputSlot is not a function") seen on rapid batched removals — on a
-      // first-attempt throw it severs this node's links via the record path and
-      // retries once, instead of aborting the removal.
-      safeRemoveNode(graph, node);
+      for (const node of nodes) {
+        try {
+          // #420: robust against the intermittent litegraph link-disconnect crash
+          // ("t.findInputSlot is not a function") seen on rapid batched removals —
+          // on a first-attempt throw it severs this node's links via the record
+          // path and retries once, instead of aborting the removal.
+          safeRemoveNode(graph, node);
+        } catch (err) {
+          if (hasNodeId) throw err;
+          removeErrors.push({ id: node.id, error: err });
+        }
+      }
       // graph.remove() is a NO-OP for protected nodes (ignore_remove). Only prune
-      // (and report success) once the node has ACTUALLY left the graph — otherwise
-      // we would delete boundary slots still connected to a surviving node.
-      removedOk = graph.getNodeById?.(Number(removedId)) !== node;
-      if (removedOk && inSubgraph && boundaryModel) {
-        cleaned = pruneOrphanedBoundaries(graph, boundaryModel, [removedId]);
+      // (and report success) for nodes that have ACTUALLY left — otherwise we
+      // would delete boundary slots still connected to a surviving node.
+      const gone = nodes.filter((node) => !stillOnGraph(node));
+      if (gone.length && inSubgraph && boundaryModel) {
+        cleaned = pruneOrphanedBoundaries(
+          graph,
+          boundaryModel,
+          gone.map((node) => node.id),
+        );
       }
     } finally {
       graph.afterChange();
     }
-    if (!removedOk) {
+
+    const gone = [];
+    const stayed = [];
+    for (let i = 0; i < nodes.length; i++) {
+      if (stillOnGraph(nodes[i])) stayed.push({ node: nodes[i], summary: summaries[i] });
+      else gone.push({ node: nodes[i], summary: summaries[i] });
+    }
+    if (!gone.length) {
+      const firstErr = removeErrors[0]?.error;
+      if (firstErr) throw firstErr;
+      const label = nodes.map((n) => n.id).join(", ");
       throw new Error(
-        `Node ${removedId} could not be removed (it may be protected / ignore_remove).`,
+        hasNodeId
+          ? `Node ${label} could not be removed (it may be protected / ignore_remove).`
+          : `None of the ${nodes.length} node(s) could be removed (they may be protected / ignore_remove).`,
       );
     }
-    // #1286 — drop stored execution images for this id so a later add that
-    // reuses it cannot inherit the removed node's preview.
-    clearStoredExecutionOutputs(
-      { nodeOutputs: app?.nodeOutputs, nodePreviewImages: app?.nodePreviewImages },
-      removedId,
-    );
+
+    // #1286 — drop stored execution images for each id that left so a later add
+    // that reuses it cannot inherit the removed node's preview.
+    for (const { node } of gone) {
+      clearStoredExecutionOutputs(
+        { nodeOutputs: app?.nodeOutputs, nodePreviewImages: app?.nodePreviewImages },
+        node.id,
+      );
+    }
     graph.setDirtyCanvas(true, true);
-    return {
-      removed: summary,
-      ...(cleaned && (cleaned.inputs.length || cleaned.outputs.length)
+
+    const cleanedPayload =
+      cleaned && (cleaned.inputs.length || cleaned.outputs.length)
         ? { cleaned_boundary_slots: cleaned }
-        : {}),
-    };
+        : {};
+    if (hasNodeId) {
+      return { removed: gone[0].summary, ...cleanedPayload };
+    }
+    const result = { removed: gone.map((g) => g.summary), ...cleanedPayload };
+    if (stayed.length) {
+      result.not_removed = stayed.map(({ node }) => {
+        const err = removeErrors.find((e) => e.id === node.id);
+        return {
+          id: node.id,
+          type: node.type,
+          reason: err
+            ? String(err.error?.message ?? err.error)
+            : "could not be removed (it may be protected / ignore_remove)",
+        };
+      });
+      result.warning =
+        `${stayed.length} of ${nodes.length} node(s) are STILL on the canvas. ` +
+        `Removed: ${gone.map((g) => g.node.id).join(", ")}. ` +
+        `Still present: ${stayed.map((s) => s.node.id).join(", ")}. ` +
+        `Re-read it (panel_graph_outline) before retrying: a second call for the ids that left is a no-op; ` +
+        `a second call for the ids that stayed may still fail.`;
+    }
+    return result;
   },
 
   graph_clear() {
@@ -24327,6 +24409,7 @@ function describeCommand(cmd, msg, reply) {
         }),
       };
     case "graph_remove_node": {
+      const list = Array.isArray(r.removed) ? r.removed : r.removed ? [r.removed] : [];
       const cb = r.cleaned_boundary_slots;
       const cleaned = [...(cb?.inputs ?? []), ...(cb?.outputs ?? [])].filter(Boolean);
       // The count drives the FORM ("slot"/"slots") without being rendered — the slot names
@@ -24342,13 +24425,39 @@ function describeCommand(cmd, msg, reply) {
             { count: cleaned.length, slots: cleaned.join(", ") },
           )
         : "";
+      const leftover = r.not_removed?.length
+        ? tr("panel.removed_nodes_partial", " — {n} still on the canvas", {
+            n: r.not_removed.length,
+          })
+        : "";
+      // TWO DIFFERENT CLAIMS, not two grammatical numbers — same as graph_edit_node.
+      // A plural category is NOT a count (`Intl.PluralRules("ru").select(21)` is "one"),
+      // so a one-id reply names the node and a batch names the count.
+      if (list.length === 1) {
+        return {
+          icon: "pi-minus-circle",
+          text:
+            tr("panel.removed_node", "Removed {type} (id {id})", {
+              type: list[0]?.type ?? tr("panel.a_node", "node"),
+              id: list[0]?.id,
+            }) +
+            suffix +
+            leftover,
+        };
+      }
       return {
         icon: "pi-minus-circle",
         text:
-          tr("panel.removed_node", "Removed {type} (id {id})", {
-            type: r.removed?.type ?? tr("panel.a_node", "node"),
-            id: r.removed?.id,
-          }) + suffix,
+          tr(
+            "panel.removed_nodes",
+            {
+              one: "Removed {count} node (one Ctrl+Z restores all)",
+              other: "Removed {count} nodes (one Ctrl+Z restores all)",
+            },
+            { count: list.length },
+          ) +
+          suffix +
+          leftover,
       };
     }
     case "graph_clear":

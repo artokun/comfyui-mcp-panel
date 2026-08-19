@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 - `graph_save_subgraph` can replace a user-published blueprint in place with `overwrite:true` — no Save dialog, bundled/global blueprints stay protected (#1122)
+- `panel_remove_node` accepts `node_ids` and removes every listed node in one undo step — one Ctrl+Z restores them all, and a single reply names what left and what did not (#841)
 
 ## [0.15.9] - 2026-08-19
 

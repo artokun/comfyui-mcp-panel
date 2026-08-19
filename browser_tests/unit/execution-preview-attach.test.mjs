@@ -200,7 +200,7 @@ test("#1286: the panel imports and calls the shipped sanitizer on the add / remo
   assert.ok(addFn, "graph_add_node body not found");
   assert.match(addFn[0], /clearInheritedExecutionPreview\(/);
 
-  const removeFn = panelSrc.match(/\n {2}graph_remove_node\(\{ node_id \}\) \{[\s\S]*?\n {2}\},/);
+  const removeFn = panelSrc.match(/\n {2}graph_remove_node\(args = \{\}\) \{[\s\S]*?\n {2}\},/);
   assert.ok(removeFn, "graph_remove_node body not found");
   assert.match(removeFn[0], /clearStoredExecutionOutputs\(/);
 
