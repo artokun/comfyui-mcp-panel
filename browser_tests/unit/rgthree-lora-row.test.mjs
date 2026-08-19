@@ -20,6 +20,9 @@ import {
   POWER_LORA_LOADER_TYPE,
 } from "../../web/js/lib/rgthree-lora-row.js";
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+// #1413 - the module bindings graph_set_widget acquired when it took a command budget.
+// Shared rather than restated so the next one is added in one place, not three.
+import { setWidgetCommandBudgetDeps } from "./_panel-constants.mjs";
 
 const SLOT = { on: true, lora: "x.safetensors", strength: 0.5, strengthTwo: null };
 
@@ -1317,6 +1320,9 @@ const EXECUTOR_DEPS = [
   "refreshComfyNodeDefs",
   "clearStaleRedFlag",
   "snapshotAuthorizationNote",
+  // #1413 - the command budget's own bindings, listed from the shared map so this array
+  // cannot acquire a stale copy of one.
+  ...Object.keys(setWidgetCommandBudgetDeps()),
 ];
 
 /**
@@ -1450,6 +1456,9 @@ function executor(node, overrides = {}) {
     clearStaleRedFlag: () => {},
     objectInfoHistory: { wasTypeEverDefined: () => true },
     comfyBackendIsDown: () => false,
+    // #1413 - the REAL budget, clock and bounding primitive, so an executor rebuilt here
+    // measures the way the shipped one does rather than against a hand-set number.
+    ...setWidgetCommandBudgetDeps(),
     ...overrides,
   };
   const factory = new Function(

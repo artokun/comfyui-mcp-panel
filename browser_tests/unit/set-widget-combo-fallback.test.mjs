@@ -27,6 +27,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+// #1413 - the module bindings `refreshCombos` acquired when graph_set_widget took a command
+// budget, and the two locals it closes over. Shared rather than restated: three harnesses
+// rebuild this method or a fragment of it, and a free identifier throws ReferenceError in
+// all of them at once.
+import { setWidgetCommandBudgetDeps, SET_WIDGET_LOCALS_PRELUDE } from "./_panel-constants.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 const panelSrc = readFileSync(PANEL_JS, "utf8");
@@ -39,12 +45,25 @@ assert.ok(match, "could not locate the panel's refreshCombos wiring");
 
 function shippedRefreshCombos({ onFromDefs, onFullRefresh }) {
   const body = match[0].replace(/^refreshCombos: /, "");
+  // #1413 - the callback now reads `budget` and writes `comboRefreshUnavailable`, both of
+  // which are graph_set_widget's own locals. The prelude declares them the way the panel
+  // declares them (a REAL makeCommandBudget over the panel's REAL constant), and the
+  // accessor is what lets a test read the token the fallback records.
+  const deps = setWidgetCommandBudgetDeps();
+  const depNames = Object.keys(deps);
   const factory = new Function(
     "refreshComboOptionsFromDefs",
     "refreshComfyNodeDefs",
-    `return (${body.replace(/,$/, "")});`,
+    ...depNames,
+    `${SET_WIDGET_LOCALS_PRELUDE}
+     const refreshCombos = ${body.replace(/,$/, "")};
+     return { refreshCombos, readToken: () => comboRefreshUnavailable, budget };`,
   );
-  return factory(onFromDefs, onFullRefresh);
+  const built = factory(onFromDefs, onFullRefresh, ...depNames.map((n) => deps[n]));
+  const fn = built.refreshCombos;
+  fn.readToken = built.readToken;
+  fn.budget = built.budget;
+  return fn;
 }
 
 function spies() {

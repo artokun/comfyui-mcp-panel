@@ -480,6 +480,44 @@ export async function runSetWidget(
             `${err.message}`,
         );
 
+  // #1413 — the stale-combo recovery's own verdict, and the three places that used to
+  // assert it unconditionally.
+  //
+  // `refreshCombos` refreshes the option list two ways: in place from the payload already
+  // fetched for authorization, or — when that payload cannot key this target's type — by
+  // falling back to the full frontend refresh. Only the second can fail to happen at all:
+  // it is bounded by the command's remaining budget, and a node-def run that outlives that
+  // budget leaves the list exactly as stale as it was. It reports that as a structured
+  // token rather than by throwing, because nothing FAILED — the run was not cancelled, it
+  // still holds the coalescer's slot and it is still registering the definitions this write
+  // is waiting for.
+  //
+  // Which makes the distinction actionable in the one direction that matters: "a fresh list
+  // does not contain your value" ends the conversation, and "the list was never re-read"
+  // asks for a retry that normally succeeds. Collapsing the two — which is what claiming
+  // `refreshed: true` and "after refreshing combo options" did — turns a transient wait
+  // into a permanent-sounding rejection of a value that may be perfectly valid.
+  let comboRefreshUnavailable = null;
+  /** The `refreshed` field for a reply, told from what the recovery reported. */
+  const comboRefreshDisclosure = () =>
+    comboRefreshUnavailable
+      ? {
+          refreshed: false,
+          // A TOKEN on a field of its own, never wording. `warning` is single-slot and
+          // priority-ordered (#1223/#757), and a caller deciding whether to retry must not
+          // have to parse a sentence that another disclosure can displace.
+          combo_refresh_incomplete: comboRefreshUnavailable,
+          combo_refresh_note:
+            "The write SUCCEEDED, but the combo option list was NOT re-read from the " +
+            "server first: a node-def refresh was still running when this command's time " +
+            "budget ran out waiting for it. Nothing failed and that refresh was not " +
+            "cancelled.",
+        }
+      : { refreshed: true };
+  /** The clause a refusal appends. Never claims a refresh that did not happen. */
+  const afterRefreshClause = () =>
+    comboRefreshUnavailable ? " with the combo options NOT refreshed" : " after refreshing combo options";
+
   const write = (extra = {}) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
@@ -817,17 +855,36 @@ export async function runSetWidget(
           writeTargetWidgetName && concreteWidgetName
             ? { [writeTargetWidgetName]: concreteWidgetName }
             : undefined;
-        await refreshCombos(freshDefs ?? undefined, resolvedTargetNode, authTarget?.type, comboNameMap);
+        // #1413 — WHAT THE RECOVERY ACTUALLY DID, read from its return value.
+        //
+        // The injected callback may report, as a structured token, that it did NOT refresh:
+        // its full-refresh fallback is bounded by the command's remaining budget, and when
+        // that budget runs out waiting on a node-def run the option list is exactly as stale
+        // as it was a moment ago. Every claim below this line — the retry's `refreshed:true`
+        // and the refusals' "after refreshing combo options" — asserts the opposite, and an
+        // agent told a fresh list rejected its value stops retrying a value that is fine.
+        //
+        // A non-empty STRING is the contract, and it is deliberately narrow: `undefined` is
+        // what the in-place path returns and what a successful plain join resolves to, and a
+        // verdict OBJECT is what a completed run resolves to. Neither can be mistaken for
+        // this.
+        const comboOutcome = await refreshCombos(
+          freshDefs ?? undefined,
+          resolvedTargetNode,
+          authTarget?.type,
+          comboNameMap,
+        );
+        if (typeof comboOutcome === "string" && comboOutcome) comboRefreshUnavailable = comboOutcome;
       } catch {
         /* refresh best-effort; fall through to re-raise the original rejection */
       }
       try {
-        return withWarning({ set: write(), refreshed: true });
+        return withWarning({ set: write(), ...comboRefreshDisclosure() });
       } catch (retryErr) {
         if (!(retryErr instanceof WidgetWriteError)) throw retryErr;
         // A NON-combo failure on the retry is terminal — fail closed loudly.
         if (!retryErr.combo) {
-          throw refusalFrame(retryErr, " after refreshing combo options");
+          throw refusalFrame(retryErr, afterRefreshClause());
         }
         // Still a combo miss after the refresh — keep the freshest reason and try the
         // upload-asset fallback below.
@@ -838,7 +895,7 @@ export async function runSetWidget(
     // #387: server-confirmed upload asset (e.g. a subfolder-nested LoadImage image).
     if (await tryUploadAssetAccept()) {
       try {
-        return withWarning({ set: write(), refreshed: true, server_confirmed: true });
+        return withWarning({ set: write(), ...comboRefreshDisclosure(), server_confirmed: true });
       } catch (confErr) {
         if (confErr instanceof WidgetWriteError) {
           throw refusalFrame(confErr, " after confirming the uploaded asset exists on the server");
@@ -886,7 +943,7 @@ export async function runSetWidget(
     ) {
       return withWarning({
         set: write({ acceptEmptyComboOptions: true }),
-        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+        ...(typeof refreshCombos === "function" ? comboRefreshDisclosure() : {}),
         empty_option_list: true,
       });
     }
@@ -1074,7 +1131,7 @@ export async function runSetWidget(
         }
         return withWarning({
           set,
-          ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+          ...(typeof refreshCombos === "function" ? comboRefreshDisclosure() : {}),
           // A stateful callback that finally answered `[]` landed on #507's acceptance instead,
           // and that is reported as #507 reports it — the same field the branch above returns,
           // so one outcome has one name wherever it is reached from.
@@ -1173,9 +1230,24 @@ export async function runSetWidget(
     // contain the value, or a list that could not be read at all. Nothing is appended
     // here suggesting a retry, because at this point there is no argument the caller can
     // add that changes the answer — the decision is the panel's observation, not theirs.
+    //
+    // #1413 — WITH ONE EXCEPTION, and it is the exception the sentence above defines rather
+    // than one it forgot: when the option list was never re-read, the decision is NOT the
+    // panel's observation. It is the absence of one. A retry then has something new to
+    // offer — the very node-def run this command stopped waiting for, still running and
+    // still registering these definitions — so the refusal says so and names the structured
+    // reason the successful path discloses on its own field.
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
-        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}`,
+        `${typeof refreshCombos === "function" ? afterRefreshClause() : ""}: ${latest.message}` +
+        (comboRefreshUnavailable
+          ? ` The option list could NOT be re-read from the server before this decision ` +
+            `(${comboRefreshUnavailable}): a node-def refresh was still running when this ` +
+            `command's time budget ran out waiting for it. Nothing failed, nothing was ` +
+            `written, and that refresh was NOT cancelled — it is still fetching exactly the ` +
+            `/object_info this write needed — so RETRY in a few seconds. Only if the retry ` +
+            `reports the same thing is the value itself worth doubting.`
+          : ""),
     );
   }
 }

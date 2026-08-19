@@ -271,7 +271,13 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  // #1413 — the oracle's OWN deadline, imported rather than restated so the cap
+  // `graph_set_widget` puts on it can only ever narrow the real number.
+  OBJECT_INFO_DEADLINE_MS,
+} from "./lib/object-info-oracle.js";
 import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
@@ -10449,6 +10455,76 @@ const ADD_NODE_COMMAND_BUDGET_MS = 25000;
 const REFRESH_NODES_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1413 — a command budget for `graph_set_widget`, the FOURTH command found relaying an
+ * unbounded node-def wait inside the orchestrator's 30,000 ms window (#1192 → #1349 → #1404
+ * → this).
+ *
+ * THE GAP. The stale-combo recovery — the branch that exists so a just-downloaded model, a
+ * just-uploaded image or a just-installed pack is accepted on one revalidation — falls back
+ * to the full frontend refresh when the authorization payload cannot key the target's type.
+ * That call passed NO `joinMs`, so the one deadline `makeRefreshCoalescer` takes at
+ * invocation (#1351: it spans the join AND the run that follows it) was never armed, and the
+ * recovery waited unbounded on a run whose own budget deliberately stops its clock across
+ * `registerNodesFromDefs` and `reapplyDefsToLiveNodes`.
+ *
+ * WHY A BUDGET RATHER THAN A CONSTANT, which is the part that makes this different from
+ * `refresh_nodes`. `refresh_nodes` is ONE await taken on its first line, so a flat number is
+ * the whole command. This recovery is reached LATE — after the baseline seed wait
+ * (`OBJECT_INFO_SEED_WAIT_MS`, 8,000 ms) and after the authorization `/object_info`
+ * (`OBJECT_INFO_DEADLINE_MS`, 20,000 ms in lib/object-info-oracle.js), which compose to
+ * 28,000 ms against a 30,000 ms window BEFORE the refresh is even considered. A fresh
+ * constant here could only disagree with what the command had already spent; what the
+ * recovery needs is the REMAINDER. So the clock is taken on the command's first line and
+ * every step below draws from it, exactly as #671 does for `nodes_install` and #1192 for
+ * `graph_add_node`.
+ *
+ * 25,000 ms, mirroring ADD_NODE_COMMAND_BUDGET_MS, NODES_INSTALL_COMMAND_BUDGET_MS and
+ * REFRESH_NODES_COMMAND_BUDGET_MS against the same 30,000 ms window for the same reason:
+ * 5,000 ms of slack for composing the reply, serialising it, and the websocket hop.
+ *
+ * WHAT IT COSTS, stated rather than left to be discovered. On a slow install the
+ * authorization fetch no longer gets a flat 20,000 ms — it gets what the command has left of
+ * 25,000 ms. A fetch that would have answered at 21 s now fails its bound. That fetch was
+ * already useless: the steps after it still have to run, so its reply landed past the window
+ * and the agent got a bare `did not reply … within 30000 ms` instead of a worded refusal.
+ * Narrowing it to fit is the trade #1192 made for `graph_add_node`'s copy of the same fetch.
+ */
+const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
+
+/**
+ * #1413 — the bound on the #387 `/view` existence probe.
+ *
+ * A HEAD-shaped `Range: bytes=0-0` GET against the server's own input directory; it is the
+ * one remaining network step in this command that had no bound at all. Failing it closed
+ * costs nothing that was not already lost — the probe ALREADY answers `false` for every
+ * error, and a probe that did not answer has confirmed nothing, which is exactly what
+ * `false` means here. #240 strictness is unaffected: a bound can only ever refuse a value,
+ * never admit one.
+ *
+ * 3,000 ms for a request whose response body is one byte.
+ */
+const SET_WIDGET_ASSET_PROBE_MS = 3000;
+
+/**
+ * #1413 — what the write still has to do AFTER the stale-combo refresh, held back so the
+ * refresh cannot spend it.
+ *
+ * The recovery is not the last step. What follows is the retry `write()` and then the #387
+ * upload-asset probe — and a refresh that finishes at the wire leaves the probe its 1 ms
+ * floor, at which point a subfolder-nested LoadImage image that IS on disk is refused
+ * because nothing had time to look for it. That is the wrong-cause failure
+ * ADD_NODE_POST_REFRESH_RESERVE_MS exists to prevent, in this command's shape.
+ *
+ * #1126's live re-read deliberately gets NO reserve. It draws from whatever remains, and
+ * when that is nothing it fails to produce a live answer — which is a first-class outcome
+ * on that path with a refusal already written for it ("re-asking the server did not produce
+ * a live answer either. Retry in a moment."), not a wrong-cause report.
+ *
+ * DERIVED from the step it protects, not picked, so the two cannot drift apart.
+ */
+const SET_WIDGET_POST_REFRESH_RESERVE_MS = SET_WIDGET_ASSET_PROBE_MS;
+
+/**
  * #1192 — what an add still has to do AFTER the node-def refresh, held back so the join
  * cannot spend it.
  *
@@ -12416,10 +12492,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // than parking.
         // #1223 — read the epoch HERE, immediately before the whole request is issued.
         addNodeObservedAtEpoch = backendReconnectEpoch;
-        // #1192 — the same request `graph_set_widget`'s oracle allows 10,000 ms, allowed
-        // 10,000 ms here too, and BOTH now capped by their caller's remaining budget. The
-        // two paths agreeing about how long one /object_info may take is what stops a
-        // "set_widget works but add_node fails" asymmetry appearing on a slow install.
+        // #1192 — the same /object_info `graph_set_widget`'s oracle asks for, allowed
+        // 10,000 ms here and capped by this command's remaining budget.
+        //
+        // #1413 CORRECTS what this note used to assert: that `graph_set_widget`'s oracle
+        // "allows 10,000 ms" too, so "BOTH" were capped and the two paths agreed. It never
+        // did. That oracle goes through `fetchWholeObjectInfo`, whose own
+        // OBJECT_INFO_DEADLINE_MS is 20,000 ms, and until #1413 nothing capped it at all —
+        // so the asymmetry this sentence claimed to have closed was the live behaviour, in
+        // the direction the sentence ruled out. Both are capped by their caller's budget
+        // NOW; the numbers they start from still differ, and saying which is which is the
+        // point. Counted from the source rather than restated, because the version that was
+        // merely restated is what made a false claim survive two releases.
         const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
         freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
@@ -13564,8 +13648,22 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
+    // #1413 — ONE deadline for the whole command, taken on the first line so every wait
+    // below draws from what is left of it rather than from a number of its own.
+    //
+    // FIRST LINE, and that placement is the fix rather than an incidental. The wait this
+    // issue is about — the stale-combo recovery's node-def refresh — is reached only after
+    // the baseline seed and the authorization `/object_info` have already spent part of the
+    // window, so a bound computed there from a fresh constant would be a bound on time the
+    // command no longer had. Starting the clock here is what makes `budget.remaining()` at
+    // that point a true statement.
+    const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // #1413 — the structured token for a stale-combo recovery whose refresh did not happen,
+    // or `null` when it did. PER-REQUEST for the reason `oracleFailures` is: a concurrent
+    // write must not make THIS reply disclose — or fail to disclose — another call's refresh.
+    let comboRefreshUnavailable = null;
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
     // widget write would otherwise overwrite this between one request's failed fetch and
     // its refusal, so the message would name routes another call tried. Declared in the
@@ -13666,7 +13764,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // fails CLOSED for this call only, with a TEMPORARY "retry in a moment" refusal. The
     // seed keeps running, so a late response still establishes the baseline and the next
     // call authorizes normally — ordinary latency must never burn the session.
-    await awaitObjectInfoHistorySeed();
+    // #1413 — CAPPED BY THE COMMAND, exactly as graph_add_node caps its copy of this wait.
+    // 8,000 ms is the seed's own allowance; what this command can afford to give it is
+    // whichever of the two is smaller. The refusal an expired seed produces is already the
+    // right one for an expired budget — nothing was written and the caller is told to retry
+    // in a moment — so no new wording is needed here.
+    await awaitObjectInfoHistorySeed(budget.bounded(OBJECT_INFO_SEED_WAIT_MS));
     // #757 — MINT an rgthree Power Lora Loader row when the write targets one that does not
     // exist yet. Those rows are created only by the node's own "➕ Add Lora" button, a
     // DOM-only control an agent cannot click, so every write to `lora_1` on a fresh node was
@@ -13770,6 +13873,16 @@ const GRAPH_TOOL_EXECUTORS = {
             return fetchWholeObjectInfo({
               getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
               fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+              // #1413 — the oracle's own 20,000 ms deadline, CAPPED by what this command has
+              // left. Uncapped it is the single largest term in a window of 30,000 ms, and
+              // `graph_add_node` already caps its copy of this same request for that reason.
+              //
+              // NARROWING ONLY. `fetchWholeObjectInfo` divides whatever deadline it is given
+              // among its transports and charges each for what it used, so a smaller number
+              // changes how long the routes get and nothing about which of them are tried or
+              // how a failure is reported — the refusal still names every route and what it
+              // did (#982). What it cannot do is turn a live answer into a wrong one.
+              deadlineMs: budget.bounded(OBJECT_INFO_DEADLINE_MS),
             });
           },
           { stamp: () => backendReconnectEpoch },
@@ -13935,7 +14048,40 @@ const GRAPH_TOOL_EXECUTORS = {
           refreshComboOptionsFromDefs(target, defs, keyType, nameMap);
           return;
         }
-        return refreshComfyNodeDefs();
+        // #1413 — BOUNDED, and bounded by what THIS COMMAND has left rather than by a
+        // constant of its own.
+        //
+        // This branch is the whole defect. `refreshComfyNodeDefs` is the coalescer, and with
+        // no `joinMs` the one deadline it takes at invocation is never armed — so this
+        // awaited a run someone else started, or (with an empty slot) one of its own, with
+        // no bound at all, inside the 30,000 ms window `graph_set_widget` is relayed in.
+        // #1351 made that single deadline span the join AND the run that follows it, so one
+        // number here is genuinely the whole wait; there is no second clock to disagree with.
+        //
+        // THE RUN IS NOT CANCELLED — `waitForRun` in refresh-coalesce.js says so in as many
+        // words — and that is what makes the refusal below honest about retrying: the run
+        // keeps the slot and keeps registering exactly the definitions this write is waiting
+        // for, so a retry JOINS work in progress instead of restarting it.
+        //
+        // NO BLIND RETRY IS ADDED HERE, deliberately. Re-issuing on a timeout is only safe
+        // when nothing was applied, and this recovery sits between two write attempts —
+        // establishing that would take a receipt this path does not have. The caller is told
+        // what happened and decides.
+        return refreshComfyNodeDefs(undefined, {
+          joinMs: budget.remaining() - SET_WIDGET_POST_REFRESH_RESERVE_MS,
+        }).then((outcome) => {
+          if (outcome === REFRESH_JOIN_ABANDONED) {
+            // A STRUCTURED token, not wording, and returned to the lib rather than only
+            // recorded here. Everything downstream of this call — the retry's `refreshed`
+            // claim, and the refusal's "after refreshing combo options" — asserts that the
+            // option list was re-read from the server. None of that is true when the budget
+            // ran out waiting, and a caller must never have to parse a sentence to find out
+            // which of the two happened.
+            comboRefreshUnavailable = NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING;
+            return comboRefreshUnavailable;
+          }
+          return outcome;
+        });
       },
       // #387: last-resort probe for an UPLOAD input value the refreshed /object_info
       // combo still cannot list — a LoadImage image uploaded under a SUBFOLDER (ComfyUI
@@ -13951,11 +14097,22 @@ const GRAPH_TOOL_EXECUTORS = {
           const filename = i >= 0 ? v.slice(i + 1) : v;
           if (!filename) return false;
           const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
-          const res = await api.fetchApi(`/view?${qs}`, {
-            method: "GET",
-            cache: "no-store",
-            headers: { Range: "bytes=0-0" },
-          });
+          // #1413 — BOUNDED. The last network step in this command with no bound of its own,
+          // and it runs at the END of the ladder, so a stalled connection here spends a
+          // window the steps before it already drew down. `withTimeout` does not cancel the
+          // request; it stops this command waiting on it, and the probe's own contract makes
+          // that safe — every failure already answers `false`, and a probe that did not
+          // answer has confirmed nothing. Failing closed can only refuse a value, never
+          // admit one, so #240 strictness is untouched.
+          const res = await withTimeout(
+            api.fetchApi(`/view?${qs}`, {
+              method: "GET",
+              cache: "no-store",
+              headers: { Range: "bytes=0-0" },
+            }),
+            budget.bounded(SET_WIDGET_ASSET_PROBE_MS),
+            () => null,
+          );
           return !!res && (res.ok || res.status === 206);
         } catch {
           return false;

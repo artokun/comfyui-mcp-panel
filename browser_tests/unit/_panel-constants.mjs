@@ -17,6 +17,8 @@ import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
+import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 
 export const PANEL_SRC = readFileSync(
@@ -179,3 +181,59 @@ export function addNodeCommandBudgetDeps() {
       `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
   };
 }
+
+/** #1413 - the whole-command deadline `graph_set_widget` takes on its first line. */
+export const SET_WIDGET_COMMAND_BUDGET_MS = readPanelNumber(
+  /const SET_WIDGET_COMMAND_BUDGET_MS = (\d+);/,
+  "the set_widget command budget",
+);
+
+/** #1413 - the bound on the #387 `/view` existence probe. */
+export const SET_WIDGET_ASSET_PROBE_MS = readPanelNumber(
+  /const SET_WIDGET_ASSET_PROBE_MS = (\d+);/,
+  "the upload-asset probe bound",
+);
+
+/**
+ * #1413 - every module binding the command budget added to `graph_set_widget`, in ONE place,
+ * for the same reason `addNodeCommandBudgetDeps` exists.
+ *
+ * Three harnesses rebuild that executor or a FRAGMENT of it in a synthetic scope
+ * (rgthree-lora-row: the whole method; set-widget-combo-fallback: `refreshCombos`;
+ * object-info-snapshot: the oracle body), so one new free identifier throws
+ * `ReferenceError` in all three at once - and each of them catches it and reports some other
+ * cause, so the failure never names itself. Collected here so the fourth is added once.
+ *
+ * The REAL implementations wherever they exist - `makeCommandBudget`, `withTimeout`,
+ * `NODE_DEF_REFRESH_REASONS`, `REFRESH_JOIN_ABANDONED` and `OBJECT_INFO_DEADLINE_MS` are
+ * imported, and the numbers are read from the panel source - so no harness can pass against
+ * a value the panel no longer holds.
+ */
+export function setWidgetCommandBudgetDeps() {
+  return {
+    makeCommandBudget,
+    monotonicNow,
+    withTimeout,
+    NODE_DEF_REFRESH_REASONS,
+    REFRESH_JOIN_ABANDONED,
+    OBJECT_INFO_DEADLINE_MS,
+    OBJECT_INFO_SEED_WAIT_MS,
+    SET_WIDGET_COMMAND_BUDGET_MS,
+    SET_WIDGET_ASSET_PROBE_MS,
+    // Derived exactly as the panel derives it.
+    SET_WIDGET_POST_REFRESH_RESERVE_MS: SET_WIDGET_ASSET_PROBE_MS,
+  };
+}
+
+/**
+ * #1413 - the two names that are `graph_set_widget`'s OWN locals rather than module state,
+ * for harnesses that rebuild a FRAGMENT of the method instead of the whole thing.
+ *
+ * A fragment has no enclosing method to declare them, and a harness that hard-codes its own
+ * `budget` is one that keeps passing after the panel stops taking one. Emitted as SOURCE so
+ * the budget is constructed the way the panel constructs it, from the constant the panel
+ * actually holds.
+ */
+export const SET_WIDGET_LOCALS_PRELUDE =
+  "const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);\n" +
+  "let comboRefreshUnavailable = null;\n";

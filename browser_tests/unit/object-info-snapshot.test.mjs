@@ -32,6 +32,9 @@ import {
   objectInfoOracleFailureNote,
 } from "../../web/js/lib/object-info-oracle.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
+// #1413 - the module bindings the oracle body acquired when graph_set_widget took a
+// command budget, plus the locals it now closes over. Shared, for the reason the map says.
+import { setWidgetCommandBudgetDeps, SET_WIDGET_LOCALS_PRELUDE } from "./_panel-constants.mjs";
 
 const SCHEMA = { KSampler: { input: {} }, H3Keyframes: { input: {} } };
 const silence = [
@@ -498,6 +501,9 @@ function extractSetWidgetOracle() {
  */
 function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epochDuringFetch = null }) {
   const body = extractSetWidgetOracle();
+  // #1413 - the budget's bindings, from the shared map rather than restated here.
+  const budgetDeps = setWidgetCommandBudgetDeps();
+  const budgetDepNames = Object.keys(budgetDeps);
   const factory = new Function(
     "api",
     "objectInfoCache",
@@ -508,12 +514,14 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "epochDuringFetch",
     "comfyBackendSocketDown",
     "objectInfoOracleFailureNote",
+    ...budgetDepNames,
     // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
     // extracted body, because the panel's is module state the body re-reads. An earlier
     // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
     // read the same number by construction — the reconnect-mid-fetch case could not fail,
     // and the test passed while proving nothing.
-    `let backendReconnectEpoch = initialEpoch;
+    `${SET_WIDGET_LOCALS_PRELUDE}
+     let backendReconnectEpoch = initialEpoch;
      let oracleFailures = [];
      let snapshotIneligibility = "";
      let setWidgetSchemaFromSnapshot = null;
@@ -552,6 +560,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     epochDuringFetch,
     socketDown,
     objectInfoOracleFailureNote,
+    ...budgetDepNames.map((n) => budgetDeps[n]),
   );
 }
 
