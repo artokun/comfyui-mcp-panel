@@ -47,6 +47,47 @@ const UPLOAD_KIND_EXTENSIONS = {
 };
 
 /**
+ * The TRI-STATE verdict a ComfyUI `/view` existence probe supports (#1357).
+ *
+ *   true  — the server served the file: it is there.
+ *   false — the server ANSWERED and said it is not there (404).
+ *   null  — the question was NOT answered: no response, a traversal refusal (400),
+ *           an auth/proxy status, a 5xx, a timeout.
+ *
+ * The third state is load-bearing. A caller that only ever over-reports (the
+ * missing-media filter, which already has a STORE asserting the miss) may collapse
+ * `false` and `null` into "keep reporting". The live combo scan may NOT: its only
+ * other evidence is an option list that structurally cannot contain the value, so
+ * a flaky fetch read as a confirmed miss manufactures the exact false positive
+ * #1357 reported. `null` on every uncertainty, always.
+ */
+export function inputAssetProbeVerdict(res) {
+  try {
+    if (!res) return null;
+    if (res.ok === true || res.status === 206) return true;
+    return res.status === 404 ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `config` back, when it is an input spec's config object carrying at least one
+ * UPLOAD flag; otherwise null. Callers that already hold the per-input config
+ * (the live combo scan reads it straight out of `/object_info/<class>`) use this
+ * instead of re-walking a whole defs map, so both paths decide "is this an upload
+ * input" from the ONE flag list above.
+ */
+export function uploadConfigOf(config) {
+  try {
+    if (!config || typeof config !== "object") return null;
+    return UPLOAD_CONFIG_FLAGS.some((f) => config[f]) ? config : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The config object for `widgetName` on the fresh /object_info def for `type`, when
  * that input is an UPLOAD input; otherwise null. ComfyUI encodes an input spec as
  * `[typeOrOptions, config?]`; an upload input carries e.g. `{ image_upload: true }`.
@@ -63,9 +104,7 @@ export function uploadInputConfig(defsByType, type, widgetName) {
       (input.required && input.required[widgetName]) ??
       (input.optional && input.optional[widgetName]);
     if (!Array.isArray(spec)) return null;
-    const config = spec[1];
-    if (!config || typeof config !== "object") return null;
-    return UPLOAD_CONFIG_FLAGS.some((f) => config[f]) ? config : null;
+    return uploadConfigOf(spec[1]);
   } catch {
     return null;
   }

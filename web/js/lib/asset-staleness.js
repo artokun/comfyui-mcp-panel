@@ -626,7 +626,15 @@ export function graphErrorsFindingCounts(result) {
       (Number(r.missing_node_count) || 0) +
       arr(r.stale_placeholders).length,
     unavailable,
-    unchecked: arr(r.unchecked_nodes).length,
+    // #1357 — DISTINCT nodes, not entries. This feeds a pill that literally reads
+    // "{count} nodes could not be checked", and since #1357 one node can put
+    // several entries in that list: a widget value the server's combo has no
+    // authority over is reported per VALUE, so three nested LoadImage paths on one
+    // node used to render as "3 nodes". The list itself still carries every entry
+    // with its own reason; only the node COUNT is counted as nodes.
+    unchecked: new Set(
+      arr(r.unchecked_nodes).map((u, i) => (u?.id == null ? `#${i}` : `id:${String(u.id)}`)),
+    ).size,
   };
 }
 

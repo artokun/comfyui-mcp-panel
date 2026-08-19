@@ -195,7 +195,11 @@ import { fetchSingleNodeDef } from "./lib/single-node-def.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
-import { scanComboAvailability, comboAvailabilityNote } from "./lib/live-combo-availability.js";
+import {
+  scanComboAvailability,
+  comboAvailabilityNote,
+  uncheckedNodesNote,
+} from "./lib/live-combo-availability.js";
 import {
   collectDisabledAncestorOutputs,
   disabledOutputsInPrompt,
@@ -300,6 +304,7 @@ import { runSetWidget } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
+  inputAssetProbeVerdict,
   inputPathsUseWindowsSeparators,
 } from "./lib/input-asset.js";
 import {
@@ -9317,25 +9322,46 @@ async function filterServerConfirmedInputSubfolderMedia(
   if (!(probeBudget > 0)) return media;
   return filterServerConfirmedInputSubfolderCandidates(
     media,
-    async (assetValue, ref) => {
-      try {
-        if (typeof api?.fetchApi !== "function") return false;
-        const { subfolder, filename, type } = ref ?? {};
-        if (!filename || !type) return false;
-        const qs = new URLSearchParams({ filename, subfolder, type }).toString();
-        const res = await api.fetchApi(`/view?${qs}`, {
-          method: "GET",
-          cache: "no-store",
-          headers: { Range: "bytes=0-0" },
-          signal: AbortSignal.timeout(probeBudget),
-        });
-        return !!res && (res.ok || res.status === 206);
-      } catch {
-        return false;
-      }
-    },
+    async (assetValue, ref) => (await probeInputAssetPresence(ref, probeBudget)) === true,
     { backslashIsSeparator },
   );
+}
+
+/**
+ * TRI-STATE `/view` existence probe for a parsed `{filename, subfolder, type}` ref:
+ *
+ *   true  — the server served the file: it is there.
+ *   false — the server ANSWERED and said it is not there (404).
+ *   null  — could not be determined (no api client, malformed ref, timeout,
+ *           network failure, or any other status).
+ *
+ * The third state is the whole point (#1357). Callers that only ever over-report
+ * (the missing-media filter above) collapse `false` and `null` into "keep the
+ * candidate", which is safe there because a STORE already asserted the miss. The
+ * live combo scan has no such prior assertion — its only other evidence is a combo
+ * list that structurally cannot contain the value — so treating a flaky fetch as a
+ * confirmed miss would manufacture the exact false positive that issue reports.
+ */
+async function probeInputAssetPresence(ref, timeoutMs) {
+  try {
+    if (typeof api?.fetchApi !== "function") return null;
+    const { subfolder, filename, type } = ref ?? {};
+    if (!filename || !type) return null;
+    if (!(timeoutMs > 0)) return null;
+    const qs = new URLSearchParams({ filename, subfolder: subfolder ?? "", type }).toString();
+    const res = await api.fetchApi(`/view?${qs}`, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    // ComfyUI's /view 404s a path it resolved but did not find. Every OTHER
+    // status (400 traversal refusal, 403, 5xx, a proxy's error page) means the
+    // question was not answered, NOT that the file is absent.
+    return inputAssetProbeVerdict(res);
+  } catch {
+    return null;
+  }
 }
 
 /** True when EITHER missing-asset store holds a RAW candidate (isMissing !== false),
@@ -15317,12 +15343,40 @@ const GRAPH_TOOL_EXECUTORS = {
     // worse than the omission this closes.
     let liveScan = null;
     try {
+      // #1357 — the scan's combo lists cannot enumerate an input file below the
+      // input root (LoadImage.INPUT_TYPES is `os.listdir` + `isfile`, top level
+      // only, nodes.py) nor an `[output]`/`[temp]`/`[input]`-annotated value, so
+      // for those it asks the server directly rather than calling a present file
+      // missing. The same /view EVIDENCE panel_set_widget accepts the very same
+      // value on (#387) — the two must not confirm and deny one value in one
+      // session. NOT byte-for-byte the same probe, and it diverges BOTH ways:
+      //   - `sub\a.png` on a POSIX server — set_widget normalises the backslash
+      //     and would clear it; this declines to split, so the value stays
+      //     reported. STRICTER.
+      //   - `x.png [output]` — set_widget always asks the `input` root and would
+      //     404; this parses the annotation and asks `output`, which is the root
+      //     `folder_paths.get_annotated_filepath` actually resolves. LOOSER, and
+      //     correct — that is the #743 false positive.
+      // An unknown platform keeps POSIX semantics, so a backslash is never
+      // re-read as a separator the server would not honour (#513). Read
+      // BEFORE the scan's own budget is taken, so a slow /system_stats shortens
+      // the scan rather than letting it start with a full step it no longer has
+      // (it is cached for the session, and the media probe above normally warms
+      // it, so this is free in the common case).
+      const statsBudget = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
+      const backslashIsSeparator =
+        statsBudget > 0 ? await inputAssetServerUsesWindowsPaths(statsBudget) : false;
       const scanBudgetMs = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
       if (scanBudgetMs > 0) {
         liveScan = await scanComboAvailability(
           nodes,
           (cls) => fetchSingleNodeDef(cls, (route) => api?.fetchApi?.(route)),
-          { budgetMs: scanBudgetMs },
+          {
+            budgetMs: scanBudgetMs,
+            backslashIsSeparator,
+            confirmServerAsset: (_value, ref) =>
+              probeInputAssetPresence(ref, errorsStepBudget(GET_ERRORS_STEP_CAP_MS)),
+          },
         );
       }
     } catch {
@@ -15586,9 +15640,17 @@ const GRAPH_TOOL_EXECUTORS = {
             unavailable_widget_values_note: comboAvailabilityNote(liveScan.unavailable),
           }
         : {}),
-      ...(liveScan?.unknown?.length ? { unchecked_nodes: liveScan.unknown } : {}),
+      ...(liveScan?.unknown?.length
+        ? {
+            unchecked_nodes: liveScan.unknown,
+            unchecked_nodes_note: uncheckedNodesNote(liveScan.unknown),
+          }
+        : {}),
       ...(liveScan?.unchecked_budget_exhausted ? { unchecked_budget_exhausted: true } : {}),
       ...(liveScan?.unchecked_class_limit ? { unchecked_class_limit: liveScan.unchecked_class_limit } : {}),
+      ...(liveScan?.unchecked_asset_probe_limit
+        ? { unchecked_asset_probe_limit: liveScan.unchecked_asset_probe_limit }
+        : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),

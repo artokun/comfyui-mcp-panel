@@ -1119,6 +1119,37 @@ test("#984 (codex): `unchecked` is reported but is never a finding", () => {
   assert.equal(counts.erroredNodes, 0);
 });
 
+test("#1357: `unchecked` counts NODES, because that is what the pill says", () => {
+  // Since #1357 one node can contribute several entries — a widget value the
+  // server's combo has no authority over is abstained on per VALUE. The pill reads
+  // "{count} nodes could not be checked", so three nested LoadImage paths on node 4
+  // must not render as "3 nodes".
+  const counts = graphErrorsFindingCounts({
+    unchecked_nodes: [
+      { id: 4, type: "LoadImage", widget: "image", value: "a/1.png", reason: "not checked: x" },
+      { id: 4, type: "LoadImage", widget: "image2", value: "a/2.png", reason: "not checked: x" },
+      { id: 4, type: "LoadImage", widget: "image3", value: "a/3.png", reason: "not checked: x" },
+      { id: 9, type: "SomePackNode", reason: "node type not found in /object_info" },
+    ],
+  });
+  assert.equal(counts.unchecked, 2, "node 4 once, node 9 once");
+  assert.equal(counts.unavailable, 0, "an abstention is still never a finding");
+});
+
+test("#1357: an id-less unchecked entry is counted, never merged away", () => {
+  // Collapsing every `{id: undefined}` into one bucket would UNDER-report, which is
+  // the wrong direction for a count whose whole job is to say "I did not look here".
+  const counts = graphErrorsFindingCounts({
+    unchecked_nodes: [{ reason: "a" }, { reason: "b" }, { id: null, reason: "c" }],
+  });
+  assert.equal(counts.unchecked, 3);
+  // A numeric and a string id for the same node are one node, not two.
+  assert.equal(
+    graphErrorsFindingCounts({ unchecked_nodes: [{ id: 7 }, { id: "7" }] }).unchecked,
+    1,
+  );
+});
+
 test("#984: the overlap join is injective — a concatenation collision cannot swallow a finding", () => {
   // Without a field separator, (node "1", file "23") and (node "12", file "3") produce
   // the same key, and a real live-scan finding is silently deduped away as a phantom
