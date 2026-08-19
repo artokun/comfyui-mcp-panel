@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.10] - 2026-08-19
 
 ### Added
+- `graph_get_virtual_types` bridge command reports the node types this page's LiteGraph registry proves frontend-virtual (`isVirtualNode === true` on a probe instance of the registered class — KJNodes' Get/Set bus, rgthree's Label / Fast Groups toggles, and any pack that sets the same flag), so the orchestrator's headless `check_runtime` can consult the authority instead of a name list (comfyui-mcp#1400)
 - `graph_configure_app_mode` sets ComfyUI App Mode inputs, outputs, and default mode on the live canvas without clobbering `extra.comfyui_mcp` (#1429)
 - `graph_save_subgraph` can replace a user-published blueprint in place with `overwrite:true` — no Save dialog, bundled/global blueprints stay protected (#1122)
 - `panel_remove_node` accepts `node_ids` and removes every listed node in one undo step — one Ctrl+Z restores them all, and a single reply names what left and what did not (#841)

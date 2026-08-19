@@ -366,6 +366,7 @@ import { findExistingRailSlot } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
+import { collectFrontendVirtualTypes } from "./lib/virtual-registry.js";
 import {
   unrunnableNodeIds,
   describeUnrunnable,
@@ -11034,6 +11035,42 @@ const GRAPH_TOOL_EXECUTORS = {
       node_type_count: Object.keys(defs).length,
       object_info: defs,
     };
+  },
+
+  // comfyui-mcp#1400 — the node types THIS page proves frontend-virtual
+  // (`isVirtualNode === true` on a probe instance of the registered class):
+  // KJNodes' Get/Set bus, rgthree's Label / Fast Groups toggles, litegraph's own
+  // natives, and any pack nobody has heard of that sets the same flag. The
+  // orchestrator asks on hello and publishes the answer to its spawned tool
+  // servers, whose headless `check_runtime` classifier cannot see this registry —
+  // without it every third-party virtual type lands in `unknownNodes` and
+  // collapses the paid-API verdict to "unknown" for a node that can never
+  // execute, let alone bill.
+  //
+  // Reads the GLOBAL LiteGraph registry, not any canvas: registered in
+  // CANVAS_INDEPENDENT_COMMANDS so the workflow fence does not refuse it (a
+  // hello-time pull carries no workflow stamp). Idempotent and free of graph
+  // state, so it is safe to re-ask on every reconnect.
+  //
+  // FAIL CLOSED by construction (see lib/virtual-registry.js): a class with
+  // backend provenance, a throwing constructor, or an absent flag is simply not
+  // listed, and a type that is not listed keeps the classifier's cautious
+  // "unknown". An unreadable registry answers ok:false rather than a partial
+  // list dressed up as complete.
+  graph_get_virtual_types() {
+    const LG = window.LiteGraph ?? globalThis.LiteGraph;
+    const registry = LG?.registered_node_types;
+    if (!registry || typeof registry !== "object") {
+      return {
+        ok: false,
+        reason: "registry_unavailable",
+        detail:
+          "This page's LiteGraph node registry is not readable, so no frontend " +
+          "virtual types can be proven. Nothing is reported rather than a partial list.",
+      };
+    }
+    const virtual_types = collectFrontendVirtualTypes(registry);
+    return { ok: true, virtual_types, virtual_type_count: virtual_types.length };
   },
 
   graph_get_state() {
