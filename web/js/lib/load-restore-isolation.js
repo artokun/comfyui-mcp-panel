@@ -111,3 +111,103 @@ export function retryNodeRestores(graph, failures) {
   }
   return { restored, failed };
 }
+
+/**
+ * Did the graph restore RUN TO COMPLETION? (panel#1283 family)
+ *
+ * ## Why this observation has to exist
+ *
+ * `resolveOpenRebindVerdict` refuses to report an open applied whenever the graph
+ * on the canvas is not byte-reproducible from the payload, and states its reason:
+ *
+ *   "LiteGraph creates every node (with its id and type) and THEN configures each
+ *    one, and `loadGraphData` catches a `configure()` failure and returns. A throw
+ *    in that second pass leaves the complete node id/type set, the links, and the
+ *    panel's marker over nodes that silently LOST their widget values and
+ *    properties. That is byte-for-byte the same observation as 'the loader
+ *    normalized the widget values', and no discriminator available to the panel
+ *    separates them."
+ *
+ * MEASURED against the frontend source (`LGraph.prototype.configure`, the same
+ * build #1260 was measured on): that account is exactly right, and it is
+ * exhaustive. The node pass is
+ *
+ *     for (const [id, nodeData] of nodeDataMap) {
+ *       const node = this.getNodeById(toNodeId(id))
+ *       node?.configure(nodeData)          // <- no try/catch
+ *     }
+ *
+ * with no try/catch anywhere between it and `loadGraphData`'s own. So the ONLY way
+ * the feared partial load can present is a THROW — out of a node's `configure`, or
+ * out of `LGraph.prototype.configure` itself (its later passes: floating links,
+ * reroute validation, groups, execution order, proxy-widget migration).
+ *
+ * Both are observable. `installNodeConfigureIsolation` above already records the
+ * first, for #1260. This records the second. Together they answer the question the
+ * comment says cannot be answered: **did any part of this restore abort?**
+ *
+ * That is a POSITIVE observation, not a widened tolerance. It never says a
+ * difference is benign; it says the load did not stop early, which is the one
+ * hypothesis the refusal rests on.
+ *
+ * ## What it does NOT change
+ *
+ * Behaviour. The wrapper records the throw and RE-THROWS it, so every caller sees
+ * precisely what it saw before — including `loadGraphData`'s own catch. An
+ * observation that altered control flow would be measuring something other than
+ * what production does.
+ *
+ * Returns null when the wrap is impossible (no LiteGraph / LGraph / prototype
+ * configure). The caller must read null as UNKNOWN — never as "nothing threw" —
+ * because a frontend this cannot instrument is exactly one whose restore it cannot
+ * vouch for.
+ */
+export function installGraphConfigureWatch(LG) {
+  const proto = LG?.LGraph?.prototype;
+  if (!proto || typeof proto.configure !== "function") return null;
+  const original = proto.configure;
+  const throws = [];
+  let active = true;
+  const wrapped = function (...args) {
+    if (!active) return original.apply(this, args);
+    try {
+      return original.apply(this, args);
+    } catch (err) {
+      throws.push(errorText(err));
+      // RE-THROWN. This is an observer, not an isolation: swallowing here would
+      // change what `loadGraphData` sees and what the canvas ends up holding.
+      throw err;
+    }
+  };
+  proto.configure = wrapped;
+  return {
+    throws,
+    restore() {
+      active = false;
+      // Only when this wrapper is still the installed one — the same rule
+      // `installNodeConfigureIsolation` follows, so a nested install/restore in
+      // either order never drops somebody else's wrapper.
+      if (proto.configure === wrapped) proto.configure = original;
+    },
+  };
+}
+
+/**
+ * Fold the two observations into ONE answer with THREE states.
+ *
+ * `true`  — every wrap was installed AND nothing threw: the restore ran to the end.
+ * `false` — something threw. The partial-load hypothesis is LIVE for this load.
+ * `null`  — at least one wrap could not be installed, so the question was never
+ *           asked. Unknown, and the caller must treat it as such: a load that
+ *           could not be watched proves nothing about whether it completed.
+ *
+ * The null case is the point. Collapsing "nothing threw" and "nobody looked" into
+ * one boolean is the exact defect this whole family is about, one level down.
+ */
+export function loadRestoreCompleted({ nodeIsolation, graphWatch } = {}) {
+  if (!nodeIsolation || !graphWatch) return null;
+  const nodeFailures = Array.isArray(nodeIsolation.failures) ? nodeIsolation.failures : null;
+  const graphThrows = Array.isArray(graphWatch.throws) ? graphWatch.throws : null;
+  if (!nodeFailures || !graphThrows) return null;
+  return nodeFailures.length === 0 && graphThrows.length === 0;
+}
