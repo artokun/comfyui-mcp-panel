@@ -305,9 +305,11 @@ test("#1623 the reassurance sentence itself is unchanged for what still fails", 
 
 test("#1623 wiring: the open's pass/fail reads BOTH grounds, and the disclosures stay separate", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  // Deleting `|| contentProof.presentationOnly` restores the reported false error and
-  // this assertion is what notices. Deleting the whole line breaks the handler.
-  assert.match(src, /const contentMatches = contentProof\.proven \|\| contentProof\.presentationOnly;/);
+  // panel#1283 family added a THIRD ground to the same expression, so the pin is on the
+  // two disjuncts #1623 is about rather than on the whole line — deleting
+  // `|| contentProof.presentationOnly` still restores the reported false error, and this
+  // assertion is still what notices. Deleting the whole line breaks the handler.
+  assert.match(src, /const contentMatches =\s*contentProof\.proven \|\| contentProof\.presentationOnly/);
   // Two keys, two notes. The weaker ground must not borrow `geometry_rewritten`'s
   // note, which asserts every difference is a height with the width unchanged —
   // false of the very case this fix admits.
