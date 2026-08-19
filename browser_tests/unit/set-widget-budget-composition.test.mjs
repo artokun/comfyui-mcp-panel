@@ -178,6 +178,7 @@ const EXECUTOR_DEPS = [
   "OBJECT_INFO_DEADLINE_MS",
   "SET_WIDGET_ASSET_PROBE_MS",
   "withTimeout",
+  "inputAssetProbeVerdict",
 ];
 
 const never = () => new Promise(() => {});
@@ -395,6 +396,58 @@ test("#1418 the #387 /view probe IS reached after a refresh that completes, and 
   assert.match(built.seen.viewRoutes[0], /subfolder=sub/, "…with the nested path #387 is about");
   assert.ok(elapsed < 2500, `the command answered in ${elapsed}ms; unbounded the probe never settles`);
   assert.equal(widget.value, "top.png", "a probe that could not answer admits nothing — #240 strictness holds");
+});
+
+test("#1418 a probe that could not ANSWER is not reported as a confirmed miss", async () => {
+  // The trap this bound would otherwise set. #1357 established the tri-state for the live
+  // combo scan: `false` is the server saying the file is not there, `null` is nobody having
+  // answered. Bounding the probe created a NEW way to produce `null`, and the old boolean
+  // collapsed it into `false` — so a command whose budget ran out would tell the caller
+  // their perfectly-real nested upload is invalid, on the strength of a request that never
+  // came back. That is the same wrong-cause shape this issue is about.
+  const { node, widget } = loadImageNode();
+  const built = realGraphSetWidget({
+    node,
+    getNodeDefs: async () => UPLOAD_DEFS,
+    viewFetch: never, // reached, bounded, never answers
+    budgetMs: 4000,
+    probeMs: 200,
+  });
+  const outcome = await withinWatchdog(2500, "the refusal", () =>
+    built.graph_set_widget({ node_id: 12, widget: "image", value: "sub/new.png", workflow_uuid: "u" }),
+  );
+  assert.ok(outcome instanceof Error);
+  assert.equal(built.seen.viewRoutes.length, 1, "the probe was reached");
+  assert.match(outcome.message, /probe did NOT answer/, "the refusal says the question went unanswered");
+  assert.match(
+    outcome.message,
+    /does NOT\s+establish that the file is missing/,
+    "…and explicitly declines to assert the cause it could not observe",
+  );
+  assert.match(outcome.message, /RETRY/, "…and says the one thing that can change the answer");
+  assert.equal(widget.value, "top.png", "still nothing written — #240 strictness is untouched");
+});
+
+test("#1418 a server that ANSWERS 404 is still a confirmed miss, with no unanswered note", async () => {
+  // The other half: `false` must keep meaning what it meant. A refusal that hedged on a
+  // real 404 would be its own kind of dishonesty, and would train callers to retry forever.
+  const { node } = loadImageNode();
+  const built = realGraphSetWidget({
+    node,
+    getNodeDefs: async () => UPLOAD_DEFS,
+    viewFetch: async () => ({ ok: false, status: 404 }),
+    budgetMs: 4000,
+    probeMs: 300,
+  });
+  const outcome = await withinWatchdog(2500, "the refusal", () =>
+    built.graph_set_widget({ node_id: 12, widget: "image", value: "sub/new.png", workflow_uuid: "u" }),
+  );
+  assert.ok(outcome instanceof Error);
+  assert.equal(built.seen.viewRoutes.length, 1, "the probe was reached and answered");
+  assert.ok(
+    !/probe did NOT answer/.test(outcome.message),
+    "the server answered, so the refusal must NOT hedge — 404 is a real observation",
+  );
 });
 
 test("#1418 a /view that ANSWERS still accepts the nested asset — the bound refuses nothing else", async () => {

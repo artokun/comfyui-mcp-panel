@@ -19,6 +19,7 @@ import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { inputAssetProbeVerdict } from "../../web/js/lib/input-asset.js";
 import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
 
 export const PANEL_SRC = readFileSync(
@@ -225,5 +226,9 @@ export function setWidgetCommandBudgetDeps() {
     OBJECT_INFO_DEADLINE_MS,
     SET_WIDGET_ASSET_PROBE_MS,
     OBJECT_INFO_SEED_WAIT_MS,
+    // #1418 — the #387 probe now returns #1357's TRI-STATE verdict rather than a
+    // boolean, so an unanswered probe stays distinguishable from a real 404. REAL: a
+    // stub would classify every response as whatever the stub decided.
+    inputAssetProbeVerdict,
   };
 }

@@ -14081,8 +14081,8 @@ const GRAPH_TOOL_EXECUTORS = {
           if (!filename) return false;
           const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
           // withTimeout never rejects and never cancels the request — the fetch keeps
-          // going, this stops waiting on it. A timeout resolves the same NO-ANSWER
-          // sentinel a thrown fetch is caught into below, so both take one branch.
+          // going, this stops waiting on it. A timeout resolves `null`, which
+          // `inputAssetProbeVerdict` already classifies as THE QUESTION WAS NOT ANSWERED.
           const res = await withTimeout(
             api.fetchApi(`/view?${qs}`, {
               method: "GET",
@@ -14092,9 +14092,15 @@ const GRAPH_TOOL_EXECUTORS = {
             budget.bounded(SET_WIDGET_ASSET_PROBE_MS),
             () => null,
           );
-          return !!res && (res.ok || res.status === 206);
+          // #1418 — the TRI-STATE verdict (#1357), not `!!res && …`. Bounding this probe
+          // created a second way for it to come back without an answer, and the old
+          // boolean collapsed that into "the server says the file is not there" — which
+          // set-widget.js would then report as a confirmed miss. `null` keeps "nobody
+          // answered" distinct from a real 404 all the way into the refusal. It still
+          // does not ACCEPT anything, so #240 strictness is unchanged.
+          return inputAssetProbeVerdict(res);
         } catch {
-          return false;
+          return null;
         }
       },
     };

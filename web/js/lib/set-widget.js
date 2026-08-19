@@ -805,6 +805,11 @@ export async function runSetWidget(
     }
   };
 
+  // #1418 — set when the #387 probe was REACHED but did not answer (see the tri-state note
+  // below). Read only by the final refusal, which must not assert a confirmed miss on the
+  // strength of a question the server never answered.
+  let assetProbeUnanswered = false;
+
   // #387 UPLOAD-ASSET fallback: a value rejected by the combo list even AFTER the
   // authoritative /object_info refresh may still be a VALID, loadable input asset the
   // server has on disk but /object_info never enumerates — specifically a LoadImage
@@ -831,13 +836,33 @@ export async function runSetWidget(
       (w) => w?.name === (writeTargetWidgetName ?? widgetName),
     );
     if (!uploadWidget) return false;
-    let exists = false;
+    // #1418 — TRI-STATE, not a boolean, for the reason #1357 already established for the
+    // live combo scan: `false` means the server ANSWERED and said the file is not there,
+    // `null` means the question was NOT answered — no response, a 5xx, a proxy status, or
+    // (new here) the probe's own bound firing because the command's budget ran out. The
+    // two demand different REFUSALS. Collapsing them, as this did while the probe was
+    // unbounded and could only ever answer, now makes an unasked question read as a
+    // confirmed miss — and the refusal below would then tell the caller their value is
+    // invalid on the strength of a request that never came back. That is the same
+    // wrong-cause shape this whole issue is about, so bounding the probe without
+    // splitting these would have traded one instance of it for another.
+    //
+    // A THROW is `null` too: a probe that blew up did not answer the question either.
+    // Neither `false` nor `null` ACCEPTS, so #240 strictness is untouched — the only
+    // thing that changes is what the caller is told.
+    let verdict = null;
     try {
-      exists = await confirmServerAsset(value);
+      const answered = await confirmServerAsset(value);
+      // Tolerates a caller still returning a plain boolean: `true`/`false` keep their
+      // meanings, so a driver that has not been updated behaves exactly as before.
+      verdict = answered === true ? true : answered === false ? false : null;
     } catch {
-      exists = false;
+      verdict = null;
     }
-    if (!exists) return false;
+    if (verdict !== true) {
+      assetProbeUnanswered = verdict === null;
+      return false;
+    }
     // confirmServerAsset may have yielded while the user changed canvases; do
     // not add an option to the captured widget after that switch (#718).
     assertTargetStillCurrentNow();
@@ -1248,9 +1273,27 @@ export async function runSetWidget(
     // contain the value, or a list that could not be read at all. Nothing is appended
     // here suggesting a retry, because at this point there is no argument the caller can
     // add that changes the answer — the decision is the panel's observation, not theirs.
+    //
+    // #1418 — WITH ONE EXCEPTION, and the sentence above is exactly why it has to be named.
+    // When the #387 upload-asset probe was reached and did NOT answer (a 5xx, a proxy
+    // status, a throw, or its bound firing on a spent command budget), the panel did not
+    // observe anything about this value's existence on the server. The rejection carried
+    // in `latest` is still true about the COMBO LIST, so it stays — but "the list does not
+    // list it" is not the whole answer for an upload input, and a caller told only that
+    // will conclude the file is absent when nobody ever managed to ask. A retry DOES change
+    // this one, so unlike every other path out of here, it says so.
+    const probeNote = assetProbeUnanswered
+      ? ` NOTE: this value looks like an uploadable asset for this input, so the panel also ` +
+        `probed the server for a file /object_info cannot list (a subfolder-nested upload, #387) ` +
+        `— and that probe did NOT answer: it timed out, failed, or the command's time budget ` +
+        `ran out before it could. So this refusal rests on the combo list ALONE and does NOT ` +
+        `establish that the file is missing from the server. If you believe the file is there, ` +
+        `RETRY — the retry probes again with a fresh budget.`
+      : "";
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
-        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}`,
+        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}` +
+        probeNote,
     );
   }
 }

@@ -1331,6 +1331,7 @@ const EXECUTOR_DEPS = [
   "OBJECT_INFO_DEADLINE_MS",
   "SET_WIDGET_ASSET_PROBE_MS",
   "withTimeout",
+  "inputAssetProbeVerdict",
 ];
 
 /**
