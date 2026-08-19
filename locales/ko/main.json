@@ -700,6 +700,8 @@
       "remove_attachment": "첨부 제거",
       "remove_from_recently_used": "최근 사용에서 제거",
       "remove_this_key_from_the_orchestrator_s": "오케스트레이터 저장소에서 이 키 제거",
+      "removed_boundary_slot": "{side} 경계 슬롯 “{name}” 제거됨",
+      "removed_boundary_slot_dropped_other": " — 경계를 넘던 와이어 {count}개 끊김",
       "removed_group": "그룹 “{title}” 제거됨",
       "removed_node": "{type} 제거됨 (id {id})",
       "removed_node_cleaned_slots_other": " — 남겨진 경계 슬롯 {slots} 정리됨",

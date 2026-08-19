@@ -81,12 +81,17 @@ test("names what accepts a rail id — and how each one actually takes it", () =
   assert.match(msg, /panel_move_rail addresses the same rail by SIDE/);
 });
 
-test("does NOT invent an unexpose tool — that half is parked", () => {
+test("names the unexpose tools as the removal path — by slot NAME, not rail id (artokun/comfyui-mcp#1294)", () => {
   const msg = describeRailNodeTarget(-20, "output");
-  assert.ok(!/unexpose_subgraph/.test(msg), "no such command exists");
-  assert.match(msg, /NO unexpose\/remove-boundary operation/);
-  // The workaround that does work today is named instead of implied.
-  assert.match(msg, /remove or replace the interior node/);
+  // The removal half is no longer parked: the tools exist and are named. But the
+  // message must not read as "pass -20 to unexpose" — a rail id names the whole
+  // rail and is refused there too.
+  assert.match(msg, /panel_unexpose_subgraph_input/);
+  assert.match(msg, /panel_unexpose_subgraph_output/);
+  assert.match(msg, /take the slot's NAME/);
+  assert.match(msg, /a rail id is refused there too/);
+  // The interior-node workaround stays named for the slot-and-source case.
+  assert.match(msg, /Removing or replacing the interior node/);
 });
 
 test("the INPUT rail reads as itself, not as a copy of the output text", () => {

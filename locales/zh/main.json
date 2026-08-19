@@ -700,6 +700,8 @@
       "remove_attachment": "移除附件",
       "remove_from_recently_used": "从最近使用中移除",
       "remove_this_key_from_the_orchestrator_s": "从编排器的存储中移除这个密钥",
+      "removed_boundary_slot": "已移除 {side} 边界插槽“{name}”",
+      "removed_boundary_slot_dropped_other": " —— 已断开跨越边界的 {count} 条连线",
       "removed_group": "已移除分组“{title}”",
       "removed_node": "已移除 {type}（id {id}）",
       "removed_node_cleaned_slots_other": " —— 已清理残留的边界插槽 {slots}",

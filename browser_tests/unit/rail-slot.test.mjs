@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { findExistingRailSlot, railSlotIndex } from "../../web/js/lib/rail-slot.js";
+import { findExistingRailSlot, railSlotIndex, resolveRailSlotForRemoval } from "../../web/js/lib/rail-slot.js";
 
 /** A rail with twelve slots, none of them named with digits — the reported shape. */
 const RAIL = Array.from({ length: 12 }, (_, i) => ({ name: `in_${i}`, type: "STRING", slot: i }));
@@ -110,17 +110,72 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
   );
   assert.match(
     panel,
-    /import \{ findExistingRailSlot \} from "\.\/lib\/rail-slot\.js";/,
-    "the panel imports the shared lookup",
+    /import \{ findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks \} from "\.\/lib\/rail-slot\.js";/,
+    "the panel imports the shared lookups",
   );
   assert.doesNotMatch(
     panel,
     /function findExistingRailSlot\s*\(/,
     "and keeps no local copy that would shadow it",
   );
+  assert.doesNotMatch(
+    panel,
+    /function resolveRailSlotForRemoval\s*\(/,
+    "and keeps no local copy of the removal resolver either",
+  );
+  assert.doesNotMatch(
+    panel,
+    /function countHostRailLinks\s*\(/,
+    "and keeps no local copy of the host-wire counter either",
+  );
   // Both rail branches must go through it: outputs (to_input) and inputs (from_output).
   const uses = panel.match(/findExistingRailSlot\(graph\.(inputs|outputs),/g) ?? [];
   assert.equal(uses.length, 2, "both rail branches resolve through it");
+  // And both unexpose executors resolve through the removal resolver.
+  const removals = panel.match(/resolveRailSlotForRemoval\(subgraph\.(inputs|outputs),/g) ?? [];
+  assert.equal(removals.length, 2, "both unexpose executors resolve through it");
+});
+
+test("#1294 removal resolves a slot by name or index, like a connect", () => {
+  const rail = [{ name: "model", slot: 0 }, { name: "prompt", slot: 1 }];
+  assert.equal(resolveRailSlotForRemoval(rail, "prompt", "input")?.slot, 1);
+  assert.equal(resolveRailSlotForRemoval(rail, "PROMPT", "input")?.slot, 1); // case-insensitive
+  assert.equal(resolveRailSlotForRemoval(rail, 0, "input")?.slot, 0);
+  assert.equal(resolveRailSlotForRemoval(rail, "1", "input")?.slot, 1);
+});
+
+test("#1294 removal of an UNKNOWN slot refuses and names what IS on the rail", () => {
+  // The pre-#930 failure shape was reporting a miss as something else; a removal
+  // that no-ops or guesses silently is the destructive version of the same bug.
+  const rail = [{ name: "model", slot: 0 }, { name: "prompt", slot: 1 }];
+  assert.throws(() => resolveRailSlotForRemoval(rail, "pixels", "input"), /No input boundary slot "pixels"/);
+  assert.throws(() => resolveRailSlotForRemoval(rail, "5", "input"), /No input boundary slot "5"/);
+  try {
+    resolveRailSlotForRemoval(rail, "pixels", "input");
+    assert.fail("must throw");
+  } catch (e) {
+    assert.match(e.message, /nothing was removed/);
+    assert.match(e.message, /Available input slots: model, prompt/);
+    assert.match(e.message, /rails\.input/);
+  }
+});
+
+test("#1294 a rail_node_id is rejected BY NAME, never used as an index", () => {
+  // -20 is the synthetic id of the WHOLE output rail (panel_query_graph's
+  // rails.output.rail_node_id), not of a slot on it. Silently indexing with it
+  // would remove an unrelated slot — worse than the refusal the issue asks for.
+  const rail = [{ name: "images", slot: 0 }, { name: "latent", slot: 1 }];
+  assert.throws(() => resolveRailSlotForRemoval(rail, -20, "output"), /rail_node_id/);
+  try {
+    resolveRailSlotForRemoval(rail, -20, "output");
+    assert.fail("must throw");
+  } catch (e) {
+    assert.match(e.message, /WHOLE output RAIL, not of a slot on it/);
+    assert.match(e.message, /Nothing was removed/);
+  }
+  // And the ambiguous digit-name refusal still fires on the removal path.
+  const crossed = [{ name: "1", slot: 0 }, { name: "0", slot: 1 }];
+  assert.throws(() => resolveRailSlotForRemoval(crossed, "1", "input"), /ambiguous on this boundary rail/);
 });
 
 test("#1114 an AMBIGUOUS ref refuses instead of guessing (codex round 2)", () => {

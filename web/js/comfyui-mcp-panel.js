@@ -363,7 +363,7 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
-import { findExistingRailSlot } from "./lib/rail-slot.js";
+import { findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
@@ -18373,7 +18373,130 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  // Dissolve a subgraph: inline its interior nodes into the parent + rewire
+  // --- Subgraph boundary I/O removal: the inverse of the expose twins --------
+  // #1294 — the boundary surface had three ways to CREATE/MOVE a slot and none
+  // to remove one; the only supported path was deleting the interior node that
+  // feeds the slot. Removal is DESTRUCTIVE to the wires crossing that boundary:
+  // the interior link(s) on the rail slot and any parent-graph links on the
+  // host SubgraphNode's matching slot go with it, so both are counted BEFORE
+  // the removal and reported — never silently dropped. Run while INSIDE the
+  // subgraph, same as the expose twins.
+
+  // Remove a subgraph OUTPUT boundary slot (unexpose an interior output).
+  graph_unexpose_subgraph_output({ name }) {
+    const { graph, canvas, rootGraph } = getGraphCtx();
+    const subgraph = graph;
+    if (graph === rootGraph || typeof subgraph.removeOutput !== "function" || !subgraph.outputNode) {
+      throw new Error(
+        "panel_unexpose_subgraph_output must be run INSIDE a subgraph — call panel_enter_subgraph first",
+      );
+    }
+    // Refuses unknown names, ambiguous digit-names, and rail_node_ids by name
+    // (see rail-slot.js) — a wrong removal is worse than a refusal.
+    const slot = resolveRailSlotForRemoval(subgraph.outputs, name, "output");
+    const slotIndex = subgraph.outputs.indexOf(slot);
+    // Count what the removal takes with it BEFORE it goes — afterwards there
+    // is nothing left to count.
+    const interiorLinks = (slot.linkIds ?? []).length;
+    const hostLinks = countHostRailLinks(rootGraph, subgraph, "output", slotIndex);
+    subgraph.beforeChange?.();
+    let removeErr = null;
+    try {
+      subgraph.removeOutput(slot);
+    } catch (err) {
+      // Not a verdict — the expose twin's connect taught the same lesson: the
+      // slot may be gone anyway. The live rail below is the only reading.
+      removeErr = err;
+    } finally {
+      subgraph.afterChange?.();
+    }
+    // OBSERVED, not "the call returned": LGraph.removeOutput dispatches a
+    // CANCELABLE "removing-output" event and returns without removing when a
+    // listener cancels it — a clean return is not a removal.
+    if ((subgraph.outputs ?? []).includes(slot)) {
+      subgraph.setDirtyCanvas?.(true, true);
+      throw new Error(
+        `The subgraph output "${slot.name}" is still on the rail after removeOutput returned` +
+          (removeErr ? ` — the frontend threw: ${removeErr?.message ?? removeErr}` : "") +
+          `. A frontend listener can cancel the "removing-output" event; nothing was removed.`,
+      );
+    }
+    findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
+    subgraph.setDirtyCanvas?.(true, true);
+    canvas?.setDirty?.(true, true);
+    return {
+      removed: {
+        side: "output",
+        name: slot.name,
+        type: slot.type,
+        slot: slotIndex,
+        interior_links_dropped: interiorLinks,
+        host_links_dropped: hostLinks,
+      },
+      ...(removeErr
+        ? {
+            warning:
+              `removeOutput threw (${removeErr?.message ?? removeErr}) but the slot is gone from ` +
+              `the rail — the removal landed despite the throw. Inspect the boundary before relying on it.`,
+          }
+        : {}),
+    };
+  },
+
+  // Remove a subgraph INPUT boundary slot (unexpose an interior input).
+  graph_unexpose_subgraph_input({ name }) {
+    const { graph, canvas, rootGraph } = getGraphCtx();
+    const subgraph = graph;
+    if (graph === rootGraph || typeof subgraph.removeInput !== "function" || !subgraph.inputNode) {
+      throw new Error(
+        "panel_unexpose_subgraph_input must be run INSIDE a subgraph — call panel_enter_subgraph first",
+      );
+    }
+    const slot = resolveRailSlotForRemoval(subgraph.inputs, name, "input");
+    const slotIndex = subgraph.inputs.indexOf(slot);
+    const interiorLinks = (slot.linkIds ?? []).length;
+    const hostLinks = countHostRailLinks(rootGraph, subgraph, "input", slotIndex);
+    subgraph.beforeChange?.();
+    let removeErr = null;
+    try {
+      subgraph.removeInput(slot);
+    } catch (err) {
+      removeErr = err;
+    } finally {
+      subgraph.afterChange?.();
+    }
+    // See the output twin: a cancelable "removing-input" event means a clean
+    // return is not evidence of a removal.
+    if ((subgraph.inputs ?? []).includes(slot)) {
+      subgraph.setDirtyCanvas?.(true, true);
+      throw new Error(
+        `The subgraph input "${slot.name}" is still on the rail after removeInput returned` +
+          (removeErr ? ` — the frontend threw: ${removeErr?.message ?? removeErr}` : "") +
+          `. A frontend listener can cancel the "removing-input" event; nothing was removed.`,
+      );
+    }
+    findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
+    subgraph.setDirtyCanvas?.(true, true);
+    canvas?.setDirty?.(true, true);
+    return {
+      removed: {
+        side: "input",
+        name: slot.name,
+        type: slot.type,
+        slot: slotIndex,
+        interior_links_dropped: interiorLinks,
+        host_links_dropped: hostLinks,
+      },
+      ...(removeErr
+        ? {
+            warning:
+              `removeInput threw (${removeErr?.message ?? removeErr}) but the slot is gone from ` +
+              `the rail — the removal landed despite the throw. Inspect the boundary before relying on it.`,
+          }
+        : {}),
+    };
+  },
+
   // external links. node_id is the SubgraphNode in the CURRENT (parent) graph.
   // Ref: ComfyUI_frontend LGraph.ts unpackSubgraph ~1932 (wraps its own
   // beforeChange/afterChange) and _unpackSubgraphImpl ~1950.
@@ -24984,6 +25107,31 @@ function describeCommand(cmd, msg, reply) {
           pos: r.pos?.map(Math.round),
         }),
       };
+    case "graph_unexpose_subgraph_input":
+    case "graph_unexpose_subgraph_output": {
+      // The dropped-wire count goes on the card, not just the payload: removal
+      // silently eating parent-graph wires is exactly what a user must SEE (#1294).
+      const rm = r.removed;
+      const dropped = (rm?.interior_links_dropped ?? 0) + (rm?.host_links_dropped ?? 0);
+      return {
+        icon: "pi-minus-circle",
+        text:
+          tr("panel.removed_boundary_slot", "Removed {side} boundary slot “{name}”", {
+            side: rm?.side,
+            name: rm?.name,
+          }) +
+          (dropped
+            ? tr(
+                "panel.removed_boundary_slot_dropped",
+                {
+                  one: " — dropped {count} wire that crossed the boundary",
+                  other: " — dropped {count} wires that crossed the boundary",
+                },
+                { count: dropped },
+              )
+            : ""),
+      };
+    }
     case "graph_set_node_mode":
       return {
         icon: r.mode === "active" ? "pi-play-circle" : r.mode === "mute" ? "pi-volume-off" : "pi-ban",
