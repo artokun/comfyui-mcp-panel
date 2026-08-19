@@ -883,7 +883,16 @@ export function emptyComboNote(empties) {
   );
 }
 
-export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
+/**
+ * Stamp fresh defs onto live node INSTANCES, rebuild their combo option lists, and repair
+ * UNKNOWN widget names. Returns the number of nodes whose widget names were repaired.
+ *
+ * `stats`, when given, is filled in with what this sweep OBSERVABLY did — `nodesSwept`,
+ * `combosRebuilt`, and `completed` (set only after every graph was walked to the end).
+ * #1193 reads it: a caller may treat the live combo lists as rebuilt from `defsByType`
+ * only when the sweep it ran actually finished, never because it was called.
+ */
+export function reapplyDefsToLiveNodes(rootGraph, defsByType, stats = null) {
   let repaired = 0;
   if (!defsByType) return repaired;
   try {
@@ -913,7 +922,11 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
         // It is safe to run alongside the frontend call: `refreshComboOptionsFromDefs`
         // skips a dynamic (function) option source and writes the same values
         // `/object_info` just published.
-        refreshComboOptionsFromDefs(node, defsByType, type, undefined, mergedInputsFor(def, mergedCache, type));
+        const rebuilt = refreshComboOptionsFromDefs(node, defsByType, type, undefined, mergedInputsFor(def, mergedCache, type));
+        if (stats) {
+          stats.nodesSwept = (stats.nodesSwept ?? 0) + 1;
+          stats.combosRebuilt = (stats.combosRebuilt ?? 0) + rebuilt;
+        }
         // Stamp only onto a TYPE-SPECIFIC constructor (already carries nodeData
         // for this type) — never onto a shared generic/unknown fallback class,
         // which would corrupt every other unknown node.
@@ -928,6 +941,12 @@ export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
         if (reconcileUnknownWidgetNames(node, def)) repaired++;
       }
     }
+    // #1193 — the LAST statement inside the try, so `completed` means every graph was
+    // walked to the end. The sweep is best-effort and swallows its own throw below; a
+    // caller that treats a PARTIAL sweep as authoritative would be trusting combo lists
+    // that were never rebuilt. Set here, the flag cannot say "yes" for a sweep that
+    // stopped early — and stays absent, which is neither yes nor no, when it did.
+    if (stats) stats.completed = true;
   } catch {
     /* best-effort sweep */
   }

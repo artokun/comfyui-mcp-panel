@@ -643,6 +643,39 @@ test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (fi
   assert.deepEqual(node.widgets.map((w) => w.name), ["lora_name", "strength_model"]);
 });
 
+test("#1193 the sweep REPORTS what it rebuilt, and only claims completion after the whole walk", () => {
+  // The contract #1193's combo phase reads. `completed` is what licenses the panel to say
+  // the live lists are current without waiting for the frontend's own refreshComboInNodes,
+  // so it must be set by the sweep itself — never inferred from the fact that it was called.
+  const nodes = [
+    { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", value: "a", options: { values: [] } }], constructor: {} },
+    { id: 2, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", value: "a", options: { values: [] } }], constructor: {} },
+  ];
+  const stats = {};
+  reapplyDefsToLiveNodes(graphOf(nodes), { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors", "b.safetensors"]) }, stats);
+  assert.equal(stats.completed, true);
+  assert.equal(stats.nodesSwept, 2);
+  assert.equal(stats.combosRebuilt, 2, "one combo widget rebuilt per node");
+  assert.deepEqual(nodes[0].widgets[0].options.values, ["a.safetensors", "b.safetensors"]);
+
+  // A sweep that stops part way must NOT claim completion. `_nodes` is a getter that
+  // throws on the second graph, which is a failure the sweep swallows by design — the
+  // point is that swallowing it cannot look like success to the caller.
+  const good = graphOf([{ id: 3, type: "CheckpointLoaderSimple", widgets: [], constructor: {} }]);
+  const exploding = { get _nodes() { throw new Error("graph went away mid-sweep"); } };
+  const root = {
+    _nodes: [{ id: 4, type: "Sub", subgraph: exploding }, ...good._nodes],
+    getNodeById: () => null,
+  };
+  const partial = {};
+  reapplyDefsToLiveNodes(root, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }, partial);
+  assert.notEqual(partial.completed, true, "a sweep that threw part way must leave completion unclaimed");
+
+  // No stats object at all is still supported — the argument is optional and every other
+  // caller passes two arguments.
+  assert.doesNotThrow(() => reapplyDefsToLiveNodes(good, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }));
+});
+
 test("reapplyDefsToLiveNodes stamps fresh nodeData onto a type-specific constructor", () => {
   const oldDef = { input: { required: { seed: {} } } };
   const newDef = { input: { required: { seed: {}, box_toggle_max_frames: {} } } };
@@ -1321,8 +1354,9 @@ test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's
   assert.match(code, /verdict\.empty_combo_lists = empties;/, "the verdict must carry the field");
   assert.match(
     code,
-    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored \};/,
-    "…and the refreshed:true branch must forward it (…and #1275's restored disclosure rides the same branch)",
+    /if \(refreshed\) return \{ ok: true, refreshed: true, \.\.\.stale, \.\.\.emptyCombos, \.\.\.restored, \.\.\.comboUnconfirmed \};/,
+    "…and the refreshed:true branch must forward it (#1275's restored disclosure and #1193's " +
+      "unconfirmed-combo disclosure ride the same branch)",
   );
   // The spread alone is not enough: `emptyCombos` could still be built without the list
   // itself, forwarding only the note. Pin BOTH fields of the mapping.
