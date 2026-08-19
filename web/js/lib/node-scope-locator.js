@@ -20,6 +20,13 @@
  *
  * This module answers the question the failure raises: WHERE is it, then?
  *
+ * #1298 is the sibling when the answer is NOWHERE. A mutation after a graph
+ * change (the user deleted nodes; a load remapped ids) used to stop at "not in
+ * the current graph" and send the caller to re-read. The re-read is a second
+ * round-trip they already had the evidence for: the live graph the write just
+ * searched. The genuine-miss path now names the current ids on the graph the
+ * mutation applied to, so the next call can retarget without another outline.
+ *
  * SEARCH IS BOUNDED AND NON-THROWING. It runs only on the failure path, and any
  * unexpected shape simply ends that branch — a diagnostic that throws would replace a
  * bad error with a worse one.
@@ -41,6 +48,13 @@
 
 /** Depth guard for a pathological/looping graph. Real workflows nest a handful deep. */
 const MAX_DEPTH = 12;
+
+/**
+ * Cap on ids named in a genuine-miss error. The list exists so a mutation can
+ * retarget without another outline call (#1298); it is not a substitute for
+ * outline, so a 200-node dump would hide the diagnosis.
+ */
+const MAX_CURRENT_IDS = 40;
 
 function nodesOf(graph) {
   const raw = graph?._nodes ?? graph?.nodes;
@@ -108,18 +122,66 @@ export function countSubgraphs(rootGraph) {
 }
 
 /**
+ * Current ids on the graph a mutation actually applied to, so a genuine miss
+ * can name what IS addressable (#1298). Best-effort and non-throwing: a
+ * diagnostic that throws replaces a bad error with a worse one.
+ *
+ * The missing id is filtered out even if `_nodes` and `getNodeById` have
+ * drifted — listing it as live would send the caller back at the same miss.
+ */
+function currentIdSuffix(graph, nodeId) {
+  if (!graph) return "";
+  try {
+    const wanted = nodeId == null ? "" : String(nodeId);
+    const parts = [];
+    for (const n of nodesOf(graph)) {
+      if (n?.id == null) continue;
+      if (wanted && String(n.id) === wanted) continue;
+      const type =
+        typeof n.type === "string" && n.type
+          ? n.type
+          : typeof n.comfyClass === "string" && n.comfyClass
+            ? n.comfyClass
+            : "";
+      parts.push(type ? `${n.id} (${type})` : `${n.id}`);
+    }
+    if (!parts.length) {
+      return (
+        "The graph you are viewing currently has no nodes. " +
+        "Re-read with panel_graph_outline before retrying."
+      );
+    }
+    const shown = parts.slice(0, MAX_CURRENT_IDS);
+    const extra =
+      parts.length > MAX_CURRENT_IDS ? `, …and ${parts.length - MAX_CURRENT_IDS} more` : "";
+    return (
+      `Current ids on the graph you are viewing: ${shown.join(", ")}${extra}. ` +
+      `Retarget using a current id; re-read with panel_graph_outline if you need wiring.`
+    );
+  } catch {
+    return "";
+  }
+}
+
+/**
  * The message for a node id that did not resolve in the current graph.
  *
  * Always begins `No node with id <id>` so existing callers/tests that match that
  * prefix are unaffected.
  *
  * @param {number|string} nodeId
- * @param {object|null} rootGraph  null/absent ⇒ the plain message, unchanged
+ * @param {object|null} rootGraph  null/absent ⇒ the plain message, unless
+ *   `currentGraph` can still name live ids
  * @param {boolean} viewingRoot    true when the current graph IS the root
+ * @param {object|null} [currentGraph]  the graph the mutation applied to (the
+ *   one `getNodeById` just searched). When omitted, the root is used only if
+ *   `viewingRoot` is true — a subgraph view must not be told the root's ids.
  */
-export function describeMissingNode(nodeId, rootGraph, viewingRoot) {
+export function describeMissingNode(nodeId, rootGraph, viewingRoot, currentGraph) {
   const base = `No node with id ${nodeId} in the current graph`;
-  if (!rootGraph) return base;
+  const graphForIds = currentGraph ?? (viewingRoot ? rootGraph : null);
+  const ids = currentIdSuffix(graphForIds, nodeId);
+  if (!rootGraph) return ids ? `${base}. ${ids}` : base;
 
   const found = locateNodeAcrossScopes(rootGraph, nodeId);
   if (!found) {
@@ -128,7 +190,7 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot) {
       `${base} — and it is not in any other scope either ` +
       `(searched the root graph${subs ? ` and ${subs} subgraph(s)` : ""}). ` +
       `The id may be from a different workflow, or the node was removed. ` +
-      `Re-read with panel_graph_outline before retrying.`
+      (ids || `Re-read with panel_graph_outline before retrying.`)
     );
   }
 

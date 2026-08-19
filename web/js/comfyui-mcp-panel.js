@@ -9526,7 +9526,9 @@ function resolveNode(graph, nodeId) {
     } catch {
       rootGraph = null;
     }
-    throw new Error(describeMissingNode(nodeId, rootGraph, viewingRoot));
+    // #1298 — pass the graph this lookup just searched so a genuine miss can
+    // name the current ids the next mutation can actually target.
+    throw new Error(describeMissingNode(nodeId, rootGraph, viewingRoot, graph));
   }
   return node;
 }
@@ -17319,8 +17321,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const store = getSubgraphStore();
     let target = null;
     if (node_id != null) {
-      target = graph.getNodeById(canonicalNodeId(node_id));
-      if (!target) throw new Error(`No node with id ${node_id} in the current graph`);
+      target = resolveNode(graph, node_id);
       if (!target.subgraph) {
         throw new Error(`Node ${node_id} (${target.type}) is not a subgraph node`);
       }
