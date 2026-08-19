@@ -174,7 +174,7 @@ which receives `panel_*` by a different route.
 | Tool | Effect |
 |---|---|
 | `panel_add_node` | Add a node by class_type |
-| `panel_remove_node` | Remove a node |
+| `panel_remove_node` | Remove a node, or several as one undo step (`node_ids`) |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
 | `panel_set_property` | Set a node **property** (right-click → Properties), e.g. rgthree Fast Groups Bypasser `matchTitle` — the counterpart to `panel_set_widget` |

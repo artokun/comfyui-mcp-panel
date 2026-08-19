@@ -109,6 +109,17 @@ test("a count can drive the FORM without being rendered", () => {
     say("graph_remove_node", { removed: { type: "T", id: 3 }, cleaned_boundary_slots: { inputs: ["a"], outputs: ["b"] } }),
     "Removed T (id 3) — cleaned orphaned boundary slots a, b",
   );
+  assert.equal(
+    say("graph_remove_node", { removed: [{ type: "T", id: 3 }, { type: "U", id: 8 }] }),
+    "Removed 2 nodes (one Ctrl+Z restores all)",
+  );
+  assert.equal(
+    say("graph_remove_node", {
+      removed: [{ type: "T", id: 3 }],
+      not_removed: [{ id: 8 }],
+    }),
+    "Removed T (id 3) — 1 still on the canvas",
+  );
 });
 
 test("an untranslated locale degrades to correct English, never to a raw key", () => {
