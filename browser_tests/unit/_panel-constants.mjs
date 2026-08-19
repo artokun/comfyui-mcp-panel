@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
+import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -134,6 +135,9 @@ export const OBJECT_INFO_SEED_WAIT_MS = readPanelNumber(
  */
 export function addNodeCommandBudgetDeps() {
   return {
+    // #1286 — graph_add_node now names this after graph.add. The shipped
+    // implementation is a no-op when the new id has no leftover store entries.
+    clearInheritedExecutionPreview,
     makeCommandBudget,
     ADD_NODE_COMMAND_BUDGET_MS,
     // Derived exactly as the panel derives it.

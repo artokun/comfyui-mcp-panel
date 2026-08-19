@@ -48,6 +48,7 @@ import {
   monotonicNow,
   widenSocketProofBudget,
 } from "./_panel-constants.mjs";
+import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -237,6 +238,7 @@ function realGraphAddNode({
     makeCommandBudget,
     REFRESH_JOIN_ABANDONED,
     addNodeRefreshBusyMessage,
+    clearInheritedExecutionPreview,
     OBJECT_INFO_SEED_WAIT_MS: 8000,
     ADD_NODE_COMMAND_BUDGET_MS: budgetMs,
     ADD_NODE_POST_REFRESH_RESERVE_MS: reserveMs,
