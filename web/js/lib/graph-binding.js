@@ -1107,11 +1107,28 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     // (`pos`/`order`, and a `size` whose WIDTH moved) is refused by the strict proof
     // and is presentation-only, and returning the shared `NOT_PROVEN` there is what
     // would have left the fix wired into a branch its own bug report cannot reach.
-    const presentationOnly = openContentDifferenceIsPresentationOnly({
-      comparable: true,
-      surfaces: diff.surfaces,
-      nodeDifference: diff.nodeDifference,
-    });
+    //
+    // panel#1283 family — AND NOT WHEN A RESTORE FAILURE WAS RECORDED. This is a hole the
+    // observation OPENS if it is only ever used to say yes, and it is worth spelling out.
+    // Before it, `workflow_open` did not contain a per-node `configure` throw, so a node
+    // that threw aborted the whole restore and the links and groups never landed — which
+    // this predicate refuses on the surface list. With the throw contained, the rest of
+    // the graph restores and the throwing node sits at CONSTRUCTION DEFAULTS, including
+    // `pos: [10, 10]` — and `pos` IS cosmetic. A node whose saved state differed from its
+    // defaults only in position would then be waved through as "nothing authored was lost"
+    // while the user's layout for it was in fact lost.
+    //
+    // So a recorded throw vetoes the weaker ground. `proven` is deliberately NOT vetoed:
+    // byte equality with the payload means nothing was lost whatever threw. And this is
+    // `=== false`, so a caller that passes nothing (every caller but the open) behaves
+    // exactly as before.
+    const presentationOnly =
+      loadRanToCompletion !== false &&
+      openContentDifferenceIsPresentationOnly({
+        comparable: true,
+        surfaces: diff.surfaces,
+        nodeDifference: diff.nodeDifference,
+      });
     // panel#1283 family — the surfaces still UNEXPLAINED, which is what #1588's second
     // round established the reassurance's own predicate must read. `definitions` differs
     // on every open of a workflow containing subgraphs (#886: link ids are regenerated),

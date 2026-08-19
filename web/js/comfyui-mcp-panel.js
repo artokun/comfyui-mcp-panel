@@ -16688,6 +16688,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // it is a materially weaker claim than either neighbour: `geometry_rewritten`
       // asserts a characterised height-only rewrite and `presentation_rewritten` asserts
       // that every content-bearing field matched. Neither is established here.
+      // #1260, on the OPEN path — a node whose `configure` threw during this load and whose
+      // saved state the post-load retry then re-applied successfully. Reachable on a SUCCESS
+      // reply precisely because the retry healed it: the content then compares clean. Named
+      // because the throw is real and belongs to a pack the user may want to update, and
+      // because a silent heal is how the next report of this arrives with no evidence.
+      ...(openRestoreRetried?.length
+        ? {
+            nodes_restored_on_retry: openRestoreRetried,
+            nodes_restored_on_retry_note:
+              `${openRestoreRetried.length} node(s) threw while their saved state was being applied ` +
+              `during this open, and were re-applied successfully after the load settled — their ` +
+              `widgets are built asynchronously by their own pack. Nothing is missing because of ` +
+              `it. That failure came from the node's own frontend code, not from the open; if it ` +
+              `recurs, update or report the pack.`,
+          }
+        : {}),
       ...(openContentNormalized?.length
         ? {
             content_normalized: openContentNormalized,

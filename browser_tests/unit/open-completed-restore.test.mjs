@@ -588,6 +588,46 @@ test("panel#1283 a cosmetic difference keeps #1623's stronger disclosure, not th
   assert.deepEqual(proof.fields, ["order", "pos"]);
 });
 
+test("panel#1283 a RECORDED THROW vetoes #1623's cosmetic ground too — the hole the wrap opens", () => {
+  // Before this change `workflow_open` did not contain a per-node configure throw, so a
+  // throwing node aborted the restore and links/groups never landed — refused on the
+  // surface list. Containing it means the rest of the graph restores and the throwing node
+  // sits at CONSTRUCTION DEFAULTS, `pos: [10, 10]` among them — and `pos` is cosmetic. A
+  // node whose saved state differed from its defaults only in position would otherwise be
+  // waved through as "nothing authored was lost" with the user's layout for it gone.
+  const state = stateOf([node(1, "KSampler", { pos: [900, 640] })]);
+  const live = stateOf([{ ...node(1, "KSampler"), pos: [10, 10] }]);
+  const asked = { rootGraph: rootOf(live), state };
+  assert.equal(
+    graphRootReproducesStateContent({ ...asked, loadRanToCompletion: true }).presentationOnly,
+    true,
+    "a completed restore keeps #1623's answer",
+  );
+  assert.equal(
+    graphRootReproducesStateContent({ ...asked, loadRanToCompletion: false }).presentationOnly,
+    false,
+    "a recorded throw must veto it",
+  );
+  // …and a caller that never asked the question is unaffected — every caller but the open.
+  assert.equal(graphRootReproducesStateContent(asked).presentationOnly, true);
+  // `proven` is deliberately NOT vetoed: byte equality means nothing was lost, whatever threw.
+  const exact = graphRootReproducesStateContent({
+    rootGraph: rootOf(state),
+    state,
+    loadRanToCompletion: false,
+  });
+  assert.equal(exact.proven, true);
+  assert.equal(exact.exact, true);
+});
+
+test("panel#1283 wiring: a node the retry HEALED is disclosed on the success reply", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /nodes_restored_on_retry: openRestoreRetried,/);
+  assert.match(src, /nodes_restored_on_retry_note:/);
+  const assignments = [...src.matchAll(/(?<!let )openRestoreRetried = ([^;\n]+);/g)].map((m) => m[1]);
+  assert.deepEqual(assignments, ["retry.restored"]);
+});
+
 test("panel#1283 wiring: a node the retry could not heal is still disclosed on the open path", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const openAt = src.indexOf("async workflow_open({");
