@@ -816,6 +816,7 @@
       "thinking_tokens": "思考中…（{tokens} 個 token）",
       "this_affects_every_workflow_and_open_comfyui": "這會影響所有工作流程與開著的 ComfyUI 分頁，而且無法復原。你的工作流程與它們的穩定識別碼不會被刪除。",
       "this_browser_can_t_play_this_video": "這個瀏覽器播不了這段影片的格式。請重新編碼成 H.264（yuv420p）或 WebM。",
+      "this_image_could_not_be_loaded": "這張圖片無法載入。",
       "this_video_could_not_be_loaded": "這段影片無法載入。",
       "thorough": "仔細",
       "timed_out": "已逾時",

@@ -816,6 +816,7 @@
       "thinking_tokens": "생각 중… ({tokens} 토큰)",
       "this_affects_every_workflow_and_open_comfyui": "이 작업은 모든 워크플로우와 열려 있는 ComfyUI 탭에 영향을 주며 되돌릴 수 없습니다. 워크플로우와 그 고유 식별 정보는 삭제되지 않습니다.",
       "this_browser_can_t_play_this_video": "이 브라우저는 이 동영상 형식을 재생할 수 없습니다. H.264(yuv420p) 또는 WebM으로 다시 인코딩하세요.",
+      "this_image_could_not_be_loaded": "이 이미지를 불러오지 못했습니다.",
       "this_video_could_not_be_loaded": "이 동영상을 불러오지 못했습니다.",
       "thorough": "꼼꼼하게",
       "timed_out": "시간 초과",

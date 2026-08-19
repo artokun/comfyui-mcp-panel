@@ -816,6 +816,7 @@
       "thinking_tokens": "思考中…（{tokens} 个 token）",
       "this_affects_every_workflow_and_open_comfyui": "这会影响所有工作流和已打开的 ComfyUI 标签页，并且无法撤销。你的工作流及其稳定标识不会被删除。",
       "this_browser_can_t_play_this_video": "这个浏览器无法播放该视频的格式。请重新编码为 H.264（yuv420p）或 WebM。",
+      "this_image_could_not_be_loaded": "无法加载该图片。",
       "this_video_could_not_be_loaded": "无法加载该视频。",
       "thorough": "较深入",
       "timed_out": "已超时",

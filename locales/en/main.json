@@ -862,6 +862,7 @@
       "thinking_tokens": "Thinking… ({tokens} tokens)",
       "this_affects_every_workflow_and_open_comfyui": "This affects every workflow and open ComfyUI tab. It cannot be undone. Your workflows and their stable identities will not be deleted.",
       "this_browser_can_t_play_this_video": "This browser can't play this video's format. Re-encode as H.264 (yuv420p) or WebM.",
+      "this_image_could_not_be_loaded": "This image could not be loaded.",
       "this_video_could_not_be_loaded": "This video could not be loaded.",
       "thorough": "thorough",
       "timed_out": "timed out",

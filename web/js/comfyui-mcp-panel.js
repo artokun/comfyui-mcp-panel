@@ -28886,13 +28886,24 @@ function buildPanel() {
     card._cmcpMedia = { url, type: "image", caption: name || "" };
     const tools = mediaToolsFor(card);
     const img = document.createElement("img");
-    img.src = url;
     img.alt = name || tr("panel.output", "output"); // read aloud by screen readers
     img.loading = "lazy";
     // NO inline `display` — it would outrank the collapsed rule in the stylesheet
     // and the card would never actually hide (#818). `.cmcp-imgcard > img` sets it.
     img.style.cssText = "max-width:100%;border-radius:6px;cursor:zoom-in;";
     img.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
+    // #1417 — SAY SO when the browser cannot load or decode it. `panel_show_media`
+    // answers for the DOM dispatch, not the browser's fetch/decode, so an 18 MB 16-bit
+    // PNG through /view returned ok:true and rendered as a silent broken-image icon —
+    // the user had to ask where the image went. Unlike <video>, an <img> error carries
+    // no error code, so no cause is claimed: one honest sentence plus a way out. Some
+    // decode failures fire `load` with a zero natural size instead of `error`, so both
+    // routes lead to the same paint. Listeners attach BEFORE src so a synchronously
+    // cached failure cannot slip past them.
+    const onFail = () => paintImageFailure(img, url);
+    img.addEventListener("error", onFail);
+    img.addEventListener("load", () => { if (img.naturalWidth === 0) onFail(); });
+    img.src = url;
     card.appendChild(img);
     attachMediaCollapse(card, { url, kind: "image", name, tools });
     if (name) {
@@ -28906,6 +28917,35 @@ function buildPanel() {
     scrollLog();
     // Persist servable images so they survive reload / thread switch (#177).
     recordMedia("image", url, name);
+  }
+
+  // #1417 — the visible failure state a broken image card gets instead of the browser's
+  // silent broken-image icon. No cause is claimed (<img> errors carry no code, so a
+  // "16-bit" or "too large" verdict would be a guess); the caption painted below the
+  // card already names the file, and the Open-original button is the way to see the
+  // bytes the inline card could not render — it reuses the lightbox's handler, which
+  // also knows how to open a data: URL. `replaceWith` removes the dead <img> and with
+  // it the card's click-to-lightbox target, which would only open the same undecodable
+  // source one size larger.
+  function paintImageFailure(img, url) {
+    if (img._cmcpFailed) return; // error followed by a 0-size load must not paint twice
+    img._cmcpFailed = true;
+    const box = document.createElement("div");
+    box.className = "cmcp-imgcard-failed";
+    box.style.cssText =
+      "display:grid;place-items:center;gap:0.5rem;padding:1.25rem 1rem;box-sizing:border-box;text-align:center;" +
+      "border:1px dashed var(--p-content-border-color,#3f3f46);border-radius:6px;" +
+      "color:var(--p-text-muted-color,#a1a1aa);font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);";
+    const label = document.createElement("div");
+    label.textContent = tr("panel.this_image_could_not_be_loaded", "This image could not be loaded.");
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "cmcp-lightbox-open";
+    open.textContent = tr("panel.open_original", "Open original");
+    open.title = tr("panel.open_in_a_new_browser_tab", "Open in a new browser tab");
+    open.addEventListener("click", (e) => { e.stopPropagation(); openMediaUrl(url); });
+    box.append(label, open);
+    img.replaceWith(box);
   }
 
   // Lazy chat-video manager: only videos currently scrolled into view hold a live
