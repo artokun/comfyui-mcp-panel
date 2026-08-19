@@ -35,6 +35,7 @@ import {
   registryTypePredicate,
   formatUnpasteableCopyWarning,
 } from "../../web/js/lib/paste-report.js";
+import { sanitizeNodesAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import {
   finitePoint,
   isGraphNode,
@@ -310,6 +311,7 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
       "getVerifiedSnapshot",
       "diffCopiedVsPasted",
       "formatDroppedWarning",
+      "sanitizeNodesAuxId",
       "window",
       `"use strict"; const e = { ${pasteSrc} }; return e.graph_paste_nodes;`,
     )(
@@ -328,6 +330,7 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
       getVerifiedSnapshot,
       diffCopiedVsPasted,
       formatDroppedWarning,
+      sanitizeNodesAuxId,
       window,
     );
   }

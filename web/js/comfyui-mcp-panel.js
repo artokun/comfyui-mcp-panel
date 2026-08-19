@@ -86,6 +86,7 @@ import {
 } from "./lib/duplicate-panel-guard.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
+import { sanitizeNodeAuxId, sanitizeNodesAuxId } from "./lib/aux-id-sanitize.js";
 import {
   installNodeConfigureIsolation,
   retryNodeRestores,
@@ -12590,6 +12591,14 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       graph.afterChange();
     }
+    // #1411 — sanitize the freshly created node's aux_id install-hint, mirroring
+    // the load-path sanitizer in graph_load. The frontend/Manager
+    // metadata chain can stamp a MALFORMED aux_id (observed: "work") on nodes
+    // created via LG.createNode, and ComfyUI's workflow zod schema then rejects
+    // EVERY subsequent save/load of the workflow ("Invalid format. Must be
+    // 'github-user/repo-name'"). A valid hint is kept; an invalid one is dropped
+    // rather than guessed at, so one added node can never poison the file.
+    const auxIdSanitized = sanitizeNodeAuxId(node);
     // #1286 — a newly assigned id may still hold the previous occupant's
     // execution images. Wipe that leftover so this node cannot inherit a preview.
     clearInheritedExecutionPreview(node, {
@@ -12598,6 +12607,9 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     graph.setDirtyCanvas(true, true);
     const added = summarizeNode(node);
+    // #1411 — disclose the dropped install-hint, like every other correction on
+    // this path: the node was created with an aux_id its own zod schema rejects.
+    if (auxIdSanitized) added.aux_id_sanitized = true;
     const rejectedCorrections = correctionOut.rejected ?? [];
     if (valueCorrections.length) {
       added.schema_value_corrections = valueCorrections;
@@ -12847,16 +12859,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // 'github-user/repo-name' (or absent) — packs/exports sometimes carry a bare
     // node name (e.g. "GetNode"/"SetNode"); drop those invalid install-hints rather
     // than let the whole load fail validation.
-    const AUX_ID_RE = /^[^/\s]+\/[^/\s]+$/;
     let auxSanitized = 0;
     const sanitizeNodes = (nodes) => {
-      for (const n of nodes || []) {
-        const aux = n?.properties?.aux_id;
-        if (aux != null && !(typeof aux === "string" && AUX_ID_RE.test(aux))) {
-          delete n.properties.aux_id;
-          auxSanitized++;
-        }
-      }
+      auxSanitized += sanitizeNodesAuxId(nodes);
     };
     sanitizeNodes(clone.nodes);
     // Recurse into subgraph DEFINITIONS — their inner nodes (e.g. KJNodes
@@ -18233,10 +18238,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // or skips groups that were not in the native selection (#1294).
     const rawClipboard = getEffectiveClipboard(storage);
     const layout = getVerifiedLayout(rawClipboard) ?? parseClipboardLayout(rawClipboard);
+    let auxIdSanitizedCount = 0;
     graph.beforeChange?.();
     try {
       withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
       const pastedNodes = (graph._nodes ?? []).filter((n) => !before.has(n.id));
+      // #1411 — LiteGraph's paste configures properties VERBATIM from the
+      // clipboard payload, so a copied node (e.g. one cut from an older,
+      // unsanitized workflow, or a native Ctrl+C of an externally-authored
+      // graph) can land an aux_id the zod schema rejects and poison every later
+      // save/load. Same rule as the load/add paths: valid hint kept, invalid
+      // dropped.
+      auxIdSanitizedCount = sanitizeNodesAuxId(pastedNodes);
       const pastedGroups = (graph._groups ?? []).filter((g) => !beforeGroups.has(g));
       const pasteDest = dest && dest.every(Number.isFinite) ? dest : resolvePasteDest(null, pastedNodes);
       applyPastedLayout({
@@ -18304,6 +18317,7 @@ const GRAPH_TOOL_EXECUTORS = {
       pasted,
       copied_groups: layout.groups.length,
       pasted_groups: groupsNow.length,
+      ...(auxIdSanitizedCount ? { aux_id_sanitized: auxIdSanitizedCount } : {}),
     };
     if (groupsNow.length) {
       result.groups = groupsNow.map((g) => summarizeGroup(graph, g));
