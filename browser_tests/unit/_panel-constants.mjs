@@ -18,6 +18,9 @@ import { REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
+import { COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -197,8 +200,16 @@ export function addNodeCommandBudgetDeps() {
  * place, for the same reason addNodeCommandBudgetDeps exists: harnesses that rebuild that
  * executor in a synthetic scope throw ReferenceError on a new free identifier, and each
  * would otherwise grow its own copy of these. The REAL implementations where they exist
- * (`makeCommandBudget`, and the numbers read from the panel source), so a harness cannot
- * pass against a value the panel no longer holds.
+ * (`makeCommandBudget`, `withTimeout`, the symbols, and the numbers read from the panel
+ * source or imported from the lib that owns them), so a harness cannot pass against a
+ * value the panel no longer holds.
+ *
+ * #1418 widened the budget's reach inside the handler: the seed wait and the oracle read
+ * are now capped with `budget.bounded(...)`, the upload probe is wrapped in `withTimeout`,
+ * and the recovery's refusal distinguishes "still running" from "never ran" on a second
+ * token. `nodeDefRefreshInFlight` is deliberately NOT here: it is the coalescer's live
+ * slot, a piece of mutable module state each harness must wire to its own slot double —
+ * a shared snapshot of it would be stale by construction.
  */
 export function setWidgetCommandBudgetDeps() {
   return {
@@ -206,5 +217,10 @@ export function setWidgetCommandBudgetDeps() {
     SET_WIDGET_COMMAND_BUDGET_MS,
     SET_WIDGET_POST_REFRESH_RESERVE_MS,
     monotonicNow,
+    withTimeout,
+    OBJECT_INFO_SEED_WAIT_MS,
+    OBJECT_INFO_DEADLINE_MS,
+    REFRESH_JOIN_ABANDONED,
+    COMBO_REFRESH_NEVER_RAN,
   };
 }

@@ -271,7 +271,7 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "./lib/object-info-oracle.js";
+import { fetchWholeObjectInfo, objectInfoOracleFailureNote, OBJECT_INFO_DEADLINE_MS } from "./lib/object-info-oracle.js";
 import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
@@ -304,7 +304,7 @@ import {
   clearAutoLayoutScope,
   layoutScopeFingerprint,
 } from "./lib/auto-layout-scope.js";
-import { runSetWidget } from "./lib/set-widget.js";
+import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
@@ -12455,10 +12455,14 @@ const GRAPH_TOOL_EXECUTORS = {
         // than parking.
         // #1223 — read the epoch HERE, immediately before the whole request is issued.
         addNodeObservedAtEpoch = backendReconnectEpoch;
-        // #1192 — the same request `graph_set_widget`'s oracle allows 10,000 ms, allowed
-        // 10,000 ms here too, and BOTH now capped by their caller's remaining budget. The
-        // two paths agreeing about how long one /object_info may take is what stops a
-        // "set_widget works but add_node fails" asymmetry appearing on a slow install.
+        // #1192 — allowed 10,000 ms here, capped by the caller's remaining budget.
+        // #1418 — what this comment used to claim about the OTHER path was never true: it
+        // said `graph_set_widget`'s oracle "allows 10,000 ms" and that both were capped, but
+        // that oracle is fetchWholeObjectInfo at OBJECT_INFO_DEADLINE_MS (20,000 ms), and
+        // nothing capped it until #1418 gave it the same budget.bounded(...) treatment. The
+        // two paths genuinely agree now. The earlier sentence is left corrected rather than
+        // deleted because it did real harm twice: a reassurance-shaped claim concealed the
+        // very next occurrence of the defect it described (#1413's note, then this one).
         const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
         freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
@@ -13711,7 +13715,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // fails CLOSED for this call only, with a TEMPORARY "retry in a moment" refusal. The
     // seed keeps running, so a late response still establishes the baseline and the next
     // call authorizes normally — ordinary latency must never burn the session.
-    await awaitObjectInfoHistorySeed();
+    // #1418 — capped by what the COMMAND has left, exactly as graph_add_node caps its copy:
+    // the flat 8,000 ms here plus the oracle's flat 20,000 ms used to compose past the
+    // 25,000 ms budget before the stale-combo recovery was even reached, which is how the
+    // recovery's join could be handed a negative allowance with nothing in flight (#1413's
+    // bound then correctly started nothing — and the refusal correctly says so).
+    await awaitObjectInfoHistorySeed(budget.bounded(OBJECT_INFO_SEED_WAIT_MS));
     // #757 — MINT an rgthree Power Lora Loader row when the write targets one that does not
     // exist yet. Those rows are created only by the node's own "➕ Add Lora" button, a
     // DOM-only control an agent cannot click, so every write to `lora_1` on a fresh node was
@@ -13812,9 +13821,19 @@ const GRAPH_TOOL_EXECUTORS = {
             // The OUTCOME rides through the cache, not just the schema (codex): a second
             // concurrent write JOINS this in-flight read and never runs its own loader, so
             // returning bare defs would leave that caller's refusal naming no routes at all.
+            //
+            // #1418 — the deadline is what the COMMAND has left, computed INSIDE the loader
+            // so it is read when the request is actually issued (a joined read runs no
+            // loader and spends nothing), not when the options object was built. Uncapped,
+            // this flat 20,000 ms plus the 8,000 ms seed wait above composed past the
+            // 25,000 ms budget before the stale-combo recovery was reached — the exact
+            // composition #1413's refusal then had to report. On a timeout the oracle
+            // answers "nothing usable" as it already does for every other doubt, and the
+            // write fails closed on the same path, inside the window.
             return fetchWholeObjectInfo({
               getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
               fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+              deadlineMs: budget.bounded(OBJECT_INFO_DEADLINE_MS),
             });
           },
           { stamp: () => backendReconnectEpoch },
@@ -13958,7 +13977,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // genuinely-invalid value simply stays rejected on the retry). Only a MISSING
       // payload falls back to the full frontend refresh (refreshComfyNodeDefs →
       // refreshComboInNodes), which re-fetches /object_info.
-      refreshCombos: (defs, target, concreteType, nameMap) => {
+      refreshCombos: async (defs, target, concreteType, nameMap) => {
         // A payload that does not CONTAIN the type we are keying on cannot refresh
         // anything: refreshComboOptionsFromDefs looks up `defsByType[type]` and
         // returns 0 on a miss, silently. The caller then treats the retry as
@@ -13990,9 +14009,21 @@ const GRAPH_TOOL_EXECUTORS = {
         // a best-effort catch that would swallow one; the lib turns the token into a
         // worded "nothing was written — retry" refusal instead of revalidating against
         // the list that was never refreshed and calling the value invalid.
-        return refreshComfyNodeDefs(undefined, {
-          joinMs: budget.remaining() - SET_WIDGET_POST_REFRESH_RESERVE_MS,
-        });
+        const joinMs = budget.remaining() - SET_WIDGET_POST_REFRESH_RESERVE_MS;
+        // #1418 — REFRESH_JOIN_ABANDONED answers two different states and the refusal must
+        // not confuse them. With nothing in flight and nothing left, the coalescer starts
+        // NOTHING (its bottom branch returns before startRun) — and "a refresh is still
+        // running, retry joins it" would then be a claim about a run that does not exist.
+        // The distinction is read HERE, from the same two facts the coalescer's own
+        // decision is made from — the slot and the bound — captured BEFORE the call so the
+        // two can never disagree (reading the slot after the await would race the run's
+        // own cleanup). joinMs > 0 always leaves a run owned: no in-flight ⇒ the coalescer
+        // starts this caller's own, which keeps the slot past the abandoned wait.
+        const refreshCanBeRunning = joinMs > 0 || nodeDefRefreshInFlight != null;
+        const outcome = await refreshComfyNodeDefs(undefined, { joinMs });
+        return outcome === REFRESH_JOIN_ABANDONED && !refreshCanBeRunning
+          ? COMBO_REFRESH_NEVER_RAN
+          : outcome;
       },
       // #387: last-resort probe for an UPLOAD input value the refreshed /object_info
       // combo still cannot list — a LoadImage image uploaded under a SUBFOLDER (ComfyUI
@@ -14008,11 +14039,22 @@ const GRAPH_TOOL_EXECUTORS = {
           const filename = i >= 0 ? v.slice(i + 1) : v;
           if (!filename) return false;
           const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
-          const res = await api.fetchApi(`/view?${qs}`, {
-            method: "GET",
-            cache: "no-store",
-            headers: { Range: "bytes=0-0" },
-          });
+          // #1418 — the LAST network step in a command relayed at 30,000 ms, and until now
+          // the only unbounded one: reached after a SUCCESSFUL refresh (the abandoned-join
+          // refusal fires before it), so #1413's joinMs never covered it. It draws what the
+          // command has left. A timeout answers FALSE — the same answer the probe already
+          // gives for every error and every doubt below — so the bound can only ever refuse
+          // a value, never admit one: #240 strictness is untouched. The retry then re-runs
+          // the probe with a fresh budget.
+          const res = await withTimeout(
+            api.fetchApi(`/view?${qs}`, {
+              method: "GET",
+              cache: "no-store",
+              headers: { Range: "bytes=0-0" },
+            }),
+            budget.bounded(),
+            () => null,
+          );
           return !!res && (res.ok || res.status === 206);
         } catch {
           return false;

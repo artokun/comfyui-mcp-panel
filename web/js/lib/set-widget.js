@@ -77,28 +77,57 @@ function coerceAdvisoryMessage(err) {
 }
 
 /**
- * #1413 — the refusal for a stale-combo recovery whose authoritative refresh was still
- * running when the command's budget ran out.
+ * #1418 — what the panel's refreshCombos returns instead of REFRESH_JOIN_ABANDONED when the
+ * abandoned wait STARTED NOTHING: the command's budget was already spent before the recovery
+ * could begin (the seed wait and the authorization /object_info are drawn against it too),
+ * so no node-def refresh is running and none is coming. REFRESH_JOIN_ABANDONED alone cannot
+ * say this — the coalescer returns it both for "stopped waiting on a run that is still
+ * going" and for "joinMs was already non-positive with an empty slot", and the refusal below
+ * must not claim a refresh is running in the second case. The coalescer is deliberately NOT
+ * changed to return this itself: graph_add_node reads REFRESH_JOIN_ABANDONED and its wording
+ * is out of scope here, so the distinction is made by THIS command's wrapper, from the same
+ * two facts the coalescer's decision is made from (the slot, and the bound), read BEFORE the
+ * call so the two can never disagree.
+ */
+export const COMBO_REFRESH_NEVER_RAN = Symbol("combo-refresh-never-ran");
+
+/**
+ * #1413/#1418 — the refusal for a stale-combo recovery that never revalidated the value.
  *
  * RECOVERABLE BY CONSTRUCTION, and worded to say so — the same shape as #1192's
- * addNodeRefreshBusyMessage. The in-flight refresh was NOT cancelled (the coalescer never
- * cancels work someone else started) and it is registering the very list this write needs,
- * so the retry this text asks for is the normal outcome, not a hope. What it must NOT say
- * is "not a valid option": the revalidation never completed, so this refusal cannot tell a
- * genuinely-invalid value from one the refresh would have accepted — and claiming the
- * former is how a retryable busy reads as a permanent rejection.
+ * addNodeRefreshBusyMessage. What it must NOT say is "not a valid option": the revalidation
+ * never completed, so this refusal cannot tell a genuinely-invalid value from one a refresh
+ * would have accepted — and claiming the former is how a retryable busy reads as a permanent
+ * rejection.
+ *
+ * `refreshStillRunning` is the panel's VERIFIED statement about the coalescer's slot, not a
+ * guess (#1418): TRUE means a run is occupying it and still registering the very list this
+ * write needs, so the retry joins work in progress. FALSE means the budget was spent before
+ * the recovery could start and NO refresh is running — the retry rests on what is true in
+ * that state: it re-enters the recovery with a fresh budget. Naming only the first state is
+ * the false claim #1409 had to correct in refresh_nodes' own verdict ("a detail naming only
+ * the first is flatly wrong on an uncontended big install").
  */
-function staleComboRefreshBusyMessage() {
+function staleComboRefreshRefusalMessage(refreshStillRunning) {
+  const state = refreshStillRunning
+    ? "the authoritative refresh that would have re-read the list — a node-def refresh " +
+      "started by a ComfyUI reconnect, a finished install, or another tool call — was still " +
+      "running when this command's time budget ran out waiting for it, so the revalidation " +
+      "did NOT complete. That refresh is still running and is registering exactly the list " +
+      "this write needs, so RETRY in a few seconds — this normally succeeds on the next " +
+      "attempt, joining the work already in progress."
+    : "the authoritative refresh that would have re-read the list never started: this " +
+      "command's time budget was already spent (on the startup schema seed and the " +
+      "authorization /object_info read) before the recovery could run. No node-def refresh " +
+      "is running and none is coming. RETRY re-enters the recovery with a fresh budget and " +
+      "normally succeeds once those reads answer faster — if this recurs, the schema read " +
+      "itself is the slow part.";
   return (
-    "the value is not in this combo's current option list, and the authoritative refresh " +
-    "that would have re-read the list — a node-def refresh started by a ComfyUI reconnect, " +
-    "a finished install, or another tool call — was still running when this command's time " +
-    "budget ran out waiting for it, so the revalidation did NOT complete. This refusal " +
-    "cannot tell a genuinely-invalid value from one the refresh would have accepted. " +
-    "NOTHING WAS WRITTEN and nothing was changed. That refresh is still running and is " +
-    "registering exactly the list this write needs, so RETRY in a few seconds — this " +
-    "normally succeeds on the next attempt. If it keeps happening, call panel_refresh_nodes " +
-    "once and wait for it to report, then retry the write."
+    "the value is not in this combo's current option list, and " +
+    state +
+    " This refusal cannot tell a genuinely-invalid value from one the refresh would have " +
+    "accepted. NOTHING WAS WRITTEN and nothing was changed. If it keeps happening, call " +
+    "panel_refresh_nodes once and wait for it to report, then retry the write."
   );
 }
 
@@ -837,7 +866,11 @@ export async function runSetWidget(
       // that runs out is reported back as a STRUCTURED TOKEN (REFRESH_JOIN_ABANDONED), not
       // a throw — the catch below is the best-effort channel and would swallow one. The
       // in-flight refresh is not cancelled by the abandonment; only THIS caller's wait ends.
-      let refreshJoinAbandoned = false;
+      // #1418 — COMBO_REFRESH_NEVER_RAN is the same abandonment with one fact flipped: the
+      // budget was spent before the recovery could begin, so NO refresh is running. The
+      // refusal below words the two states differently because the retry advice that is
+      // true for one ("join the work in progress") is false for the other.
+      let refreshAbandoned = null;
       try {
         // Reuse the /object_info payload already fetched for type authorization so a
         // combo miss does not round-trip /object_info a SECOND time (#458 P2). Key the
@@ -850,7 +883,9 @@ export async function runSetWidget(
             ? { [writeTargetWidgetName]: concreteWidgetName }
             : undefined;
         const refreshOutcome = await refreshCombos(freshDefs ?? undefined, resolvedTargetNode, authTarget?.type, comboNameMap);
-        refreshJoinAbandoned = refreshOutcome === REFRESH_JOIN_ABANDONED;
+        if (refreshOutcome === REFRESH_JOIN_ABANDONED || refreshOutcome === COMBO_REFRESH_NEVER_RAN) {
+          refreshAbandoned = refreshOutcome;
+        }
       } catch {
         /* refresh best-effort; fall through to re-raise the original rejection */
       }
@@ -865,8 +900,12 @@ export async function runSetWidget(
       // for a reason that is true. A PARTIAL first write is the one case that outranks
       // this wording: its own error reports a graph that could not be restored, and that
       // must propagate undiluted rather than be replaced by "nothing was written".
-      if (refreshJoinAbandoned) {
-        throw refusalFrame(err.partialWrite ? err : new Error(staleComboRefreshBusyMessage()));
+      if (refreshAbandoned) {
+        throw refusalFrame(
+          err.partialWrite
+            ? err
+            : new Error(staleComboRefreshRefusalMessage(refreshAbandoned === REFRESH_JOIN_ABANDONED)),
+        );
       }
       try {
         return withWarning({ set: write(), refreshed: true });
