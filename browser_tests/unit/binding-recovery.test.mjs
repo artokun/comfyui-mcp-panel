@@ -416,7 +416,7 @@ test("#607 the dispatch-time fence also re-advertises before refusing", () => {
  * ADVERTISED (`lastAdvertisedWorkflowUuid`) on its success path only — so the
  * harness hands the test a setter for exactly that, and nothing else.
  */
-function buildRehelloHook({ sendHello, stableUuid }) {
+function buildRehelloHook({ sendHello, stableUuid, routeId = () => "route-A" }) {
   const declStart = SRC.indexOf("const MISMATCH_REHELLO_MAX_PER_IDENTITY");
   assert.notEqual(declStart, -1, "the re-hello budget constants are missing");
   const marker = "workflowInstanceMismatchRehello = () => {";
@@ -442,16 +442,21 @@ function buildRehelloHook({ sendHello, stableUuid }) {
     slice.includes("mismatchRehelloLandedCount += 1;"),
     "the extracted hook is truncated — its landed bookkeeping is missing",
   );
+  // #1389 — the hook now also reads the live ROUTE (its budget is keyed on the identity a
+  // hello ADVERTISES, and a route is half of that). A `new Function` scope missing a
+  // binding the shipping code reads throws ReferenceError, which reads as a broken
+  // harness rather than as the missing dependency it is — so inject it here.
   const factory = new Function(
     "sendHello",
     "workflowStableUuid",
+    "bridgeRouteId",
     `let workflowInstanceMismatchRehello = null;\n${slice};\n` +
       `return {\n` +
       `  hook: workflowInstanceMismatchRehello,\n` +
       `  advertise: (uuid) => { lastAdvertisedWorkflowUuid = uuid; },\n` +
       `};`,
   );
-  return factory(sendHello, stableUuid);
+  return factory(sendHello, stableUuid, routeId);
 }
 
 /** Let every queued microtask (the hook's own promise chain) drain. */
@@ -733,7 +738,12 @@ test("#606 the binding refusal marks the reload remedy as REQUESTED, not confirm
  * delegation between them is the shipping one. Deleting the drift hook, or making it
  * fire unconditionally, fails a test below.
  */
-function buildDriftHook({ sendHello, stableUuid }) {
+function buildDriftHook({
+  sendHello,
+  stableUuid,
+  routeStale = () => false,
+  routeId = () => "route-A",
+}) {
   const declStart = SRC.indexOf("const MISMATCH_REHELLO_MAX_PER_IDENTITY");
   assert.notEqual(declStart, -1, "the re-hello budget constants are missing");
   const marker = "workflowIdentityDriftRehello = () => {";
@@ -757,9 +767,19 @@ function buildDriftHook({ sendHello, stableUuid }) {
     slice.includes("mismatchRehelloLandedCount += 1;"),
     "the extracted region is truncated — the #607 landed bookkeeping is missing",
   );
+  // #1389 — the ROUTE half of the same drift check. Asserted on the SLICE (not only
+  // through behaviour) because a `new Function` scope that is missing a binding the
+  // shipping code reads throws ReferenceError, which would read as a broken harness
+  // rather than as the missing dependency it is.
+  assert.ok(
+    slice.includes("advertisedRouteIsStale()"),
+    "the drift hook must also watch the ROUTE the orchestrator keys its tab registry on",
+  );
   const factory = new Function(
     "sendHello",
     "workflowStableUuid",
+    "advertisedRouteIsStale",
+    "bridgeRouteId",
     `let workflowInstanceMismatchRehello = null;\n` +
       `let workflowIdentityDriftRehello = null;\n${slice};\n` +
       `return {\n` +
@@ -768,7 +788,7 @@ function buildDriftHook({ sendHello, stableUuid }) {
       `  advertise: (uuid) => { lastAdvertisedWorkflowUuid = uuid; },\n` +
       `};`,
   );
-  return factory(sendHello, stableUuid);
+  return factory(sendHello, stableUuid, routeStale, routeId);
 }
 
 test("#1209 a fence that drifted under an unchanged route is re-advertised, unprompted", async () => {
@@ -924,6 +944,172 @@ test("#1209 an attempt the #607 guards refused does not spend the drift bound", 
     await settle();
   }
   assert.equal(dbl.started, 3, "the refused ticks left the rest of the bound intact");
+});
+
+// ---------------------------------------------------------------------------
+// #1389 — the ROUTE half of the same drift check.
+//
+// A hello advertises two identities and they do not move together: the fence uuid is
+// durable per workflow INSTANCE, while the route (`tab_id`) is composed from the tab's
+// lease and the workflow's PATH. A first save or a rename/Save-As re-keys the route and
+// leaves the instance exactly where it was — so the uuid half reports convergence, and
+// replenishes the bound, while the address ui-bridge keys its tab registry on is wrong.
+//
+// The panel can already SEE it (`advertisedRouteIsStale()` drives the outbound refusals),
+// but nothing re-advertised on it: the poll re-hellos on the EDGE of a route change and
+// then reports `wfid === currentWorkflowId` forever after, and a held frame may never
+// cause an advertisement by `holdForRoute`'s own rule. A re-advertise that did not land
+// therefore wedged the tab until a browser refresh — the reported recovery.
+// ---------------------------------------------------------------------------
+
+test("#1389 a ROUTE that drifted under an UNCHANGED fence identity is re-advertised", async () => {
+  // The reported shape: same workflow instance (a first save / a rename), so the uuid
+  // the orchestrator holds is still correct — and the route it holds is not. Before this
+  // fix the drift hook saw "uuid converged" and sent nothing, forever.
+  let routeStale = false;
+  const dbl = helloDouble(() => "uuid-SAME", { lands: () => true });
+  const h = buildDriftHook({
+    sendHello: () => dbl.send(),
+    stableUuid: () => "uuid-SAME",
+    routeStale: () => routeStale,
+  });
+  // A landed hello re-advertises the LIVE route, so the staleness clears with it.
+  dbl.harness = {
+    advertise: (uuid) => {
+      h.advertise(uuid);
+      routeStale = false;
+    },
+  };
+  h.advertise("uuid-SAME");
+
+  h.drift();
+  await settle();
+  assert.equal(dbl.started, 0, "an agreeing panel sends nothing");
+
+  routeStale = true; // the save re-keyed the route; the instance is the same object
+  h.drift();
+  await settle();
+  assert.deepEqual(dbl.calls, ["uuid-SAME"], "the drifted ROUTE is re-advertised unprompted");
+
+  // …and it QUIESCES once the advertisement lands, exactly like the fence half.
+  for (let i = 0; i < 10; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 1, "an advertisement that landed ends the route drift");
+});
+
+test("#1389 a converged fence identity does not replenish the bound while the ROUTE is stale", async () => {
+  // The bound is what stops a 600ms poll becoming a greeting storm, and the uuid half
+  // owns its replenishment. Resetting on "the uuid agrees" while the route does not
+  // would make the bound infinite for exactly the case this fix adds — an unbounded
+  // re-hello loop is a NEW wedge, not a fix.
+  const dbl = helloDouble(() => "uuid-SAME");
+  const h = buildDriftHook({
+    sendHello: () => dbl.send(),
+    stableUuid: () => "uuid-SAME",
+    routeStale: () => true, // an orchestrator that takes the hello and keeps the old route
+  });
+  dbl.harness = { advertise: () => {} };
+  h.advertise("uuid-SAME");
+  for (let i = 0; i < 25; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "a route that never clears stops churning");
+});
+
+test("#1389 a route that converges again replenishes the bound for the next real drift", async () => {
+  // BOTH bounds have to hand themselves back, and only one of them did. The drift
+  // caller's own counter replenishes on convergence, but the #607 per-identity budget
+  // underneath it is keyed on the ADVERTISED identity — and while that key was the fence
+  // uuid alone, a pure route drift never presented a new one. Three route
+  // re-advertisements were then all a workflow instance ever got for the life of the
+  // socket: a first save spends one, a rename another, and the third leaves the panel
+  // permanently unable to re-address itself on a canvas the user never left.
+  let routeStale = true;
+  let liveRoute = "route-B";
+  const dbl = helloDouble(() => "uuid-SAME");
+  const h = buildDriftHook({
+    sendHello: () => dbl.send(),
+    stableUuid: () => "uuid-SAME",
+    routeStale: () => routeStale,
+    routeId: () => liveRoute,
+  });
+  // Phase 1: the hellos land but the route stays stale — three tries, then quiet.
+  dbl.harness = { advertise: () => {} };
+  h.advertise("uuid-SAME");
+  for (let i = 0; i < 12; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "the stuck route exhausted the bound");
+
+  // Phase 2: something else re-registered the tab (a reconnect's open hello). One
+  // observed convergence — both halves agreeing — and the mechanism is live again.
+  routeStale = false;
+  h.drift();
+  await settle();
+  assert.equal(dbl.calls.length, 3, "convergence itself sends nothing");
+
+  // Phase 3: a LATER genuine route move — a rename of the same instance, so the fence
+  // uuid is the one it always was and only the route is new evidence.
+  liveRoute = "route-C";
+  routeStale = true;
+  h.drift();
+  await settle();
+  assert.equal(dbl.calls.length, 4, "the next real route drift is advertised again");
+});
+
+test("#1389 an unreadable fence identity does not credit a convergence the panel never observed", async () => {
+  // `uuidObserved` is why the reset is not simply `!drifted`. An identity that cannot be
+  // read is not evidence that re-advertising works here, and crediting it would hand a
+  // later genuine drift a bound this tick never earned — the same rule #1209 states for
+  // its own early exit, kept now that the exit has become a branch.
+  let readable = false;
+  const dbl = helloDouble(() => "uuid-A");
+  const h = buildDriftHook({
+    sendHello: () => dbl.send(),
+    stableUuid: () => {
+      if (!readable) throw new Error("no workflow service");
+      return "uuid-B";
+    },
+    routeStale: () => true,
+  });
+  dbl.harness = { advertise: () => {} };
+  h.advertise("uuid-A");
+
+  // Spend the bound on a route that never converges…
+  readable = true;
+  for (let i = 0; i < 12; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "the stuck route exhausted the bound");
+
+  // …then go unreadable. That is not convergence, so it must not hand the bound back.
+  readable = false;
+  for (let i = 0; i < 12; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "an unreadable identity replenished nothing");
+});
+
+test("#1389 nothing advertised yet is still not a drift, even with the route half added", async () => {
+  // A fresh or reconnecting socket has no landed mapping, so `advertisedRouteIsStale()`
+  // answers false by construction (`mapped`). Pinned here anyway: the route half must not
+  // reopen the race the uuid half's early exit closed — the open hello carries the truth.
+  const dbl = helloDouble(() => "uuid-LIVE");
+  const h = buildDriftHook({
+    sendHello: () => dbl.send(),
+    stableUuid: () => "uuid-LIVE",
+    routeStale: () => false,
+  });
+  dbl.harness = h;
+  h.drift();
+  await settle();
+  assert.equal(dbl.started, 0, "an unadvertised socket must not re-hello");
 });
 
 test("#1209 the workflow poll calls the drift check when the ROUTE did not change", () => {

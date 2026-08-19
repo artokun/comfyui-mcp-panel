@@ -22357,6 +22357,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
    *  identity collect an uncounted hello on top of its own budget. */
   let lastAdvertisedWorkflowUuid = null;
   let mismatchRehelloIdentity = null;
+  /** #1389 — the ROUTE half of the identity this budget is keyed on.
+   *
+   *  The budget exists to stop churn on UNCHANGING evidence, and the evidence a re-hello
+   *  carries is its PAYLOAD — which names a fence uuid AND a route. Keyed on the uuid
+   *  alone it could not tell a fresh route from a repeat of the same one, so the drift
+   *  the route half of #1389 detects had only three re-advertisements available for the
+   *  whole life of a workflow instance: a first save spends one, a rename spends another,
+   *  and the third leaves the mechanism permanently spent on a canvas the user never
+   *  stopped working in. A route that MOVED is new evidence by exactly the argument that
+   *  makes a moved uuid new evidence.
+   *
+   *  `null` when the route cannot be read, which compares equal to the next unreadable
+   *  one — an id we cannot READ is not an id we know to be different, so it neither
+   *  resets the budget nor makes every tick look like a fresh identity. */
+  let mismatchRehelloRoute = null;
   let mismatchRehelloLandedCount = 0;
   let mismatchRehelloInFlight = false;
   let lastFailedMismatchRehelloAt = 0;
@@ -22372,8 +22387,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       liveUuid = null;
     }
     if (!liveUuid) return false;
-    if (liveUuid !== mismatchRehelloIdentity) {
+    // #1389 — read the live ROUTE on the same terms: unreadable is `null`, never a
+    // guess and never a fallback to the path (bridgeRouteId refuses rather than
+    // re-merging two tabs, and this must not undo that).
+    let liveRoute = null;
+    try {
+      const read = bridgeRouteId();
+      liveRoute = typeof read === "string" && read ? read : null;
+    } catch {
+      liveRoute = null;
+    }
+    if (liveUuid !== mismatchRehelloIdentity || liveRoute !== mismatchRehelloRoute) {
       mismatchRehelloIdentity = liveUuid;
+      mismatchRehelloRoute = liveRoute;
       mismatchRehelloLandedCount = 0;
       lastFailedMismatchRehelloAt = 0;
     }
@@ -22441,20 +22467,71 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   //     and firing another one here would only race it.
   //   - an identity that cannot be READ is not an identity known to differ, and it is
   //     not convergence either, so it neither spends the bound nor replenishes it.
+  //
+  // #1389 — TWO ADVERTISEMENTS CAN GO STALE, AND ONLY ONE OF THEM WAS WATCHED.
+  //
+  // A hello carries two identities, and they answer different questions:
+  //
+  //   * `workflow_uuid` — the per-instance FENCE identity. A stale one gets a command
+  //     refused as a `workflow instance mismatch`, which is what #1209 above is about.
+  //   * `tab_id` (the ROUTE, from bridgeRouteId()) — the key ui-bridge keeps exactly ONE
+  //     connection under. A stale one is not a refusal; it is a WRONG or MISSING address.
+  //     The orchestrator resolves every panel_* call and every push against it, and the
+  //     panel refuses its own outbound traffic on it too: `sendUserMessage` returns false
+  //     while `advertisedRouteIsStale()` holds, and `sendFrame` parks session-ordered
+  //     frames behind a hello that, by `holdForRoute`'s own rule, a held frame may never
+  //     cause. Nothing else re-advertises either — the 600 ms poll re-hellos on the EDGE
+  //     of a route change and then reports `wfid === currentWorkflowId` forever after.
+  //
+  // So a re-advertise that did not land, or that landed carrying the route it had already
+  // composed before the switch, left the panel permanently addressed as somewhere it no
+  // longer is, with the user's only recovery a browser refresh — the reported symptom,
+  // verbatim ("a browser F5/hard refresh was required to reconnect").
+  //
+  // THE TWO IDENTITIES DO NOT MOVE TOGETHER, which is why watching one is not watching
+  // both. The route is composed from the tab's lease and the workflow's PATH; the uuid is
+  // durable per workflow INSTANCE. A first save (`tmp:` → `wf:<path>`) and a
+  // rename/Save-As (`wf:<old>` → `wf:<new>`) both re-key the route while the instance —
+  // and therefore the uuid — is the same object it always was. On those, the uuid half of
+  // this check reports convergence and replenishes the bound while the address the
+  // orchestrator holds is wrong. That is the gap; #1267 reports its save-as face.
+  //
+  // Routed through the SAME bounded send, deliberately. The per-identity budget, the
+  // backoff, the in-flight guard and the #1095 gate's coalescing all apply unchanged — so
+  // a route that is stale only because a re-advertise is legitimately PARKED joins that
+  // parked hello instead of racing it, and a route that never converges goes quiet after
+  // the same three tries rather than becoming a greeting storm.
   const DRIFT_REHELLO_MAX_UNCONVERGED = 3;
   let driftRehelloUnconverged = 0;
   workflowIdentityDriftRehello = () => {
-    if (typeof lastAdvertisedWorkflowUuid !== "string" || !lastAdvertisedWorkflowUuid) return;
-    let liveUuid = null;
-    try {
-      const read = workflowStableUuid();
-      liveUuid = typeof read === "string" && read ? read : null;
-    } catch {
-      liveUuid = null;
+    // #1389 — the ROUTE half. `advertisedRouteIsStale()` already fails open on an
+    // unreadable id and answers false on a socket with no landed mapping, so it is
+    // false in exactly the states the uuid half also refuses to act on.
+    const routeDrifted = advertisedRouteIsStale();
+    // The FENCE half (#1209), unchanged in what it observes. Split into "was it
+    // readable" and "did it differ" because the two now have to be reported separately:
+    // an unreadable or never-advertised uuid is no longer a reason to skip the route.
+    let uuidObserved = false;
+    let uuidDrifted = false;
+    if (typeof lastAdvertisedWorkflowUuid === "string" && lastAdvertisedWorkflowUuid) {
+      let liveUuid = null;
+      try {
+        const read = workflowStableUuid();
+        liveUuid = typeof read === "string" && read ? read : null;
+      } catch {
+        liveUuid = null;
+      }
+      if (liveUuid) {
+        uuidObserved = true;
+        uuidDrifted = liveUuid !== lastAdvertisedWorkflowUuid;
+      }
     }
-    if (!liveUuid) return;
-    if (liveUuid === lastAdvertisedWorkflowUuid) {
-      driftRehelloUnconverged = 0;
+    if (!routeDrifted && !uuidDrifted) {
+      // Convergence replenishes the bound — but only when it was OBSERVED. An identity
+      // that could not be read, or a socket that has advertised nothing yet, is not
+      // evidence that re-advertising works here; crediting it would hand a later genuine
+      // drift a bound this tick never earned.
+      if (uuidObserved) driftRehelloUnconverged = 0;
       return;
     }
     if (driftRehelloUnconverged >= DRIFT_REHELLO_MAX_UNCONVERGED) return;
