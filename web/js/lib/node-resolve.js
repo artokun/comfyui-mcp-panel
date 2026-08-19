@@ -561,10 +561,16 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // are absent from /object_info exactly as if it were gone. Installing it
       // again cannot help. I walked into that dead end myself and filed a wrong
       // diagnosis from it (ComfyUI-LTXVideo, ImportError on a core rename).
+      // #1447 — pass the live map and the requested type so a pack that currently
+      // provides nodes (ReActorFaceSwap just added) is not named as the reason a
+      // different type (VideoToImages) is missing.
       let failedNote = "";
       if (typeof readImportFailures === "function") {
         try {
-          failedNote = importFailureNote(await readImportFailures());
+          failedNote = importFailureNote(await readImportFailures(), {
+            forType: class_type,
+            liveDefs: freshDefs,
+          });
         } catch {
           // A diagnostic that throws must not replace the refusal it explains.
         }

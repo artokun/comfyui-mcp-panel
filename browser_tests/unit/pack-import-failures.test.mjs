@@ -22,6 +22,7 @@ import {
   packsThatFailedToImport,
   importFailureNote,
   readPackImportFailures,
+  dropLivePackImportFailures,
 } from "../../web/js/lib/pack-import-failures.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -216,6 +217,115 @@ test("#775 a reader that THROWS does not replace the refusal", async () => {
 test("#775 WIRING: the panel supplies the reader to the add-node resolver", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(src, /readImportFailures: \(\) => readPackImportFailures\(api\)/);
+});
+
+// ---------------------------------------------------------------------------
+// #1447: an import-failure note must not name a pack that is currently live.
+// ---------------------------------------------------------------------------
+
+test("#1447 a pack that currently provides types is dropped from the note", () => {
+  // ReActorFaceSwap in the live /object_info is proof comfyui-reactor-node
+  // registered. Naming it as the reason VideoToImages is missing is the report.
+  const live = {
+    KSampler: { python_module: "nodes" },
+    ReActorFaceSwap: { python_module: "custom_nodes.comfyui-reactor-node" },
+  };
+  assert.deepEqual(
+    dropLivePackImportFailures(["comfyui-reactor-node"], live),
+    [],
+  );
+});
+
+test("#1447 hyphen/underscore/case in the folder still identify the same pack", () => {
+  const live = {
+    ReActorFaceSwap: { python_module: "custom_nodes.comfyui_reactor_node.nodes" },
+  };
+  assert.deepEqual(
+    dropLivePackImportFailures(["ComfyUI-Reactor-Node"], live),
+    [],
+  );
+});
+
+test("#1447 a pack with NO live types is kept — that is still the #775 case", () => {
+  // ComfyUI-LTXVideo failed to import, so none of ITS types are in /object_info.
+  // Core LTX nodes from comfy_extras do not exonerate it.
+  const live = {
+    KSampler: { python_module: "nodes" },
+    LTXVImgToVideo: { python_module: "comfy_extras.nodes_lt" },
+  };
+  assert.deepEqual(
+    dropLivePackImportFailures(["ComfyUI-LTXVideo", "comfyui-reactor-node"], live),
+    ["ComfyUI-LTXVideo", "comfyui-reactor-node"],
+  );
+});
+
+test("#1447 no python_module evidence leaves the list alone", () => {
+  // A stub map without python_module must not silently eat the #775 note.
+  assert.deepEqual(
+    dropLivePackImportFailures(["ComfyUI-LTXVideo"], { KSampler: {} }),
+    ["ComfyUI-LTXVideo"],
+  );
+  assert.deepEqual(dropLivePackImportFailures(["ComfyUI-LTXVideo"], null), [
+    "ComfyUI-LTXVideo",
+  ]);
+});
+
+test("#1447 panel_add_node of VideoToImages does not name a live ReActor pack", async () => {
+  // The shipped add-node guard, on the reporter's sequence: ReActorFaceSwap is
+  // on the backend, VideoToImages is not, the log still has an old reactor
+  // IMPORT FAILED line. The refusal must stay a refusal and must not append
+  // that pack as if it owned the missing type.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "VideoToImages", {
+    getFreshObjectInfo: async () => ({
+      KSampler: { python_module: "nodes" },
+      ReActorFaceSwap: { python_module: "custom_nodes.comfyui-reactor-node" },
+    }),
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["comfyui-reactor-node"],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an absent type must still be refused");
+  assert.match(err.message, /Unknown node type "VideoToImages"/);
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.doesNotMatch(err.message, /FAILED TO IMPORT/);
+});
+
+test("#1447 a leftover failure is labelled as not owning the requested type", async () => {
+  // A pack that really did fail (no live types) is still worth naming — #775 —
+  // but must not read as the cause of an unrelated class_type.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "VideoToImages", {
+    getFreshObjectInfo: async () => ({
+      KSampler: { python_module: "nodes" },
+      ReActorFaceSwap: { python_module: "custom_nodes.comfyui-reactor-node" },
+    }),
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["comfyui-reactor-node", "ComfyUI-LTXVideo"],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.match(err.message, /ComfyUI-LTXVideo/);
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.match(err.message, /does not prove it provides "VideoToImages"/);
+  assert.match(err.message, /may be unrelated/);
+});
+
+test("#1447 importFailureNote itself drops a live pack", () => {
+  const note = importFailureNote(["comfyui-reactor-node"], {
+    forType: "VideoToImages",
+    liveDefs: {
+      ReActorFaceSwap: { python_module: "custom_nodes.comfyui-reactor-node" },
+    },
+  });
+  assert.equal(note, "");
 });
 
 test("#1180: a hanging log read cannot outlive the refusal it is explaining", async () => {
