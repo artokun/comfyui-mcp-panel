@@ -15346,12 +15346,17 @@ const GRAPH_TOOL_EXECUTORS = {
       // #1357 — the scan's combo lists cannot enumerate an input file below the
       // input root (LoadImage.INPUT_TYPES is `os.listdir` + `isfile`, top level
       // only) nor an `[output]`/`[temp]`-annotated value, so for those it asks
-      // the server directly rather than calling a present file missing. Same
-      // /view probe panel_set_widget already uses to server-confirm the very
-      // same value (#387) — the two must not contradict each other. The path
-      // split follows the SERVER's platform, exactly as the missing-media probe
-      // above does; an unknown platform keeps POSIX semantics so a backslash is
-      // never re-read as a separator the server would not honour (#513). Read
+      // the server directly rather than calling a present file missing. The same
+      // /view EVIDENCE panel_set_widget accepts the very same value on (#387) —
+      // the two must not confirm and deny one value in one session. Not
+      // byte-for-byte the same probe: set_widget's inline one always normalises
+      // backslashes and always asks the `input` root, while this one parses the
+      // annotation for its root and splits on the SERVER's platform, exactly as
+      // the missing-media probe above does. Where they can differ (a `sub\a.png`
+      // on a POSIX server) this one is the STRICTER of the two — it declines to
+      // split, so the value stays reported. An unknown platform keeps POSIX
+      // semantics, so a backslash is never re-read as a separator the server
+      // would not honour (#513). Read
       // BEFORE the scan's own budget is taken, so a slow /system_stats shortens
       // the scan rather than letting it start with a full step it no longer has
       // (it is cached for the session, and the media probe above normally warms
