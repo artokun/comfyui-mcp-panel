@@ -12165,7 +12165,7 @@ const GRAPH_TOOL_EXECUTORS = {
     );
     graph.setDirtyCanvas(true, true);
     return {
-      removed: summary;
+      removed: summary,
       ...(cleaned && (cleaned.inputs.length || cleaned.outputs.length)
         ? { cleaned_boundary_slots: cleaned }
         : {}),
