@@ -1,4 +1,4 @@
-import { definitionsDifferOnlyByLinkRenumber } from "./definitions-renumber.js";
+import { definitionsDifferOnlyByRenumber } from "./definitions-renumber.js";
 import { nodeInputsDifferOnlyByDefinitionRebuild } from "./node-inputs-rebuild.js";
 import {
   isEmptyBaselineMismatch,
@@ -786,7 +786,7 @@ export function describeGraphStateDifference({ rootGraph, state } = {}) {
     // `definitions` is the one surface with a hardened account of WHY it differs.
     // #886 measured it on the rig: loading a persisted workflow regenerates link
     // identity inside `definitions.subgraphs` (`state.lastLinkId` 2092 -> 2106) while
-    // node ids, types and topology stay identical. `definitionsDifferOnlyByLinkRenumber`
+    // node ids, types and topology stay identical. `definitionsDifferOnlyByRenumber`
     // is the predicate `graphRootReproducesStateContent` — the VERDICT — already trusts
     // for exactly this, and it fails CLOSED: anything it cannot fully account for
     // returns false, which is read as "not accounted for", never as "changed".
@@ -794,8 +794,21 @@ export function describeGraphStateDifference({ rootGraph, state } = {}) {
     // So this reports the SAME judgement the verdict makes, to the sentence that had no
     // access to it. It decides nothing new; it stops the disclosure from being blind to
     // a difference the verdict has already characterised.
+    //
+    // comfyui-mcp#1706 — the SECOND rewrite on the same surface, and the reason the
+    // predicate now takes the ROOT nodes. The frontend also renumbers subgraph NODE ids
+    // on load (`deduplicateSubgraphNodeIds`, measured on 1.48.7: definition node ids
+    // 78/77/76 came back 182/183/184 with the definition's links patched through the
+    // same map and `state.lastNodeId` 196 -> 214, root `nodes` unchanged). A definition
+    // node id is also referenced from OUTSIDE `definitions` — a root node's
+    // `properties.proxyWidgets` names the definition node a promoted widget comes from —
+    // so the payload's root nodes are the evidence that admits or refuses that account.
     const accountedSurfaces = surfaces.filter(
-      (key) => key === "definitions" && definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions),
+      (key) =>
+        key === "definitions" &&
+        definitionsDifferOnlyByRenumber(state?.definitions, actualState?.definitions, {
+          rootNodes: state?.nodes,
+        }),
     );
     return {
       comparable: true,
@@ -1180,7 +1193,7 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     // CONTENT_UNVERIFIED — binding proven, nodes perfect, refused on a surface nobody
     // had characterised.
     //
-    // Everything else still refuses. `definitionsDifferOnlyByLinkRenumber` returns
+    // Everything else still refuses. `definitionsDifferOnlyByRenumber` returns
     // false for anything it cannot fully account for, and the caller reads that as
     // "not proven" — never as "changed".
     // The surface set must be a subset of { nodes, definitions } — nothing else is
@@ -1198,7 +1211,18 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     if (!unique.length) return notProven;
     if (unique.some((s) => s !== "nodes" && s !== "definitions")) return notProven;
     if (unique.includes("definitions")) {
-      if (!definitionsDifferOnlyByLinkRenumber(state?.definitions, actualState?.definitions)) {
+      // comfyui-mcp#1706 — `state?.nodes` is not decoration here. The node-id
+      // relabeling is admitted only against the PAYLOAD's root nodes, because a root
+      // node's `properties.proxyWidgets` references a definition node BY ID: when the
+      // relabeling touches one of those, the frontend's own `patchProxyWidgets` runs
+      // over `rootNodes` too and the promoted widget's value did not survive (measured).
+      // Without this argument the predicate answers the pre-#1706 question, so removing
+      // it silently un-ships the fix.
+      if (
+        !definitionsDifferOnlyByRenumber(state?.definitions, actualState?.definitions, {
+          rootNodes: state?.nodes,
+        })
+      ) {
         return notProven;
       }
     }
@@ -1991,10 +2015,12 @@ function abortedRestoreClause(observed = {}) {
 }
 
 /** The only surfaces this file has a written account of. `definitions` differs on a
- *  faithful open because loading a saved workflow regenerates link ids inside subgraph
- *  definitions (#886, measured: state.lastLinkId 2092 -> 2106), and
- *  `definitionsDifferOnlyByLinkRenumber` decides per-case whether THIS difference is
- *  only that. Nothing else has such an account, so nothing else may be waved through. */
+ *  faithful open because loading a saved workflow regenerates ids inside subgraph
+ *  definitions — LINK ids (#886, measured: state.lastLinkId 2092 -> 2106) and, when they
+ *  collide with the payload's own root node ids, NODE ids (comfyui-mcp#1706, measured:
+ *  78/77/76 -> 182/183/184 with the definition's links patched through the same map).
+ *  `definitionsDifferOnlyByRenumber` decides per-case whether THIS difference is only
+ *  those. Nothing else has such an account, so nothing else may be waved through. */
 const ACCOUNTABLE_CONTENT_SURFACES = new Set(["definitions"]);
 
 /**
@@ -2079,11 +2105,17 @@ function openRebindPartClause(part, observed = {}) {
         `the graph on the canvas differs from what was loaded on: ${named}` +
         nodeSurfaceClause(observed) +
         abortedRestoreClause(observed) +
+        // comfyui-mcp#1706 — this sentence used to name LINK renumbering as "the whole
+        // difference". There are TWO measured rewrites on this surface now (link ids,
+        // #886; subgraph node ids, #1706), and the predicate does not report which one
+        // it matched — so naming one would state a mechanism this reply never observed.
+        // It says instead exactly what the predicate PROVED, which covers both.
         (accounted.length
           ? `. Its \`${accounted.join("`, `")}\` also differ, and that one IS accounted for: the ` +
-            `whole difference is link RENUMBERING — loading a saved workflow regenerates link ids ` +
-            `inside subgraph definitions while the wiring stays identical — so it is not a content ` +
-            `change and is not part of what is unconfirmed here`
+            `whole difference is the frontend RENUMBERING its own ids on load — link ids, and the ` +
+            `node ids inside subgraph definitions when they collide — with the same nodes in the ` +
+            `same order, the same values, and every connection still joining the same two slots, ` +
+            `so it is not a content change and is not part of what is unconfirmed here`
           : "")
       );
     default:
@@ -2169,7 +2201,7 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     //
     // The narrowness was right and is kept: what may not gate this is a surface the
     // panel has already fully characterised with the same predicate the content VERDICT
-    // trusts. `definitionsDifferOnlyByLinkRenumber` fails closed, so a `definitions`
+    // trusts. `definitionsDifferOnlyByRenumber` fails closed, so a `definitions`
     // difference that is anything more than renumbering is NOT accounted for and still
     // sends this to the honest "cannot tell" — as does any other second surface.
     const unexplained = unexplainedContentSurfaces(observed);

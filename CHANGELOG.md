@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `workflow_open` no longer reports a false content mismatch on `definitions` when the frontend renumbered subgraph NODE ids during the load: the relabeling is proven (same nodes in the same order, links and promoted widgets patched through one injective map) rather than tolerated, and it still refuses when a root node promotes a widget from a node the relabeling touched (artokun/comfyui-mcp#1706)
+
 ## [0.15.4] - 2026-08-19
 
 ### Fixed

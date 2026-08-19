@@ -54,9 +54,14 @@
  * (`content_normalized`) rather than vouching for them.
  *
  * WHAT STILL REFUSES: a changed node set, any surface but `nodes` (an unaccounted
- * `definitions` block included — comfyui-mcp#1706 is a DIFFERENT mechanism and is
- * deliberately left failing here), a recorded throw, and a frontend that could not be
+ * `definitions` block included), a recorded throw, and a frontend that could not be
  * instrumented at all.
+ *
+ * comfyui-mcp#1706 was a DIFFERENT mechanism and was deliberately left failing here.
+ * It has since been characterised — the frontend also renumbers subgraph NODE ids on
+ * load — so the caller now ACCOUNTS for that difference before this predicate sees the
+ * surface list, and only an unaccounted `definitions` block reaches it. This file's
+ * refusal is unchanged; what changed is which differences arrive as unaccounted.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -197,7 +202,7 @@ test("panel#1283 any surface but `nodes` refuses — a completed node pass expla
     ["links"],
     ["groups"],
     ["nodes", "links"],
-    ["nodes", "definitions"], // an UNACCOUNTED definitions block: comfyui-mcp#1706's shape
+    ["nodes", "definitions"], // an UNACCOUNTED definitions block (the caller filters accounted ones out)
     ["definitions"],
     ["reroutes"],
     ["extra"],
@@ -298,17 +303,61 @@ test("comfyui-mcp#1705 `nodes` PLUS a definitions block that is only link renumb
   assert.deepEqual(proof.normalizedFields, ["properties", "widgets_values"]);
 });
 
-test("comfyui-mcp#1706 a definitions difference that is NOT renumbering still refuses", () => {
-  // The reported case is two workflows sharing subgraph definition UUIDs, where the
-  // frontend's root-graph configure DEDUPLICATES subgraph node ids against ids already
-  // reserved by the definitions store. That is a different rewrite from #886's link
-  // renumbering, it has no characterisation here, and this ground must not smuggle it
-  // through: `definitions` is not `nodes`.
-  const defs = (nodeId) => ({
-    subgraphs: [{ id: "sg-1", name: "d", nodes: [{ id: nodeId, type: "VAEDecode" }], links: [], state: {} }],
+// RE-ARMED, not relaxed (comfyui-mcp#1706). When this test was written the node-id
+// rewrite had no characterisation, so the honest answer was to refuse it and say so.
+// It has one now — measured on the rig, see `definitions-renumber.js` — and the two
+// halves of that are pinned separately: the renumber IS accounted, and a definitions
+// difference that is NOT one still refuses. The second half is what the original
+// assertion was protecting, and it is unchanged.
+test("comfyui-mcp#1706 the subgraph NODE-id renumber is accounted, on a definitions-only diff", () => {
+  // The frontend renumbers a definition's node ids and patches that definition's links
+  // through the same map (`deduplicateSubgraphNodeIds`). Root nodes come back identical,
+  // which is exactly the reported shape: identity confirmed, nodes matching, only
+  // `definitions` differing.
+  const defs = (a, b) => ({
+    subgraphs: [
+      {
+        id: "sg-1",
+        name: "d",
+        nodes: [
+          { id: a, type: "VAEDecode", widgets_values: [] },
+          { id: b, type: "PreviewImage", widgets_values: [] },
+        ],
+        links: [[11, a, 0, b, 0, "IMAGE"]],
+        state: { lastNodeId: a },
+      },
+    ],
   });
-  const state = stateOf([node(1, "KSampler")], { definitions: defs(9) });
-  const live = stateOf([node(1, "KSampler")], { definitions: defs(41) });
+  const state = stateOf([node(1, "KSampler")], { definitions: defs(9, 10) });
+  const live = stateOf([node(1, "KSampler")], { definitions: defs(41, 42) });
+  const proof = graphRootReproducesStateContent({
+    rootGraph: rootOf(live),
+    state,
+    loadRanToCompletion: true,
+  });
+  assert.equal(proof.proven, true, "a definitions-only relabeling is the whole difference");
+});
+
+test("comfyui-mcp#1706 a definitions difference that is NOT renumbering still refuses", () => {
+  // Same relabeling, and one node ALSO retyped. A relabeling never changes what a node
+  // is, so this is not one — and `definitions` is not `nodes`, so no other ground here
+  // may smuggle it through.
+  const defs = (a, b, secondType) => ({
+    subgraphs: [
+      {
+        id: "sg-1",
+        name: "d",
+        nodes: [
+          { id: a, type: "VAEDecode", widgets_values: [] },
+          { id: b, type: secondType, widgets_values: [] },
+        ],
+        links: [[11, a, 0, b, 0, "IMAGE"]],
+        state: { lastNodeId: a },
+      },
+    ],
+  });
+  const state = stateOf([node(1, "KSampler")], { definitions: defs(9, 10, "PreviewImage") });
+  const live = stateOf([node(1, "KSampler")], { definitions: defs(41, 42, "SaveImage") });
   const proof = graphRootReproducesStateContent({
     rootGraph: rootOf(live),
     state,
