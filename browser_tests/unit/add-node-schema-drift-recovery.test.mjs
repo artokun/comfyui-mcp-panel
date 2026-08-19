@@ -104,7 +104,18 @@ test("#1242: the add runs the refresh itself, then re-checks, BEFORE the refusal
   const refusalAt = PANEL.indexOf("added or retyped since this page loaded its node schema");
   assert.ok(checkAt > 0 && refusalAt > checkAt, "the drift check must precede the refusal");
   const between = PANEL.slice(checkAt, refusalAt);
-  const refreshAt = between.indexOf("refreshComfyNodeDefs(undefined, { force: true })");
+  // #1192 — the call now spans lines because it carries a bound, so this matches the SHAPE
+  // rather than one spelling of it. STRONGER than the literal it replaces: it pins that the
+  // drift recovery is forced AND that its wait draws from the command budget, which is the
+  // property #1192 needs and the literal could not express.
+  const forced = between.match(
+    /refreshComfyNodeDefs\(undefined, \{\s*force: true,\s*joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,\s*\}\)/,
+  );
+  assert.ok(
+    forced,
+    "the drift branch must run the forced refresh itself, bounded by the command budget",
+  );
+  const refreshAt = forced.index;
   assert.ok(refreshAt > 0, "the drift branch must run the forced refresh itself");
   const recheckAt = between.indexOf("drifted = driftedRequiredInputNames(currentDef, nodeData)", refreshAt);
   assert.ok(recheckAt > refreshAt, "the drift must be re-checked AFTER the refresh");
