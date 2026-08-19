@@ -2112,6 +2112,29 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // apart and the caller passes that through as `contentComparable`; anything but
     // an explicit `true` takes the non-asserting wording.
     const compared = contentWasCompared(observed);
+    // panel#1283 family — AN ABORTED RESTORE GETS ITS OWN HEADLINE, before either of the
+    // sentences below can be reached.
+    //
+    // Both of those were written for a load that COMPLETED, and both are false here. The
+    // reassuring one says "there is no missing work to redo"; the generic one says "the
+    // panel cannot tell whether the ComfyUI frontend merely normalized it or the load only
+    // partly applied". Since the panel started watching the restore it CAN tell, and it
+    // knows the answer is the second — so leaving either in place would put a sentence
+    // next to `because`'s "part of what was loaded never landed" that contradicts it.
+    // A reply that says two opposite things about one observation is the defect #1623 was
+    // reported for, one level down.
+    if (compared && observed.contentLoadRanToCompletion === false) {
+      return (
+        `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but the ` +
+        `RESTORE ITSELF DID NOT FINISH, so the graph on the canvas is not what was loaded. This is ` +
+        `not the frontend normalizing its own fields: the panel watched this load and something ` +
+        `threw part-way through it.${because} Treat the canvas as UNKNOWN and re-read it ` +
+        `(panel_graph_outline) before editing. Any node named above is at CONSTRUCTION DEFAULTS — ` +
+        `its saved widget values were never applied — so reconfigure it, or fix the pack it comes ` +
+        `from and open again. Do NOT save from here: it would write the unrestored state over ` +
+        `${workflow}.` + FENCE_NOT_REFRESHED
+      );
+    }
     // #825 — the headline may only claim "the panel cannot tell" while that is
     // still true. When the ONLY surface that differs is `nodes` and the node set
     // came through intact with just presentation rewritten, the panel CAN tell:

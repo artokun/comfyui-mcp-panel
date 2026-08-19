@@ -88,8 +88,12 @@ test('a content-unverified open names the fence recovery, and it works', async (
   await page.evaluate(() => (window as any).__cmcpRestoreConfigure?.())
   const text = JSON.stringify(reopened)
   // Precondition: this must be the outcome the issue is about, not some other failure.
+  // panel#1283 — an ABORTED restore gets its own headline (the "and" form), because both
+  // of the older ones were written for a load that completed and are false here: one says
+  // there is no missing work to redo, the other that the panel cannot tell normalization
+  // from a partial load. This is the more specific sentence of the two, not a looser match.
   expect(text, 'the reply must be the post-repaint content verdict').toContain(
-    'workflow_open RAN, the canvas IS bound to'
+    'workflow_open RAN and the canvas IS bound to'
   )
   expect(reopened.ok, 'content-unverified is ok:false by design').toBe(false)
 

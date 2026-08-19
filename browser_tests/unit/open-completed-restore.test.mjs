@@ -444,6 +444,41 @@ test("panel#1283 a refusal on an ABORTED restore names what aborted it", () => {
   assert.match(msg, /DID NOT RUN TO COMPLETION/);
   assert.match(msg, /FaceDetailer \(id 7\): widgets not built/);
   assert.match(msg, /part of what was loaded never landed/);
+  // …and the HEADLINE must not contradict it. Both pre-existing headlines were written
+  // for a load that completed: one says there is no missing work to redo, the other says
+  // the panel cannot tell normalization from a partial load. The panel CAN tell here, and
+  // the answer is the partial load.
+  assert.doesNotMatch(msg, /no missing work to redo/i);
+  assert.doesNotMatch(msg, /cannot tell from here whether/i);
+  assert.doesNotMatch(msg, /cannot tell whether the ComfyUI frontend merely normalized/i);
+  assert.match(msg, /RESTORE ITSELF DID NOT FINISH/);
+  assert.match(msg, /Do NOT save from here/);
+  assert.match(msg, /carries NO fence refresh/, "the recovery #702 added must still ride along");
+});
+
+test("panel#1283 an aborted restore whose difference is only COSMETIC still refuses, and says so", () => {
+  // The dangerous combination: `pos` moved (cosmetic) AND a node threw. #1623's reassurance
+  // would have fired — "you are on the right workflow and there is no missing work to redo" —
+  // over a node sitting at construction defaults. The proof vetoes the ground; this asserts
+  // the SENTENCE is vetoed too, on the same observation.
+  const msg = describeOpenRebindOutcome(
+    resolveOpenRebindVerdict({
+      instanceStillTarget: true,
+      markerMatches: true,
+      identityMatches: true,
+      contentMatches: false,
+    }),
+    {
+      targetLabel: "detailer.json",
+      contentComparable: true,
+      contentSurfaces: ["nodes"],
+      contentNodeDifference: { comparable: true, sameNodeSet: true, cosmeticOnly: true, fields: ["pos"] },
+      contentLoadRanToCompletion: false,
+      contentRestoreFailures: [{ id: 7, type: "FaceDetailer", error: "widgets not built" }],
+    },
+  );
+  assert.doesNotMatch(msg, /no missing work to redo/i);
+  assert.match(msg, /RESTORE ITSELF DID NOT FINISH/);
 });
 
 test("panel#1283 a restore that aborted but left nothing unrestored may NOT claim values are missing", () => {
