@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- graph mutations notify the visible canvas (and bump the frontend layout revision) so a successful edit/remove actually appears, not only in panel_graph_outline (#1443)
+
 ## [0.15.11] - 2026-08-19
 
 ### Added
