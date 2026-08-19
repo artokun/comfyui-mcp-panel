@@ -347,6 +347,13 @@ import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { isSameInstanceRename } from "./lib/workflow-route-change.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import {
+  collisionSharesPublishKey,
+  replacedBlueprintIdentity,
+  subgraphCollisionRefusalMessage,
+  subgraphSaveCollisionAction,
+  withBlueprintOverwriteConfirm,
+} from "./lib/subgraph-blueprint-overwrite.js";
+import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
   migratableRouteIds,
@@ -18552,7 +18559,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // Publish a subgraph node to the library. node_id selects the subgraph node
   // first (else the current single selection must be a subgraph node). name is the
   // blueprint name (defaults to the node's title). No dialog when name is given.
-  async graph_save_subgraph({ node_id, name } = {}) {
+  // overwrite:true replaces an existing USER blueprint of that name in place
+  // (#1122); bundled/global blueprints stay non-overwritable, and a collision
+  // without the flag still refuses rather than popping ComfyUI's confirm dialog.
+  async graph_save_subgraph({ node_id, name, overwrite } = {}) {
     const { graph, canvas } = getGraphCtx();
     if (!canvas) throw new Error("canvas unavailable");
     const store = getSubgraphStore();
@@ -18606,15 +18616,18 @@ const GRAPH_TOOL_EXECUTORS = {
       d?.name === fullType || bareName(d) === finalName || displayName(d) === finalName;
     // publishSubgraph() pops a confirmOverwrite() dialog on a name COLLISION — which
     // would hang this programmatic call waiting for UI. Preflight and refuse with a
-    // clear error instead. The remedy must be actionable from where the caller IS:
-    // there is no programmatic delete, so name both real options explicitly rather than
-    // leaving "overwrite isn't supported" as a dead end (#636).
+    // clear error instead, unless the caller opted in with overwrite:true (#1122).
+    // Overwrite is never inferred from the collision; bundled/global blueprints stay
+    // non-overwritable. The no-flag remedy must still be actionable from where the
+    // caller IS: name the flag, a different name, or (for a user blueprint) delete
+    // rather than leaving "overwrite isn't supported" as a dead end (#636).
     // ONE snapshot backs BOTH the collision preflight and the before/after comparison, so
     // the entry this call ultimately attributes to itself is one this call PROVED was
     // absent beforehand — not one that merely happens to match the name now.
     const before = blueprintList();
     const beforeKeys = new Set(before.map((d) => d?.name));
-    const collision = before.find(matchesRequested);
+    const matches = before.filter(matchesRequested);
+    const collision = matches[0];
     if (collision) {
       // #636 — DON'T SEND THEM AFTER A BLUEPRINT COMFYUI WON'T DELETE. The remedy below
       // used to say "delete it from the library and retry" unconditionally, and
@@ -18640,15 +18653,40 @@ const GRAPH_TOOL_EXECUTORS = {
       } catch {
         collisionIsGlobal = false;
       }
+      const action = subgraphSaveCollisionAction({
+        hasCollision: true,
+        overwrite,
+        isGlobal: collisionIsGlobal,
+        matchCount: matches.length,
+        sameCacheKey: collisionSharesPublishKey(collision, { fullType, finalName, prefix }),
+      });
+      if (action === "overwrite") {
+        // Answer ComfyUI's confirmOverwrite() ourselves so the official publish
+        // path runs without a human dialog. A matching library entry afterwards
+        // is the observed replace — the key does not change on an in-place save,
+        // so the new-entry check used for first publish cannot prove this one.
+        const replaced = replacedBlueprintIdentity(collision, { prefix });
+        await withBlueprintOverwriteConfirm(getPiniaStore("dialog"), () =>
+          store.publishSubgraph(finalName),
+        );
+        const updated = blueprintList().find(matchesRequested);
+        if (!updated) {
+          throw new Error(
+            `panel_save_subgraph overwrite did not leave a blueprint named "${finalName}" in the ` +
+              `library. Nothing is being reported as saved. Check panel_list_subgraphs, then retry.`,
+          );
+        }
+        return {
+          saved: { name: finalName, from_node_id: target.id, type: updated?.name ?? fullType },
+          replaced: replaced,
+        };
+      }
       throw new Error(
-        `a subgraph blueprint named "${finalName}" already exists (type "${collision.name}") and this ` +
-          `tool will not replace it — replacing one programmatically would need ComfyUI's overwrite ` +
-          `dialog, which cannot be answered from here. ` +
-          (collisionIsGlobal
-            ? `That one ships WITH ComfyUI, and ComfyUI refuses to delete a bundled blueprint — so ` +
-              `there is no way to free the name. Save under a different one.`
-            : `Either save under a different name, or delete "${finalName}" from the subgraph library ` +
-              `in the ComfyUI UI first and then retry this call.`),
+        subgraphCollisionRefusalMessage({
+          action,
+          finalName,
+          collisionType: collision.name,
+        }),
       );
     }
     await store.publishSubgraph(finalName);

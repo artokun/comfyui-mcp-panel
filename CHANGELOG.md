@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- `graph_save_subgraph` can replace a user-published blueprint in place with `overwrite:true` — no Save dialog, bundled/global blueprints stay protected (#1122)
+
 ## [0.15.9] - 2026-08-19
 
 ### Fixed

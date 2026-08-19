@@ -194,10 +194,12 @@ const refusalSite = src.slice(
 test("#636: a GLOBAL collision is not told to delete it", () => {
   // subgraphStore.deleteBlueprint refuses a bundled blueprint outright, so "delete it and
   // retry" is unfollowable — and on a stock install most blueprints are global, making it
-  // the likeliest collision.
+  // the likeliest collision. The wording lives in subgraphCollisionRefusalMessage so it
+  // is tested as a string; pin that this site still classifies globality and refuses
+  // through that helper (overwrite:true cannot free a bundled name — #1122).
   assert.ok(refusalSite.length > 0, "the refusal must classify the collision");
-  assert.match(refusalSite, /ships WITH ComfyUI/, "it must say why the name cannot be freed");
-  assert.match(refusalSite, /Save under a different one/, "and give the one remedy that works");
+  assert.match(refusalSite, /subgraphCollisionRefusalMessage/, "the refusal must use the shared wording");
+  assert.match(refusalSite, /subgraphSaveCollisionAction/, "and classify before throwing");
 });
 
 test("#636: UNKNOWN is not treated as global", () => {
