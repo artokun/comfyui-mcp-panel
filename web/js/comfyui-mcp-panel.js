@@ -10396,8 +10396,9 @@ const ADD_NODE_COMMAND_BUDGET_MS = 25000;
  * change only TWO of the six held a command budget — `graph_add_node` (#1192) and
  * `nodes_install` (#671) — so "the last one that never took one" was false, and the false
  * version of this sentence concealed a sibling: `graph_set_widget`'s stale-combo recovery
- * awaits the coalescer with no bound of its own. Filed separately rather than folded in; the
- * point for a future reader is that this is a RECURRING shape, not a last straggler.
+ * awaits the coalescer with no bound of its own (bounded in #1413). Filed separately rather
+ * than folded in; the point for a future reader is that this is a RECURRING shape, not a
+ * last straggler.
  *
  * REPORTED: after a workflow switch and a successful re-target, `panel_refresh_nodes` got no
  * acknowledgement for 30 s while ComfyUI stayed healthy and idle; the identical call then
@@ -10544,6 +10545,44 @@ function widenSocketProofBudget(deadlineMs) {
   // fetch inside a wait that has already run out.
   return Math.max(1, Math.floor(whole / WIDEN_SOCKET_PROOF_DIVISOR));
 }
+
+/**
+ * #1413 — `graph_set_widget`'s whole-command deadline, taken on the handler's first line.
+ *
+ * The fourth instance of the defect #1192 fixed for `graph_add_node` and #1404/#1409 for
+ * `refresh_nodes`: a wait relayed inside the orchestrator's 30,000 ms window
+ * (`OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS` in comfyui-mcp's panel-tools.ts — the same relay
+ * constant add_node is measured against) that never took a command budget. Here it is the
+ * stale-combo recovery's `refreshComfyNodeDefs()` fallback: a plain join of a run someone
+ * else started, under a deadline this command never stated. One run is ~14.5 s of wall
+ * clock (NODE_DEFS_RUN_BUDGET_MS deliberately stops its clock across
+ * registerNodesFromDefs/reapplyDefsToLiveNodes), and the recovery is reached only AFTER
+ * the authorization /object_info has already spent part of the window — so an unbounded
+ * join can outlive the relay even with every other step on the path bounded, and the
+ * reply is then the bare `did not reply to "graph_set_widget" within 30000 ms` that names
+ * nothing, instead of the worded, retryable refusal below.
+ *
+ * 25,000 ms, mirroring ADD_NODE_COMMAND_BUDGET_MS against the same 30,000 ms window for
+ * the same reason: 5,000 ms of slack for composing the reply, serialising it, and the
+ * websocket hop. Mirrored rather than derived for the same reason too — the relay
+ * constant lives in the OTHER repo, and a derived copy here could not be kept true.
+ */
+const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
+
+/**
+ * #1413 — what a widget write still has to do AFTER the stale-combo refresh, held back so
+ * the join cannot spend it.
+ *
+ * The retry write itself is synchronous, but a still-refused value then runs the #387
+ * upload-asset probe (one ranged /view request), and the refusal or result still has to
+ * be composed, serialised and relayed. A join handed the whole remainder can land at the
+ * wire and leave those steps nothing — the same wrong-cause refusal
+ * ADD_NODE_POST_REFRESH_RESERVE_MS exists to prevent on the add path. PICKED, not derived:
+ * none of the steps it protects has a measured bound to derive from, and the cost of a
+ * reserve that is too large is only a slightly earlier "retry" on a path that was already
+ * going to say exactly that.
+ */
+const SET_WIDGET_POST_REFRESH_RESERVE_MS = 4000;
 
 async function awaitRequiredCustomWidgetRegistration(
   nodeData,
@@ -13564,6 +13603,12 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
+    // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
+    // bounded steps inside it compose instead of adding (#1192, #671). The step this
+    // exists for is the stale-combo recovery's refresh join below: reached only after
+    // the authorization /object_info has already spent part of the relay window, and
+    // unbounded until now.
+    const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
@@ -13935,7 +13980,19 @@ const GRAPH_TOOL_EXECUTORS = {
           refreshComboOptionsFromDefs(target, defs, keyType, nameMap);
           return;
         }
-        return refreshComfyNodeDefs();
+        // #1413 — the ONE await on this recovery path that was never bounded: a plain
+        // join of a node-def refresh someone else started, under a deadline this command
+        // never stated. It now draws what the command has left, minus the reserve the
+        // retry write and the reply still need. The run is NOT cancelled (the coalescer
+        // never cancels work in flight — it keeps the slot and keeps registering, which
+        // is exactly what makes the retry safe). REFRESH_JOIN_ABANDONED comes back as the
+        // return value rather than a throw, because set-widget.js awaits this call inside
+        // a best-effort catch that would swallow one; the lib turns the token into a
+        // worded "nothing was written — retry" refusal instead of revalidating against
+        // the list that was never refreshed and calling the value invalid.
+        return refreshComfyNodeDefs(undefined, {
+          joinMs: budget.remaining() - SET_WIDGET_POST_REFRESH_RESERVE_MS,
+        });
       },
       // #387: last-resort probe for an UPLOAD input value the refreshed /object_info
       // combo still cannot list — a LoadImage image uploaded under a SUBFOLDER (ComfyUI

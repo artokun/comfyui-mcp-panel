@@ -39,6 +39,7 @@ import {
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
+import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
@@ -73,6 +74,32 @@ function coerceAdvisoryMessage(err) {
   } catch {
     return "the reason could not be rendered";
   }
+}
+
+/**
+ * #1413 — the refusal for a stale-combo recovery whose authoritative refresh was still
+ * running when the command's budget ran out.
+ *
+ * RECOVERABLE BY CONSTRUCTION, and worded to say so — the same shape as #1192's
+ * addNodeRefreshBusyMessage. The in-flight refresh was NOT cancelled (the coalescer never
+ * cancels work someone else started) and it is registering the very list this write needs,
+ * so the retry this text asks for is the normal outcome, not a hope. What it must NOT say
+ * is "not a valid option": the revalidation never completed, so this refusal cannot tell a
+ * genuinely-invalid value from one the refresh would have accepted — and claiming the
+ * former is how a retryable busy reads as a permanent rejection.
+ */
+function staleComboRefreshBusyMessage() {
+  return (
+    "the value is not in this combo's current option list, and the authoritative refresh " +
+    "that would have re-read the list — a node-def refresh started by a ComfyUI reconnect, " +
+    "a finished install, or another tool call — was still running when this command's time " +
+    "budget ran out waiting for it, so the revalidation did NOT complete. This refusal " +
+    "cannot tell a genuinely-invalid value from one the refresh would have accepted. " +
+    "NOTHING WAS WRITTEN and nothing was changed. That refresh is still running and is " +
+    "registering exactly the list this write needs, so RETRY in a few seconds — this " +
+    "normally succeeds on the next attempt. If it keeps happening, call panel_refresh_nodes " +
+    "once and wait for it to report, then retry the write."
+  );
 }
 
 export async function runSetWidget(
@@ -806,6 +833,11 @@ export async function runSetWidget(
     // upload-asset probe for a value the refreshed list still cannot contain.
     let latest = err;
     if (typeof refreshCombos === "function") {
+      // #1413 — the panel bounds this wait by the command's remaining budget, and a bound
+      // that runs out is reported back as a STRUCTURED TOKEN (REFRESH_JOIN_ABANDONED), not
+      // a throw — the catch below is the best-effort channel and would swallow one. The
+      // in-flight refresh is not cancelled by the abandonment; only THIS caller's wait ends.
+      let refreshJoinAbandoned = false;
       try {
         // Reuse the /object_info payload already fetched for type authorization so a
         // combo miss does not round-trip /object_info a SECOND time (#458 P2). Key the
@@ -817,9 +849,24 @@ export async function runSetWidget(
           writeTargetWidgetName && concreteWidgetName
             ? { [writeTargetWidgetName]: concreteWidgetName }
             : undefined;
-        await refreshCombos(freshDefs ?? undefined, resolvedTargetNode, authTarget?.type, comboNameMap);
+        const refreshOutcome = await refreshCombos(freshDefs ?? undefined, resolvedTargetNode, authTarget?.type, comboNameMap);
+        refreshJoinAbandoned = refreshOutcome === REFRESH_JOIN_ABANDONED;
       } catch {
         /* refresh best-effort; fall through to re-raise the original rejection */
+      }
+      // #1413 — the refresh never re-read the list, so the retry CANNOT be trusted: it
+      // would re-fail against the same stale snapshot and the refusal would call the
+      // value "not a valid option" — a false cause for a retryable busy, and the exact
+      // report this issue exists to replace. Refuse IN WORDS instead, before the retry
+      // and before the upload probe: the budget that ran out is the command's, and an
+      // unbounded /view probe after it would reopen the relay-window overrun the bound
+      // just closed. On the retry the refresh has usually landed, so the value then
+      // takes the ordinary path — accepted against the fresh list, or probed, or refused
+      // for a reason that is true. A PARTIAL first write is the one case that outranks
+      // this wording: its own error reports a graph that could not be restored, and that
+      // must propagate undiluted rather than be replaced by "nothing was written".
+      if (refreshJoinAbandoned) {
+        throw refusalFrame(err.partialWrite ? err : new Error(staleComboRefreshBusyMessage()));
       }
       try {
         return withWarning({ set: write(), refreshed: true });

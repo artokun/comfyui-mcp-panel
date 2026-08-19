@@ -88,6 +88,18 @@ export const REFRESH_NODES_EXECUTOR_DEPS = Object.freeze({
   REFRESH_NODES_COMMAND_BUDGET_MS,
 });
 
+/** #1413 — the whole-command deadline `graph_set_widget` takes on its first line. */
+export const SET_WIDGET_COMMAND_BUDGET_MS = readPanelNumber(
+  /const SET_WIDGET_COMMAND_BUDGET_MS = (\d+);/,
+  "the set_widget command budget",
+);
+
+/** #1413 — what a widget write still has to do after the stale-combo refresh, held back. */
+export const SET_WIDGET_POST_REFRESH_RESERVE_MS = readPanelNumber(
+  /const SET_WIDGET_POST_REFRESH_RESERVE_MS = (\d+);/,
+  "the set_widget post-refresh reserve",
+);
+
 export const NODE_DEFS_FETCH_TIMEOUT_MS = readPanelNumber(
   /const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/,
   "the single-call fetch bound",
@@ -177,5 +189,22 @@ export function addNodeCommandBudgetDeps() {
     // a hand-copied sentence here would just be a third place for it to drift.
     addNodeRefreshBusyMessage: (classType) =>
       `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
+  };
+}
+
+/**
+ * #1413 — every module binding the command budget added to `graph_set_widget`, in ONE
+ * place, for the same reason addNodeCommandBudgetDeps exists: harnesses that rebuild that
+ * executor in a synthetic scope throw ReferenceError on a new free identifier, and each
+ * would otherwise grow its own copy of these. The REAL implementations where they exist
+ * (`makeCommandBudget`, and the numbers read from the panel source), so a harness cannot
+ * pass against a value the panel no longer holds.
+ */
+export function setWidgetCommandBudgetDeps() {
+  return {
+    makeCommandBudget,
+    SET_WIDGET_COMMAND_BUDGET_MS,
+    SET_WIDGET_POST_REFRESH_RESERVE_MS,
+    monotonicNow,
   };
 }
