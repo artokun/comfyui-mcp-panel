@@ -23588,8 +23588,11 @@ const PANEL_CSS = `
    leaving a decoding, looping element behind an invisible box. The stub is the
    only thing left, so its own toggle can NOT be hover-revealed: a control the
    user cannot find is a card they cannot get back. */
+/* #1422 — the #1417 failure box sits in the <img>'s slot; without it in this rule it
+   is the one surface that ignores the toggle, showing stub AND failure box at once. */
 .cmcp-imgcard.cmcp-media-collapsed > img,
-.cmcp-imgcard.cmcp-media-collapsed > .cmcp-video-holder { display: none; }
+.cmcp-imgcard.cmcp-media-collapsed > .cmcp-video-holder,
+.cmcp-imgcard.cmcp-media-collapsed > .cmcp-imgcard-failed { display: none; }
 .cmcp-imgcard.cmcp-media-collapsed .cmcp-media-expand { display: none; }
 .cmcp-imgcard.cmcp-media-collapsed .cmcp-media-collapse { opacity: 1; }
 .cmcp-media-stub {
@@ -28680,7 +28683,23 @@ function buildPanel() {
         v.play?.().catch(() => {}); // opened by a user gesture; ignore if blocked
       } else {
         const img = document.createElement("img");
-        img.src = it.url; img.alt = it.caption || "media"; img.className = "cmcp-lightbox-el";
+        img.alt = it.caption || "media"; img.className = "cmcp-lightbox-el";
+        // #1422 — the stage must SAY SO too. Stepping onto an item the browser cannot
+        // load (a failed card stays in collectChatGallery, so prev/next reaches it)
+        // used to blank the stage with nothing on screen and nothing in the log — the
+        // #1417 failure, one click in. An <img> needs no teardown guard, unlike
+        // mountHolderVideo (#909): render() clears the stage with innerHTML="" and
+        // detaching an <img> does not fire error — only a src change does. The one
+        // guard that IS needed: render() may have moved on before an async error
+        // lands, and a verdict for an item no longer on stage must not paint.
+        // offerOpen:false — the bar already has Open original aimed at this item.
+        const onStageFail = () => {
+          if (img.parentNode !== mediaWrap) return; // render() moved on
+          paintImageFailure(img, it.url, { offerOpen: false });
+        };
+        img.addEventListener("error", onStageFail);
+        img.addEventListener("load", () => { if (img.naturalWidth === 0) onStageFail(); });
+        img.src = it.url;
         mediaWrap.appendChild(img);
       }
       caption.textContent = it.caption || "";
@@ -28927,7 +28946,11 @@ function buildPanel() {
   // also knows how to open a data: URL. `replaceWith` removes the dead <img> and with
   // it the card's click-to-lightbox target, which would only open the same undecodable
   // source one size larger.
-  function paintImageFailure(img, url) {
+  //
+  // #1422 — the same paint serves the lightbox stage, with `offerOpen: false`: the bar
+  // already carries an Open-original button aimed at the current item, so a second one
+  // inside the stage would be a duplicate.
+  function paintImageFailure(img, url, { offerOpen = true } = {}) {
     if (img._cmcpFailed) return; // error followed by a 0-size load must not paint twice
     img._cmcpFailed = true;
     const box = document.createElement("div");
@@ -28938,13 +28961,16 @@ function buildPanel() {
       "color:var(--p-text-muted-color,#a1a1aa);font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);";
     const label = document.createElement("div");
     label.textContent = tr("panel.this_image_could_not_be_loaded", "This image could not be loaded.");
-    const open = document.createElement("button");
-    open.type = "button";
-    open.className = "cmcp-lightbox-open";
-    open.textContent = tr("panel.open_original", "Open original");
-    open.title = tr("panel.open_in_a_new_browser_tab", "Open in a new browser tab");
-    open.addEventListener("click", (e) => { e.stopPropagation(); openMediaUrl(url); });
-    box.append(label, open);
+    box.appendChild(label);
+    if (offerOpen) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "cmcp-lightbox-open";
+      open.textContent = tr("panel.open_original", "Open original");
+      open.title = tr("panel.open_in_a_new_browser_tab", "Open in a new browser tab");
+      open.addEventListener("click", (e) => { e.stopPropagation(); openMediaUrl(url); });
+      box.appendChild(open);
+    }
     img.replaceWith(box);
   }
 

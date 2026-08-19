@@ -339,10 +339,15 @@ test("collapse state is applied at paint time so a replayed card comes back hidd
 });
 
 test("collapsed cards hide the media element itself, and hide the ⛶ with it", () => {
-  assert.match(PANEL, /\.cmcp-imgcard\.cmcp-media-collapsed > img[\s\S]{0,120}display: none/);
+  // The rule gained a third selector in #1422: `.cmcp-imgcard-failed` (the #1417
+  // failure box) sits in the <img>'s slot, so a failed card must obey the toggle too.
+  // `{ display: none; }` now closes the GROUPED rule, so each selector is pinned
+  // individually rather than as `selector { display: none; }` pairs.
+  assert.match(PANEL, /\.cmcp-imgcard\.cmcp-media-collapsed > img[\s\S]{0,200}display: none/);
+  assert.match(PANEL, /\.cmcp-imgcard\.cmcp-media-collapsed > \.cmcp-video-holder,/);
   assert.match(
     PANEL,
-    /\.cmcp-imgcard\.cmcp-media-collapsed > \.cmcp-video-holder \{ display: none; \}/,
+    /\.cmcp-imgcard\.cmcp-media-collapsed > \.cmcp-imgcard-failed \{ display: none; \}/,
   );
   assert.match(
     PANEL,

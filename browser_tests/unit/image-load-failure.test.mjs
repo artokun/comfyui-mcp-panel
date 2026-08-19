@@ -15,13 +15,18 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+const FAILURE_DEF = "function paintImageFailure(img, url, { offerOpen = true } = {}) {";
 const paint = src.slice(
   src.indexOf("function paintImage(url, name) {"),
-  src.indexOf("function paintImageFailure(img, url) {"),
+  src.indexOf(FAILURE_DEF),
 );
 const failure = src.slice(
-  src.indexOf("function paintImageFailure(img, url) {"),
+  src.indexOf(FAILURE_DEF),
   src.indexOf("function videoObserver() {"),
+);
+const lightbox = src.slice(
+  src.indexOf("function openMediaLightbox(items, startIndex) {"),
+  src.indexOf("function openLightboxFromCard(card) {"),
 );
 
 test("#1417: the image card observes a load failure at all", () => {
@@ -65,4 +70,47 @@ test("#1417: error followed by a 0-size load must not paint twice", () => {
   // Both events can fire for one failure; the guard keeps the card to one message.
   assert.match(failure, /if \(img\._cmcpFailed\) return;/, "the double-fire guard must exist");
   assert.match(failure, /img\._cmcpFailed = true;/, "the failure must be recorded");
+});
+
+// #1422 — two gaps of the same class survived #1417: the lightbox stage was still a
+// silent blank (a failed card stays in collectChatGallery, so prev/next lands on it),
+// and a failed card ignored the collapse toggle (the stylesheet hid `> img`, not the
+// box that replaced it). Both measured in Chromium against merged main.
+
+test("#1422: the lightbox stage observes a load failure", () => {
+  assert.ok(lightbox.length > 0, "openMediaLightbox must exist");
+  assert.match(lightbox, /addEventListener\("error"/, "an undecodable stage must be observed");
+  assert.match(lightbox, /naturalWidth === 0/, "the zero-size decode route applies here too");
+});
+
+test("#1422: the stage reuses the card's failure paint", () => {
+  assert.match(lightbox, /paintImageFailure\(img, it\.url/, "one painter, one wording");
+  assert.match(lightbox, /offerOpen: false/, "the bar already has Open original — no duplicate");
+  assert.match(failure, /offerOpen = true/, "the card keeps its own Open-original button");
+});
+
+test("#1422: a verdict for an item the stage moved on from must not paint", () => {
+  // render() clears the stage with innerHTML="" and detaching an <img> does not fire
+  // error, so no video-style teardown guard is needed — but an async error CAN land
+  // after prev/next moved to another item, and that verdict belongs to a stage that
+  // no longer shows it.
+  assert.match(lightbox, /img\.parentNode !== mediaWrap/, "the stale-stage guard must exist");
+});
+
+test("#1422: the stage listeners attach before src, as the card's do", () => {
+  const errAt = lightbox.indexOf('addEventListener("error"');
+  const srcAt = lightbox.indexOf("img.src = it.url;");
+  assert.ok(errAt > -1 && srcAt > -1, "both statements must exist");
+  assert.ok(errAt < srcAt, "setting src first would race a cache-instant failure");
+});
+
+test("#1422: a collapsed card hides the failure box too", () => {
+  // The box sits in the <img>'s slot as a direct child of the card; the collapse rule
+  // that hid `> img` and `> .cmcp-video-holder` must name it or the one failed card in
+  // the log shows the stub AND the failure box at once.
+  assert.match(
+    src,
+    /\.cmcp-imgcard\.cmcp-media-collapsed > \.cmcp-imgcard-failed \{ display: none; \}/,
+    "the failure box must obey the collapse toggle",
+  );
 });
