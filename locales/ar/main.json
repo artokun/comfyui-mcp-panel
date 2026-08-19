@@ -1011,6 +1011,7 @@
       "thinking_tokens": "جارٍ التفكير… ({tokens} رمز)",
       "this_affects_every_workflow_and_open_comfyui": "يؤثر هذا على كل سير عمل وكل تبويب ComfyUI مفتوح. ولا يمكن التراجع عنه. أما مسارات سير عملك وهوياتها الثابتة فلن تُحذف.",
       "this_browser_can_t_play_this_video": "لا يستطيع هذا المتصفح تشغيل صيغة هذا الفيديو. أعد ترميزه بصيغة H.264 (yuv420p) أو WebM.",
+      "this_image_could_not_be_loaded": "تعذّر تحميل هذه الصورة.",
       "this_video_could_not_be_loaded": "تعذّر تحميل هذا الفيديو.",
       "thorough": "شامل",
       "timed_out": "انتهت المهلة",

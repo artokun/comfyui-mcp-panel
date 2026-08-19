@@ -23602,6 +23602,22 @@ const PANEL_CSS = `
 .cmcp-imgcard.cmcp-media-collapsed .cmcp-media-stub { display: flex; }
 /* The stub already names the file — a caption under it would say it twice. */
 .cmcp-imgcard.cmcp-media-collapsed .cmcp-media-caption { display: none; }
+/* #1417 — the visible failure state an image card gets when the browser cannot
+   load it. Collapsed hides it with the picture, so a hidden card is one stub
+   whether or not its media arrived. */
+.cmcp-media-failed {
+  display: grid; gap: 0.35rem; justify-items: start;
+  padding: 0.6rem 0.7rem; border-radius: 6px; box-sizing: border-box;
+  background: var(--p-content-hover-background, #2a2a2e);
+  border: 1px dashed var(--p-content-border-color, #3f3f46);
+  color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
+}
+.cmcp-media-failed-open {
+  background: none; border: 0; padding: 0; font: inherit; cursor: pointer;
+  text-decoration: underline; color: var(--p-primary-color, #60a5fa);
+}
+.cmcp-imgcard.cmcp-media-collapsed > .cmcp-media-failed { display: none; }
 .cmcp-media-stub:hover { color: var(--p-text-color, #fafafa); border-color: var(--p-primary-color, #60a5fa); }
 .cmcp-media-stub-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Audio cards (#710) — a real <audio controls> player, and a link card for a
@@ -28681,6 +28697,10 @@ function buildPanel() {
       } else {
         const img = document.createElement("img");
         img.src = it.url; img.alt = it.caption || "media"; img.className = "cmcp-lightbox-el";
+        // #1417 — the chat card says so, and so does the stage. Otherwise prev/next onto
+        // a picture the browser cannot load is the same blank the report is about, one
+        // click further in. `offerOpen:false` — the bar below already has that button.
+        img.addEventListener("error", () => paintImageLoadFailure(mediaWrap, img, { url: it.url, offerOpen: false }));
         mediaWrap.appendChild(img);
       }
       caption.textContent = it.caption || "";
@@ -28876,6 +28896,60 @@ function buildPanel() {
     apply(mediaCollapse.isCollapsed(url));
   }
 
+  /**
+   * #1417 — SAY SO when the browser cannot load an image.
+   *
+   * `panel_show_media` answers for the DOM dispatch, not for the browser's fetch and
+   * decode. The report was an 18 MB, 2048x2048, 16-bit PNG handed over as a ComfyUI
+   * `/view` REFERENCE: the tool replied `ok:true, painted:3, unrenderable:[]`, its own
+   * probe fetched the reference from the orchestrator and passed, and the user saw
+   * nothing at all. Their next message was "where is the image". This is the video
+   * decode message of #909 for the other half of the media pipeline.
+   *
+   * IT CLAIMS NO CAUSE. `<video>` exposes `error.code`, so #909 could offer a re-encode
+   * only for MEDIA_ERR_SRC_NOT_SUPPORTED; an `<img>` error event carries nothing at all
+   * — a 404, HTML served in place of the bytes, a refused decode and an out-of-memory
+   * image are one indistinguishable event. So it says what is true (this did not load),
+   * and offers the one thing the panel can still do about it: open the original, where
+   * the browser gets to show its own failure and the file can be saved.
+   *
+   * IT NAMES NOTHING EITHER. The caption underneath already carries the agent's own
+   * caption/filename (`composeShowMediaReply` falls back to `item.filename`), and the
+   * notice is inserted where the picture was — directly above it. Repeating the name
+   * inside the box would print it twice on every failed card.
+   *
+   * IT REPLACES THE ELEMENT rather than annotating around it: a broken `<img>` paints
+   * the browser's own placeholder glyph or an empty box, and leaving that next to the
+   * message is the ambiguity the report is about.
+   */
+  function paintImageLoadFailure(container, img, { url, offerOpen = true } = {}) {
+    // A TEARDOWN FIRES THIS TOO. The lightbox empties `mediaWrap` on every step, so an
+    // error arriving after the element left says nothing about what is on screen now.
+    // The same test makes a second dispatch on an already-replaced image a no-op.
+    if (!container || !img || img.parentNode !== container) return;
+    // Land where the picture was, so the notice sits above the caption rather than
+    // below it. `insertBefore(node, null)` appends, which is the right answer when the
+    // image was the last child.
+    const at = img.nextSibling;
+    img.remove();
+    const box = document.createElement("div");
+    box.className = "cmcp-media-failed";
+    const line = document.createElement("div");
+    line.textContent = tr("panel.this_image_could_not_be_loaded", "This image could not be loaded.");
+    box.appendChild(line);
+    // The lightbox bar already carries an "Open original" button; a second one inside
+    // the stage would be the same control twice.
+    if (offerOpen && url) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "cmcp-media-failed-open";
+      open.textContent = tr("panel.open_original", "Open original");
+      open.addEventListener("click", (e) => { e.stopPropagation(); openMediaUrl(url); });
+      box.appendChild(open);
+    }
+    container.insertBefore(box, at);
+  }
+
   function paintImage(url, name) {
     // Coerce the caption at the painter boundary — a structured/persisted caption
     // must never render (or re-persist) as "[object Object]", live OR on replay (#276).
@@ -28893,6 +28967,9 @@ function buildPanel() {
     // and the card would never actually hide (#818). `.cmcp-imgcard > img` sets it.
     img.style.cssText = "max-width:100%;border-radius:6px;cursor:zoom-in;";
     img.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
+    // #1417 — a picture that never arrives must not be blank space. Attached before the
+    // element is in the log, which is safe: the event is dispatched from a later task.
+    img.addEventListener("error", () => paintImageLoadFailure(card, img, { url }));
     card.appendChild(img);
     attachMediaCollapse(card, { url, kind: "image", name, tools });
     if (name) {
