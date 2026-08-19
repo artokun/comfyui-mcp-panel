@@ -72,6 +72,7 @@ test("MUTATIONS are still mutations — the guard is not weakened for writes", (
     "graph_unpack_subgraph",
     "graph_enter_subgraph",
     "graph_exit_subgraph",
+    "graph_configure_app_mode",
   ]) {
     assert.equal(graphCommandMayMutateWorkflow(cmd), true, cmd);
     assert.equal(graphCommandBindingBar(cmd).requireDirtyMutationBinding, true, cmd);
