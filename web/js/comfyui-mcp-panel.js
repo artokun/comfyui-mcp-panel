@@ -4041,10 +4041,14 @@ function establishedWorkflowReplyIdentity(wf) {
 function activeWorkflowUuidForOpenReply(target, activeSnapshot) {
   // Do not accept a workflow-service reference captured before workflow_open's
   // awaits: a reconnect can replace/rebind that service while the old instance
-  // still reports `target` as active. Read the panel's CURRENT binding at reply
-  // emission, then require object and routing identity to agree.
-  const active = activeWorkflowRef();
-  if (!target || active !== target) return null;
+  // still reports `target` as active. The caller takes ONE observation of the
+  // live active workflow at reply emission and this helper MUST use that same
+  // object. Re-reading the live binding here would pair a uuid decided against a
+  // later observation with binding fields decided against the snapshot — the
+  // internally contradictory diagnostics #887/#716 exist to prevent. Omit rather
+  // than guess when the snapshot is missing (#1014).
+  const active = activeSnapshot;
+  if (!target || !active || active !== target) return null;
   const activeIdentity = establishedWorkflowReplyIdentity(active);
   const targetIdentity = establishedWorkflowReplyIdentity(target);
   if (!activeIdentity || !targetIdentity || activeIdentity.routingKey !== targetIdentity.routingKey) return null;

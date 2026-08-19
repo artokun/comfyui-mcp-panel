@@ -983,6 +983,16 @@ test("#716 wiring: post-open and active workflow responses carry the live instan
     "the binding report must use the shared snapshot, not read the active workflow again",
   );
   assert.match(open, /activeWorkflowUuid \? \{ workflow_uuid: activeWorkflowUuid \} : \{\}/);
+  // #1014 — the callee must CONSUME that snapshot. The call-site match above is
+  // not enough: a helper that re-reads the live binding discards the argument
+  // and the suite still goes green. Code-only so a comment cannot fake it.
+  const helperCode = stripComments(namedFunctionSource(src, "activeWorkflowUuidForOpenReply") || "");
+  assert.match(helperCode, /\bactiveSnapshot\b/, "the helper must read the snapshot it is passed");
+  assert.doesNotMatch(
+    helperCode,
+    /activeWorkflowRef\s*\(/,
+    "the helper must not take a second live read of the active workflow",
+  );
 });
 
 test("#716 P1: service rebind during workflow_open omits the former target UUID", () => {
@@ -1017,7 +1027,11 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
     savedWorkflowHandle,
   );
 
-  assert.equal(replyUuid(openedTarget), "11111111-1111-4111-8111-111111111111", "the normal completed open reports its actual active tab");
+  assert.equal(
+    replyUuid(openedTarget, openedTarget),
+    "11111111-1111-4111-8111-111111111111",
+    "the normal completed open reports its actual active tab",
+  );
   // workflow_open has retained its old local `s`, but a reconnect/rebind has
   // replaced the service before the final reply. The old service could still
   // report A; the actual binding now says B. Returning target.uuid here would
@@ -1025,8 +1039,73 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
   const staleService = currentService;
   currentService = { activeWorkflow: otherActive };
   assert.equal(staleService.activeWorkflow, openedTarget, "the pre-await service still looks like the opened target");
-  assert.equal(replyUuid(openedTarget), null, "the re-bound live service omits the stale reply UUID and leaves the MCP fence unchanged");
-  assert.equal(replyUuid(otherActive), "22222222-2222-4222-8222-222222222222", "the same helper still reports the actual active tab");
+  assert.equal(
+    replyUuid(openedTarget, otherActive),
+    null,
+    "the re-bound live service omits the stale reply UUID and leaves the MCP fence unchanged",
+  );
+  assert.equal(
+    replyUuid(otherActive, otherActive),
+    "22222222-2222-4222-8222-222222222222",
+    "the same helper still reports the actual active tab",
+  );
+});
+
+test("#1014: open-reply uuid is decided against the shared snapshot, not a second live read", () => {
+  // The park on #1014 measured that `activeWorkflowUuidForOpenReply` declared
+  // `activeSnapshot` and then re-read the live binding. The call-site wiring
+  // test could only see that the snapshot was PASSED; it could not see that
+  // the callee discarded it. A live re-read after any await would pair a uuid
+  // decided against one observation with binding fields decided against another.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  assert.ok(pathSource && canonicalUuidSource && identitySource && helperSource, "the reply identity check must live in the shipped panel source");
+
+  const openedTarget = { isPersisted: true, isTemporary: false, path: "workflows/a.json" };
+  const otherActive = { isPersisted: true, isTemporary: false, path: "workflows/b.json" };
+  const workflowUuids = new WeakMap([
+    [openedTarget, "11111111-1111-4111-8111-111111111111"],
+    [otherActive, "22222222-2222-4222-8222-222222222222"],
+  ]);
+  let liveReads = 0;
+  let currentService = { activeWorkflow: otherActive };
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "workflowObjectUuid",
+    "savedWorkflowHandle",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => {
+      liveReads += 1;
+      return currentService.activeWorkflow;
+    },
+    (wf) => workflowUuids.get(wf),
+    savedWorkflowHandle,
+  );
+
+  // Snapshot says A (the opened target). A live re-read would see B and omit.
+  // Using the snapshot keeps the uuid aligned with the binding fields the
+  // caller derived from the same observation.
+  assert.equal(
+    replyUuid(openedTarget, openedTarget),
+    "11111111-1111-4111-8111-111111111111",
+    "a matching snapshot publishes even when a later live read would see a different tab",
+  );
+  // Snapshot says B, target is A. A live re-read of A would publish A's uuid
+  // and contradict the binding report that observed B.
+  currentService = { activeWorkflow: openedTarget };
+  assert.equal(
+    replyUuid(openedTarget, otherActive),
+    null,
+    "a mismatched snapshot omits even when a later live read would see the target",
+  );
+  // No snapshot at all — fail closed. The discarded-argument helper used to
+  // succeed here by re-reading.
+  assert.equal(replyUuid(openedTarget), null, "a missing snapshot omits rather than guessing from a second live read");
+  assert.equal(liveReads, 0, "the helper must not consult the live binding at all");
 });
 
 test("#716 P1: service rebind during workflow_list reports only the current active UUID", () => {
@@ -1093,7 +1172,7 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   // Execute the actual shipped reply helper against a truthy but malformed
   // binding. It must be an observation only: no tmp routing id and no UUID can
   // be initialized while deciding whether to publish the response field.
-  assert.equal(replyUuid(malformedActive), null);
+  assert.equal(replyUuid(malformedActive, malformedActive), null);
   assert.equal(workflowUuids.has(malformedActive), false, "must not mint an ephemeral workflow UUID");
 });
 
@@ -1146,7 +1225,7 @@ test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", (
   );
 
   // The FENCE uuid is published — the canonical live-object value, not the handle.
-  assert.equal(replyUuid(temporaryActive), "33333333-3333-4333-8333-333333333333");
+  assert.equal(replyUuid(temporaryActive, temporaryActive), "33333333-3333-4333-8333-333333333333");
 });
 
 test("#760: an unsaved canvas with NO established uuid still publishes nothing (#716 holds)", () => {
@@ -1176,7 +1255,7 @@ test("#760: an unsaved canvas with NO established uuid still publishes nothing (
     },
   );
 
-  assert.equal(replyUuid(unestablished), null);
+  assert.equal(replyUuid(unestablished, unestablished), null);
   // …and it bailed BEFORE reaching the handle, so nothing was minted on the way.
   assert.equal(tabIdCalls, 0, "an unestablished object must not even ask for a routing handle");
 });
@@ -1202,7 +1281,7 @@ test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
     (wf) => `tmp:${String(!!wf)}`,
   );
 
-  assert.equal(replyUuid(temporaryActive), null);
+  assert.equal(replyUuid(temporaryActive, temporaryActive), null);
 });
 
 test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
@@ -1236,6 +1315,6 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
 
   for (const workflow of [invalidVersion, invalidVariant, uppercase]) {
     active = workflow;
-    assert.equal(replyUuid(workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
+    assert.equal(replyUuid(workflow, workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
   }
 });
