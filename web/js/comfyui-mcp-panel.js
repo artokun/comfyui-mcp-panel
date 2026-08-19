@@ -15187,6 +15187,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // edits (or was edited during `openWorkflow`) already reads clean. That erased signal
     // is what would authorize the destructive re-read to discard the user's work.
     const wasDirty = !!target.isModified;
+    // #1215 — WHO was active before this open moves the pointer, snapshotted now:
+    // `s.openWorkflow(target)` below changes the answer. The #874 canvas capture's
+    // own precondition is "the mounted canvas is the target's", and on an UNTAGGED
+    // root — where describeLiveCanvasBinding can only answer "unknown" — whether
+    // the pointer just moved is the only evidence left bearing on that. Consumed
+    // by the capture gate below.
+    const activeBefore = activeWorkflowRef();
     // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
     // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
     // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
@@ -15213,6 +15220,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // identity, so the repaint below reproduced a graph that is not this workflow's.
     // Drives the disk re-read that corrects it, and is disclosed either way.
     let sourceForeign = false;
+    // #1215 — set at the capture gate: the active pointer was on a DIFFERENT
+    // workflow when this open began (or unreadable). Drives both the gate itself
+    // and the untagged-source disclosure below.
+    let pointerMovedThisOpen = false;
+    // #1215 — the weaker sibling of sourceForeign: the repaint source carried NO
+    // resolvable workflow identity at all, on an open that switched tabs. The
+    // tag-based classification answers "unknown" for it, which warns nobody —
+    // and that is the configuration the wrong-canvas reports arrived in.
+    let sourceUnproven = false;
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -15344,33 +15360,46 @@ const GRAPH_TOOL_EXECUTORS = {
           // concurrency — which is what the reports without a reconnect storm were telling
           // us all along.
           //
-          // The guard is the #708 oracle, already used for exactly this hazard on the SAVE
-          // path: a positive, durable identity conflict refuses the capture. "unknown"
-          // still captures, so older frontends and first observation behave as before —
-          // this only ever REMOVES a capture we can prove is reading someone else's canvas.
-          // When the target IS already the painted tab (the `wasOpen`/already-current case
-          // #874 was written for) the binding is "bound" and the capture runs unchanged.
-          // The question is ONLY "is the mounted canvas this target's graph?", and it must
-          // be answered with POSITIVE proof, because BOTH answers can destroy data:
-          // capturing a foreign canvas writes another workflow's graph into this one
-          // (#968), and skipping a legitimate capture lets the repaint below overwrite live
-          // canvas work with a stale snapshot (#874). There is no safe default, so this
-          // never guesses from "did the pointer move" — that says nothing about who owns
-          // the canvas, and an earlier draft of this fix got both directions wrong with it
-          // (codex).
+          // The guard has two tiers, because "unknown" turned out to be two different
+          // questions (#1215).
           //
-          //   "bound"   — the root graph carries THIS workflow's identity tag. Proof. This
-          //               is the already-current case #874 was written for, and it captures
-          //               exactly as it always did.
+          // Tier one is the #708 oracle, already used for exactly this hazard on the SAVE
+          // path, and its POSITIVE answers decide outright:
+          //
+          //   "bound"   — the root graph carries THIS workflow's identity tag. Proof.
+          //               Capture whether or not the pointer moved: the mounted canvas is
+          //               the target's, so the capture can only preserve its node-written
+          //               values (#874) — including the #604/#708 divergence, where the
+          //               target's canvas was already mounted under another tab's pointer.
           //   "foreign" — the root positively belongs to another workflow. Skip.
-          //   "unknown" — cannot tell. CAPTURES, exactly as it does today.
           //
-          // "unknown" deliberately changes NOTHING, which is the same discipline #708
-          // already applies with this oracle: only a POSITIVE, durable identity conflict
-          // refuses, so older frontends and a first observation behave as they always have.
-          // This fix therefore closes the provable case and introduces no regression
-          // anywhere else — it can only ever REMOVE a capture proven to be reading another
-          // workflow's canvas.
+          // Tier two fires only when the tag is silent ("unknown": an untagged root, an
+          // older frontend, a first observation). There, "did the pointer move during
+          // this open?" DOES bear on the capture's own precondition — "the mounted canvas
+          // is the target's" — because on a switch `openWorkflow` moved the pointer and
+          // repainted NOTHING (that is why this function repaints at all), so the mounted
+          // canvas is the PREVIOUS tab's, and an untagged capture can only serialize that
+          // tab's graph into the target's state. That is the poisoning #968/#1089/#1215
+          // reported: the repaint below then faithfully reproduced it, and every proof
+          // part passed against the poisoned source. When the pointer did NOT move — the
+          // already-current case #874 was written for — the mounted canvas is the
+          // target's own and the capture runs exactly as it always has.
+          //
+          //   "unknown" + pointer moved   — SKIP. The capture's precondition is unmet.
+          //   "unknown" + already current — capture, as before.
+          //
+          // The codex note this replaces said the guard "never guesses from 'did the
+          // pointer move'", and an earlier draft did get both directions wrong with it —
+          // by letting pointer movement decide a REFUSAL, where it proves nothing about
+          // who owns the canvas. That objection stands in that direction, and nothing
+          // here refuses on it. Here the snapshot gates only the capture, a WRITE whose
+          // correctness already depends on the canvas being the target's, and whose
+          // absence is the safe direction on a switch: the cost of a skipped legitimate
+          // capture is confined to the #604/#708 divergence (node-written values that
+          // only ever existed on the mounted canvas are reverted by the repaint below),
+          // while the cost of a wrong one is another tab's whole graph imported into
+          // this workflow's state under this workflow's identity. BOTH answers can still
+          // destroy data, so the tier-one positives keep deciding outright.
           //
           // I tried to do better and the attempt was unsound, so it is recorded here rather
           // than repeated: falling back to node-id OVERLAP against the target's own state
@@ -15381,13 +15410,17 @@ const GRAPH_TOOL_EXECUTORS = {
           // reading (DISJOINT is suspicious) and its own header warns that a refusal built
           // on it would be a wrong-graph refusal of its own (codex).
           //
-          // KNOWN RESIDUAL, stated rather than hidden: an UNTAGGED root graph is still
-          // captured, so the contamination remains reachable on a canvas the panel has
-          // never stamped. Closing that needs ownership evidence that does not exist yet —
-          // not a guess dressed as one — and the reported cases are saved, panel-driven
-          // workflows whose roots carry the tag, which is the case this does close.
+          // WHAT REMAINS OPEN, stated rather than hidden: a target state poisoned BEFORE
+          // this gate existed stays poisoned — it is untagged, so
+          // describeRepaintSourceBinding below can only answer "unknown" for it, which is
+          // why the reply discloses that combination (unproven_source_state) instead of
+          // reporting a bland success.
           const captureBinding = describeLiveCanvasBinding(target);
-          if (captureBinding !== "foreign") {
+          pointerMovedThisOpen = !sameWorkflowObject(activeBefore, target);
+          if (
+            captureBinding === "bound" ||
+            (captureBinding !== "foreign" && !pointerMovedThisOpen)
+          ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
               // otherwise have `activeState` read before the capture landed — the silent
@@ -15462,6 +15495,19 @@ const GRAPH_TOOL_EXECUTORS = {
                   return Array.isArray(openNow) && openNow.some((w) => sameWorkflowObject(w, owner));
                 },
               }) === "foreign";
+            // #1215 — the UNTAGGED arm the tag-based classification cannot reach.
+            // `describeRepaintSourceBinding` answers "unknown" for a source carrying
+            // no resolvable identity, and "unknown" warns nobody — yet an untagged
+            // source on a tab-switching open is exactly the configuration the
+            // wrong-canvas reports arrived in (a state poisoned before the capture
+            // gate above existed reads identically to the target's own untagged
+            // state; the panel cannot separate them, and says so rather than
+            // guessing). Disclosure only, like its foreign sibling — refusing here
+            // strands the pointer the same way (see the #1089 note above).
+            sourceUnproven =
+              !sourceForeign &&
+              pointerMovedThisOpen &&
+              typeof st?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] !== "string";
             // A graph shape is not ownership proof: two dirty tabs can have the same
             // nodes, and the normal read guard intentionally stays inconclusive for a
             // dirty, un-stamped root. Stamp THIS target's live-object identity into the
@@ -16076,6 +16122,36 @@ const GRAPH_TOOL_EXECUTORS = {
                 "Could not verify whether the on-disk file still matches this tab (disk read unavailable or slower than its deadline). Treat the canvas as possibly stale; call panel_load_workflow to be sure you have the on-disk version.",
             }
           : {}),
+      // #1215 — the weaker sibling of foreign_source_state. The repaint source
+      // carried NO resolvable identity (untagged), and this open switched tabs, so
+      // the panel cannot show the canvas it just painted was built from this
+      // workflow's own state — and before the capture gate above existed, an
+      // untagged capture on a switch serialized the PREVIOUS tab's canvas into
+      // this tab's state, which then repainted faithfully with every proof part
+      // passing. The two read identically now, so this discloses instead of
+      // claiming. Its own key, like the foreign one: a caller can hit it with
+      // neither `stale` nor `canvas_file_divergence` firing.
+      ...(sourceUnproven
+        ? {
+            unproven_source_state:
+              "VERIFY THE GRAPH BEFORE EDITING. This open switched tabs, and the in-memory " +
+              "state the canvas was repainted from carried NO workflow identity the panel " +
+              "could check — untagged states read the same whether they are this workflow's " +
+              "own or a previous tab's graph left behind by an older capture path, and the " +
+              "panel observed no evidence separating the two. Everything else on this reply " +
+              "(path, filename, workflow_uuid, modified) is TRUE of the tab and says nothing " +
+              "about which graph the state held, which is why none of it warned. Read the " +
+              "graph (panel_graph_outline / panel_query_graph) and compare it against what " +
+              "you expect this workflow to contain. MAY be, not IS: an untagged state is the " +
+              "normal case for a workflow the panel has never stamped, so this fires on good " +
+              "opens too, and only your comparison separates them. If it IS the wrong graph, " +
+              "panel_load_workflow with this workflow's path loads the saved copy from disk. " +
+              "Weigh that: it REPLACES the canvas, and the tab's modified flag does not " +
+              "account for values a NODE wrote rather than you (#874) — so preserve anything " +
+              "you need to a NEW path first: a plain save would write the canvas over the " +
+              "workflow you asked for, because the active identity already names that one.",
+          }
+        : {}),
     };
   },
 
