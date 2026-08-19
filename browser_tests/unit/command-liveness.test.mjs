@@ -866,7 +866,41 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
   // retires a prompt permanently on exactly that answer), and answering `false` would leave
   // the tray showing failed while the queued copy still goes out on the next advertisement.
   assert.equal(holdSites.length, 1, "only the session-ordered control frames may be queued");
-  assert.equal(staleReads.length, 2, "…but BOTH send paths must consult the route first");
+  // …but BOTH send paths must consult the route first.
+  //
+  // #1389 — asserted by WHERE each read is, not by how many there are. A third reader now
+  // exists and it is deliberately not a send path: the workflow poll's drift check
+  // re-advertises on the same staleness these two refuse on, because nothing else did and
+  // a held frame may never cause an advertisement (holdForRoute's own rule). Counting to
+  // two would have made adding that reader look like a regression, and raising the count
+  // to three would have stopped saying anything about where the reads are — which is the
+  // whole claim. So: exactly one read inside each send path, and every other read
+  // accounted for by name.
+  const rangeOfMember = (name) => {
+    const at = src.indexOf(`    ${name}(`);
+    assert.notEqual(at, -1, `could not locate ${name}`);
+    const end = src.indexOf("\n    },", at);
+    assert.notEqual(end, -1, `could not bound ${name}`);
+    return [at, end];
+  };
+  const driftStart = src.indexOf("workflowIdentityDriftRehello = () => {");
+  assert.notEqual(driftStart, -1, "the drift re-advertise hook must exist");
+  const driftEnd = src.indexOf("\n  };", driftStart);
+  assert.notEqual(driftEnd, -1, "could not bound the drift re-advertise hook");
+  const readerRanges = {
+    sendUserMessage: rangeOfMember("sendUserMessage"),
+    sendFrame: rangeOfMember("sendFrame"),
+    workflowIdentityDriftRehello: [driftStart, driftEnd],
+  };
+  const readers = staleReads.map((pos) => {
+    const hit = Object.entries(readerRanges).find(([, [a, b]]) => pos >= a && pos <= b);
+    return hit ? hit[0] : `UNACCOUNTED@${pos}`;
+  });
+  assert.deepEqual(
+    readers.slice().sort(),
+    ["sendFrame", "sendUserMessage", "workflowIdentityDriftRehello"],
+    "both send paths must consult the route, and only the drift re-advertise may also read it",
+  );
   assert.equal(
     (src.match(/^\s*function advertisedRouteIsStale\(\) \{/gm) || []).length,
     1,

@@ -1066,34 +1066,50 @@ test("#1389 an unreadable fence identity does not credit a convergence the panel
   // read is not evidence that re-advertising works here, and crediting it would hand a
   // later genuine drift a bound this tick never earned — the same rule #1209 states for
   // its own early exit, kept now that the exit has become a branch.
-  let readable = false;
-  const dbl = helloDouble(() => "uuid-A");
+  let readable = true;
+  let routeStale = true;
+  const dbl = helloDouble(() => "uuid-B");
   const h = buildDriftHook({
     sendHello: () => dbl.send(),
     stableUuid: () => {
       if (!readable) throw new Error("no workflow service");
       return "uuid-B";
     },
-    routeStale: () => true,
+    routeStale: () => routeStale,
+    routeId: () => "route-B",
   });
+  // An orchestrator that takes the hellos and republishes nothing, so the drift never
+  // clears on its own and the bound is the only thing that stops the poll.
   dbl.harness = { advertise: () => {} };
   h.advertise("uuid-A");
 
-  // Spend the bound on a route that never converges…
-  readable = true;
+  // Spend the bound on a drift that never converges…
   for (let i = 0; i < 12; i += 1) {
     h.drift();
     await settle();
   }
-  assert.equal(dbl.calls.length, 3, "the stuck route exhausted the bound");
+  assert.equal(dbl.calls.length, 3, "the stuck drift exhausted the bound");
 
-  // …then go unreadable. That is not convergence, so it must not hand the bound back.
+  // …then reach the no-drift branch with the fence identity UNREADABLE. Nothing
+  // disagrees, but nothing was observed to agree either: an exception is not a
+  // convergence, and crediting it would hand the bound straight back.
   readable = false;
+  routeStale = false;
   for (let i = 0; i < 12; i += 1) {
     h.drift();
     await settle();
   }
-  assert.equal(dbl.calls.length, 3, "an unreadable identity replenished nothing");
+  assert.equal(dbl.calls.length, 3, "an unreadable identity is not convergence");
+
+  // The bound really is still spent — a genuine drift returning finds nothing left,
+  // exactly as it would have without the unreadable ticks in between.
+  readable = true;
+  routeStale = true;
+  for (let i = 0; i < 12; i += 1) {
+    h.drift();
+    await settle();
+  }
+  assert.equal(dbl.calls.length, 3, "an unreadable tick replenished nothing");
 });
 
 test("#1389 nothing advertised yet is still not a drift, even with the route half added", async () => {
