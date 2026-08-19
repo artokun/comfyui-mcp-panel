@@ -894,6 +894,7 @@
       "thinking_tokens": "Réflexion… ({tokens} tokens)",
       "this_affects_every_workflow_and_open_comfyui": "Cela concerne tous les workflows et tous les onglets ComfyUI ouverts. C'est irréversible. Vos workflows et leurs identités stables ne seront pas supprimés.",
       "this_browser_can_t_play_this_video": "Ce navigateur ne sait pas lire le format de cette vidéo. Réencodez-la en H.264 (yuv420p) ou en WebM.",
+      "this_image_could_not_be_loaded": "Cette image n'a pas pu être chargée.",
       "this_video_could_not_be_loaded": "Cette vidéo n'a pas pu être chargée.",
       "thorough": "approfondi",
       "timed_out": "délai dépassé",

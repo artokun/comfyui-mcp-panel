@@ -894,6 +894,7 @@
       "thinking_tokens": "Pensando… ({tokens} tokens)",
       "this_affects_every_workflow_and_open_comfyui": "Isso afeta todos os workflows e todas as abas abertas do ComfyUI. Não dá para desfazer. Os seus workflows e as identidades estáveis deles não serão apagados.",
       "this_browser_can_t_play_this_video": "Este navegador não reproduz o formato deste vídeo. Reconverta para H.264 (yuv420p) ou WebM.",
+      "this_image_could_not_be_loaded": "Não foi possível carregar esta imagem.",
       "this_video_could_not_be_loaded": "Não foi possível carregar este vídeo.",
       "thorough": "minucioso",
       "timed_out": "tempo esgotado",

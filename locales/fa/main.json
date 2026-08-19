@@ -855,6 +855,7 @@
       "thinking_tokens": "در حال اندیشیدن… ({tokens} توکن)",
       "this_affects_every_workflow_and_open_comfyui": "این کار روی همهٔ گردش‌کارها و زبانه‌های باز ComfyUI اثر می‌گذارد. برگشت‌پذیر نیست. گردش‌کارهای شما و هویت پایدارشان حذف نمی‌شوند.",
       "this_browser_can_t_play_this_video": "این مرورگر نمی‌تواند قالب این ویدیو را پخش کند. آن را به H.264 (yuv420p) یا WebM تبدیل کنید.",
+      "this_image_could_not_be_loaded": "این تصویر بارگذاری نشد.",
       "this_video_could_not_be_loaded": "این ویدیو بارگذاری نشد.",
       "thorough": "دقیق",
       "timed_out": "مهلت تمام شد",

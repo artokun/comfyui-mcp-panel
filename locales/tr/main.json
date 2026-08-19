@@ -855,6 +855,7 @@
       "thinking_tokens": "Düşünüyor… ({tokens} token)",
       "this_affects_every_workflow_and_open_comfyui": "Bu, her iş akışını ve açık her ComfyUI sekmesini etkiler. Geri alınamaz. İş akışlarınız ve onların kalıcı kimlikleri silinmez.",
       "this_browser_can_t_play_this_video": "Bu tarayıcı bu videonun biçimini oynatamıyor. H.264 (yuv420p) ya da WebM olarak yeniden kodlayın.",
+      "this_image_could_not_be_loaded": "Bu görsel yüklenemedi.",
       "this_video_could_not_be_loaded": "Bu video yüklenemedi.",
       "thorough": "titiz",
       "timed_out": "süre doldu",

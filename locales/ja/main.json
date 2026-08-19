@@ -816,6 +816,7 @@
       "thinking_tokens": "思考中…（{tokens} トークン）",
       "this_affects_every_workflow_and_open_comfyui": "これはすべてのワークフローと、開いているすべての ComfyUI タブに影響し、取り消せません。ワークフローとその識別情報が削除されることはありません。",
       "this_browser_can_t_play_this_video": "このブラウザーはこの動画の形式を再生できません。H.264（yuv420p）または WebM に再エンコードしてください。",
+      "this_image_could_not_be_loaded": "この画像を読み込めませんでした。",
       "this_video_could_not_be_loaded": "この動画を読み込めませんでした。",
       "thorough": "入念",
       "timed_out": "タイムアウト",
