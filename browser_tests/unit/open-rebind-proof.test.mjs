@@ -782,11 +782,13 @@ test("#702: the fence note is ONLY on the content-unverified outcome", () => {
 //
 // Nothing was fooled. All four parts of resolveOpenRebindVerdict are taken
 // against the root the loader produced, so each was a true statement about a
-// poisoned SOURCE state. #968 closed the writer this repo owns and recorded
-// that an untagged root is still captured; a state already poisoned still
-// reaches the load, and the load is what makes it durable — it stamps the
-// target's identity onto the foreign graph, so a later save writes it to the
-// target's file.
+// poisoned SOURCE state. #968 closed the writer this repo owns, and #1215 then
+// closed the untagged-root residual it had recorded — the capture now runs on
+// an untagged root only when the pointer never moved. A state poisoned BEFORE
+// that gate still reaches the load, and the load is what makes it durable — it
+// stamps the target's identity onto the foreign graph, so a later save writes
+// it to the target's file — which is why the open reply carries the
+// `unproven_source_state` disclosure for exactly that combination.
 // ---------------------------------------------------------------------------
 
 /** A serialized tab state carrying the panel's durable workflow tag. */
@@ -1106,4 +1108,76 @@ test("#1089 follow-up: the foreign-source finding rides a FAILING open too", () 
     /sourceForeign/,
     "describeOpenRebindOutcome must stay ignorant of the source-state question",
   );
+});
+
+// ---------------------------------------------------------------------------
+// #1215 — the untagged-root capture residual #968 recorded is CLOSED.
+//
+// The reporter's sequence: panel_open_workflow on another tab reported
+// opened/main, active_matches_target:true and the target's uuid — and
+// panel_graph_outline then read an unrelated default canvas with zero shared
+// node ids. The open's own checkState() capture had serialized the
+// still-mounted PREVIOUS tab's untagged canvas into the target's tracker, and
+// the repaint faithfully reproduced it; every proof part passed against the
+// poisoned source. "unknown" from describeLiveCanvasBinding no longer admits
+// the capture when the pointer just moved, and an untagged repaint source on a
+// switched tab is disclosed rather than silently served.
+// ---------------------------------------------------------------------------
+
+test("#1215: the pre-switch active workflow is snapshotted BEFORE the pointer moves", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const snapAt = src.indexOf("const activeBefore = activeWorkflowRef();");
+  const switchAt = src.indexOf("await s.openWorkflow(target);");
+  assert.notEqual(snapAt, -1, "the pre-switch pointer must be snapshotted");
+  assert.notEqual(switchAt, -1);
+  assert.ok(snapAt < switchAt, "…before openWorkflow, which is what changes the answer");
+});
+
+test("#1215: an untagged root admits the capture only in the already-current case", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const gateAt = src.indexOf("const captureBinding = describeLiveCanvasBinding(target);");
+  assert.notEqual(gateAt, -1, "the capture must stay gated on the live-canvas binding");
+  const captureAt = src.indexOf("checkState?.()", gateAt);
+  assert.notEqual(captureAt, -1);
+  const gate = src.slice(gateAt, captureAt);
+  assert.match(gate, /pointerMovedThisOpen = !sameWorkflowObject\(activeBefore, target\)/);
+  // "bound" captures outright — the #604/#708 divergence's node-written values
+  // ride on it — and a proven-foreign root still skips. "unknown" no longer
+  // suffices on its own: the pointer must NOT have moved.
+  assert.match(gate, /captureBinding === "bound"/);
+  assert.match(gate, /captureBinding !== "foreign" && !pointerMovedThisOpen/);
+  assert.doesNotMatch(
+    gate,
+    /if \(captureBinding !== "foreign"\)/,
+    '"not foreign" alone was the #1215 hole — it must not come back',
+  );
+});
+
+test("#1215: an untagged repaint source on a tab switch is DISCLOSED, not silently served", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  // The finding needs all three: the pointer moved, the tag-based
+  // classification did not fire, and the source state carries no workflow_uuid.
+  const classifyAt = src.indexOf('}) === "foreign"');
+  assert.notEqual(classifyAt, -1, "the tag-based classification must still be there");
+  const at = src.indexOf("sourceUnproven =", classifyAt);
+  assert.notEqual(at, -1, "the untagged-source finding must be computed alongside it");
+  const stmt = src.slice(at, src.indexOf(";", at));
+  assert.match(stmt, /!sourceForeign/, "the foreign finding keeps its own, stronger disclosure");
+  assert.match(stmt, /pointerMovedThisOpen/);
+  assert.match(stmt, /WORKFLOW_UUID_FIELD/, "the untagged question is about the source state's own stamp");
+  // …and it must reach the reply on its own key, like foreign_source_state.
+  const keyAt = src.indexOf("unproven_source_state:");
+  assert.notEqual(keyAt, -1, "the caller must be told the source carried no resolvable identity");
+  assert.match(src.slice(Math.max(0, keyAt - 200), keyAt), /\.\.\.\(sourceUnproven/);
+  const block = src.slice(keyAt, src.indexOf("\n    };", keyAt));
+  assert.match(block, /VERIFY THE GRAPH BEFORE EDITING/);
+  assert.match(block, /panel_graph_outline/, "it must name the read that lets the caller check");
+  // MAY, not IS — an untagged state is the normal case for a workflow the panel
+  // never stamped, so a definite claim would warn on every such open.
+  assert.match(block, /MAY be, not IS/);
+  assert.match(block, /is TRUE\b/, "the other fields are true, not broken");
+  assert.match(block, /panel_load_workflow/);
+  assert.match(block, /REPLACES the canvas/);
+  assert.match(block, /#874/, "the node-written-values trap must be named");
+  assert.match(block, /a plain save/, "…and the save-over-the-target trap");
 });
