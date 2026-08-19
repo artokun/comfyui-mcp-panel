@@ -61,6 +61,9 @@ export const NO_PROMPT_KEY = "__no_prompt__";
  *   with the FULL batch for that prompt_id, the correct start→finish duration,
  *   and the prompt_id (`key`/`promptId`) so the delivery can be attributed.
  * @param {() => number} [opts.now]        Clock (injectable for tests).
+ * @param {(promptId:(string|null)) => void} [opts.onRepend]  Called after
+ *   markUndelivered() re-pends a run, so the wiring can re-arm recovery
+ *   (the safety sweep) for the ledger the run just re-entered (#1739).
  * @param {(fn:Function, ms:number) => any} [opts.setTimer]
  * @param {(t:any) => void} [opts.clearTimer]
  * @param {number} [opts.debounceMs]       Orphan-flush / re-arm interval (default 1500).
@@ -71,6 +74,13 @@ export function createRunCompletionTracker({
   onReconcileError,
   onReconcileInterrupted,
   onReconcileGiveUp,
+  // comfyui-mcp#1739 — called AFTER markUndelivered() has re-pended a run. The
+  // pending ledger is recovery-driven (reconnect edges + the safety sweep, which
+  // SELF-DISARMS the moment it observes an empty ledger), and flush() retires a
+  // run OPTIMISTICALLY before the async compose+send resolves — so a send that
+  // then fails re-pends a run into a ledger nothing is sweeping. This hook is how
+  // the wiring re-arms recovery; without it the re-pend is a silent dead end.
+  onRepend,
   now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (t) => clearTimeout(t),
@@ -931,6 +941,10 @@ export function createRunCompletionTracker({
       // 120s backstop can't be what decides isSettled() for it (#585).
       clearAwaitingDelivery(k);
       if (!pending.has(k)) pending.set(k, { promptId: k, at: now() }); // normalized string id
+      // comfyui-mcp#1739 — the re-pend is only half the recovery: the ledger the
+      // run just re-entered may have NO sweeper left (the safety sweep disarmed
+      // during the optimistic-retire window), so notify the wiring to re-arm it.
+      if (typeof onRepend === "function") onRepend(promptIdOf(k));
     },
 
     /**
