@@ -53,7 +53,9 @@ function setup(nodes, { rootGraph = null, safeRemove = null } = {}) {
   const fn = realRemove(
     () => ({ graph, rootGraph: rootGraph ?? graph }),
     (_graph, id) => {
-      const node = live.find((n) => n.id === id) ?? nodes.find((n) => n.id === id);
+      // Match shipped resolveNode: a miss on the LIVE graph throws. Falling back
+      // to the original `nodes` list would make a gone id look retryable.
+      const node = live.find((n) => n.id === id);
       if (!node) throw new Error(`No node with id ${id}`);
       return node;
     },
@@ -137,10 +139,14 @@ test("#841 a mid-batch survivor is named, not reported as a clean success", () =
   const a = makeNode(1);
   const b = makeNode(2);
   const c = makeNode(3);
+  const skipped = new Set();
   const { fn, events, graph } = setup([a, b, c], {
     safeRemove: (g, node) => {
       events.push(`remove:${node.id}`);
-      if (node.id === 2) return; // no-op: stays on the graph
+      if (node.id === 2 && !skipped.has(2)) {
+        skipped.add(2);
+        return; // first attempt no-op: stays on the graph
+      }
       const i = g._nodes.indexOf(node);
       if (i !== -1) g._nodes.splice(i, 1);
     },
@@ -148,10 +154,27 @@ test("#841 a mid-batch survivor is named, not reported as a clean success", () =
   const result = fn({ node_ids: [1, 2, 3] });
   assert.deepEqual(result.removed.map((n) => n.id), [1, 3]);
   assert.deepEqual(result.not_removed.map((n) => n.id), [2]);
+  assert.match(result.not_removed[0].reason, /could not be removed/);
   assert.match(result.warning, /STILL on the canvas/);
   assert.match(result.warning, /panel_graph_outline/);
+  assert.match(result.warning, /not_removed/);
+  assert.match(result.warning, /refuses the whole list/);
+  assert.doesNotMatch(result.warning, /no-op/i);
   assert.deepEqual(graph._nodes.map((n) => n.id), [2]);
   assert.deepEqual(events.filter((e) => e === "before" || e === "after"), ["before", "after"]);
+
+  // The leftover is only actionable as `not_removed`. Including an id that
+  // already left throws before the envelope opens and never retries 2.
+  const eventsAfterPartial = events.length;
+  assert.throws(() => fn({ node_ids: [1, 2, 3] }), /No node with id 1/);
+  assert.throws(() => fn({ node_ids: [1, 3] }), /No node with id 1/);
+  assert.deepEqual(graph._nodes.map((n) => n.id), [2]);
+  assert.equal(events.length, eventsAfterPartial);
+
+  const retry = fn({ node_ids: [2] });
+  assert.deepEqual(retry.removed.map((n) => n.id), [2]);
+  assert.equal(retry.not_removed, undefined);
+  assert.deepEqual(graph._nodes.map((n) => n.id), []);
 });
 
 test("#841 a one-id node_ids call still shares the batch reply shape", () => {

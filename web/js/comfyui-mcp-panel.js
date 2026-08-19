@@ -12825,7 +12825,9 @@ const GRAPH_TOOL_EXECUTORS = {
   // form. Known-upfront failures (missing, duplicate, ignore_remove) refuse
   // the whole list before the envelope opens. A mid-batch no-op or throw is
   // reported as a precise leftover manifest rather than rolled back — link
-  // teardown is not reversible from here.
+  // teardown is not reversible from here. The only useful retry of that
+  // leftover is `not_removed`: resolveNode throws on a miss, so including an
+  // id that already left refuses the whole list.
   graph_remove_node(args = {}) {
     const { graph, rootGraph } = getGraphCtx();
     const own = (key) => Object.prototype.hasOwnProperty.call(args, key);
@@ -12949,8 +12951,8 @@ const GRAPH_TOOL_EXECUTORS = {
         `${stayed.length} of ${nodes.length} node(s) are STILL on the canvas. ` +
         `Removed: ${gone.map((g) => g.node.id).join(", ")}. ` +
         `Still present: ${stayed.map((s) => s.node.id).join(", ")}. ` +
-        `Re-read it (panel_graph_outline) before retrying: a second call for the ids that left is a no-op; ` +
-        `a second call for the ids that stayed may still fail.`;
+        `Re-read it (panel_graph_outline) before retrying. Retry ONLY the not_removed ids — ` +
+        `including an id that already left throws and refuses the whole list.`;
     }
     return result;
   },
