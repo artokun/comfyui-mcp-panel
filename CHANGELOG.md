@@ -6,8 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.12] - 2026-08-19
+
 ### Fixed
 - graph mutations notify the visible canvas (and bump the frontend layout revision) so a successful edit/remove actually appears, not only in panel_graph_outline (#1443)
+
+### Fixed
+- editing a node keeps compact geometry instead of inflating it (#1446)
+- graph edits appear on the canvas, not only in the outline (#1445)
+
 
 ## [0.15.11] - 2026-08-19
 
