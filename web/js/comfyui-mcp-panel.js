@@ -6026,13 +6026,31 @@ async function groundUnsavedWorkflow() {
   }
 }
 
-/** Resolve on the next animation frame (or a short timer when rAF is absent) so
- *  a just-loaded graph can finish rendering / capturing state before we read it. */
+/** Resolve on the next animation frame so a just-loaded graph can finish
+ *  rendering / capturing state before we read it.
+ *
+ *  comfyui-mcp-panel#1264 — the frame wait must be BOUNDED. rAF does not fire in
+ *  a hidden or occluded tab (and can be starved on a busy one), so an unbounded
+ *  await here never settles in exactly the state a backgrounded ComfyUI tab is
+ *  in. This runs inside workflow_open's switch/reload section holding a reload
+ *  STEP (beginWorkflowReloadStep), and a step in flight is deliberately immune
+ *  to the section's 30s age-out — that immunity exists so a genuine load cannot
+ *  lose the fence mid-write, but a render frame is not a load: starving it
+ *  latched the fence forever, refused every graph/workflow command, and left
+ *  the open's reply (and its open receipt) undeliverable until a manual page
+ *  reload. Falling back to a timer after NEXT_FRAME_FALLBACK_MS degrades the
+ *  wait to "the capture may not have landed yet", which is the LOUD direction —
+ *  the tab keeps a cosmetic modified flag rather than wedging the bridge. */
+const NEXT_FRAME_FALLBACK_MS = 2000;
 function nextFrame() {
-  return new Promise((resolve) => {
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
-    else setTimeout(resolve, 16);
-  });
+  return withTimeout(
+    new Promise((resolve) => {
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+      else setTimeout(resolve, 16);
+    }),
+    NEXT_FRAME_FALLBACK_MS,
+    () => undefined,
+  );
 }
 
 /** Opening a workflow must NOT leave it flagged modified. ComfyUI re-serializes
