@@ -6,9 +6,14 @@ import {
   ChatHistoryStore,
   boundShadowBytes,
   mergeHistorySnapshots,
+  measurePanelShadowBytes,
+  probeDraftIndexWrite,
+  writeLocalStorageItem,
   CHAT_HISTORY_SCHEMA,
   CHAT_HISTORY_DB_VERSION,
   CHAT_HISTORY_LEGACY_STORE,
+  CHAT_HISTORY_LOCAL_SNAPSHOT_KEY,
+  COMFY_DRAFT_INDEX_KEY,
 } from "../../web/js/lib/chat-history-store.js";
 
 // #861 — the panel's localStorage shadow kept every `legacyShadow` thread in full,
@@ -1243,4 +1248,171 @@ test("a metadata-only version never displaces the payload-carrier for the same h
     { nodes: [] },
     "…and the payload obviously survives the canonical-last order too",
   );
+});
+
+// ── #1305: an already-full origin still cannot take ComfyUI's draft ─────────
+//
+// #861 bounded the snapshot. #1318 stripped version payloads so the bound can
+// hold. The symptom came back on 0.14.44 anyway, because neither change
+// reclaimed a PREVIOUSLY over-budget origin:
+//
+//   1. Browsers measure remaining quota BEFORE freeing the value being
+//      replaced, so setItem of a smaller snapshot still throws.
+//   2. The two-key shadow (threads + historyMeta) is a second full copy of
+//      the same cache, so even a successful bound left ~3MB of a 5MB origin
+//      in panel keys and Comfy.Workflow.DraftIndex.v2 had nothing left.
+//
+// Do not clear the origin. Only panel keys that IndexedDB already holds may
+// move, and a failed draft probe is a recovery message — not a wipe.
+
+const THREADS_KEY = "comfyui-mcp.panel.threads";
+const META_KEY = "comfyui-mcp.panel.historyMeta";
+const SNAPSHOT_KEY = CHAT_HISTORY_LOCAL_SNAPSHOT_KEY;
+
+function createQuotaStorage(maxBytes) {
+  const map = new Map();
+  const used = () => {
+    let n = 0;
+    for (const value of map.values()) n += String(value).length;
+    return n;
+  };
+  class QuotaExceededError extends Error {
+    constructor() {
+      super("The quota has been exceeded.");
+      this.name = "QuotaExceededError";
+      this.code = 22;
+    }
+  }
+  return {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => {
+      const next = String(value);
+      // Chrome: remaining is checked BEFORE the old value is freed. A rewrite
+      // of a smaller payload still throws when leftover headroom is smaller
+      // than the new payload — the #1305 failure.
+      if (used() + next.length > maxBytes) throw new QuotaExceededError();
+      map.set(key, next);
+    },
+    removeItem: (key) => { map.delete(key); },
+    _map: map,
+    _used: used,
+  };
+}
+
+const preV1157Thread = (id, ts, size) => ({
+  id,
+  ts,
+  updatedAt: ts,
+  msgs: [{ id: `${id}-m`, role: "user", text: "x".repeat(size) }],
+});
+
+test("writeLocalStorageItem shrinks a key the naive setItem cannot replace", () => {
+  const storage = createQuotaStorage(1000);
+  storage.setItem("k", "a".repeat(800));
+  assert.throws(() => storage.setItem("k", "b".repeat(400)), { name: "QuotaExceededError" });
+  assert.equal(writeLocalStorageItem(storage, "k", "b".repeat(400)), true);
+  assert.equal(storage.getItem("k").length, 400);
+});
+
+test("an over-budget pre-0.11.57 shadow leaves room for Comfy.Workflow.DraftIndex.v2", async () => {
+  // The upgrade state the issue names: a 0.11.56-or-older install wrote every
+  // transcript into `threads` + `historyMeta`, no historySnapshot, no bound.
+  // Origin ~5MB. Panel keys already ~3.6MB. ComfyUI then cannot persist the
+  // draft index, and #861's post-bound setItem cannot replace the huge key.
+  const quota = 5_000_000;
+  const storage = createQuotaStorage(quota);
+  const threads = Array.from({ length: 24 }, (_, i) => preV1157Thread(`old-${i}`, i + 1, 140_000));
+  storage.setItem(THREADS_KEY, JSON.stringify(threads));
+  storage.setItem(META_KEY, JSON.stringify({ updatedAt: 1 }));
+  const foreign = { keep: true, pad: "c".repeat(200) };
+  storage.setItem("Comfy.Workflow.OpenTabs", JSON.stringify(foreign));
+  assert.equal(storage.getItem(SNAPSHOT_KEY), null, "precondition: pre-0.11.57 has no atomic snapshot");
+  assert.ok(storage._used() > 3_000_000, "precondition: the origin is already over the panel budget");
+
+  const indexedDb = createFakeIndexedDb();
+  const failures = [];
+  const store = new ChatHistoryStore({
+    storage,
+    indexedDb,
+    maxShadowBytes: 1_500_000,
+    onPersistenceError: (failure) => failures.push(failure),
+  });
+  const local = store.readLocal();
+  store.persist(local.threads, local.meta);
+  assert.equal(await store.flush(), true, "history must persist");
+  assert.equal(store.lastDraftHeadroomOk, true, "the draft-index probe must succeed after reclaim");
+  assert.ok(
+    store.lastShadowBytes <= 1_500_000,
+    `panel shadow still over budget: ${store.lastShadowBytes}`,
+  );
+  assert.deepEqual(
+    JSON.parse(storage.getItem("Comfy.Workflow.OpenTabs")),
+    foreign,
+    "a non-panel origin key must not be rewritten",
+  );
+
+  const draft = JSON.stringify({
+    version: 2,
+    workflows: { wf: { modified: true, pad: "d".repeat(80_000) } },
+  });
+  storage.setItem(COMFY_DRAFT_INDEX_KEY, draft);
+  assert.equal(storage.getItem(COMFY_DRAFT_INDEX_KEY), draft, "ComfyUI must be able to persist the draft index");
+
+  const reader = new ChatHistoryStore({ storage, indexedDb });
+  const read = await reader.readCanonical();
+  const ids = new Set((read?.threads || []).map((t) => t.id));
+  for (const thread of threads) {
+    assert.ok(ids.has(thread.id), `${thread.id} must still be recoverable from IndexedDB`);
+  }
+  assert.equal(
+    failures.some((f) => f.code === "history-draft-headroom-unavailable"),
+    false,
+    "a successful reclaim must not nag",
+  );
+});
+
+test("without IndexedDB the over-budget shadow is not deleted to make room", async () => {
+  const storage = createQuotaStorage(5_000_000);
+  const threads = Array.from({ length: 10 }, (_, i) => preV1157Thread(`only-${i}`, i + 1, 80_000));
+  storage.setItem(THREADS_KEY, JSON.stringify(threads));
+  storage.setItem(META_KEY, JSON.stringify({}));
+  const store = new ChatHistoryStore({ storage, indexedDb: null, maxShadowBytes: 1_500_000 });
+  store.persist(threads, {});
+  await store.flush();
+  const kept = JSON.parse(storage.getItem(THREADS_KEY) || "[]");
+  assert.equal(kept.length, 10, "an only-copy transcript must stay when nothing is durable");
+});
+
+test("a draft probe that still fails is reported, and foreign keys stay", async () => {
+  // After the panel has done everything it is allowed to, some other occupant
+  // of the origin can still leave no room. The recovery is a message, not a
+  // wipe of site data.
+  const storage = createQuotaStorage(2_000_000);
+  const hog = "z".repeat(1_999_996);
+  storage.setItem("other-extension.blob", hog);
+  const indexedDb = createFakeIndexedDb();
+  const failures = [];
+  const store = new ChatHistoryStore({
+    storage,
+    indexedDb,
+    maxShadowBytes: 50_000,
+    onPersistenceError: (failure) => failures.push(failure),
+  });
+  store.persist([preV1157Thread("T0", 1, 40)], {});
+  assert.equal(await store.flush(), true, "history itself persisted");
+  assert.equal(store.lastDraftHeadroomOk, false);
+  assert.ok(
+    failures.some((f) => f.code === "history-draft-headroom-unavailable"),
+    "the remaining failure must be named",
+  );
+  assert.equal(storage.getItem("other-extension.blob"), hog, "foreign origin data is not cleared");
+  assert.equal(probeDraftIndexWrite(storage), false);
+});
+
+test("measurePanelShadowBytes sums only the keys it is given", () => {
+  const storage = createMemoryStorage();
+  storage.setItem(THREADS_KEY, "aaa");
+  storage.setItem(META_KEY, "bb");
+  storage.setItem("ignore-me", "cccccccc");
+  assert.equal(measurePanelShadowBytes(storage, [THREADS_KEY, META_KEY]), 5);
 });

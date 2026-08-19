@@ -407,6 +407,7 @@
       "comfyui_agent_panel_your_agent_session_s": "ComfyUI Agent Panel — your agent session's window into this graph",
       "comfyui_is_back_reconnecting_the_agent": "ComfyUI is back — reconnecting the agent…",
       "comfyui_is_restarting": "ComfyUI is restarting…",
+      "comfyui_still_cannot_save_workflow_drafts": "ComfyUI still cannot save workflow drafts. The panel already moved chat history out of this site's shared browser storage — nothing was deleted. Do not clear this site's data: that would drop your open workflow tabs. Free space from other extensions on this origin, then save or send once to retry.",
       "coming_soon": " — coming soon",
       "command_copied": "Command copied.",
       "command_failed": "{cmd} failed",

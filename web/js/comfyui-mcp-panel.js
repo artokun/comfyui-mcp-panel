@@ -26535,6 +26535,14 @@ function buildPanel() {
                 "Some legacy chat history has no IndexedDB copy and could not be saved to localStorage. " +
                   "Keep this tab open, free browser storage, then send or edit once to retry.",
               )
+            : failure?.code === "history-draft-headroom-unavailable"
+              ? tr(
+                  "panel.comfyui_still_cannot_save_workflow_drafts",
+                  "ComfyUI still cannot save workflow drafts. The panel already moved chat history out of " +
+                    "this site's shared browser storage — nothing was deleted. Do not clear this site's data: " +
+                    "that would drop your open workflow tabs. Free space from other extensions on this origin, " +
+                    "then save or send once to retry.",
+                )
             : tr(
                 "panel.chat_history_could_not_be_saved_keep",
                 "Chat history could not be saved. Keep this tab open, free browser storage, then send or edit once to retry.",
