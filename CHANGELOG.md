@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- converting a video-gen workflow to an app exposes LTX 2.3/Director, Wan, Bernini, Hunyuan and Easy-Use Media generation parameters, treats LoadVideo/VHS/easy loadVideo as video inputs, and collects SaveVideo/VHS_VideoCombine/easy saveVideo as video outputs (including ComfyUI history `videos[]`) instead of classifying them as stills (#428)
 - `/record-skill` snapshots the open graph as a reusable skill file (`skills/<name>/SKILL.md`) so the agent can rebuild it (#350)
 
 ### Fixed

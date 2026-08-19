@@ -4,7 +4,14 @@
 // AppsClient HTTP surface (mocked fetch).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { AppBuilder, AppsClient } from "../../web/js/cmcp-apps.js";
+
+const APPS_UI = readFileSync(
+  fileURLToPath(new URL("../../web/js/cmcp-apps-ui.js", import.meta.url)),
+  "utf8",
+);
 
 // ── APP-mode config import ──────────────────────────────────────────────────
 
@@ -78,6 +85,72 @@ test("heuristicAppMode: object-valued widget entries (link markers) are skipped"
   assert.ok(cfg.inputs.every((i) => i.positional));
 });
 
+// ── #428 video-gen family convert ───────────────────────────────────────────
+
+test("heuristicAppMode: an LTX graph exposes Director/ImgToVideo params and a video output", () => {
+  const cfg = AppBuilder.heuristicAppMode([
+    { id: 6, type: "CLIPTextEncode", widgets_values: ["a cat walks through a forest"] },
+    { id: 12, type: "EmptyLTXVLatentVideo", widgets_values: [768, 512, 97, 1] },
+    { id: 14, type: "LTXVImgToVideo", widgets_values: [768, 512, 97, 1, 0.6] },
+    { id: 20, type: "LTXDirector", widgets_values: ['{"segments":[]}'] },
+    { id: 21, type: "LTXVConditioning", widgets_values: [25] },
+    { id: 30, type: "SaveVideo", widgets_values: ["ltx"] },
+  ]);
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 14), "LTXVImgToVideo must be an app input");
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 20), "LTXDirector must be an app input");
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 21), "LTXVConditioning must be an app input");
+  const save = cfg.outputs.find((o) => o.nodeId === 30);
+  assert.equal(save?.kind, "video");
+  assert.deepEqual(AppBuilder.videoFamiliesOnGraph([
+    { type: "LTXDirector" },
+    { type: "EmptyLTXVLatentVideo" },
+  ]), ["ltx"]);
+});
+
+test("heuristicAppMode: a Wan graph exposes sampler/FLF params and VHS_VideoCombine as video", () => {
+  const cfg = AppBuilder.heuristicAppMode([
+    { id: 1, type: "WanVideoTextEncode", widgets_values: ["walks", "static"] },
+    { id: 2, type: "WanVideoSampler", widgets_values: [4, 1, 5] },
+    { id: 3, type: "WanFirstLastFrameToVideo", widgets_values: [480, 720, 81] },
+    { id: 9, type: "VHS_VideoCombine", widgets_values: [16, "wan"] },
+  ]);
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 1));
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 2));
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 3));
+  const out = cfg.outputs.find((o) => o.nodeId === 9);
+  assert.equal(out?.kind, "video");
+  assert.ok(AppBuilder.videoFamiliesOnGraph([{ type: "WanVideoSampler" }]).includes("wan"));
+});
+
+test("heuristicAppMode: Bernini r2v, Hunyuan, and Easy-Use Media become video-gen app endpoints", () => {
+  const cfg = AppBuilder.heuristicAppMode([
+    { id: 5, type: "Bernini r2v", widgets_values: [24, 1.0] },
+    { id: 7, type: "HunyuanImageToVideo", widgets_values: [848, 480, 129] },
+    { id: 8, type: "easy loadVideo", widgets_values: ["clip.mp4"] },
+    { id: 12, type: "easy saveVideo", widgets_values: ["easy"] },
+  ]);
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 5), "Bernini r2v must be an app input");
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 7), "HunyuanImageToVideo must be an app input");
+  assert.ok(cfg.inputs.some((i) => i.nodeId === 8 && i.kind === "video"), "easy loadVideo is a video input");
+  const save = cfg.outputs.find((o) => o.nodeId === 12);
+  assert.equal(save?.kind, "video");
+  const families = AppBuilder.videoFamiliesOnGraph([
+    { type: "Bernini r2v" },
+    { type: "HunyuanImageToVideo" },
+    { type: "easy saveVideo" },
+  ]);
+  assert.deepEqual(families, ["bernini", "hunyuan", "easyuse"]);
+});
+
+test("heuristicAppMode: a still-image graph still reports SaveImage as images", () => {
+  const cfg = AppBuilder.heuristicAppMode([
+    { id: 6, type: "CLIPTextEncode", widgets_values: ["a cat"] },
+    { id: 9, type: "SaveImage", widgets_values: ["ComfyUI"] },
+  ]);
+  assert.equal(cfg.outputs.find((o) => o.nodeId === 9)?.kind, "images");
+  assert.deepEqual(AppBuilder.videoFamiliesOnGraph([{ type: "SaveImage" }]), []);
+});
+
 // ── widget classification ───────────────────────────────────────────────────
 
 test("classifyWidget", () => {
@@ -98,6 +171,34 @@ test("classifyWidget", () => {
   // loader still wins over a seed-ish name; positional (nameless) never seeds.
   assert.equal(AppBuilder.classifyWidget("VAELoader", "vae_name", "v.pt"), "model");
   assert.equal(AppBuilder.classifyWidget("KSampler", "", 42), "number");
+  // #428: video file loaders are video, not model/text. Model loaders in the
+  // Wan wrapper still classify as model (the *Loader rule).
+  assert.equal(AppBuilder.classifyWidget("LoadVideo", "video", "clip.mp4"), "video");
+  assert.equal(AppBuilder.classifyWidget("VHS_LoadVideo", "video", "a.webm"), "video");
+  assert.equal(AppBuilder.classifyWidget("easy loadVideo", "video", "x.mp4"), "video");
+  assert.equal(AppBuilder.classifyWidget("WanVideoModelLoader", "model", "wan.safetensors"), "model");
+});
+
+test("live convert and run UI drive AppBuilder video-gen helpers, not a copy", () => {
+  assert.match(APPS_UI, /AppBuilder\.isInputHint\(/);
+  assert.match(APPS_UI, /AppBuilder\.outputKind\(/);
+  assert.match(APPS_UI, /AppBuilder\.collectRunMedia\(/);
+  assert.match(APPS_UI, /AppBuilder\.isRunVideoRef\(/);
+  assert.match(APPS_UI, /video\/\*/);
+  assert.equal(APPS_UI.includes("INPUT_HINT_TYPES.has"), false);
+});
+
+test("collectRunMedia reads ComfyUI videos[] and isRunVideoRef honours format", () => {
+  const media = AppBuilder.collectRunMedia({
+    images: [{ filename: "still.png" }],
+    gifs: [{ filename: "loop.gif", format: "image/gif" }],
+    videos: [{ filename: "clip.mp4", format: "video/h264-mp4" }, { filename: "clip.mp4", format: "video/h264-mp4" }],
+  });
+  assert.equal(media.length, 3);
+  assert.equal(AppBuilder.isRunVideoRef(media.find((r) => r.filename === "clip.mp4")), true);
+  assert.equal(AppBuilder.isRunVideoRef(media.find((r) => r.filename === "loop.gif")), false);
+  assert.equal(AppBuilder.isRunVideoRef(media.find((r) => r.filename === "still.png")), false);
+  assert.deepEqual(AppBuilder.collectRunMedia(null), []);
 });
 
 // ── dependency scan ─────────────────────────────────────────────────────────

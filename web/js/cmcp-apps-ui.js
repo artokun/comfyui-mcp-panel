@@ -408,22 +408,19 @@ async function draftFromCanvas(getApp) {
   for (const node of liveNodes) {
     const id = Number(node.id);
     if (!Number.isFinite(id)) continue;
-    const isOutput =
-      node.constructor?.nodeData?.output_node === true ||
-      /^(SaveImage|PreviewImage|SaveVideo|SaveAudio|PreviewAudio|ShowText|PreviewAsText)/.test(
-        String(node.type || ""),
-      );
-    if (isOutput) {
+    const nodeType = String(node.type || "");
+    const outputKind = AppBuilder.outputKind(nodeType, node.constructor?.nodeData?.output_node === true);
+    if (outputKind) {
       outputs.push({
         nodeId: id,
-        kind: /^Show|^PreviewAs/.test(String(node.type || "")) ? "text" : "images",
+        kind: outputKind,
         label: `${node.title || node.type} #${id}`,
         checked: true,
       });
       continue;
     }
     const nodeHasImported = [...importedKeys].some((k) => Number(k.split(".")[0]) === id);
-    if (!AppBuilder.INPUT_HINT_TYPES.has(String(node.type || "")) && !nodeHasImported) continue;
+    if (!AppBuilder.isInputHint(nodeType) && !nodeHasImported) continue;
     // Only a CONNECTED widget-input makes a widget link-driven. Modern
     // frontends materialize an input socket (link: null) for EVERY widget —
     // treating mere presence as link-driven excluded every candidate on
@@ -439,7 +436,6 @@ async function draftFromCanvas(getApp) {
       const key = `${id}.${w.name}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const nodeType = String(node.type || "");
       const kind = AppBuilder.classifyWidget(nodeType, w.name, w.value, w.type);
       const opts = w.options || {};
       const num = (x) => (typeof x === "number" && Number.isFinite(x) ? x : undefined);
@@ -1376,10 +1372,10 @@ export function createAppsContent(ctx, shell, opts = {}) {
       const field = el("div", "cmcp-apps-field");
       field.append(el("label", "", input.label || key));
       let getter;
-      if (input.kind === "image") {
+      if (input.kind === "image" || input.kind === "video") {
         const fileInput = document.createElement("input");
         fileInput.type = "file";
-        fileInput.accept = "image/*";
+        fileInput.accept = input.kind === "video" ? "video/*" : "image/*";
         field.append(fileInput);
         // Return the raw File — the RUN path decides where the bytes go
         // (local /upload/image, or the bridge's upload_media → the pod).
@@ -1793,10 +1789,10 @@ export function createAppsContent(ctx, shell, opts = {}) {
       const wanted = new Set((app.appMode?.outputs || []).map((o) => String(o.nodeId)));
       for (const [nodeId, out] of Object.entries(st.outputs || {})) {
         if (wanted.size && !wanted.has(String(nodeId))) continue;
-        const media = [...(out.images || []), ...(out.gifs || [])];
+        const media = AppBuilder.collectRunMedia(out);
         for (const ref of media) {
           const url = viewUrl(ref);
-          const isVideo = /webm|mp4|mov|gif/i.test(ref.filename || "");
+          const isVideo = AppBuilder.isRunVideoRef(ref);
           const m = document.createElement(isVideo ? "video" : "img");
           m.src = url;
           if (isVideo) {
