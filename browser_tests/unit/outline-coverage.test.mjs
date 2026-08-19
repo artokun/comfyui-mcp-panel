@@ -225,9 +225,28 @@ test("#809 the outline's own fixed clips are not left silent", () => {
   assert.match(body, /outlineTitlesClipped\+\+/, "so is the fixed per-title clip");
   assert.match(
     body,
-    /outlineValueClipNote\(outlineClipped, outlineTitlesClipped\)/,
+    /outlineValueClipNote\(outlineClipped, outlineTitlesClipped, outlineClippedNoteIds\)/,
     "and both are reported on the outline itself",
   );
+});
+
+// A bare count of clipped values cannot tell the reader that one of them was on-canvas
+// INSTRUCTIONS (a Note/MarkdownNote holding trigger words) rather than a re-queryable
+// seed — the row's own 60-char clip reads as the whole note. The footer must NAME the
+// note nodes whose text was clipped, and the id list must reset per rung like the
+// counts do, or a lower rung would claim note clips it does not contain.
+test("#1748 clipped NOTE text is named by node id, not folded into the count", () => {
+  const body = outline();
+  assert.match(body, /let outlineClippedNoteIds = \[\];/, "the note-id list exists");
+  assert.match(
+    body,
+    /NOTE_NODE_TYPES\.has\(node\?\.type\) && !outlineClippedNoteIds\.includes\(node\.id\)\s*\)\s*\n?\s*outlineClippedNoteIds\.push\(node\.id\)/,
+    "a clipped value on a Note/MarkdownNote records the node id, deduped",
+  );
+  const assembleStart = body.indexOf("const assemble = (level) => {");
+  assert.notEqual(assembleStart, -1, "assemble() must exist");
+  const assembleBody = body.slice(assembleStart, body.indexOf("// Walk DOWN the ladder"));
+  assert.match(assembleBody, /outlineClippedNoteIds = \[\];/, "the id list resets per rung, inside assemble");
 });
 
 // The footer is PART of the rung. Appending it after the fit test could tip a rung over

@@ -38,6 +38,8 @@ import {
   clipOutlineTitle,
   OUTLINE_TITLE_CAP,
   MAX_CHARS_CEILING,
+  // #1748
+  NOTE_NODE_TYPES,
 } from "../../web/js/lib/graph-read.js";
 
 // ---- #607: link-driven widget detection -----------------------------------
@@ -427,6 +429,33 @@ test("#809 the outline footer covers title clips as well as value clips", () => 
   const both = outlineValueClipNote(2, 3);
   assert.match(both, /2 widget value\(s\) clipped to 60 chars and 3 title\(s\) clipped to 120 chars/);
   assert.match(both, /`max_chars` does not raise/);
+});
+
+test("#1748 the outline footer names NOTE nodes whose text was clipped", () => {
+  // No note ids → byte-identical to the old footer: an unnoted graph pays nothing and
+  // the clause never fires on title-only clips either.
+  assert.equal(outlineValueClipNote(2, 0), outlineValueClipNote(2, 0, []), "no ids, no clause");
+  const noted = outlineValueClipNote(3, 0, [7, 12]);
+  assert.match(noted, /3 widget value\(s\) clipped to 60 chars/);
+  assert.match(noted, /on-canvas note text \(node id\(s\): 7, 12\)/, "names the note nodes");
+  assert.match(noted, /trigger words and usage instructions/, "says WHY a note clip matters");
+  // The remedy that was already there still applies — detail reads the note up to the
+  // fixed per-widget cap.
+  assert.match(noted, /panel_query_graph \{ids:\[…\], fields:'detail'\}/);
+  // The id list is bounded: a graph dense with notes cannot flood the footer (the
+  // footer is part of the measured rung, but an unbounded list would still be noise).
+  const many = outlineValueClipNote(25, 0, Array.from({ length: 30 }, (_, i) => i + 1));
+  assert.match(many, /\+10 more/, "the id list is capped with an explicit remainder");
+  assert.doesNotMatch(many, /\b21\b/, "ids past the cap are not listed");
+});
+
+test("#1748 NOTE_NODE_TYPES is the positive allowlist of on-canvas prose nodes", () => {
+  assert.ok(NOTE_NODE_TYPES.has("Note"));
+  assert.ok(NOTE_NODE_TYPES.has("MarkdownNote"));
+  // A type that merely CONTAINS "note" is not prose-on-canvas by convention — the
+  // footer naming a non-note would send the agent reading instructions that are not.
+  assert.ok(!NOTE_NODE_TYPES.has("NoteToSelf"));
+  assert.ok(!NOTE_NODE_TYPES.has("Reroute"));
 });
 
 test("#809 shown-of-matched is always stated, so 'how much is left' is never guesswork", () => {

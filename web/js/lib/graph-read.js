@@ -33,6 +33,12 @@ export const MAX_CHARS_FLOOR = 500;
 /** Widget values are clipped to this in the `compact` projection (a FIXED cap). */
 export const COMPACT_VALUE_CLIP = 60;
 
+/** #1748: frontend node types whose widget value IS on-canvas prose — the place
+ *  workflow authors put trigger words, download paths and usage instructions. A
+ *  clipped value on one of these is lost instructions, not a re-queryable detail,
+ *  so the outline footer names them instead of folding them into a bare count. */
+export const NOTE_NODE_TYPES = new Set(["Note", "MarkdownNote"]);
+
 /**
  * #809 (codex gate): "raise `X` up to N" is ITSELF a dead retry when the caller is
  * already at N, and "raise `X`" with no ceiling leaves them guessing how far. Both cost
@@ -436,13 +442,25 @@ export function outlineDegradeBanner({ level, nodeCount, groupCount, maxChars })
  *
  * "Read FULL values" would over-promise: panel_query_graph's detail projection has its
  * own fixed 2048-char per-widget cap (codex gate). Say "fuller, up to N".
- */
-export function outlineValueClipNote(valueCount, titleCount = 0) {
+ *
+ * #1748: `noteIds` are the NOTE-node ids (Note/MarkdownNote) whose widget values were
+ * among the clips. A bare count cannot tell the reader that one of the clipped values
+ * was on-canvas INSTRUCTIONS (trigger words, download paths) rather than a seed it can
+ * re-query — and the node row's own 60-char clip reads as the whole note. Naming the
+ * ids turns "N values clipped" into "instructions existed, and here is where". The id
+ * list is bounded so a graph dense with notes cannot flood the footer. */
+export function outlineValueClipNote(valueCount, titleCount = 0, noteIds = []) {
   if (!valueCount && !titleCount) return "";
   const parts = [];
   if (valueCount) parts.push(`${valueCount} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars`);
   if (titleCount) parts.push(`${titleCount} title(s) clipped to ${OUTLINE_TITLE_CAP} chars`);
-  return `\n\n(${parts.join(" and ")} — fixed outline caps that \`max_chars\` does not raise. Read fuller values with panel_query_graph {ids:[…], fields:'detail'}, which caps each value at ${WIDGET_VALUE_CAP} chars.)`;
+  let noteClause = "";
+  if (noteIds.length) {
+    const shown = noteIds.slice(0, 20);
+    const more = noteIds.length - shown.length;
+    noteClause = ` The clipped values include on-canvas note text (node id(s): ${shown.join(", ")}${more ? `, +${more} more` : ""}) — notes are where workflow authors put trigger words and usage instructions; read them before prompting.`;
+  }
+  return `\n\n(${parts.join(" and ")} — fixed outline caps that \`max_chars\` does not raise.${noteClause} Read fuller values with panel_query_graph {ids:[…], fields:'detail'}, which caps each value at ${WIDGET_VALUE_CAP} chars.)`;
 }
 
 /** Group/subgraph titles are user-controlled and unbounded. */
