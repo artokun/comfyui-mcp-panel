@@ -16570,15 +16570,14 @@ const GRAPH_TOOL_EXECUTORS = {
     const outputType = String(outputSlot?.type ?? "*");
     subgraph.beforeChange?.();
     let subgraphOutput;
-    let link;
     let exposeConnectErr = null;
     try {
       subgraphOutput = subgraph.addOutput(outputName, outputType);
       subgraphOutput.label = outputSlot?.label;
-      link =
-        typeof subgraphOutput.connect === "function"
-          ? subgraphOutput.connect(outputSlot, node)
-          : null;
+      // The RETURN value is deliberately not kept: it is no longer the verdict.
+      // The live rail slot is (findLandedRailLink below) — the only reading that
+      // survives a throw, where there IS no return value.
+      if (typeof subgraphOutput.connect === "function") subgraphOutput.connect(outputSlot, node);
     } catch (err) {
       // #1272 — the removeOutput cleanup used to live INSIDE this try, on the
       // `!link` branch only, so a THROW from connect() skipped it and left the
@@ -16613,8 +16612,8 @@ const GRAPH_TOOL_EXECUTORS = {
             ? ` — the frontend threw: ${exposeConnectErr?.message ?? exposeConnectErr}`
             : "") +
           (cleanedUp
-            ? `. The subgraph output slot this call created was removed, so the rail carries no ` +
-            `slot from this call.`
+            ? `. The subgraph output slot this call created was removed, so the rail carries ` +
+              `no slot from this call.`
             : `.`),
       );
     }
@@ -16671,13 +16670,12 @@ const GRAPH_TOOL_EXECUTORS = {
     const inputType = String(inputSlot?.type ?? "*");
     subgraph.beforeChange?.();
     let subgraphInput;
-    let link;
     let exposeConnectErr = null;
     try {
       subgraphInput = subgraph.addInput(inputName, inputType);
       subgraphInput.label = inputSlot?.label;
-      link =
-        typeof subgraphInput.connect === "function" ? subgraphInput.connect(inputSlot, node) : null;
+      // See the output twin: the return value is not the verdict, the rail slot is.
+      if (typeof subgraphInput.connect === "function") subgraphInput.connect(inputSlot, node);
     } catch (err) {
       // #1272 — same leak as the output twin: the removeInput cleanup was inside
       // the try on the `!link` branch, so a throw stranded the slot addInput had
@@ -16707,8 +16705,8 @@ const GRAPH_TOOL_EXECUTORS = {
             ? ` — the frontend threw: ${exposeConnectErr?.message ?? exposeConnectErr}`
             : "") +
           (cleanedUp
-            ? `. The subgraph input slot this call created was removed, so the rail carries no ` +
-            `slot from this call.`
+            ? `. The subgraph input slot this call created was removed, so the rail carries ` +
+              `no slot from this call.`
             : `.`),
       );
     }
