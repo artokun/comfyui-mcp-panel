@@ -294,6 +294,8 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch } = {}) {
   // INSTALLED IS NOT ENTERED. An empty `throws` off a watch the restore never
   // reached is "nobody looked", and it must not read as "nothing threw".
   const graphEntered = graphWatch.entered;
-  if (typeof graphEntered !== "number" || graphEntered < 1) return null;
+  // `>= 1` and not `< 1`: NaN fails every comparison, so a `< 1` test would let it
+  // through as "entered" — the same fold, hiding in an operator.
+  if (typeof graphEntered !== "number" || !(graphEntered >= 1)) return null;
   return nodeFailures.length === 0 && graphThrows.length === 0;
 }

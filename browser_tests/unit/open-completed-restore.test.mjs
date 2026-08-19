@@ -398,12 +398,14 @@ test("panel#1283 an uninstrumentable frontend answers null, never false", () => 
 });
 
 test("panel#1283 the fold is true only when BOTH halves looked and neither saw a throw", () => {
-  assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: { throws: [] } }), true);
+  // `entered: 1` is part of "looked" — see the F1 section at the foot of this file.
+  const watched = (throws) => ({ throws, entered: 1 });
+  assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: watched([]) }), true);
   assert.equal(
-    loadRestoreCompleted({ nodeIsolation: { failures: [{ id: 3 }] }, graphWatch: { throws: [] } }),
+    loadRestoreCompleted({ nodeIsolation: { failures: [{ id: 3 }] }, graphWatch: watched([]) }),
     false,
   );
-  assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: { throws: ["x"] } }), false);
+  assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: watched(["x"]) }), false);
 });
 
 test("panel#1283 both wraps compose: a node throw is contained, the graph throw is not", () => {
@@ -413,6 +415,10 @@ test("panel#1283 both wraps compose: a node throw is contained, the graph throw 
   };
   const nodeIsolation = installNodeConfigureIsolation(LG);
   const graphWatch = installGraphConfigureWatch(LG);
+  // The graph restore runs — so the watch is ENTERED and this is not the un-watched
+  // case the F1 section below is about.
+  assert.equal(LG.LGraph.prototype.configure({ nodes: [] }), "graph-ok");
+  assert.equal(graphWatch.entered, 1);
   // The node throw is swallowed and RECORDED (#1260's contract, unchanged)…
   assert.equal(LG.LGraphNode.prototype.configure({ id: 7, type: "FaceDetailer" }), undefined);
   assert.equal(nodeIsolation.failures.length, 1);
@@ -671,4 +677,200 @@ test("panel#1283 wiring: a node the retry could not heal is still disclosed on t
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
   assert.match(repaint, /retryNodeRestores\(app\?\.graph, containedNodeFailureList\)/);
   assert.match(repaint, /openRestoreFailures = retry\.failed;/);
+});
+
+// ── F1: INSTALLED IS NOT ENTERED (post-merge review of #1358) ────────────────
+
+/**
+ * #1358's own two-states-one-answer fold, one level down from the one it fixed.
+ *
+ * The fold licensed "the restore ran to completion" off two EMPTY records. Empty
+ * means "nothing threw" — or "the wrapper was installed on a method nothing called".
+ * Wrapping a prototype proves the method EXISTS; it proves nothing about whether
+ * this frontend's restore went THROUGH it.
+ *
+ * No test written against the wrappers can see that, because a test that drives a
+ * wrapper always enters it. This fixture deliberately does not: the root graph
+ * carries its OWN `configure` and never calls `super`, which is a frontend
+ * restructure the panel does not control. The abort then happens where nothing is
+ * watching, both records stay empty, and a genuinely partial load is waved through
+ * as "normalization" — precisely the harm #1358 exists to prevent.
+ */
+function frontendWhoseRootBypassesLGraphPrototype() {
+  class LGraphNode {
+    constructor(id, type) {
+      this.id = id;
+      this.type = type;
+      this.widgets_values = ["construction-default"];
+    }
+    configure(info) {
+      this.widgets_values = info.widgets_values;
+      return "node-ok";
+    }
+  }
+  class LGraph {
+    // The prototype method `installGraphConfigureWatch` wraps. Present and wrappable —
+    // and never reached by the root graph's restore on this frontend.
+    configure() {
+      throw new Error("LGraph.prototype.configure was reached — the fixture is wrong");
+    }
+  }
+  class RootGraph extends LGraph {
+    constructor(nodes) {
+      super();
+      this.nodes = nodes;
+    }
+    // Its OWN restore, with no `super.configure`. The node loop still dispatches
+    // through `LGraphNode.prototype`, so the NODE wrapper is entered — which is why
+    // a node-level counter would not have caught this.
+    configure(state) {
+      for (const info of state.nodes) {
+        // The abort. Node 2 and everything after it keep construction defaults.
+        // `loadGraphData`'s own catch swallows this, exactly as production does.
+        if (info.id === 2) throw new Error("reroute validation blew up mid-restore");
+        this.nodes.find((n) => n.id === info.id)?.configure(info);
+      }
+    }
+    serialize() {
+      return stateOf(
+        this.nodes.map((n) => node(n.id, n.type, { widgets_values: n.widgets_values })),
+      );
+    }
+  }
+  return { LG: { LGraph, LGraphNode }, RootGraph };
+}
+
+/** Run one load on that frontend, exactly as `workflow_open` runs it. */
+function runBypassedLoad() {
+  const { LG, RootGraph } = frontendWhoseRootBypassesLGraphPrototype();
+  const root = new RootGraph([new LG.LGraphNode(1, "KSampler"), new LG.LGraphNode(2, "FaceDetailer")]);
+  const payload = stateOf([
+    node(1, "KSampler", { widgets_values: ["authored-1"] }),
+    node(2, "FaceDetailer", { widgets_values: ["authored-2"] }),
+  ]);
+  const nodeIsolation = installNodeConfigureIsolation(LG);
+  const graphWatch = installGraphConfigureWatch(LG);
+  try {
+    try {
+      root.configure(payload);
+    } catch {
+      // `loadGraphData`'s own catch. The restore aborted; nothing propagates.
+    }
+  } finally {
+    nodeIsolation.restore();
+    graphWatch.restore();
+  }
+  return { root, payload, nodeIsolation, graphWatch };
+}
+
+test("panel#1283 F1: a watch installed on a method the restore never calls is UNKNOWN, not completed", () => {
+  const { root, nodeIsolation, graphWatch } = runBypassedLoad();
+  assert.ok(nodeIsolation && graphWatch, "both wraps INSTALL on this frontend — that is the trap");
+
+  // Everything #1358 looked at reads "clean".
+  assert.deepEqual(nodeIsolation.failures, [], "no node throw was contained…");
+  assert.deepEqual(graphWatch.throws, [], "…and no graph throw was seen");
+  // …because nothing watched. The NODE wrapper was entered — gating on it would not
+  // have caught this — and the graph watch was not.
+  assert.equal(nodeIsolation.entered, 1, "the node wrapper ran for the one node that restored");
+  assert.equal(graphWatch.entered, 0, "the graph watch was installed and NEVER entered");
+  // And the load really was partial: node 2 sits at construction defaults.
+  assert.deepEqual(root.serialize().nodes[1].widgets_values, ["construction-default"]);
+
+  // The fold must therefore say UNKNOWN. #1358 as shipped said `true` here.
+  assert.equal(loadRestoreCompleted({ nodeIsolation, graphWatch }), null);
+});
+
+test("panel#1283 F1: the consuming ground does not fire, and `null` degrades to pre-#1358 behaviour", () => {
+  const { root, payload, nodeIsolation, graphWatch } = runBypassedLoad();
+  const observed = loadRestoreCompleted({ nodeIsolation, graphWatch });
+  assert.equal(observed, null);
+
+  const proof = graphRootReproducesStateContent({ rootGraph: root, state: payload, loadRanToCompletion: observed });
+  assert.equal(proof.proven, false);
+  assert.equal(proof.normalizedOnly, false, "a load nobody watched may not be called normalization");
+  assert.deepEqual(proof.normalizedFields, []);
+
+  // THE REFUTATION, in the same test. The ONLY input that differs is the observation:
+  // with the answer #1358 shipped, the lost widget value is waved through.
+  const asShipped = graphRootReproducesStateContent({ rootGraph: root, state: payload, loadRanToCompletion: true });
+  assert.equal(asShipped.normalizedOnly, true, "…which is exactly what the shipped fold answered");
+  assert.deepEqual(asShipped.normalizedFields, ["widgets_values"]);
+
+  // `null`, not `false`: the consumer's ground is licensed on `=== true`, and #1623's
+  // WEAKER ground is vetoed on `=== false`. So unknown must degrade to the pre-#1358
+  // path — identical to a caller that never asked the question — and not to a new
+  // refusal that #1358 was never entitled to introduce.
+  const neverAsked = graphRootReproducesStateContent({ rootGraph: root, state: payload });
+  assert.equal(proof.presentationOnly, neverAsked.presentationOnly);
+  assert.deepEqual(proof.fields, neverAsked.fields);
+  assert.equal(
+    graphRootReproducesStateContent({ rootGraph: root, state: payload, loadRanToCompletion: false })
+      .presentationOnly,
+    false,
+    "…and `false` still vetoes it, which is the behaviour `null` must NOT borrow",
+  );
+});
+
+test("panel#1283 F1: gating on the NODE count would manufacture a false unknown", () => {
+  // This is why the veto is `graphWatch.entered` alone. An empty workflow restores
+  // through the graph watch and configures NO nodes: `nodeIsolation.entered === 0` is
+  // the correct reading there, and the load demonstrably ran to the end.
+  const LG = fakeLG();
+  const nodeIsolation = installNodeConfigureIsolation(LG);
+  const graphWatch = installGraphConfigureWatch(LG);
+  assert.equal(LG.LGraph.prototype.configure({ nodes: [] }), "graph-ok");
+  nodeIsolation.restore();
+  graphWatch.restore();
+  assert.equal(nodeIsolation.entered, 0, "no node configured — an empty workflow");
+  assert.equal(graphWatch.entered, 1);
+  assert.equal(loadRestoreCompleted({ nodeIsolation, graphWatch }), true, "…and that IS a completed restore");
+});
+
+test("panel#1283 F1: a deactivated wrapper counts nothing — a pass-through is not an observation", () => {
+  const LG = fakeLG();
+  const inner = installGraphConfigureWatch(LG);
+  const outer = installGraphConfigureWatch(LG);
+  // Out of order, so the deactivated inner stays in the chain as a pass-through.
+  inner.restore();
+  assert.equal(LG.LGraph.prototype.configure({ nodes: [] }), "graph-ok");
+  assert.equal(outer.entered, 1, "the active wrapper counted its entry");
+  assert.equal(inner.entered, 0, "the deactivated one is a pass-through and counts nothing");
+  outer.restore();
+});
+
+test("panel#1283 F1: a handle that cannot say whether it ran is UNKNOWN, not a pass", () => {
+  const clean = { failures: [] };
+  for (const graphWatch of [
+    { throws: [] }, // no counter at all — a hand-rolled or stale handle
+    { throws: [], entered: 0 },
+    { throws: [], entered: -1 },
+    { throws: [], entered: "1" },
+    { throws: [], entered: null },
+    { throws: [], entered: true },
+    { throws: [], entered: Number.NaN }, // `< 1` would have let this through
+  ]) {
+    assert.equal(
+      loadRestoreCompleted({ nodeIsolation: clean, graphWatch }),
+      null,
+      `entered=${String(graphWatch.entered)} must not license a completion`,
+    );
+  }
+  assert.equal(loadRestoreCompleted({ nodeIsolation: clean, graphWatch: { throws: [], entered: 1 } }), true);
+  assert.equal(loadRestoreCompleted({ nodeIsolation: clean, graphWatch: { throws: [], entered: 12 } }), true);
+});
+
+test("panel#1283 F1: the real handles expose `entered` as a live count, and a throw still counts", () => {
+  const LG = fakeLG();
+  LG.LGraph.prototype.configure = function () {
+    throw new Error("groups blew up");
+  };
+  const watch = installGraphConfigureWatch(LG);
+  assert.equal(watch.entered, 0, "installed, not yet entered");
+  assert.throws(() => LG.LGraph.prototype.configure({}));
+  // Counted on ENTRY: an aborted restore is the case the watch exists for, and a
+  // counter bumped on the way out would read 0 for exactly it.
+  assert.equal(watch.entered, 1);
+  assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: watch }), false);
+  watch.restore();
 });
