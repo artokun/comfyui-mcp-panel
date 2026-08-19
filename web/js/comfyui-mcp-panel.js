@@ -429,7 +429,18 @@ import {
   withInMemoryClipboard,
   getInMemoryClipboard,
   getEffectiveClipboard,
+  CLIPBOARD_KEY,
 } from "./lib/clipboard-store.js";
+import {
+  collectCopySelection,
+  snapshotCopyLayout,
+  patchClipboardLayout,
+  parseClipboardLayout,
+  recordCopiedLayout,
+  getVerifiedLayout,
+  applyPastedLayout,
+  resolvePasteDest,
+} from "./lib/copy-paste-layout.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { createMediaCollapseStore } from "./lib/media-collapse.js";
 import {
@@ -17049,10 +17060,21 @@ const GRAPH_TOOL_EXECUTORS = {
       else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
     }
     const selected = canvas.selectedItems;
-    const count = selected?.size ?? (Array.isArray(selected) ? selected.length : 0);
-    if (!count) {
+    const selectedCount = selected?.size ?? (Array.isArray(selected) ? selected.length : 0);
+    if (!selectedCount) {
       throw new Error("nothing selected to copy — pass node_ids or select nodes first");
     }
+    // #1294: LiteGraph only serializes groups that are IN the selection, and a
+    // node_ids copy selects nodes only — so every group vanished on paste. Also
+    // collect groups whose members are fully selected and pass them with the
+    // nodes, then patch the clipboard with LIVE positions (clone/configure drops
+    // unique pos on some types, collapsing same-type branch rows onto one point).
+    const selection = collectCopySelection(graph, selected);
+    if (!selection.nodes.length) {
+      throw new Error("nothing selected to copy — pass node_ids or select nodes first");
+    }
+    if (typeof canvas.selectItems === "function") canvas.selectItems(selection.items);
+    const layout = snapshotCopyLayout(graph, selection);
     // panel#500: copyToClipboard persists the payload in localStorage, which
     // throws QuotaExceededError ("The quota has been exceeded.") once a large
     // multi-node selection overflows the ~5–10 MB quota — the copy then failed
@@ -17066,7 +17088,14 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       storage = null;
     }
-    withInMemoryClipboard(storage, () => canvas.copyToClipboard(selected));
+    withInMemoryClipboard(storage, () => {
+      canvas.copyToClipboard(selection.items);
+      const raw = storage && typeof storage.getItem === "function" ? storage.getItem(CLIPBOARD_KEY) : getInMemoryClipboard();
+      const patched = patchClipboardLayout(raw, layout);
+      if (patched && patched !== raw && storage && typeof storage.setItem === "function") {
+        storage.setItem(CLIPBOARD_KEY, patched);
+      }
+    });
     // Snapshot the copied node types (plus a fingerprint of the clipboard
     // payload AFTER the copy) so the next graph_paste_nodes can detect any node
     // the target frontend silently drops on paste — and so a later native
@@ -17074,7 +17103,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // fingerprint comes from the in-memory store, so it's stable even when the
     // localStorage mirror was refused for quota.
     const fingerprint = getInMemoryClipboard();
-    recordCopiedNodes(selected, fingerprint);
+    recordCopiedNodes(selection.nodes, fingerprint);
+    recordCopiedLayout(layout, fingerprint);
     // #286: never report a clean copy that can't round-trip. Any copied node
     // whose type is unregistered on THIS frontend (uninstalled custom-node pack)
     // will be silently dropped by a later paste — the destination is the same
@@ -17084,8 +17114,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // missing/empty (frontend not fully loaded) registryTypePredicate returns
     // undefined and we report nothing rather than falsely flagging every node.
     const isRegisteredType = registryTypePredicate(LG?.registered_node_types);
-    const unregistered = unregisteredCopiedTypes(selected, isRegisteredType);
-    const result = { copied: count };
+    const unregistered = unregisteredCopiedTypes(selection.nodes, isRegisteredType);
+    const result = { copied: selection.nodes.length, copied_groups: selection.groups.length };
     if (unregistered.length) {
       result.unregistered_types = unregistered;
       result.warning = formatUnpasteableCopyWarning(unregistered);
@@ -17103,8 +17133,10 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error("pasteFromClipboard unavailable on this frontend");
     }
     const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    const beforeGroups = new Set(graph._groups ?? []);
     const options = { connectInputs: connect_inputs ?? false };
-    if (Array.isArray(pos) && pos.length === 2) options.position = [Number(pos[0]), Number(pos[1])];
+    const dest = Array.isArray(pos) && pos.length === 2 ? [Number(pos[0]), Number(pos[1])] : null;
+    if (dest && dest.every(Number.isFinite)) options.position = dest;
     // panel#500: read the clipboard through the in-memory store so a payload
     // that overflowed localStorage on copy is still available to paste (reads
     // of the clipboard key resolve to the in-memory copy, or to localStorage
@@ -17115,16 +17147,52 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       storage = null;
     }
+    // Effective payload BEFORE paste — same bytes paste will consume. Needed so
+    // we can restore positions/groups even when LiteGraph's configure drops pos
+    // or skips groups that were not in the native selection (#1294).
+    const rawClipboard = getEffectiveClipboard(storage);
+    const layout = getVerifiedLayout(rawClipboard) ?? parseClipboardLayout(rawClipboard);
     graph.beforeChange?.();
     try {
       withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
+      const pastedNodes = (graph._nodes ?? []).filter((n) => !before.has(n.id));
+      const pastedGroups = (graph._groups ?? []).filter((g) => !beforeGroups.has(g));
+      const pasteDest = dest && dest.every(Number.isFinite) ? dest : resolvePasteDest(null, pastedNodes);
+      applyPastedLayout({
+        pastedNodes,
+        pastedGroups,
+        layout,
+        dest: pasteDest,
+        hooks: {
+          createGroup: (spec) => {
+            const GroupCls = LG?.LGraphGroup;
+            if (typeof GroupCls !== "function") return null;
+            const group = new GroupCls(typeof spec.title === "string" && spec.title ? spec.title : "Group");
+            if (spec.color != null) group.color = String(spec.color);
+            if (Number.isFinite(spec.font_size)) group.font_size = Number(spec.font_size);
+            if (spec.flags) group.flags = { ...(group.flags || {}), ...spec.flags };
+            setGroupBounds(group, spec.bounding);
+            graph.add(group);
+            if (group.id == null) group.id = nextGroupId(graph);
+            group.recomputeInsideNodes?.();
+            return group;
+          },
+          placeGroup: (group, bounding) => {
+            setGroupBounds(group, bounding);
+            group.recomputeInsideNodes?.();
+          },
+        },
+      });
     } finally {
       graph.afterChange?.();
     }
     graph.setDirtyCanvas?.(true, true);
+    // Summarize AFTER the layout restore so returned positions are the ones that
+    // actually landed, not the collapsed same-type coordinate LiteGraph left.
     const pasted = (graph._nodes ?? [])
       .filter((n) => !before.has(n.id))
       .map((n) => summarizeNode(n));
+    const groupsNow = (graph._groups ?? []).filter((g) => !beforeGroups.has(g));
     // Surface any node the frontend silently DROPPED on paste (an unregistered
     // node type such as AudioCrop/AudioSeparation) instead of quietly reducing
     // the count (#261). Diff the clipboard snapshot from the matching
@@ -17137,7 +17205,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // Ctrl+C that replaced the clipboard can never resurrect a stale snapshot.
     // Effective payload = in-memory copy (authoritative after a quota overflow)
     // or localStorage when a native Ctrl+C replaced it since the tool copy.
-    const rawClipboard = getEffectiveClipboard(storage);
     let expected = parseClipboardNodes(rawClipboard);
     if (!expected.length) expected = getVerifiedSnapshot(rawClipboard);
     // A type is a genuine drop only if it isn't a registered node class on this
@@ -17150,7 +17217,16 @@ const GRAPH_TOOL_EXECUTORS = {
       pasted,
       isRegisteredType,
     );
-    const result = { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+    const result = {
+      pasted_count: pasted.length,
+      pasted_node_ids: pasted.map((n) => n.id),
+      pasted,
+      copied_groups: layout.groups.length,
+      pasted_groups: groupsNow.length,
+    };
+    if (groupsNow.length) {
+      result.groups = groupsNow.map((g) => summarizeGroup(graph, g));
+    }
     if (dropped_count > 0) {
       result.dropped_count = dropped_count;
       result.dropped_nodes = dropped;
