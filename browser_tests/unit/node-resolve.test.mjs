@@ -978,10 +978,11 @@ test("#496 add_node: a genuinely INVALID target still fails closed (unknown type
   );
   // (d) an allowlisted name that is NOT registered in the live registry at all — the
   //     exemption requires registry membership (which is also what createNode needs).
+  //     Still refused; only the diagnosis changed (#1296 — see the dedicated block below).
   const reg4 = loadedRegistry();
   await assert.rejects(
     () => assertAddNodeResolvableRefreshing(() => reg4, "MarkdownNote", ADD_OPTS(fresh)),
-    /Unknown node type|does not provide/i,
+    /frontend-only node type|does not provide/i,
   );
 });
 
@@ -1018,6 +1019,82 @@ test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a fron
         wasTypeEverDefined: () => false,
       }),
     /cannot verify|object_info is unavailable/i,
+  );
+});
+
+// ---- #1296: an allowlisted FRONTEND-ONLY type that is NOT in the live registry is
+//      still refused (LiteGraph could only mint a placeholder — that part is
+//      correct), but the refusal must stop diagnosing it as "not installed / its
+//      pack failed to import" and pointing at create_workflow (action:"node_info").
+//      A frontend-only class never comes from /object_info, so no fetch can confirm
+//      it, and the reported rig (rgthree-comfy installed, ComfyUI restarted, tab
+//      never reloaded) is exactly "pack JS not loaded in this tab". The refusal now
+//      names that and prescribes the ONE action that changes it: reload the tab. ---
+
+test('#1296 add_node: "Fast Groups Bypasser (rgthree)" with rgthree installed but the tab never reloaded is refused with a RELOAD-THE-TAB diagnosis, not "not installed"', async () => {
+  const fresh = objectInfo(); // healthy backend — never lists a frontend-only type
+  const reg = loadedRegistry(); // this tab predates the rgthree install: not registered
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "Fast Groups Bypasser (rgthree)", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /frontend-only node type/);
+      assert.match(err.message, /RELOAD the ComfyUI tab/);
+      // The old diagnosis — install a pack they already have, then query the live
+      // /object_info for a type that is never in it — must be GONE.
+      assert.doesNotMatch(err.message, /not installed, its pack was removed/);
+      assert.doesNotMatch(err.message, /failed to import/);
+      assert.doesNotMatch(err.message, /create_workflow \(action:"node_info"\)/);
+      return true;
+    },
+  );
+  // …and once the tab IS reloaded (the pack JS registers the class, defless), the
+  // same add succeeds — the refusal above was about this tab, not the type.
+  const regReloaded = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => regReloaded, "Fast Groups Bypasser (rgthree)", ADD_OPTS(fresh)),
+  );
+});
+
+test("#1296 add_node: the reload diagnosis is scoped — provenance-bearing husk, ever-seen removal, and non-allowlisted types keep their own refusals", async () => {
+  const fresh = objectInfo();
+  // (a) an allowlisted name whose REGISTERED class carries backend provenance (a
+  //     removed pack's stale class squatting a reserved name) is NOT told to reload —
+  //     it keeps the generic unknown-type refusal.
+  const regHusk = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regHusk, "MarkdownNote", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /Unknown node type "MarkdownNote"/);
+      assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
+      return true;
+    },
+  );
+  // (b) the EVER-SEEN gate still wins over the reload diagnosis: a type the backend
+  //     reported earlier this session and no longer does is a REMOVED pack.
+  const reg = loadedRegistry();
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "Fast Groups Bypasser (rgthree)",
+        ADD_OPTS(fresh, (t) => t === "Fast Groups Bypasser (rgthree)"),
+      ),
+    (err) => {
+      assert.match(err.message, /defined this node type earlier this session|removed/i);
+      assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
+      return true;
+    },
+  );
+  // (c) a genuinely unknown, non-allowlisted type keeps the generic refusal with the
+  //     node_info pointer — nothing about it suggests a not-yet-loaded pack.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /Unknown node type "TotallyMadeUpNode"/);
+      assert.match(err.message, /create_workflow \(action:"node_info"\)/);
+      assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
+      return true;
+    },
   );
 });
 
@@ -1120,10 +1197,11 @@ test("#496 recurrence: the SetNode/GetNode allowlist entries do NOT weaken the g
     /defined this node type earlier this session|removed/i,
   );
   // (c) An allowlisted name that is NOT registered in the live registry at all stays
-  //     refused (registry membership is also what createNode needs).
+  //     refused (registry membership is also what createNode needs). #1296 changed only
+  //     the DIAGNOSIS: it now names the unloaded pack JS and prescribes a tab reload.
   await assert.rejects(
     () => assertAddNodeResolvableRefreshing(() => loadedRegistry(), "SetNode", ADD_OPTS(fresh)),
-    /Unknown node type|does not provide/i,
+    /frontend-only node type|does not provide/i,
   );
 });
 
