@@ -162,6 +162,102 @@ export function diskExistenceFromStatus(status) {
   return null;
 }
 
+/** #1267 — TRI-STATE: did the graph CAPTURE actually land, for the value a Save-As
+ *  copy is about to write (or has just written)?
+ *
+ *  THE DEFECT THIS SEPARATES. A Save-As copy is persisted by ComfyUI's
+ *  `ComfyWorkflow.save()`, whose FIRST statement is
+ *  `this.content = JSON.stringify(this.activeState)` — so the bytes that land are
+ *  the copy's `activeState` at write time, and NOTHING else. `activeState` is the
+ *  derived getter `this.changeTracker?.activeState ?? null` (measured on the
+ *  installed 1.47 bundle), so a copy whose tracker was never built serializes to
+ *  the JSON literal `null`: a file that is not a workflow, written and reported
+ *  as a successful save. The panel's post-write read-back cannot see it — it
+ *  compares the target against the copy's OWN content, and `"null" === "null"`
+ *  reads back as "ours", i.e. as a confirmed success.
+ *
+ *  THE TWO EMPTY CASES, AND WHY THEY ARE DISTINGUISHABLE. A user may legitimately
+ *  Save-As an EMPTY canvas, and refusing that would be its own data loss. So the
+ *  signal here is CAPTURE COMPLETION, never node count:
+ *    · genuinely empty  ⇒ a COMPLETED serialization. `LGraph.serialize()` always
+ *      returns an OBJECT carrying a `nodes` array, and the frontend's own
+ *      `blankGraph` is `{last_node_id:0,last_link_id:0,nodes:[],links:[],groups:[],
+ *      config:{},extra:{},version:0.4}` (both read out of the installed bundle).
+ *      `nodes: []` is therefore "captured" and MUST save.
+ *    · never captured   ⇒ NO serialization happened: `null` (an absent tracker), or
+ *      a value that is not a serialized graph at all. No canvas — empty or not —
+ *      can produce that.
+ *
+ *  UNKNOWN NEVER REFUSES, and it is a genuinely distinct third state rather than a
+ *  hedge: on a real ComfyWorkflow `activeState` is a CLASS GETTER that yields
+ *  `null` when unloaded, never `undefined`. So `undefined` means the object does
+ *  not expose the field at all (a frontend that does not model it, a stub), which
+ *  is exactly the case in which we have observed nothing and must not veto. Same
+ *  for content that will not parse.
+ *
+ *  Accepts either the state OBJECT (pre-write: what `save()` will serialize) or the
+ *  serialized STRING (post-write: `copy.content`, the exact bytes `save()` POSTed),
+ *  so both guards ask ONE question with one definition. */
+export function classifyGraphCapture(state) {
+  if (state === undefined) return "unknown"; // field not exposed ⇒ nothing observed
+  if (state === null) return "uncaptured"; // absent tracker ⇒ serializes to `null`
+  if (typeof state === "string") {
+    if (state.trim() === "") return "uncaptured"; // empty bytes are not a graph
+    let parsed;
+    try {
+      parsed = JSON.parse(state);
+    } catch {
+      return "unknown"; // unreadable ⇒ we cannot judge it ⇒ never refuse on it
+    }
+    return classifyGraphCapture(parsed === undefined ? null : parsed);
+  }
+  if (typeof state !== "object" || Array.isArray(state)) return "uncaptured";
+  // The one structural test: a serialized graph carries a `nodes` ARRAY. Empty is fine.
+  if (!Array.isArray(state.nodes)) return "uncaptured";
+  return "captured";
+}
+
+/** Read a workflow's `activeState` without letting a hostile/absent getter decide the
+ *  outcome: an unreadable state is "unknown" (never a refusal), same as an absent one. */
+export function classifyWorkflowCapture(wf) {
+  let state;
+  try {
+    state = wf?.activeState;
+  } catch {
+    return "unknown";
+  }
+  return classifyGraphCapture(state);
+}
+
+/** Errors raised by a guard that runs BEFORE any write are marked, so the copy
+ *  adapter's failure handler does not run its AMBIGUOUS-post-commit reconciliation
+ *  (read the target back, and ADOPT it when it holds our content). That
+ *  reconciliation exists for a persist that may have committed before its response
+ *  was lost; a pre-commit refusal provably wrote nothing, and sending it down that
+ *  path could turn a refusal into a reported success. */
+function markPreCommit(err) {
+  try {
+    Object.defineProperty(err, "cmcpPreCommit", {
+      value: true,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    /* frozen error ⇒ unmarked; the handler just takes the normal (removal) path */
+  }
+  return err;
+}
+
+/** True for a refusal raised before any write was attempted. */
+function isPreCommitRefusal(err) {
+  try {
+    return err?.cmcpPreCommit === true;
+  } catch {
+    return false;
+  }
+}
+
 /** Record the authoritative outcome into an optional `details` sink (a plain object
  *  the caller passes to saveActiveWorkflow). No-op when absent, so behaviour and the
  *  return value are unchanged for every existing caller/test. */
@@ -1218,6 +1314,61 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         // copy persists the state `saveAs` took from the source tab; asking the copy's
         // tracker to "prepare" re-reads the shared global canvas, which is precisely the
         // read that put a foreign workflow's graph into a brand-new tab's file.
+        //
+        // #1267 — OBSERVE THE CAPTURE, DO NOT INFER IT FROM THE CALL ABOVE.
+        //
+        // Until now the ONLY thing standing between this route and a saved-but-empty
+        // file was a CAPABILITY check: `openWorkflow` must exist, therefore the copy
+        // must be loaded. That is a dispatch receipt, not an effect — `openWorkflow`
+        // returning proves it was CALLED, never that a change tracker was BUILT.
+        //
+        // What was MEASURED on the installed frontend bundle (not inferred):
+        //   · `workflowStore.saveAs(wf, path)` returns the copy UNLOADED — the class
+        //     field `changeTracker = null` is never set by it;
+        //   · `get activeState() { return this.changeTracker?.activeState ?? null }`;
+        //   · `ComfyWorkflow.save()` begins `this.content = JSON.stringify(this.activeState)`
+        //     and POSTs that — so an unloaded copy writes the JSON literal `null`;
+        //   · BOTH `openWorkflow` variants can return WITHOUT loading — each begins with an
+        //     `isActive` early exit, and neither returns anything the caller could use to
+        //     tell "loaded it" from "decided not to".
+        //
+        // Which of those drops the capture in any given session is NOT something this
+        // guard needs to know, and guessing is how a fix ends up aimed at the wrong
+        // line: it asks the copy what it is ABOUT TO WRITE. That question has one
+        // answer whatever the upstream cause.
+        //
+        // It has to be asked HERE because nothing downstream can: the post-write
+        // read-back compares the target against the copy's OWN content, so a copy that
+        // wrote `"null"` finds `"null"` on disk and reads back as "ours" — the check
+        // meant to catch a bad write CONFIRMS this one.
+        //
+        // So ask the copy what it is actually going to write, SYNCHRONOUSLY, with no
+        // await between the question and the write. `classifyWorkflowCapture` allows a
+        // legitimately EMPTY canvas (a completed serialization with `nodes: []`) and
+        // refuses only a state that never got serialized at all; a frontend that does
+        // not expose `activeState` is "unknown" and is not refused.
+        //
+        // REFUSING HERE COSTS NOTHING AND DESTROYS NOTHING: it runs BEFORE any write,
+        // so no file is created, the source tab and its file are untouched, and the
+        // catch below removes the in-memory copy and restores the previously-active
+        // tab — the user is returned to their real graph and can retry.
+        //
+        // RESIDUAL, stated honestly: ComfyUI's `save()` awaits a dynamic import before
+        // it reads `activeState`, so a tracker torn down inside that microtask gap is
+        // not caught here. That is the same residual this module already documents for
+        // the #708/#878 canvas re-asserts, and the post-write check below — which reads
+        // the BYTES the write used — is what covers it.
+        if (classifyWorkflowCapture(copy) === "uncaptured") {
+          throw markPreCommit(
+            new Error(
+              `refusing to save "${effectiveName}": the copy's graph was never captured, so the ` +
+                `only thing this save could write to "${finalTargetPath}" is an EMPTY workflow. ` +
+                `(An empty CANVAS still captures — this is a copy that holds no serialized graph ` +
+                `at all.) NOTHING was written and the original is untouched; the previous tab has ` +
+                `been restored. Retry the save (#1267).`,
+            ),
+          );
+        }
         await svc.saveWorkflow(copy);
       } catch (err) {
         // P2 — distinguish a CONFIRMED pre-commit failure (409 conflict, or the
@@ -1226,7 +1377,15 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         // response was lost/failed to parse). Blindly removing the copy on ambiguity
         // ORPHANS the on-disk file (a later retry then 409s). So on a NON-conflict
         // failure, RECONCILE by reading the target back:
-        if (!isConflictError(err) && typeof reconcileSavedCopy === "function") {
+        // #1267 — a PRE-COMMIT refusal (raised before `saveWorkflow` was ever called)
+        // must not go down the ambiguity path: that path exists to ADOPT a write that
+        // committed before its response was lost, and adopting here would convert a
+        // refusal into a reported success on a target we never wrote.
+        if (
+          !isConflictError(err) &&
+          !isPreCommitRefusal(err) &&
+          typeof reconcileSavedCopy === "function"
+        ) {
           let state = "unknown";
           try {
             state = await reconcileSavedCopy(finalTargetPath, copy);
@@ -1263,6 +1422,33 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         removeInMemoryWorkflow(svc, copy);
         if (prevActive !== undefined) svc.activeWorkflow = prevActive;
         throw err;
+      }
+      // #1267 — POST-WRITE: report the BYTES, not the call. `ComfyWorkflow.save()`'s
+      // first statement is `this.content = JSON.stringify(this.activeState)`, so after a
+      // reported-success persist `copy.content` IS the payload that went to /userdata —
+      // the effect we observed, not the request we made. Classifying it closes the one
+      // residual the pre-write guard cannot: a tracker torn down inside the microtask gap
+      // `save()` opens (it awaits a dynamic import before reading `activeState`).
+      //
+      // This is deliberately NOT a node-count veto. It fires only on bytes that are not a
+      // serialized graph at all (`null`, empty); `{…,"nodes":[],…}` — the frontend's own
+      // blankGraph — classifies as CAPTURED and reports success like any other save.
+      //
+      // The write already happened, so this cannot un-write it and must not pretend to:
+      // it surfaces the truth instead of a false acknowledgement, and hands the user back
+      // their previous tab (their real graph) rather than leaving them bound to a target
+      // we just proved holds no graph. The file is left in place — deleting on this path
+      // is its own hazard, and the source was never touched.
+      const writtenCapture = classifyGraphCapture(copy?.content);
+      if (writtenCapture === "uncaptured") {
+        removeInMemoryWorkflow(svc, copy);
+        if (prevActive !== undefined) svc.activeWorkflow = prevActive;
+        throw new Error(
+          `save-as wrote "${finalTargetPath}" but the bytes it sent contain no graph — the copy's ` +
+            `state was lost between opening it and the write, so the file is EMPTY. Reporting the ` +
+            `failure rather than a phantom success: the original workflow was NOT modified and the ` +
+            `previous tab has been restored. Delete "${finalTargetPath}" and retry (#1267).`,
+        );
       }
       // SUCCESS-PATH BOOKKEEPING (#309 P1, mirror of the adoption branch). ComfyUI's own
       // saveWorkflow(copy) captures copy.content, awaits the write, THEN calls

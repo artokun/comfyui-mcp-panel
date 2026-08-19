@@ -1736,7 +1736,11 @@ function makeLowLevelStore({ active, saveWorkflowImpl } = {}) {
         get isPersisted() {
           return this.size !== -1
         },
-        content: '{"id":"OUR-ID"}',
+        // A real copy's content is a SERIALIZED GRAPH (store.saveAs deep-copies the
+        // source's activeState and stamps a fresh id), never a bare id. Modelled
+        // faithfully so the #1267 capture check sees what a real save would send;
+        // the id is what these tests' read-back identity assertions turn on.
+        content: '{"id":"OUR-ID","nodes":[],"links":[],"version":0.4}',
         changeTracker: { prepareForSave() {} }
       }
       store.set(path, copy) // raw into the lookup
@@ -1968,6 +1972,12 @@ test('#309 P2: an adopted copy is marked PERSISTED (size != -1) so a later in-pl
 // activeState the live canvas; updateModified sets isModified = !graphEqual(initial,
 // active) (JSON compare here). reset() re-baselines to activeState (the WRONG direction
 // the fix must avoid). undo() restores the previous state and recomputes.
+// A GRAPH-SHAPED state snapshot. The `v` tag is what these tests compare (S0/S1/S2);
+// the surrounding `nodes`/`links` are what a real serialized workflow always carries —
+// modelled so the #1267 capture check sees the shape a real save would send, and so a
+// snapshot in these doubles cannot be mistaken for a graph that was never captured.
+const graphState = (v) => ({ id: 'OUR-ID', nodes: [], links: [], version: 0.4, extra: { v } })
+
 function attachChangeTracker(copy, { committedContent, activeState, undoStack = [] }) {
   copy.content = committedContent
   const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b)
@@ -2014,7 +2024,7 @@ test('#309 P1: adoption keeps the copy DIRTY when the canvas was edited DURING t
   svc.saveAs = (wf, path) => {
     const copy = origSaveAs(wf, path)
     // The write committed S1; the user edited the live canvas to S2 during the await.
-    attachChangeTracker(copy, { committedContent: JSON.stringify({ v: 'S1' }), activeState: { v: 'S2' } })
+    attachChangeTracker(copy, { committedContent: JSON.stringify(graphState('S1')), activeState: graphState('S2') })
     return copy
   }
   const existsOnDisk = async () => false
@@ -2052,10 +2062,10 @@ test('#309 P1: adoption sets isModified on OUR copy directly — a distinct late
   const origSaveAs = svc.saveAs
   svc.saveAs = (wf, path) => {
     const copy = origSaveAs(wf, path)
-    copy.content = JSON.stringify({ v: 'S1' }) // committed S1; A itself is clean (active S1)
+    copy.content = JSON.stringify(graphState('S1')) // committed S1; A itself is clean (active S1)
     copy.changeTracker = {
       initialState: JSON.parse(copy.content),
-      activeState: { v: 'S1' },
+      activeState: graphState('S1'),
       workflow: copy,
       // Faithful 1.47: resolve the workflow BY PATH and write isModified on it.
       updateModified() {
@@ -2094,9 +2104,9 @@ test('#309 P1: adoption with NO in-flight edit is CLEAN, and a later Undo makes 
     const copy = origSaveAs(wf, path)
     // Committed S1; live canvas still S1 (no edit during the await); undo stack has S0.
     attachChangeTracker(copy, {
-      committedContent: JSON.stringify({ v: 'S1' }),
-      activeState: { v: 'S1' },
-      undoStack: [{ v: 'S0' }],
+      committedContent: JSON.stringify(graphState('S1')),
+      activeState: graphState('S1'),
+      undoStack: [graphState('S0')],
     })
     return copy
   }
@@ -2126,13 +2136,13 @@ test('#309 P1: a SUCCESSFUL Save-As with an in-flight edit keeps the copy DIRTY 
     // The write PERSISTS S1; the user edits the live canvas to S2 during the (successful)
     // save await.
     saveWorkflowImpl: async (wf) => {
-      wf.changeTracker.activeState = { v: 'S2' }
+      wf.changeTracker.activeState = graphState('S2')
     },
   })
   const origSaveAs = svc.saveAs
   svc.saveAs = (wf, path) => {
     const copy = origSaveAs(wf, path)
-    attachChangeTracker(copy, { committedContent: JSON.stringify({ v: 'S1' }), activeState: { v: 'S1' } })
+    attachChangeTracker(copy, { committedContent: JSON.stringify(graphState('S1')), activeState: graphState('S1') })
     return copy
   }
   const existsOnDisk = async () => false
@@ -2157,7 +2167,7 @@ test('#309 P1: a SUCCESSFUL Save-As with NO in-flight edit leaves the copy CLEAN
   const origSaveAs = svc.saveAs
   svc.saveAs = (wf, path) => {
     const copy = origSaveAs(wf, path)
-    attachChangeTracker(copy, { committedContent: JSON.stringify({ v: 'S1' }), activeState: { v: 'S1' } })
+    attachChangeTracker(copy, { committedContent: JSON.stringify(graphState('S1')), activeState: graphState('S1') })
     return copy
   }
   const existsOnDisk = async () => false
