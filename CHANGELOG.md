@@ -6,8 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.9] - 2026-08-19
+
 ### Fixed
 - `panel_open_workflow` reports the fence uuid from the same active-workflow observation as the binding fields beside it, instead of a second live read that could disagree (#1014)
+
+### Fixed
+- an open reply reports one identity observation, not two (#1428)
+- a promoted-widget write lands in the instance that was addressed, not the shared subgraph definition (#1427)
+
 
 ## [0.15.8] - 2026-08-19
 
