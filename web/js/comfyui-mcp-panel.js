@@ -27646,16 +27646,6 @@ function buildPanel() {
     if (entry?.role !== "user" && turnOutputFenced()) {
       return entry;
     }
-    // #1310 — persist what the user can see. Mutate in place: callers keep this
-    // object. Agent-directed prefixes that leaked into a record (an older build
-    // prepended them to user_message.text; a card used to dump the raw tool
-    // payload) must not come back on replay.
-    if (entry && (entry.role === "user" || entry.role === "agent") && typeof entry.text === "string") {
-      entry.text = stripAgentDirectedBlocks(entry.text);
-    } else if (entry && entry.role === "card") {
-      if (typeof entry.text === "string") entry.text = stripAgentDirectedBlocks(entry.text);
-      if (typeof entry.detail === "string") entry.detail = stripAgentDirectedBlocks(entry.detail);
-    }
     const followsPanel = historyScopeFollowsPanel();
     // Panel-owned continuity uses a global active-thread pointer, but the thread
     // keeps the stable workflow UUID as provenance for archive grouping. Panel
