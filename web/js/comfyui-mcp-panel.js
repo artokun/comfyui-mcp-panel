@@ -398,6 +398,7 @@ import {
   verifyDisconnect,
 } from "./lib/disconnect-verify.js";
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
+import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
@@ -15607,6 +15608,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // guard age out mid-flight (see begin/endWorkflowReloadStep).
       beginWorkflowReloadStep(reloadGuardToken);
       try {
+        // #1295 — FLUSH THE SOURCE, not the target, while SOURCE is still active.
+        // Inverse of the #1215 capture gate below. A node added through the bridge
+        // lives on the live canvas and is invisible to the outgoing tab's tracker
+        // (ComfyUI snapshots on user input; the add's own snapshot is deferred after
+        // the reply). Switching then repaints from that stale snapshot and the
+        // added node is gone; a later reconnect restores the same stale state.
+        // captureCanvasIntoTracker no-ops on a non-active tracker, so this has to
+        // happen BEFORE openWorkflow moves the pointer. Best-effort: a failed
+        // flush must not block the switch.
+        await flushSourceCanvasBeforeSwitch({
+          source: activeBefore,
+          target,
+          sameWorkflowObject,
+          describeLiveCanvasBinding,
+          captureCanvasIntoTracker,
+        });
         // #968 — claim this move BEFORE it happens, so the observer attributes it to this
         // command rather than reporting it as a move nobody made. A claim that is never
         // followed by a move is discarded by the next observation.
