@@ -16589,8 +16589,8 @@ const GRAPH_TOOL_EXECUTORS = {
             //
             // `resolveOpenRebindVerdict` refuses this open on one named hypothesis: a
             // mid-`configure()` throw leaves the node id/type set, the links and the
-            // marker over nodes that lost their values, "and no discriminator available
-            // to the panel separates them" from a normalization. These two wraps ARE that
+            // marker over nodes that lost their values, which its comment once called
+            // indistinguishable from a normalization. These two wraps ARE the
             // discriminator, and they are the whole of it — measured against the frontend
             // source, `LGraph.prototype.configure` runs its node pass with no try/catch
             // and nothing between it and `loadGraphData`'s own catch adds one, so a throw

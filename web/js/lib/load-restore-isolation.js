@@ -130,7 +130,8 @@ export function retryNodeRestores(graph, failures) {
  * ## Why this observation has to exist
  *
  * `resolveOpenRebindVerdict` refuses to report an open applied whenever the graph
- * on the canvas is not byte-reproducible from the payload, and states its reason:
+ * on the canvas is not byte-reproducible from the payload. Its reason, as that comment
+ * read BEFORE this observation existed (it now points here instead):
  *
  *   "LiteGraph creates every node (with its id and type) and THEN configures each
  *    one, and `loadGraphData` catches a `configure()` failure and returns. A throw
@@ -155,8 +156,8 @@ export function retryNodeRestores(graph, failures) {
  * reroute validation, groups, execution order, proxy-widget migration).
  *
  * Both are observable. `installNodeConfigureIsolation` above already records the
- * first, for #1260. This records the second. Together they answer the question the
- * comment says cannot be answered: **did any part of this restore abort?**
+ * first, for #1260. This records the second. Together they answer the question that
+ * comment said could not be answered: **did any part of this restore abort?**
  *
  * ## Why the pair is exhaustive and the node wrap alone is not
  *

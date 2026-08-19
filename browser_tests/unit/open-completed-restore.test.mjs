@@ -27,7 +27,8 @@
  * Adding them one at a time is a treadmill: the next pack invents the next field.
  *
  * THE MECHANISM, AND WHY IT IS ANSWERABLE NOW. `resolveOpenRebindVerdict` names
- * exactly ONE reason a content difference might mean loss:
+ * exactly ONE reason a content difference might mean loss (quoted as that comment read
+ * before this landed — it now points at the discriminator instead):
  *
  *   "`loadGraphData` catches a `configure()` failure and returns. A throw in that
  *    second pass leaves the complete node id/type set, the links, and the panel's
@@ -45,7 +46,7 @@
  * `installNodeConfigureIsolation` records per-node throws (#1260, on `graph_load`),
  * and `installGraphConfigureWatch` (added here) records a throw out of the restore.
  * `workflow_open` now installs both, so `loadRanToCompletion` REFUTES that hypothesis
- * per load, by observation. That is the discriminator the comment says does not exist.
+ * per load, by observation. That is the discriminator the comment said did not exist.
  *
  * WHAT THIS DOES NOT CLAIM, and the tests below hold the line: it never says the
  * differing values are the file's values. It says the restore did not stop early, so
