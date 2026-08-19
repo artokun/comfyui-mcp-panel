@@ -447,3 +447,281 @@ test("#886 failing closed never reports a WRONG graph as proven", () => {
   });
   assert.equal(definitionsDifferOnlyByRenumber(g, renumberedP0()), false);
 });
+
+// ── comfyui-mcp#1706 — the SECOND rewrite on this surface: subgraph NODE ids ──
+//
+// MEASURED in a real browser (ComfyUI 0.33.1 / comfyui-frontend-package 1.48.7, the
+// live rig on :8211), payload vs `app.graph.serialize()`:
+//
+//   1. A workflow the frontend itself serialized reopens BYTE-IDENTICALLY — 0 differing
+//      paths in `definitions`, 0 in `nodes`. There is no baseline drift to explain.
+//   2. Take that same workflow, force its definition node ids to collide with its own
+//      root node ids (what a paste- or agent-authored definitions store looks like),
+//      reopen it. Root `nodes`: still 0 differing paths. `definitions`: differs, and the
+//      WHOLE of the difference is
+//
+//        /subgraphs/#/nodes/#/id                     the relabeling
+//        /subgraphs/#/links/#/origin_id,/target_id   patched through the same map
+//        /subgraphs/#/nodes/#/order                  recomputed execution index
+//        /subgraphs/#/state/lastNodeId  196 -> 214   the counter that allocated them
+//
+//      and nothing else (the "everything else" bucket came back EMPTY on both rigs).
+//
+// That is comfyui-mcp#1706's reported shape exactly: identity confirmed, every node
+// matching, `definitions` the only differing surface. The fixture below is that capture.
+const CAPTURED = JSON.parse(
+  readFileSync(join(ROOT, "browser_tests/unit/fixtures-1706-definitions-renumber.json"), "utf8"),
+);
+const captured = () => JSON.parse(JSON.stringify(CAPTURED));
+
+test("#1706 the MEASURED node-id renumber is recognised", () => {
+  const c = captured();
+  assert.equal(
+    definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, { rootNodes: c.payloadRootNodes }),
+    true,
+  );
+});
+
+test("#1706 the account is granted only to a caller that hands over the ROOT nodes", () => {
+  // The evidence gate. A caller that does not supply them gets byte-for-byte the
+  // pre-#1706 answer, so dropping the argument at a call site un-ships the fix rather
+  // than silently widening it.
+  const c = captured();
+  for (const options of [undefined, {}, { rootNodes: null }, { rootNodes: "nodes" }]) {
+    assert.equal(
+      definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, options),
+      false,
+      `${JSON.stringify(options)} is not the evidence`,
+    );
+  }
+});
+
+test("#1706 pure LINK renumbering is unaffected by the gate — #886 never needed the nodes", () => {
+  assert.equal(definitionsDifferOnlyByRenumber(sgP0(), renumberedP0()), true);
+  assert.equal(definitionsDifferOnlyByRenumber(defs(), renumbered()), true);
+});
+
+// ── the cross-surface reference: a promoted widget names a definition node BY ID ──
+
+const promoting = (id) => [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[String(id), "seed"]] } }];
+
+test("#1706 a root node promoting a widget from a RELABELED node refuses", () => {
+  // MEASURED (`templates-6-key-frames.json`, 5 root nodes promoting widgets, definition
+  // ids forced to collide): that variant is NOT confined to `definitions` — the root
+  // `nodes` surface came back differing on `inputs/#/widget` and `widgets_values/#`,
+  // i.e. promoted widget VALUES were gone. Accounting for `definitions` here would take
+  // it out of the UNEXPLAINED set the weaker completed-load ground reads, and that
+  // ground does admit a `widgets_values` difference. So it refuses outright.
+  const c = captured();
+  const movedFrom = c.payloadDefinitions.subgraphs[0].nodes[0].id;
+  assert.equal(
+    definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, { rootNodes: promoting(movedFrom) }),
+    false,
+  );
+});
+
+test("#1706 a root node promoting from an UNTOUCHED id does not block the account", () => {
+  const c = captured();
+  assert.equal(
+    definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, {
+      rootNodes: promoting("no-such-node-id"),
+    }),
+    true,
+  );
+});
+
+test("#1706 an unreadable proxyWidgets shape refuses — cannot tell is not no", () => {
+  const c = captured();
+  for (const rootNodes of [
+    [{ id: 400, type: "sub-1", properties: { proxyWidgets: "seed" } }],
+    [{ id: 400, type: "sub-1", properties: { proxyWidgets: [null] } }],
+    [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[]] } }],
+    [{ id: 400, type: "sub-1", properties: { proxyWidgets: [[{ toString: null, valueOf: null }, "seed"]] } }],
+  ]) {
+    assert.equal(definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, { rootNodes }), false);
+  }
+});
+
+// ── what STILL produces a genuine mismatch, on top of the relabeling ──
+
+/** The captured live definitions with one surgical change. */
+const mutatedLive = (fn) => {
+  const c = captured();
+  fn(c.liveDefinitions.subgraphs[0], c);
+  return c;
+};
+const verdict = (c) =>
+  definitionsDifferOnlyByRenumber(c.payloadDefinitions, c.liveDefinitions, { rootNodes: c.payloadRootNodes });
+
+test("#1706 P0: a definition node that VANISHED is not a relabeling", () => {
+  assert.equal(verdict(mutatedLive((def) => def.nodes.pop())), false);
+});
+
+test("#1706 P0: a RETYPED definition node is not a relabeling", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.nodes[0].type = "SomethingElse";
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: a changed WIDGET VALUE inside a relabeled definition is not a relabeling", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.nodes[0].widgets_values = ["CHANGED", ...(def.nodes[0].widgets_values ?? [])];
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: a RE-WIRED link inside a relabeled definition is not a relabeling", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.links[0].target_slot = (def.links[0].target_slot ?? 0) + 7;
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: a link endpoint that does NOT follow the map is not a relabeling", () => {
+  // The patch is what makes the relabeling harmless. A definition whose node ids moved
+  // while a link kept pointing at the OLD id is a broken graph, not a renamed one.
+  assert.equal(
+    verdict(
+      mutatedLive((def, c) => {
+        def.links[0].origin_id = c.payloadDefinitions.subgraphs[0].links[0].origin_id;
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: an ADDED or REMOVED link is not a relabeling", () => {
+  assert.equal(verdict(mutatedLive((def) => def.links.pop())), false);
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.links.push({ ...def.links[0], id: 90210 });
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: a RENAMED interface port is not a relabeling", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.inputs[0].name = "renamed";
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: a node that MOVED is not a relabeling — geometry is untouched", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.nodes[0].pos = [999, 999];
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P0: REORDERED nodes inside a relabeled definition are not a relabeling", () => {
+  assert.equal(verdict(mutatedLive((def) => def.nodes.reverse())), false);
+});
+
+test("#1706 P0: a duplicated live node id collapses two nodes into one and refuses", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def) => {
+        def.nodes[1].id = def.nodes[0].id;
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P1: the allocation counter may only go FORWARD", () => {
+  const back = mutatedLive((def, c) => {
+    for (const d of c.liveDefinitions.subgraphs) d.state.lastNodeId = 1;
+  });
+  assert.equal(verdict(back), false);
+  const nonNumeric = mutatedLive((def, c) => {
+    for (const d of c.liveDefinitions.subgraphs) d.state.lastNodeId = "214";
+  });
+  assert.equal(verdict(nonNumeric), false);
+});
+
+test("#1706 P1: a structural state counter moving is still not a relabeling", () => {
+  assert.equal(
+    verdict(
+      mutatedLive((def, c) => {
+        for (const d of c.liveDefinitions.subgraphs) d.state.lastGroupId = 999;
+      }),
+    ),
+    false,
+  );
+});
+
+test("#1706 P1: WITHOUT a relabeling, lastNodeId and order stay refusals", () => {
+  // The wider allowances are bought by the relabeling, not granted by default. A
+  // definitions block whose node ids did not move gets exactly the #886 answer.
+  const counterOnly = sgP0({ state: { lastLinkId: 2092, lastNodeId: 13 } });
+  assert.equal(definitionsDifferOnlyByRenumber(sgP0(), counterOnly, { rootNodes: [] }), false);
+  const orderOnly = sgP0({
+    nodes: [
+      { id: 3, type: "LoadImage", order: 5, outputs: [{ links: [11] }] },
+      { id: 4, type: "VAEEncode", inputs: [{ link: 11 }], outputs: [{ links: [12] }] },
+      { id: 5, type: "KSampler", inputs: [{ link: null }, { link: 12 }] },
+    ],
+  });
+  assert.equal(definitionsDifferOnlyByRenumber(sgP0(), orderOnly, { rootNodes: [] }), false);
+});
+
+test("#1706 P1: a promoted WIDGET whose id did not follow the map refuses", () => {
+  const base = (widgetId) =>
+    sgP0({
+      widgets: [{ id: widgetId, name: "seed", promotedName: "seed" }],
+      state: { lastLinkId: 2092, lastNodeId: 12 },
+    });
+  const relabel = (widgetId) =>
+    sgP0({
+      widgets: [{ id: widgetId, name: "seed", promotedName: "seed" }],
+      state: { lastLinkId: 2092, lastNodeId: 42 },
+      links: [
+        [11, 40, 0, 41, 0, "IMAGE"],
+        [12, 41, 0, 42, 1, "MASK"],
+      ],
+      nodes: [
+        { id: 40, type: "LoadImage", outputs: [{ links: [11] }] },
+        { id: 41, type: "VAEEncode", inputs: [{ link: 11 }], outputs: [{ links: [12] }] },
+        { id: 42, type: "KSampler", inputs: [{ link: null }, { link: 12 }] },
+      ],
+    });
+  assert.equal(definitionsDifferOnlyByRenumber(base(3), relabel(40), { rootNodes: [] }), true);
+  assert.equal(definitionsDifferOnlyByRenumber(base(3), relabel(3), { rootNodes: [] }), false);
+  assert.equal(definitionsDifferOnlyByRenumber(base(3), relabel(41), { rootNodes: [] }), false);
+});
+
+test("#1706 P1: a definition the map did not move is still compared in FULL", () => {
+  // The two-pass shape: `state.lastNodeId` is the ROOT graph's counter, so a definition
+  // that was NOT relabeled shows it moving anyway as soon as another one was. That is
+  // the only thing the second definition is allowed to differ in.
+  const c = captured();
+  c.liveDefinitions.subgraphs[1] = JSON.parse(JSON.stringify(c.payloadDefinitions.subgraphs[1]));
+  c.liveDefinitions.subgraphs[1].state.lastNodeId = c.liveDefinitions.subgraphs[0].state.lastNodeId;
+  assert.equal(verdict(c), true, "an untouched definition riding the shared counter is fine");
+  c.liveDefinitions.subgraphs[1].nodes[0].widgets_values = ["CHANGED"];
+  assert.equal(verdict(c), false);
+});
