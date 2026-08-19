@@ -532,6 +532,7 @@ import {
   holdGraphItemPositions,
   describeItems,
   describeThrown,
+  writePoint,
 } from "./lib/group-geometry.js";
 import {
   activeWorkflowPossiblyStale,
@@ -14452,11 +14453,25 @@ const GRAPH_TOOL_EXECUTORS = {
     if (own("preset") && (own("color") || own("bgcolor"))) {
       throw new Error("preset cannot be combined with color or bgcolor");
     }
-    if (own("pos") && (!Array.isArray(args.pos) || args.pos.length !== 2 || !args.pos.every(Number.isFinite))) {
-      throw new Error("pos must be [x, y] finite numbers");
+    // #1444 — read [0],[1] only. ComfyUI backs pos/size with a 4-float Rectangle;
+    // spreading that container reports [x, y, w, h] as "size" (height = y) and a
+    // later setSize of those first two numbers inflates the node to its position.
+    const pair = (p) => {
+      const x = Number(p?.[0]);
+      const y = Number(p?.[1]);
+      return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null;
+    };
+    // Compact nodes are a few hundred px; image previews stay below 8K. Tens of
+    // thousands are the corrupted-geometry signature from #1444, not a real node.
+    const MAX_NODE_SIZE = 16384;
+    const MAX_NODE_COORD = 1e6;
+    const sizeSane = (s) => s && s[0] > 0 && s[1] > 0 && s[0] <= MAX_NODE_SIZE && s[1] <= MAX_NODE_SIZE;
+    const posSane = (p) => p && Math.abs(p[0]) <= MAX_NODE_COORD && Math.abs(p[1]) <= MAX_NODE_COORD;
+    if (own("pos") && (!Array.isArray(args.pos) || args.pos.length !== 2 || !posSane(pair(args.pos)))) {
+      throw new Error("pos must be [x, y] finite numbers within a reasonable canvas range");
     }
-    if (own("size") && (!Array.isArray(args.size) || args.size.length !== 2 || !args.size.every((n) => Number.isFinite(n) && n > 0))) {
-      throw new Error("size must be two positive numbers");
+    if (own("size") && (!Array.isArray(args.size) || args.size.length !== 2 || !sizeSane(pair(args.size)))) {
+      throw new Error("size must be two positive numbers within a reasonable canvas range");
     }
     if (own("title") && typeof args.title !== "string") throw new Error("title must be a string");
     if (own("shape") && !["default", "box", "round", "card"].includes(args.shape)) {
@@ -14524,8 +14539,8 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     const snapshot = (node) => ({
       node,
-      pos: [...(node.pos ?? [])],
-      size: [...(node.size ?? [])],
+      pos: pair(node.pos) ?? [],
+      size: pair(node.size) ?? [],
       title: node.title,
       hasColor: Object.prototype.hasOwnProperty.call(node, "color"),
       color: node.color,
@@ -14539,24 +14554,34 @@ const GRAPH_TOOL_EXECUTORS = {
       mode: node.mode,
     });
     const before = nodes.map(snapshot);
-    const restore = (s) => {
-      const node = s.node;
-      const currentPos = [...(node.pos ?? [])];
-      node.pos = [...s.pos];
-      // Re-run LiteGraph's geometry path for targets that already accepted the edit:
-      // setSize carries widget/layout side effects which a raw node.size assignment
-      // cannot undo. If an extension rejects restoration too, preserve the captured
-      // geometry directly rather than leaving a partial transaction behind.
+    const writeSize = (node, size) => {
+      if (!size || size.length < 2) return false;
       let restoredSize = false;
       if (typeof node.setSize === "function") {
         try {
-          node.setSize([...s.size]);
-          restoredSize = node.size?.[0] === s.size[0] && node.size?.[1] === s.size[1];
+          node.setSize([size[0], size[1]]);
+          const now = pair(node.size);
+          restoredSize = !!now && now[0] === size[0] && now[1] === size[1];
         } catch {
           // Fall through to the authoritative snapshot assignment below.
         }
       }
-      if (!restoredSize) node.size = [...s.size];
+      if (!restoredSize) {
+        if (!writePoint(node, "size", size[0], size[1])) node.size = [size[0], size[1]];
+      }
+      const now = pair(node.size);
+      return !!now && now[0] === size[0] && now[1] === size[1];
+    };
+    const restore = (s) => {
+      const node = s.node;
+      const currentPos = pair(node.pos) ?? [];
+      if (s.pos.length >= 2) writePoint(node, "pos", s.pos[0], s.pos[1]);
+      else node.pos = [...s.pos];
+      // Re-run LiteGraph's geometry path for targets that already accepted the edit:
+      // setSize carries widget/layout side effects which a raw node.size assignment
+      // cannot undo. If an extension rejects restoration too, preserve the captured
+      // geometry directly rather than leaving a partial transaction behind.
+      writeSize(node, s.size);
       refreshNodeArea(node, currentPos);
       node.title = s.title;
       if (s.hasColor) node.color = s.color;
@@ -14572,8 +14597,8 @@ const GRAPH_TOOL_EXECUTORS = {
     };
     const summarize = (node) => ({
       node_id: node.id,
-      pos: [...(node.pos ?? [])],
-      size: [...(node.size ?? [])],
+      pos: pair(node.pos) ?? [],
+      size: pair(node.size) ?? [],
       title: node.title,
       color: node.color ?? null,
       bgcolor: node.bgcolor ?? null,
@@ -14587,15 +14612,41 @@ const GRAPH_TOOL_EXECUTORS = {
     graph.beforeChange?.();
     try {
       for (const node of nodes) {
+        const snap = before[nodes.indexOf(node)];
         if (own("pos")) {
-          const previous = [...(node.pos ?? [])];
-          node.pos = [Number(args.pos[0]), Number(args.pos[1])];
+          const previous = pair(node.pos) ?? [0, 0];
+          const next = pair(args.pos);
+          writePoint(node, "pos", next[0], next[1]);
           refreshNodeArea(node, previous);
+          // Shared-buffer updateArea + delta-sync can apply the move twice
+          // (pos becomes x+(x-oldX)). Pin the requested point.
+          const landed = pair(node.pos);
+          if (!landed || landed[0] !== next[0] || landed[1] !== next[1]) {
+            writePoint(node, "pos", next[0], next[1]);
+          }
+          if (!posSane(pair(node.pos))) {
+            throw new Error("pos must be [x, y] finite numbers within a reasonable canvas range");
+          }
         }
         if (own("size")) {
-          const size = [Number(args.size[0]), Number(args.size[1])];
+          const size = pair(args.size);
           if (typeof node.setSize === "function") node.setSize(size);
-          else node.size = size;
+          else if (!writePoint(node, "size", size[0], size[1])) node.size = size;
+          // setSize/onResize may clamp to a widget minimum. Refuse only when
+          // that path inflates to a non-node size (the #1444 signature).
+          if (!sizeSane(pair(node.size))) {
+            throw new Error("size must be two positive numbers within a reasonable canvas range");
+          }
+        } else if (snap.size.length >= 2) {
+          // #1444 — a move/title/color must not let updateArea rewrite size from
+          // a shared Rectangle (height becomes y, then tens of thousands).
+          const now = pair(node.size);
+          if (!now || now[0] !== snap.size[0] || now[1] !== snap.size[1]) {
+            writeSize(node, snap.size);
+          }
+          if (!sizeSane(pair(node.size))) {
+            throw new Error("size must be two positive numbers within a reasonable canvas range");
+          }
         }
         if (own("title")) node.title = args.title;
         if (palette) {

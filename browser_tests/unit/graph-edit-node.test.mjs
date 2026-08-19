@@ -5,6 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { canonicalNodeId, isQualifiedNodeId } from "../../web/js/lib/node-id.js";
+import { writePoint, refreshNodeArea } from "../../web/js/lib/group-geometry.js";
 import { fileURLToPath } from "node:url";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -36,6 +37,7 @@ function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypa
     // extracted method pass against a canonicalNodeId that always returned NaN.
     "canonicalNodeId",
     "isQualifiedNodeId",
+    "writePoint",
     `const executors = { ${methodMatch[0]} }; return executors.graph_edit_node;`,
   );
   return factory(
@@ -47,6 +49,7 @@ function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypa
     railKindFor,
     canonicalNodeId,
     isQualifiedNodeId,
+    writePoint,
   );
 }
 
@@ -70,9 +73,10 @@ function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypas
     "normalizeLegacyNodeId",
     "canonicalNodeId",
     "isQualifiedNodeId",
+    "writePoint",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyMoveMatch[0]} ${legacyResizeMatch[0]} };
      return { move: GRAPH_TOOL_EXECUTORS.graph_move_node, resize: GRAPH_TOOL_EXECUTORS.graph_resize_node };`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId, writePoint);
 }
 
 function realLegacyTitle(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
@@ -86,8 +90,9 @@ function realLegacyTitle(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypass
     "normalizeLegacyNodeId",
     "canonicalNodeId",
     "isQualifiedNodeId",
+    "writePoint",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyTitleMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_title;`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId, writePoint);
 }
 
 function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
@@ -101,8 +106,9 @@ function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBy
     "normalizeLegacyNodeId",
     "canonicalNodeId",
     "isQualifiedNodeId",
+    "writePoint",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyCollapsedMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_node_collapsed;`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId, canonicalNodeId, isQualifiedNodeId, writePoint);
 }
 
 function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings, normalizeLegacyNodeId) {
@@ -564,4 +570,109 @@ test("#538 legacy wrappers normalize canonical numeric node-id strings without w
   assert.throws(() => move({ node_id: "07", pos: [1, 2] }), /node_id must be an integer/);
   assert.throws(() => title({ node_id: "8.0", title: "wrong" }), /node_id must be an integer/);
   assert.equal(titleNode.title, "Legacy title", "invalid legacy forms are rejected before the strict editor mutates");
+});
+
+/** ComfyUI-shaped node: pos and size are views into one [x, y, w, h] Rectangle.
+ *  updateArea writes [x, y, x2, y2] into that same buffer — the #1444 inflation
+ *  (height becomes y+h, then the next stack/move compounds to tens of thousands). */
+function makeRectBackedNode(id, { pos = [100, 200], size = [210, 80] } = {}) {
+  const rect = new Float64Array([pos[0], pos[1], size[0], size[1]]);
+  return {
+    id,
+    title: `Node ${id}`,
+    flags: {},
+    get pos() { return rect.subarray(0, 2); },
+    set pos(v) {
+      if (!v || v.length < 2) return;
+      rect[0] = v[0];
+      rect[1] = v[1];
+    },
+    get size() { return rect.subarray(2, 4); },
+    set size(v) {
+      if (!v || v.length < 2) return;
+      rect[2] = v[0];
+      rect[3] = v[1];
+    },
+    setSize(s) { this.size = s; },
+    boundingRect: rect,
+    updateArea() {
+      const x = this.pos[0];
+      const y = this.pos[1];
+      const w = this.size[0];
+      const h = this.size[1];
+      rect[0] = x;
+      rect[1] = y;
+      rect[2] = x + w;
+      rect[3] = y + h;
+    },
+  };
+}
+
+test("#1444 a move does not inflate size when pos/size share a Rectangle buffer", () => {
+  const node = makeRectBackedNode(1, { pos: [100, 200], size: [210, 80] });
+  const startedWidth = node.size[0];
+  const startedHeight = node.size[1];
+  const events = [];
+  const graph = {
+    beforeChange: () => events.push("before"),
+    afterChange: () => events.push("after"),
+    setDirtyCanvas: () => events.push("dirty"),
+    getNodeById: (id) => (id === 1 ? node : null),
+  };
+  // Real refreshNodeArea so updateArea actually runs after the pos write, like
+  // the shipped GRAPH_TOOL_EXECUTORS path.
+  const edit = realGraphEditNode(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: {} } } }),
+    (_g, id) => {
+      if (id !== 1) throw new Error(`No node with id ${id}`);
+      return node;
+    },
+    refreshNodeArea,
+    () => [],
+    () => null,
+    () => null,
+  );
+
+  const result = edit({ node_id: 1, pos: [400, 500] });
+  assert.equal(node.pos[0], 400);
+  assert.equal(node.pos[1], 500);
+  assert.equal(node.size[0], startedWidth, "width must stay the pre-move size, not x+w");
+  assert.equal(node.size[1], startedHeight, "height must stay the pre-move size, not y+h");
+  assert.equal(result.edited[0].after.size.length, 2);
+  assert.deepEqual(result.edited[0].after.size, [startedWidth, startedHeight]);
+  assert.deepEqual(result.edited[0].after.pos, [400, 500]);
+});
+
+test("#1444 rejects a tens-of-thousands size without mutating the node", () => {
+  const node = makeNode(1, { pos: [40, 60], size: [210, 80] });
+  const { fn, events } = setup([node]);
+  const beforeSize = [node.size[0], node.size[1]];
+  const beforePos = [node.pos[0], node.pos[1]];
+  // Reporter's LoadImage height. Must refuse before any write.
+  assert.throws(() => fn({ node_id: 1, size: [210, 49135.84375] }), /size/);
+  assert.deepEqual([node.size[0], node.size[1]], beforeSize);
+  assert.deepEqual([node.pos[0], node.pos[1]], beforePos);
+  assert.deepEqual(events, []);
+});
+
+test("#1444 rejects a billion-pixel position without mutating the node", () => {
+  const node = makeNode(1, { pos: [40, 60], size: [210, 80] });
+  const { fn, events } = setup([node]);
+  const beforePos = [node.pos[0], node.pos[1]];
+  assert.throws(() => fn({ node_id: 1, pos: [100, 1e9] }), /pos/);
+  assert.deepEqual([node.pos[0], node.pos[1]], beforePos);
+  assert.deepEqual(events, []);
+});
+
+test("#1444 setSize/onResize inflation is rolled back, not reported as success", () => {
+  const node = makeNode(1, { pos: [40, 60], size: [210, 80] });
+  const beforeSize = [node.size[0], node.size[1]];
+  node.setSize = () => {
+    // Image-preview / computeSize path that writes the reporter's LoadImage height.
+    node.size = [210, 49135.84375];
+  };
+  const { fn, events } = setup([node]);
+  assert.throws(() => fn({ node_id: 1, size: [400, 200] }), /size/);
+  assert.deepEqual([node.size[0], node.size[1]], beforeSize);
+  assert.deepEqual(events.filter((e) => e === "before" || e === "after"), ["before", "after"]);
 });
