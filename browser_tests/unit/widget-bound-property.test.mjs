@@ -225,6 +225,41 @@ test("a bound NUMERIC widget the node normalizes still succeeds", () => {
   assert.deepEqual(set.bound_property, { name: "size", previous: 512 });
 });
 
+test("a bound widget whose `value` is an ACCESSOR still verifies", () => {
+  // ComfyUI's DOM widgets define `value` as an accessor —
+  // `set value(v) { options.setValue?.(v); callback?.(this.value) }` — so `setProperty`'s
+  // copy-back runs that setter a second time. The write must still verify, and the
+  // widget's own callback must not be able to turn the extra invocation into a failure.
+  // Counted, because the count is the thing that changes for a BOUND widget, and it is
+  // the same count `BaseWidget.setValue` produces for an on-canvas edit of one.
+  let store = "old";
+  let callbacks = 0;
+  const widget = {
+    name: "prompt",
+    type: "customtext",
+    options: { property: "prompt", getValue: () => store, setValue: (v) => (store = v) },
+    callback() {
+      callbacks += 1;
+    },
+    get value() {
+      return this.options.getValue();
+    },
+    set value(v) {
+      this.options.setValue(v);
+      this.callback?.(this.value);
+    },
+  };
+  const node = { id: 3, type: "DomBacked", properties: { prompt: "old" }, widgets: [widget], setProperty };
+
+  const set = applyWidgetWrite(node, "prompt", "new", HOOKS);
+
+  assert.equal(set.value, "new");
+  assert.equal(store, "new");
+  assert.equal(node.properties.prompt, "new");
+  assert.deepEqual(set.bound_property, { name: "prompt", previous: "old" });
+  assert.equal(callbacks, 3);
+});
+
 test("an unrelated failure still rolls the bound property back", () => {
   // The widget's own callback reverts the value, so the write fails on the #240 check.
   // The property must not be left carrying the new value after that rollback.
