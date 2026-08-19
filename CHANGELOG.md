@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- `panel_edit_group({bounds})` writes the group box only — contained nodes stay at their canvas coordinates (#1306)
 - an already-full origin can save workflow drafts again after the chat-history quota fix (#1305)
 - a group that encloses rgthree Label nodes now moves, instead of being refused because those nodes' visual bounds are not the panel's generic footprint — the same nodes already moved fine one-by-one with panel_edit_node (#1300)
 - a subgraph preview widget is promoted through the frontend's previewExposure store, and a failed link-only promote no longer hides behind a missing promotion store (#1271)

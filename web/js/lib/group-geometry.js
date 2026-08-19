@@ -1160,6 +1160,87 @@ export function placeReroute(r, x, y) {
 }
 
 /**
+ * Snapshot every node position, every other group box, and every reroute on
+ * the graph, then put them back. A box-only bounds write must not be a group
+ * drag (#1306): some frontends couple `pos` / `_bounding` writes to
+ * LGraphGroup.move(), which translates the cached `_children` set.
+ *
+ * The snapshot is the WHOLE graph, not just current geometric members. A stale
+ * `_children` cache can still include nodes that have left the box, and those
+ * would ride along if we only pinned the live members.
+ *
+ * NEVER THROWS. Restore is best-effort per item — one unrestorable node must
+ * not stop the rest, and must not replace the caller's stated outcome with a
+ * raw TypeError.
+ */
+export function holdGraphItemPositions(graph, exceptGroup) {
+  const nodeSnap = [];
+  try {
+    for (const n of graph?._nodes ?? []) {
+      try {
+        const x = Number(n?.pos?.[0]);
+        const y = Number(n?.pos?.[1]);
+        if (Number.isFinite(x) && Number.isFinite(y)) nodeSnap.push([n, x, y]);
+      } catch {
+        /* unreadable node — skip */
+      }
+    }
+  } catch {
+    /* walk failed — restore what we captured */
+  }
+
+  const groupSnap = [];
+  try {
+    for (const other of graph?._groups ?? []) {
+      if (!other || other === exceptGroup) continue;
+      try {
+        const b = groupBoundsOf(other);
+        if (b) groupSnap.push([other, b]);
+      } catch {
+        /* unreadable box — skip */
+      }
+    }
+  } catch {
+    /* walk failed */
+  }
+
+  const rerouteSnap = [];
+  try {
+    for (const r of allReroutes(graph)) {
+      try {
+        const x = Number(r?.pos?.[0]);
+        const y = Number(r?.pos?.[1]);
+        if (Number.isFinite(x) && Number.isFinite(y)) rerouteSnap.push([r, x, y]);
+      } catch {
+        /* unreadable reroute — skip */
+      }
+    }
+  } catch {
+    /* walk failed */
+  }
+
+  return {
+    restore() {
+      restoreNodePositions(nodeSnap);
+      for (const [g, quad] of groupSnap) {
+        try {
+          restoreGroupBox(g, quad);
+        } catch {
+          /* never raise from a restore */
+        }
+      }
+      for (const [r, x, y] of rerouteSnap) {
+        try {
+          placeReroute(r, x, y);
+        } catch {
+          /* never raise from a restore */
+        }
+      }
+    },
+  };
+}
+
+/**
  * Translate reroute points by (dx, dy), reporting which ones actually moved.
  * Without this a moved group leaves its wire elbows behind and the links visibly
  * snake back to where the group used to be.
