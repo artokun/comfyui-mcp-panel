@@ -752,3 +752,37 @@ test("#1706 P0: two payload nodes COLLAPSING onto one live id is not a relabelin
   // ...and the collapse is not, even though every other check passes under it.
   assert.equal(definitionsDifferOnlyByRenumber(twoNodes(3, 4), twoNodes(40, 40), { rootNodes: [] }), false);
 });
+
+test("#1706 P0: an id whose only change is its TYPE is not a relabeling", () => {
+  // Adversarial re-review of this change, not a reported case. The map is keyed by
+  // String(id), so `78 -> "78"` reads as the identity — and once ANY definition in the
+  // block has relabeled, `id` is an allowed field on EVERY definition, so a definition
+  // whose ids only changed dialect would go completely unchecked. Pre-#1706 that case
+  // refused (the definition-level deep-equal compared `id`), and it still must.
+  const def = (id, over = {}) => ({
+    id: "sub-1",
+    name: "d",
+    state: { lastLinkId: 11, lastNodeId: 9 },
+    links: [],
+    nodes: [{ id, type: "VAEDecode", widgets_values: [] }],
+    ...over,
+  });
+  const moved = (a, b) => ({
+    subgraphs: [
+      { ...def(a), id: "sub-0", nodes: [{ id: a, type: "LoadImage", widgets_values: [] }] },
+      def(b),
+    ],
+  });
+  // Definition [0] genuinely relabels; definition [1]'s id only changes type.
+  const payload = moved(3, 9);
+  const live = moved(40, "9");
+  live.subgraphs[0].state = { lastLinkId: 11, lastNodeId: 40 };
+  live.subgraphs[1].state = { lastLinkId: 11, lastNodeId: 40 };
+  assert.equal(definitionsDifferOnlyByRenumber(payload, live, { rootNodes: [] }), false);
+  // The same shape with definition [1] left alone IS accounted, so the refusal above is
+  // the type change and nothing else.
+  const okLive = moved(40, 9);
+  okLive.subgraphs[0].state = { lastLinkId: 11, lastNodeId: 40 };
+  okLive.subgraphs[1].state = { lastLinkId: 11, lastNodeId: 40 };
+  assert.equal(definitionsDifferOnlyByRenumber(payload, okLive, { rootNodes: [] }), true);
+});

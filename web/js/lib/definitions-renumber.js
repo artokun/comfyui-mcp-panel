@@ -291,6 +291,13 @@ function buildNodeIdMap(nodesA, nodesB) {
     } catch {
       return null;
     }
+    // A "did not move" has to be an ACTUAL non-move. `mapRelabelsAnything` reads the map
+    // by string key, so `78` -> `"78"` would register as the identity — and once ANY
+    // definition in the block relabels, `id` is an allowed field, and a definition whose
+    // ids only changed TYPE would then go completely unchecked. Refuse instead: an id
+    // whose dialect changed is not something this file has characterised, and refusing
+    // reproduces the pre-#1706 answer for it exactly.
+    if (keyFrom === keyTo && from !== to) return null;
     if (map.has(keyFrom) || usedTargets.has(keyTo)) return null;
     map.set(keyFrom, to);
     usedTargets.add(keyTo);
