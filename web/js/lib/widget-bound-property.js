@@ -138,11 +138,15 @@ export function boundPropertyState(node, widget) {
  * `onPropertyChanged` returning false is the documented way, but a property accessor
  * or a later hook can produce the same observation.
  */
-export function boundPropertyFailure({ property, widgetName, nodeId, expected, actual }) {
+export function boundPropertyFailure({ property, widgetName, nodeId, expected, actual, unreadable }) {
+  // An unreadable property is reported as unreadable, never rendered as a value. A
+  // throwing accessor and a property genuinely holding `undefined` are different facts,
+  // and JSON.stringify collapses both to the same text.
+  const observed = unreadable ? "unreadable (reading it threw)" : `${JSON.stringify(actual)}`;
   return (
     `Widget "${widgetName}" on node ${nodeId} is bound to that node's own property ` +
     `"${property}" (\`options.property\`), and the property did not take the requested ` +
-    `value: wrote ${JSON.stringify(expected)} but it is ${JSON.stringify(actual)}. ` +
+    `value: wrote ${JSON.stringify(expected)} but it is ${observed}. ` +
     `LiteGraph copies that property back into the widget on the next \`setProperty\`, so ` +
     `reporting success here would report a value the node is about to replace with the ` +
     `old one. Rolled back.`

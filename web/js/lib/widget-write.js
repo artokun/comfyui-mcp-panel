@@ -1,6 +1,11 @@
 import { pressableWidgetHint } from "./pressable-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
+import {
+  boundPropertyFailure,
+  boundPropertyState,
+  boundPropertyUnverifiedNote,
+} from "./widget-bound-property.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
 // property off the callback itself (a poisoned `.call` getter or a Proxy trap would
@@ -1441,6 +1446,16 @@ export function applyWidgetWrite(
   // caught structurally, mirroring the rail's rollback rigor.
   const previousDisplays = displayWidgets.map((dw) => dw.value);
   const previousDisplayClones = displayWidgets.map((dw) => deepClone(dw.value));
+  // #1268 / comfyui-mcp#1658 — the SECOND STORE this write has to keep in step, when
+  // litegraph declares one. `w.value` read back after `w.value = coerced` cannot tell a
+  // write that took effect from a write that landed on a view of state held elsewhere;
+  // a widget carrying `options.property` names that elsewhere itself. Classified BEFORE
+  // the envelope so the write, the verification and the rollback all act on ONE reading
+  // (`node.setProperty` mutates `properties`, so a second classification taken later
+  // would describe the state this write already produced). See widget-bound-property.js
+  // for the two litegraph paths that make the binding load-bearing.
+  const boundProperty = boundPropertyState(targetNode, w);
+  const previousPropertyClone = boundProperty?.reachable ? deepClone(boundProperty.previous) : undefined;
   // The ACTUAL serialization binding for an unlinked subgraph input is its
   // `widgetId` (the widget-value STORE key that queue compilation reads). A callback
   // could keep the SAME host input and projection objects but re-point `widgetId` to
@@ -1523,6 +1538,20 @@ export function applyWidgetWrite(
     // promoted value (no semantic callback of their own — the inner target's fires
     // once below), so we assign their value directly, same as the rail.
     for (const dw of displayWidgets) dw.value = coerced;
+    // #1268 / comfyui-mcp#1658 — drive the BOUND PROPERTY, in litegraph's own position:
+    // `BaseWidget.setValue` assigns the widget, then calls `node.setProperty(...)`, then
+    // fires the callback. Placed here so a programmatic write leaves the node in the SAME
+    // state an on-canvas edit leaves it in — rather than in the half-updated state that
+    // reads back clean and is overwritten by the node's next `setProperty`.
+    //
+    // Inside the SAME undo envelope as the value assignments, so this cannot land while
+    // the widget write rolls back. `setProperty` copies the value into the bound widget as
+    // its last step; `w.value` is already `coerced`, so that copy is a no-op assignment.
+    //
+    // A throw from here is captured by the same catch as everything else in this envelope
+    // and stays UNATTRIBUTED — `onPropertyChanged` is a node's own code and this is not
+    // the widget-callback invocation #976 can name.
+    if (boundProperty?.reachable) targetNode.setProperty(boundProperty.property, coerced);
     // Fire the inner widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
     //
@@ -1592,6 +1621,25 @@ export function applyWidgetWrite(
   let driftFailure = false;
   let writeWarning = null;
   let threwFrame = null;
+  // #1268 — read the bound property TOTALLY. It is ordinary node state on every real
+  // node, but `properties` can be swapped for a Proxy or the key defined as a throwing
+  // accessor by a callback that ran inside the envelope above, and a verification that
+  // throws would escape past the rollback with the write left applied. A read that could
+  // not be taken yields a sentinel that matches nothing, so the write fails CLOSED and
+  // rolls back rather than being reported as verified.
+  const UNREADABLE_PROPERTY = Symbol("bound property unreadable");
+  const readBoundProperty = () => {
+    try {
+      const props = targetNode.properties;
+      if (!props || typeof props !== "object") return UNREADABLE_PROPERTY;
+      return props[boundProperty.property];
+    } catch {
+      return UNREADABLE_PROPERTY;
+    }
+  };
+  // Read ONCE, after the envelope closed. Two reads of a stateful accessor can disagree,
+  // and the verdict and the message it prints must be the same observation.
+  const boundPropertyActual = boundProperty?.reachable ? readBoundProperty() : undefined;
   // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
   // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
   // exactly its job (min 1 / step 2 snaps 4096 -> 4097) was reported as "did not
@@ -1616,6 +1664,29 @@ export function applyWidgetWrite(
       // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
       // that would have worked. Diagnosis, never a gate.
       describeNonValueBearingWidget(w, targetNode);
+  } else if (boundProperty?.reachable && !matchesExpected(boundPropertyActual)) {
+    // #1268 / comfyui-mcp#1658 — the widget kept the value and the node's own bound
+    // property did NOT. This is the read the old verification never took: `w.value` came
+    // back equal to what was assigned to it two statements earlier, which is true whether
+    // or not the write reached anything the node reads.
+    //
+    // Compared against `expected` — the value that was WRITTEN to the property — and not
+    // against `w.value`. That distinction is what keeps a legitimate write passing: when a
+    // widget callback normalizes `w.value` (a numeric grid snapping 4096 to 4097, #805),
+    // the property still holds 4096 and the two stores diverge, but an ON-CANVAS edit
+    // leaves them diverged in exactly the same way — litegraph's `BaseWidget.setValue`
+    // calls `setProperty` BEFORE the callback runs. Failing there would refuse a write the
+    // UI itself performs. What this branch catches is the property not holding what was
+    // written to it at all: `onPropertyChanged` returning false, which litegraph documents
+    // as the abort signal and honours by restoring the previous value.
+    failure = boundPropertyFailure({
+      property: boundProperty.property,
+      widgetName: w.name,
+      nodeId: targetNode.id,
+      expected,
+      actual: boundPropertyActual,
+      unreadable: boundPropertyActual === UNREADABLE_PROPERTY,
+    });
   } else if (parentWidget && !matchesExpected(parentWidget.value)) {
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
@@ -1841,6 +1912,18 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
+      // #1268 — restore the BOUND PROPERTY before the widget values, through the same
+      // `setProperty` litegraph uses, so the node's own `onPropertyChanged` sees the
+      // rollback the way it sees any other property change. Its last step copies the
+      // restored value into the bound widget, and `w.value = previous` follows, so the
+      // widget ends on its own captured value either way.
+      if (boundProperty?.reachable) {
+        try {
+          targetNode.setProperty(boundProperty.property, boundProperty.previous);
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
       try {
         w.value = previous;
       } catch {
@@ -1871,6 +1954,19 @@ export function applyWidgetWrite(
     // object IN PLACE (which an identity compare would miss), are ALL detected.
     let rollbackFailed = null;
     if (!structurallyEqual(w.value, previousClone)) rollbackFailed = `inner "${w.name}"`;
+    // #1268 — the bound property must be back to its captured value too. A node whose
+    // `onPropertyChanged` refuses the write ALSO refuses the restore, which leaves the
+    // node holding a value neither the caller nor the previous state asked for; that is
+    // an honest partial state and is reported as one rather than hidden behind a clean
+    // rollback. Compared structurally against the pre-mutation clone, exactly as the
+    // widget values are, so a hook mutating a restored object in place is caught.
+    if (boundProperty?.reachable) {
+      const restored = readBoundProperty();
+      if (restored === UNREADABLE_PROPERTY || !structurallyEqual(restored, previousPropertyClone)) {
+        const label = `bound property "${boundProperty.property}"`;
+        rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
+      }
+    }
     if (parentWidget && !structurallyEqual(parentWidget.value, previousParentClone)) {
       rollbackFailed = rollbackFailed
         ? `${rollbackFailed} and rail "${parentWidget.name}"`
@@ -2026,6 +2122,37 @@ export function applyWidgetWrite(
           // a check that did not happen. The cross-check above is what establishes it, and
           // only a match on the serializing rail counts — never a #477 display proxy.
           ...(railValidated ? { promoted_rail_validated: true } : {}),
+        }
+      : {}),
+    // #1268 / comfyui-mcp#1658 — WHAT THE VERIFICATION ACTUALLY ESTABLISHED for a widget
+    // litegraph binds to one of its node's own properties. Two mutually exclusive shapes,
+    // and the second is the whole point of this pair of issues:
+    //
+    //   bound_property             the property was driven with `setProperty` and READ BACK
+    //                              holding the written value. The effect is established, not
+    //                              just the assignment.
+    //   bound_property_unverified  the node declares the property but exposes no way to
+    //                              drive or read it from here. The widget's stored value was
+    //                              verified and the value the NODE reads was not — reported
+    //                              as UNKNOWN on a successful write, because "success" for a
+    //                              value that may be about to be replaced is the false claim
+    //                              both reporters received, and a refusal would block writes
+    //                              that are very likely fine.
+    //
+    // Neither field appears for a widget with no `options.property`, which is every stock
+    // ComfyUI widget built from /object_info — those replies are byte-identical to before.
+    ...(boundProperty?.reachable
+      ? { bound_property: { name: boundProperty.property, previous: boundProperty.previous } }
+      : {}),
+    ...(boundProperty && !boundProperty.reachable
+      ? {
+          bound_property_unverified: { name: boundProperty.property, reason: boundProperty.reason },
+          bound_property_note: boundPropertyUnverifiedNote({
+            property: boundProperty.property,
+            widgetName: w.name,
+            nodeId: targetNode.id,
+            reason: boundProperty.reason,
+          }),
         }
       : {}),
     // #507/#1126 — the empty-list acceptance is what admitted the value. Reported here so a
