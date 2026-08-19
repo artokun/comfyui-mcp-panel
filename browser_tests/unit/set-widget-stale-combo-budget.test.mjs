@@ -30,6 +30,7 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "../../web/js/lib/object-info-oracle.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "../../web/js/lib/rgthree-lora-row.js";
+import { inputAssetViewQuery } from "../../web/js/lib/input-asset.js";
 import {
   PANEL_SRC,
   setWidgetCommandBudgetDeps,
@@ -222,6 +223,10 @@ const EXECUTOR_DEPS = [
   // coalescer, so the value captured at build time is exactly what that read must see:
   // the in-flight run a test started before dispatching the command.
   "nodeDefRefreshInFlight",
+  // #1357 — confirmServerAsset builds the /view query with this free name. Leaving it
+  // out of the eval harness throws ReferenceError, the catch returns false, fetchApi
+  // never runs, and #1418's hung-probe assertion reads as "skipped" instead of bounded.
+  "inputAssetViewQuery",
 ];
 
 function deferred() {
@@ -348,6 +353,7 @@ function realGraphSetWidget({
     // Captured AFTER the held-open run above has taken the slot — the value the shipped
     // refreshCombos reads before it calls the coalescer.
     nodeDefRefreshInFlight: inFlight,
+    inputAssetViewQuery,
   };
   const factory = new Function(
     ...EXECUTOR_DEPS,
