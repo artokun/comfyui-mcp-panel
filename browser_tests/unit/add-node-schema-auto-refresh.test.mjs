@@ -279,7 +279,20 @@ test("#1242: the reporter's add succeeds in one call — the panel refreshes fir
   assert.equal(comfy.graph._nodes.length, 1);
   assert.equal(refreshCalls.length, 1, "exactly one refresh — the recovery, not a retry storm");
   assert.equal(refreshCalls[0].defs, undefined, "the refresh is the whole-schema forced one");
-  assert.deepEqual(refreshCalls[0].opts, { force: true });
+  assert.equal(refreshCalls[0].opts.force, true, "the recovery is the forced whole-schema one");
+  // #1192 — and it is BOUNDED now. This recovery awaits any refresh already in flight before
+  // queueing its own; unbounded that wait is the composition defect #1192 is about, arriving
+  // at the one await inside this command that named no bound. Asserting the bound EXISTS is
+  // stronger than the literal `{ force: true }` this replaces, which could not see it.
+  assert.ok(
+    Number.isFinite(refreshCalls[0].opts.joinMs) && refreshCalls[0].opts.joinMs > 0,
+    "the drift recovery's wait must be bounded by what the command has left",
+  );
+  assert.deepEqual(
+    Object.keys(refreshCalls[0].opts).sort(),
+    ["force", "joinMs"],
+    "…and nothing else is passed",
+  );
 });
 
 test("#1242: the recovery is disclosed on the result, not silent", async () => {
