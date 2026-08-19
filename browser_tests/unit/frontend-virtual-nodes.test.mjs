@@ -313,3 +313,215 @@ test("#1648 CALL SITE 3 WIRING: the registry is diagnosis only — the refusal i
   assert.match(block, /if \(badIds\.length\) \{/);
   assert.equal((block.match(/registered_node_types/g) ?? []).length, 1);
 });
+
+// ── #1370: the COUNT is filtered with the names, and only by a REAL removal ──────
+//
+// The filter above only ever touched the type LIST. The collector also returns
+// `nodeCount` (ComfyUI's own `missingNodeCount`) and computes `any` from it, so
+// `{ nodeTypes: [], nodeCount: 2, any: true }` was reachable — and both surfaces that
+// read the bare count then raised an alarm with the names stripped out: graph_get_errors'
+// `missing_node_count: 2` and the banner's "2 node type(s) not installed on this ComfyUI".
+//
+// Driven against the SHIPPED collector, extracted from the panel source and executed —
+// a re-implementation here would pass while production kept the old tuple.
+//
+// The pair that must stay distinguishable is A vs D: "every recorded name was proven
+// frontend-virtual" and "the record named nothing at all" were byte-identical on the
+// collector's output, and only the first is safe to suppress. D is the state the
+// pre-existing `missingNodeCount && !missingNodeTypes.length` consumer branch reports,
+// so it is kept, not deleted.
+
+function extractPanelFn(sig) {
+  const start = PANEL.indexOf(sig);
+  assert.notEqual(start, -1, `${sig} not found in the panel source`);
+  const open = PANEL.indexOf(") {", start) + 1;
+  let depth = 0;
+  for (let i = open; i < PANEL.length; i += 1) {
+    const ch = PANEL[i];
+    if (ch === "/" && PANEL[i + 1] === "/") {
+      i = PANEL.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && PANEL[i + 1] === "*") {
+      i = PANEL.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < PANEL.length; i += 1) {
+        if (PANEL[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (PANEL[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return PANEL.slice(start, i + 1);
+  }
+  throw new Error(`unterminated: ${sig}`);
+}
+
+const COLLECTOR_BODY = extractPanelFn("function collectMissingAssets(trustComboOverride) {");
+
+/**
+ * Run the shipping collector against a real `missingNodesError` store shape.
+ * `record` is the store's own load-time list; `nodes` is the live graph.
+ */
+function runCollector({ record, count, nodes = [], readableGraph = true }) {
+  const stores = {
+    missingModel: { missingModelCandidates: [] },
+    missingMedia: { missingMediaCandidates: [] },
+    missingNodesError: {
+      hasMissingNodes: true,
+      missingNodeCount: count,
+      missingNodesError: record,
+    },
+  };
+  const factory = new Function(
+    "getPiniaStore",
+    "isStaleAssetCandidate",
+    "resolveMissingModelDirectory",
+    "withoutFrontendVirtualTypes",
+    "collectAllGraphs",
+    "getGraphCtx",
+    `return (${COLLECTOR_BODY});`,
+  );
+  const collect = factory(
+    (name) => stores[name],
+    () => false,
+    (d) => d,
+    withoutFrontendVirtualTypes,
+    (g) => (g ? [g] : []),
+    () => {
+      if (!readableGraph) throw new Error("no graph");
+      return { rootGraph: { _nodes: nodes } };
+    },
+  );
+  const r = collect();
+  return { nodeTypes: r.nodeTypes, nodeCount: r.nodeCount, any: r.any };
+}
+
+test("#1370 A: every recorded type proven frontend-virtual — the count goes with the names", () => {
+  assert.deepEqual(
+    runCollector({
+      record: [{ type: "SetNode" }, { type: "GetNode" }],
+      count: 2,
+      nodes: [virtualNode(1, "SetNode"), virtualNode(2, "GetNode")],
+    }),
+    { nodeTypes: [], nodeCount: 0, any: false },
+  );
+});
+
+test("#1370 D: a record that named NOTHING keeps its count — unknown stays representable", () => {
+  // The panel could not read the record's shape (a Map, an unexpected object) while the
+  // store still says two nodes are missing. Collapsing this into A would report a broken
+  // canvas as clean — the count is the only evidence left.
+  assert.deepEqual(runCollector({ record: [], count: 2, nodes: [virtualNode(1, "SetNode")] }), {
+    nodeTypes: [],
+    nodeCount: 2,
+    any: true,
+  });
+  assert.deepEqual(runCollector({ record: new Map([["SetNode", {}]]), count: 2, nodes: [] }), {
+    nodeTypes: [],
+    nodeCount: 2,
+    any: true,
+  });
+});
+
+test("#1370 F: an entry the parser could not name keeps the count alive", () => {
+  // One record names a virtual type, the other names nothing at all. Nothing was proven
+  // about the second, so suppressing the whole count on the first would hide it.
+  assert.deepEqual(
+    runCollector({
+      record: [{ type: "SetNode" }, { unreadable: 1 }],
+      count: 2,
+      nodes: [virtualNode(1, "SetNode")],
+    }),
+    { nodeTypes: [], nodeCount: 2, any: true },
+  );
+});
+
+test("#1370 the fail-closed directions are untouched: a real miss keeps count AND names", () => {
+  // B — same types, but the pack's JS never loaded in this tab, so they are placeholders.
+  assert.deepEqual(
+    runCollector({
+      record: [{ type: "SetNode" }, { type: "GetNode" }],
+      count: 2,
+      nodes: [placeholderNode(1, "SetNode"), placeholderNode(2, "GetNode")],
+    }),
+    { nodeTypes: ["SetNode", "GetNode"], nodeCount: 2, any: true },
+  );
+  // C — one of each: the survivor keeps the alarm named, so the count is never surfaced.
+  assert.deepEqual(
+    runCollector({
+      record: [{ type: "SetNode" }, { type: "GetNode" }],
+      count: 2,
+      nodes: [virtualNode(1, "SetNode"), placeholderNode(2, "GetNode")],
+    }),
+    { nodeTypes: ["GetNode"], nodeCount: 2, any: true },
+  );
+  // E — an unreadable graph proves nothing virtual, so nothing is suppressed either.
+  assert.deepEqual(
+    runCollector({
+      record: [{ type: "SetNode" }, { type: "GetNode" }],
+      count: 2,
+      nodes: [virtualNode(1, "SetNode"), virtualNode(2, "GetNode")],
+      readableGraph: false,
+    }),
+    { nodeTypes: ["SetNode", "GetNode"], nodeCount: 2, any: true },
+  );
+});
+
+test("#1370 CONSUMER WIRING: both count-readers zero only on an ACTUAL removal", () => {
+  // #1332 zeroes the count when the adjudication drops every type the client can now
+  // construct. Ungated, that same line ALSO fires when the recorded list was empty from
+  // the start (case D), turning "N missing, names unknown" into a clean payload.
+  assert.equal(
+    (PANEL.match(/if \(recordedTypes\.length && !assets\.nodeTypes\.length\) assets\.nodeCount = 0;/g) ?? []).length,
+    1,
+    "graph_get_errors must gate the #1332 zeroing on a real removal",
+  );
+  assert.equal(
+    (PANEL.match(/if \(recordedTypes\.length && !missing\.nodeTypes\.length\) missing\.nodeCount = 0;/g) ?? []).length,
+    1,
+    "the turn-start banner must gate it the same way",
+  );
+  assert.doesNotMatch(PANEL, /if \(!assets\.nodeTypes\.length\) assets\.nodeCount = 0;/);
+  assert.doesNotMatch(PANEL, /if \(!missing\.nodeTypes\.length\) missing\.nodeCount = 0;/);
+  // `recordedTypes` must be what the adjudication was GIVEN. A post-assignment re-read
+  // is always the narrowed list, so the gate would never fire and #1332 would regress.
+  for (const holder of ["assets", "missing"]) {
+    const at = PANEL.indexOf(`const recordedTypes = ${holder}.nodeTypes;`);
+    assert.ok(at > 0, `${holder}: the pre-adjudication capture must exist`);
+    const after = PANEL.slice(at, at + 400);
+    assert.match(
+      after,
+      /adjudicateRecordedMissingNodeTypes\(\r?\n\s+recordedTypes,/,
+      `${holder}: the captured list must be the one adjudicated`,
+    );
+    assert.ok(
+      after.indexOf(`${holder}.nodeTypes = adjudicated.stillMissing;`) >
+        after.indexOf("adjudicateRecordedMissingNodeTypes("),
+      `${holder}: the capture must precede the narrowing assignment`,
+    );
+  }
+});
+
+test("#1370 the bare-count branch is KEPT — it is how an unnamed miss reaches an agent", () => {
+  // Deleting the trigger would have been the other half of the same bug: with the count
+  // now honest, a surviving count means "missing, names unreadable", which must still be
+  // reported. Both consumers keep their branch.
+  assert.ok(
+    PANEL.includes("...(missingNodeCount && !missingNodeTypes.length"),
+    "graph_get_errors must still emit missing_node_count for an unnamed miss",
+  );
+  assert.ok(
+    PANEL.includes("} else if (missing.nodeCount) {"),
+    "the turn-start banner must still report an unnamed miss",
+  );
+});

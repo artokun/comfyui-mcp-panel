@@ -9102,6 +9102,12 @@ function collectMissingAssets(trustComboOverride) {
           ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
           : [];
       nodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
+      // Captured BEFORE the frontend-virtual filter below (#1370): what the load-time
+      // record actually NAMED, and how many of its entries the parser could not name at
+      // all. The suppression after the filter needs both to tell "every name was proven
+      // virtual" apart from "there were never any names".
+      const recordedTypeCount = nodeTypes.length;
+      const unnamedRecordCount = pool.filter((m) => !asType(m)).length;
       // comfyui-mcp#1657 / panel#1284 — a FRONTEND VIRTUAL node is not a missing one.
       //
       // `missingNodesError` is a LOAD-TIME snapshot the frontend never re-evaluates
@@ -9137,6 +9143,30 @@ function collectMissingAssets(trustComboOverride) {
       } catch {
         /* no readable graph → nothing is proven virtual → every type stays reported */
       }
+      // panel#1370 — the COUNT must not outlive the names it was counting.
+      //
+      // The filter above only ever touched the type LIST, so
+      // `{ hasMissingNodes: true, missingNodeCount: 2, nodeTypes: [] }` was reachable and
+      // was measured on a canvas whose two recorded types were both frontend-virtual.
+      // Both surfaces that read the bare count then raised an alarm with the names
+      // stripped out — graph_get_errors' `missing_node_count: 2` and the turn-start
+      // banner's "2 node type(s) not installed on this ComfyUI" — which is NARROWER than
+      // the pre-filter message that at least named them.
+      //
+      // Suppressed HERE, in the shared collector, for the same reason the list is: this
+      // is the one collector graph_get_errors, the turn-start banner and the
+      // stale-red-flag adjudication read, and this family recurred three times precisely
+      // because each call site decided separately.
+      //
+      // TWO conditions, because a bare count is not noise in general. A count with no
+      // names is exactly how "the store says N nodes are missing and the panel could not
+      // read the record's shape" reaches an agent — the state the pre-existing
+      // `missingNodeCount && !missingNodeTypes.length` consumer branch was written to
+      // report, and the only signal left in it. So the count is dropped only when the
+      // record DID name types (the count has a known referent) and every named record was
+      // proven virtual. An entry the parser could not name keeps the count alive, because
+      // nothing about it was proven.
+      if (recordedTypeCount && !nodeTypes.length && !unnamedRecordCount) nodeCount = 0;
     }
   } catch {
     /* optional */
@@ -9521,14 +9551,17 @@ async function validationBanner() {
   try {
     const { rootGraph: bannerRoot } = getGraphCtx();
     const allNodes = collectAllGraphs(bannerRoot).flatMap((g) => g?._nodes ?? []);
+    const recordedTypes = missing.nodeTypes;
     const adjudicated = adjudicateRecordedMissingNodeTypes(
-      missing.nodeTypes,
+      recordedTypes,
       allNodes,
       (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
     );
     missing.nodeTypes = adjudicated.stillMissing;
     bannerStalePlaceholders = adjudicated.stalePlaceholders;
-    if (!missing.nodeTypes.length) missing.nodeCount = 0;
+    // Same gate as graph_get_errors (panel#1370): an empty recorded list was never
+    // narrowed by the adjudication, so its count is an unnamed miss, not a cleared one.
+    if (recordedTypes.length && !missing.nodeTypes.length) missing.nodeCount = 0;
   } catch {
     bannerStalePlaceholders = [];
   }
@@ -15441,14 +15474,21 @@ const GRAPH_TOOL_EXECUTORS = {
     let stalePlaceholders = [];
     try {
       const allNodes = collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []);
+      const recordedTypes = assets.nodeTypes;
       const adjudicated = adjudicateRecordedMissingNodeTypes(
-        assets.nodeTypes,
+        recordedTypes,
         allNodes,
         (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
       );
       assets.nodeTypes = adjudicated.stillMissing;
       stalePlaceholders = adjudicated.stalePlaceholders;
-      if (!assets.nodeTypes.length) assets.nodeCount = 0;
+      // #1332 drops the count when the adjudication removes every type the client can
+      // now construct, so it cannot keep alarming for names that are no longer reported.
+      // panel#1370 — gate that on the adjudication having ACTUALLY removed something. An
+      // empty recorded list means the store named nothing to begin with, and the count is
+      // then the only evidence that anything is missing; zeroing it there turns "N
+      // missing, names unknown" into "no errors recorded since the last execution start".
+      if (recordedTypes.length && !assets.nodeTypes.length) assets.nodeCount = 0;
     } catch {
       /* unreadable registry → keep the load-time list (fail closed) */
       stalePlaceholders = [];
