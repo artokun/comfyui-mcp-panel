@@ -470,6 +470,7 @@ import {
   snapshotBackendDef,
 } from "./lib/add-node-widget-guard.js";
 import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
+import { ackVisibleCanvasMutation, withVisibleCanvasAck } from "./lib/visible-canvas-ack.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
@@ -22010,6 +22011,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // has been handed to the socket below, so a large nested subgraph cannot
         // turn an already-applied graph_connect into a false timeout.
         let changeTrackerToSnapshot = null;
+        // #1443 — capture the graph/canvas the fence proved, so a successful
+        // mutation can dirty THAT canvas after the executor (graph.setDirtyCanvas
+        // only walks list_of_graphcanvas, which can omit the visible one).
+        let visibleMutationTarget = null;
         try {
           let result;
           if (msg.cmd === "ask_user") {
@@ -22276,8 +22281,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               flushPendingChangeTrackerSnapshot(
                 app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null,
               );
-              const { graph, rootGraph } = getGraphCtx();
+              const { graph, rootGraph, canvas } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
+              if (graphCommandMayMutateWorkflow(msg.cmd)) {
+                visibleMutationTarget = { graph, canvas };
+              }
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor
@@ -22350,6 +22358,22 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               }
             }
             result = await executor(msg);
+            // #1443 — the executor mutated LiteGraph (and outline will agree).
+            // Tell the ACTIVE canvas, bump the revision Vue nodes paint from,
+            // and disclose if that canvas never acknowledged. A miss is not a
+            // refusal: the graph already changed, and a false "nothing applied"
+            // invites a destructive retry.
+            if (visibleMutationTarget && graphCommandMayMutateWorkflow(msg.cmd)) {
+              const ack = ackVisibleCanvasMutation({
+                graph: visibleMutationTarget.graph,
+                canvas: visibleMutationTarget.canvas ?? app?.canvas,
+                vueNodes: vueNodesActive(
+                  (id) => getSetting(id),
+                  window.LiteGraph ?? globalThis.LiteGraph,
+                ),
+              });
+              result = withVisibleCanvasAck(result, ack);
+            }
             // ComfyUI's ChangeTracker snapshots on USER input events only —
             // graph.beforeChange/afterChange is not wired into it, so bridge-driven
             // mutations were invisible to undo (Ctrl+Z did nothing). An explicit
