@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { writePoint } from "../../web/js/lib/group-geometry.js";
 import {
   VISIBLE_CANVAS_ACK_NOTE,
   ackVisibleCanvasMutation,
@@ -255,6 +256,7 @@ function realGraphEditNode(getGraphCtx) {
     "railKindFor",
     "canonicalNodeId",
     "isQualifiedNodeId",
+    "writePoint",
     `const executors = { ${methodMatch[0]} }; return executors.graph_edit_node;`,
   );
   const graph = getGraphCtx().graph;
@@ -271,6 +273,7 @@ function realGraphEditNode(getGraphCtx) {
     () => null,
     canonicalNodeId,
     isQualifiedNodeId,
+    writePoint,
   );
 }
 
