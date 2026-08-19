@@ -959,8 +959,10 @@ function sizeDifferenceIsHeightOnly(expectedNodes, actualNodes) {
  * `widgets_values`, `properties`, `title`, `flags`, `mode`, `inputs` and `outputs`
  * are every one of them OUTSIDE `COSMETIC_NODE_FIELDS`, and `configure()` writes
  * them in the same pass as the cosmetic five — so a load that died mid-configure
- * answers false on the first node it reached. The discriminator that comment says
- * does not exist is WHICH FIELDS DIFFER, and the panel already computes it.
+ * answers false on the first node it reached. One discriminator that comment once said
+ * did not exist is WHICH FIELDS DIFFER, and the panel already computes it. (The other,
+ * an observation of the load itself, is `openContentDifferenceIsCompletedLoadNormalization`
+ * below.)
  *
  * It is deliberately NOT a widening of `RECOMPUTED_NODE_FIELDS`. That set licenses
  * "the content was reproduced", which is why it demands a characterised rewrite per
@@ -1017,7 +1019,8 @@ export function openContentDifferenceIsPresentationOnly({ comparable, surfaces, 
  * `resolveOpenRebindVerdict` states exactly one mechanism for why a content
  * difference might mean data loss: `loadGraphData` catches a mid-`configure()` throw
  * and returns, leaving the node id/type set and the marker over nodes that lost their
- * values. It then says no discriminator separates that from normalization.
+ * values. Before panel#1283/#1358 it added that no discriminator separates that from
+ * normalization; that sentence is gone from it now and points back here instead.
  *
  * There is one, and the panel already owns half of it. `installNodeConfigureIsolation`
  * (#1260) records every per-node `configure` throw; `installGraphConfigureWatch`
@@ -1790,20 +1793,32 @@ export const OPEN_REBIND_STATUS = Object.freeze({
  * from the bytes handed in. It is therefore genuinely a false negative to deny the
  * OPEN for it, and softening it was tried here.
  *
- * It was reverted, because the two cases cannot currently be told apart. LiteGraph
- * creates every node (with its id and type) and THEN configures each one, and
- * `loadGraphData` catches a `configure()` failure and returns. A throw in that
+ * It was reverted the first time, because the two cases could not then be told apart.
+ * LiteGraph creates every node (with its id and type) and THEN configures each one,
+ * and `loadGraphData` catches a `configure()` failure and returns. A throw in that
  * second pass leaves the complete node id/type set, the links, and the panel's
  * marker — written by `_configureBase` before any node is built — over nodes that
  * silently LOST their widget values and properties. That is byte-for-byte the same
- * observation as "the loader normalized the widget values", and no discriminator
- * available to the panel separates them. Reporting it as a completed open would
- * fabricate a success over data loss, which is worse than the false negative.
+ * observation as "the loader normalized the widget values". Reporting it as a
+ * completed open would fabricate a success over data loss, which is worse than the
+ * false negative.
  *
- * So `unknown` stays `unknown` here — deliberately, and it is the honest answer to a
- * question this code cannot settle. What the status split buys is that the
- * DISCLOSURE can now say the binding IS proven and only the content is unconfirmed,
- * instead of implying the canvas may be the wrong workflow.
+ * THE DISCRIMINATOR NOW EXISTS (panel#1283 / #1358), and it is not a field-name
+ * judgement — it is an observation of THIS load. `installNodeConfigureIsolation` and
+ * `installGraphConfigureWatch` (web/js/lib/load-restore-isolation.js) wrap the only
+ * two places the restore can abort, `loadRestoreCompleted` folds them into
+ * true/false/null, and `openContentDifferenceIsCompletedLoadNormalization` (above)
+ * consumes it. In one line: **a mid-`configure()` abort is a THROW, and a load whose
+ * throws the panel watched for and did not see did not abort.** Only an explicit
+ * `true` licenses anything — `false` (something threw) and `null` (the watch was
+ * absent, or installed on a method this frontend's restore never called) both keep
+ * the old, refusing path.
+ *
+ * `resolveOpenRebindVerdict` itself is unchanged and still says `unknown` on
+ * `contentMatches !== true`: the discriminator is applied UPSTREAM, where the content
+ * proof is computed, so what arrives here is already the answer. What the status split
+ * buys is that the DISCLOSURE can say the binding IS proven and only the content is
+ * unconfirmed, instead of implying the canvas may be the wrong workflow.
  *
  * Every part is compared against `true` explicitly: an unreadable observation
  * arrives as null/undefined and must count as NOT proven, never as proven.
