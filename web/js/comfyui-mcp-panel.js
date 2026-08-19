@@ -34883,9 +34883,8 @@ function buildPanel() {
       return;
     }
     recognition = new SR();
-    // Dictate in the language the PANEL is speaking (#1289): currentLocale() already
-    // encodes the explicit panel setting → ComfyUI locale → navigator precedence, so
-    // the browser's own language is only a fallback for an unresolved panel.
+    // #1289 / #1329: voiceRecognitionLang prefers a real panel locale, but will not
+    // let the shipped-UI "en" floor override a non-English spoken language.
     recognition.lang = voiceRecognitionLang({ panelLocale: currentLocale(), browserLang: navigator.language });
     recognition.continuous = true;
     recognition.interimResults = false;
