@@ -785,6 +785,49 @@ test("findLandedRailLink: excluded (pre-existing) ids are never credited to this
   assert.equal(findLandedRailLink(graph, rail, node, 0, "output", linkIdExclusionSet([4])), null);
 });
 
+// ---------------------------------------------------------------------------
+// A caller-supplied Set must be NORMALISED, not trusted.
+//
+// Both finders used to short-circuit on `excludeIds instanceof Set` and use the
+// caller's Set verbatim. Membership is asked as `skip.has(String(linkId))`, so a
+// Set of RAW NUMBERS — the shape any caller gets from `new Set(railSlot.linkIds)`
+// or `new Set(inputLinkIds(node))`, since both id readers deliberately return raw
+// ids — matched NOTHING: the exclusion evaporated and a link that existed BEFORE
+// the mutation was credited to the current call. That is the same string/number
+// key mismatch this file already recovered from once, arriving from the other
+// side; `linkIdExclusionSet` is now the unconditional gate on both paths.
+// ---------------------------------------------------------------------------
+
+test("both finders normalise a caller-supplied Set — a RAW-number Set still excludes", () => {
+  const rail = { linkIds: [4] };
+  const node = { id: 9 };
+  const railGraph = {
+    links: { 4: { id: 4, origin_id: 9, origin_slot: 0, target_id: -20, target_slot: 0 } },
+  };
+  // Pre-condition: link 4 IS on the rail and IS found when nothing is excluded.
+  assert.deepEqual(findLandedRailLink(railGraph, rail, node, 0, "output", null), { linkId: 4 });
+  // Excluding it as a raw-number Set must suppress it exactly as an array does.
+  assert.equal(findLandedRailLink(railGraph, rail, node, 0, "output", new Set([4])), null);
+  assert.equal(findLandedRailLink(railGraph, rail, node, 0, "output", new Set(["4"])), null);
+
+  // The inbound finder leaks identically without normalisation.
+  const inboundGraph = {
+    links: { 5: { id: 5, origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 } },
+  };
+  const target = { id: 2, inputs: [{ name: "a", link: 5 }] };
+  const origin = { id: 1 };
+  assert.deepEqual(findLandedInboundLink(inboundGraph, origin, 0, target, null), {
+    linkId: 5,
+    inputIndex: 0,
+  });
+  assert.equal(findLandedInboundLink(inboundGraph, origin, 0, target, new Set([5])), null);
+  assert.equal(findLandedInboundLink(inboundGraph, origin, 0, target, new Set(["5"])), null);
+
+  // And the normaliser itself accepts a Set, so there is nothing left for a call
+  // site to have to special-case.
+  assert.deepEqual([...linkIdExclusionSet(new Set([4, 5]))], ["4", "5"]);
+});
+
 test("isRailLinkPersisted: the rail slot must list THAT id and the link must join the node", () => {
   const graph = {
     links: { 4: { id: 4, origin_id: 9, origin_slot: 0, target_id: -20, target_slot: 0 } },
