@@ -29,6 +29,8 @@ export const CHAT_HISTORY_LEGACY_STORE = "legacy";
 export const CHAT_HISTORY_LOCAL_SNAPSHOT_KEY = "comfyui-mcp.panel.historySnapshot";
 export const CHAT_HISTORY_MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 export const CHAT_HISTORY_EXPORT_FORMAT = "comfyui-agent-panel-chat-history";
+/** ComfyUI's own draft-index key on the shared origin (#1305). */
+export const COMFY_DRAFT_INDEX_KEY = "Comfy.Workflow.DraftIndex.v2";
 
 const DEFAULT_THREADS_KEY = "comfyui-mcp.panel.threads";
 const DEFAULT_META_KEY = "comfyui-mcp.panel.historyMeta";
@@ -85,6 +87,89 @@ const MAX_TODO_TEXT = 2000;
 
 function utf8ByteLength(value) {
   return new TextEncoder().encode(String(value)).byteLength;
+}
+
+export function isQuotaExceededError(error) {
+  if (!error) return false;
+  return error.name === "QuotaExceededError"
+    || error.name === "NS_ERROR_DOM_QUOTA_REACHED"
+    || error.code === 22
+    || error.code === 1014;
+}
+
+/**
+ * Write one localStorage key, and if the origin is already full, drop THIS key
+ * first so a shrink can land (#1305).
+ *
+ * Browsers measure remaining quota BEFORE freeing the value being replaced.
+ * That is why #861's bounded `setItem` still threw on an already-over-budget
+ * origin: the new payload was smaller, but not smaller than the leftover
+ * headroom, so the huge pre-0.11.57 shadow never moved. Removing the key
+ * first is the only way a guest can give the host its bytes back.
+ *
+ * On a failed retry the previous value is restored when we still have it —
+ * this must not become a delete of someone else's key (the draft-index probe
+ * uses the same helper).
+ */
+export function writeLocalStorageItem(storage, key, value) {
+  writeLocalStorageItem.lastError = null;
+  if (!storage) return false;
+  try {
+    storage.setItem(key, value);
+    return true;
+  } catch (error) {
+    writeLocalStorageItem.lastError = error;
+    if (!isQuotaExceededError(error)) return false;
+    let previous = null;
+    try { previous = storage.getItem(key); } catch { /* ignore */ }
+    try { storage.removeItem(key); } catch { /* ignore */ }
+    try {
+      storage.setItem(key, value);
+      writeLocalStorageItem.lastError = null;
+      return true;
+    } catch (retry) {
+      writeLocalStorageItem.lastError = retry;
+      if (previous != null) {
+        try { storage.setItem(key, previous); } catch { /* best-effort restore */ }
+      }
+      return false;
+    }
+  }
+}
+
+export function measurePanelShadowBytes(storage, keys) {
+  if (!storage) return 0;
+  let total = 0;
+  for (const key of keys) {
+    try {
+      const raw = storage.getItem(key);
+      if (typeof raw === "string") total += raw.length;
+    } catch { /* ignore */ }
+  }
+  return total;
+}
+
+/**
+ * Can ComfyUI still persist `Comfy.Workflow.DraftIndex.v2`? (#1305)
+ *
+ * Writes the EXISTING value back when one is present, so this is not a
+ * rewrite of the user's drafts. A missing key gets a tiny probe that is
+ * removed again. Never clears any other origin key.
+ */
+export function probeDraftIndexWrite(storage) {
+  if (!storage) return false;
+  let previous;
+  try {
+    previous = storage.getItem(COMFY_DRAFT_INDEX_KEY);
+  } catch {
+    return false;
+  }
+  const payload = previous == null ? "{\"v\":2}" : previous;
+  const wrote = writeLocalStorageItem(storage, COMFY_DRAFT_INDEX_KEY, payload);
+  if (previous == null && wrote) {
+    try { storage.removeItem(COMFY_DRAFT_INDEX_KEY); } catch { /* probe only */ }
+  }
+  return wrote;
 }
 
 function finiteTs(value) {
@@ -1950,6 +2035,8 @@ export class ChatHistoryStore {
     this.maxShadowBytes = Number.isFinite(options.maxShadowBytes)
       ? options.maxShadowBytes
       : LOCAL_SHADOW_MAX_BYTES;
+    this.lastDraftHeadroomOk = null;
+    this.lastShadowBytes = 0;
     /**
      * What the legacy store has ACCEPTED, as id -> content fingerprint (#861).
      *
@@ -2280,26 +2367,51 @@ export class ChatHistoryStore {
     // fires onPersistenceError forever against a state that can never fit.
     const legacyComplete = legacyThreads.every((thread) =>
       shadowById.has(thread.id) || this._durableLegacy?.get(thread.id) === legacyFingerprint(thread));
-    try {
-      this.storage?.setItem(this.snapshotKey, bounded.serialized);
-      this.lastShadowWriteOk = true;
-      this.lastShadowError = null;
-    } catch (error) {
+    const shadowKeys = [this.snapshotKey, this.threadsKey, this.metaKey];
+    const dropDuplicateKeys = () => {
+      // The two-key shadow is a cache of the atomic snapshot (and of IndexedDB
+      // once canonicalDurable). Dropping it is not a delete of user data — it
+      // is how an already-full origin gets the headroom ComfyUI needs (#1305).
+      // Never run this without a durable copy: the caller gates on
+      // canonicalDurable.
+      try { this.storage?.removeItem(this.threadsKey); } catch { /* ignore */ }
+      try { this.storage?.removeItem(this.metaKey); } catch { /* ignore */ }
+    };
+    const measure = () => {
+      this.lastShadowBytes = measurePanelShadowBytes(this.storage, shadowKeys);
+      return this.lastShadowBytes;
+    };
+
+    let snapshotOk = writeLocalStorageItem(this.storage, this.snapshotKey, bounded.serialized);
+    if (!snapshotOk && canonicalDurable) {
+      dropDuplicateKeys();
+      snapshotOk = writeLocalStorageItem(this.storage, this.snapshotKey, bounded.serialized);
+    }
+    if (!snapshotOk) {
       this.lastShadowWriteOk = false;
-      this.lastShadowError = error;
-      this.onShadowError?.(error);
+      this.lastShadowError = writeLocalStorageItem.lastError
+        || new Error("localStorage shadow write failed");
+      this.onShadowError?.(this.lastShadowError);
+      measure();
       return { committed: false, complete: false, legacyComplete: false };
     }
-    try {
-      this.storage?.setItem(this.threadsKey, JSON.stringify(keptThreads));
-    } catch {
-      // The atomic shadow is already committed.
+    this.lastShadowWriteOk = true;
+    this.lastShadowError = null;
+
+    const threadsJson = JSON.stringify(keptThreads);
+    const metaJson = JSON.stringify(snapshot.meta ?? {});
+    const totalIfDuplicated = bounded.serialized.length + threadsJson.length + metaJson.length;
+    if (canonicalDurable && totalIfDuplicated > this.maxShadowBytes) {
+      // The byte bound was on the snapshot alone, so writing threads+meta
+      // again doubled the panel's share and left ComfyUI no room. Once
+      // canonical holds the transcripts, the two-key copy is the leftover
+      // occupancy #1305 is about — drop it rather than keep a second 1.5MB.
+      dropDuplicateKeys();
+    } else {
+      writeLocalStorageItem(this.storage, this.threadsKey, threadsJson);
+      writeLocalStorageItem(this.storage, this.metaKey, metaJson);
     }
-    try {
-      this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));
-    } catch {
-      // The atomic shadow is already committed.
-    }
+    measure();
     return { committed: true, complete, legacyComplete };
   }
 
@@ -2463,12 +2575,30 @@ export class ChatHistoryStore {
       })
       .then((merged) => {
         let postMergeShadowWrite = null;
+        let draftHeadroom = null;
         if (merged) {
           this._lastCommitted = merged;
           this._observeSnapshot(merged);
           postMergeShadowWrite = this._writeLocalSnapshot(merged, protectedThreadIds, {
             canonicalDurable: true,
           });
+          // After the shadow has been given a chance to shrink, ask whether
+          // ComfyUI can still write its draft index. A failed probe is not a
+          // failed history persist — do not dirty the write — but it is the
+          // remaining #1305 failure, and it must be named rather than left
+          // as ComfyUI's "Failed to save workflow draft" with no pointer.
+          draftHeadroom = probeDraftIndexWrite(this.storage);
+          this.lastDraftHeadroomOk = draftHeadroom;
+          if (!draftHeadroom) {
+            this.onPersistenceError?.({
+              ok: true,
+              code: "history-draft-headroom-unavailable",
+              retryable: true,
+              shadowCommitted: Boolean(postMergeShadowWrite?.committed),
+              canonicalCommitted: true,
+              panelBytes: this.lastShadowBytes,
+            });
+          }
           try {
             this._broadcastChannel?.postMessage({ type: "history-changed", writerId: this.writerId });
           } catch {
