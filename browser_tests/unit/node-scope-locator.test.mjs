@@ -126,6 +126,75 @@ test("no root graph ⇒ the original message, unchanged", () => {
   assert.equal(describeMissingNode(5, null, true), "No node with id 5 in the current graph");
 });
 
+// ── #1298 current ids on a genuine miss ───────────────────────────────────
+//
+// Reporter: panel_remove_node(99) after a prior outline had shown 99, then the
+// user deleted nodes. The miss said only "not in the current graph" and sent
+// them to re-read — a second round-trip whose answer was already on the graph
+// the write had just searched. Naming the live ids lets the next mutation
+// retarget (or skip) without another outline.
+
+test("#1298 genuine miss lists the current live ids so a mutation can retarget", () => {
+  const root = sub([
+    node(1, { type: "CheckpointLoaderSimple" }),
+    node(3, { type: "KSampler" }),
+    node(8, { type: "SaveImage" }),
+  ]);
+  const msg = describeMissingNode(99, root, true);
+  assert.match(msg, /^No node with id 99/);
+  assert.match(msg, /not in any other scope either/);
+  assert.match(msg, /Current ids on the graph you are viewing:/);
+  assert.match(msg, /1 \(CheckpointLoaderSimple\)/);
+  assert.match(msg, /3 \(KSampler\)/);
+  assert.match(msg, /8 \(SaveImage\)/);
+  assert.ok(!/99 \(/.test(msg), "must not invent the missing id as live");
+  assert.match(msg, /Retarget using a current id/);
+});
+
+test("#1298 lists ids from the graph being viewed, not the root", () => {
+  // A subgraph-scoped write that misses must not hand back root ids: those are
+  // not addressable without exiting, and naming them would retarget the next
+  // mutation into the wrong scope.
+  const inner = sub([node(10, { type: "InnerA" }), node(11, { type: "InnerB" })]);
+  const root = sub([node(1, { type: "Root" }), node(9, { title: "S", subgraph: inner })]);
+  const msg = describeMissingNode(99, root, false, inner);
+  assert.match(msg, /10 \(InnerA\)/);
+  assert.match(msg, /11 \(InnerB\)/);
+  assert.ok(!/1 \(Root\)/.test(msg), "root ids would retarget a write into the wrong scope");
+});
+
+test("#1298 current-id list is capped so a large graph does not dump every id", () => {
+  const nodes = Array.from({ length: 60 }, (_, i) => node(i + 1, { type: "N" }));
+  const msg = describeMissingNode(999, sub(nodes), true);
+  assert.match(msg, /Current ids on the graph you are viewing:/);
+  assert.match(msg, /1 \(N\)/);
+  assert.match(msg, /40 \(N\)/);
+  assert.match(msg, /and 20 more/);
+  assert.ok(!/\b41 \(N\)/.test(msg), "the 41st id is past the cap");
+});
+
+test("#1298 empty current graph is said plainly", () => {
+  const msg = describeMissingNode(99, sub([]), true);
+  assert.match(msg, /currently has no nodes/);
+  assert.match(msg, /Re-read with panel_graph_outline/);
+  assert.ok(!/Current ids on the graph you are viewing:/.test(msg));
+});
+
+test("#1298 a current graph with no root still names live ids", () => {
+  // resolveNode can lose the root (getGraphCtx throws) and still holds the
+  // graph it just searched. That graph's ids are the ones a retarget can use.
+  const current = sub([node(4, { type: "CLIPTextEncode" })]);
+  const msg = describeMissingNode(99, null, true, current);
+  assert.match(msg, /^No node with id 99 in the current graph/);
+  assert.match(msg, /4 \(CLIPTextEncode\)/);
+  assert.match(msg, /Retarget using a current id/);
+});
+
+test("#1298 current-id listing never throws", () => {
+  const root = { get _nodes() { throw new Error("boom"); } };
+  assert.doesNotThrow(() => describeMissingNode(1, root, true));
+});
+
 // ── WIRING ────────────────────────────────────────────────────────────────
 test("WIRING: resolveNode builds its error through describeMissingNode", async () => {
   // resolveNode is module-private and shared by 20+ handlers, so the wiring is pinned
@@ -135,11 +204,22 @@ test("WIRING: resolveNode builds its error through describeMissingNode", async (
   assert.match(src, /import \{ describeMissingNode(?:, describeRailNodeTarget)? \} from "\.\/lib\/node-scope-locator\.js";/);
   const fn = src.slice(src.indexOf("function resolveNode(graph, nodeId) {"));
   const body = fn.slice(0, fn.indexOf("function normalizeLegacyNodeId"));
-  assert.ok(body.includes("describeMissingNode(nodeId, rootGraph, viewingRoot)"),
-    "the failure path must go through the locator");
+  assert.ok(body.includes("describeMissingNode(nodeId, rootGraph, viewingRoot, graph)"),
+    "the failure path must go through the locator with the live graph so current ids can be named");
   // The lookup itself must be unchanged — this is diagnostics only, never a wider search.
   assert.ok(body.includes("graph.getNodeById(canonicalNodeId(nodeId))"),
     "resolution must still be scoped to the current graph");
   // And the diagnostic must not be able to break the call.
   assert.ok(body.includes("} catch {"), "reading the root must be guarded");
+  // graph_save_subgraph used to throw the bare prefix and skip the locator, so a
+  // post-edit miss there named no current ids. Pin the one remaining production
+  // site onto resolveNode.
+  assert.ok(
+    /target = resolveNode\(graph, node_id\)/.test(src),
+    "graph_save_subgraph must resolve through the same miss path",
+  );
+  assert.ok(
+    !/throw new Error\(`No node with id \$\{node_id\} in the current graph`\)/.test(src),
+    "no production mutation may still throw the bare missing-id message",
+  );
 });
