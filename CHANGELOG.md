@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.8] - 2026-08-19
+
+### Fixed
+- stale-combo refusal tells the truth about the refresh, and the /view probe is bounded (#1425)
+- lightbox stage and collapsed cards honor the same honest failure state (#1424)
+
+
 ## [0.15.7] - 2026-08-19
 
 ### Fixed
