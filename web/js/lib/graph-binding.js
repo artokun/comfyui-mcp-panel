@@ -993,8 +993,85 @@ export function openContentDifferenceIsPresentationOnly({ comparable, surfaces, 
   );
 }
 
-export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
-  const NOT_PROVEN = { proven: false, exact: false, fields: [], presentationOnly: false };
+/**
+ * Did this open apply COMPLETELY, leaving only per-node fields the frontend rewrote?
+ * (panel#1283 / #1285 / #1307 / #1330, comfyui-mcp#1705)
+ *
+ * ## The defect this answers
+ *
+ * Five reporters got `isError` on an open the same reply describes as correct: the
+ * canvas bound, every node present with the same id and type, nothing extra — and a
+ * per-node difference in `widgets_values`, `outputs`, `properties` or
+ * `widgets_values_named`. None of those is on `COSMETIC_NODE_FIELDS`, so #1623's
+ * presentation-only ground does not reach them, and none has a per-field rewrite
+ * account, so `RECOMPUTED_NODE_FIELDS` does not either.
+ *
+ * The two existing grounds are both FIELD-LEVEL: they ask "is a difference in THIS
+ * NAME benign". That question cannot be answered for `widgets_values` — it is the
+ * field a genuine partial load drops, which is what #1111/#1089 are about — and
+ * chasing it field by field just moves the refusal to the next field a pack invents.
+ * `outputs` would be the sixth such entry; `widgets_values_named` the seventh.
+ *
+ * ## So this asks a different question, at a different level
+ *
+ * `resolveOpenRebindVerdict` states exactly one mechanism for why a content
+ * difference might mean data loss: `loadGraphData` catches a mid-`configure()` throw
+ * and returns, leaving the node id/type set and the marker over nodes that lost their
+ * values. It then says no discriminator separates that from normalization.
+ *
+ * There is one, and the panel already owns half of it. `installNodeConfigureIsolation`
+ * (#1260) records every per-node `configure` throw; `installGraphConfigureWatch`
+ * records a throw out of the graph restore itself. MEASURED against the frontend
+ * source: those two are the ONLY places the restore can abort — `LGraph.configure`
+ * runs the node pass with no try/catch of its own, and nothing between it and
+ * `loadGraphData`'s catch adds one. So `loadRanToCompletion === true` REFUTES the
+ * hypothesis the refusal rests on, for this load, by observation.
+ *
+ * ## What it therefore may and may not claim
+ *
+ * It licenses "the load did not stop early, so nothing was dropped by a failed
+ * restore". It does NOT license "these values are the file's values" — the caller is
+ * told which fields differ and that a widget value is content. That is why the reply
+ * this feeds carries `content_normalized` with the field names rather than silence.
+ *
+ * Everything else still refuses, and deliberately:
+ *  - `loadRanToCompletion !== true` — a throw was recorded, OR the frontend could not
+ *    be instrumented at all. Unknown is not a yes: the strict `=== true` is what keeps
+ *    an un-watched load on the old, refusing path.
+ *  - any surface but `nodes` — a lost link, group, reroute or unaccounted definitions
+ *    block is not explained by anything a completed node pass establishes.
+ *  - a changed node SET — a missing, extra or retyped node is the shape real loss
+ *    takes, and a completed restore does not produce it.
+ *  - an unnamed difference — `fields` empty means the classifier could not point at
+ *    what moved, and proving an open off a difference nobody can name is the
+ *    fabricated all-clear this module exists to avoid.
+ */
+export function openContentDifferenceIsCompletedLoadNormalization({
+  comparable,
+  surfaces,
+  nodeDifference,
+  loadRanToCompletion,
+} = {}) {
+  // STRICTLY true. `null` is "nobody watched" and `false` is "something threw"; both
+  // must refuse, and collapsing either into a truthiness test is the same two-states-
+  // one-answer fold this predicate exists to undo.
+  if (loadRanToCompletion !== true) return false;
+  if (comparable !== true) return false;
+  const unique = Array.isArray(surfaces) ? [...new Set(surfaces)] : [];
+  if (unique.length !== 1 || unique[0] !== "nodes") return false;
+  if (nodeDifference?.comparable !== true || nodeDifference.sameNodeSet !== true) return false;
+  return Array.isArray(nodeDifference.fields) && nodeDifference.fields.length > 0;
+}
+
+export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCompletion } = {}) {
+  const NOT_PROVEN = {
+    proven: false,
+    exact: false,
+    fields: [],
+    presentationOnly: false,
+    normalizedOnly: false,
+    normalizedFields: [],
+  };
   try {
     // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
     // per check let a synchronous serialization hook — a broken or hostile custom node —
@@ -1005,7 +1082,14 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     if (actualState == null) return NOT_PROVEN;
     const frozen = { serialize: () => actualState };
     if (graphRootMatchesState({ rootGraph: frozen, state })) {
-      return { proven: true, exact: true, fields: [], presentationOnly: false };
+      return {
+        proven: true,
+        exact: true,
+        fields: [],
+        presentationOnly: false,
+        normalizedOnly: false,
+        normalizedFields: [],
+      };
     }
     const diff = describeGraphStateDifference({ rootGraph: frozen, state });
     // Never inferred from an absent comparison: `comparable:false` means no
@@ -1028,6 +1112,27 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
       surfaces: diff.surfaces,
       nodeDifference: diff.nodeDifference,
     });
+    // panel#1283 family — the surfaces still UNEXPLAINED, which is what #1588's second
+    // round established the reassurance's own predicate must read. `definitions` differs
+    // on every open of a workflow containing subgraphs (#886: link ids are regenerated),
+    // and `describeGraphStateDifference` has already run the SAME fail-closed predicate
+    // the strict proof below trusts to decide whether THIS difference is only that. A
+    // surface that predicate accounted for is not a second unexplained difference, and
+    // comfyui-mcp#1705 is precisely the shape that fails on it: `nodes, definitions`.
+    const accounted = Array.isArray(diff.accountedSurfaces) ? diff.accountedSurfaces : [];
+    const unexplainedSurfaces = (Array.isArray(diff.surfaces) ? diff.surfaces : []).filter(
+      (s) => !accounted.includes(s),
+    );
+    // The load RAN TO COMPLETION, so the mid-`configure()` partial load the strict
+    // refusal rests on did not happen here. Weaker than `presentationOnly` about the
+    // fields (it names them rather than vouching for them) and stronger about the LOAD
+    // (it is an observation of this restore, not a judgement about a field name).
+    const normalizedOnly = openContentDifferenceIsCompletedLoadNormalization({
+      comparable: true,
+      surfaces: unexplainedSurfaces,
+      nodeDifference: diff.nodeDifference,
+      loadRanToCompletion,
+    });
     const notProven = {
       proven: false,
       exact: false,
@@ -1037,6 +1142,12 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
       // difference nobody has accounted for.
       fields: presentationOnly && Array.isArray(diff.nodeDifference?.fields) ? diff.nodeDifference.fields : [],
       presentationOnly,
+      normalizedOnly,
+      // Carried on EVERY refusal below, for the same reason `presentationOnly` is: the
+      // reporters' own cases (`widgets_values`, `outputs`, `properties`) are refused by
+      // the strict proof, so a fix that only populated this on the success path would be
+      // wired into a branch its own bug reports cannot reach.
+      normalizedFields: normalizedOnly && Array.isArray(diff.nodeDifference?.fields) ? diff.nodeDifference.fields : [],
     };
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
@@ -1074,7 +1185,7 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // A definitions-only difference is fully accounted for once the renumber check
     // passes: there is no node difference to classify.
     if (!unique.includes("nodes")) {
-      return { proven: true, exact: false, fields: [], presentationOnly: false };
+      return { proven: true, exact: false, fields: [], presentationOnly: false, normalizedOnly: false, normalizedFields: [] };
     }
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
@@ -1120,7 +1231,7 @@ export function graphRootReproducesStateContent({ rootGraph, state } = {}) {
     // nobody can point at is exactly the fabricated all-clear to avoid.
     if (!fields.length) return notProven;
     if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return notProven;
-    return { proven: true, exact: false, fields, presentationOnly: false };
+    return { proven: true, exact: false, fields, presentationOnly: false, normalizedOnly: false, normalizedFields: [] };
   } catch {
     return NOT_PROVEN;
   }
@@ -1802,6 +1913,39 @@ function nodeSurfaceClause(observed = {}) {
   );
 }
 
+/**
+ * The restore ABORTED — say so, and name what aborted it. (panel#1283 family)
+ *
+ * Only when `contentLoadRanToCompletion` is explicitly `false`: the panel watched this
+ * load and something threw. `null` means the load could not be watched, which is the
+ * pre-existing state of knowledge and gets no sentence — an absent observation must
+ * not be narrated as a clean one OR as a failed one.
+ *
+ * This is the ONE case where a content difference has a KNOWN cause other than the
+ * frontend rewriting its own fields, so it is the one the reader most needs named.
+ * Without it the refusal says "widget values differ" and leaves them to guess between
+ * a normalization and a node that never got its values at all.
+ */
+function abortedRestoreClause(observed = {}) {
+  if (observed.contentLoadRanToCompletion !== false) return "";
+  const failures = Array.isArray(observed.contentRestoreFailures) ? observed.contentRestoreFailures : [];
+  // Capped like `nodeSurfaceClause`'s property keys: a graph full of broken nodes must
+  // not grow this clause without bound. The cap trims the LIST, never the claim.
+  const named = failures
+    .slice(0, 10)
+    .map((f) => `${f?.type ?? "node"} (id ${f?.id ?? "?"})${f?.error ? `: ${f.error}` : ""}`)
+    .join("; ");
+  return (
+    `. AND THE RESTORE DID NOT RUN TO COMPLETION: the panel watched this load and ` +
+    (named
+      ? `${failures.length} node(s) threw while their saved state was being applied — ${named}` +
+        (failures.length > 10 ? `, and ${failures.length - 10} more` : "")
+      : `something threw while the graph was being restored`) +
+    `. So this difference is NOT the frontend normalizing its own fields: part of what was ` +
+    `loaded never landed. Fix or update the pack that threw, then open again`
+  );
+}
+
 /** The only surfaces this file has a written account of. `definitions` differs on a
  *  faithful open because loading a saved workflow regenerates link ids inside subgraph
  *  definitions (#886, measured: state.lastLinkId 2092 -> 2106), and
@@ -1890,6 +2034,7 @@ function openRebindPartClause(part, observed = {}) {
       return (
         `the graph on the canvas differs from what was loaded on: ${named}` +
         nodeSurfaceClause(observed) +
+        abortedRestoreClause(observed) +
         (accounted.length
           ? `. Its \`${accounted.join("`, `")}\` also differ, and that one IS accounted for: the ` +
             `whole difference is link RENUMBERING — loading a saved workflow regenerates link ids ` +
