@@ -401,7 +401,11 @@ export function uncheckedNodesNote(unknown) {
   const values = unknown.filter((u) => typeof u?.widget === "string").length;
   const types = unknown.length - values;
   const parts = [];
-  if (types) parts.push(`${types} node(s) whose type this scan could not resolve`);
+  // "could not resolve the type" would be wrong for two of the three ways a NODE
+  // lands here — the class cap and the budget cutoff both skip a type that
+  // resolves perfectly well. The per-entry `reason` distinguishes them; this
+  // summary must not assert a cause it has not read.
+  if (types) parts.push(`${types} node(s) this scan could not judge`);
   if (values) {
     parts.push(
       `${values} widget value(s) the server's combo list has no authority over ` +

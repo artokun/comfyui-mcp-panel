@@ -390,9 +390,13 @@ test("#1357 unchecked_nodes is worded as an abstention, not a clearance", async 
     { id: 4, type: "LoadImage", widget: "image", value: NESTED, reason: "not checked: x" },
   ]);
   assert.match(note, /NOT CHECKED/);
-  assert.match(note, /1 node\(s\) whose type this scan could not resolve/);
+  assert.match(note, /1 node\(s\) this scan could not judge/);
   assert.match(note, /1 widget value\(s\)/);
   assert.match(note, /abstentions, not clearances/);
+  // The node bucket also holds class-cap and budget skips, whose type resolved
+  // fine. The summary must not name a cause it did not read — the per-entry
+  // `reason` is where the three are told apart.
+  assert.doesNotMatch(note, /could not resolve/);
   assert.equal(uncheckedNodesNote([]), "");
   assert.equal(uncheckedNodesNote(null), "");
 });
