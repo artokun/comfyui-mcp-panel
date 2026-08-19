@@ -511,7 +511,8 @@ export function collectMissingNodeTypeReasons(nodes, missingNodeTypes) {
 /**
  * True when a `graph_get_errors` RESULT payload represents a genuinely CLEAN graph —
  * no per-node validation errors, no execution failure, no errored nodes, AND no
- * missing-asset surface of ANY kind (models / media / node-types / node-count). Every
+ * missing-asset surface of ANY kind (models / media / node-types / node-count /
+ * stale placeholders left after a class registered — #1332). Every
  * consumer that summarizes the result — the command-summary label, banners, etc. —
  * must derive "errors vs none" from THIS, so a missing-asset-ONLY result (e.g. a red or
  * BYPASSED uninstalled node, #399/#356) is never labelled "none" while its own payload
@@ -529,6 +530,8 @@ export function graphErrorsResultIsClean(result) {
     !len(result.missing_media) &&
     !len(result.missing_node_types) &&
     !(Number(result.missing_node_count) > 0) &&
+    !len(result.stale_placeholders) &&
+    !result.requires_reload &&
     // #984 — the #745 LIVE scan was added to the payload after this helper was
     // written and never folded in, so a result carrying `unavailable_widget_values`
     // was still labelled "Checked errors — none". Every entry there is a widget
@@ -617,7 +620,11 @@ export function graphErrorsFindingCounts(result) {
   return {
     erroredNodes: Number(r.errored_count) || 0,
     missingAssets:
-      models.length + media.length + arr(r.missing_node_types).length + (Number(r.missing_node_count) || 0),
+      models.length +
+      media.length +
+      arr(r.missing_node_types).length +
+      (Number(r.missing_node_count) || 0) +
+      arr(r.stale_placeholders).length,
     unavailable,
     unchecked: arr(r.unchecked_nodes).length,
   };

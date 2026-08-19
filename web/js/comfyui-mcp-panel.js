@@ -206,7 +206,12 @@ import {
   virtualSourceNote,
   virtualSourceTag,
 } from "./lib/virtual-source-promotion.js";
-import { findStalePlaceholders, stalePlaceholderNote } from "./lib/stale-placeholders.js";
+import {
+  findStalePlaceholders,
+  stalePlaceholderNote,
+  anyRecordedTypeUnregistered,
+  adjudicateRecordedMissingNodeTypes,
+} from "./lib/stale-placeholders.js";
 import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
@@ -9263,6 +9268,27 @@ function hasRawMissingAssetCandidates() {
   } catch {
     /* optional */
   }
+  // #1332 — the load-time missing-node-type store is the same kind of snapshot as
+  // the model/media stores: after a ComfyUI restart that registered the class, it
+  // still names it. A forced /object_info refresh is how this page learns the new
+  // registry; without it get_errors would adjudicate against the PRE-restart
+  // LiteGraph and keep reporting a type panel_add_node can already construct.
+  // Only when a recorded type is still absent from the CLIENT registry — a
+  // genuine miss, or a restart whose refresh has not landed yet. Types already
+  // in LiteGraph are dropped at report time without another fetch.
+  try {
+    const recorded = collectMissingAssets(false).nodeTypes;
+    if (
+      anyRecordedTypeUnregistered(
+        recorded,
+        (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
+      )
+    ) {
+      return true;
+    }
+  } catch {
+    /* store / registry unreadable → do not spend the 14s refresh on a guess */
+  }
   return false;
 }
 
@@ -9344,7 +9370,32 @@ async function validationBanner() {
   ) {
     return "";
   }
-  missing.any = !!(missing.models.length || missing.media.length || missing.nodeTypes.length || missing.nodeCount);
+  // #1332 — same re-evaluation as graph_get_errors, so the turn-start banner
+  // cannot keep saying "node types not installed" after a restart that registered
+  // them. Placeholders of those types stay a warning (they still fail at queue
+  // time) rather than being dropped as if the canvas were clean.
+  let bannerStalePlaceholders = [];
+  try {
+    const { rootGraph: bannerRoot } = getGraphCtx();
+    const allNodes = collectAllGraphs(bannerRoot).flatMap((g) => g?._nodes ?? []);
+    const adjudicated = adjudicateRecordedMissingNodeTypes(
+      missing.nodeTypes,
+      allNodes,
+      (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
+    );
+    missing.nodeTypes = adjudicated.stillMissing;
+    bannerStalePlaceholders = adjudicated.stalePlaceholders;
+    if (!missing.nodeTypes.length) missing.nodeCount = 0;
+  } catch {
+    bannerStalePlaceholders = [];
+  }
+  missing.any = !!(
+    missing.models.length ||
+    missing.media.length ||
+    missing.nodeTypes.length ||
+    missing.nodeCount ||
+    bannerStalePlaceholders.length
+  );
   // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
   // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
   // asset the banner still calls missing, OR a since-deleted asset a prior-confirmed
@@ -9385,6 +9436,7 @@ async function validationBanner() {
         missing.media.map((x) => `${x.node_id}:${x.file}`),
         missing.nodeTypes,
         missing.nodeCount,
+        bannerStalePlaceholders.map((s) => `${s.node_id}:${s.type}`),
       ],
     });
   } catch {
@@ -9449,6 +9501,14 @@ async function validationBanner() {
       lines.push(`node types not installed: ${missing.nodeTypes.slice(0, 12).map((t) => coerceMessageText(t)).join(", ")}`);
     } else if (missing.nodeCount) {
       lines.push(`${missing.nodeCount} node type(s) not installed on this ComfyUI`);
+    }
+    if (bannerStalePlaceholders.length) {
+      const types = [...new Set(bannerStalePlaceholders.map((s) => coerceMessageText(s.type)).filter(Boolean))];
+      lines.push(
+        `${bannerStalePlaceholders.length} node(s) still PLACEHOLDERS after their class registered ` +
+          `(${types.slice(0, 6).join(", ")}): SAVE then reopen the saved workflow — registering a class ` +
+          `does not rehydrate nodes created while it was unknown (#1332/#981)`,
+      );
     }
     out +=
       `⚠️ MISSING ASSETS — the user's canvas has RED nodes RIGHT NOW because the workflow ` +
@@ -15173,6 +15233,27 @@ const GRAPH_TOOL_EXECUTORS = {
           "DIFFERENT workflows. Retry panel_get_errors — it re-reads the now-active workflow.",
       );
     }
+    // #1332 — the missing-node-type store is a LOAD-TIME snapshot. After a
+    // ComfyUI restart that registered the class (a fresh panel_add_node of that
+    // type succeeds), it still names it. Re-evaluate against this page's client
+    // registry so a now-constructable type is not reported as missing. Leftover
+    // placeholders of those types stay a finding — they are not missing, they
+    // need a save+reopen (#981). The store is not cleared.
+    let stalePlaceholders = [];
+    try {
+      const allNodes = collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []);
+      const adjudicated = adjudicateRecordedMissingNodeTypes(
+        assets.nodeTypes,
+        allNodes,
+        (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
+      );
+      assets.nodeTypes = adjudicated.stillMissing;
+      stalePlaceholders = adjudicated.stalePlaceholders;
+      if (!assets.nodeTypes.length) assets.nodeCount = 0;
+    } catch {
+      /* unreadable registry → keep the load-time list (fail closed) */
+      stalePlaceholders = [];
+    }
     assets.any = !!(assets.models.length || assets.media.length || assets.nodeTypes.length || assets.nodeCount);
     const missingModels = assets.models.map((m) => ({ ...m, kind: "missing_model" }));
     const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
@@ -15210,6 +15291,13 @@ const GRAPH_TOOL_EXECUTORS = {
     //    identical to how a subgraph-hosted missing model behaves here.
     for (const { nodeId, type } of collectMissingNodeTypeReasons(nodes, missingNodeTypes)) {
       addReason(nodeId, { kind: "missing_node_type", type });
+    }
+    // Placeholders of a NOW-registered type on the currently viewed graph. Types
+    // nested in an un-entered subgraph stay on the top-level stale_placeholders
+    // list (same scope split as missing_node_types above).
+    for (const s of stalePlaceholders) {
+      if (s?.node_id == null || !byId.has(String(s.node_id))) continue;
+      addReason(s.node_id, { kind: "stale_placeholder", type: s.type });
     }
 
     // 3) Per-node VALIDATION errors from the last queue attempt. `app.lastNodeErrors`
@@ -15325,6 +15413,7 @@ const GRAPH_TOOL_EXECUTORS = {
       !missingMedia.length &&
       !missingNodeTypes.length &&
       !missingNodeCount &&
+      !stalePlaceholders.length &&
       !liveScan?.unavailable?.length;
     return {
       viewing: describeActiveGraph(graph),
@@ -15389,6 +15478,13 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
       ...(missingNodeCount && !missingNodeTypes.length
         ? { missing_node_count: missingNodeCount }
+        : {}),
+      ...(stalePlaceholders.length
+        ? {
+            requires_reload: true,
+            stale_placeholders: stalePlaceholders.slice(0, MAX_STATE_NODES),
+            stale_placeholders_note: stalePlaceholderNote(stalePlaceholders),
+          }
         : {}),
       // --- backwards-compatible payloads (existing consumers read these) ---
       // Bounded at emission (#664): verbatim, this carried tensor-sized
