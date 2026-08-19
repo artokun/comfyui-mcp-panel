@@ -1324,6 +1324,16 @@ const EXECUTOR_DEPS = [
   "SET_WIDGET_COMMAND_BUDGET_MS",
   "SET_WIDGET_POST_REFRESH_RESERVE_MS",
   "monotonicNow",
+  // #1418 — the budget now reaches the seed wait, the oracle read and the upload probe,
+  // and the recovery distinguishes "still running" from "never ran" on a second token.
+  "withTimeout",
+  "OBJECT_INFO_SEED_WAIT_MS",
+  "OBJECT_INFO_DEADLINE_MS",
+  "REFRESH_JOIN_ABANDONED",
+  "COMBO_REFRESH_NEVER_RAN",
+  // The coalescer's live slot. This harness's refreshCombos path is never exercised (the
+  // runSetWidget double never calls it), so a fixed null is the truth here.
+  "nodeDefRefreshInFlight",
 ];
 
 /**
@@ -1460,6 +1470,7 @@ function executor(node, overrides = {}) {
     // #1413 — the handler now takes a command budget on its first line. The real pieces,
     // with the shipped numbers, from the shared harness constants.
     ...setWidgetCommandBudgetDeps(),
+    nodeDefRefreshInFlight: null,
     ...overrides,
   };
   const factory = new Function(

@@ -30,8 +30,10 @@ import {
   TRANSPORT_OUTCOME,
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
+  OBJECT_INFO_DEADLINE_MS,
 } from "../../web/js/lib/object-info-oracle.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
+import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 
 const SCHEMA = { KSampler: { input: {} }, H3Keyframes: { input: {} } };
 const silence = [
@@ -508,6 +510,8 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "epochDuringFetch",
     "comfyBackendSocketDown",
     "objectInfoOracleFailureNote",
+    "OBJECT_INFO_DEADLINE_MS",
+    "makeCommandBudget",
     // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
     // extracted body, because the panel's is module state the body re-reads. An earlier
     // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
@@ -520,6 +524,11 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
      const comfyBackendIsDown = () => comfyBackendSocketDown;
      const historyRecorded = [];
      const recordObjectInfoTypes = (defs) => { historyRecorded.push(defs); return defs; };
+     // #1418 — the shipped body now draws the oracle's deadline from the command budget.
+     // The REAL budget, freshly minted per build, so the arithmetic is production's; the
+     // harness wrapper below still overrides the deadline to its own 20ms, so no test here
+     // waits on it either way.
+     const budget = makeCommandBudget(25000);
      // Declared HERE so it closes over the mutable epoch above and can move it the moment
      // the read is issued — the panel's real hazard is a reconnect landing mid-fetch.
      const fetchWholeObjectInfo = (opts) => {
@@ -552,6 +561,8 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     epochDuringFetch,
     socketDown,
     objectInfoOracleFailureNote,
+    OBJECT_INFO_DEADLINE_MS,
+    makeCommandBudget,
   );
 }
 

@@ -24,7 +24,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
@@ -129,6 +129,34 @@ test("#1413 a refresh that COMPLETES (resolves undefined) still drives the retry
   assert.equal(res.refreshed, true);
 });
 
+test("#1418 a never-started recovery says NOTHING IS RUNNING — never 'still running'", async () => {
+  // The budget-spent arm: the coalescer answered without starting anything, so the refusal
+  // must rest the retry on what is true in THAT state — a fresh budget on the retry — not
+  // on joining a run that does not exist.
+  const widget = { name: "image", type: "combo", options: { values: ["old_a.png"] }, value: "old_a.png" };
+  const node = makeNode("LoadImage", widget);
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "image", "new.png", {
+        registry: REGISTRY,
+        ...freshOracle,
+        refreshCombos: async () => COMBO_REFRESH_NEVER_RAN,
+      }),
+    (err) => {
+      assert.match(err.message, /panel_set_widget refused "image" on node 105/, "the standard refusal frame");
+      assert.match(err.message, /never started/, "the true state: the recovery never ran");
+      assert.match(err.message, /No node-def refresh is running/, "…and no run is claimed");
+      assert.match(err.message, /NOTHING WAS WRITTEN/);
+      assert.match(err.message, /RETRY/, "the remedy that is true in this state too");
+      assert.match(err.message, /panel_refresh_nodes/, "…with the same escalation");
+      assert.ok(!/still running/.test(err.message), "must not assert a refresh that does not exist");
+      assert.ok(!/not a valid option/.test(err.message), "nor call the value invalid");
+      return true;
+    },
+  );
+  assert.equal(widget.value, "old_a.png", "nothing was written");
+});
+
 // ---------------------------------------------------------------------------
 // 2. The wiring: the SHIPPED graph_set_widget, extracted and run.
 // ---------------------------------------------------------------------------
@@ -183,6 +211,17 @@ const EXECUTOR_DEPS = [
   "SET_WIDGET_COMMAND_BUDGET_MS",
   "SET_WIDGET_POST_REFRESH_RESERVE_MS",
   "monotonicNow",
+  // #1418 — the budget now reaches the seed wait, the oracle read and the upload probe,
+  // and the recovery distinguishes "still running" from "never ran" on a second token.
+  "withTimeout",
+  "OBJECT_INFO_SEED_WAIT_MS",
+  "OBJECT_INFO_DEADLINE_MS",
+  "REFRESH_JOIN_ABANDONED",
+  "COMBO_REFRESH_NEVER_RAN",
+  // The coalescer's live slot. The shipped refreshCombos reads it BEFORE calling the
+  // coalescer, so the value captured at build time is exactly what that read must see:
+  // the in-flight run a test started before dispatching the command.
+  "nodeDefRefreshInFlight",
 ];
 
 function deferred() {
@@ -190,6 +229,8 @@ function deferred() {
   const promise = new Promise((r) => (resolve = r));
   return { promise, resolve };
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Build the SHIPPED `graph_set_widget` with the REAL runSetWidget, the REAL coalescer and
@@ -209,6 +250,15 @@ function realGraphSetWidget({
   onRunRegister = null,
   budgetMs = 400,
   reserveMs = 120,
+  // #1418 — the two waits AHEAD of the recovery, made slow so the budget is genuinely
+  // spent when the recovery is reached (the issue's no-concurrency arm).
+  seedDelayMs = 0,
+  oracleDelayMs = 0,
+  // What the authorization oracle answers. Default lacks "Note"; the probe test needs a
+  // LoadImage def whose image input is upload-capable.
+  oracleDefs = null,
+  // /view probe behaviour: default answers 404 (the asset is not there).
+  fetchApiImpl = null,
 } = {}) {
   const graph = {
     _nodes: [node],
@@ -230,8 +280,11 @@ function realGraphSetWidget({
   // refreshCombos down the full-refresh fallback this issue is about: a payload that
   // cannot contain the keyed type must not be treated as the authoritative list (#796).
   const api = {
-    getNodeDefs: async () => ({ LoadImage: { input: { required: { image: [["old_a.png"], {}] } } } }),
-    fetchApi: async () => ({ ok: false, status: 404 }),
+    getNodeDefs: async () => {
+      if (oracleDelayMs) await sleep(oracleDelayMs);
+      return oracleDefs ?? { LoadImage: { input: { required: { image: [["old_a.png"], {}] } } } };
+    },
+    fetchApi: fetchApiImpl ?? (async () => ({ ok: false, status: 404 })),
   };
 
   // The REAL single-flight coordinator over a real slot, with a real in-flight run when
@@ -260,7 +313,10 @@ function realGraphSetWidget({
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,
     classifyIdeogram4PromptBuilderWrite: () => null,
-    awaitObjectInfoHistorySeed: async () => {},
+    // #1418 — honors the cap it is handed, the way the shipped one does: it waits at most
+    // waitMs, and a slow seed simply spends it.
+    awaitObjectInfoHistorySeed: (waitMs) =>
+      seedDelayMs ? sleep(Math.min(typeof waitMs === "number" ? waitMs : 8000, seedDelayMs)) : Promise.resolve(),
     // The REAL classifier and creator, as rgthree-lora-row.test.mjs requires: a double
     // would let the executor pass against a route that never fires.
     isRgthreeLoraRowCreation,
@@ -289,6 +345,9 @@ function realGraphSetWidget({
     ...setWidgetCommandBudgetDeps(),
     SET_WIDGET_COMMAND_BUDGET_MS: budgetMs,
     SET_WIDGET_POST_REFRESH_RESERVE_MS: reserveMs,
+    // Captured AFTER the held-open run above has taken the slot — the value the shipped
+    // refreshCombos reads before it calls the coalescer.
+    nodeDefRefreshInFlight: inFlight,
   };
   const factory = new Function(
     ...EXECUTOR_DEPS,
@@ -372,6 +431,83 @@ test("#1413 wiring: with NOTHING in flight the fallback still runs the refresh, 
   assert.equal(built.runs.length, 1, "the fallback ran exactly one refresh");
 });
 
+test("#1418 wiring: a budget spent by the seed+oracle says NOTHING IS RUNNING, with no concurrency", async () => {
+  // The issue's measured arm: no other command, no reconnect, no install — the seed wait
+  // and the authorization read alone spend the budget, the coalescer starts NOTHING, and
+  // the refusal must say so. Driven through the shipped handler so the caps on those two
+  // waits are what keep the answer inside the window at all.
+  const { node, widget } = noteNode();
+  const built = realGraphSetWidget({
+    node,
+    budgetMs: 400,
+    reserveMs: 220,
+    seedDelayMs: 120, // waits its capped allowance…
+    oracleDelayMs: 80, // …and the oracle answers, slowly, inside its own capped share
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    () => built.graph_set_widget({ node_id: 7, widget: "mode", value: "b", workflow_uuid: "u" }),
+    (err) => {
+      assert.match(err.message, /never started/, "the recovery never ran and says so");
+      assert.match(err.message, /No node-def refresh is running/, "no phantom refresh is claimed");
+      assert.match(err.message, /NOTHING WAS WRITTEN/);
+      assert.match(err.message, /RETRY/);
+      assert.ok(!/still running/.test(err.message), "the other state's wording must not appear");
+      return true;
+    },
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 3000,
+    `the write took ${elapsed}ms — before the caps, the flat seed+oracle waits alone summed past the budget`,
+  );
+  assert.equal(widget.value, "a", "nothing was written");
+  assert.deepEqual(built.runs, [], "no refresh run was ever started");
+});
+
+test("#1418 wiring: a hung /view probe gives up at the budget instead of outliving the relay", async () => {
+  // The probe is reached after a SUCCESSFUL (in-place) refresh, so #1413's joinMs never
+  // covered it: the payload contains LoadImage, the refresh re-lists only the top-level
+  // file, the retry misses the nested value, and the #387 probe hangs on a dead backend.
+  const widget = { name: "image", type: "combo", options: { values: ["example.png"] }, value: "example.png" };
+  const node = { id: 191, type: "LoadImage", widgets: [widget] };
+  let probed = false;
+  const built = realGraphSetWidget({
+    node,
+    budgetMs: 300,
+    reserveMs: 120,
+    oracleDefs: { LoadImage: { input: { required: { image: [["example.png"], { image_upload: true }] } } } },
+    fetchApiImpl: (route) => {
+      if (String(route).startsWith("/view")) {
+        probed = true;
+        return new Promise(() => {}); // half-open: never answers, never fails
+      }
+      return Promise.resolve({ ok: false, status: 404 });
+    },
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      built.graph_set_widget({
+        node_id: 191,
+        widget: "image",
+        value: "xyr_canvas/boswellia_source.png",
+        workflow_uuid: "u",
+      }),
+    /not a valid option/,
+    "a probe that cannot answer in time is the 'not confirmed' the probe already answers on any doubt",
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 3000,
+    `the probe took ${elapsed}ms of a 300ms command — unbounded, the refusal never leaves the tab`,
+  );
+  assert.ok(probed, "the probe did run — it is bounded, not skipped");
+  assert.equal(widget.value, "example.png", "nothing was written");
+});
+
 // ---------------------------------------------------------------------------
 // 3. The shipped numbers, pinned against the relay window (the single-node-def
 //    technique): the harnesses above inject small budgets, so only a source-level check
@@ -392,7 +528,33 @@ test("#1413 the shipped budget mirrors add_node's against the same 30s relay win
   );
   assert.match(
     body,
-    /joinMs: budget\.remaining\(\) - SET_WIDGET_POST_REFRESH_RESERVE_MS/,
+    /joinMs = budget\.remaining\(\) - SET_WIDGET_POST_REFRESH_RESERVE_MS/,
     "the fallback join draws from the command's remaining budget, not a fresh constant",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 4. #1418: the waits AHEAD of the recovery draw from the budget too, and the probe
+//    after it is bounded. SCOPED to this command's body — graph_add_node holds the
+//    sibling call sites, so an unscoped pin stays green with these deleted (the trap
+//    the issue itself names).
+// ---------------------------------------------------------------------------
+
+test("#1418 the seed wait and the oracle read are capped by the command budget", () => {
+  const body = SET_WIDGET_SRC;
+  assert.match(
+    body,
+    /awaitObjectInfoHistorySeed\(budget\.bounded\(OBJECT_INFO_SEED_WAIT_MS\)\)/,
+    "the flat 8000ms seed wait is capped by what the command has left",
+  );
+  assert.match(
+    body,
+    /deadlineMs: budget\.bounded\(OBJECT_INFO_DEADLINE_MS\)/,
+    "the flat 20000ms oracle deadline is capped by what the command has left",
+  );
+  assert.match(
+    body,
+    /budget\.bounded\(\)/,
+    "the upload probe draws the remainder (no constant of its own to drift)",
   );
 });
