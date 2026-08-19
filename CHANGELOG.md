@@ -6,7 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-08-19
+
 ### Fixed
+- a combo that cannot list its files is no authority on whether a file exists: an unreadable listing no longer reads as an empty one (#1357)
+- an abandoned combo refresh is reported as a missing confirmation rather than silently trusted: V2 and dynamic combo specs are rebuilt too, and a spec the panel cannot derive marks the run uncovered instead of suppressing a real missing-asset warning (#1193)
+- a caller-supplied link-exclusion Set is normalised instead of trusted, so a raw-number Set cannot silently lose the exclusion and credit a pre-existing link to the current call (#1272)
 - `panel_auto_layout` apply inside a subgraph no longer escapes to and rearranges the root graph (#1328)
 - `panel_get_errors` no longer keeps load-time missing-node-type errors after a ComfyUI restart that registered those classes — leftover placeholders are reported as needing a save+reopen, not as still-uninstalled types (#1332)
 - agent-directed instruction blocks (LIVE-CANVAS TOOLS, MANUAL CANVAS CHANGES, query-graph budget accounting) stay in the agent's context and no longer render in the user's chat (#1310)
@@ -19,6 +24,38 @@ All notable changes to this project are documented here. This project adheres to
 - an already-full origin can save workflow drafts again after the chat-history quota fix (#1305)
 - a group that encloses rgthree Label nodes now moves, instead of being refused because those nodes' visual bounds are not the panel's generic footprint — the same nodes already moved fine one-by-one with panel_edit_node (#1300)
 - a subgraph preview widget is promoted through the frontend's previewExposure store, and a failed link-only promote no longer hides behind a missing promotion store (#1271)
+
+### Fixed
+- author an LTXDirector timeline without a live editor (#1371)
+- leftover link-driven widgets are not graph drift after reconnect (#1379)
+- a connect that THROWS is judged on the link the live graph shows, not on the exception (#1352)
+- dictation listens for the spoken language, not the English UI floor (#1375)
+- a widget write is verified against the node property litegraph binds it to, and says UNKNOWN when it cannot be (#1363)
+- a load the panel WATCHED run to completion is not a content mismatch (#1358)
+- live_sync reports notified only when the active canvas applied (#1372)
+- a Save-As acknowledges the CAPTURE it observed, not the openWorkflow it called (#1359)
+- panel_edit_group bounds writes the box only (#1369)
+- a frontend VIRTUAL node is not a missing one — the derivable signal, at three call sites (#1353)
+- the FIFTH wait in graph_add_node draws from the command budget too (#1349)
+- reclaim an already-full origin so ComfyUI can save drafts (#1367)
+- keep execution image previews on the node that emitted them (#1361)
+- a frontend-only add_node refusal names the unloaded pack JS, not a missing install (#1366)
+- missing-node mutation errors name the current live ids (#1365)
+- a group containing rgthree Label nodes moves instead of being refused (#1364)
+- a dynamically added node survives workflow switch + reconnect (#1362)
+- promote preview widgets through previewExposure (#1360)
+- copy/paste keeps groups and branch positions (#1356)
+- video preview uses the source duration, not a truncated default (#1355)
+- graph_add_node gets ONE budget, so its bounds stop adding up (#1342)
+- the fixed-seed ARRAY and its SENTENCE come from one predicate (#1350)
+- a ComfyUI restart the bridge SURVIVES re-advertises the tab route (#1347)
+- a slow-but-healthy fetch no longer starves the combo refresh of its budget (#1346)
+- the outline resolves a link's live target slot through the backlink — a stale target_slot renders nothing instead of fabricating connectivity (#1340)
+- a proven read keeps its stale-tag bypass through the executor's own fence re-assert (#1345)
+- an untagged canvas is no longer captured into the target tab's state on a switch (#1344)
+- a rename is announced as a rename, not a workflow switch (#1343)
+- the post-open frame wait is bounded — a starved rAF no longer latches the switch fence (#1341)
+
 
 ## [0.15.3] - 2026-08-19
 
