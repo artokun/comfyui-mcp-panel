@@ -307,6 +307,7 @@ import {
 } from "./lib/graph-read.js";
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
+import { isSameInstanceRename } from "./lib/workflow-route-change.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import {
   threadMatchesCurrentWorkflow,
@@ -28670,6 +28671,21 @@ function buildPanel() {
         setActiveThread(currentHistoryScopeKey(), thread.id);
         persistThreads();
       }
+      // #1261 — a RENAME is not a switch. ComfyUI renames a saved workflow by
+      // mutating the SAME object's path in place (the instance identity survives;
+      // only the derived route id moves wf:<old> → wf:<new>), so "same live object,
+      // wf:→wf: id change" can only be a rename — a genuine switch always arrives on
+      // a DIFFERENT object. Announcing it with the switch wording below claimed a
+      // different workflow identity and told the agent to re-read the canvas it is
+      // still bound to (the reported "rename reads as a switch with conflicting
+      // identity"). The discriminator is the object, never the path text — see
+      // lib/workflow-route-change.js.
+      const renaming = isSameInstanceRename({
+        sameWorkflowObject: sameWorkflowObject(wf, currentWorkflowRef),
+        previousRouteId: currentWorkflowId,
+        newRouteId: wfid,
+      });
+      const previousName = renaming ? String(currentWorkflowId).replace(/^wf:/, "").split("/").pop() : null;
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
       currentWorkflowRef = wf;
@@ -28681,9 +28697,13 @@ function buildPanel() {
         }
         const name = wf?.filename || wfkey || wfid;
         client?.armContext?.(
-          `[panel] The user switched the open workflow on the canvas — it is now "${name}". ` +
-            `Your panel_* graph tools operate on THIS graph now; re-read it (panel_graph_outline) before ` +
-            `assuming or editing anything, since earlier turns may refer to a different workflow.`,
+          renaming
+            ? `[panel] The open workflow was RENAMED (a rename or save-as of the SAME instance): ` +
+              `"${previousName}" is now "${name}". Same canvas, same conversation, same node ` +
+              `ids — only its file path changed. Earlier turns still refer to THIS workflow.`
+            : `[panel] The user switched the open workflow on the canvas — it is now "${name}". ` +
+              `Your panel_* graph tools operate on THIS graph now; re-read it (panel_graph_outline) before ` +
+              `assuming or editing anything, since earlier turns may refer to a different workflow.`,
         );
         // The armContext line just above is AGENT-facing and stays English; this one is
         // the transcript note the human reads, so only this one is translated.
@@ -28722,12 +28742,15 @@ function buildPanel() {
     // .key getter change), so "same object, wf:→wf: id change" can only be a rename —
     // a genuine switch always arrives on a different object. Without this branch the
     // thread stays keyed to the OLD path and the renamed workflow opens a blank chat.
+    // #1261 — the discriminator now lives in lib/workflow-route-change.js, shared
+    // with the panel-owned-session branch above.
     const renaming =
       wf &&
-      wf === currentWorkflowRef &&
-      currentWorkflowId &&
-      currentWorkflowId.startsWith("wf:") &&
-      wfid.startsWith("wf:");
+      isSameInstanceRename({
+        sameWorkflowObject: wf === currentWorkflowRef,
+        previousRouteId: currentWorkflowId,
+        newRouteId: wfid,
+      });
     if (renaming) {
       const t = threadForWorkflow(historyKey);
       if (t) persistThreads(); // alias + embedded UUID keep the history identity stable
