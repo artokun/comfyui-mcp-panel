@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- `graph_configure_app_mode` sets ComfyUI App Mode inputs, outputs, and default mode on the live canvas without clobbering `extra.comfyui_mcp` (#1429)
 - `graph_save_subgraph` can replace a user-published blueprint in place with `overwrite:true` — no Save dialog, bundled/global blueprints stay protected (#1122)
 
 ## [0.15.9] - 2026-08-19
@@ -17,7 +18,6 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - an open reply reports one identity observation, not two (#1428)
 - a promoted-widget write lands in the instance that was addressed, not the shared subgraph definition (#1427)
-
 
 ## [0.15.8] - 2026-08-19
 

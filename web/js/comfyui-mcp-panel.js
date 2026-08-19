@@ -396,6 +396,7 @@ import {
 
 
 import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
+import { configureAppMode } from "./lib/configure-app-mode.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
@@ -10927,6 +10928,31 @@ const GRAPH_TOOL_EXECUTORS = {
     const { rootGraph } = getGraphCtx();
     const workflow = rootGraph.serialize();
     return { workflow, node_count: workflow?.nodes?.length ?? 0 };
+  },
+
+  // #1429 — write ComfyUI App Mode metadata onto the live root extra.
+  // Merges extra.linearData (widget-control tuples + output node ids) and
+  // extra.linearMode (boolean default). Never replaces extra and never touches
+  // extra.comfyui_mcp. One undo step: beforeChange/afterChange plus
+  // changeTracker.captureCanvasState after the envelope (the frontend persist
+  // path). A graph_load of patched JSON is not an acceptable substitute.
+  graph_configure_app_mode(args = {}) {
+    const { app: ctxApp, rootGraph } = getGraphCtx();
+    const target = ctxApp?.rootGraph ?? rootGraph;
+    const wf = ctxApp?.extensionManager?.workflow?.activeWorkflow;
+    const tracker = wf?.changeTracker;
+    const capture = tracker?.captureCanvasState ?? tracker?.checkState;
+    const appModeStore = getPiniaStore("appMode");
+    return configureAppMode({
+      rootGraph: target,
+      resolveNode,
+      args,
+      captureCanvasState: typeof capture === "function" ? () => capture.call(tracker) : null,
+      loadSelections:
+        typeof appModeStore?.loadSelections === "function"
+          ? (data) => appModeStore.loadSelections(data)
+          : null,
+    });
   },
 
   // #1006 — THIS TAB'S OWN ComfyUI node definitions.
@@ -24314,6 +24340,26 @@ function describeCommand(cmd, msg, reply) {
           { count: r.node_count },
         ),
       };
+    case "graph_configure_app_mode": {
+      const inputs = r.linearData?.inputs?.length ?? 0;
+      const outputs = r.linearData?.outputs?.length ?? 0;
+      const mode = r.default_mode ?? (r.linearMode === true ? "app" : r.linearMode === false ? "graph" : null);
+      return {
+        icon: "pi-th-large",
+        text:
+          tr(
+            "panel.configured_app_mode_inputs",
+            { one: "Configured App Mode — {count} input", other: "Configured App Mode — {count} inputs" },
+            { count: inputs },
+          ) +
+          tr(
+            "panel.configured_app_mode_outputs",
+            { one: ", {count} output", other: ", {count} outputs" },
+            { count: outputs },
+          ) +
+          (mode ? tr("panel.configured_app_mode_default", ", default {mode}", { mode }) : ""),
+      };
+    }
     case "graph_add_node":
       return {
         icon: "pi-plus-circle",

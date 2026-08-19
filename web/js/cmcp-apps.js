@@ -185,6 +185,8 @@ export class AppBuilder {
    *  probe defensively (extra.* first, then top-level) so older/newer
    *  frontends keep importing. Each entry is a path array. */
   static APP_MODE_PATHS = [
+    // Official frontend App Mode (frontend ≥1.41 LinearData) — tuples, not objects.
+    ["extra", "linearData"],
     ["extra", "appMode"],
     ["extra", "app_mode"],
     ["extra", "apps"],
@@ -219,8 +221,34 @@ export class AppBuilder {
       const n = Number(v);
       return Number.isFinite(n) ? n : null;
     };
+    // extra.linearData stores [id, widgetName, config?] and bare output node ids.
+    // Widget ids are `graphUuid:nodeId:widgetName` (UUID has no colons).
+    const linearNodeId = (v) => {
+      const direct = num(v);
+      if (direct != null) return direct;
+      if (typeof v !== "string" || !v) return null;
+      const widgetId = /^(?:[^:]+):([^:]+):(?:[^:]+)$/.exec(v);
+      if (!widgetId) return null;
+      try {
+        return num(decodeURIComponent(widgetId[1]));
+      } catch {
+        return num(widgetId[1]);
+      }
+    };
     const inputs = (Array.isArray(rawInputs) ? rawInputs : [])
       .map((it) => {
+        if (Array.isArray(it) && it.length >= 2) {
+          const nodeId = linearNodeId(it[0]);
+          const widget = String(it[1] ?? "").trim();
+          if (nodeId == null || !widget) return null;
+          const cfg = it[2] && typeof it[2] === "object" && !Array.isArray(it[2]) ? it[2] : null;
+          return {
+            nodeId,
+            widget,
+            label: String(cfg?.description ?? widget),
+            kind: "text",
+          };
+        }
         if (!it || typeof it !== "object") return null;
         const nodeId = num(it.nodeId ?? it.node_id ?? it.id);
         const widget = String(it.widget ?? it.name ?? it.key ?? "").trim();
@@ -235,6 +263,11 @@ export class AppBuilder {
       .filter(Boolean);
     const outputs = (Array.isArray(rawOutputs) ? rawOutputs : [])
       .map((it) => {
+        if (typeof it === "number" || typeof it === "string") {
+          const nodeId = linearNodeId(it);
+          if (nodeId == null) return null;
+          return { nodeId, kind: "images" };
+        }
         if (!it || typeof it !== "object") return null;
         const nodeId = num(it.nodeId ?? it.node_id ?? it.id);
         if (nodeId == null) return null;

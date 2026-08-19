@@ -41,6 +41,44 @@ test("findAppModeConfig: falls back through candidate keys", () => {
   assert.equal(AppBuilder.findAppModeConfig({ extra: { appMode: { notInputs: [] } } }), null);
 });
 
+test("#1429 findAppModeConfig reads official extra.linearData tuples and bare output ids", () => {
+  const wf = {
+    extra: {
+      linearData: {
+        inputs: [
+          [6, "text", { description: "Prompt" }],
+          ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:4:ckpt_name", "ckpt_name"],
+        ],
+        outputs: [9, "10"],
+      },
+    },
+  };
+  const cfg = AppBuilder.findAppModeConfig(wf);
+  assert.deepEqual(cfg, {
+    inputs: [
+      { nodeId: 6, widget: "text", label: "Prompt", kind: "text" },
+      { nodeId: 4, widget: "ckpt_name", label: "ckpt_name", kind: "text" },
+    ],
+    outputs: [
+      { nodeId: 9, kind: "images" },
+      { nodeId: 10, kind: "images" },
+    ],
+    importedFromFrontend: true,
+  });
+});
+
+test("#1429 extra.linearData wins over extra.appMode when both exist", () => {
+  const cfg = AppBuilder.findAppModeConfig({
+    extra: {
+      linearData: { inputs: [[6, "text"]], outputs: [9] },
+      appMode: { inputs: [{ nodeId: 1, widget: "other" }] },
+    },
+  });
+  assert.equal(cfg.inputs[0].nodeId, 6);
+  assert.equal(cfg.inputs[0].widget, "text");
+  assert.equal(cfg.outputs[0].nodeId, 9);
+});
+
 test("findAppModeConfig: skips malformed entries", () => {
   const wf = {
     extra: {

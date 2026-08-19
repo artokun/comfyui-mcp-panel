@@ -444,6 +444,7 @@ const MUTATING_GRAPH_COMMANDS = [
   "graph_clear",
   "graph_load",
   "graph_run",
+  "graph_configure_app_mode",
   "graph_future_command", // unknown commands fail closed as mutations
 ];
 
