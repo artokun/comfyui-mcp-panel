@@ -22,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "../../web/js/lib/slot-labels.js";
+import { duplicateWidgetRows } from "../../web/js/lib/widget-rows.js";
 import { virtualFedInputs } from "../../web/js/lib/virtual-source-promotion.js";
 import { controlAfterGenerateModes } from "../../web/js/lib/control-after-generate.js";
 import { drivenWidgetsFor } from "../../web/js/lib/graph-read.js";
@@ -52,6 +53,7 @@ const summarizeNode = (() => {
     "boundaryInputLabel",
     "displayLabel",
     "widgetLabelMap",
+    "duplicateWidgetRows",
     "controlAfterGenerateModes",
     "drivenWidgetsFor",
     `${fn}; return summarizeNode;`,
@@ -60,6 +62,7 @@ const summarizeNode = (() => {
     boundaryInputLabel,
     displayLabel,
     widgetLabelMap,
+    duplicateWidgetRows,
     controlAfterGenerateModes,
     drivenWidgetsFor,
   );
@@ -129,4 +132,27 @@ test("#1402 index is the live widgets[] slot, not a filtered-name compact index"
   assert.equal(node.widgets[listed[1].index], b);
   assert.equal("label" in listed[0], false, "no invented label when the widget carries none");
   assert.equal("label" in listed[1], false);
+});
+
+test("#1402 a widget named __proto__ is reported, not thrown on", () => {
+  // A widget name is arbitrary third-party data. Accumulating occurrences into a plain
+  // object reads `bucket["__proto__"]` back as Object.prototype rather than a missing
+  // key, so `(out[name] ??= []).push(…)` THROWS — and a throw here takes the WHOLE
+  // node's detail with it, strictly worse than the collapsed read this field replaced.
+  for (const name of ["__proto__", "constructor", "toString"]) {
+    const node = bypasser([{ name, value: 1 }, { name, value: 2 }]);
+    let summary;
+    assert.doesNotThrow(() => {
+      summary = summarizeNode(node);
+    }, `summarizeNode must not throw on a widget named ${name}`);
+    assert.deepEqual(
+      summary.duplicate_widgets[name].map((r) => r.value),
+      [1, 2],
+      `${name} must come back as ordinary data`,
+    );
+    // It must survive the trip the payload actually makes — the detail line is
+    // JSON.stringify'd before it is sent.
+    assert.deepEqual(JSON.parse(JSON.stringify(summary.duplicate_widgets))[name].map((r) => r.value), [1, 2]);
+  }
+  assert.equal({}.polluted, undefined, "nothing leaked onto Object.prototype");
 });
