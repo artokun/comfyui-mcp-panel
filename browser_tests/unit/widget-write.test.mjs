@@ -517,6 +517,99 @@ test("#179 REGRESSION: a valid full-object write still merges + preserves unspec
   assert.equal(set.value.strengthTwo, null); // preserved
 });
 
+// ---- comfyui-mcp#1711: nested composites inside a JSON widget (Pixaroma) ----
+
+test("comfyui-mcp#1711: a read-modify-write pass-through of a widget holding a nested ARRAY-OF-ARRAYS is accepted", () => {
+  // PixaromaSizes' sizes_ui: scalars plus `sizes`, an Array<Array<number>>. The agent
+  // reads the value verbatim, changes only scalar leaves, and sends the whole JSON back;
+  // the untouched `sizes` field must not be refused as "not a recognized type".
+  const node = {
+    id: 223,
+    type: "PixaromaSizes",
+    widgets: [
+      {
+        name: "sizes_ui",
+        value: { selected: 2, w: 480, h: 864, sizes: [[608, 352], [736, 416], [864, 480]] },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(
+    node,
+    "sizes_ui",
+    '{"selected":8,"w":768,"h":1344,"sizes":[[608,352],[736,416],[864,480]]}',
+    HOOKS,
+  );
+  assert.equal(set.value.selected, 8);
+  assert.equal(set.value.w, 768);
+  assert.deepEqual(set.value.sizes, [[608, 352], [736, 416], [864, 480]]);
+});
+
+test("comfyui-mcp#1711: a CHANGED but same-shaped nested array is accepted", () => {
+  const node = {
+    id: 224,
+    type: "PixaromaSizes",
+    widgets: [
+      { name: "sizes_ui", value: { selected: 2, sizes: [[608, 352], [736, 416]] } },
+    ],
+  };
+  // Add one pair and edit another — the shape (array of [number, number]) is unchanged.
+  const set = applyWidgetWrite(
+    node,
+    "sizes_ui",
+    '{"sizes":[[608,352],[864,480],[1920,1088]]}',
+    HOOKS,
+  );
+  assert.deepEqual(set.value.sizes, [[608, 352], [864, 480], [1920, 1088]]);
+  assert.equal(set.value.selected, 2); // unspecified field preserved
+});
+
+test("comfyui-mcp#1711: a same-shaped nested array is accepted via DOTTED sub-field addressing too", () => {
+  const node = {
+    id: 225,
+    type: "PixaromaSizes",
+    widgets: [
+      { name: "sizes_ui", value: { selected: 2, sizes: [[608, 352]] } },
+    ],
+  };
+  const set = applyWidgetWrite(node, "sizes_ui.sizes", [[1024, 576], [1280, 720]], HOOKS);
+  assert.deepEqual(set.value.sizes, [[1024, 576], [1280, 720]]);
+  assert.equal(set.value.selected, 2);
+});
+
+test("comfyui-mcp#1711: a shape-DIVERGENT value for a nested composite field still FAILS CLOSED", () => {
+  const node = {
+    id: 226,
+    type: "PixaromaSizes",
+    widgets: [
+      { name: "sizes_ui", value: { selected: 2, sizes: [[608, 352], [736, 416]] } },
+    ],
+  };
+  // A string where the array-of-arrays sits, and an array with a wrong leaf type, are
+  // both provable mistypes — refused, and the widget is left untouched.
+  assert.throws(
+    () => applyWidgetWrite(node, "sizes_ui", '{"sizes":"608x352"}', HOOKS),
+    (err) => err instanceof WidgetWriteError && /cannot validate the value/.test(err.message),
+  );
+  assert.throws(
+    () => applyWidgetWrite(node, "sizes_ui", '{"sizes":[["608","352"]]}', HOOKS),
+    (err) => err instanceof WidgetWriteError && /cannot validate the value/.test(err.message),
+  );
+  assert.deepEqual(node.widgets[0].value.sizes, [[608, 352], [736, 416]]);
+});
+
+test("comfyui-mcp#1711: an EMPTY existing array stays fail-closed (no element type to infer)", () => {
+  const node = {
+    id: 227,
+    type: "PixaromaSizes",
+    widgets: [{ name: "sizes_ui", value: { selected: 2, sizes: [] } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "sizes_ui", '{"sizes":[[608,352]]}', HOOKS),
+    (err) => err instanceof WidgetWriteError && /cannot validate the value/.test(err.message),
+  );
+  assert.deepEqual(node.widgets[0].value.sizes, []);
+});
+
 test("#560 SAFETY: dotted addressing on a SUBGRAPH parent is refused (never a rail-only write)", () => {
   // A subgraph-shaped node whose "lora_1" is NOT resolvable as a promotion alias here:
   // the dotted form must fail closed rather than write the parent rail directly (#366).

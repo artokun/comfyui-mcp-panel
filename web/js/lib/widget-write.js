@@ -369,13 +369,42 @@ function coerceByType(type, value, where) {
   return value;
 }
 
+// True when `value` has the SAME recursive type shape as `existing` — every leaf the
+// same primitive type, arrays element-compatible, plain objects carrying no key the
+// existing object lacks. Used to validate an unknown composite's OBJECT/ARRAY field
+// against its own current value (comfyui-mcp#1711): UI-heavy node packs (e.g.
+// ComfyUI-Pixaroma) store state as JSON blobs with nested composites like
+// `sizes: [[608,352],...]`, whose element types are perfectly inferable from the
+// existing value — so a same-shaped write (including the byte-identical pass-through
+// a read-modify-write agent sends back) is provably not a mistype and must be accepted,
+// while a shape-DIVERGENT value (string where an array sits, a foreign key) still fails
+// closed. An EMPTY existing array/object carries no element type to infer, so only an
+// equally-empty value matches it.
+function matchesExistingShape(existing, value) {
+  if (Array.isArray(existing)) {
+    if (!Array.isArray(value)) return false;
+    if (existing.length === 0) return value.length === 0;
+    return value.every((v) => existing.some((e) => matchesExistingShape(e, v)));
+  }
+  if (existing !== null && typeof existing === "object") {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    return Object.keys(value).every(
+      (k) =>
+        Object.prototype.hasOwnProperty.call(existing, k) &&
+        matchesExistingShape(existing[k], value[k]),
+    );
+  }
+  return typeof value === typeof existing && (existing !== null || value === null);
+}
+
 /**
  * Validate + coerce a composite field value. The expected type comes FIRST from the
  * declared schema (so a null current field still enforces the right type, #560 P0), and
  * `null` is accepted only for a nullable field (#560 P2). For an UNKNOWN composite with
- * no schema, fall back to the existing NON-null value's type; a null/undefined current
- * value with no schema is genuinely untyped, so only a primitive is accepted verbatim.
- * Throws WidgetWriteError on a mismatch.
+ * no schema, fall back to the existing NON-null value's type — a scalar field coerces
+ * strictly, and an object/array field is accepted when the value matches the existing
+ * value's recursive shape (comfyui-mcp#1711). A null/undefined current value with no
+ * schema is genuinely untyped and refused. Throws WidgetWriteError on a mismatch.
  */
 function coerceCompositeFieldValue(widgetName, base, field, value) {
   const where = `sub-field "${widgetName}.${field}"`;
@@ -392,10 +421,16 @@ function coerceCompositeFieldValue(widgetName, base, field, value) {
   if (typeof existing === "boolean") return coerceByType("boolean", value, where);
   if (typeof existing === "number") return coerceByType("number", value, where);
   if (typeof existing === "string") return coerceByType("string", value, where);
-  // No schema AND an untyped current value (null/undefined/object): the field's type is
-  // genuinely unknowable, so we REFUSE rather than write a possibly-wrong-typed value —
-  // #560's principle is a loud, safe failure over silent corruption. (A KNOWN composite,
-  // e.g. rgthree, is handled by the schema above and its nullable fields still clear.)
+  // comfyui-mcp#1711: the existing value is an object/array, so the field is a NESTED
+  // composite — not untyped. Validate the value against the existing value's recursive
+  // shape; a same-shaped value (typically the read-modify-write pass-through of the
+  // field's own current content) is safe to write verbatim.
+  if (existing != null && matchesExistingShape(existing, value)) return value;
+  // No schema AND an untyped current value (null/undefined) OR a shape-DIVERGENT value
+  // for a nested composite: the write cannot be proven correctly-typed, so we REFUSE
+  // rather than write a possibly-wrong-typed value — #560's principle is a loud, safe
+  // failure over silent corruption. (A KNOWN composite, e.g. rgthree, is handled by the
+  // schema above and its nullable fields still clear.)
   throw new WidgetWriteError(
     `${where}: cannot validate the value — this composite is not a recognized type and the ` +
       `field's current value is ${existing === undefined ? "undefined" : JSON.stringify(existing)}, ` +
