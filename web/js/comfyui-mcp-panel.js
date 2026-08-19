@@ -16125,8 +16125,12 @@ const GRAPH_TOOL_EXECUTORS = {
               // a healed node makes the content comparison below honest rather than
               // reporting a difference the panel could have repaired. Same helper, same
               // contract as graph_load.
-              if (nodeIsolation?.failures?.length) {
-                const retry = retryNodeRestores(app?.graph, nodeIsolation.failures);
+              // Bound to a local first: the #268 contract scanner captures members off
+              // an unanchored `s\.` pattern, so `…failures?.length` reads to it as a new
+              // workflow-SERVICE dependency. Same reason `canvasView` exists below.
+              const containedNodeFailureList = nodeIsolation?.failures ?? [];
+              if (containedNodeFailureList.length) {
+                const retry = retryNodeRestores(app?.graph, containedNodeFailureList);
                 openRestoreRetried = retry.restored;
                 openRestoreFailures = retry.failed;
               }
