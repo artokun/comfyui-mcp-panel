@@ -23580,7 +23580,9 @@ function describeCommand(cmd, msg, reply) {
                   { count: seg },
                 )
               : "") +
-            tr("panel.ltx_timeline_resynced", " — UI re-synced, derived prompt/length widgets regenerated"),
+            (r.ltx_timeline.fallback
+              ? ""
+              : tr("panel.ltx_timeline_resynced", " — UI re-synced, derived prompt/length widgets regenerated")),
         };
       }
       // #366: a promoted-subgraph write is only truly applied when the parent RAIL

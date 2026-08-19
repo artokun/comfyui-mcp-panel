@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - dictation listens for the spoken language when the panel UI is the English catalog floor — a German (or other unshipped) speaker no longer gets an English recognizer (#1329)
+- panel_set_widget can author an LTXDirector timeline from the serialized widgets when the live timeline editor is not initialized (#1308)
 - live-sync no longer reports notified unless the active canvas actually holds the saved workflow (#1299)
 - `panel_edit_group({bounds})` writes the group box only — contained nodes stay at their canvas coordinates (#1306)
 - an already-full origin can save workflow drafts again after the chat-history quota fix (#1305)

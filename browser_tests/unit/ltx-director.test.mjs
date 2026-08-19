@@ -6,6 +6,8 @@
 // reverted if written directly. These tests drive the REAL shipped lib.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   LTX_DIRECTOR_NODE_TYPE,
   LTX_TIMELINE_MASTER_WIDGET,
@@ -14,9 +16,14 @@ import {
   classifyLtxTimelineWrite,
   normalizeLtxTimelineValue,
   currentTimelineSnapshot,
+  parseTimelineSnapshot,
+  deriveLtxTimelineWidgets,
+  readLtxTimelineWindow,
   derivedTimelineRefusal,
   applyLtxTimelineWrite,
   LtxTimelineWriteError,
+  LTX_AUDIO_TOGGLE_WIDGET,
+  LTX_MOTION_TOGGLE_WIDGET,
 } from "../../web/js/lib/ltx-director.js";
 
 /** A fake node whose _timelineEditor records the _applyLoadedTimeline call. */
@@ -39,6 +46,37 @@ function makeLtxNode({
 
 /** The JSON string passed to the node's _applyLoadedTimeline, parsed back. */
 const drivenPayload = (calls) => JSON.parse(calls[0].jsonStr);
+
+/** A headless LTXDirector — widgets exist, live TimelineEditor does not (#1308). */
+function makeHeadlessLtxNode({
+  id = 42,
+  timelineData = "",
+  localPrompts = "",
+  segmentLengths = "",
+  guideStrength = "",
+  useCustomAudio = false,
+  useCustomMotion = true,
+  startFrame = 0,
+  durationFrames = 120,
+  extraWidgets = [],
+} = {}) {
+  const widgets = [
+    { name: "timeline_data", value: timelineData },
+    { name: "local_prompts", value: localPrompts },
+    { name: "segment_lengths", value: segmentLengths },
+    { name: "guide_strength", value: guideStrength },
+    { name: LTX_AUDIO_TOGGLE_WIDGET, value: useCustomAudio },
+    { name: LTX_MOTION_TOGGLE_WIDGET, value: useCustomMotion },
+    { name: "start_frame", value: startFrame },
+    { name: "duration_frames", value: durationFrames },
+    ...extraWidgets,
+  ];
+  return { id, type: LTX_DIRECTOR_NODE_TYPE, widgets, _timelineEditor: null };
+}
+
+function widgetOf(node, name) {
+  return node.widgets.find((w) => w.name === name);
+}
 
 /** A minimally-valid segment — finite numeric start + length are REQUIRED (NaN-timing guard). */
 const seg = (extra = {}) => ({ start: 0, length: 24, ...extra });
@@ -269,11 +307,11 @@ test("currentTimelineSnapshot reads the widget JSON, and null on empty/invalid",
   assert.equal(currentTimelineSnapshot({}), null);
 });
 
-test("applyLtxTimelineWrite fails LOUDLY when the editor / load path is missing", () => {
-  // No editor at all (node UI not initialized).
+test("applyLtxTimelineWrite fails LOUDLY when the editor is missing AND there are no serialized widgets", () => {
+  // No editor and no node.widgets — nothing to write.
   const noEditor = makeLtxNode({ withEditor: false });
   assert.throws(() => applyLtxTimelineWrite(noEditor.node, "{}"), LtxTimelineWriteError);
-  // Editor present but without the _applyLoadedTimeline method (pack version mismatch).
+  // Editor present but without the _applyLoadedTimeline method, and no node widgets.
   const wrongMethod = makeLtxNode({ method: "_somethingElse" });
   assert.throws(() => applyLtxTimelineWrite(wrongMethod.node, "{}"), LtxTimelineWriteError);
 });
@@ -355,4 +393,246 @@ test("derivedTimelineRefusal names the widget, the node, and points at timeline_
   assert.match(msg, /node 99/);
   assert.match(msg, /timeline_data/);
   assert.match(msg, /#314/);
+});
+
+test("parseTimelineSnapshot / currentTimelineSnapshot read the widget JSON, and null on empty/invalid", () => {
+  assert.deepEqual(parseTimelineSnapshot('{"a":1}'), { a: 1 });
+  assert.equal(parseTimelineSnapshot(""), null);
+  assert.equal(parseTimelineSnapshot("not json"), null);
+  assert.deepEqual(currentTimelineSnapshot({ timelineDataWidget: { value: '{"a":1}' } }), { a: 1 });
+});
+
+test("deriveLtxTimelineWidgets mirrors commitChanges: joiners, gap absorb, window fill", () => {
+  // Two 24-frame segments on a 120-frame window: last length absorbs the trailing 72.
+  const d = deriveLtxTimelineWidgets(
+    { segments: [seg({ prompt: "a" }), seg({ start: 24, length: 24, prompt: "b" })] },
+    { startFrames: 0, durationFrames: 120 },
+  );
+  assert.equal(d.local_prompts, "a | b");
+  assert.equal(d.segment_lengths, "24,96", "no space after comma; last segment fills the window");
+  assert.equal(d.guide_strength, "1.00,1.00", "non-text segments emit default 1.00");
+});
+
+test("deriveLtxTimelineWidgets skips text segments for guide_strength and uses explicit strength", () => {
+  const d = deriveLtxTimelineWidgets(
+    {
+      segments: [
+        seg({ prompt: "img", guideStrength: 0.4 }),
+        seg({ start: 24, length: 24, prompt: "txt", type: "text" }),
+      ],
+    },
+    { startFrames: 0, durationFrames: 48 },
+  );
+  assert.equal(d.local_prompts, "img | txt");
+  assert.equal(d.guide_strength, "0.40");
+});
+
+test("deriveLtxTimelineWidgets retake mode emits preserved/retake/preserved regions", () => {
+  const d = deriveLtxTimelineWidgets(
+    {
+      retakeMode: true,
+      global_prompt: "keep",
+      retakeStart: 24,
+      retakeLength: 48,
+      retakePrompt: "new take",
+      retakeStrength: 0.7,
+    },
+    { startFrames: 0, durationFrames: 120 },
+  );
+  assert.equal(d.local_prompts, "keep | new take | keep");
+  assert.equal(d.segment_lengths, "24,48,48");
+  assert.equal(d.guide_strength, "0.00,0.70,0.00");
+});
+
+test("readLtxTimelineWindow reads start_frame / duration_frames with the editor's fallbacks", () => {
+  const node = makeHeadlessLtxNode({ startFrame: 8, durationFrames: 96 });
+  assert.deepEqual(readLtxTimelineWindow(node), { startFrames: 8, durationFrames: 96 });
+  assert.deepEqual(readLtxTimelineWindow({ widgets: [] }), { startFrames: 0, durationFrames: 24 });
+  assert.deepEqual(readLtxTimelineWindow({ widgets: [{ name: "duration_frames", value: 0 }] }), {
+    startFrames: 0,
+    durationFrames: 24,
+  });
+});
+
+test("applyLtxTimelineWrite authors a timeline from serialized widgets when the editor is absent (#1308)", () => {
+  const node = makeHeadlessLtxNode();
+  const value = { global_prompt: "g", segments: [seg({ prompt: "hello", guideStrength: 0.5 })] };
+  const res = applyLtxTimelineWrite(node, value);
+  assert.equal(res.ltx_timeline.driven, true);
+  assert.equal(res.ltx_timeline.fallback, true);
+  assert.equal(res.ltx_timeline.editor_driven, false);
+  assert.equal(res.ltx_timeline.segments, 1);
+  assert.deepEqual(res.ltx_timeline.derived_regenerated, [...LTX_DERIVED_TIMELINE_WIDGETS]);
+  assert.equal(JSON.parse(widgetOf(node, "timeline_data").value).global_prompt, "g");
+  assert.equal(widgetOf(node, "local_prompts").value, "hello");
+  // 24-frame segment on the node's 120-frame window → last (only) segment fills to 120.
+  assert.equal(widgetOf(node, "segment_lengths").value, "120");
+  assert.equal(widgetOf(node, "guide_strength").value, "0.50");
+  assert.equal(res.ltx_timeline.local_prompts, "hello");
+  assert.equal(res.ltx_timeline.segment_lengths, "120");
+  assert.equal(res.ltx_timeline.guide_strength, "0.50");
+});
+
+test("serialized fallback MERGES onto the current timeline_data widget (omitted tracks preserved)", () => {
+  const current = {
+    global_prompt: "old global",
+    segments: [seg({ prompt: "old-seg" })],
+    motionSegments: [seg({ prompt: "keep-motion" })],
+    audioSegments: [seg({ prompt: "keep-audio" })],
+    audioTrackEnabled: true,
+  };
+  const node = makeHeadlessLtxNode({ timelineData: JSON.stringify(current) });
+  const res = applyLtxTimelineWrite(node, { segments: [seg({ prompt: "new-seg" })] });
+  const written = JSON.parse(widgetOf(node, "timeline_data").value);
+  assert.deepEqual(written.segments, [seg({ prompt: "new-seg" })]);
+  assert.deepEqual(written.motionSegments, [seg({ prompt: "keep-motion" })]);
+  assert.deepEqual(written.audioSegments, [seg({ prompt: "keep-audio" })]);
+  assert.equal(written.global_prompt, "old global");
+  assert.equal(res.ltx_timeline.merged_onto_current, true);
+  assert.deepEqual(res.ltx_timeline.preserved_tracks.sort(), ["audioSegments", "motionSegments"]);
+  assert.equal(widgetOf(node, "local_prompts").value, "new-seg");
+});
+
+test("serialized fallback sets use_custom_audio / use_custom_motion from the timeline flags", () => {
+  const node = makeHeadlessLtxNode({ useCustomAudio: false, useCustomMotion: true });
+  const res = applyLtxTimelineWrite(node, {
+    segments: [seg({ prompt: "a" })],
+    audioTrackEnabled: true,
+    motionTrackEnabled: false,
+  });
+  assert.equal(widgetOf(node, LTX_AUDIO_TOGGLE_WIDGET).value, true);
+  assert.equal(widgetOf(node, LTX_MOTION_TOGGLE_WIDGET).value, false);
+  assert.deepEqual(res.ltx_timeline.audio_motion_toggles, {
+    [LTX_AUDIO_TOGGLE_WIDGET]: true,
+    [LTX_MOTION_TOGGLE_WIDGET]: false,
+  });
+});
+
+test("serialized fallback defaults omitted audio/motion flags to ON (pack: `!== false`)", () => {
+  const node = makeHeadlessLtxNode({ useCustomAudio: false, useCustomMotion: false });
+  applyLtxTimelineWrite(node, { segments: [seg({ prompt: "a" })] });
+  assert.equal(widgetOf(node, LTX_AUDIO_TOGGLE_WIDGET).value, true);
+  assert.equal(widgetOf(node, LTX_MOTION_TOGGLE_WIDGET).value, true);
+});
+
+test("an unready editor plus serialized widgets takes the fallback, not a refusal (#1308)", () => {
+  const node = makeHeadlessLtxNode();
+  // Editor object exists but has no load path — the install-without-hard-refresh shape.
+  node._timelineEditor = { timeline: {} };
+  const res = applyLtxTimelineWrite(node, { segments: [seg({ prompt: "via-fallback" })] });
+  assert.equal(res.ltx_timeline.fallback, true);
+  assert.equal(widgetOf(node, "local_prompts").value, "via-fallback");
+});
+
+test("a ready live editor is preferred over the serialized fallback", () => {
+  const { node, calls } = makeLtxNode();
+  node.widgets = [
+    { name: "timeline_data", value: "" },
+    { name: "local_prompts", value: "" },
+    { name: "segment_lengths", value: "" },
+    { name: "guide_strength", value: "" },
+  ];
+  const res = applyLtxTimelineWrite(node, { segments: [seg({ prompt: "via-editor" })] });
+  assert.equal(res.ltx_timeline.editor_driven, true);
+  assert.equal(res.ltx_timeline.fallback, false);
+  assert.equal(calls.length, 1);
+  assert.equal(widgetOf(node, "local_prompts").value, "", "fallback must not also assign widgets");
+});
+
+test("serialized fallback REFUSES when derived widgets are missing (execute would stay on old prompts)", () => {
+  const node = {
+    id: 9,
+    type: LTX_DIRECTOR_NODE_TYPE,
+    widgets: [{ name: "timeline_data", value: "" }],
+  };
+  assert.throws(() => applyLtxTimelineWrite(node, { segments: [seg({ prompt: "x" })] }), /local_prompts/);
+  assert.equal(widgetOf(node, "timeline_data").value, "", "must not write timeline_data alone");
+});
+
+test("serialized fallback REFUSES a wipe-inducing payload BEFORE opening the undo envelope", () => {
+  const node = makeHeadlessLtxNode();
+  const order = [];
+  assert.throws(
+    () =>
+      applyLtxTimelineWrite(node, { segments: [null] }, {
+        beforeChange: () => order.push("before"),
+        afterChange: () => order.push("after"),
+        setDirty: () => order.push("dirty"),
+      }),
+    LtxTimelineWriteError,
+  );
+  assert.deepEqual(order, []);
+  assert.equal(widgetOf(node, "timeline_data").value, "");
+});
+
+test("serialized fallback wraps the write in an undo envelope: before → after → dirty", () => {
+  const node = makeHeadlessLtxNode();
+  const order = [];
+  applyLtxTimelineWrite(node, { segments: [seg({ prompt: "x" })] }, {
+    beforeChange: () => order.push("before"),
+    afterChange: () => order.push("after"),
+    setDirty: () => order.push("dirty"),
+  });
+  assert.deepEqual(order, ["before", "after", "dirty"]);
+});
+
+// The SHIPPED graph_set_widget branch — not a copy of it. A headless LTXDirector
+// (widgets exist, no live editor) must author the timeline through that exact code.
+const PANEL_SRC = readFileSync(
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  "utf8",
+).replace(/\r\n/g, "\n");
+
+const LTX_SET_WIDGET_BRANCH = PANEL_SRC.match(
+  /const ltxKind = classifyLtxTimelineWrite\(node, widget\);\n    if \(ltxKind === "derived"\) \{[\s\S]*?setDirty: \(\) => graph\.setDirtyCanvas\(true, true\),\n      \}\);\n    \}/,
+);
+
+test("graph_set_widget still routes LTXDirector timeline_data through applyLtxTimelineWrite", () => {
+  assert.ok(LTX_SET_WIDGET_BRANCH, "LTXDirector branch not found in graph_set_widget");
+  const ltxAt = PANEL_SRC.indexOf("const ltxKind = classifyLtxTimelineWrite");
+  const applyAt = PANEL_SRC.indexOf("return applyLtxTimelineWrite(node, value,");
+  const genericAt = PANEL_SRC.indexOf("await runSetWidget(node, widget, value");
+  assert.ok(ltxAt > 0 && applyAt > 0 && genericAt > 0);
+  assert.ok(ltxAt < applyAt && applyAt < genericAt, "LTX route must stay ahead of the generic write");
+});
+
+test("shipped graph_set_widget authors an LTXDirector timeline without a live editor (#1308)", () => {
+  assert.ok(LTX_SET_WIDGET_BRANCH, "LTXDirector branch not found in graph_set_widget");
+  const node = makeHeadlessLtxNode();
+  const graph = {
+    log: [],
+    beforeChange() {
+      this.log.push("before");
+    },
+    afterChange() {
+      this.log.push("after");
+    },
+    setDirtyCanvas() {
+      this.log.push("dirty");
+    },
+  };
+  const run = new Function(
+    "classifyLtxTimelineWrite",
+    "derivedTimelineRefusal",
+    "applyLtxTimelineWrite",
+    "node",
+    "widget",
+    "value",
+    "graph",
+    `return (function () { ${LTX_SET_WIDGET_BRANCH[0]} })();`,
+  );
+  const res = run(
+    classifyLtxTimelineWrite,
+    derivedTimelineRefusal,
+    applyLtxTimelineWrite,
+    node,
+    LTX_TIMELINE_MASTER_WIDGET,
+    { global_prompt: "g", segments: [seg({ prompt: "shipped" })] },
+    graph,
+  );
+  assert.equal(res.ltx_timeline.fallback, true);
+  assert.equal(res.ltx_timeline.driven, true);
+  assert.equal(widgetOf(node, "local_prompts").value, "shipped");
+  assert.equal(JSON.parse(widgetOf(node, "timeline_data").value).global_prompt, "g");
+  assert.deepEqual(graph.log, ["before", "after", "dirty"]);
 });
