@@ -121,8 +121,21 @@ test('reopening the active workflow keeps a value the tracker never saw', async 
   // final assertion below passes vacuously, because the widget write was never
   // touched by anything.
   const ran = JSON.stringify(reopened)
-  expect(ran, 'the reply must be the post-repaint verdict, not an earlier failure').toContain(
-    'workflow_open RAN, the canvas IS bound to'
+  // panel#1283 — TWO replies now prove the repaint ran, and the assertion must accept
+  // both without accepting anything else.
+  //
+  // The sentence above is emitted only by the CONTENT_UNVERIFIED branch. Since the panel
+  // started WATCHING the restore, a benign repaint difference on a load that ran to
+  // completion is reported APPLIED instead — and that reply is a STRONGER post-repaint
+  // signal, not a weaker one: the success path is reached only once this attempt's
+  // one-time marker was found on the live root, which can only be there because THIS
+  // load configured it. An error raised before the repaint has neither, so the vacuous
+  // pass this assertion was written against (codex) is still excluded.
+  const provenPostRepaint =
+    ran.includes('workflow_open RAN, the canvas IS bound to') ||
+    (reopened.ok === true && typeof reopened.result?.workflow_uuid === 'string')
+  expect(provenPostRepaint, 'the reply must be the post-repaint verdict, not an earlier failure').toBe(
+    true
   )
 
   // Two independent signals, because either alone can be satisfied for the wrong

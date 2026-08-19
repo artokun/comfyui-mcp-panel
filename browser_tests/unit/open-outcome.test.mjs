@@ -505,14 +505,31 @@ test("#721 P1: dirty rebind success requires the target UUID, never only a read-
   // and demanding byte-identity made every such open report CONTENT_UNVERIFIED (which
   // throws, which withholds the fence). The predicate still refuses anything but a
   // nodes-only, same-set, geometry-only difference.
-  assert.match(repaint, /graphRootReproducesStateContent\(\{ rootGraph, state: repaintState \}\)/);
+  // panel#1283 family — the call now also hands over `loadRanToCompletion`, the
+  // observation of whether this restore aborted, so the pin spans the call rather than
+  // one formatted line. Both payload arguments are still named: dropping either one
+  // fails here.
+  assert.match(repaint, /graphRootReproducesStateContent\(\{[\s\S]{0,600}?state: repaintState,/);
+  assert.match(
+    repaint,
+    /graphRootReproducesStateContent\(\{[\s\S]{0,600}?loadRanToCompletion,/,
+    "the completed-restore observation must actually reach the proof",
+  );
   // #1623 — TWO grounds now, and BOTH must be named here. `proven` is the strict
   // "the content was reproduced"; `presentationOnly` is the weaker "nothing authored
   // was lost", which is the question the caller acts on and the one the panel's own
   // disclosure already answered on the same observation. Pinning the expression
   // rather than either half is deliberate: dropping `presentationOnly` restores the
   // reported false error, and dropping `proven` silently narrows the #1001 fix.
-  assert.match(repaint, /const contentMatches = contentProof\.proven \|\| contentProof\.presentationOnly;/);
+  // panel#1283 family — a THIRD ground, `normalizedOnly`, licensed by an observation
+  // that the restore ran to completion rather than by a judgement about a field name.
+  // All three are pinned: dropping `presentationOnly` restores #1623's false error,
+  // dropping `proven` silently narrows the #1001 fix, and dropping `normalizedOnly`
+  // restores the false error this family reported.
+  assert.match(
+    repaint,
+    /const contentMatches =\s*contentProof\.proven \|\| contentProof\.presentationOnly \|\| contentProof\.normalizedOnly;/,
+  );
   // The two disclosures stay SEPARATE. Folding the weaker case into
   // `openGeometryRewritten` would attach a note asserting a characterised
   // height-only rewrite to a difference where no such thing was established.

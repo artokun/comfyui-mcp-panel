@@ -86,7 +86,12 @@ import {
 } from "./lib/duplicate-panel-guard.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
-import { installNodeConfigureIsolation, retryNodeRestores } from "./lib/load-restore-isolation.js";
+import {
+  installNodeConfigureIsolation,
+  retryNodeRestores,
+  installGraphConfigureWatch,
+  loadRestoreCompleted,
+} from "./lib/load-restore-isolation.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
 import {
@@ -7262,6 +7267,21 @@ function fixedCapNote(what, shown, total, targeted) {
     `Showing ${of} ${what} — this view has a FIXED cap of ${MAX_STATE_NODES} and no parameter raises it. ` +
     targeted
   );
+}
+
+/**
+ * The LiteGraph global, resolved exactly as `getGraphCtx()` resolves it — and WITHOUT
+ * its refusals. `getGraphCtx()` is the authoritative viewing-scope source and throws on
+ * a canvas/root divergence by design; a caller that only needs the LiteGraph namespace
+ * (to wrap a prototype, say) must not inherit that, or it moves a refusal earlier than
+ * the destructive step it was written to survive.
+ *
+ * Lives at module scope on purpose: `globalThis.LiteGraph` inside a handler that has
+ * aliased the workflow service reads to the #268 contract scanner as a new
+ * workflow-SERVICE dependency (it captures members off an unanchored `s\.` pattern).
+ */
+function liteGraphGlobal() {
+  return window.LiteGraph ?? globalThis.LiteGraph;
 }
 
 function getGraphCtx() {
@@ -15784,6 +15804,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // this one carries the weaker, differently-earned claim and must not borrow that
     // sentence.
     let openPresentationRewritten = null;
+    // panel#1283 family — the per-node fields that differ on a load the panel WATCHED
+    // run to completion. Neither of the two above: those judge a FIELD NAME, this rests
+    // on an observation of the restore itself, so it names the fields rather than
+    // vouching for them.
+    let openContentNormalized = null;
+    // #1260's disclosure, on the OPEN path: every node whose saved state could not be
+    // applied even after the post-load retry. Non-empty is what makes the refusal
+    // actionable — it is the difference between "widget values differ" and "this pack's
+    // node threw and never got its values".
+    let openRestoreFailures = [];
+    let openRestoreRetried = [];
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
@@ -16102,12 +16133,66 @@ const GRAPH_TOOL_EXECUTORS = {
                 ...(target.path ? { [WORKFLOW_PATH_FIELD]: target.path } : {}),
               },
             };
+            // panel#1283 family — WATCH THE RESTORE, so a content difference can be told
+            // apart from a load that stopped early.
+            //
+            // `resolveOpenRebindVerdict` refuses this open on one named hypothesis: a
+            // mid-`configure()` throw leaves the node id/type set, the links and the
+            // marker over nodes that lost their values, "and no discriminator available
+            // to the panel separates them" from a normalization. These two wraps ARE that
+            // discriminator, and they are the whole of it — measured against the frontend
+            // source, `LGraph.prototype.configure` runs its node pass with no try/catch
+            // and nothing between it and `loadGraphData`'s own catch adds one, so a throw
+            // out of a node's configure or out of the graph restore is the only way the
+            // hypothesised partial load can present.
+            //
+            // The node wrap also CONTAINS its throw, exactly as graph_load has since
+            // #1260: one pack's node no longer aborts the links, the groups and every
+            // later node. The graph wrap only observes — it re-throws — because changing
+            // what `loadGraphData` sees would make the observation describe something
+            // other than production.
+            // Read off the global, NOT through `getGraphCtx()`. That helper is the
+            // authoritative viewing-scope source and it THROWS on a canvas/root
+            // divergence by design — calling it here would move a refusal from after the
+            // load to before it, cancelling the #442 disk re-read that heals exactly that
+            // state. This wants one thing, `LiteGraph`, and an absent one is already
+            // handled: both wraps answer null, the fold answers UNKNOWN, and the open
+            // behaves exactly as it did before this change.
+            const LGForOpen = liteGraphGlobal();
+            const nodeIsolation = installNodeConfigureIsolation(LGForOpen);
+            const graphWatch = installGraphConfigureWatch(LGForOpen);
             // The load is INSIDE the try whose finally strips the marker: the payload
             // carrying the marker is handed over the moment this call starts, so a
             // REJECTION leaves it on a partially-mutated live graph. A cleanup that
             // begins after the await never runs for exactly that case.
             try {
-              await app.loadGraphData(repaintState, true, true, target);
+              try {
+                await app.loadGraphData(repaintState, true, true, target);
+              } finally {
+                // BEFORE anything reads the graph. A wrapper left installed would still
+                // be swallowing throws from an unrelated later edit, and `restore()` is
+                // what deactivates it.
+                nodeIsolation?.restore();
+                graphWatch?.restore();
+              }
+              // Retry each contained node ONCE now that the load has settled — the
+              // asynchronously-built widgets that made it throw usually exist by then, and
+              // a healed node makes the content comparison below honest rather than
+              // reporting a difference the panel could have repaired. Same helper, same
+              // contract as graph_load.
+              // Bound to a local first: the #268 contract scanner captures members off
+              // an unanchored `s\.` pattern, so `…failures?.length` reads to it as a new
+              // workflow-SERVICE dependency. Same reason `canvasView` exists below.
+              const containedNodeFailureList = nodeIsolation?.failures ?? [];
+              if (containedNodeFailureList.length) {
+                const retry = retryNodeRestores(app?.graph, containedNodeFailureList);
+                openRestoreRetried = retry.restored;
+                openRestoreFailures = retry.failed;
+              }
+              // THREE states, and the null one is the point: `loadRestoreCompleted`
+              // answers null when either wrap could not be installed, i.e. the question
+              // was never asked. Only an explicit `true` may license anything below.
+              const loadRanToCompletion = loadRestoreCompleted({ nodeIsolation, graphWatch });
               // A successful promise alone is not a binding receipt: old/partial frontend
               // implementations can resolve while leaving app.canvas on the previous root.
               // Demand the positive, attempt-specific marker even for dirty workflows —
@@ -16133,7 +16218,13 @@ const GRAPH_TOOL_EXECUTORS = {
               // `workflow_uuid` — so a perfectly good open left the caller's fence
               // stale and the next command was refused as an instance mismatch. The
               // rewritten geometry is DISCLOSED on the reply rather than swallowed.
-              const contentProof = graphRootReproducesStateContent({ rootGraph, state: repaintState });
+              const contentProof = graphRootReproducesStateContent({
+                rootGraph,
+                state: repaintState,
+                // panel#1283 family — the third ground, and the only one that rests on an
+                // observation of THIS load rather than on a judgement about a field name.
+                loadRanToCompletion,
+              });
               // #1623 — TWO grounds, and they license different sentences.
               //
               // `proven` is "the content was reproduced": every difference fits a
@@ -16151,12 +16242,34 @@ const GRAPH_TOOL_EXECUTORS = {
               // answered it: a reporter was told "you are on the right workflow and
               // there is no missing work to redo" by a call reported as an ERROR, twice
               // in a row, and re-read a graph that was already correct.
-              const contentMatches = contentProof.proven || contentProof.presentationOnly;
+              //
+              // panel#1283 family — the THIRD ground, `normalizedOnly`. `presentationOnly`
+              // still cannot reach the reported cases: `widgets_values`, `outputs`,
+              // `properties` and `widgets_values_named` are all outside
+              // `COSMETIC_NODE_FIELDS`, deliberately and correctly, because a difference
+              // in a field NAME cannot tell normalization from loss. `normalizedOnly`
+              // does not try: it is licensed by `loadRanToCompletion`, an observation
+              // that the restore did not stop early, which REFUTES the one mechanism
+              // this refusal was ever justified by. It names the differing fields on the
+              // reply instead of vouching for them.
+              const contentMatches =
+                contentProof.proven || contentProof.presentationOnly || contentProof.normalizedOnly;
               if (contentProof.proven && !contentProof.exact) {
                 openGeometryRewritten = contentProof.fields;
               }
               if (contentProof.presentationOnly) {
                 openPresentationRewritten = contentProof.fields;
+              }
+              // The STRONGER disclosure wins when both apply, and both DO apply often: a
+              // cosmetic-only difference on a watched, completed restore satisfies
+              // `presentationOnly` and `normalizedOnly` at once. Emitting two keys for one
+              // observation would ask the caller to reconcile "every content-bearing field
+              // matched" with "the panel observed the difference and not its cause" — the
+              // reply saying two different-sized things about the same fields, which is the
+              // contradiction #1623 was reported for. `proven` cannot collide: every branch
+              // that returns it returns `normalizedOnly: false`.
+              if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
+                openContentNormalized = contentProof.normalizedFields;
               }
               const verdict = resolveOpenRebindVerdict({
                 instanceStillTarget,
@@ -16187,6 +16300,14 @@ const GRAPH_TOOL_EXECUTORS = {
                     // Without this the disclosure counts an explained surface as a
                     // second unexplained one and drops to the maximal-alarm wording.
                     contentAccountedSurfaces: contentDiff.accountedSurfaces,
+                    // panel#1283 family — whether the restore ABORTED. `false` is the one
+                    // case where a content difference has a known cause other than the
+                    // frontend rewriting its own fields, and it is the case the reader
+                    // most needs named. `null` (the load could not be watched) is passed
+                    // through as null and says nothing, which is the pre-existing state
+                    // of knowledge.
+                    contentLoadRanToCompletion: loadRanToCompletion,
+                    contentRestoreFailures: openRestoreFailures,
                     // #825 — within the `nodes` surface, whether anything was LOST
                     // or the frontend merely re-measured the boxes. Same three
                     // words otherwise, opposite meanings for the reader.
@@ -16593,6 +16714,46 @@ const GRAPH_TOOL_EXECUTORS = {
               `is published rather than refused (#1623). The panel observed the difference and not ` +
               `its cause, and it is still a real difference from what is on disk: saving from here ` +
               `writes the live values.`,
+          }
+        : {}),
+      // panel#1283 / #1285 / #1307 / #1330, comfyui-mcp#1705 — present only when the
+      // open was reported applied on the COMPLETED-RESTORE ground. Its own key, because
+      // it is a materially weaker claim than either neighbour: `geometry_rewritten`
+      // asserts a characterised height-only rewrite and `presentation_rewritten` asserts
+      // that every content-bearing field matched. Neither is established here.
+      // #1260, on the OPEN path — a node whose `configure` threw during this load and whose
+      // saved state the post-load retry then re-applied successfully. Reachable on a SUCCESS
+      // reply precisely because the retry healed it: the content then compares clean. Named
+      // because the throw is real and belongs to a pack the user may want to update, and
+      // because a silent heal is how the next report of this arrives with no evidence.
+      ...(openRestoreRetried?.length
+        ? {
+            nodes_restored_on_retry: openRestoreRetried,
+            nodes_restored_on_retry_note:
+              `${openRestoreRetried.length} node(s) threw while their saved state was being applied ` +
+              `during this open, and were re-applied successfully after the load settled — their ` +
+              `widgets are built asynchronously by their own pack. Nothing is missing because of ` +
+              `it. That failure came from the node's own frontend code, not from the open; if it ` +
+              `recurs, update or report the pack.`,
+          }
+        : {}),
+      ...(openContentNormalized?.length
+        ? {
+            content_normalized: openContentNormalized,
+            content_normalized_note:
+              `Every node in this workflow came back with the same id and type, nothing extra ` +
+              `appeared, and the panel WATCHED this load: no node's configure threw and the graph ` +
+              `restore ran to completion. So the load did not stop part-way — the failure mode ` +
+              `that leaves a full node set over nodes that lost their values — and that is why ` +
+              `the open is reported APPLIED and the workflow_uuid published rather than refused. ` +
+              `What differs from the file is per-node ${openContentNormalized.join(", ")}. The ` +
+              `panel observed that difference and NOT its cause. It is NOT established that each ` +
+              `value still means what the file meant: a completed load can still hand a node ` +
+              `different values than the file held — the frontend migrates widget values and ` +
+              `rebuilds slot arrays from the node definition, and a node whose definition changed ` +
+              `since the file was saved is remapped without anything throwing. If an exact widget ` +
+              `value matters, read it with panel_graph_outline. Saving from here writes the live ` +
+              `values, not the file's.`,
           }
         : {}),
       modified: !!target.isModified,
