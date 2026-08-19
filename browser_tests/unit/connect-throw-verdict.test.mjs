@@ -327,7 +327,7 @@ test("#1272 node→node: a throw that leaves NOTHING on the graph still FAILS", 
     (err) => {
       assert.match(err.message, /threw and NOTHING landed/);
       assert.match(err.message, /reading 'slots'/);
-      assert.match(err.message, /no link from that output reaches node 143/);
+      assert.match(err.message, /this call left NO new link from that output on node 143/);
       return true;
     },
   );
@@ -411,7 +411,7 @@ test("#1272 node→node: a link that PRE-DATED the call is never credited to it"
         to_node_id: 143,
         to_input: "input1",
       }),
-    /threw and NOTHING landed/,
+    /threw and NOTHING landed[\s\S]*ALREADY on input "input2"[\s\S]*do not tear it down/,
   );
   assert.equal(dst.inputs[1].link, 7, "the pre-existing wire is left untouched");
 });
@@ -485,7 +485,7 @@ test("#1272 output rail: connect throws and the rail is EMPTY → honest failure
         to_node_id: -20,
         to_input: "image",
       }),
-    /threw and NOTHING landed[\s\S]*rail slot carries no link/,
+    /threw and NOTHING landed[\s\S]*left no new link from that output on the rail slot/,
   );
   assert.equal(rail.linkIds.length, 0);
 });
@@ -586,7 +586,7 @@ test("#1272 expose output: a throwing connect no longer STRANDS the slot addOutp
         from_output: "selected_value",
         name: "image",
       }),
-    /the frontend threw[\s\S]*was removed, so the rail is unchanged/,
+    /the frontend threw[\s\S]*was removed, so the rail carries no slot from this call/,
   );
   assert.deepEqual(graph.outputs, [], "no junk boundary output is left on the rail");
 });
@@ -655,7 +655,7 @@ test("#1272 expose input: a throwing connect no longer STRANDS the slot addInput
         to_input: "image",
         name: "image",
       }),
-    /the frontend threw[\s\S]*was removed, so the rail is unchanged/,
+    /the frontend threw[\s\S]*was removed, so the rail carries no slot from this call/,
   );
   assert.deepEqual(graph.inputs, []);
 });

@@ -12159,7 +12159,8 @@ const GRAPH_TOOL_EXECUTORS = {
               `panel_connect from node ${node.id} output "${outputSlot?.name ?? outIdx}" to subgraph ` +
                 `output "${existing.name}" threw and NOTHING landed (#1272): ` +
                 `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
-                `the rail slot carries no link from that output. Re-read with panel_graph_outline ` +
+                `this call left no new link from that output on the rail slot. Re-read with ` +
+                `panel_graph_outline ` +
                 `before retrying.`,
             );
           }
@@ -12231,7 +12232,8 @@ const GRAPH_TOOL_EXECUTORS = {
               `panel_connect from subgraph input "${existing.name}" to node ${node.id} input ` +
                 `"${inputSlot?.name ?? inIdx}" threw and NOTHING landed (#1272): ` +
                 `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
-                `the rail slot carries no link to that input. Re-read with panel_graph_outline ` +
+                `this call left no new link to that input on the rail slot. Re-read with ` +
+                `panel_graph_outline ` +
                 `before retrying.`,
             );
           }
@@ -12356,16 +12358,26 @@ const GRAPH_TOOL_EXECUTORS = {
         // new one, so a throw in between can leave the input empty. Say so only
         // when the live graph actually shows it.
         const priorWireGone = prevLinkId != null && target.inputs?.[inIdx]?.link == null;
+        // The scan above EXCLUDES ids that pre-dated this call, so "nothing landed"
+        // means "this call added nothing" — NOT "no such wire exists". Re-run it
+        // without the exclusion so an older wire from the same output is DISCLOSED
+        // rather than implicitly denied by the sentence below.
+        const preexisting = findLandedInboundLink(graph, origin, outIdx, target, null);
         throw new Error(
           `panel_connect threw and NOTHING landed (#1272): node ${origin.id} output ` +
             `"${origin.outputs?.[outIdx]?.name ?? outIdx}" → node ${target.id} input ` +
             `"${target.inputs?.[inIdx]?.name ?? inIdx}" — ${connectErr?.message ?? connectErr}. ` +
-            `Observed post-state of the live graph: no link from that output reaches node ` +
-            `${target.id}` +
+            `Observed post-state of the live graph: this call left NO new link from that ` +
+            `output on node ${target.id}` +
             (priorWireGone
               ? `, and the wire that was on that input before this call (from node ` +
                 `${replacedLink?.node_id ?? "?"} output "${replacedLink?.output ?? "?"}") is GONE — ` +
                 `the input is now EMPTY and must be rewired`
+              : "") +
+            (preexisting
+              ? `. A link from that same output was ALREADY on input ` +
+                `"${target.inputs?.[preexisting.inputIndex]?.name ?? preexisting.inputIndex}" ` +
+                `before this call and is untouched — do not tear it down`
               : "") +
             `. Re-read with panel_graph_outline before retrying.`,
         );
@@ -16601,7 +16613,8 @@ const GRAPH_TOOL_EXECUTORS = {
             ? ` — the frontend threw: ${exposeConnectErr?.message ?? exposeConnectErr}`
             : "") +
           (cleanedUp
-            ? `. The subgraph output slot this call created was removed, so the rail is unchanged.`
+            ? `. The subgraph output slot this call created was removed, so the rail carries no ` +
+            `slot from this call.`
             : `.`),
       );
     }
@@ -16694,7 +16707,8 @@ const GRAPH_TOOL_EXECUTORS = {
             ? ` — the frontend threw: ${exposeConnectErr?.message ?? exposeConnectErr}`
             : "") +
           (cleanedUp
-            ? `. The subgraph input slot this call created was removed, so the rail is unchanged.`
+            ? `. The subgraph input slot this call created was removed, so the rail carries no ` +
+            `slot from this call.`
             : `.`),
       );
     }
