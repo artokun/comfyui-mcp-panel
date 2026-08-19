@@ -1320,14 +1320,27 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         // Until now the ONLY thing standing between this route and a saved-but-empty
         // file was a CAPABILITY check: `openWorkflow` must exist, therefore the copy
         // must be loaded. That is a dispatch receipt, not an effect — `openWorkflow`
-        // returning proves it was called, never that a change tracker was built. The
-        // store's own `openWorkflow` returns EARLY (`if (isActive(w)) return w`) without
-        // loading, and the service's returns early on the same condition; a load that
-        // resolves without populating the tracker leaves `activeState === null`, which
-        // `ComfyWorkflow.save()` serializes to the JSON literal `null` — an empty file,
-        // POSTed and reported as a successful Save-As. Every downstream guard then
-        // CONFIRMS it: the post-write read-back compares the target against the copy's
-        // own content, so `"null"` matches `"null"` and reads back as "ours".
+        // returning proves it was CALLED, never that a change tracker was BUILT.
+        //
+        // What was MEASURED on the installed frontend bundle (not inferred):
+        //   · `workflowStore.saveAs(wf, path)` returns the copy UNLOADED — the class
+        //     field `changeTracker = null` is never set by it;
+        //   · `get activeState() { return this.changeTracker?.activeState ?? null }`;
+        //   · `ComfyWorkflow.save()` begins `this.content = JSON.stringify(this.activeState)`
+        //     and POSTs that — so an unloaded copy writes the JSON literal `null`;
+        //   · BOTH `openWorkflow` variants can return WITHOUT loading — each begins with an
+        //     `isActive` early exit, and neither returns anything the caller could use to
+        //     tell "loaded it" from "decided not to".
+        //
+        // Which of those drops the capture in any given session is NOT something this
+        // guard needs to know, and guessing is how a fix ends up aimed at the wrong
+        // line: it asks the copy what it is ABOUT TO WRITE. That question has one
+        // answer whatever the upstream cause.
+        //
+        // It has to be asked HERE because nothing downstream can: the post-write
+        // read-back compares the target against the copy's OWN content, so a copy that
+        // wrote `"null"` finds `"null"` on disk and reads back as "ours" — the check
+        // meant to catch a bad write CONFIRMS this one.
         //
         // So ask the copy what it is actually going to write, SYNCHRONOUSLY, with no
         // await between the question and the write. `classifyWorkflowCapture` allows a
@@ -1368,7 +1381,11 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         // must not go down the ambiguity path: that path exists to ADOPT a write that
         // committed before its response was lost, and adopting here would convert a
         // refusal into a reported success on a target we never wrote.
-        if (!isConflictError(err) && !isPreCommitRefusal(err) && typeof reconcileSavedCopy === "function") {
+        if (
+          !isConflictError(err) &&
+          !isPreCommitRefusal(err) &&
+          typeof reconcileSavedCopy === "function"
+        ) {
           let state = "unknown";
           try {
             state = await reconcileSavedCopy(finalTargetPath, copy);
@@ -1406,16 +1423,6 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         if (prevActive !== undefined) svc.activeWorkflow = prevActive;
         throw err;
       }
-      // SUCCESS-PATH BOOKKEEPING (#309 P1, mirror of the adoption branch). ComfyUI's own
-      // saveWorkflow(copy) captures copy.content, awaits the write, THEN calls
-      // changeTracker.reset() (re-baselining to the LIVE canvas) and forces
-      // isModified=false. If the user edited the graph DURING the successful save await,
-      // the live canvas advanced past what committed (disk holds S1, canvas is S2), so
-      // upstream marks the copy "clean" at S2 while S2 is UNSAVED — workflow_close then
-      // silently unloads it (data loss). Re-run our committed-vs-live bookkeeping to
-      // OVERRIDE that: baseline to the COMMITTED snapshot (copy.content) and set
-      // isModified DIRECTLY on OUR copy (never path-resolving). Identical to upstream
-      // when no edit occurred; strictly more correct when an in-flight edit happened.
       // #1267 — POST-WRITE: report the BYTES, not the call. `ComfyWorkflow.save()`'s
       // first statement is `this.content = JSON.stringify(this.activeState)`, so after a
       // reported-success persist `copy.content` IS the payload that went to /userdata —
@@ -1443,6 +1450,16 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
             `previous tab has been restored. Delete "${finalTargetPath}" and retry (#1267).`,
         );
       }
+      // SUCCESS-PATH BOOKKEEPING (#309 P1, mirror of the adoption branch). ComfyUI's own
+      // saveWorkflow(copy) captures copy.content, awaits the write, THEN calls
+      // changeTracker.reset() (re-baselining to the LIVE canvas) and forces
+      // isModified=false. If the user edited the graph DURING the successful save await,
+      // the live canvas advanced past what committed (disk holds S1, canvas is S2), so
+      // upstream marks the copy "clean" at S2 while S2 is UNSAVED — workflow_close then
+      // silently unloads it (data loss). Re-run our committed-vs-live bookkeeping to
+      // OVERRIDE that: baseline to the COMMITTED snapshot (copy.content) and set
+      // isModified DIRECTLY on OUR copy (never path-resolving). Identical to upstream
+      // when no edit occurred; strictly more correct when an in-flight edit happened.
       markCopyPersisted(copy);
       // P0 — POST-WRITE CLOBBER DETECTION. The server's overwrite:false is NOT
       // exclusive-create (os.path.exists → await body-read → os.replace), so a target
