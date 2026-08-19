@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.11] - 2026-08-19
+
+### Added
+- Qwen Code as a selectable Agent Panel provider (#1438)
+- graph_get_virtual_types — serve the frontend's proven virtual-node registry (artokun/comfyui-mcp#1400) (#1441)
+
+
 ## [0.15.10] - 2026-08-19
 
 ### Added
