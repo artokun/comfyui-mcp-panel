@@ -107,9 +107,10 @@ test("the two other unlisted reads are deliberately still refused", () => {
 // reporter's refusal came from, and it is a whole-file search, so it is exact.
 //
 // NOT TESTED, verified by reading: `graph_get_errors`'s executor writes nothing —
-// it calls `assertGraphBoundToActiveWorkflow(graph, rootGraph)` with no options
-// (so it already took the read-shaped defaults; only the DISPATCH bar was wrong)
-// and otherwise only reads `graph._nodes` and builds a report.
+// it re-asserts the fence on this command's own read bar plus the baseline guard
+// (`graphCommandBindingBar("graph_get_errors")` with `includeBaselineReadGuard`,
+// since #1233 — bare defaults had silently dropped the #995 stale-tag bypass) and
+// otherwise only reads `graph._nodes` and builds a report.
 //
 // A source-scanning version of that check was written and REMOVED. Bounding a
 // method body by counting braces needs real tokenization: masking comments first

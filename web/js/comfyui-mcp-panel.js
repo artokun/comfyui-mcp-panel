@@ -10277,7 +10277,17 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph, rootGraph } = getGraphCtx();
     // panel#389: refuse a false-clean empty read when the live graph is desynced
     // from the active workflow (empty canvas graph while the workflow reports nodes).
-    assertGraphBoundToActiveWorkflow(graph, rootGraph);
+    // panel#1233: re-assert on this command's OWN read bar, not bare defaults. The
+    // defaults drop the #995 stale-tag bypass the dispatch fence admitted this read
+    // through, so a canvas that bypass had just PROVEN (content-equal to the active
+    // tab, exclusive, nothing written) was refused again HERE — the
+    // root-workflow-uuid-mismatch a tab switch onto an unsaved/modified tab kept
+    // surfacing. The bypass stays opt-in via the one classification site; the
+    // executor-only baseline guard (#389) is kept on.
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      ...graphCommandBindingBar("graph_outline"),
+      includeBaselineReadGuard: true,
+    });
     // #429: geometric group membership is tested boundingRect-first, so resync every
     // node's cached rect to its live pos/size BEFORE computing membership — a node
     // moved by a path the panel didn't own (paste/load/manual drag) otherwise reports
@@ -14278,7 +14288,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // from the active workflow (empty canvas graph while the workflow reports nodes)
     // — otherwise get_errors reports "no errors" for a workflow whose red nodes the
     // agent then wrongly tells the user to ignore.
-    assertGraphBoundToActiveWorkflow(graph, rootGraph);
+    // panel#1233: same re-assert fix as graph_outline — this read's OWN bar carries
+    // the #995 stale-tag bypass the dispatch fence granted; bare defaults revoked it
+    // and re-refused a proven canvas on a tab switch onto an unsaved/modified tab.
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      ...graphCommandBindingBar("graph_get_errors"),
+      includeBaselineReadGuard: true,
+    });
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
     const reasons = new Map();
