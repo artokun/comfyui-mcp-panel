@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- `panel_auto_layout` apply inside a subgraph no longer escapes to and rearranges the root graph (#1328)
 - `panel_get_errors` no longer keeps load-time missing-node-type errors after a ComfyUI restart that registered those classes — leftover placeholders are reported as needing a save+reopen, not as still-uninstalled types (#1332)
 - agent-directed instruction blocks (LIVE-CANVAS TOOLS, MANUAL CANVAS CHANGES, query-graph budget accounting) stay in the agent's context and no longer render in the user's chat (#1310)
 - graph mutations no longer stay stuck in `[backend-reconnecting]` after a long Wan render: a busy `/prompt` poll is not a down socket, and binding status now distinguishes a readable canvas from a backend that is actually reconnecting (#1325)

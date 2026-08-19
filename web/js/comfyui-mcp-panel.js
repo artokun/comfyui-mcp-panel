@@ -289,6 +289,12 @@ import {
   resolveRunToNodeTarget,
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
+import {
+  bindAutoLayoutGraph,
+  rememberAutoLayoutScope,
+  clearAutoLayoutScope,
+  layoutScopeFingerprint,
+} from "./lib/auto-layout-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
@@ -7443,6 +7449,12 @@ function getGraphCtx() {
   if (!graph) {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
+  // #1328 — remember a live subgraph identity here so an auto-layout APPLY that
+  // later sees a canvas escaped to root can still resolve the graph enter_subgraph
+  // put the user in. Root observations do NOT clear this: escape looks like root.
+  if (scope.scope === "subgraph") {
+    rememberAutoLayoutScope(layoutScopeFingerprint(graph, app.graph));
+  }
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
 
@@ -14119,7 +14131,10 @@ const GRAPH_TOOL_EXECUTORS = {
     groups = "preserve",
     dry_run = false,
   } = {}) {
-    const { graph } = getGraphCtx();
+    const ctx = getGraphCtx();
+    // #1328 — resolve against the captured viewing-scope identity, not a canvas
+    // that the mutation dispatch/preflight may have walked back to root.
+    const { graph, viewing } = bindAutoLayoutGraph(ctx, { apply: !dry_run });
     // #429: resync live rects before deriving group membership for clustering, so a
     // non-panel move can't cluster the wrong nodes (or drop members) during layout.
     syncGraphNodeAreas(graph);
@@ -14266,6 +14281,7 @@ const GRAPH_TOOL_EXECUTORS = {
         node_count: moved.length,
         columns: layout.columns,
         moved,
+        viewing,
         ...(groupResults.length ? { groups: groupResults } : {}),
         ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
       };
@@ -14301,6 +14317,7 @@ const GRAPH_TOOL_EXECUTORS = {
       node_count: moved.length,
       columns: layout.columns,
       moved,
+      viewing,
       ...(groupResults.length ? { groups: groupResults } : {}),
       ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
     };
@@ -19330,6 +19347,11 @@ const GRAPH_TOOL_EXECUTORS = {
           `subgraph, retry, or leave it on the ComfyUI canvas (its breadcrumb, or double-click out).`,
       );
     }
+    // #1328 — an explicit exit is the one root observation that MAY drop the
+    // captured subgraph identity. Escape (canvas jumped to root without this
+    // call) must keep it so auto-layout apply can still find the subgraph.
+    if (parentGraph === rootGraph) clearAutoLayoutScope();
+    else rememberAutoLayoutScope(layoutScopeFingerprint(parentGraph, rootGraph));
     let viewing = null;
     try {
       viewing = describeActiveGraph(getGraphCtx().graph);
@@ -31489,7 +31511,7 @@ function buildPanel() {
       // debounced fit so the view still settles.
       if (reply.ok) {
         const followed = focusFollowOnCommand(cmd, msg, reply);
-        if (!followed && AUTOFIT_CMDS.has(cmd)) scheduleAutoFit();
+        if (!followed && AUTOFIT_CMDS.has(cmd) && msg?.dry_run !== true) scheduleAutoFit();
       }
       // The agent restarted ComfyUI — arm the auto-resume so we reconnect and
       // nudge it to continue once ComfyUI is back (install→restart→continue).
