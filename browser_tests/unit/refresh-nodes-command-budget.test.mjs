@@ -159,6 +159,14 @@ test("#1404: the reply NAMES the cause instead of collapsing it into 'unknown'",
   // decide it may re-issue a command, and "unknown" — what the generic branch produces for a
   // Symbol — would make a refresh that is still running indistinguishable from a fetch that
   // threw, which is the one distinction a caller deciding whether to retry actually needs.
+  // THE LITERAL, not only the map lookup. The panel and this file read the token from the
+  // SAME frozen map, so deleting the entry degrades both to `undefined` together and
+  // `assert.equal(undefined, undefined)` passes — while the shipped reply carries
+  // `reason: undefined`, which `JSON.stringify` DROPS, so the field a caller keys on
+  // vanishes from the wire with all 67 tests in the three refresh harnesses still green.
+  // Measured, not reasoned about: that mutation was run and killed nothing.
+  assert.equal(value.reason, "refresh_still_running", "the WIRE token, spelled out");
+  assert.equal(NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING, "refresh_still_running");
   assert.equal(value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
   assert.notEqual(value.reason, "unknown", "an abandoned wait is not an unknown failure");
   assert.match(value.remedy, /RETRY/, "…and the remedy is a retry");
@@ -227,7 +235,7 @@ test("#1404: an UNCONTENDED run that outlives the budget lands on the same named
     1500,
     "an uncontended slow run never replied",
   );
-  assert.equal(value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
+  assert.equal(value.reason, "refresh_still_running");
   assert.equal(built.runs.length, 1, "there was never a second run — nothing else was in flight");
   assert.ok(elapsed < 1000, `replied in ${elapsed}ms — the bound must end this wait too`);
 
