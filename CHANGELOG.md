@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- a subgraph preview widget is promoted through the frontend's previewExposure store, and a failed link-only promote no longer hides behind a missing promotion store (#1271)
+
 ## [0.15.3] - 2026-08-19
 
 ### Fixed
