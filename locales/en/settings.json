@@ -115,6 +115,10 @@
     "name": "Default model",
     "tooltip": "Default model for the Grok background agent, chosen from the models fetched for Grok (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Grok this may show only 'Auto' + your saved choice."
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Default model",
+    "tooltip": "Default model for the Qwen Code background agent, chosen from the models fetched for Qwen Code (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Qwen Code this may show only 'Auto' + your saved choice."
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Default model",
     "tooltip": "Default model for the Kimi background agent, chosen from the models fetched for Kimi (the same list the panel's model picker shows). 'Auto' lets the agent pick. Changing the model in the panel updates this too. Until you connect to Kimi this may show only 'Auto' + your saved choice."
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Default reasoning effort",
     "tooltip": "Grok exposes no reasoning-effort control; leave this at 'Model default'."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Default reasoning effort",
+    "tooltip": "Qwen Code exposes no reasoning-effort control; leave this at 'Model default'."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Default reasoning effort",

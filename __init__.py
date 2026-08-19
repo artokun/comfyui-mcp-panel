@@ -75,6 +75,7 @@ _BACKEND_PORTS = {
     "antigravity": _BRIDGE_PORT,  # Google Antigravity (agy) — single-port multi-provider
     "pi": _BRIDGE_PORT,  # pi.dev (pi) — single-port multi-provider, same orchestrator (#491)
     "grok": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
+    "qwen": _BRIDGE_PORT,  # Qwen Code (qwen --acp) — single-port multi-provider, same orchestrator
     "kimi": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "moonshot": _BRIDGE_PORT,  # hosted (Moonshot / Kimi K3) — same orchestrator, key-gated
     "glm": _BRIDGE_PORT,  # hosted (z.ai coding plan / GLM) — same orchestrator, key-gated
@@ -391,6 +392,7 @@ _PROVIDER_CLIS = {
     # Keep this probe aligned with its executable-only resolver (#491).
     "pi": ("pi", "pi.exe"),
     "grok": ("grok", "grok.cmd", "grok.exe"),
+    "qwen": ("qwen", "qwen.cmd", "qwen.exe"),
     "kimi": ("kimi", "kimi.cmd", "kimi.exe"),
     "ollama": ("ollama", "ollama.exe"),
 }

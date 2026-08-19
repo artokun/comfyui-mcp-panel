@@ -115,6 +115,10 @@
     "name": "Modelo por defecto",
     "tooltip": "Modelo por defecto del agente en segundo plano de Grok, elegido entre los modelos obtenidos para Grok (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Grok, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Modelo por defecto",
+    "tooltip": "Modelo por defecto del agente en segundo plano de Qwen Code, elegido entre los modelos obtenidos para Qwen Code (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Qwen Code, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Modelo por defecto",
     "tooltip": "Modelo por defecto del agente en segundo plano de Kimi, elegido entre los modelos obtenidos para Kimi (la misma lista que muestra el selector de modelos del panel). 'Auto' deja que elija el agente. Cambiar el modelo en el panel actualiza también este valor. Hasta que te conectes a Kimi, puede que aquí solo aparezcan 'Auto' y tu elección guardada."
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Esfuerzo de razonamiento por defecto",
     "tooltip": "Grok no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Esfuerzo de razonamiento por defecto",
+    "tooltip": "Qwen Code no expone ningún control de esfuerzo de razonamiento; deja esto en 'Predeterminado del modelo'."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Esfuerzo de razonamiento por defecto",

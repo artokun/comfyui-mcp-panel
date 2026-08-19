@@ -2593,6 +2593,7 @@ const DEFAULT_BRIDGE_URL_BY_BACKEND = {
   antigravity: DEFAULT_BRIDGE_URL,
   pi: DEFAULT_BRIDGE_URL,
   grok: DEFAULT_BRIDGE_URL,
+  qwen: DEFAULT_BRIDGE_URL,
   kimi: DEFAULT_BRIDGE_URL,
   moonshot: DEFAULT_BRIDGE_URL,
   glm: DEFAULT_BRIDGE_URL,
@@ -4390,6 +4391,7 @@ const SETTING_MODEL = {
   antigravity: "comfyui-mcp.defaultModel.antigravity",
   pi: "comfyui-mcp.defaultModel.pi",
   grok: "comfyui-mcp.defaultModel.grok",
+  qwen: "comfyui-mcp.defaultModel.qwen",
   kimi: "comfyui-mcp.defaultModel.kimi",
   moonshot: "comfyui-mcp.defaultModel.moonshot",
   glm: "comfyui-mcp.defaultModel.glm",
@@ -4407,6 +4409,7 @@ const SETTING_EFFORT = {
   antigravity: "comfyui-mcp.defaultEffort.antigravity",
   pi: "comfyui-mcp.defaultEffort.pi",
   grok: "comfyui-mcp.defaultEffort.grok",
+  qwen: "comfyui-mcp.defaultEffort.qwen",
   kimi: "comfyui-mcp.defaultEffort.kimi",
   moonshot: "comfyui-mcp.defaultEffort.moonshot",
   glm: "comfyui-mcp.defaultEffort.glm",
@@ -4432,6 +4435,7 @@ const SETTING_BRIDGE_URL = {
   antigravity: "comfyui-mcp.bridgeUrl.antigravity",
   pi: "comfyui-mcp.bridgeUrl.pi",
   grok: "comfyui-mcp.bridgeUrl.grok",
+  qwen: "comfyui-mcp.bridgeUrl.qwen",
   kimi: "comfyui-mcp.bridgeUrl.kimi",
   moonshot: "comfyui-mcp.bridgeUrl.moonshot",
   glm: "comfyui-mcp.bridgeUrl.glm",
@@ -4540,6 +4544,7 @@ const BACKEND_SECTION = {
   get antigravity() { return tr("panel.antigravity_google", "Antigravity (Google)"); },
   get pi() { return tr("panel.pi_pi_dev", "Pi (pi.dev)"); },
   get grok() { return tr("panel.grok", "Grok"); },
+  get qwen() { return tr("panel.qwen_code", "Qwen Code"); },
   get kimi() { return tr("panel.kimi", "Kimi"); },
   get moonshot() { return tr("panel.kimi_k3", "Kimi K3"); },
   get glm() { return tr("panel.glm_z_ai", "GLM (z.ai)"); },
@@ -4557,7 +4562,7 @@ const BACKEND_SECTION = {
 // row exists for either, its description reads "the undefined background agent". No row does
 // today (they are instantiated one by one, not from this map), which is exactly why the gap
 // was invisible: the entries are added here so the next row added cannot ship that string.
-const BACKEND_TEXT = /* null-prototype: see BACKEND_LABELS (#1084 codex) */ Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
+const BACKEND_TEXT = /* null-prototype: see BACKEND_LABELS (#1084 codex) */ Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", qwen: "Qwen Code", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -4626,7 +4631,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, antigravity: null, pi: null, grok: null, kimi: null, moonshot: null, glm: null, minimax: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, antigravity: null, pi: null, grok: null, qwen: null, kimi: null, moonshot: null, glm: null, minimax: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -4638,7 +4643,7 @@ function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
   // Every selectable backend counts — this list lagging a provider addition
   // silently stops that provider's Settings edits from driving the live panel.
-  return ["codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
+  return ["codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -5366,6 +5371,7 @@ function panelSettingsList() {
           // apart by eye.
           { value: "pi", text: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)") },
           { value: "grok", text: tr("panel.grok", "Grok") },
+          { value: "qwen", text: tr("panel.qwen_code", "Qwen Code") },
           { value: "kimi", text: tr("panel.kimi", "Kimi") },
           { value: "moonshot", text: tr("panel.kimi_k3", "Kimi K3") },
           { value: "glm", text: tr("panel.glm_z_ai", "GLM (z.ai)") },
@@ -5689,6 +5695,9 @@ function panelSettingsList() {
     // ---- Grok (Default model, Default reasoning effort) ----
     modelSetting("grok", 80),
     effortSetting("grok", 75),
+    // ---- Qwen Code (Default model; no effort scale, like Grok) ----
+    modelSetting("qwen", 79),
+    effortSetting("qwen", 79),
     modelSetting("kimi", 76),
     effortSetting("kimi", 72),
     // ---- Kimi K3 (Moonshot platform, hosted API key) (Default model; no effort scale) ----
@@ -5843,6 +5852,8 @@ const BACKEND_EFFORTS = {
   pi: [],
   // Grok rides the ACP CLI like gemini — no user-facing reasoning-effort scale.
   grok: [],
+  // Qwen Code rides the ACP CLI like gemini/grok — no user-facing effort scale.
+  qwen: [],
   kimi: [],
   // Moonshot (Kimi K3) is a hosted OpenAI-compatible API — no reasoning-effort scale.
   moonshot: [],
@@ -21318,13 +21329,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
   // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
   // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
-  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, antigravity: 6, pi: 6, grok: 6, kimi: 6, moonshot: 6, glm: 6, minimax: 6, ollama: 6, claude: 2 };
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, antigravity: 6, pi: 6, grok: 6, qwen: 6, kimi: 6, moonshot: 6, glm: 6, minimax: 6, ollama: 6, claude: 2 };
   function respawnAfterAttempts() {
     return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
   }
   // Failed (re)connect attempts ridden out as a steady "connecting" before a
   // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
-  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, antigravity: 12, pi: 12, grok: 12, kimi: 12, moonshot: 12, glm: 12, minimax: 12, ollama: 12, claude: 4 };
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, antigravity: 12, pi: 12, grok: 12, qwen: 12, kimi: 12, moonshot: 12, glm: 12, minimax: 12, ollama: 12, claude: 4 };
   function connectPatienceAttempts() {
     return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
   }
@@ -21344,7 +21355,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
   // Ollama gets the long handshake too: a cold model load into VRAM can take
   // tens of seconds before the first token.
-  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, antigravity: 45000, pi: 45000, grok: 45000, kimi: 45000, moonshot: 45000, glm: 45000, minimax: 45000, ollama: 45000, claude: 20000 };
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, antigravity: 45000, pi: 45000, grok: 45000, qwen: 45000, kimi: 45000, moonshot: 45000, glm: 45000, minimax: 45000, ollama: 45000, claude: 20000 };
   function handshakeMs() {
     return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
   }
@@ -25436,7 +25447,7 @@ function buildPanel() {
   // and `["__proto__"]` returns an object, so the `|| id` fallback never fires and a
   // function would be interpolated into a sentence. Harmless while the gate below only let
   // known ids through; reachable the moment it accepts an id this map has never seen.
-  const BACKEND_LABELS = Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
+  const BACKEND_LABELS = Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", qwen: "Qwen Code", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
   // Appends a visible "(experimental)" marker to a backend's display label when
   // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
   // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
@@ -25528,7 +25539,7 @@ function buildPanel() {
   // Pi must stay conservative until that snapshot has landed for this connection.
   let piBackendsReadinessReceived = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", antigravity: "Gemini 3 · Google subscription", pi: "pi.dev · multi-provider CLI · no ComfyUI tools", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", glm: "GLM · z.ai coding plan", minimax: "MiniMax M3 · 1M context", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", antigravity: "Gemini 3 · Google subscription", pi: "pi.dev · multi-provider CLI · no ComfyUI tools", grok: "Grok Composer · Build", qwen: "Qwen3 Coder · Coding Plan", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", glm: "GLM · z.ai coding plan", minimax: "MiniMax M3 · 1M context", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -25565,6 +25576,7 @@ function buildPanel() {
     if (b.backend === "antigravity") return tr("panel.not_ready_antigravity_install_cli", "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.");
     if (b.backend === "pi") return tr("panel.not_ready_pi_no_provider", "No provider configured — set a provider API key (e.g. ANTHROPIC_API_KEY) or run `pi` once and `/login`.");
     if (b.backend === "grok") return tr("panel.not_ready_grok_signed_out", "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok");
+    if (b.backend === "qwen") return tr("panel.not_ready_qwen_signed_out", "Not signed in — run `qwen` once and complete /auth, or set DASHSCOPE_API_KEY");
     if (b.backend === "kimi") return tr("panel.not_ready_kimi_signed_out", "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi");
     if (b.backend === "ollama") return tr("panel.not_ready_ollama_not_running", "Ollama not running — run: ollama serve");
     if (b.backend === "lmstudio") return tr("panel.not_ready_lmstudio_not_running", "LM Studio server not running — LM Studio → Developer → Start Server");
@@ -25959,6 +25971,7 @@ function buildPanel() {
     // reword them, same rule as the shell commands in the sibling `install` slots.
     pi: { label: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)"), install: "curl -fsSL https://pi.dev/install.sh | sh", login: tr("panel.set_a_provider_api_key_or_run", "set a provider API key, or run `{cmd}` then {slashCmd}", { cmd: "pi", slashCmd: "/login" }) },
     grok: { label: tr("panel.grok", "Grok"), install: tr("panel.install_the_grok_cli_grok_build", "install the Grok CLI (Grok Build / xAI)"), login: "grok" },
+    qwen: { label: tr("panel.qwen_code", "Qwen Code"), install: tr("panel.install_the_qwen_code_cli", "install the Qwen Code CLI (npm i -g @qwen-code/qwen-code)"), login: tr("panel.qwen_login_hint", "run `{cmd}` once and complete {slashCmd}, or set DASHSCOPE_API_KEY", { cmd: "qwen", slashCmd: "/auth" }) },
     kimi: { label: tr("panel.kimi", "Kimi"), install: tr("panel.install_the_kimi_cli_moonshot", "install the Kimi CLI (Moonshot)"), login: "kimi" },
     // No CLI — "setup" is pasting a Moonshot platform API key (Kimi K3).
     // The three "paste an env key" hints share ONE key with an {envVar} hole: the only
@@ -26022,7 +26035,7 @@ function buildPanel() {
       "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.",
     );
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
+    for (const id of ["claude", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -34350,7 +34363,7 @@ function buildPanel() {
   // backend's handshake window (handshakeMs()) so a healthy slow reload completes
   // on its own backoff before the guard releases — Codex's app-server handshake is
   // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
-  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, antigravity: 50000, pi: 50000, grok: 50000, kimi: 50000, moonshot: 50000, glm: 50000, minimax: 50000, ollama: 50000, claude: 28000 };
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, antigravity: 50000, pi: 50000, grok: 50000, qwen: 50000, kimi: 50000, moonshot: 50000, glm: 50000, minimax: 50000, ollama: 50000, claude: 28000 };
   function softReloadGuardMs() {
     return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
   }
@@ -34367,7 +34380,7 @@ function buildPanel() {
   // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
   // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
   // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
-  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, antigravity: 40000, pi: 40000, grok: 40000, kimi: 40000, moonshot: 40000, glm: 40000, minimax: 40000, ollama: 40000, claude: 11000 };
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, antigravity: 40000, pi: 40000, grok: 40000, qwen: 40000, kimi: 40000, moonshot: 40000, glm: 40000, minimax: 40000, ollama: 40000, claude: 11000 };
   function softReloadEscalateMs() {
     return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
   }

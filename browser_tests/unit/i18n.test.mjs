@@ -400,7 +400,7 @@ test("translating a combo changes only its TEXT, never the value that gets store
   // "chatgpt". Both are ids on the wire and neither may ever be translated, which is what
   // this list is here to hold.
   assert.deepEqual(values, [
-    "claude", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "claude", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot",
     "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
   ]);
   // Every one of those labels must go through tr() — a bare string here is a row that
@@ -421,7 +421,7 @@ test("EVERY backend section label is a getter — not most of them", () => {
 
   const getters = [...block.matchAll(/^\s*get (\w+)\(\) \{ return tr\(/gm)].map((m) => m[1]);
   assert.deepEqual(getters, [
-    "claude", "codex", "gemini", "antigravity", "pi", "grok", "kimi", "moonshot",
+    "claude", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot",
     "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
   ], "every backend must resolve its section label lazily, through tr()");
 

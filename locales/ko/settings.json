@@ -115,6 +115,10 @@
     "name": "기본 모델",
     "tooltip": "Grok 백그라운드 에이전트의 기본 모델로, Grok용으로 가져온 모델 목록(패널의 모델 선택기에 나오는 것과 같은 목록)에서 고릅니다. 'Auto'는 에이전트가 알아서 고르게 합니다. 패널에서 모델을 바꾸면 이 값도 함께 바뀝니다. Grok에 연결하기 전에는 'Auto'와 저장해 둔 선택만 보일 수 있습니다."
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "기본 모델",
+    "tooltip": "Qwen Code 백그라운드 에이전트의 기본 모델로, Qwen Code용으로 가져온 모델 목록(패널의 모델 선택기에 나오는 것과 같은 목록)에서 고릅니다. 'Auto'는 에이전트가 알아서 고르게 합니다. 패널에서 모델을 바꾸면 이 값도 함께 바뀝니다. Qwen Code에 연결하기 전에는 'Auto'와 저장해 둔 선택만 보일 수 있습니다."
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "기본 모델",
     "tooltip": "Kimi 백그라운드 에이전트의 기본 모델로, Kimi용으로 가져온 모델 목록(패널의 모델 선택기에 나오는 것과 같은 목록)에서 고릅니다. 'Auto'는 에이전트가 알아서 고르게 합니다. 패널에서 모델을 바꾸면 이 값도 함께 바뀝니다. Kimi에 연결하기 전에는 'Auto'와 저장해 둔 선택만 보일 수 있습니다."
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "기본 추론 강도",
     "tooltip": "Grok에는 추론 강도 조절 기능이 없습니다. 'Model default'로 두세요."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "기본 추론 강도",
+    "tooltip": "Qwen Code에는 추론 강도 조절 기능이 없습니다. 'Model default'로 두세요."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "기본 추론 강도",

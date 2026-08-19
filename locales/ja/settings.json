@@ -115,6 +115,10 @@
     "name": "既定のモデル",
     "tooltip": "Grok のバックグラウンドエージェントで使う既定のモデルです。Grok 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Grok に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "既定のモデル",
+    "tooltip": "Qwen Code のバックグラウンドエージェントで使う既定のモデルです。Qwen Code 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Qwen Code に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "既定のモデル",
     "tooltip": "Kimi のバックグラウンドエージェントで使う既定のモデルです。Kimi 用に取得したモデル（パネルのモデルピッカーに出るものと同じ一覧）から選びます。「Auto」はエージェントに選ばせます。パネルでモデルを変更すると、この値も一緒に更新されます。Kimi に接続するまでは「Auto」と保存済みの選択だけが表示されることがあります。"
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "既定の推論強度",
     "tooltip": "Grok には推論強度の設定がありません。「Model default」のままにしてください。"
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "既定の推論強度",
+    "tooltip": "Qwen Code には推論強度の設定がありません。「Model default」のままにしてください。"
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "既定の推論強度",

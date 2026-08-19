@@ -115,6 +115,10 @@
     "name": "默认模型",
     "tooltip": "Grok 后台智能体的默认模型，从为 Grok 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Grok 之前，这里可能只显示“Auto”和你已保存的选择。"
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "默认模型",
+    "tooltip": "Qwen Code 后台智能体的默认模型，从为 Qwen Code 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Qwen Code 之前，这里可能只显示“Auto”和你已保存的选择。"
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "默认模型",
     "tooltip": "Kimi 后台智能体的默认模型，从为 Kimi 获取到的模型中选择（与面板模型选择器显示的是同一份列表）。“Auto”表示交由智能体决定。在面板中更换模型也会同步更新此项。在连接到 Kimi 之前，这里可能只显示“Auto”和你已保存的选择。"
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "默认推理强度",
     "tooltip": "Grok 不提供推理强度控制；请保持“Model default”。"
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "默认推理强度",
+    "tooltip": "Qwen Code 不提供推理强度控制；请保持“Model default”。"
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "默认推理强度",
