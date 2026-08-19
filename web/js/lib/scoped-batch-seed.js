@@ -425,6 +425,44 @@ export function rgthreeQueueTimeSeedInput(node) {
 }
 
 /**
+ * The scanned nodes that WILL submit the same seed for every item of a batch.
+ *
+ * THE PROSE AND THE STRUCTURED FIELD MUST BE ONE PREDICATE, and they were two.
+ * `rgthreeFixedSeedNote` selected on `varies === false`, while the caller that
+ * attaches `fixed_seed_nodes` to the run result selected on `armed === false` —
+ * and those disagree on exactly the case the #1339 warning exists for. An ARMED
+ * node whose randomMin/randomMax (or step) admit a single value is `armed: true,
+ * varies: false`, so it was NAMED in the sentence and MISSING from the array.
+ * Because the caller only attaches the field when the note is non-empty, that is
+ * not a hypothetical: a run against an armed-but-degenerate node returned
+ * `fixed_seed_note` saying "ALL 10 ITEMS OF THIS BATCH WILL USE THE SAME SEED
+ * from node 649" next to `fixed_seed_nodes: []`.
+ *
+ * A caller branching on the ARRAY — which is the one a program should read, and the
+ * one #1339's own diagnostic loop asks a reporter to check — therefore concluded
+ * nothing was wrong, in the single case the shipped fix describes as the confusing
+ * one ("you did press the button and it still repeats"). Reading the sentence
+ * instead is not a fix: prose is evidence for a human, never a field to branch on.
+ *
+ * `varies === false` is the correct predicate, so it lives here once and both
+ * consumers call it. `armed` stays ON each entry (with `degenerate_range` beside it)
+ * so a reader can still tell the two ways a seed repeats apart — what is removed is
+ * the ability for the two answers to disagree.
+ *
+ * NOT SHARED WITH `rgthreeQueueTimeSeedInput` (#1124), deliberately: that one gates
+ * on `armed` because a degenerate-range node still SUBSTITUTES and so is still
+ * volatile for the drift hash. Same nodes, opposite question — see its own note.
+ */
+export function repeatingRgthreeSeeds(seeds) {
+  if (!Array.isArray(seeds)) return [];
+  // `varies === false` covers BOTH ways an rgthree seed repeats: a concrete number in the
+  // widget, and an armed node whose random range admits one value. Keying on `armed`
+  // alone missed the second (codex P2) — and an armed-but-degenerate node is the more
+  // confusing of the two, because the user did press the button.
+  return seeds.filter((s) => s && s.varies === false);
+}
+
+/**
  * The disclosure for a batch whose rgthree seed is FIXED.
  *
  * Silent when the node is armed, because then it genuinely varies per item and there is
@@ -437,11 +475,7 @@ export function rgthreeQueueTimeSeedInput(node) {
  */
 export function rgthreeFixedSeedNote(seeds, batchCount) {
   if (!Array.isArray(seeds) || !(Number(batchCount) > 1)) return "";
-  // `varies === false` covers BOTH ways an rgthree seed repeats: a concrete number in the
-  // widget, and an armed node whose random range admits one value. Keying on `armed`
-  // alone missed the second (codex P2) — and an armed-but-degenerate node is the more
-  // confusing of the two, because the user did press the button.
-  const repeating = seeds.filter((s) => s && s.varies === false);
+  const repeating = repeatingRgthreeSeeds(seeds);
   if (!repeating.length) return "";
   const which = repeating
     .slice(0, 5)
