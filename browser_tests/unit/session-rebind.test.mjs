@@ -10,6 +10,8 @@ import { readFileSync } from "node:fs";
 
 import {
   shouldResumeAfterComfyReconnect,
+  shouldReadvertiseAfterComfyRestart,
+  createComfyBackendOutageTracker,
   shouldRehelloAfterCommand,
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
@@ -1124,4 +1126,304 @@ test("#1168 WIRING: the death is recorded where the panel EARNS the conclusion",
     ),
     "the nudge must be decided on the measured outage alone, never on the raw conclusion",
   );
+});
+
+// ---- #654 re-advertise the tab after a ComfyUI restart --------------------
+//
+// The report: `panel_restart_comfyui` confirms the server cycle
+// (`saw_down:true`, `confirmed_cycle:true`, `server_ready:true`) and the tab is
+// never usable again — the reply's tab-reconnected and graph-tools-ready flags
+// both stay false, and every graph call answers `Connected: none` until the
+// browser tab is reloaded by hand.
+//
+// The panel re-registers its bridge route ONLY by sending a `hello`, and on this
+// path nothing sent one: the pack is pure-frontend, so the orchestrator survives
+// the restart, the bridge socket never closes, no socket `open` handler runs,
+// and `connectAgent()` early-returns on an already-OPEN socket. The orchestrator
+// waits for a strictly NEWER hello generation that can never arrive.
+
+test("#654: bridge UP + a real restart-length outage → re-advertise the route", () => {
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 26_000 }),
+    true,
+  );
+});
+
+test("#654: bridge DOWN → never, whatever the outage — the socket's own open-hello owns it", () => {
+  // Firing here as well is two greetings and two `ready` acks for one outage,
+  // which is #1138's false-nudge-into-a-live-session harm.
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({ bridgeConnected: false, outageMs: 26_000 }),
+    false,
+  );
+});
+
+test("#654: a benign WS blip is NOT a restart", () => {
+  // ComfyUI fires `reconnected` for viewing an asset, checking an image, a tab
+  // refocus. The elapsed interval is the only thing that separates those from a
+  // restart, so a short one must not re-greet a working agent.
+  assert.equal(shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 800 }), false);
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 5999 }),
+    false,
+  );
+  assert.equal(shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 6000 }), true);
+});
+
+test("#654: an unmeasured outage is not evidence of a restart", () => {
+  // Absent, zero, negative and unreadable all mean "no outage was measured" —
+  // never "a long one". A missed re-advertise leaves the tab exactly as it is
+  // today; an invented one re-greets a live agent, so this fails closed.
+  for (const outageMs of [undefined, 0, -1, NaN, Infinity, "26000", null]) {
+    assert.equal(
+      shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs }),
+      false,
+      `outageMs ${String(outageMs)} must not authorise a re-advertise`,
+    );
+  }
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({
+      bridgeConnected: true,
+      outageMs: 26_000,
+      minOutageMs: NaN,
+    }),
+    false,
+  );
+});
+
+test("#654: a hello that already landed during the outage suppresses the re-advertise", () => {
+  // The bridge dropped and reconnected FIRST: its socket-open hello already
+  // re-registered the tab, so this one would be the redundant second greeting.
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({
+      bridgeConnected: true,
+      outageMs: 26_000,
+      helloLandedSinceOutage: true,
+    }),
+    false,
+  );
+});
+
+test("#654: one-shot per outage — a repeated `reconnected` does not re-greet", () => {
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({
+      bridgeConnected: true,
+      outageMs: 26_000,
+      alreadyReadvertised: true,
+    }),
+    false,
+  );
+});
+
+test("#654 INVARIANT: the re-advertise and the #278 resume can never both fire", () => {
+  // The whole reason this is a separate predicate is that #278's
+  // `if (bridgeConnected) return false` must stay exactly as strict. Enumerate
+  // the cross product rather than reasoning about it: a guard that is present,
+  // correct in isolation and comparing the wrong pair is this repo's most
+  // expensive recurring defect.
+  for (const bridgeConnected of [true, false]) {
+    for (const outageMs of [0, 800, 26_000]) {
+      for (const rebootPending of [true, false]) {
+        for (const hasResumableSession of [true, false]) {
+          const resume = shouldResumeAfterComfyReconnect({
+            bridgeConnected,
+            rebootPending,
+            hasResumableSession,
+          });
+          const readvertise = shouldReadvertiseAfterComfyRestart({ bridgeConnected, outageMs });
+          assert.ok(
+            !(resume && readvertise),
+            `both fired for bridgeConnected=${bridgeConnected} outageMs=${outageMs}`,
+          );
+        }
+      }
+    }
+  }
+});
+
+// ---- #654 the backend outage tracker --------------------------------------
+
+test("#654 tracker: the FIRST down signal owns the outage — later ones do not reset it", () => {
+  // The defect this exists to prevent is a SEQUENCE, so drive one. ComfyUI
+  // announces a drop as `reconnecting` AND as a null `status` payload, and a
+  // frontend emits several across a restart. Re-stamping on each measures the
+  // gap between the last two instead of the restart — #1145 exactly.
+  let clock = 1000;
+  const t = createComfyBackendOutageTracker({ now: () => clock });
+  t.noteDown(3);
+  clock = 5000;
+  t.noteDown(3); // a second `reconnecting`
+  clock = 20_000;
+  t.noteDown(3); // a null `status` payload
+  clock = 27_000;
+  t.noteUp();
+  assert.equal(t.outageMs(), 26_000, "the outage is measured from the FIRST signal");
+  assert.equal(t.seq(), 1, "three signals, one outage");
+});
+
+test("#654 tracker: a reconnect that ended no outage records nothing", () => {
+  // It must not inherit the previous outage as if it were its own — the rule the
+  // bridge tracker's `noteHandshake` already follows for a re-advertise on a
+  // live socket.
+  let clock = 1000;
+  const t = createComfyBackendOutageTracker({ now: () => clock });
+  t.noteDown(0);
+  clock = 30_000;
+  t.noteUp();
+  assert.equal(t.outageMs(), 29_000);
+  clock = 40_000;
+  t.noteUp(); // a `reconnected` with no drop before it
+  assert.equal(t.outageMs(), 0, "an unopened outage measures nothing, not the last one");
+});
+
+test("#654 tracker: a near-zero start is a REAL reading, not 'no outage'", () => {
+  // performance.now()'s origin is page load, so a drop moments after load
+  // genuinely stamps ~0. A falsy-0 sentinel would read that as "no outage open",
+  // every later signal would re-stamp it, and the restart would measure one
+  // backoff step (#1138's sentinel-sharing-a-value-with-real-data defect).
+  let clock = 0;
+  const t = createComfyBackendOutageTracker({ now: () => clock });
+  t.noteDown(0);
+  clock = 500;
+  t.noteDown(0); // must NOT re-stamp
+  clock = 26_000;
+  t.noteUp();
+  assert.equal(t.outageMs(), 26_000);
+});
+
+test("#654 tracker: reads LIVE while open, so listener order cannot change the answer", () => {
+  // Two listeners on one `reconnected` event, registered at different times: the
+  // module-scope one closes the outage, the panel's reads it. Both orders must
+  // agree, or the fix works only when the listeners happen to be registered in
+  // one particular sequence.
+  let clock = 1000;
+  const t = createComfyBackendOutageTracker({ now: () => clock });
+  t.noteDown(0);
+  clock = 27_000;
+  const readBeforeClose = t.outageMs();
+  t.noteUp();
+  const readAfterClose = t.outageMs();
+  assert.equal(readBeforeClose, 26_000);
+  assert.equal(readAfterClose, 26_000);
+});
+
+test("#654 tracker: the hello baseline is captured when the outage OPENS", () => {
+  let clock = 1000;
+  const t = createComfyBackendOutageTracker({ now: () => clock });
+  t.noteDown(7);
+  clock = 27_000;
+  t.noteUp();
+  assert.equal(t.helloBaseline(), 7);
+  // A hello that landed during the outage (the bridge dropped and re-helloed
+  // first) is therefore visible to the caller as a count above the baseline.
+  assert.equal(9 > t.helloBaseline(), true);
+  assert.equal(7 > t.helloBaseline(), false);
+});
+
+test("#654 tracker: an unreadable clock opens no outage and authorises nothing", () => {
+  const t = createComfyBackendOutageTracker({ now: () => NaN });
+  t.noteDown(0);
+  t.noteUp();
+  assert.equal(t.outageMs(), 0);
+  assert.equal(t.seq(), 0, "no outage was opened, so no seq was consumed");
+});
+
+test("#654 tracker: a backwards clock cannot produce a negative duration", () => {
+  let clock = 30_000;
+  const t = createComfyBackendOutageTracker({ now: () => clock });
+  t.noteDown(0);
+  clock = 1000;
+  t.noteUp();
+  assert.equal(t.outageMs(), 0);
+});
+
+test("#654 wiring: the panel measures, feeds and consults the outage — every site", () => {
+  // The predicate and the tracker are covered by behaviour above. This covers
+  // what a pure test cannot see: that production actually reaches them. A
+  // tracker nothing feeds answers 0 forever and every test above still passes —
+  // deleting a single write site silently restores "no restart was ever
+  // observed", which IS the bug. Exact substrings on purpose: #1096's review
+  // proved by mutation that loose token scans over this file assert nothing.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  for (const [site, snippet] of [
+    [
+      "the tracker measures on the MONOTONIC clock (its own default is Date.now())",
+      "const comfyBackendOutage = createComfyBackendOutageTracker({ now: monotonicNow });",
+    ],
+    [
+      "the `reconnecting` listener opens the outage, carrying the landed-hello baseline",
+      "comfyBackendOutage.noteDown(landedHelloCount); // #654 — open the outage clock on the FIRST down signal.",
+    ],
+    [
+      "the null-`status` down signal opens it too — some frontends announce the drop only that way",
+      "        comfyBackendOutage.noteDown(landedHelloCount);",
+    ],
+    [
+      "the `reconnected` listener closes it",
+      "comfyBackendOutage.noteUp(); // #654 — close the outage clock and record its duration.",
+    ],
+    [
+      "a LANDED hello advances the count the baseline is compared against",
+      "          landedHelloCount++;",
+    ],
+    [
+      "the panel consults the predicate on the reconnect path",
+      "      shouldReadvertiseAfterComfyRestart({",
+    ],
+    [
+      "the one-shot claim is stamped from the tracker's own outage identity",
+      "      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();",
+    ],
+  ]) {
+    assert.ok(src.includes(snippet), site);
+  }
+  // …and the branch RE-ADVERTISES. Asserted POSITIONALLY, not by presence: this
+  // file already contains three other `client?.rehello?.()` calls (#607, #310,
+  // #508), so a presence check stays green with THIS one deleted — the exact
+  // mutation this assertion was rewritten to catch, and the "wiring tests must
+  // check PATHS" lesson. It must be `rehello`, never `connectAgent()`, which
+  // early-returns on an already-OPEN socket and so can never produce a hello.
+  const claim = src.indexOf("      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();");
+  assert.notEqual(claim, -1);
+  const branchEnd = src.indexOf("    // After ComfyUI comes back (backend-only reboot", claim);
+  assert.notEqual(branchEnd, -1, "the #654 branch sits above the #278 resume commentary");
+  const branch = src.slice(claim, branchEnd);
+  assert.ok(
+    branch.includes("client?.rehello?.();"),
+    "the #654 branch must re-advertise the route, and it must do so with rehello",
+  );
+  assert.doesNotMatch(
+    branch,
+    /connectAgent\(/,
+    "connectAgent() cannot hello on an open socket — using it here is a no-op that looks like a fix",
+  );
+  // The re-advertise must sit BEFORE the resume gate, because that gate RETURNS
+  // — placed after it, the branch this fix exists for is never reached.
+  const readvertise = src.indexOf("shouldReadvertiseAfterComfyRestart({");
+  const resume = src.indexOf("!shouldResumeAfterComfyReconnect({");
+  assert.ok(readvertise !== -1 && resume !== -1);
+  assert.ok(
+    readvertise < resume,
+    "the re-advertise must run before the resume gate's early return",
+  );
+});
+
+test("#654: #278's guard is NOT relaxed to make room for this", () => {
+  // The recurring way this cluster gets worse is by widening an existing guard
+  // instead of adding a narrower action beside it. `if (bridgeConnected) return
+  // false` is what stops a benign blip bouncing a live agent session.
+  const lib = readFileSync(new URL("../../web/js/lib/session-rebind.js", import.meta.url), "utf8");
+  const resumeStart = lib.indexOf("export function shouldResumeAfterComfyReconnect(");
+  assert.notEqual(resumeStart, -1);
+  // Bounded by the NEXT export, not by the first "\n}" — the signature's own
+  // destructured-parameter brace closes before the body begins, so a slice that
+  // stopped there would read an empty body and assert on nothing.
+  const nextExport = lib.indexOf("\nexport function", resumeStart + 1);
+  assert.notEqual(nextExport, -1);
+  const body = lib.slice(resumeStart, nextExport);
+  assert.ok(body.includes("if (bridgeConnected) return false;"), "#278's guard stands unchanged");
+  // And `shouldRehelloAfterCommand` stays narrow — widening it to cover the
+  // restart was the tempting wrong fix: at `comfy_reboot` reply time ComfyUI is
+  // on its way DOWN, so a hello there reaches nothing.
+  assert.equal(shouldRehelloAfterCommand("comfy_reboot", { ok: true }), false);
 });

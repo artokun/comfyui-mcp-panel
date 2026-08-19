@@ -77,6 +77,7 @@ export class MockBridge {
     greeting: string | null
   }
   private readonly sockets = new Set<WebSocket>()
+  private connectionsAccepted = 0
   private readonly userMessageCbs = new Set<UserMessageCb>()
   private readonly frameCbs = new Set<FrameCb>()
   private readonly userMessages: UserMessage[] = []
@@ -139,7 +140,18 @@ export class MockBridge {
     return addr.port
   }
 
+  /** How many WebSocket connections this bridge has ACCEPTED since `start()`.
+   *
+   *  #654 turns on a distinction the status pill cannot make: a tab that
+   *  RE-ADVERTISED on its live socket vs. one whose socket dropped and dialled
+   *  back. Both end at "connected" with a fresh hello on the wire, and only the
+   *  first is what a ComfyUI restart under a surviving orchestrator produces. */
+  get connectionsOpened(): number {
+    return this.connectionsAccepted
+  }
+
   private handleConnection(sock: WebSocket) {
+    this.connectionsAccepted += 1
     this.sockets.add(sock)
     sock.on('close', () => this.sockets.delete(sock))
     sock.on('message', (data) => {

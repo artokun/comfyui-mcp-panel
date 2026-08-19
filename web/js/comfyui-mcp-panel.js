@@ -554,9 +554,11 @@ import {
 } from "./lib/model-catalog.js";
 import {
   shouldResumeAfterComfyReconnect,
+  shouldReadvertiseAfterComfyRestart,
   shouldRehelloAfterCommand,
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
+  createComfyBackendOutageTracker,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -703,6 +705,20 @@ let postReconnectWatchToken = 0;
 // signal). A graph mutation dispatched in that gap can be applied and then wiped
 // by the incoming restore — so mutations are refused while this holds.
 let comfyBackendSocketDown = false;
+// #654 — the ComfyUI BACKEND outage clock. The elapsed interval is the only
+// thing that separates a real restart from a benign WS blip (asset view, image
+// check, tab refocus), and `reconnected` fires for both.
+//
+// Constructed on the MONOTONIC clock: the tracker's own default is `Date.now()`
+// so it stays usable standalone, so which clock the PANEL measures with is
+// decided here and nowhere else. A wall clock lets an NTP/DST correction inside
+// a restart invent or erase an outage (the rule reconnect-staleness.js and
+// #1145's bridge tracker already established).
+const comfyBackendOutage = createComfyBackendOutageTracker({ now: monotonicNow });
+// The outage seq the #654 re-advertise has already fired for. One-shot per
+// outage: `reconnected` can repeat, and a hello is a full re-greeting. 0 is a
+// safe start because the tracker's seq only reaches 1 once an outage has opened.
+let comfyRestartReadvertisedSeq = 0;
 // #402 — OPEN RECEIPTS. Every workflow_open / workflow_new that RAN is journaled here
 // with the selector it was asked for, the identity it resolved to, and whether it
 // applied. When a mid-command drop loses the reply, this is the ONLY non-inferential
@@ -1654,6 +1670,7 @@ function setupListeners() {
     api.addEventListener("reconnecting", () => {
       nodeDefsRefreshConfirmed = false;
       comfyBackendSocketDown = true;
+      comfyBackendOutage.noteDown(landedHelloCount); // #654 — open the outage clock on the FIRST down signal.
       objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
     });
     api.addEventListener("status", (ev) => {
@@ -1661,6 +1678,10 @@ function setupListeners() {
       if (ev?.detail == null) {
         nodeDefsRefreshConfirmed = false;
         comfyBackendSocketDown = true;
+        // #654 — and it is a down signal in its own right: some frontends
+        // announce the drop only this way, so the outage clock must open here
+        // too or the restart measures as no outage at all.
+        comfyBackendOutage.noteDown(landedHelloCount);
         objectInfoSnapshot.clear(); // #1223 — same reasoning as `reconnecting`.
       }
     });
@@ -1669,6 +1690,7 @@ function setupListeners() {
     // stale node registry + combos then (#221/#171/#185/#181).
     api.addEventListener("reconnected", () => {
       comfyBackendSocketDown = false;
+      comfyBackendOutage.noteUp(); // #654 — close the outage clock and record its duration.
       objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
       // #433: the frontend may now restore a stale/wrong active tab — bump the
       // epoch and arm the monotonic possibly-stale window. Bumping the epoch
@@ -8306,6 +8328,14 @@ let sessionEpoch = 0;
 // received neither. So this bumps on a socket (re)connect AND on every
 // AGENT_SESSION_RESET_FRAMES frame.
 let agentSessionEpoch = 0;
+// #654 — hellos that PROVABLY reached the wire, counted. Deliberately its own
+// counter rather than a read of agentSessionEpoch: that epoch also advances on
+// every AGENT_SESSION_RESET_FRAMES frame, so it cannot tell "the tab announced
+// itself" from "the agent session was reset for some other reason" — two states
+// collapsing into one answer is the defect class this file keeps re-learning.
+// Incremented on the same landed-hello path that advances the epoch, so it is
+// never credited for a hello the panel merely meant to send.
+let landedHelloCount = 0;
 // canvasToolsProvenEpoch is the ONLY evidence the panel has about the agent's
 // toolset, and it is one-directional: a `cmd` frame reaches this panel solely
 // because the model invoked a panel_* tool (panel-tools.ts is the only caller of
@@ -20706,6 +20736,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // pre-hello agent, which is exactly the generation it was stamped with.
         if (sent) {
           agentSessionEpoch++;
+          // #654 — this tab is now announced. Counted on the SAME landed path and
+          // for the same reason: a hello that never reached the wire registered
+          // nothing, and crediting it would suppress the one re-advertise that
+          // could actually re-register the tab after a restart.
+          landedHelloCount++;
           // Published only now, for the same reason the epoch advances only now:
           // a hello that never reached the wire advertised nothing.
           lastAdvertisedWorkflowUuid = advertisedWorkflowUuid;
@@ -31694,6 +31729,50 @@ function buildPanel() {
     // may have been missed, so reconcile pending runs against /history first,
     // independent of whether we go on to resume the agent below (#370).
     void reconcileRunsAfterReconnect();
+    // #654 — RE-ADVERTISE THE BRIDGE ROUTE when the bridge stayed up.
+    //
+    // The resume below is the bridge-DIED recovery and declines this case on
+    // purpose (#278). But the pack is pure-frontend now — it can no longer spawn
+    // the orchestrator, so `externalOrchestratorMode()` is hardcoded true and the
+    // orchestrator ALWAYS survives a ComfyUI restart. The bridge socket therefore
+    // never closes, no socket `open` handler runs, `connectAgent()` early-returns
+    // on an already-OPEN socket, and nothing sends the `hello` that is the only
+    // thing which re-registers this tab's route. The orchestrator's post-restart
+    // watch waits for a strictly NEWER hello generation that never arrives, so
+    // the restart reply's tab-reconnected and graph-tools-ready flags both stay
+    // false after every successful restart and the only recovery is a manual
+    // browser refresh — this issue, verbatim.
+    //
+    // The repair is the one the panel already ships for a free_vram bounce
+    // (#310): re-advertise. Placed BEFORE the resume gate because that gate
+    // returns, and gated so the two can never both fire — resume requires the
+    // bridge DOWN, this requires it UP. `client.rehello()` (not `connectAgent()`,
+    // which cannot produce a hello on an open socket) routes through the #1095
+    // gate, so the re-advertise waits out in-flight commands instead of stranding
+    // one mid-flight.
+    if (
+      shouldReadvertiseAfterComfyRestart({
+        bridgeConnected: client.isConnected(),
+        outageMs: comfyBackendOutage.outageMs(),
+        // A bridge that dropped and came back during this outage already
+        // re-registered through its own socket-open hello; a second greeting
+        // here is the #1138 double-ready-ack harm.
+        helloLandedSinceOutage: landedHelloCount > comfyBackendOutage.helloBaseline(),
+        alreadyReadvertised: comfyRestartReadvertisedSeq === comfyBackendOutage.seq(),
+      })
+    ) {
+      // Claimed BEFORE the send, so a `reconnected` that repeats cannot fire a
+      // second greeting while the first is still resolving its identity. The
+      // hello is bounded and the socket's own open-hello remains the fallback,
+      // so a claim spent on a send that never lands costs one restart's
+      // re-advertise — where an unclaimed repeat costs a re-greeting per event.
+      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();
+      try {
+        client?.rehello?.();
+      } catch {
+        // the reconnect path retries the hello
+      }
+    }
     // After ComfyUI comes back (backend-only reboot — the page didn't reload),
     // the orchestrator died with it. Respawn + reconnect if the agent was in use.
     // ComfyUI fires "reconnected" for BENIGN WS blips too — viewing assets,
