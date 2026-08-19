@@ -14058,10 +14058,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // #1351 made that single deadline span the join AND the run that follows it, so one
         // number here is genuinely the whole wait; there is no second clock to disagree with.
         //
-        // THE RUN IS NOT CANCELLED — `waitForRun` in refresh-coalesce.js says so in as many
-        // words — and that is what makes the refusal below honest about retrying: the run
-        // keeps the slot and keeps registering exactly the definitions this write is waiting
-        // for, so a retry JOINS work in progress instead of restarting it.
+        // A RUN THAT WAS IN FLIGHT IS NOT CANCELLED — `waitForRun` in refresh-coalesce.js
+        // says so in as many words — so it keeps the slot and keeps registering node
+        // definitions, and a retry joins that work instead of restarting it.
+        //
+        // STATED THAT CAREFULLY ON PURPOSE, twice over. One symbol comes back whether the
+        // budget went on a run already in flight or was ALREADY SPENT before one could be
+        // started (`joinMs <= 0` with an empty slot starts nothing), so nothing downstream
+        // may assert that a refresh is running. And this call is deliberately NOT forced —
+        // #458 P2's single-fetch rule — so a run it joins may have begun its /object_info
+        // fetch before the asset this write is about existed. What makes the retry worth
+        // asking for is simpler and true in every case: it re-enters this recovery with a
+        // fresh budget.
         //
         // NO BLIND RETRY IS ADDED HERE, deliberately. Re-issuing on a timeout is only safe
         // when nothing was applied, and this recovery sits between two write attempts —

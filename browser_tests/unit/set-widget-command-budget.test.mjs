@@ -199,8 +199,8 @@ test("#1413 a refresh that lands INSIDE the budget is reported as a refresh, unc
 });
 
 test("#1413 an EXHAUSTED budget starts nothing it then has to abandon at once", async () => {
-  // `budget.bounded` floors at 1ms, and `withTimeout` reads a non-positive bound as NO
-  // BOUND — the trap #1188 recorded. A command whose window is already gone must report
+  // A negative `joinMs` must never reach `withTimeout`, which reads a non-positive bound as
+  // NO BOUND — the trap #1188 recorded. A command whose window is already gone must report
   // that, not remove its own bound at the moment it is most needed.
   const never = deferred();
   const h = shippedFallback({ runRegister: () => never.promise, spentMs: SET_WIDGET_COMMAND_BUDGET_MS + 5000 });
@@ -210,6 +210,12 @@ test("#1413 an EXHAUSTED budget starts nothing it then has to abandon at once", 
     "the recovery on an exhausted budget",
   );
   assert.equal(outcome, "refresh_still_running");
+  // AND NOTHING IS RUNNING. This is the state the reply's wording has to survive: the same
+  // symbol comes back here as when a real run held the slot, so any sentence asserting "a
+  // node-def refresh is still running" is flatly wrong in this arm. Found by the gate, not
+  // by the first version of these tests.
+  assert.deepEqual(h.registered, [], "no run was started");
+  assert.equal(h.slotOccupied(), false, "and none is in flight to be waiting for");
   never.resolve({ refreshed: true });
 });
 
@@ -335,6 +341,43 @@ test("#1413 only a STRING is read as the token — a verdict object is not a ref
   });
   assert.equal(res.refreshed, true);
   assert.equal(res.combo_refresh_incomplete, undefined);
+});
+
+test("#1413 neither the disclosure nor the refusal asserts a refresh that may not exist", async () => {
+  // The same symbol comes back whether the budget went on a run already in flight or was
+  // already spent before one could be started, so no reply may name only the first — the
+  // over-claim #1409 had to correct in `refresh_nodes`' own refusal, caught here by the gate.
+  const node = loaderNode();
+  const res = await runSetWidget(node, "ckpt_name", "landed.safetensors", {
+    registry: REGISTRY,
+    ...freshOracle,
+    refreshCombos: async () => {
+      node.widgets[0].options.values.push("landed.safetensors");
+      return NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING;
+    },
+  });
+  assert.ok(
+    !/refresh was still running|is still running|still fetching/.test(res.combo_refresh_note),
+    `the disclosure asserts a run it cannot see: ${res.combo_refresh_note}`,
+  );
+  assert.match(res.combo_refresh_note, /either waiting on a node-def refresh already in flight, or before one could be started/);
+
+  const err = await runSetWidget(loaderNode(), "ckpt_name", "nope.safetensors", {
+    registry: REGISTRY,
+    ...freshOracle,
+    refreshCombos: async () => NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING,
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err);
+  assert.ok(
+    !/still fetching exactly the/.test(err.message),
+    "the refusal promises a fetch it cannot know happened",
+  );
+  assert.match(err.message, /either waiting on a node-def refresh already in flight, or before one could be started/);
+  // The retry argument that IS true in every arm, including the one with no run at all.
+  assert.match(err.message, /re-enters this recovery|runs this recovery again with a fresh budget/);
 });
 
 // ---------------------------------------------------------------------------

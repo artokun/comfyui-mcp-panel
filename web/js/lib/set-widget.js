@@ -507,11 +507,17 @@ export async function runSetWidget(
           // priority-ordered (#1223/#757), and a caller deciding whether to retry must not
           // have to parse a sentence that another disclosure can displace.
           combo_refresh_incomplete: comboRefreshUnavailable,
+          // NAMES BOTH STATES, because the value cannot tell them apart and neither may
+          // this sentence. One symbol comes back whether the budget went on a node-def run
+          // that was already in flight or whether it was already spent before one could be
+          // started — and the second case has NO run in it at all, so a note asserting "a
+          // refresh is still running" would be flatly wrong there. #1409 corrected the same
+          // over-claim in `refresh_nodes`' refusal for the same reason.
           combo_refresh_note:
             "The write SUCCEEDED, but the combo option list was NOT re-read from the " +
-            "server first: a node-def refresh was still running when this command's time " +
-            "budget ran out waiting for it. Nothing failed and that refresh was not " +
-            "cancelled.",
+            "server first: this command's time budget was spent before that could happen — " +
+            "either waiting on a node-def refresh already in flight, or before one could be " +
+            "started. Nothing failed, and any refresh that was running was not cancelled.",
         }
       : { refreshed: true };
   /** The clause a refusal appends. Never claims a refresh that did not happen. */
@@ -1234,19 +1240,23 @@ export async function runSetWidget(
     // #1413 — WITH ONE EXCEPTION, and it is the exception the sentence above defines rather
     // than one it forgot: when the option list was never re-read, the decision is NOT the
     // panel's observation. It is the absence of one. A retry then has something new to
-    // offer — the very node-def run this command stopped waiting for, still running and
-    // still registering these definitions — so the refusal says so and names the structured
-    // reason the successful path discloses on its own field.
+    // offer: a fresh budget for the re-read this one could not pay for. So the refusal says
+    // so and names the structured reason the successful path discloses on its own field.
     throw new Error(
       `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
         `${typeof refreshCombos === "function" ? afterRefreshClause() : ""}: ${latest.message}` +
         (comboRefreshUnavailable
           ? ` The option list could NOT be re-read from the server before this decision ` +
-            `(${comboRefreshUnavailable}): a node-def refresh was still running when this ` +
-            `command's time budget ran out waiting for it. Nothing failed, nothing was ` +
-            `written, and that refresh was NOT cancelled — it is still fetching exactly the ` +
-            `/object_info this write needed — so RETRY in a few seconds. Only if the retry ` +
-            `reports the same thing is the value itself worth doubting.`
+            `(${comboRefreshUnavailable}): this command's time budget was spent first — ` +
+            // BOTH STATES, for the reason the disclosure above gives: the budget can go on a
+            // refresh that was already in flight, or be gone before one could be started, and
+            // one symbol comes back either way.
+            `either waiting on a node-def refresh already in flight, or before one could be ` +
+            `started. Nothing failed and nothing was written. A refresh that WAS running is ` +
+            `not cancelled — it keeps the panel's refresh slot and keeps registering node ` +
+            `definitions — so RETRY in a few seconds: the retry runs this recovery again with ` +
+            `a fresh budget. Only if it reports the same thing is the value itself worth ` +
+            `doubting.`
           : ""),
     );
   }
