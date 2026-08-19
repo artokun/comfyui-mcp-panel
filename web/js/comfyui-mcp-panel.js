@@ -207,6 +207,7 @@ import {
   scopedBatchSeedNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
+  repeatingRgthreeSeeds,
 } from "./lib/scoped-batch-seed.js";
 import {
   materializePromotedValues,
@@ -14013,9 +14014,14 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     // #1339 — the same class of surprise from a node the scan above cannot see, because
     // rgthree deletes the `control_after_generate` widget it matches on.
+    //
+    // The ARRAY and the SENTENCE come from ONE predicate (repeatingRgthreeSeeds). They
+    // used to be two — `armed === false` here against `varies === false` in the note —
+    // which disagreed on the armed-but-degenerate node the note calls the confusing case,
+    // shipping `fixed_seed_nodes: []` beside a sentence naming that very node.
     const fixedSeedNote = rgthreeFixedSeedNote(rgthreeSeeds, batch);
     if (fixedSeedNote) {
-      accept.fixed_seed_nodes = rgthreeSeeds.filter((s) => s && s.armed === false);
+      accept.fixed_seed_nodes = repeatingRgthreeSeeds(rgthreeSeeds);
       accept.fixed_seed_note = fixedSeedNote;
     }
     // #572/#1124 — TRUTHFUL drift-coverage note for a scoped run: the drift hash

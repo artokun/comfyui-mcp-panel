@@ -21,6 +21,7 @@ import {
   scopedBatchSeedNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
+  repeatingRgthreeSeeds,
   rgthreeQueueTimeSeedInput,
 } from "../../web/js/lib/scoped-batch-seed.js";
 
@@ -434,4 +435,88 @@ test("#1124 — foreign seed nodes and malformed nodes exclude NOTHING (fail tow
   // A throwing accessor must not escape onto the dispatch path.
   const hostile = { type: "Seed (rgthree)", get widgets() { throw new Error("boom"); } };
   assert.equal(rgthreeQueueTimeSeedInput(hostile), null);
+});
+
+/**
+ * #1339 round 2 — THE ARRAY AND THE SENTENCE DISAGREED.
+ *
+ * The shipped fix computed the prose with `varies === false` and the structured
+ * `fixed_seed_nodes` field with `armed === false`. Those agree for a concrete seed and
+ * DISAGREE for the armed-but-degenerate node the note itself calls the confusing case —
+ * so a run against one returned a sentence naming node 649 beside `fixed_seed_nodes: []`.
+ * A program reads the array; only a human reads the sentence.
+ */
+test("#1339 r2 — an ARMED, degenerate node is in the ARRAY, not only in the prose", () => {
+  const degenerate = { ...rgthreeSeed(649, -1), properties: { randomMin: 5, randomMax: 5 } };
+  const found = findRgthreeSeedNodes([degenerate]);
+  // Precondition: this is the shape the two predicates disagreed on.
+  assert.equal(found[0].armed, true);
+  assert.equal(found[0].varies, false);
+
+  const note = rgthreeFixedSeedNote(found, 10);
+  assert.notEqual(note, "", "the prose names it");
+  // THE REGRESSION. Pre-fix this was `[]` — `seeds.filter(s => s.armed === false)`.
+  const repeating = repeatingRgthreeSeeds(found);
+  assert.equal(repeating.length, 1, "the array must name it too");
+  assert.equal(repeating[0].node_id, "649");
+  // …and the entry still carries WHICH of the two ways it repeats, so collapsing the
+  // predicate did not collapse the distinction a reader needs.
+  assert.equal(repeating[0].armed, true);
+  assert.match(repeating[0].degenerate_range, /randomMin=5, randomMax=5/);
+});
+
+test("#1339 r2 — INVARIANT: every node the note names is in the array, and vice versa", () => {
+  // The contract, stated as one property rather than a list of cases: the field is only
+  // attached when the note is non-empty, so an empty array beside a note is a guaranteed
+  // contradiction — never a "no findings" answer.
+  const cases = [
+    ["fixed", [rgthreeSeed(649, 12345)]],
+    ["armed+degenerate", [{ ...rgthreeSeed(649, -1), properties: { randomMin: 5, randomMax: 5 } }]],
+    ["armed+degenerate by step", [{
+      ...rgthreeSeed(650, -1),
+      properties: { randomMin: 0, randomMax: 5 },
+      widgets: [{ name: "seed", value: -1, options: { step: 100 } }],
+    }]],
+    ["armed+healthy", [rgthreeSeed(649, -1)]],
+    ["mixed", [rgthreeSeed(700, -1), rgthreeSeed(701, 999), { ...rgthreeSeed(702, -2), properties: { randomMin: 7, randomMax: 7 } }]],
+    ["none", [ksampler(53, "randomize")]],
+  ];
+  for (const [label, nodes] of cases) {
+    const found = findRgthreeSeedNodes(nodes);
+    const note = rgthreeFixedSeedNote(found, 10);
+    const repeating = repeatingRgthreeSeeds(found);
+    assert.equal(Boolean(note), repeating.length > 0, `${label}: note and array must agree on WHETHER`);
+    // …and on WHICH. Every id the sentence mentions is in the array.
+    for (const s of found) {
+      const named = note.includes(`node ${s.node_id}`);
+      assert.equal(named, repeating.some((r) => r.node_id === s.node_id), `${label}: node ${s.node_id}`);
+    }
+  }
+  // The armed+healthy case must be silent on BOTH channels, or the fix traded a missing
+  // warning for a false one.
+  const healthy = findRgthreeSeedNodes([rgthreeSeed(649, -1)]);
+  assert.equal(rgthreeFixedSeedNote(healthy, 10), "");
+  assert.deepEqual(repeatingRgthreeSeeds(healthy), []);
+});
+
+test("#1339 r2 — repeatingRgthreeSeeds is total: malformed input yields [], never a throw", () => {
+  for (const bad of [null, undefined, "nodes", 7, {}]) assert.deepEqual(repeatingRgthreeSeeds(bad), []);
+  assert.deepEqual(repeatingRgthreeSeeds([null, undefined, {}]), [], "no `varies` ⇒ not a finding");
+});
+
+test("#1339 r2 source guard: the CALL SITE uses the shared predicate, not its own filter", () => {
+  // A helper-level test cannot see this: the assignment lives in the monolith, and the
+  // ONLY thing that made the two disagree was the call site rolling its own filter. So
+  // assert on the source, and on EVERY assignment rather than the first — a second path
+  // attaching the field is exactly how this comes back.
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const sites = [...src.matchAll(/fixed_seed_nodes\s*=\s*([^\n;]+)/g)].map((m) => m[1].trim());
+  assert.ok(sites.length > 0, "the field is no longer assigned anywhere — has it been renamed?");
+  for (const rhs of sites) {
+    assert.match(rhs, /^repeatingRgthreeSeeds\(/, `fixed_seed_nodes must come from the shared predicate, got: ${rhs}`);
+    assert.doesNotMatch(rhs, /\barmed\b/, `the armed-only filter is the #1339 r2 regression: ${rhs}`);
+  }
+  // It has to be imported to be callable — a bare reference would be a ReferenceError
+  // that only a live panel would surface.
+  assert.match(src, /import \{[^}]*\brepeatingRgthreeSeeds\b[^}]*\} from "\.\/lib\/scoped-batch-seed\.js"/s);
 });
