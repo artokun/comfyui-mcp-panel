@@ -7682,13 +7682,63 @@ function getPiniaStore(id) {
 
 /** Reach ComfyUI's subgraph widget-promotion store (id "promotion"; methods
  *  promote/demote/isPromoted) — the state that exposes an inner subgraph widget
- *  on the parent SubgraphNode. */
+ *  on the parent SubgraphNode. Frontend >= 1.48 removed this store: value
+ *  widgets promote via linked subgraph inputs, and preview widgets use
+ *  `previewExposure` instead. */
 function getPromotionStore() {
   const store = getPiniaStore("promotion");
   if (!store || typeof store.promote !== "function") {
     throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
   }
   return store;
+}
+
+/** Reach ComfyUI's PREVIEW-widget exposure store (id "previewExposure"; methods
+ *  getExposures/addExposure/removeExposure) — the state behind the canvas action
+ *  "Promote Widget: $$canvas-image-preview". Preview widgets are NOT backed by a
+ *  connectable input slot, so the link-only path (subgraph.addInput + connect)
+ *  cannot promote them, and the legacy "promotion" store no longer exists on
+ *  frontend >= 1.48. Returns null when the store is absent. */
+function getPreviewExposureStore() {
+  const store = getPiniaStore("previewExposure");
+  return store && typeof store.addExposure === "function" ? store : null;
+}
+
+/** Display-only preview widgets: `$$`-prefixed names ($$canvas-image-preview)
+ *  or a non-serializing widget whose type is a preview media type. Matches
+ *  ComfyUI_frontend `isPreviewPseudoWidget` so the panel routes the same
+ *  widgets the canvas context menu does. */
+const PREVIEW_WIDGET_TYPES = new Set(["preview", "video", "audioUI"]);
+function isPreviewWidget(widget) {
+  if (!widget) return false;
+  if (typeof widget.name === "string" && widget.name.startsWith("$$")) return true;
+  if (widget.serialize !== false && widget.options?.serialize !== false) return false;
+  return typeof widget.type === "string" && PREVIEW_WIDGET_TYPES.has(widget.type);
+}
+
+/** Promote/demote a PREVIEW widget on the parent SubgraphNode via the
+ *  previewExposure store. Store shape is (rootGraphId, hostNodeLocator, …)
+ *  — the same key the canvas menu uses. */
+function promotePreviewExposure(store, parents, rootGraph, source, demote) {
+  for (const p of parents) {
+    const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
+    const hostId = String(p.id);
+    const existing = store.getExposures?.(rootGraphId, hostId) ?? [];
+    const match = existing.filter(
+      (ex) =>
+        String(ex?.sourceNodeId) === source.sourceNodeId &&
+        ex?.sourcePreviewName === source.sourceWidgetName,
+    );
+    if (demote) {
+      for (const ex of match) store.removeExposure?.(rootGraphId, hostId, ex.name);
+    } else if (!match.length) {
+      store.addExposure(rootGraphId, hostId, {
+        sourceNodeId: source.sourceNodeId,
+        sourcePreviewName: source.sourceWidgetName,
+      });
+    }
+  }
+  return true;
 }
 
 /** Reach ComfyUI's subgraph-blueprint store (id "subgraph"). Exposes
@@ -18634,19 +18684,39 @@ const GRAPH_TOOL_EXECUTORS = {
     let strategy = "link-only";
     graph.beforeChange?.();
     try {
-      try {
-        let changed = false;
-        for (const p of parents) {
-          const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
-          changed = changed || result.changed;
-        }
-        if (demote && !changed) throw new Error("link-only promoted input not found");
-      } catch (linkErr) {
-        const store = getPromotionStore();
-        strategy = "legacy-store";
-        for (const p of parents) {
-          const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
-          store[action](rootGraphId, p.id, source);
+      // Preview widgets ($$canvas-image-preview) have no connectable input slot,
+      // so the link-only path cannot promote them. Frontend >= 1.48 exposes
+      // them through the `previewExposure` store (the canvas context-menu
+      // action), and the legacy "promotion" store it used to fall back to no
+      // longer exists there. Route the same widgets the canvas menu does,
+      // first, when that store is present.
+      const previewStore = isPreviewWidget(w) ? getPreviewExposureStore() : null;
+      if (previewStore) {
+        strategy = "preview-exposure";
+        promotePreviewExposure(previewStore, parents, rootGraph, source, demote);
+      } else {
+        try {
+          let changed = false;
+          for (const p of parents) {
+            const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
+            changed = changed || result.changed;
+          }
+          if (demote && !changed) throw new Error("link-only promoted input not found");
+        } catch (linkErr) {
+          // Don't mask why the primary path failed — that message is the useful
+          // one. The legacy store is gone on frontend >= 1.48; if it is also
+          // missing here, surface BOTH errors rather than only "no promotion store".
+          strategy = "legacy-store";
+          let store;
+          try {
+            store = getPromotionStore();
+          } catch (storeErr) {
+            throw new Error(`${linkErr?.message ?? linkErr} (and ${storeErr.message})`);
+          }
+          for (const p of parents) {
+            const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
+            store[action](rootGraphId, p.id, source);
+          }
         }
       }
       refreshPromotedParents(parents, canvas);
