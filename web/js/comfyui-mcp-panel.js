@@ -420,7 +420,7 @@ import {
 } from "./lib/disconnect-verify.js";
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
-import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
+import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
@@ -22307,13 +22307,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         disclosedEpoch: canvasToolDisclosedEpoch,
       });
       const disclosed = disclosure.disclose && typeof text === "string";
-      const outText = disclosed ? CANVAS_TOOL_DISCLOSURE + text : text;
+      // #1310 — the disclosure is agent-directed. It rides in `context` so the
+      // orchestrator still prepends it for the model, but user_message.text stays
+      // what the user (or resume nudge) wrote. Prepending it to `text` made the
+      // block appear in the visible transcript whenever that field was rendered
+      // (history replay, an echo, a quoted say) and users read it as a warning
+      // their install was broken.
+      const outContext = disclosed
+        ? [CANVAS_TOOL_DISCLOSURE.trimEnd(), mergedContext].filter(Boolean).join("\n\n")
+        : mergedContext;
       try {
         sock.send(
           JSON.stringify({
             type: "user_message",
-            text: outText,
-            ...(mergedContext ? { context: mergedContext } : {}),
+            text,
+            ...(outContext ? { context: outContext } : {}),
             ...(images?.length ? { images: normalizeImageList(images) } : {}),
             // Client message id — the orchestrator echoes it in the "working"
             // ack so the panel can mark this exact bubble delivered ("Seen").
@@ -24001,6 +24009,28 @@ function describeCommand(cmd, msg, reply) {
             // Raw validation output — the machine's words, deliberately untranslated.
             detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
+    case "graph_outline":
+      // #1310 — a user-facing count only. The outline's budget_overrun / degraded
+      // prose is for the agent and must not land in the activity card.
+      return {
+        icon: "pi-sitemap",
+        text: tr(
+          "panel.read_graph_nodes",
+          { one: "Read graph — {count} node", other: "Read graph — {count} nodes" },
+          { count: r.node_count },
+        ),
+      };
+    case "graph_query":
+      // Same rule: shown/total is what the user can read; groups_omitted and
+      // max_chars accounting stay in the tool result the agent already has.
+      return {
+        icon: "pi-search",
+        text: tr(
+          "panel.found_nodes",
+          { one: "Found {found} of {count} node", other: "Found {found} of {count} nodes" },
+          { count: r.total, found: `${r.shown ?? r.matched ?? r.count ?? 0}${r.truncated ? "+" : ""}` },
+        ),
+      };
     case "graph_find_nodes":
       // The TOTAL drives the plural; the match count carries its own "+" truncation marker,
       // so it is interpolated as text rather than as a second count.
@@ -24079,9 +24109,10 @@ function describeCommand(cmd, msg, reply) {
     case "workflow_save_as":
       return { icon: "pi-save", text: tr("panel.workflow_saved_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
     default:
-      // `cmd` is the raw tool name (an identifier) and the detail is the raw reply payload —
-      // neither is prose, so neither is translated.
-      return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
+      // `cmd` is the raw tool name (an identifier). #1310 — do NOT dump the raw
+      // reply payload: that is how graph_query's budget_overrun / groups_omitted
+      // accounting (and every other agent-only field) rendered in the transcript.
+      return { icon: "pi-bolt", text: cmd };
   }
 }
 
@@ -27615,6 +27646,16 @@ function buildPanel() {
     if (entry?.role !== "user" && turnOutputFenced()) {
       return entry;
     }
+    // #1310 — persist what the user can see. Mutate in place: callers keep this
+    // object. Agent-directed prefixes that leaked into a record (an older build
+    // prepended them to user_message.text; a card used to dump the raw tool
+    // payload) must not come back on replay.
+    if (entry && (entry.role === "user" || entry.role === "agent") && typeof entry.text === "string") {
+      entry.text = stripAgentDirectedBlocks(entry.text);
+    } else if (entry && entry.role === "card") {
+      if (typeof entry.text === "string") entry.text = stripAgentDirectedBlocks(entry.text);
+      if (typeof entry.detail === "string") entry.detail = stripAgentDirectedBlocks(entry.detail);
+    }
     const followsPanel = historyScopeFollowsPanel();
     // Panel-owned continuity uses a global active-thread pointer, but the thread
     // keeps the stable workflow UUID as provenance for archive grouping. Panel
@@ -27777,7 +27818,7 @@ function buildPanel() {
   // Surrounding text renders verbatim too. Tokens with no matching attachment
   // content fall back to their literal text. Never throws into the render.
   function renderUserText(container, text, atts) {
-    const raw = coerceMessageText(text);
+    const raw = stripAgentDirectedBlocks(coerceMessageText(text));
     try {
       const byId = new Map();
       if (Array.isArray(atts)) {
@@ -27882,7 +27923,7 @@ function buildPanel() {
     // isDroppedAgentReplay) — a genuinely-empty STRING record is valid stored
     // input and must still render its empty bubble (#241).
     if (isDroppedAgentReplay(text)) return;
-    const safeText = coerceMessageText(text);
+    const safeText = stripAgentDirectedBlocks(coerceMessageText(text));
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble agent";
@@ -27894,8 +27935,8 @@ function buildPanel() {
   function paintCard({ icon, text, detail, error }) {
     // Coerce both slots: a structured error/detail (e.g. reply.error object) must
     // never reach textContent as "[object Object]" — live OR on card replay (#276).
-    text = coerceMessageText(text);
-    detail = detail == null ? detail : coerceMessageText(detail);
+    text = stripAgentDirectedBlocks(coerceMessageText(text));
+    detail = detail == null ? detail : stripAgentDirectedBlocks(coerceMessageText(detail));
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card" + (error ? " error" : "");
@@ -29493,8 +29534,8 @@ function buildPanel() {
   function commitStream(id, text) {
     const s = streamBubbles.get(id);
     if (!s) return false;
-    s.commitText = text;
-    s.replyTarget = text; // authoritative — guarantees the typewriter reaches the end
+    s.commitText = stripAgentDirectedBlocks(text);
+    s.replyTarget = s.commitText; // authoritative — guarantees the typewriter reaches the end
     // CRITICAL: the typewriter (pumpStreams) runs on requestAnimationFrame, which
     // the browser PAUSES in a hidden/background tab. If the user switched away
     // during the turn (common on long pipeline runs), the reply would never paint
@@ -35824,25 +35865,26 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    const context = {
-      workflow: getWorkflowTitle(),
-      ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
-    };
-    // Surface any MANUAL canvas edits the user made since the agent's last turn,
-    // prepended to the agent-facing text only (the visible `text` is untouched).
-    // Orchestrator status the user must not see (failed panel auto-sync, lock
-    // recovery, …). Delivered the same way as the banners below — prepended to the
-    // agent-facing text only, so the visible bubble stays what the user typed.
+    // Agent-directed banners ride in `context`, never in user_message.text (#1310).
+    // The visible bubble is the typed `text`; the orchestrator prepends string
+    // context above it for the model. Putting these in `text` is how LIVE-CANVAS
+    // TOOLS / MANUAL CANVAS CHANGES rendered in the user's chat.
     const hiddenNotes = takeHiddenAgentNotes();
-    if (hiddenNotes) sendText = hiddenNotes + sendText;
     const changeBanner = manualChangeBanner();
-    if (changeBanner) sendText = changeBanner + sendText;
     // Surface ComfyUI's own pre-run validation errors (missing models,
     // value_not_in_list, broken links) the instant they appear — the same data the
     // user sees in the frontend's error panel — so the agent isn't blind to a broken
     // graph until it independently re-runs. Conditional + deduped (event-driven).
     const valBanner = await validationBanner();
-    if (valBanner) sendText = valBanner + sendText;
+    const context = [
+      hiddenNotes,
+      changeBanner,
+      valBanner,
+      serializeContext({
+        workflow: getWorkflowTitle(),
+        ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
+      }),
+    ].filter(Boolean).join("\n\n") || undefined;
     // The target conversation is decided at DISPATCH, not at type time (gate
     // P0-5): if the shared selection moved while we awaited above, relocate the
     // optimistically recorded prompt into the conversation the backend will

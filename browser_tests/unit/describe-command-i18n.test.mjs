@@ -57,6 +57,10 @@ test("English is unchanged by being keyed — same words, both plural forms", ()
   assert.equal(say("graph_clear", { cleared: 1 }), "Cleared canvas — removed 1 node (one Ctrl+Z restores all)");
   assert.equal(say("graph_clear", { cleared: 3 }), "Cleared canvas — removed 3 nodes (one Ctrl+Z restores all)");
   assert.equal(say("graph_find_nodes", { count: 5, total: 20, truncated: true }), "Found 5+ of 20 nodes");
+  // #1310 — outline/query used to fall through to JSON.stringify(result), which
+  // painted budget_overrun / groups_omitted in the activity card.
+  assert.equal(say("graph_outline", { node_count: 12, degraded_reason: "raise max_chars" }), "Read graph — 12 nodes");
+  assert.equal(say("graph_query", { total: 20, shown: 8, truncated: true, budget_overrun: "huge" }), "Found 8+ of 20 nodes");
   // Two independent counts in one sentence — nodes and columns pluralise separately.
   assert.equal(say("graph_auto_layout", { node_count: 1, columns: 1 }), "Auto-arranged 1 node (1 column)");
   assert.equal(say("graph_auto_layout", { node_count: 9, columns: 1 }), "Auto-arranged 9 nodes (1 column)");
@@ -197,6 +201,25 @@ test("user data in a summary is never mistaken for a placeholder", () => {
     say("graph_set_widget", { set: { widget: "text", value: "a {node_id} b", node_id: 12, previous: null } }),
     'Set text = "a {node_id} b" on node 12',
   );
+});
+
+test("#1310 graph_query / the default do not dump the raw tool payload", () => {
+  __setCatalogForTest("en", {});
+  const query = describeCommand(
+    "graph_query",
+    {},
+    { ok: true, result: { total: 4, shown: 4, budget_overrun: "max_chars", groups_omitted: 3 } },
+  );
+  assert.equal(query.detail, undefined);
+  assert.doesNotMatch(String(query.text), /budget_overrun|groups_omitted|max_chars/);
+
+  const fallback = describeCommand(
+    "some_new_cmd",
+    {},
+    { ok: true, result: { budget_overrun: "secret", groups_omitted: 3 } },
+  );
+  assert.equal(fallback.detail, undefined);
+  assert.equal(fallback.text, "some_new_cmd");
 });
 
 test("#1126: the summary discloses an unvalidated write, scoped to the widget it is about", () => {
