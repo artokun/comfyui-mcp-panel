@@ -1935,12 +1935,24 @@ function abortedRestoreClause(observed = {}) {
     .slice(0, 10)
     .map((f) => `${f?.type ?? "node"} (id ${f?.id ?? "?"})${f?.error ? `: ${f.error}` : ""}`)
     .join("; ");
+  if (!named) {
+    // Something threw, and nothing is still broken that the panel can name — a node
+    // whose post-load retry repaired it, or a throw out of the graph restore itself.
+    // The refusal stands (a restore that stopped early is not one whose result can be
+    // called byte-identical) but it may NOT claim values are missing, because the
+    // observation that would support that is exactly the one that came back empty.
+    return (
+      `. The restore also DID NOT RUN TO COMPLETION: the panel watched this load and ` +
+      `something threw while the graph was being restored. No node is still reported ` +
+      `unrestored, so this may already be repaired — but the panel cannot call the result ` +
+      `byte-identical, which is why the content stays unconfirmed rather than applied`
+    );
+  }
   return (
     `. AND THE RESTORE DID NOT RUN TO COMPLETION: the panel watched this load and ` +
-    (named
-      ? `${failures.length} node(s) threw while their saved state was being applied — ${named}` +
-        (failures.length > 10 ? `, and ${failures.length - 10} more` : "")
-      : `something threw while the graph was being restored`) +
+    `${failures.length} node(s) are still at CONSTRUCTION DEFAULTS after a post-load retry — ` +
+    `${named}` +
+    (failures.length > 10 ? `, and ${failures.length - 10} more` : "") +
     `. So this difference is NOT the frontend normalizing its own fields: part of what was ` +
     `loaded never landed. Fix or update the pack that threw, then open again`
   );
