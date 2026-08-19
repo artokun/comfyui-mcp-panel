@@ -115,6 +115,10 @@
     "name": "Varsayılan model",
     "tooltip": "Grok arka plan ajanı için varsayılan model; Grok için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Grok'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Varsayılan model",
+    "tooltip": "Qwen Code arka plan ajanı için varsayılan model; Qwen Code için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Qwen Code'a bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Varsayılan model",
     "tooltip": "Kimi arka plan ajanı için varsayılan model; Kimi için getirilen modeller arasından seçilir (panelin model seçicisinde görünen listenin aynısı). 'Otomatik', seçimi ajana bırakır. Paneldeki modeli değiştirmek burayı da günceller. Kimi'ye bağlanana kadar burada yalnızca 'Otomatik' ve kayıtlı seçiminiz görünebilir."
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Varsayılan akıl yürütme çabası",
     "tooltip": "Grok akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Varsayılan akıl yürütme çabası",
+    "tooltip": "Qwen Code akıl yürütme çabası denetimi sunmuyor; bunu 'Model varsayılanı' olarak bırakın."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Varsayılan akıl yürütme çabası",

@@ -115,6 +115,10 @@
     "name": "預設模型",
     "tooltip": "Grok 背景代理的預設模型，從為 Grok 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Grok 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "預設模型",
+    "tooltip": "Qwen Code 背景代理的預設模型，從為 Qwen Code 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Qwen Code 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "預設模型",
     "tooltip": "Kimi 背景代理的預設模型，從為 Kimi 取得的模型清單中挑選（就是面板模型選單顯示的那一份）。選「自動」會讓代理自己決定。在面板裡換模型時也會同步更新這裡。在你連上 Kimi 之前，這裡可能只會顯示「自動」和你先前儲存的選擇。"
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "預設推理強度",
     "tooltip": "Grok 沒有提供推理強度的控制項；請保持在「模型預設」。"
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "預設推理強度",
+    "tooltip": "Qwen Code 沒有提供推理強度的控制項；請保持在「模型預設」。"
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "預設推理強度",

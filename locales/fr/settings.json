@@ -115,6 +115,10 @@
     "name": "Modèle par défaut",
     "tooltip": "Modèle par défaut de l'agent d'arrière-plan Grok, choisi parmi les modèles récupérés pour Grok (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Grok, seuls « Auto » et votre choix enregistré peuvent apparaître."
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Modèle par défaut",
+    "tooltip": "Modèle par défaut de l'agent d'arrière-plan Qwen Code, choisi parmi les modèles récupérés pour Qwen Code (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Qwen Code, seuls « Auto » et votre choix enregistré peuvent apparaître."
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Modèle par défaut",
     "tooltip": "Modèle par défaut de l'agent d'arrière-plan Kimi, choisi parmi les modèles récupérés pour Kimi (la même liste que celle du sélecteur de modèles du panneau). « Auto » laisse l'agent choisir. Changer le modèle dans le panneau met aussi ce réglage à jour. Tant que vous ne vous êtes pas connecté à Kimi, seuls « Auto » et votre choix enregistré peuvent apparaître."
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Effort de raisonnement par défaut",
     "tooltip": "Grok n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Effort de raisonnement par défaut",
+    "tooltip": "Qwen Code n'expose aucun réglage d'effort de raisonnement ; laissez « Défaut du modèle »."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Effort de raisonnement par défaut",

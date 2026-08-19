@@ -115,6 +115,10 @@
     "name": "Modelo padrão",
     "tooltip": "Modelo padrão do agente em segundo plano do Grok, escolhido entre os modelos buscados para o Grok (a mesma lista que o seletor de modelos do painel mostra). 'Auto' deixa o agente escolher. Mudar o modelo no painel atualiza isto também. Até você se conectar ao Grok, aqui pode aparecer só 'Auto' + a sua escolha salva."
   },
+  "comfyui-mcp_defaultModel_qwen": {
+    "name": "Modelo padrão",
+    "tooltip": "Modelo padrão do agente em segundo plano do Qwen Code, escolhido entre os modelos buscados para o Qwen Code (a mesma lista que o seletor de modelos do painel mostra). 'Auto' deixa o agente escolher. Mudar o modelo no painel atualiza isto também. Até você se conectar ao Qwen Code, aqui pode aparecer só 'Auto' + a sua escolha salva."
+  },
   "comfyui-mcp_defaultModel_kimi": {
     "name": "Modelo padrão",
     "tooltip": "Modelo padrão do agente em segundo plano do Kimi, escolhido entre os modelos buscados para o Kimi (a mesma lista que o seletor de modelos do painel mostra). 'Auto' deixa o agente escolher. Mudar o modelo no painel atualiza isto também. Até você se conectar ao Kimi, aqui pode aparecer só 'Auto' + a sua escolha salva."
@@ -174,6 +178,10 @@
   "comfyui-mcp_defaultEffort_grok": {
     "name": "Esforço de raciocínio padrão",
     "tooltip": "O Grok não expõe controle de esforço de raciocínio; deixe em 'Padrão do modelo'."
+  },
+  "comfyui-mcp_defaultEffort_qwen": {
+    "name": "Esforço de raciocínio padrão",
+    "tooltip": "O Qwen Code não expõe controle de esforço de raciocínio; deixe em 'Padrão do modelo'."
   },
   "comfyui-mcp_defaultEffort_kimi": {
     "name": "Esforço de raciocínio padrão",
