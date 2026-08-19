@@ -29,6 +29,15 @@ export const NODE_DEF_REFRESH_REASONS = Object.freeze({
   // be restored. A data-loss verdict: it overrides even a real phase failure,
   // because the lost nodes are the fact the caller must act on first.
   GRAPH_NODES_LOST: "graph_nodes_lost",
+  // #1404 — the ONE token in this map that `describeNodeDefRefresh` never produces,
+  // because it does not describe a run at all: the caller's command budget ran out
+  // WAITING for a refresh (someone else's, then its own), and the run it stopped
+  // waiting for is still going. It lives here anyway, and deliberately: `reason` is a
+  // single vocabulary as far as its reader is concerned, and a value that could only be
+  // found by reading the executor is a value nobody will handle. Distinct from every
+  // token above by the fact that matters to a caller — nothing failed, so a retry is
+  // expected to succeed rather than hoped to.
+  REFRESH_STILL_RUNNING: "refresh_still_running",
 });
 
 function detailSuffix(thrown) {
