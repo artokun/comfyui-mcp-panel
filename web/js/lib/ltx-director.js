@@ -32,6 +32,13 @@
 // independently — a direct write is reverted — so we REFUSE them LOUDLY (mirroring #560's
 // principle of "a loud, safe failure over silent corruption") and redirect the caller to
 // `timeline_data`.
+//
+// #1308. After a pack install + backend restart the node and its widgets exist, but the
+// frontend extension may not have constructed TimelineEditor yet. Requiring the live editor
+// then leaves NO programmatic authoring path, even though a serialized timeline_data + the
+// derived widgets is exactly what a copy/paste of the node already persists. When the editor
+// is unavailable we fall back to writing those widgets ourselves, using the same
+// commitChanges() derivation the editor would have run, so execute() sees the new prompts.
 
 export const LTX_DIRECTOR_NODE_TYPE = "LTXDirector";
 
@@ -45,6 +52,28 @@ export const LTX_DERIVED_TIMELINE_WIDGETS = Object.freeze([
   "segment_lengths",
   "guide_strength",
 ]);
+
+// Optional toggles commitChanges / syncWidgetsAndUI keep in lock-step with the timeline's
+// audioTrackEnabled / motionTrackEnabled flags (default ON when the field is omitted).
+export const LTX_AUDIO_TOGGLE_WIDGET = "use_custom_audio";
+export const LTX_MOTION_TOGGLE_WIDGET = "use_custom_motion";
+
+// Serialised fallback (#1308) needs the master + every derived widget: Python execute()
+// reads local_prompts / segment_lengths / guide_strength, never timeline_data alone.
+const FALLBACK_REQUIRED_WIDGETS = Object.freeze([
+  LTX_TIMELINE_MASTER_WIDGET,
+  ...LTX_DERIVED_TIMELINE_WIDGETS,
+]);
+
+// Separators mirrored from TimelineEditor.commitChanges() — note NO space after the
+// length/strength commas (unlike PromptRelay's ", ").
+const LTX_PROMPT_JOIN = " | ";
+const LTX_LENGTH_JOIN = ",";
+const LTX_STRENGTH_JOIN = ",";
+
+// Match getStartFrames() / getDurationFrames() when the widget is missing or invalid.
+const DEFAULT_START_FRAMES = 0;
+const DEFAULT_DURATION_FRAMES = 24;
 
 /**
  * True for an LTXDirector node (matched on the ComfyUI class, never a value shape).
@@ -203,8 +232,7 @@ export function normalizeLtxTimelineValue(value) {
  * already stripped, so it is safe to JSON round-trip, unlike the live editor.timeline which
  * holds DOM/Image refs). Returns the parsed plain object, or null when it can't be read.
  */
-export function currentTimelineSnapshot(editor) {
-  const raw = editor?.timelineDataWidget?.value;
+export function parseTimelineSnapshot(raw) {
   if (typeof raw !== "string" || raw.trim() === "") return null;
   try {
     const parsed = JSON.parse(raw);
@@ -212,6 +240,143 @@ export function currentTimelineSnapshot(editor) {
   } catch {
     return null;
   }
+}
+
+export function currentTimelineSnapshot(editor) {
+  return parseTimelineSnapshot(editor?.timelineDataWidget?.value);
+}
+
+function findWidget(node, name) {
+  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+  return widgets.find((w) => w?.name === name) ?? null;
+}
+
+function nodeTimelineSnapshot(node) {
+  return parseTimelineSnapshot(findWidget(node, LTX_TIMELINE_MASTER_WIDGET)?.value);
+}
+
+function readIntWidget(node, name, { min, fallback }) {
+  const n = Number.parseInt(findWidget(node, name)?.value, 10);
+  return Number.isFinite(n) && n >= min ? n : fallback;
+}
+
+/**
+ * The clip window commitChanges() uses: start_frame + duration_frames widgets, with the
+ * same missing/invalid fallbacks as TimelineEditor.getStartFrames / getDurationFrames.
+ */
+export function readLtxTimelineWindow(node) {
+  return {
+    startFrames: readIntWidget(node, "start_frame", { min: 0, fallback: DEFAULT_START_FRAMES }),
+    durationFrames: readIntWidget(node, "duration_frames", { min: 1, fallback: DEFAULT_DURATION_FRAMES }),
+  };
+}
+
+function isReadyLtxEditor(editor) {
+  return !!(editor && typeof editor._applyLoadedTimeline === "function" && editor.timelineDataWidget);
+}
+
+function mergeOntoCurrent(base, overlay) {
+  const merged = base ? { ...base, ...overlay } : overlay;
+  const preservedTracks = base
+    ? SEGMENT_ARRAY_FIELDS.filter(
+        (f) => !Object.prototype.hasOwnProperty.call(overlay, f) && Array.isArray(base[f]) && base[f].length,
+      )
+    : [];
+  return { merged, preservedTracks, mergedOntoCurrent: base != null };
+}
+
+function strengthString(v) {
+  const n = v !== undefined ? Number(v) : 1.0;
+  return (Number.isFinite(n) ? n : 1.0).toFixed(2);
+}
+
+/**
+ * The node's own derived-widget computation, mirrored from TimelineEditor.commitChanges().
+ * local_prompts joins with " | "; segment_lengths and guide_strength join with "," (no
+ * space). Gaps inside the start/duration window are absorbed into the adjacent segment;
+ * the last kept segment is extended to fill the window. Non-text segments in range emit
+ * a two-decimal guide strength (default 1.00).
+ */
+export function deriveLtxTimelineWidgets(timeline, { startFrames = DEFAULT_START_FRAMES, durationFrames = DEFAULT_DURATION_FRAMES } = {}) {
+  const segs = Array.isArray(timeline?.segments) ? [...timeline.segments] : [];
+  segs.sort((a, b) => a.start - b.start);
+  const endFrames = startFrames + durationFrames;
+
+  if (timeline?.retakeMode) {
+    const retakeStart = Number.isFinite(timeline.retakeStart) ? timeline.retakeStart : 0;
+    const retakeLength = Number.isFinite(timeline.retakeLength) ? timeline.retakeLength : durationFrames;
+    const retakeEnd = retakeStart + retakeLength;
+    const retakePrompt = timeline.retakePrompt || "";
+    const globalPrompt = timeline.global_prompt || "";
+    const retakeStrength = Number.isFinite(Number(timeline.retakeStrength)) ? Number(timeline.retakeStrength) : 1.0;
+    const lengths = [];
+    const prompts = [];
+    const strengths = [];
+
+    const pBeforeLen = Math.min(endFrames, retakeStart) - startFrames;
+    if (pBeforeLen > 0) {
+      lengths.push(pBeforeLen);
+      prompts.push(globalPrompt || "video");
+      strengths.push("0.00");
+    }
+    const rStart = Math.max(startFrames, retakeStart);
+    const rEnd = Math.min(endFrames, retakeEnd);
+    const rLen = rEnd - rStart;
+    if (rLen > 0) {
+      lengths.push(rLen);
+      prompts.push(retakePrompt || "video");
+      strengths.push(retakeStrength.toFixed(2));
+    }
+    const pAfterLen = endFrames - Math.max(startFrames, retakeEnd);
+    if (pAfterLen > 0) {
+      lengths.push(pAfterLen);
+      prompts.push(globalPrompt || "video");
+      strengths.push("0.00");
+    }
+    return {
+      local_prompts: prompts.join(LTX_PROMPT_JOIN),
+      segment_lengths: lengths.join(LTX_LENGTH_JOIN),
+      guide_strength: strengths.join(LTX_STRENGTH_JOIN),
+    };
+  }
+
+  const contiguousLengths = [];
+  const contiguousPrompts = [];
+  let currentCursor = startFrames;
+  let pendingGap = 0;
+  for (const seg of segs) {
+    if (seg.start + seg.length <= startFrames) continue;
+    if (seg.start >= endFrames) break;
+    const effectiveStart = Math.max(seg.start, startFrames);
+    if (effectiveStart > currentCursor) {
+      const gapLength = Math.min(effectiveStart, endFrames) - currentCursor;
+      if (contiguousLengths.length > 0) {
+        contiguousLengths[contiguousLengths.length - 1] += gapLength;
+      } else {
+        pendingGap += gapLength;
+      }
+    }
+    const clippedEnd = Math.min(seg.start + seg.length, endFrames);
+    contiguousLengths.push(clippedEnd - effectiveStart + pendingGap);
+    contiguousPrompts.push(seg.prompt || "");
+    pendingGap = 0;
+    currentCursor = Math.max(currentCursor, seg.start + seg.length);
+  }
+  const clampedCursor = Math.min(currentCursor, endFrames);
+  if (contiguousLengths.length > 0 && clampedCursor < endFrames) {
+    contiguousLengths[contiguousLengths.length - 1] += endFrames - clampedCursor;
+  }
+
+  const guide = segs
+    .filter((s) => s.type !== "text")
+    .filter((s) => s.start + s.length > startFrames && s.start < endFrames)
+    .map((s) => strengthString(s.guideStrength));
+
+  return {
+    local_prompts: contiguousPrompts.join(LTX_PROMPT_JOIN),
+    segment_lengths: contiguousLengths.join(LTX_LENGTH_JOIN),
+    guide_strength: guide.join(LTX_STRENGTH_JOIN),
+  };
 }
 
 /** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
@@ -237,9 +402,11 @@ export function derivedTimelineRefusal(widgetName, nodeId) {
  *     pre-change snapshot. afterChange ALWAYS runs (even on throw); beforeChange is only
  *     fired once the value + editor are validated, so a refusal establishes no empty undo step.
  *   - `setDirty` repaints the canvas on success.
- * Returns a result envelope. Throws LtxTimelineWriteError when the value is invalid, or the
- * editor / load method is unavailable (node UI not initialized, or a pack version without the
- * load path) — an HONEST failure rather than a raw write that would be silently reverted.
+ * Returns a result envelope. Throws LtxTimelineWriteError when the value is invalid, or
+ * neither a ready editor NOR the serialized timeline_data + derived widgets exist — an
+ * HONEST failure rather than a raw write that would be silently reverted. When the editor
+ * is missing but the widgets are present (#1308), writes the serialized values and
+ * regenerates the derived widgets so execute() sees the new prompts.
  *
  * MERGE, not replace. The node's _applyLoadedTimeline is a whole-timeline REPLACE that
  * DEFAULTS every omitted field (an absent track loads as [], an absent global_prompt as "").
@@ -249,44 +416,42 @@ export function derivedTimelineRefusal(widgetName, nodeId) {
  * clean current-timeline snapshot, so anything they don't mention is PRESERVED. An explicit
  * empty array (e.g. `motionSegments: []`) still clears that track; only OMISSION preserves.
  */
-export function applyLtxTimelineWrite(node, value, { getEditor, beforeChange, afterChange, setDirty } = {}) {
-  const { timeline } = normalizeLtxTimelineValue(value);
-  const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
-  // Require BOTH the load method AND the timeline_data widget it dereferences
-  // UNCONDITIONALLY (`this.timelineDataWidget.value`, not behind a guard). Without the
-  // widget, _applyLoadedTimeline throws internally and swallows it behind its own alert(),
-  // applying nothing — so a method-presence-only check would report a false "driven"
-  // success and dirty the graph for no effect.
-  if (!editor || typeof editor._applyLoadedTimeline !== "function" || !editor.timelineDataWidget) {
+function applySerializedLtxTimeline(node, merged, { beforeChange, afterChange, setDirty, preservedTracks, mergedOntoCurrent }) {
+  const missing = FALLBACK_REQUIRED_WIDGETS.filter((name) => !findWidget(node, name));
+  if (missing.length) {
     throw new LtxTimelineWriteError(
-      `LTXDirector node ${node?.id} has no live, ready timeline editor to drive (the node UI has not ` +
-        `initialized, its timeline_data widget is missing, or this pack version does not expose the ` +
-        `timeline load path). Open the node on the canvas, or edit the timeline from the node UI; ` +
-        `panel_set_widget cannot re-sync the custom timeline on this version.`,
+      `LTXDirector node ${node?.id} has no live, ready timeline editor, and cannot use the serialized ` +
+        `fallback because the widget(s) ${missing.join(", ")} are missing. The node's Python execute() ` +
+        `reads local_prompts / segment_lengths / guide_strength — writing timeline_data alone would ` +
+        `leave the render on the OLD prompts (#1308). Refresh the ComfyUI tab so the pack frontend ` +
+        `initializes, or open the node on the canvas.`,
     );
   }
-  // Merge the caller's fields (the effective timeline — unwrapped from a { timeline: {…} }
-  // wrapper) onto the node's CLEAN current snapshot so omitted fields are preserved. When no
-  // snapshot is readable there is nothing to preserve, so fall back to a pure replace with the
-  // caller's object. The result is always an UNWRAPPED timeline object, which the node accepts
-  // via `data.timeline || data`.
-  const overlay = effectiveTimeline(timeline);
-  const base = currentTimelineSnapshot(editor);
-  const merged = base ? { ...base, ...overlay } : overlay;
-  const preservedTracks = base
-    ? SEGMENT_ARRAY_FIELDS.filter(
-        (f) => !Object.prototype.hasOwnProperty.call(overlay, f) && Array.isArray(base[f]) && base[f].length,
-      )
-    : [];
 
-  // Bracket the mutation in one undo envelope (afterChange in finally so a thrown load path
-  // never leaves the history open). The node's authored load path re-parses into
-  // this.timeline, syncs the global-prompt DOM + media, REGENERATES
-  // local_prompts/segment_lengths/guide_strength via commitChanges(), and re-renders.
-  // fileHandle=null (not loaded from a picked file).
+  const derived = deriveLtxTimelineWidgets(merged, readLtxTimelineWindow(node));
+  const audioOn = merged.audioTrackEnabled !== false;
+  const motionOn = merged.motionTrackEnabled !== false;
+  const toggles = {};
+  if (findWidget(node, LTX_AUDIO_TOGGLE_WIDGET)) toggles[LTX_AUDIO_TOGGLE_WIDGET] = audioOn;
+  if (findWidget(node, LTX_MOTION_TOGGLE_WIDGET)) toggles[LTX_MOTION_TOGGLE_WIDGET] = motionOn;
+
   beforeChange?.();
   try {
-    editor._applyLoadedTimeline(JSON.stringify(merged), null);
+    findWidget(node, LTX_TIMELINE_MASTER_WIDGET).value = JSON.stringify(merged);
+    for (const name of LTX_DERIVED_TIMELINE_WIDGETS) {
+      findWidget(node, name).value = derived[name];
+    }
+    for (const [name, val] of Object.entries(toggles)) {
+      findWidget(node, name).value = val;
+    }
+    if (Object.prototype.hasOwnProperty.call(merged, "inpaint_audio")) {
+      const w = findWidget(node, "inpaint_audio");
+      if (w) w.value = !!merged.inpaint_audio;
+    }
+    if (Object.prototype.hasOwnProperty.call(merged, "overrideAudio")) {
+      const w = findWidget(node, "override_audio");
+      if (w) w.value = !!merged.overrideAudio;
+    }
   } finally {
     afterChange?.();
   }
@@ -297,10 +462,73 @@ export function applyLtxTimelineWrite(node, value, { getEditor, beforeChange, af
       node_id: node?.id,
       widget: LTX_TIMELINE_MASTER_WIDGET,
       driven: true,
-      merged_onto_current: base != null,
+      fallback: true,
+      editor_driven: false,
+      merged_onto_current: mergedOntoCurrent,
       preserved_tracks: preservedTracks,
       segments,
       derived_regenerated: [...LTX_DERIVED_TIMELINE_WIDGETS],
+      ...derived,
+      ...(Object.keys(toggles).length ? { audio_motion_toggles: toggles } : {}),
     },
   };
+}
+
+export function applyLtxTimelineWrite(node, value, { getEditor, beforeChange, afterChange, setDirty } = {}) {
+  const { timeline } = normalizeLtxTimelineValue(value);
+  const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+  const overlay = effectiveTimeline(timeline);
+
+  // Prefer the live editor when it is actually ready. The node's _applyLoadedTimeline
+  // re-parses into this.timeline, syncs the DOM, and regenerates the derived widgets.
+  if (isReadyLtxEditor(editor)) {
+    const { merged, preservedTracks, mergedOntoCurrent } = mergeOntoCurrent(
+      currentTimelineSnapshot(editor),
+      overlay,
+    );
+    beforeChange?.();
+    try {
+      editor._applyLoadedTimeline(JSON.stringify(merged), null);
+    } finally {
+      afterChange?.();
+    }
+    setDirty?.();
+    const segments = Array.isArray(merged.segments) ? merged.segments.length : undefined;
+    return {
+      ltx_timeline: {
+        node_id: node?.id,
+        widget: LTX_TIMELINE_MASTER_WIDGET,
+        driven: true,
+        fallback: false,
+        editor_driven: true,
+        merged_onto_current: mergedOntoCurrent,
+        preserved_tracks: preservedTracks,
+        segments,
+        derived_regenerated: [...LTX_DERIVED_TIMELINE_WIDGETS],
+      },
+    };
+  }
+
+  // #1308: no live editor (pack JS not yet initialized, node never rendered). Author the
+  // serialized widgets the node already persists — the copy/paste workaround proves that
+  // shape is accepted. Still refuse when even timeline_data is absent: there is nothing to
+  // write and a "driven" report would be a lie.
+  if (findWidget(node, LTX_TIMELINE_MASTER_WIDGET)) {
+    const { merged, preservedTracks, mergedOntoCurrent } = mergeOntoCurrent(nodeTimelineSnapshot(node), overlay);
+    return applySerializedLtxTimeline(node, merged, {
+      beforeChange,
+      afterChange,
+      setDirty,
+      preservedTracks,
+      mergedOntoCurrent,
+    });
+  }
+
+  throw new LtxTimelineWriteError(
+    `LTXDirector node ${node?.id} has no live, ready timeline editor to drive (the node UI has not ` +
+      `initialized, its timeline_data widget is missing, or this pack version does not expose the ` +
+      `timeline load path) and no serialized timeline_data widget to fall back to. Open the node on ` +
+      `the canvas, or refresh the ComfyUI tab so the pack frontend initializes; panel_set_widget ` +
+      `cannot author the timeline until one of those is available.`,
+  );
 }
