@@ -501,6 +501,7 @@ import {
   isAbandonedInteractive,
 } from "./lib/interactive-abandon.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
+import { runWorkflowLiveSync } from "./lib/live-sync-ack.js";
 import {
   OPEN_DISK_READ_BUDGET_MS,
   withDeadline,
@@ -1741,6 +1742,15 @@ function setupListeners() {
     } catch (err) {
       console.warn("[comfyui-mcp-panel] Manager task-result capture unavailable:", err);
     }
+    // #1299 — an out-of-band workflow save (H3 apply) announces itself as a
+    // ComfyUI `live_sync` event. Counting that the event was *delivered* is
+    // how notified:true was reported while the canvas stayed stale. The
+    // executor ACKs only after the active canvas actually holds the saved
+    // graph (or it reports refused/stale).
+    api.addEventListener("live_sync", (ev) => {
+      const detail = ev?.detail && typeof ev.detail === "object" ? ev.detail : {};
+      void GRAPH_TOOL_EXECUTORS.workflow_live_sync(detail);
+    });
     api.addEventListener("execution_error", (ev) => {
       lastExecFailure = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
     });
@@ -6004,6 +6014,29 @@ async function workflowDiskBytes(rawPath) {
     return new Uint8Array(await res.arrayBuffer());
   } catch {
     return null; // unknown ⇒ fail safe (gate leaves overwrite:false — never a forced clobber)
+  }
+}
+
+/** #1299 — hex SHA-256 of a string, or null when SubtleCrypto is missing. */
+async function sha256Hex(text) {
+  if (typeof text !== "string") return null;
+  try {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}
+
+/** #1299 — best-effort ACK on ComfyUI's own socket so a send_sync caller can
+ *  wait for application, not delivery. Never throws. */
+function sendLiveSyncAckOnComfySocket(result) {
+  try {
+    const sock = api?.socket;
+    if (!sock || sock.readyState !== 1) return;
+    sock.send(JSON.stringify({ type: "live_sync_ack", data: result }));
+  } catch {
+    /* the command reply is the authoritative ACK */
   }
 }
 
@@ -16678,6 +16711,45 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // #1299 — apply an out-of-band saved workflow onto the ACTIVE canvas, and
+  // report notified only when that canvas actually holds the saved widgets.
+  // A dirty tab is refused (unsaved work is not clobbered). `live_sync` is the
+  // same executor under the name the H3 tool already sends.
+  async workflow_live_sync(args = {}) {
+    let host = app;
+    try {
+      host = getGraphCtx().app || app;
+    } catch {
+      host = app;
+    }
+    return runWorkflowLiveSync(args, {
+      getActiveWorkflow: () =>
+        host?.extensionManager?.workflow?.activeWorkflow || activeWorkflowRef(),
+      readDisk: (p) => workflowDiskContent(p),
+      serializeCanvas: () => host?.graph?.serialize?.() ?? null,
+      loadGraph: async (graph, target) => {
+        await host.loadGraphData(graph, true, true, target, { __cmcpKeepInstance: true });
+      },
+      rebaseline: async (target, diskText) => {
+        try {
+          target.originalContent = diskText;
+        } catch {
+          /* getter-only */
+        }
+        try {
+          await clearSpuriousOpenModified(target, { stillOwns: () => true });
+        } catch {
+          /* best-effort — a leftover modified flag is loud, not a false apply */
+        }
+      },
+      sha256: sha256Hex,
+      sendAck: sendLiveSyncAckOnComfySocket,
+    });
+  },
+  async live_sync(args) {
+    return GRAPH_TOOL_EXECUTORS.workflow_live_sync(args);
+  },
+
   async workflow_rename({ name, path }) {
     const s = app?.extensionManager?.workflow;
     if (!s?.renameWorkflow) throw new Error("rename unavailable on this frontend");
@@ -21055,6 +21127,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
         }
+        return;
+      }
+      // #1299 — a type-only live-sync frame (no cmd). Same executor as the
+      // command path; notified still means the canvas applied, never delivery.
+      if (msg && msg.type === "live_sync" && typeof msg.cmd !== "string") {
+        await GRAPH_TOOL_EXECUTORS.workflow_live_sync(msg);
         return;
       }
       // Reply to a direct callTool() request (cid-correlated).
