@@ -68,6 +68,69 @@ function capSerializedText(text, cap) {
 }
 
 /**
+ * True when a captured execution_error belongs on the currently-viewed graph.
+ *
+ * #1448: ComfyUI reuses node ids across workflows. Matching on id alone joined
+ * workflow A's `RCAITKLoadPipeline` ModuleNotFoundError onto workflow B's
+ * `LoadImage` that happened to also be id `2`. Correlation requires the current
+ * node at that id to still be the same type.
+ *
+ * Fail-open on missing type information so a genuine failure is never swallowed
+ * because a node has no type yet. Fail-closed when the id is present but the
+ * current node is a different type, or the id is absent from this graph. A
+ * node-id-less error is kept as graph-level: there is no node to mis-blame.
+ */
+export function executionErrorMatchesCurrentGraph(error, nodeById) {
+  if (error == null) return false;
+  if (error.node_id == null) return true;
+  if (!nodeById || typeof nodeById.get !== "function") return false;
+  let failedNode;
+  try {
+    failedNode = nodeById.get(String(error.node_id));
+  } catch {
+    return false;
+  }
+  if (!failedNode) return false;
+  const currentNodeType = failedNode.comfyClass ?? failedNode.type ?? null;
+  if (!error.node_type || currentNodeType == null || currentNodeType === "") return true;
+  return String(error.node_type) === String(currentNodeType);
+}
+
+/**
+ * Correlate a captured execution_error onto the current graph. graph_get_errors
+ * uses this for per-node `reasons`, `clean`, and `last_execution_error` so the
+ * three surfaces cannot disagree (#1448).
+ *
+ * Returns `{ detail, failure, reason }`:
+ *   - `detail` — the raw captured error (for last_execution_error), or null
+ *   - `failure` — the slim summary used for `clean` / red-outline classification
+ *   - `reason` — the per-node `{kind:"execution", ...}` payload, or null
+ *
+ * A stale or foreign error returns all-null.
+ */
+export function applyRuntimeExecFailure(error, nodeById) {
+  if (!executionErrorMatchesCurrentGraph(error, nodeById)) {
+    return { detail: null, failure: null, reason: null };
+  }
+  const msg = coerceMessageText(error.exception_message ?? error.message ?? "").trim();
+  const failure = {
+    node_id: error.node_id ?? null,
+    node_type: error.node_type ?? null,
+    ...(error.exception_type ? { exception_type: error.exception_type } : {}),
+    message: msg || null,
+  };
+  const reason =
+    error.node_id != null
+      ? {
+          kind: "execution",
+          ...(error.exception_type ? { exception_type: error.exception_type } : {}),
+          message: msg || null,
+        }
+      : null;
+  return { detail: error, failure, reason };
+}
+
+/**
  * Bounded form of one captured execution_error detail. `null` in → `null` out
  * (no failure stays "no failure"); a non-object detail is coerced into the
  * message rather than dropped, so a failure is never reported as absent.
