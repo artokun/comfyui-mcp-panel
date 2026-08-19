@@ -300,6 +300,78 @@ test("#1707: a failed instance-scoped write does not touch the definition on the
   assert.equal(sg.definition(), 512);
 });
 
+test("#1707 × #805: a rail that snaps the value onto its own grid is a NORMALIZED success, read back from the rail", () => {
+  // The read-back, the normalization explanation and the reported value all have to
+  // come from the widget that was written. Taken from the shared inner widget instead,
+  // an instance-scoped write can never look normalized — the inner value did not move
+  // at all — and a write that APPLIED is reported as "did not retain the requested
+  // value", which is the #805 defect reintroduced through the promoted path.
+  const sg = makeReusableSubgraph({ definitionValue: 512 });
+  const target = sg.instance(293);
+  // The wrapper's own store entry declares the grid, and the rail snaps onto it —
+  // the projection's options come from the store, as they do in the frontend.
+  const state = sg.store.get(target.widgetId);
+  state.options = { min: 1, step: 2 };
+  const snap = (v) => (typeof v === "number" ? state.options.min + Math.round((v - state.options.min) / 2) * 2 : v);
+  // Both doors into the store quantize — a widget that snapped through one and not
+  // the other would not be a snapping widget, it would be an inconsistent fixture.
+  Object.defineProperty(target.rail, "value", {
+    get: () => state.value,
+    set: (next) => {
+      state.value = snap(next);
+    },
+    configurable: true,
+  });
+  Object.defineProperty(target.rail, "callback", {
+    value: (next) => {
+      state.value = snap(next);
+    },
+    configurable: true,
+  });
+
+  const set = applyWidgetWrite(target.node, "width", 4096, { resolveSource });
+
+  assert.equal(set.normalized, true);
+  assert.equal(set.requested_value, 4096);
+  assert.equal(set.value, 4097, "the reply carries the value the RAIL stored");
+  assert.equal(sg.queuedValue(target), 4097);
+  assert.match(set.normalization_note, /width/);
+  assert.equal(sg.definition(), 512, "and the shared definition still did not move");
+});
+
+test("#1707 × #805: a definition that happens to hold the requested value does not decide the read-back", () => {
+  // The narrow case that separates "read the widget we wrote" from "read whichever
+  // widget already agrees": the shared definition is ALREADY 4096, so an early-out
+  // taken from the inner widget would conclude "the value stuck" without ever looking
+  // at the rail — and then reject the rail's legitimately quantized 4097 as a failure,
+  // because nothing computed the normalization that explains it.
+  const sg = makeReusableSubgraph({ definitionValue: 4096 });
+  const target = sg.instance(293);
+  const state = sg.store.get(target.widgetId);
+  state.options = { min: 1, step: 2 };
+  const snap = (v) => (typeof v === "number" ? state.options.min + Math.round((v - state.options.min) / 2) * 2 : v);
+  Object.defineProperty(target.rail, "value", {
+    get: () => state.value,
+    set: (next) => {
+      state.value = snap(next);
+    },
+    configurable: true,
+  });
+  Object.defineProperty(target.rail, "callback", {
+    value: (next) => {
+      state.value = snap(next);
+    },
+    configurable: true,
+  });
+
+  const set = applyWidgetWrite(target.node, "width", 4096, { resolveSource });
+
+  assert.equal(set.normalized, true);
+  assert.equal(set.value, 4097);
+  assert.equal(sg.queuedValue(target), 4097);
+  assert.equal(sg.definition(), 4096, "the definition is untouched — it was never this write's store");
+});
+
 // ------------------------------------------- the shape with no per-instance home
 
 test("#1707: a frontend with no per-instance key keeps the old behaviour, and the reply SAYS the definition was written", () => {

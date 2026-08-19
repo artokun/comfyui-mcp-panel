@@ -1859,7 +1859,14 @@ export function applyWidgetWrite(
       actual: boundPropertyActual,
       unreadable: boundPropertyActual === UNREADABLE_PROPERTY,
     });
-  } else if (parentWidget && !matchesExpected(parentWidget.value)) {
+  } else if (parentWidget && parentWidget !== valueWidget && !matchesExpected(parentWidget.value)) {
+    // comfyui-mcp#1707 — `parentWidget !== valueWidget` because on an instance-scoped
+    // promoted write the rail IS the widget this write assigned, and the branch above
+    // has already verified it — with the #805 normalization allowance this one does not
+    // have. Checking it a second time by strict equality would fail a rail that did
+    // exactly what a numeric widget is supposed to do, reporting "did not retain" for a
+    // write that applied. Nothing is verified less: it is the same object, checked once,
+    // by the check that knows about grids.
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
       `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
