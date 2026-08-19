@@ -132,10 +132,13 @@ test("WIRING: the failure branch passes the NODE, or the route can never appear"
   // message. widget-write's failure path needs a live graph to drive, so pin it here.
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/lib/widget-write.js", import.meta.url), "utf8");
-  assert.ok(src.includes("describeNonValueBearingWidget(w, targetNode);"),
-    "the observed-revert branch must pass the node");
+  // `valueWidget`/`valueNode` are the widget the write ASSIGNED and the node that owns
+  // it (comfyui-mcp#1707) — the same pair the read-back above it just failed on. Passing
+  // the promoted INNER pair here would describe a widget this write never touched.
+  assert.ok(src.includes("describeNonValueBearingWidget(valueWidget, valueNode);"),
+    "the observed-revert branch must pass the widget that was written and its node");
   // And it must stay in the OBSERVED-failure branch — never a pre-emptive gate (#715).
-  const idx = src.indexOf("describeNonValueBearingWidget(w, targetNode);");
+  const idx = src.indexOf("describeNonValueBearingWidget(valueWidget, valueNode);");
   const before = src.slice(Math.max(0, idx - 1200), idx);
   assert.ok(before.includes("did not retain the"),
     "must remain attached to the observed-revert failure, not a preflight");
