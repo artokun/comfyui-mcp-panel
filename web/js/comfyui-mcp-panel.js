@@ -14761,15 +14761,17 @@ const GRAPH_TOOL_EXECUTORS = {
       accept.fixed_seed_nodes = repeatingRgthreeSeeds(rgthreeSeeds);
       accept.fixed_seed_note = fixedSeedNote;
     }
-    // #572/#1124 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
-    // excluded the inputs that mutate at queue time by either known mechanism —
-    // beforeQueued carriers + their linked, serialized targets (e.g. a
-    // control_after_generate seed reroll), and the seed of an ARMED rgthree Seed
-    // node, which carries no hook at all because rgthree substitutes it inside
-    // its own api.queuePrompt patch. A user edit to exactly THOSE inputs during
-    // the queue window is indistinguishable from the queue-time mutation
-    // (accepted residual), so the result names the uncovered inputs instead of
-    // implying full-graph drift proof. Every other input was covered.
+    // #572/#1124/#1331 — TRUTHFUL drift-coverage note for a scoped run: the drift
+    // hash excluded the inputs that mutate at queue time by the known
+    // mechanisms — beforeQueued carriers + their linked, serialized targets
+    // (e.g. a control_after_generate seed reroll), the seed of an ARMED
+    // rgthree Seed node (no hook: rgthree substitutes inside its own
+    // api.queuePrompt patch), leftover values of link-driven converted
+    // widgets (clip/vae/model settling after reconnect), and UE broadcast
+    // targets. A user edit to exactly THOSE inputs during the queue window
+    // is indistinguishable from the queue-time mutation (accepted residual),
+    // so the result names the uncovered inputs instead of implying full-graph
+    // drift proof. Every other input was covered.
     //
     // The note does not say WHICH mechanism excluded which input: the panel
     // knows, but the reader's question is "what was not checked", and a
@@ -14781,8 +14783,9 @@ const GRAPH_TOOL_EXECUTORS = {
         uncovered_inputs: uncovered,
         note:
           "These inputs mutate at queue time — a beforeQueued hook (e.g. a " +
-          "control_after_generate seed reroll), or an extension that rewrites the prompt in " +
-          "its own api.queuePrompt patch (an armed Seed (rgthree) node) — so they were " +
+          "control_after_generate seed reroll), an extension that rewrites the prompt in " +
+          "its own api.queuePrompt patch (an armed Seed (rgthree) node), or a leftover " +
+          "link-driven widget value settling after reconnect (clip/vae/model) — so they were " +
           "excluded from this run's graph-drift check: a user edit to exactly these inputs " +
           "during the queue window is indistinguishable from that mutation and would NOT " +
           "have been caught. Every other input was drift-covered.",
