@@ -11,6 +11,7 @@ All notable changes to this project are documented here. This project adheres to
 - `/record-skill` snapshots the open graph as a reusable skill file (`skills/<name>/SKILL.md`) so the agent can rebuild it (#350)
 
 ### Fixed
+- `panel_query_graph` (fields:'detail') no longer last-wins-collapses widgets that share a name: when a name repeats (rgthree Fast Groups toggle rows), every occurrence is listed so a duplicate or orphaned row is visible (#1402)
 - `workflow_open` no longer reports a false content mismatch on `definitions` when the frontend renumbered subgraph NODE ids during the load: the relabeling is proven (same nodes in the same order, links and promoted widgets patched through one injective map) rather than tolerated, and it still refuses when a root node promotes a widget from a node the relabeling touched (artokun/comfyui-mcp#1706)
 - a panel tab whose bridge ROUTE went stale re-advertises itself instead of waiting for a browser refresh: the 600 ms workflow poll now watches the route the orchestrator keys its tab registry on, not only the workflow-instance fence identity, so a re-hello that did not land after a switch, a first save or a rename is retried (bounded) rather than leaving every graph call addressed at a tab id nothing answers to (#1389)
 
