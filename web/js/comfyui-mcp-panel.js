@@ -861,7 +861,10 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * A run therefore carries a DEADLINE, and each bounded phase gets what is left of it
  * rather than a private allowance. Two serialized runs then cost 2 x this, and that is the
  * number sized against the read default — 18,000ms against 20,000ms — because that product
- * is what the user actually waits through.
+ * is what the user actually waits through. ONE exception, added for #1193: the combo phase
+ * has a FLOOR under its remainder (NODE_DEFS_COMBO_FLOOR_MS), so a run whose fetch spent
+ * the combo's share can exceed this budget by up to that floor. The floor pays out only
+ * when the fetch was slow but healthy — the case a pure remainder got wrong.
  *
  * WHAT THE DEADLINE DOES NOT COVER, said plainly so this is not read as a total. Two calls
  * run INSIDE the window without drawing from it: `registerNodesFromDefs` and
@@ -897,10 +900,18 @@ const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
  * COMPLETELY HEALTHY machine, reporting `combo_refresh_failed` on every refresh. That was
  * measured, not reasoned about — the unit suite passed either way.
  *
- * Second, the margin that remains is thinner than this number suggests. The fetch may use
- * its full 6000 ms share and still succeed, which would leave the combo phase 3000 ms
- * against a measured 4846 ms need. That case is #1193; it needs the combo phase to have a
- * floor rather than only a remainder, and that is a design change rather than a constant.
+ * Second, the margin that remains is thinner than this number suggests — and that case,
+ * #1193, is now handled rather than merely recorded. The fetch may use its full 6000 ms
+ * share and still succeed, which leaves a pure remainder of 3000 ms against the measured
+ * 4846 ms need and abandoned a HEALTHY combo phase: `combo_refresh_failed` on a refresh
+ * that would have completed, `nodeDefsRefreshConfirmed` stuck false (which is what reopens
+ * #610's false "model still missing"), and the loader combo the refresh was FOR still
+ * refusing the new value on the next panel_set_widget. The combo phase therefore has a
+ * FLOOR — see NODE_DEFS_COMBO_FLOOR_MS — and a run may exceed this budget by up to that
+ * floor. The alternative #1193 weighed, not waiting for the combo phase at all, was
+ * rejected: it fixes only the verdict's wording while leaving every symptom in place for
+ * the seconds the refresh actually takes — the combos are still stale when the reply
+ * lands, and the write that prompted the refresh is still refused.
  */
 const NODE_DEFS_RUN_BUDGET_MS = 9000;
 /**
@@ -911,6 +922,28 @@ const NODE_DEFS_RUN_BUDGET_MS = 9000;
  * A share, not a second constant, so the two cannot be changed into disagreement.
  */
 const NODE_DEFS_FETCH_SHARE = 2 / 3;
+
+/**
+ * #1193 — a FLOOR under the combo phase's allowance, not a share of the run.
+ *
+ * The combo phase draws what the fetch left of the run deadline, and the fetch may spend
+ * its whole share and still succeed — leaving 3000 ms for a phase measured at 4846 ms
+ * (the table above). A pure remainder abandons a HEALTHY `refreshComboInNodes()` in
+ * exactly the conditions this budget was written for — a congested or remote backend —
+ * reporting `combo_refresh_failed` over a refresh that would have completed, while the
+ * abandoned call keeps running and mutates the graph AFTER the verdict declared it stale.
+ *
+ * SIZED FROM THE MEASUREMENT, not picked: 4846 ms on a 4320-type install, so 6000 ms is
+ * the measured cost plus a quarter.
+ *
+ * THE COST, stated rather than left to be discovered in review: a run can now exceed
+ * NODE_DEFS_RUN_BUDGET_MS by up to this floor. One run's worst-case bounded waiting was
+ * 9000 ms and becomes 15,000 ms; two serialized runs — a forced refresh behind an
+ * in-flight one — were 18,000 ms against the bridge's 20s read default and become
+ * 30,000 ms, over it, in exactly the case the floor exists for. #1192 already tracks that
+ * path's arithmetic; its ratchet test in browser_tests carries the new number.
+ */
+const NODE_DEFS_COMBO_FLOOR_MS = 6000;
 //
 // #954's SCHEDULE, UNFORKED. An earlier pass here cut it to a single 200ms delay, reasoning
 // that a bound which does not cancel lets three abandoned attempts download the whole
@@ -1419,7 +1452,13 @@ async function registerComfyNodeDefs(preloadedDefs) {
         Promise.resolve()
           .then(() => a.refreshComboInNodes())
           .then(() => COMBO_OK, (err) => ({ err })),
-        nodeDefsBudgetLeft(runDeadline),
+        // #1193 — the fetch's remainder, with a FLOOR under it. A fetch that spent its
+        // whole share and still succeeded leaves 3000ms for a phase measured at 4846ms,
+        // and a pure remainder abandoned that HEALTHY call: combo_refresh_failed over a
+        // refresh that would have completed, with the abandoned call mutating the graph
+        // anyway after the verdict declared it stale. The run may exceed its budget by
+        // up to the floor; that trade is recorded at NODE_DEFS_COMBO_FLOOR_MS.
+        Math.max(nodeDefsBudgetLeft(runDeadline), NODE_DEFS_COMBO_FLOOR_MS),
         () => COMBO_NO_ANSWER,
       );
       comboRan = comboSettled === COMBO_OK;
@@ -1436,7 +1475,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
         // catch. The `?? ` that used to guard this assignment could never fire.
         thrown =
           comboSettled === COMBO_NO_ANSWER
-            ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget")
+            ? new Error("refreshComboInNodes() did not answer within this refresh's remaining budget or its floor")
             : comboSettled.err;
         // WARN HERE, because reifying the outcome took this failure off the throwing path
         // and the catch below is the only place that logged one. The browser console was
@@ -1595,8 +1634,9 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // path. Disclosure, not failure.
     //
     // Read from `defs`, which is already in hand, and NOT by re-reading widgets after
-    // `app.refreshComboInNodes()` resolves: #1193 wants to stop waiting on that call, and a
-    // disclosure that depended on it would report nothing if it were ever abandoned.
+    // `app.refreshComboInNodes()` resolves: the combo phase is bounded and can still be
+    // abandoned past its floor (#1193), and a disclosure that depended on it would report
+    // nothing in that case.
     const empties = emptyComboListsOnGraph(getGraphCtx().rootGraph, defs);
     if (empties.length) {
       verdict.empty_combo_lists = empties;

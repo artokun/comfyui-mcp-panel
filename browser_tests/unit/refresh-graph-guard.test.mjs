@@ -41,6 +41,7 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
+  NODE_DEFS_COMBO_FLOOR_MS,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -233,6 +234,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
+    "NODE_DEFS_COMBO_FLOOR_MS",
     "nodeDefsBudgetLeft",
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -276,6 +278,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
+    NODE_DEFS_COMBO_FLOOR_MS,
     nodeDefsBudgetLeft,
     monotonicNow,
     NODE_DEFS_RETRY_DELAYS_MS,

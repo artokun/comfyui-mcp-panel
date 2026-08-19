@@ -315,8 +315,8 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
   );
   assert.match(
     src,
-    /nodeDefsBudgetLeft\(runDeadline\),\s*\(\) => COMBO_NO_ANSWER/,
-    "the combo phase must draw from what the fetch phase left, not from a constant",
+    /Math\.max\(nodeDefsBudgetLeft\(runDeadline\), NODE_DEFS_COMBO_FLOOR_MS\),\s*\(\) => COMBO_NO_ANSWER/,
+    "the combo phase must draw from what the fetch phase left — with #1193's floor under it — not from a private allowance",
   );
   // A monotonic clock, like every other elapsed measurement in this panel: a wall-clock
   // jump mid-run must not hand a phase a negative or enormous remainder.
@@ -348,6 +348,21 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
   assert.ok(
     comboLeft >= 1000,
     `the combo phase is left ${Math.round(comboLeft)}ms of a ${run}ms run — too little to answer in`,
+  );
+
+  // #1193 — the FLOOR under that remainder. A fetch may spend its whole share and still
+  // succeed, leaving `comboLeft` for a phase measured at 4846ms; a pure remainder
+  // abandoned that healthy call. The floor must RAISE the worst-case remainder or it is
+  // decorative, and it must not exceed the run budget or it is a second budget, not a
+  // floor.
+  const floor = num(/const NODE_DEFS_COMBO_FLOOR_MS = (\d+);/, "the combo phase floor");
+  assert.ok(
+    floor > comboLeft,
+    `the floor (${floor}ms) must beat the remainder a full-share fetch leaves (${Math.round(comboLeft)}ms) — closing that gap is the #1193 fix`,
+  );
+  assert.ok(
+    floor <= run,
+    `the floor (${floor}ms) is a floor under one phase of a ${run}ms run, not a budget of its own`,
   );
 
   // #954's SCHEDULE, SHARED not forked — read from the retry module, never restated.
@@ -420,6 +435,7 @@ test("#1180: graph_add_node's bounds are SEQUENTIAL, and their sum is tracked (#
   };
   const single = num(/const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/, "the single-call fetch bound");
   const run = num(/const NODE_DEFS_RUN_BUDGET_MS = (\d+);/, "the refresh run budget");
+  const floor = num(/const NODE_DEFS_COMBO_FLOOR_MS = (\d+);/, "the combo phase floor");
   const registration = num(/const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = (\d+);/, "the registration deadline");
 
   // Two paths, and the branch that skips the fast path is the expensive one.
@@ -428,10 +444,15 @@ test("#1180: graph_add_node's bounds are SEQUENTIAL, and their sum is tracked (#
   // the whole-schema fetch — they compose rather than exclude each other, because a
   // timeout is doubt and doubt takes the full fetch. No refresh: the type is registered.
   const registeredPath = single + single + registration;
+  // A run's worst-case WAITING is its budget plus the combo floor: #1193 lets a run
+  // exceed NODE_DEFS_RUN_BUDGET_MS by up to the floor when a slow-but-successful fetch
+  // spent the combo's remainder. That is the accepted cost of the floor, and it is
+  // counted here so this sum stays honest rather than reassuring.
+  const runWait = run + floor;
   // NOT REGISTERED: no fast path (it is gated on already-registered), then the whole-schema
   // fetch, then the resolver hands the payload to refreshComfyNodeDefs — which waits for
   // any in-flight run and then performs its own, so the run budget is paid twice.
-  const unregisteredPath = single + run + run + registration;
+  const unregisteredPath = single + runWait + runWait + registration;
   const worstCase = Math.max(registeredPath, unregisteredPath);
 
   // The widen is INSIDE the registration wait, not added to it — that is what its divisor
@@ -445,11 +466,14 @@ test("#1180: graph_add_node's bounds are SEQUENTIAL, and their sum is tracked (#
   );
   assert.ok(widen < registration, "the widen is spent inside the registration wait, not alongside it");
 
-  // The known ceiling while #1192 is open. Not a target — a ratchet.
-  const TRACKED_CEILING_MS = 33000;
+  // The known ceiling while #1192 is open. Not a target — a ratchet. Raised from
+  // 33000 to 45000 by #1193's combo floor: two serialized runs can now cost
+  // 2 x (budget + floor) in the case the floor exists for, and the issue records that
+  // trade explicitly.
+  const TRACKED_CEILING_MS = 45000;
   assert.ok(
     worstCase <= TRACKED_CEILING_MS,
-    `one add's serialized bounds now sum to ${worstCase}ms, above the ${TRACKED_CEILING_MS}ms recorded in #1192 — ` +
+    `one add's serialized bounds now sum to ${worstCase}ms, above the ${TRACKED_CEILING_MS}ms tracked while #1192 is open — ` +
       "raising a bound on this path makes an already-over-budget command worse",
   );
   // …and the fact that it is over budget is stated, so nobody reads the pass above as fine.
