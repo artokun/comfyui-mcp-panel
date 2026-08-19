@@ -139,6 +139,90 @@ function brandGateRefusal(refusal) {
   return refusal;
 }
 
+/** ComfyUI's WebSocket OPEN readyState. Inlined so Node tests need no DOM WebSocket. */
+export const WS_OPEN = 1;
+
+/**
+ * #1325 — is the backend socket actually down RIGHT NOW?
+ *
+ * The sticky `comfyBackendSocketDown` flag is necessary: ComfyUI announces a drop
+ * as events, and a mutation in that gap is the #646 applied-then-wiped hazard.
+ * It is not sufficient. ComfyUI also dispatches `status` with a null payload from
+ * `_pollQueue` whenever `GET /prompt` fails, and that poller — once started —
+ * runs for the life of the tab. A long GPU-bound render (Wan 2.2 dual-pass)
+ * blocks the backend event loop, the poll fails, the flag arms, and `reconnected`
+ * never fires again because the websocket never left OPEN. Graph reads keep
+ * working (they read the local canvas); mutations stay refused forever.
+ *
+ * The live readyState is the fact a restore-is-incoming decision can rest on:
+ * OPEN means no canvas rebuild is in flight. Flagged-down + OPEN is a stale or
+ * busy-poll signal, not a down socket.
+ *
+ * An omitted/unknown readyState + flaggedDown still refuses — fail closed when
+ * we cannot see the socket, which is the #646 direction.
+ */
+export function backendSocketIsDown({ flaggedDown = false, socketReadyState } = {}) {
+  if (flaggedDown !== true) return false;
+  if (socketReadyState === WS_OPEN) return false;
+  return true;
+}
+
+/**
+ * #1325 — classify a ComfyUI `status` event for the mutation-guard flag.
+ *
+ *   - "alive"  — a real queue/status payload; the backend is talking
+ *   - "lost"   — null payload AND the socket is not OPEN (the close-handler signal)
+ *   - "ignore" — null payload while the socket is still OPEN (busy `/prompt` poll)
+ */
+export function classifyBackendStatusEvent({ detail, socketReadyState } = {}) {
+  if (detail != null && typeof detail === "object") return "alive";
+  if (detail == null) {
+    return socketReadyState === WS_OPEN ? "ignore" : "lost";
+  }
+  return "ignore";
+}
+
+const BACKEND_SOCKET_DOWN_NOTE =
+  "ComfyUI's backend connection is down (a restart or reconnect is in progress). " +
+  "The canvas is still readable from local state, but graph mutations are refused " +
+  "until the backend reconnects. Wait a few seconds and retry; if it never comes " +
+  "back, reload the ComfyUI page or restart ComfyUI.";
+
+/**
+ * #1325 — binding-status view of the backend socket.
+ *
+ * Canvas binding ("bound") is a different question (who owns this graph). A
+ * reply that reports only `bound`/`already_current` while mutations are gated
+ * is the #1325 misread: the agent retries the wrong recovery. When the socket
+ * is down, `graph_binding` is "reconnecting" and `canvas_binding` still names
+ * the canvas identity so the two facts stay distinguishable.
+ */
+export function describeGraphMutationReadiness({
+  flaggedDown = false,
+  socketReadyState,
+  canvasBinding,
+} = {}) {
+  const down = backendSocketIsDown({ flaggedDown, socketReadyState });
+  const canvas =
+    canvasBinding === "bound" || canvasBinding === "foreign" || canvasBinding === "unknown"
+      ? canvasBinding
+      : null;
+  if (down) {
+    return {
+      backend_socket: "reconnecting",
+      mutations_ready: false,
+      graph_binding: "reconnecting",
+      ...(canvas ? { canvas_binding: canvas } : {}),
+      backend_socket_note: BACKEND_SOCKET_DOWN_NOTE,
+    };
+  }
+  return {
+    backend_socket: "up",
+    mutations_ready: true,
+    ...(canvas ? { canvas_binding: canvas, graph_binding: canvas } : {}),
+  };
+}
+
 export function graphMutationReconnectGate({ cmd, backendDown = false, bindingSettleWindow = false } = {}) {
   const name = typeof cmd === "string" && cmd ? `"${cmd}"` : "this graph command";
   /** Every refusal from this gate shares these — see the docblock. */

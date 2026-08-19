@@ -266,6 +266,9 @@ import {
   graphMutationReconnectGate,
   reconnectRefusalError,
   readReconnectRefusal,
+  backendSocketIsDown,
+  classifyBackendStatusEvent,
+  describeGraphMutationReadiness,
 } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
@@ -753,7 +756,36 @@ let postReconnectWatchToken = 0;
 // "reconnected" events (a null "status" payload is the same lost-connection
 // signal). A graph mutation dispatched in that gap can be applied and then wiped
 // by the incoming restore — so mutations are refused while this holds.
+//
+// #1325: the flag is a SIGNAL, not the live fact. ComfyUI also dispatches
+// `status` with a null payload from `_pollQueue` when `GET /prompt` fails, and
+// a long GPU-bound render (Wan) makes that poll fail without the websocket
+// ever leaving OPEN. `comfyBackendIsDown()` is the predicate the gate and
+// binding replies consult: flagged-down + OPEN socket is a stale/busy-poll
+// signal, not a restore-is-incoming window.
 let comfyBackendSocketDown = false;
+function comfyBackendSocketReadyState() {
+  const state = api?.socket?.readyState;
+  return typeof state === "number" ? state : undefined;
+}
+function comfyBackendIsDown() {
+  return backendSocketIsDown({
+    flaggedDown: comfyBackendSocketDown,
+    socketReadyState: comfyBackendSocketReadyState(),
+  });
+}
+function noteComfyBackendAlive() {
+  if (!comfyBackendSocketDown) return;
+  comfyBackendSocketDown = false;
+  comfyBackendOutage.noteUp();
+}
+function backendSocketReplyFields(wf) {
+  return describeGraphMutationReadiness({
+    flaggedDown: comfyBackendSocketDown,
+    socketReadyState: comfyBackendSocketReadyState(),
+    canvasBinding: wf ? describeLiveCanvasBinding(wf) : undefined,
+  });
+}
 // #654 — the ComfyUI BACKEND outage clock. The elapsed interval is the only
 // thing that separates a real restart from a benign WS blip (asset view, image
 // check, tab refocus), and `reconnected` fires for both.
@@ -1772,6 +1804,17 @@ function setupListeners() {
     });
     api.addEventListener("execution_start", () => {
       lastExecFailure = null;
+      // #1325 — a live execution frame is proof the backend socket is delivering.
+      noteComfyBackendAlive();
+    });
+    api.addEventListener("execution_success", () => {
+      noteComfyBackendAlive();
+    });
+    api.addEventListener("executed", () => {
+      noteComfyBackendAlive();
+    });
+    api.addEventListener("progress", () => {
+      noteComfyBackendAlive();
     });
     // While the backend socket is down, distrust the combos (they may be about
     // to change) so a stale combo can't suppress a genuine miss (finding #4).
@@ -1786,7 +1829,20 @@ function setupListeners() {
     });
     api.addEventListener("status", (ev) => {
       // A null status payload is ComfyUI's "backend connection lost" signal.
-      if (ev?.detail == null) {
+      // #1325 — except when the live socket is still OPEN: `_pollQueue` dispatches
+      // the same null on a failed /prompt while a long render is blocking the
+      // backend, which is a busy server, not a drop. A real queue payload is
+      // the backend talking, so it also CLEARS a stale flag (`reconnected` can
+      // miss if the socket never left OPEN).
+      const statusKind = classifyBackendStatusEvent({
+        detail: ev?.detail,
+        socketReadyState: comfyBackendSocketReadyState(),
+      });
+      if (statusKind === "alive") {
+        noteComfyBackendAlive();
+        return;
+      }
+      if (ev?.detail == null && statusKind === "lost") {
         nodeDefsRefreshConfirmed = false;
         comfyBackendSocketDown = true;
         // #654 — and it is a down signal in its own right: some frontends
@@ -10290,7 +10346,7 @@ function revalidateGraphMutationContext(captured) {
   // Nothing has been written to the graph yet, so the claim is true here.
   const reconnectGate = graphMutationReconnectGate({
     cmd: "graph_add_node",
-    backendDown: comfyBackendSocketDown,
+    backendDown: comfyBackendIsDown(),
     bindingSettleWindow: postReconnectBindingSettleWindow(),
   });
   if (reconnectGate) throw reconnectRefusalError(reconnectGate);
@@ -11041,6 +11097,11 @@ const GRAPH_TOOL_EXECUTORS = {
       group_count: groups.length,
       viewing: describeActiveGraph(graph),
       outline,
+      // #1325 — canvas readability is not backend readiness. A Wan render can
+      // leave the sticky down-flag armed while this read still works from the
+      // local graph; publish the live socket so the caller does not treat
+      // "outline succeeded" as "mutations will too".
+      ...backendSocketReplyFields(activeWorkflowRef()),
       // #809: the budget, the rung, and WHY — a caller that reads fields rather than
       // prose must still learn that detail was traded away and which lever restores it.
       max_chars: maxChars,
@@ -13351,7 +13412,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // looking in the wrong place (#982).
         const fallback = objectInfoSnapshot.authorize({
           epoch: backendReconnectEpoch,
-          socketDown: comfyBackendSocketDown,
+          socketDown: comfyBackendIsDown(),
           outcomes: outcome?.outcomes,
         });
         if (fallback.defs) {
@@ -15505,6 +15566,10 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
+      // #1325 — canvas binding ("bound") is not backend readiness. A sticky
+      // reconnect flag after a long render used to leave mutations refused
+      // while this list still reported a healthy bound tab.
+      ...backendSocketReplyFields(active),
     };
   },
 
@@ -16843,6 +16908,10 @@ const GRAPH_TOOL_EXECUTORS = {
       opened: { path: target.path, filename: target.filename },
       routing_key: targetRoutingKeyAtReply,
       ...openActiveBinding,
+      // #1325 — `panel_set_workflow_target({mode:"current"})` lands here and
+      // used to report bound/already_current while mutations stayed refused.
+      // Canvas identity and backend socket are different facts.
+      ...backendSocketReplyFields(target),
       ...(activeWorkflowUuid ? { workflow_uuid: activeWorkflowUuid } : {}),
       // #1001 — present only when the repaint was NOT byte-identical: the node set and
       // every value came through, and the frontend rewrote its own geometry. Disclosed
@@ -21370,7 +21439,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               if (graphCommandMayMutateWorkflow(msg.cmd)) {
                 const reconnectGate = graphMutationReconnectGate({
                   cmd: msg.cmd,
-                  backendDown: comfyBackendSocketDown,
+                  backendDown: comfyBackendIsDown(),
                   bindingSettleWindow: postReconnectBindingSettleWindow(),
                 });
                 if (reconnectGate) throw reconnectRefusalError(reconnectGate);
@@ -36643,7 +36712,7 @@ async function healStaleBundleIfNeeded() {
     // socket is down, so none can be orphaned in flight here; defer instead,
     // and UN-ARM the marker — this attempt never navigated, so the reconnect
     // that follows the backend coming back must be allowed to retry the heal.
-    if (comfyBackendSocketDown) {
+    if (comfyBackendIsDown()) {
       ssSet(BUNDLE_HEAL_KEY, null);
       console.warn(
         `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +

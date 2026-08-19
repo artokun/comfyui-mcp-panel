@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- graph mutations no longer stay stuck in `[backend-reconnecting]` after a long Wan render: a busy `/prompt` poll is not a down socket, and binding status now distinguishes a readable canvas from a backend that is actually reconnecting (#1325)
 - dictation listens for the spoken language when the panel UI is the English catalog floor — a German (or other unshipped) speaker no longer gets an English recognizer (#1329)
 - panel_set_widget can author an LTXDirector timeline from the serialized widgets when the live timeline editor is not initialized (#1308)
 - live-sync no longer reports notified unless the active canvas actually holds the saved workflow (#1299)
