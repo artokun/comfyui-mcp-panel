@@ -466,6 +466,45 @@ test("#1180: the widen's bound fits INSIDE the registration deadline it runs und
   );
 });
 
+/**
+ * #1385 — every argument list `name(` is called with in `src`, one entry per CALL SITE.
+ *
+ * A single regex over a function body cannot do this job: it answers "is this written
+ * SOMEWHERE in here", and a body with two call sites keeps answering yes after one of them
+ * is unwired. Returning the sites separately is what lets each be asserted on its own, and
+ * what makes a THIRD site — the shape of defect that keeps recurring here — visible the day
+ * it is written rather than the day it breaks.
+ *
+ * A balanced-paren scan rather than a regex because the calls span lines and nest parens
+ * (`budget.remaining()`). Quoted text is skipped so a paren inside a string cannot mis-slice
+ * a call; the scan throws rather than guessing if the parens do not balance.
+ */
+function callArgumentLists(src, name) {
+  const opener = `${name}(`;
+  const lists = [];
+  for (let at = src.indexOf(opener); at >= 0; at = src.indexOf(opener, at + 1)) {
+    // `foo.refreshComfyNodeDefs(` / `myRefreshComfyNodeDefs(` are different functions.
+    if (/[A-Za-z0-9_$.]/.test(src[at - 1] ?? "")) continue;
+    let depth = 0;
+    let quote = null;
+    let i = at + opener.length - 1;
+    for (; i < src.length; i++) {
+      const ch = src[i];
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+      else if (ch === "(") depth++;
+      else if (ch === ")" && --depth === 0) break;
+    }
+    assert.ok(depth === 0 && i < src.length, `unbalanced parentheses after ${opener}`);
+    lists.push(src.slice(at + opener.length, i));
+  }
+  return lists;
+}
+
 test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   // The predecessor of this test asserted the OPPOSITE — that this path exceeds the budget —
   // and said so in its own failure message: "If that is genuinely fixed, close #1192 and
@@ -582,7 +621,9 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
       "the single-class fast path",
     ],
     [/await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/, "the whole-schema fetch"],
-    [/joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS/, "the coalescer join"],
+    // The fifth wait — the coalescer join — is NOT a row here. #1385: it has two call sites,
+    // so a body-wide match is satisfied by whichever one is left. It is pinned per call site
+    // below instead.
     [/budget\.bounded\(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS\)/, "the custom-widget registration wait"],
   ];
   for (const [re, what] of wired) {
@@ -606,6 +647,41 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
       `${name} appears ${total} time(s) in graph_add_node but only ${capped} are capped by the command budget`,
     );
   }
+
+  // ── THE FIFTH WAIT: EVERY coalescer call, not "one of them somewhere" ─────────
+  //
+  // #1385 — this used to be one more row in `wired`, a single `assert.match` for
+  // `joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS` anywhere in the body.
+  // There are TWO calls carrying it — the resolver's join and #1242's forced drift recovery —
+  // so unwrapping either left the other satisfying the regex and the pin passed over a
+  // half-unwired file. Verified by mutation in BOTH directions on the shipped source: with
+  // one call's `joinMs` deleted this test still passed in ~2s, either way round.
+  //
+  // That is the worst wait in this command to lose quietly. Its absence does not fail a
+  // test, it HANGS — deleting the resolver's `joinMs` left add-node-command-budget.test.mjs
+  // running until an external cap killed it, and `npm run test:unit` passes no
+  // --test-timeout, so node:test buffered the whole file's output and printed nothing at
+  // all. A named assertion here is what turns that into a sentence.
+  //
+  // ENUMERATED, not counted: "there are 2" goes stale the moment a third call site is
+  // written unbounded, which is this same defect in a new place. Every call the body makes
+  // must carry the bound, however many there turn out to be.
+  const coalescerCalls = callArgumentLists(stripped, "refreshComfyNodeDefs");
+  assert.ok(
+    coalescerCalls.length >= 2,
+    `graph_add_node should still make both coalescer calls (the resolver's join and #1242's ` +
+      `forced drift recovery); found ${coalescerCalls.length} — if one was deliberately ` +
+      "removed, say which here rather than lowering the floor",
+  );
+  coalescerCalls.forEach((args, i) => {
+    assert.match(
+      args,
+      /joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS/,
+      `refreshComfyNodeDefs call ${i + 1} of ${coalescerCalls.length} in graph_add_node does ` +
+        "not draw its join bound from the command budget — unbounded, that call waits out a " +
+        `run started under someone else's deadline. Its arguments: ${args.trim()}`,
+    );
+  });
 
   // The reserve is DERIVED from the step it protects, not picked, so the two cannot drift.
   assert.match(
