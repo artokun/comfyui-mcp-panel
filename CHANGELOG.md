@@ -6,8 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.13] - 2026-08-19
+
 ### Fixed
 - `panel_get_errors` no longer joins a previous workflow's runtime failure onto a current node that only shares the same id — correlation now requires matching node type as well (#1448)
+
+### Fixed
+- panel_get_errors no longer attaches a stale execution error to a reused node id (#1451)
+
 
 ## [0.15.12] - 2026-08-19
 
