@@ -754,6 +754,45 @@ test("#1193 a combo the sweep CANNOT rebuild is counted, and withdraws the claim
   assert.deepEqual(dynamic.widgets[0].options.values, ["png", "exr"], "and it is left alone, not half-rebuilt");
 });
 
+test("#1193 a combo the SPEC does not announce is still caught by the live widget", () => {
+  // The forward-compatible arm of the skip test, and the only one with no example on the
+  // installs sampled for this fix — every unrebuildable shape there (remote V2, dynamic
+  // V3) says COMBO in its type string. That is exactly why it is pinned: the arm exists
+  // for the shape published AFTER this was written, and a shape nobody has seen yet cannot
+  // be relied on to name itself. Deleting it is invisible to every other test here.
+  //
+  // The failure it prevents is the silent one: a widget presenting a stale option list,
+  // walked past, and the graph then reported as covered.
+  const node = {
+    id: 1,
+    type: "SomePack.FutureLoader",
+    widgets: [{ name: "model_name", value: "deleted.safetensors", options: { values: ["deleted.safetensors"] } }],
+    constructor: {},
+  };
+  const stats = {};
+  reapplyDefsToLiveNodes(
+    graphOf([node]),
+    { "SomePack.FutureLoader": { input: { required: { model_name: ["MODEL_NAME_V4", { options_url: "/x" }] } } } },
+    stats,
+  );
+  assert.equal(stats.combosSkipped, 1, "a live widget presenting an option array is a combo, whatever the spec calls itself");
+  assert.equal(comboRebuildCovered(stats), false);
+  assert.deepEqual(node.widgets[0].options.values, ["deleted.safetensors"], "and it is left alone rather than guessed at");
+
+  // …while a genuine non-combo input is NOT a skip: an INT widget carries min/max/step and
+  // no values array, and counting it would withdraw the claim on every graph in existence.
+  const plain = {
+    id: 2,
+    type: "KSampler",
+    widgets: [{ name: "steps", value: 20, options: { min: 1, max: 100 } }],
+    constructor: {},
+  };
+  const plainStats = {};
+  reapplyDefsToLiveNodes(graphOf([plain]), { KSampler: { input: { required: { steps: ["INT", { default: 20 }] } } } }, plainStats);
+  assert.equal(plainStats.combosSkipped ?? 0, 0);
+  assert.equal(comboRebuildCovered(plainStats), true);
+});
+
 test("#1193 a function-valued option source is NOT a skip", () => {
   // It derives its own list and `assetCandidateResolvesLive` INVOKES it, so it is never
   // stale for want of a rebuild. Counting it would withdraw the claim on every graph that
@@ -814,6 +853,17 @@ test("#1193 the sweep REPORTS what it rebuilt, and only claims completion after 
   // No stats object at all is still supported — the argument is optional and every other
   // caller passes two arguments.
   assert.doesNotThrow(() => reapplyDefsToLiveNodes(good, { CheckpointLoaderSimple: CKPT_DEF(["a.safetensors"]) }));
+
+  // #1193 — NO PAYLOAD is not a completed sweep. The panel's only call site sits inside
+  // `if (defs)`, so this early return is unreachable from production today; it is pinned
+  // anyway because that is a property of the CALL SITE, one refactor from changing, and
+  // the failure it would cause is the silent one: `completed` claimed over a graph the
+  // sweep never looked at. A mutation setting the flag above this return survived the
+  // gate's run for exactly that reason.
+  const noDefs = {};
+  reapplyDefsToLiveNodes(good, null, noDefs);
+  assert.notEqual(noDefs.completed, true, "a sweep with no payload has not covered anything");
+  assert.equal(comboRebuildCovered(noDefs), false);
 });
 
 test("reapplyDefsToLiveNodes stamps fresh nodeData onto a type-specific constructor", () => {
