@@ -32418,6 +32418,21 @@ function buildPanel() {
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
+    // comfyui-mcp#1739 — a run re-pended by markUndelivered (the completion frame's
+    // sendFrame failed: bridge/socket churn, e.g. around a workflow-tab switch
+    // re-hello) re-enters a ledger that may have NO sweeper left: flush() retired
+    // the run OPTIMISTICALLY, and a safety-sweep tick landing in that async
+    // compose+send window saw an empty ledger and self-disarmed. Without a re-arm
+    // here the run sits pending until a real `reconnected` edge or the next queue —
+    // possibly forever — while /history already holds its outputs: exactly the
+    // reported "successful run, no completion event, manual get_history recovery".
+    // Re-arming on every re-pend closes the hole; arm() is single-flight, so a
+    // redundant kick is a no-op.
+    onRepend: () => {
+      try {
+        armRunReconcileSweepRef?.();
+      } catch {}
+    },
     // #986 — a suppressed duplicate is not silently dropped. It is a canvas re-queue
     // whose output was already announced and which plainly did not render (a
     // sub-second "render" of a clip that took minutes the first time), so the agent

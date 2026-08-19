@@ -742,3 +742,77 @@ test("#986 (codex r3): a later `executing` must NOT upgrade a FABRICATED start t
   assert.equal(h.flushes.length, 2, "a real render is delivered even when its duration looks tiny");
   assert.equal(h.flushes[1].looksCached, false, "an INVENTED duration is never called a cache hit");
 });
+
+// ---------------------------------------------------------------------------
+// comfyui-mcp#1739 — a successful panel run whose completion frame FAILED to
+// send (bridge/socket churn around a workflow-tab switch re-hello) is re-pended
+// by markUndelivered. But flush() retires runs OPTIMISTICALLY, so a safety-sweep
+// tick in the async compose+send window sees an empty ledger and self-disarms —
+// leaving the re-pended run in a ledger NOTHING sweeps until a real reconnect
+// edge or the next queue (possibly never). The tracker now notifies the wiring
+// (onRepend) on every re-pend so it can re-arm the sweep.
+// ---------------------------------------------------------------------------
+
+test("#1739: markUndelivered re-pend fires onRepend so recovery can be re-armed", () => {
+  const repends = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: () => {},
+    onRepend: (id) => repends.push(id),
+    // No-op scheduler: markDelivered schedules a fence-prune timer, and a REAL
+    // one would hold the node process open for the whole fence TTL.
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.markUndelivered("prompt-x");
+  assert.deepEqual(repends, ["prompt-x"], "the re-pend is announced with the run's id");
+  assert.ok(tracker.hasPending(), "the run is genuinely back in the pending ledger");
+});
+
+test("#1739: a null id re-pends nothing and must NOT fire onRepend", () => {
+  const repends = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: () => {},
+    onRepend: (id) => repends.push(id),
+    // No-op scheduler: markDelivered schedules a fence-prune timer, and a REAL
+    // one would hold the node process open for the whole fence TTL.
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.markUndelivered(null);
+  assert.equal(repends.length, 0);
+  assert.equal(tracker.hasPending(), false);
+});
+
+test("#1739: markDelivered is a confirmation, not a re-pend — it never fires onRepend", () => {
+  const repends = [];
+  const tracker = createRunCompletionTracker({
+    onFlush: () => {},
+    onRepend: (id) => repends.push(id),
+    // No-op scheduler: markDelivered schedules a fence-prune timer, and a REAL
+    // one would hold the node process open for the whole fence TTL.
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.markDelivered("prompt-x");
+  assert.equal(repends.length, 0);
+});
+
+test("#1739 wiring: the panel re-arms the run-reconcile sweep on every re-pend", () => {
+  // Behavioral tests above inject onRepend by hand; this pins the REAL call
+  // site's wiring by source inspection — the established pattern for the giant
+  // module (cf. the #609 wiring test above).
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const start = src.indexOf("createRunCompletionTracker({");
+  assert.notEqual(start, -1, "could not locate the createRunCompletionTracker call site");
+  const end = src.indexOf("onFlush:", start);
+  assert.notEqual(end, -1, "could not locate the onFlush option after the call site");
+  const head = src.slice(start, end);
+  assert.match(
+    head,
+    /onRepend:\s*\(\)\s*=>\s*\{[\s\S]*armRunReconcileSweepRef\?\.\(\)/,
+    "a re-pended run must re-arm the safety sweep, or its completion can be lost forever",
+  );
+});
