@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- entering a copied subgraph, editing its inner graph, and exiting no longer clears promoted widget values on the parent instances (artokun/comfyui-mcp#1827)
+
 ## [0.15.14] - 2026-08-19
 
 ### Added
