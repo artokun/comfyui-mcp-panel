@@ -150,6 +150,11 @@ export function holdsStolenExecutionPreview(owners, node, stores) {
  * `node.imgs` is rendered from it, so array identity decides whether what is on screen
  * came from the stolen entry. If it did not, the entry is merely leftover in the store
  * and dropping it is the whole job.
+ *
+ * Scoped to `nodeOutputs` on purpose. The evidence is an entry in THAT store, and says
+ * nothing about `nodePreviewImages` — a node sitting on a reused id may still be running
+ * and painting its own live `b_preview` latent frames, which are not this entry's to
+ * evict. `node.preview` is left for the same reason; the next latent frame repaints it.
  */
 function evictInheritedExecutionPreview(node, stores, record) {
   const rendered =
@@ -161,15 +166,18 @@ function evictInheritedExecutionPreview(node, stores, record) {
       changed = true;
     }
     node.images = undefined;
-    if (node.preview != null) {
-      node.preview = undefined;
-      changed = true;
-    }
     if (removePreviewWidget(node)) changed = true;
     changed = true;
     restoreCompactSize(node);
   }
-  if (clearStoredExecutionOutputs(stores, node.id)) changed = true;
+  const outputs = stores?.nodeOutputs;
+  if (outputs) {
+    for (const key of outputStoreKeys(node.id)) {
+      if (!Object.prototype.hasOwnProperty.call(outputs, key)) continue;
+      delete outputs[key];
+      changed = true;
+    }
+  }
   return changed;
 }
 

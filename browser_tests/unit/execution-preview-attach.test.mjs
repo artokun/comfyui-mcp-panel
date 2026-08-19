@@ -473,11 +473,34 @@ test("#1374: a LoadImage on a reused id keeps the thumbnail it hydrated itself",
   assert.deepEqual(loader.size, [315, 314], "the node must not collapse");
 });
 
+test("#1374: eviction does not take a live b_preview frame with it", () => {
+  const owners = new Map();
+  const { entry, nodeOutputs } = runOneEmission(9, owners);
+
+  // The proof is an entry in nodeOutputs. A node that inherits the id may still be
+  // RUNNING and painting its own latent frames into nodePreviewImages — those are not
+  // this entry's to evict, and deleting them would drop a frame mid-run.
+  const victim = imageCapableNode("VAEDecode", 9, entry);
+  const live = ["data:image/png;base64,AAAA"];
+  const nodePreviewImages = { "9": live };
+  const { stripped } = stripMisattachedExecutionPreviews({
+    graph: { _nodes: [victim] },
+    nodeOutputs,
+    nodePreviewImages,
+    owners,
+  });
+
+  assert.equal(stripped, 1);
+  assert.equal(nodeOutputs["9"], undefined, "the inherited entry goes");
+  assert.equal(nodePreviewImages["9"], live, "the live latent frame stays");
+});
+
 test("#1374: an entry written after the executed sweep is still attributed", () => {
-  // ComfyUI registers its own `executed` listener during app.setup(), before extension
-  // setup, so the panel's sweep can run with the store not yet written. The record is
-  // seeded there and caught up by the execution_success sweep — without that refresh
-  // the emitter's real entry is never attributed and the id can be stolen silently.
+  // The panel's sweep can reach the store before ComfyUI's own `executed` handling has
+  // written it — listener order is not something this module gets to assume. The record
+  // is seeded on the executed sweep and caught up by the execution_success one; without
+  // that refresh the emitter's real entry is never attributed and the id can be stolen
+  // silently.
   const owners = new Map();
   const save = saveImageNode(9);
   const nodeOutputs = {};
