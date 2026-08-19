@@ -62,6 +62,12 @@ export const ADD_NODE_COMMAND_BUDGET_MS = readPanelNumber(
   "the add_node command budget",
 );
 
+/** #1404 — the whole-command deadline `refresh_nodes` hands the coalescer as `joinMs`. */
+export const REFRESH_NODES_COMMAND_BUDGET_MS = readPanelNumber(
+  /const REFRESH_NODES_COMMAND_BUDGET_MS = (\d+);/,
+  "the refresh_nodes command budget",
+);
+
 export const NODE_DEFS_FETCH_TIMEOUT_MS = readPanelNumber(
   /const NODE_DEFS_FETCH_TIMEOUT_MS = (\d+);/,
   "the single-call fetch bound",
