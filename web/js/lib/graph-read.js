@@ -13,6 +13,11 @@
 //          the whole max_chars budget, returning `shown:0` for a node you asked for
 //          by id. capSummaryWidgets() bounds each value; isLineProtected() keeps the
 //          FIRST match and any explicitly-requested id renderable regardless.
+//   #342 — a link record's `target_slot` goes stale when the target node's inputs
+//          are compacted (dynamic-combo rebuild, removed ref_video_N input).
+//          liveLinkTargetInput() resolves the LIVE slot through the target's own
+//          inputs[].link backlink so the outline never renders an orphaned link
+//          against a slot it no longer feeds.
 
 /** Per-widget-value character cap for the `detail` projection (#609). Big enough
  *  to identify a value, small enough that one blob can't starve a whole query. */
@@ -57,6 +62,42 @@ export function linkDrivenWidgets(node) {
     out[inp.name] = { node_id: originId, output_slot: originSlot ?? 0 };
   }
   return out;
+}
+
+/**
+ * #342: the LIVE input slot a link actually lands on, resolved through the target
+ * node's OWN `inputs[].link` backlink — never through the link record's
+ * `target_slot`.
+ *
+ * `target_slot` is captured at connect time and goes STALE when the target's inputs
+ * are compacted afterwards — a dynamic combo (COMFY_DYNAMICCOMBO_V3) rebuilding its
+ * slots on a selection change, or a removed ref_video_N input shifting the tail.
+ * Rendering the stale index reports connectivity against whatever slot now OCCUPIES
+ * it: panel_graph_outline showed `VAEDecode → node.output_mode.save_metadata` (a
+ * BOOLEAN slot) while panel_query_graph, which reads the live backlink, correctly
+ * showed the link was gone. The backlink is also what the prompt serializer walks,
+ * so it is the one source of truth for "is this actually connected".
+ *
+ * Returns `{ index, name }` for the input that backlinks `linkId`, or null when NO
+ * input does — an ORPHANED link record whose slot was removed. The caller must
+ * render NOTHING for an orphaned link: showing it against a slot it no longer feeds
+ * fabricates connectivity that does not execute.
+ *
+ * Call only when `Array.isArray(targetNode.inputs)`; without a live inputs list
+ * there is nothing to verify against and the caller falls back to the recorded
+ * `target_slot` (rendered as a bare index, exactly as before).
+ */
+export function liveLinkTargetInput(targetNode, linkId) {
+  const inputs = targetNode?.inputs ?? [];
+  for (let i = 0; i < inputs.length; i++) {
+    const inp = inputs[i];
+    // `!= null` first: Number(null) is 0, and a real link id of 0 must not match an
+    // input that has NO link.
+    if (inp && inp.link != null && Number(inp.link) === Number(linkId)) {
+      return { index: i, name: inp.name };
+    }
+  }
+  return null;
 }
 
 /** Restrict a full link-driven map to only the names that are actually WIDGETS on

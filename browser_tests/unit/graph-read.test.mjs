@@ -5,6 +5,9 @@
 //          stored value as if it were the value that executes.
 //   #609 — one oversized widget blob (or several nodes) must not blow the whole
 //          max_chars budget and return shown:0 for a node asked for by id.
+//   #342 — a link's recorded target_slot goes stale when the target's inputs are
+//          compacted; the outline must resolve the LIVE backlink and render
+//          NOTHING for an orphaned link.
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -14,6 +17,7 @@ import {
   linkDrivenWidgets,
   drivenWidgetsFor,
   drivenTag,
+  liveLinkTargetInput,
   capWidgetValue,
   capSummaryWidgets,
   clipLine,
@@ -545,4 +549,79 @@ test("#1634 clipCompactValue honours a raised cap for a pinpoint read", () => {
   const pinpoint = clipCompactValue(prompt, WIDGET_VALUE_CAP);
   assert.equal(pinpoint.clipped, false);
   assert.equal(pinpoint.text, prompt);
+});
+
+// ---- #342: live target-slot resolution for the outline ---------------------
+
+// The #342 shape: `easy saveVideo` after `input_mode` (COMFY_DYNAMICCOMBO_V3)
+// collapsed — link 7's recorded target_slot (2, the old `input_mode.images`) is
+// stale, and slot 2 is now occupied by the BOOLEAN `output_mode.save_metadata`.
+// The live truth: NO input backlinks link 7 — the connection is gone.
+function saveVideoAfterComboCollapse() {
+  return {
+    id: 12,
+    type: "easy saveVideo",
+    inputs: [
+      { name: "input_mode", type: "COMBO", link: null },
+      { name: "output_mode.save_metadata", type: "BOOLEAN", link: null },
+      { name: "output_mode", type: "COMBO", link: null },
+      { name: "filename_prefix", type: "STRING", link: null },
+    ],
+  };
+}
+
+test("liveLinkTargetInput returns null for an orphaned link (slot removed) (#342)", () => {
+  // The orphaned record must render NOTHING — the old render showed it against
+  // save_metadata, fabricating a connection the graph no longer has.
+  assert.equal(liveLinkTargetInput(saveVideoAfterComboCollapse(), 7), null);
+});
+
+test("liveLinkTargetInput finds the live slot AFTER compaction shifted it (#342)", () => {
+  // A removed ref_video_0 input compacted the tail: link 9 was recorded against
+  // slot 3 but the input that still backlinks it now sits at index 2.
+  const node = {
+    id: 5,
+    inputs: [
+      { name: "image", type: "IMAGE", link: null },
+      { name: "ref_video_1", type: "VIDEO", link: 9 },
+      { name: "fps", type: "FLOAT", link: null },
+    ],
+  };
+  assert.deepEqual(liveLinkTargetInput(node, 9), { index: 1, name: "ref_video_1" });
+});
+
+test("liveLinkTargetInput resolves the ordinary uncompacted case (#342)", () => {
+  const node = {
+    id: 3,
+    inputs: [
+      { name: "model", type: "MODEL", link: 4 },
+      { name: "clip", type: "CLIP", link: null },
+    ],
+  };
+  assert.deepEqual(liveLinkTargetInput(node, 4), { index: 0, name: "model" });
+});
+
+test("liveLinkTargetInput keeps the index when the live input has no name (#342)", () => {
+  const node = { id: 8, inputs: [{ type: "IMAGE", link: 2 }] };
+  assert.deepEqual(liveLinkTargetInput(node, 2), { index: 0, name: undefined });
+});
+
+test("liveLinkTargetInput matches a string link id against a numeric backlink (#342)", () => {
+  const node = { id: 8, inputs: [{ name: "image", type: "IMAGE", link: 7 }] };
+  assert.deepEqual(liveLinkTargetInput(node, "7"), { index: 0, name: "image" });
+});
+
+test("liveLinkTargetInput never matches an unlinked input — even to link id 0 (#342)", () => {
+  // Number(null) is 0: without the null guard, link id 0 would "resolve" to the
+  // first UNCONNECTED input and fabricate the very connectivity #342 removes.
+  const node = { id: 8, inputs: [{ name: "image", type: "IMAGE", link: null }] };
+  assert.equal(liveLinkTargetInput(node, 0), null);
+});
+
+test("liveLinkTargetInput never throws on malformed nodes (#342)", () => {
+  assert.equal(liveLinkTargetInput(null, 1), null);
+  assert.equal(liveLinkTargetInput({}, 1), null);
+  // Holes in the inputs array are skipped, not crashed on.
+  assert.equal(liveLinkTargetInput({ inputs: [null, undefined] }, 3), null);
+  assert.deepEqual(liveLinkTargetInput({ inputs: [null, { link: 3 }] }, 3), { index: 1, name: undefined });
 });
