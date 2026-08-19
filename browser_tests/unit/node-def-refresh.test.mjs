@@ -22,6 +22,7 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
+  NODE_DEFS_COMBO_FLOOR_MS,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -389,6 +390,7 @@ function buildRegisterComfyNodeDefs({
   appValue,
   apiValue,
   timers,
+  now,
   recordObjectInfoTypes = () => ({}),
   reapplyDefsToLiveNodes = () => {},
 }) {
@@ -410,6 +412,7 @@ function buildRegisterComfyNodeDefs({
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
+    "NODE_DEFS_COMBO_FLOOR_MS",
     "nodeDefsBudgetLeft",
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -456,8 +459,13 @@ function buildRegisterComfyNodeDefs({
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
-    nodeDefsBudgetLeft,
-    monotonicNow,
+    NODE_DEFS_COMBO_FLOOR_MS,
+    // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
+    // helper reads the REAL monotonicNow; a fake-clock deadline measured against it is a
+    // different bound than the one the panel arms (its own nodeDefsBudgetLeft shares the
+    // panel's clock). Without the override the shared helper is passed through unchanged.
+    now ? (deadline, share = 1) => Math.max(1, Math.floor((deadline - now()) * share)) : nodeDefsBudgetLeft,
+    now ?? monotonicNow,
     NODE_DEFS_RETRY_DELAYS_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
@@ -872,6 +880,15 @@ function virtualTimers() {
         t.fn();
       }
     },
+    // Advance the clock to `limitMs`: fire every armed timer whose delay is within it,
+    // so a test can let a 4846ms step COMPLETE without firing a 6000ms bound.
+    fireUpTo(limitMs) {
+      for (const [id, t] of [...pending]) {
+        if (t.ms > limitMs) continue;
+        pending.delete(id);
+        t.fn();
+      }
+    },
   };
 }
 
@@ -915,7 +932,11 @@ test("#1180 the combo phase arms a bound, using the panel's constant", async () 
   // phase ran first and its cost comes out of the same total. So the assertion is a band,
   // and both edges matter — 0 or less arms nothing at all (withTimeout's non-positive
   // contract, which silently restores the hang), and anything above the run budget means
-  // the phase is spending time the run has not got.
+  // the phase is spending time the run has not got. #1193's FLOOR sits under that
+  // remainder but does not bind here: this fetch answered instantly, so the remainder is
+  // the whole budget, which is larger than the floor. The floor cases — armed exactly
+  // when the remainder runs out, still bounding, and not shrinking a healthy remainder —
+  // are the #1193 tests below.
   assert.ok(
     armed[0].ms > 0 && armed[0].ms <= NODE_DEFS_RUN_BUDGET_MS,
     `the combo bound must be the run's REMAINING budget, saw ${armed[0].ms}ms against a ${NODE_DEFS_RUN_BUDGET_MS}ms run`,
@@ -949,6 +970,110 @@ test("#1180 a combo refresh that never answers is NOT reported as a refresh", as
     false,
     "a combo refresh that never answered must not license trusting the combo lists to suppress missing assets",
   );
+});
+
+test("#1193: a slow-but-healthy fetch leaves the combo phase its FLOOR, and the healthy combo completes", async () => {
+  // The issue's failing row, run against the SHIPPED executor with a clock the test
+  // controls: the fetch takes 5500ms of its 6000ms share and SUCCEEDS, leaving a pure
+  // remainder of 3500ms for a combo phase whose measured cost is 4846ms — abandoned
+  // before the floor, reporting combo_refresh_failed over a refresh that would have
+  // completed (and leaving the next panel_set_widget refusing the value the refresh
+  // was for).
+  //
+  // Both waits are VIRTUAL: the deadline arithmetic runs on the injected clock, the
+  // combo's own 4846ms on the injected timers. fireUpTo(4846) lets the combo finish
+  // only when the armed bound is LARGER than that — pre-floor it was 3500ms and fired
+  // first, so this test fails on the pre-fix code for the right reason.
+  let now = 0;
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: () => new Promise((resolve) => { timers.setTimer(resolve, 4846); }),
+    },
+    apiValue: {
+      getNodeDefs: async () => {
+        now += 5500;
+        return { SomeNode: {} };
+      },
+    },
+    timers,
+    now: () => now,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  timers.fireUpTo(4846);
+  const verdict = await orFail(running, "the combo phase never settled");
+
+  assert.deepEqual(verdict, { refreshed: true, reason: "refreshed" });
+  assert.equal(getConfirmed(), true, "the combo ACTUALLY completed inside its floor, so the trust gate may open");
+});
+
+test("#1193: the floor is ARMED exactly when the remainder runs out — and it still BOUNDS", async () => {
+  // The other half of the floor: it must not become "no bound". Same starved remainder
+  // as above, but the combo never answers — the bound that fires must be the floor
+  // itself, and the run must still give up and say so.
+  let now = 0;
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: () => new Promise(() => {}), // never settles
+    },
+    apiValue: {
+      getNodeDefs: async () => {
+        now += 5500;
+        return { SomeNode: {} };
+      },
+    },
+    timers,
+    now: () => now,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  const armed = timers.armed();
+  assert.equal(armed.length, 1, "the fetch's bound is cleared by its answer; only the combo's remains");
+  assert.equal(
+    armed[0].ms,
+    NODE_DEFS_COMBO_FLOOR_MS,
+    `the fetch spent 5500ms of a ${NODE_DEFS_RUN_BUDGET_MS}ms run; the combo phase gets the floor, not the 3500ms remainder`,
+  );
+  timers.fireAll();
+  const verdict = await orFail(running, "the floor removed the bound entirely — registerComfyNodeDefs is still awaiting refreshComboInNodes");
+
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  assert.equal(getConfirmed(), false, "a combo that never answered must not be trusted, floor or not");
+});
+
+test("#1193: the floor is a FLOOR, not a new allowance — a fast fetch leaves the whole remainder in charge", async () => {
+  // If the remainder ever SHRANK to the floor the fix would have traded one starvation
+  // for another: a healthy run's combo phase gets the whole remaining budget here and
+  // must keep it.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: () => new Promise(() => {}), // never settles
+    },
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+    now: () => 0, // no time passes: the remainder is the whole budget
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  const armed = timers.armed();
+  assert.equal(armed.length, 1);
+  assert.equal(
+    armed[0].ms,
+    NODE_DEFS_RUN_BUDGET_MS,
+    "the remainder exceeds the floor, so the bound must stay the remainder",
+  );
+  timers.fireAll();
+  await orFail(running, "the combo phase never gave up");
 });
 
 test("#1180: a REAL error survives a later stall — the synthesized timeout must not speak for it", async () => {
