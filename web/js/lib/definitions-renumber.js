@@ -451,10 +451,23 @@ function definitionDiffersOnlyByRenumber(a, b, map, relabeled) {
  * reference is not something this surface may vouch for.
  *
  * An unreadable `proxyWidgets` entry counts as referencing — "cannot tell" is not "no".
+ * So does an id in a non-canonical numeric dialect: see the comparison below.
+ * Keying on ONE spelling of an id is the defect class this repo keeps catching — a
+ * String-keyed set does not see `"78.0"` as the node the frontend patches as 78.
  */
 function rootNodesReferenceRemappedId(rootNodes, remappedFrom) {
   if (!Array.isArray(rootNodes)) return true;
   if (remappedFrom.size === 0) return false;
+  // The same payload id, in every dialect this guard is willing to be sure about.
+  // Comparing ONE spelling is what makes a key-matching guard miss (gate finding):
+  // `78` and `"78.0"` are the same node to anything that reads the id numerically and
+  // two different strings to anything that reads it textually, so a promoted widget
+  // written `"78.0"` slipped past a String-keyed set while the load still broke it.
+  const numericForms = new Set();
+  for (const key of remappedFrom) {
+    const n = Number(key);
+    if (Number.isFinite(n)) numericForms.add(String(n));
+  }
   for (const node of rootNodes) {
     const promoted = node?.properties?.proxyWidgets;
     if (promoted == null) continue;
@@ -468,6 +481,21 @@ function rootNodesReferenceRemappedId(rootNodes, remappedFrom) {
         return true;
       }
       if (remappedFrom.has(key)) return true;
+      const asNumber = Number(key);
+      if (Number.isFinite(asNumber) && numericForms.has(String(asNumber))) return true;
+      // ...and one more reading, because `Number()` is not the only way an id gets
+      // interpreted numerically. `Number("78abc")` is NaN while a leading-integer parse
+      // is 78, so a text comparison AND a `Number()` comparison would both miss an entry
+      // that some reader resolves to a node the relabeling moved.
+      //
+      // Deliberately NOT "refuse every non-canonical id": that was tried and it refuses
+      // `"999999.0"`, which names nothing that moved. An over-broad guard is a
+      // regression wearing a fix's clothes — this asks only whether the entry can be
+      // read as one of the ids that ACTUALLY moved.
+      const leading = /^\s*[+-]?\d+/.exec(key);
+      if (!leading) continue;
+      const asLeadingInt = Number(leading[0]);
+      if (Number.isFinite(asLeadingInt) && numericForms.has(String(asLeadingInt))) return true;
     }
   }
   return false;
