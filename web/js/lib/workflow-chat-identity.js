@@ -385,13 +385,17 @@ export function selectorTargetsNonActiveWorkflow({ resolved, active } = {}) {
  *  active one (workflow_list, by contrast, reports the ACTIVE workflow — a
  *  stale-stamped call must not answer for the wrong tab, so it stays fenced).
  *  graph_update_node is a Manager PACK update misnamed with a graph_ prefix; it
- *  touches no graph. */
+ *  touches no graph. graph_get_virtual_types (comfyui-mcp#1400) reads the GLOBAL
+ *  LiteGraph class registry, never a canvas, and its reply describes no workflow —
+ *  and it is pulled by the orchestrator at hello, where no workflow stamp exists
+ *  to agree with. */
 const CANVAS_INDEPENDENT_COMMANDS = new Set([
   'nodes_search',
   'nodes_list',
   'nodes_install',
   'nodes_queue_status',
   'graph_update_node',
+  'graph_get_virtual_types',
   'comfy_reboot',
   'free_vram',
 ]);
