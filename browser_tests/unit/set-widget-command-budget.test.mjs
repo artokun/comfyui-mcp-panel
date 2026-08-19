@@ -491,3 +491,42 @@ test("#1413 the corrected #1192 note no longer claims set_widget's oracle allows
   );
   assert.match(PANEL_SRC, new RegExp(`OBJECT_INFO_DEADLINE_MS is ${Number(declared[1]).toLocaleString("en-US")} ms`));
 });
+
+test("#1413 the other two relayed commands still hold ONE self-bounded wait each", () => {
+  // THE AUDIT THE ISSUE ASKED FOR, checked rather than asserted in a comment. Six commands
+  // are relayed in the orchestrator's 30,000 ms window; four now hold a budget
+  // (graph_add_node, nodes_install, refresh_nodes, graph_set_widget) and these two do not.
+  // They do not need one TODAY, for a reason that is a property of their bodies rather than
+  // a promise: each has exactly one await and it lands on `fetchWholeObjectInfo`, which
+  // bounds itself below the window and has nothing to compose against.
+  //
+  // Which is precisely the kind of claim that rots. #1409's comment said refresh_nodes was
+  // "the last one that never took" a budget and that sentence concealed THIS issue, so this
+  // one is a test: grow either command a second wait and it goes red, whether or not anyone
+  // remembers to reread the note beside the constant.
+  const oracleSrc = readFileSync(new URL("../../web/js/lib/object-info-oracle.js", import.meta.url), "utf8");
+  assert.match(oracleSrc, /export const OBJECT_INFO_DEADLINE_MS = \d+;/, "the oracle's self-bound has moved");
+
+  for (const name of ["graph_get_object_info", "graph_remove_widget"]) {
+    const start = PANEL_SRC.indexOf(`async ${name}(`);
+    assert.ok(start > 0, `${name} is no longer an async executor — update this audit`);
+    const end = PANEL_SRC.indexOf("\n  },", start);
+    assert.ok(end > start, `could not find the end of ${name}`);
+    const body = PANEL_SRC.slice(start, end);
+
+    const awaits = body
+      .split(/\r?\n/)
+      .filter((line) => /\bawait /.test(line) && !/^\s*(\/\/|\*)/.test(line));
+    assert.equal(
+      awaits.length,
+      1,
+      `${name} has grown to ${awaits.length} awaits — it now COMPOSES waits inside the ` +
+        `30,000 ms relay window and needs a command budget like graph_set_widget's:\n` +
+        awaits.map((l) => `    ${l.trim()}`).join("\n"),
+    );
+    assert.ok(
+      !/refreshComfyNodeDefs/.test(body),
+      `${name} now awaits the node-def coalescer — bound it with a command budget (#1413)`,
+    );
+  }
+});

@@ -10488,6 +10488,16 @@ const REFRESH_NODES_COMMAND_BUDGET_MS = 25000;
  * already useless: the steps after it still have to run, so its reply landed past the window
  * and the agent got a bare `did not reply … within 30000 ms` instead of a worded refusal.
  * Narrowing it to fit is the trade #1192 made for `graph_add_node`'s copy of the same fetch.
+ *
+ * THE OTHER TWO RELAYED COMMANDS WERE AUDITED IN THE SAME PASS, because #1409's own comment
+ * asserting `refresh_nodes` was "the last one that never took" a budget is what concealed
+ * THIS occurrence, and a fourth instance is enough of a pattern to check the rest rather than
+ * reassure about them. `graph_get_object_info` and `graph_remove_widget` each hold exactly
+ * ONE await, and both land on `fetchWholeObjectInfo`, which bounds itself at
+ * OBJECT_INFO_DEADLINE_MS — under the window with nothing to compose against. Neither needs a
+ * budget and neither is a fifth instance. That claim is CHECKED, not stated: see
+ * set-widget-command-budget.test.mjs, which fails if either grows a second wait — a comment
+ * asserting this would rot into exactly the reassurance that produced this issue.
  */
 const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
 
