@@ -109,11 +109,14 @@ import {
   buildInstallRequest,
   classifyInstallOutcome,
   classifyUpdateOutcome,
+  collectInProgressTasks,
   collectRecentTaskFailures,
+  createManagerQueueWatch,
   createManagerTaskResultLog,
   dialectRetryTarget,
   dialectServesTaskHistory,
   looksLikeTaskHistory,
+  silentQueueStallNote,
   taskHistoryBlindNote,
   installGitUrl,
   installedListRoute,
@@ -6900,6 +6903,9 @@ function boundedDelay(ms, deadline) {
  *  the next line, which is what leaves a poll looking at an idle queue holding
  *  nothing. See manager-install.js for the source it was read from. */
 const managerTaskResults = createManagerTaskResultLog();
+
+/** Times a silent Manager in_progress so a poll can name a stall (#1480). */
+const managerQueueWatch = createManagerQueueWatch();
 
 /** How long a captured failure stays reportable on a queue poll. A defeat from
  *  hours ago is not what "is my install done?" is asking, and repeating it reads
@@ -21122,8 +21128,23 @@ const GRAPH_TOOL_EXECUTORS = {
     // byte-identical to a v4 with nothing to report.
     const canReportFailures = dialectServesTaskHistory(dialect) && looksLikeTaskHistory(history);
     const blindNote = canReportFailures ? "" : taskHistoryBlindNote(dialect);
+    // #1480 — Manager's counts are still attached as `status`. A repeating
+    // in_progress is timed here so a silent stall is named instead of looking
+    // like progress; the stall note never rewrites those counts and never
+    // claims the task failed.
+    const liveness = managerQueueWatch.observe(status);
+    const inProgress = liveness.processing ? collectInProgressTasks(history) : [];
+    const stallNote = liveness.stalled ? silentQueueStallNote(liveness) : "";
+    const withLiveness = (out) => {
+      if (inProgress.length) out.in_progress = inProgress;
+      if (liveness.processing) {
+        out.queue_liveness = { stalled: liveness.stalled, silent_ms: liveness.silent_ms };
+      }
+      if (stallNote) out.note = out.note ? `${out.note}\n\n${stallNote}` : stallNote;
+      return out;
+    };
     if (recentFailures.length) {
-      return {
+      return withLiveness({
         status,
         recent_failures: recentFailures,
         failure_reporting: canReportFailures ? "complete" : "partial",
@@ -21139,12 +21160,12 @@ const GRAPH_TOOL_EXECUTORS = {
           // record. Those are real, but the list is not exhaustive — say so,
           // rather than let a partial list be taken for the whole story.
           (blindNote ? `\n\n${blindNote}` : ""),
-      };
+      });
     }
     if (!canReportFailures) {
-      return { status, failure_reporting: "unavailable", note: blindNote };
+      return withLiveness({ status, failure_reporting: "unavailable", note: blindNote });
     }
-    return { status, failure_reporting: "complete" };
+    return withLiveness({ status, failure_reporting: "complete" });
   },
 
   // #851 — every branch below names the TARGET as well as the route, via

@@ -32,7 +32,9 @@ import { fileURLToPath } from "node:url";
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
 const {
   classifyInstallOutcome,
+  collectInProgressTasks,
   collectRecentTaskFailures,
+  createManagerQueueWatch,
   createManagerTaskResultLog,
   dialectServesTaskHistory,
   looksLikeTaskHistory,
@@ -40,6 +42,7 @@ const {
   queueDrained,
   queueEventFailureReason,
   queueEventTaskResults,
+  silentQueueStallNote,
   taskFailureReason,
   taskHistoryBlindNote,
   unlistedGitUrlAdvice,
@@ -422,12 +425,15 @@ function buildQueueStatus({ dialect, routes, managerTaskResults }) {
   const deps = {
     detectManagerDialect: async () => dialect,
     managerGet: get,
+    collectInProgressTasks,
     collectRecentTaskFailures,
     dialectServesTaskHistory,
     looksLikeTaskHistory,
     taskHistoryBlindNote,
     unlistedGitUrlAdvice,
+    silentQueueStallNote,
     managerTaskResults,
+    managerQueueWatch: createManagerQueueWatch(),
     CAPTURED_FAILURE_TTL_MS: 30 * 60 * 1000,
     MANAGER_FETCH_TIMEOUT_MS: 15000,
     AbortSignal,
