@@ -16115,7 +16115,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // running. But the caller must not be left believing this ComfyUI is healthy —
     // their next FULL run will still fail on the same node — and an agent that
     // cannot see the extra round trip cannot report it either.
-    if (partialTargets && runScopeResult?.prunedRetry) {
+    //
+    // GATED ON A VERIFIED POST (codex gate r2, P1), not on reaching this line. The
+    // note asserts that the pruned prompt is the one ComfyUI ACCEPTED, and the
+    // control flow above does establish that — a failed retry returns at the
+    // outcome check, a rejected one at summarizePromptRejection. But that is an
+    // invariant held three early-returns away, and one of them returns null for a
+    // 400 whose error and node_errors are both empty. A claim about acceptance
+    // reads the count of posts ComfyUI accepted, so it stays true on its own.
+    if (partialTargets && runScopeResult?.prunedRetry && runScopeResult.verified > 0) {
       const pr = runScopeResult.prunedRetry;
       accept.excluded_nodes_omitted = Array.isArray(pr.removed) ? pr.removed : [];
       accept.excluded_nodes_note = prunedRetryNote({

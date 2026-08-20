@@ -3631,4 +3631,12 @@ test("#1871 WIRING: graph_run actually RENDERS the pruned-retry disclosure into 
   assert.match(raw, /accept\.excluded_nodes_note = prunedRetryNote\(/, "and the sentence is built from them");
   assert.match(raw, /toNodeId: to_node_id/, "the note names the node the caller asked for");
   assert.match(raw, /namedNode: pr\.namedNode/, "and the node ComfyUI refused");
+  // codex gate r2, P1 — the note says the pruned prompt is the one ComfyUI ACCEPTED.
+  // A retry that was itself refused must never reach it, and that must be true of
+  // this line rather than of three early returns further up.
+  assert.match(
+    source.slice(start - 200, start + 120),
+    /runScopeResult\.verified > 0/,
+    "the acceptance claim is gated on a post ComfyUI actually accepted",
+  );
 });
