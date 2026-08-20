@@ -1,3 +1,4 @@
+import { fireNodeWidgetChanged } from "./node-widget-changed.js";
 import { pressableWidgetHint } from "./pressable-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
@@ -2312,6 +2313,55 @@ export function applyWidgetWrite(
 
   setDirty?.();
 
+  // #1519 — FIRE THE NODE-LEVEL HOOK, here and nowhere else.
+  //
+  // `node.onWidgetChanged(name, value, prevValue, widget)` is the litegraph hook a pack
+  // patches onto a node TYPE (in `beforeRegisterNodeDef`) to rebuild slot topology from
+  // a widget. It is not the widget's own callback and a pack cannot use the callback
+  // instead — the callback lives on a widget the rebuild replaces. The frontend fires
+  // both, in this order, on every interactive edit; this file fired only the callback,
+  // so a programmatic write left such a node holding the NEW widget value and its OLD
+  // slots, silently. See lib/node-widget-changed.js for the frontend call sites this
+  // reproduces and the reported `SWF_Subworkflow` case.
+  //
+  // PLACED AFTER THE VERIFICATION VERDICT, which is the whole of the ordering question
+  // the report raised. Every failure path above has already rolled back and THROWN by
+  // the time control reaches here, so the hook cannot run for a write that did not
+  // stick — a pack rebuilt against a value that was subsequently restored is the one
+  // outcome worse than the stale slots this fixes. Nothing in the rollback machinery is
+  // touched; this is reachable only from the success path.
+  //
+  // FIRED ONCE, on the node/widget pair whose callback this write fired — `valueNode`
+  // and `valueWidget`, which on an instance-scoped promoted write are the wrapper and
+  // its rail, and otherwise the concrete target. Announcing the change a second time
+  // for the other end of a promotion would report a change for a widget whose value
+  // did not move, which is the same reasoning the callback note above records.
+  //
+  // ARGUMENTS: the VERIFIED value read back off the widget, not `coerced`. Where a
+  // widget's own grid normalized the write (#805) the two differ, and handing a pack a
+  // value the widget does not hold is how a rebuild lands on state nothing agrees with.
+  // For every write that did not normalize they are identical. `previousForHook` is
+  // that same widget's own prior value, never the other end of the promotion's.
+  //
+  // Unlike the frontend's `BaseWidget.setValue`, this is NOT gated on the value having
+  // changed. The gate does not exist for the callback invocation above either, and
+  // adding one only here would make re-issuing the same `panel_set_widget` — the
+  // obvious way a caller recovers from exactly this bug — a silent no-op.
+  //
+  // It NEVER decides this write's verdict: a throwing hook is disclosed on the success
+  // result, the same containment the widget callback and #1282's refresh press get.
+  const verifiedValue = valueWidget.value;
+  const verifiedName = valueWidget.name;
+  const previousForHook = instanceScoped ? previousParent : previous;
+  const widgetChanged = fireNodeWidgetChanged(valueNode, valueWidget, {
+    name: verifiedName,
+    value: verifiedValue,
+    previous: previousForHook,
+    beforeChange,
+    afterChange,
+    setDirty,
+  });
+
   // On success, a promoted write has ALWAYS synced the authoritative parent rail
   // widget (verified AFTER afterChange, or it would have rolled back + thrown).
   // parent_widget_synced is reported for observability / defense-in-depth in the
@@ -2330,11 +2380,16 @@ export function applyWidgetWrite(
   // change. Provenance is not lost: `promoted_from.inner_node_id` still names the inner
   // node and `inner_previous` still reports its (unchanged) value. Every definition-scoped
   // and non-promoted write reports exactly the fields it always did.
+  // #1519 — `widget`/`value` are the captures taken BEFORE the node hook fired, not a
+  // fresh read. They are what the verification above ESTABLISHED, and a hook that
+  // rebuilds a node can replace the widget object or move its value; reporting a
+  // post-hook read would put a value in the reply that nothing verified. With no hook
+  // (every stock node) the captures are the same reads this returned before.
   return {
     node_id: valueNode.id,
-    widget: valueWidget.name,
+    widget: verifiedName,
     previous: parentWidget ? previousParent : previous,
-    value: valueWidget.value,
+    value: verifiedValue,
     // #1126 — the COERCION-TIME verdict, so the caller reports WHAT HAPPENED instead of
     // inferring it from the rejection that led here. `options.values` is a callback and
     // can answer differently per call: the final attempt may well have been admitted by
@@ -2390,6 +2445,24 @@ export function applyWidgetWrite(
     // caller reaching that acceptance from EITHER ladder branch sees one field with one
     // name, rather than the #507 branch alone naming it at the runSetWidget level.
     ...(coerceOutcome.emptyAcceptanceUsed ? { empty_option_list: true } : {}),
+    // #1519 — what the node's own onWidgetChanged hook did, as DATA. Both fields are
+    // emitted ONLY on an OBSERVATION, so every node without the hook — which is every
+    // stock ComfyUI node — replies byte-identically to before:
+    //
+    //   widget_changed_slots        the hook rebuilt the node's slots synchronously;
+    //                               these are the input/output names AFTER it, so the
+    //                               caller can wire the node without a re-read.
+    //   widget_changed_hook_failed  attempting to invoke the hook threw. The WRITE is
+    //                               unaffected — it is verified and was not rolled back
+    //                               — but the state the hook rebuilds may be stale or
+    //                               partially rebuilt, and that is stated rather than
+    //                               left for a later `panel_connect` to discover.
+    //
+    // A hook that ran and changed no slots reports NOTHING, because a pack that rebuilds
+    // from a `fetch` (the reported `SWF_Subworkflow` does) resolves after this returns:
+    // a synchronous snapshot showing no change means "not yet", not "nothing happened".
+    ...(widgetChanged?.changed ? { widget_changed_slots: widgetChanged.changed } : {}),
+    ...(widgetChanged?.failed ? { widget_changed_hook_failed: widgetChanged.failed } : {}),
     ...(writeWarning
       ? {
           write_warning: writeWarning,
@@ -2408,9 +2481,11 @@ export function applyWidgetWrite(
           requested_value: expected,
           normalization_rule: normalization.rule,
           normalization_note: normalizationNote({
-            name: valueWidget.name,
+            // #1519 — the same pre-hook captures the verdict was computed from, so the
+            // note cannot describe a value the normalization check never saw.
+            name: verifiedName,
             requested: expected,
-            actual: valueWidget.value,
+            actual: verifiedValue,
             rule: normalization.rule,
           }),
         }
