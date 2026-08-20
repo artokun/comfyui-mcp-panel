@@ -419,6 +419,7 @@
       "mcp_did_not_open_in_time": "MCP no se abrió en 90 segundos. Revisa el error de inicio en el terminal y vuelve a intentar Conectar.",
       "multiple_ready_providers_found": "Se encontraron varios proveedores listos. Elige cuál debe usar este panel.",
       "not_now": "Ahora no",
+      "set_widget_inner_callback_not_invoked": " — valor en efecto en esta instancia del subgrafo, pero la retrollamada propia del nodo interno compartido NO se ejecutó; lo que esta controla (el modo de otro nodo, widgets dependientes) puede seguir desactualizado",
       "starting_mcp": "Iniciando MCP…",
       "use_provider": "Usar proveedor",
       "click_to_copy": "Haz clic para copiar",

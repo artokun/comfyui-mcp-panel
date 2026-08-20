@@ -820,6 +820,7 @@
       "set_the_base_url_and_api_key": "Set the base URL (and API key if needed) in Settings › Custom endpoint",
       "set_type_to_replace": "•••• set — type to replace",
       "set_widget": "Set {widget} = {value} on node {node_id}",
+      "set_widget_inner_callback_not_invoked": " — value in effect on this subgraph instance, but the shared inner node's own callback did NOT run; anything it drives (another node's mode, dependent widgets) may still be stale",
       "set_widget_option_list_unreadable": " — NOT validated: this combo's own option list could not be read, so nothing checked the value",
       "set_widget_option_list_unreadable_rail_checked": " — this combo's own option list could not be read; the value was checked against the parent subgraph rail's list, which does contain it",
       "set_widget_rail_not_synced": " — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)",

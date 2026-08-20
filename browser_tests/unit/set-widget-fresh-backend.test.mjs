@@ -273,6 +273,36 @@ test("#1126 wiring: the activity summary DISCLOSES a write nothing validated", (
   assert.match(branch, /writeDisclosed \|\| unvalidatedUnreadable \? "pi-exclamation-triangle"/);
 });
 
+test("#1492 wiring: the activity summary DISCLOSES the inner callback an instance-scoped write skipped", () => {
+  // widget-write sets `promoted_from.inner_callback_not_invoked` when an instance-scoped
+  // promoted write left the SHARED inner widget's callback uninvoked — the reported case
+  // flips another node between ACTIVE and BYPASS, so the graph is half-changed. Rendered
+  // as a plain "Set … " success, the one line a user reads says the opposite. Asserted at
+  // the SOURCE for the same reason as #1126 above: this is a one-expression install in the
+  // renderer, and deleting it leaves every behavioural test in this repo green.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf('case "graph_set_widget": {');
+  assert.notEqual(start, -1, "the graph_set_widget summary branch must exist");
+  const end = src.indexOf('case "graph_get_subgraph":', start);
+  assert.notEqual(end, -1, "the summary branch boundary must exist");
+  const branch = src.slice(start, end);
+  // Read as DATA off the result. The note itself is prose and would be translated, so a
+  // text predicate over it would be disarmed in 11 of 12 locales.
+  assert.match(
+    branch,
+    /r\.set\?\.promoted_from\?\.inner_callback_not_invoked === true/,
+    "the summary must read the lib's field, not the note's wording",
+  );
+  // …and it must reach the rendered text, not merely be computed.
+  assert.match(
+    branch,
+    /innerCallbackNotInvoked[\s\S]*tr\(\s*"panel\.set_widget_inner_callback_not_invoked"/,
+    "the disclosure must be appended to the summary line",
+  );
+  // The warning icon, so a half-applied change does not read as a clean success.
+  assert.match(branch, /innerCallbackNotInvoked \|\| writeDisclosed/);
+});
+
 test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into runSetWidget", () => {
   // The lib's blind-write fallback fails closed on any schema that is not LIVE, and
   // node-resolve.test.mjs proves that behaviour by passing `schemaProvenance` directly.

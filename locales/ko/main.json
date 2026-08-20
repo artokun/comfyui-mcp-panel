@@ -389,6 +389,7 @@
       "mcp_did_not_open_in_time": "MCP가 90초 안에 열리지 않았습니다. 터미널의 시작 오류를 확인한 뒤 연결을 다시 시도하세요.",
       "multiple_ready_providers_found": "사용 가능한 제공자가 여러 개 발견되었습니다. 이 패널에서 사용할 제공자를 선택하세요.",
       "not_now": "나중에",
+      "set_widget_inner_callback_not_invoked": " — 이 서브그래프 인스턴스에는 값이 반영되었지만, 공유되는 내부 노드 자체의 콜백은 실행되지 않았습니다. 그 콜백이 제어하는 것(다른 노드의 모드, 종속 위젯)은 아직 이전 상태일 수 있습니다",
       "starting_mcp": "MCP 시작 중…",
       "use_provider": "제공자 사용",
       "click_to_copy": "클릭하면 복사됩니다",

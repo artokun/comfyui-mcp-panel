@@ -404,6 +404,7 @@
       "mcp_did_not_open_in_time": "MCP 90 saniye içinde açılmadı. Terminaldeki başlatma hatasını kontrol edip Bağlan'ı yeniden deneyin.",
       "multiple_ready_providers_found": "Birden fazla hazır sağlayıcı bulundu. Bu panelin hangisini kullanacağını seçin.",
       "not_now": "Şimdi değil",
+      "set_widget_inner_callback_not_invoked": " — değer bu alt grafik örneğinde geçerli, ancak paylaşılan iç düğümün kendi geri çağrısı ÇALIŞMADI; onun sürdüğü şeyler (başka bir düğümün modu, bağımlı widget'lar) hâlâ eski olabilir",
       "starting_mcp": "MCP başlatılıyor…",
       "use_provider": "Sağlayıcıyı kullan",
       "click_to_copy": "Kopyalamak için tıklayın",
