@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- a timestamp-less transcript longer than the local shadow keeps the order it was written in (#1536)
+
 ## [0.15.28] - 2026-08-20
 
 ### Fixed
