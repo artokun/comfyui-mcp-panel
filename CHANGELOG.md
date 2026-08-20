@@ -6,10 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.26] - 2026-08-20
+
 ### Fixed
 - `panel_add_node` of a subgraph UUID already loaded in the live workflow no longer rejects it as an unknown backend node or names an unrelated failed pack (#1523)
 - a run ComfyUI accepted while dropping some outputs is reported as queued, with the dropped outputs named, instead of as a refusal (#1504)
 - `panel_list_nodes` with `search` (or `query`) filters the installed-pack list instead of returning every pack (#1496)
+- a run-to-node no longer has its own branch vetoed by an uninstalled pack on a branch it excluded (mcp#1871)
+- the panel's own pre-flight stops refusing before ComfyUI is asked, so that recovery can run (mcp#1871)
+- a group is built from the same footprint its members are judged by, so requested collapsed nodes are included (mcp#1877)
+- a locator that could not look no longer reports the node as being from another workflow (#1501)
+- a refusal claims nothing about a final size it never read (#1872)
 
 ## [0.15.25] - 2026-08-20
 
