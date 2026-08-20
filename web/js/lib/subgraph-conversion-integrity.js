@@ -422,9 +422,11 @@ const linkOriginId = (link) => link?.origin_id ?? (Array.isArray(link) ? link[1]
 const linkTargetId = (link) => link?.target_id ?? (Array.isArray(link) ? link[3] : undefined);
 
 /** Ids of the nodes directly wired to `node` — the boundary neighbours a conversion
- *  has to disconnect and re-attach, and therefore the ones whose detachment is fatal. */
-function linkedNeighborIds(node, links) {
-  const lookup = linkLookup(links);
+ *  has to disconnect and re-attach, and therefore the ones whose detachment is fatal.
+ *
+ *  Takes a prepared `lookup` rather than the link table, so a caller sweeping a whole
+ *  selection indexes a serialized (array) table once instead of once per node. */
+function linkedNeighborIds(node, lookup) {
   const ids = new Set();
   for (const input of Array.isArray(node?.inputs) ? node.inputs : []) {
     const id = linkOriginId(lookup(input?.link));
@@ -458,6 +460,7 @@ export function detachedConversionNodes(graph, nodes) {
   if (!selection.length) return [];
   if (typeof graph?.getNodeById !== "function") return [];
   const owns = (node) => node?.id != null && graph.getNodeById(node.id) === node;
+  const lookup = linkLookup(graph?.links);
   const found = [];
   const seen = new Set();
   const consider = (node) => {
@@ -468,7 +471,7 @@ export function detachedConversionNodes(graph, nodes) {
   };
   for (const node of selection) {
     consider(node);
-    for (const id of linkedNeighborIds(node, graph?.links)) consider(graph.getNodeById(id));
+    for (const id of linkedNeighborIds(node, lookup)) consider(graph.getNodeById(id));
   }
   return found;
 }
