@@ -22,6 +22,11 @@
 // constant, because that constant lives in the OTHER repo.
 
 import { makeCommandBudget } from "./command-budget.js";
+// #1455 — the SAME normalizer the save layer decides paths with. Comparing a raw
+// requested name against ComfyUI's derived `filename` is a wrong-pair test: the
+// frontend strips the directory and the .json/.app.json suffix, so "Foo.json" and
+// "Foo" are the same workflow and must not read as a moved canvas.
+import { baseName } from "./workflow-save.js";
 
 /** Whole-command deadline `workflow_save` / `workflow_save_as` take. */
 export const WORKFLOW_SAVE_COMMAND_BUDGET_MS = 13000;
@@ -90,6 +95,14 @@ export function describeWorkflowSaveTimeout({
   const total = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : WORKFLOW_SAVE_COMMAND_BUDGET_MS;
   const seconds = Math.max(1, Math.round(total / 1000));
   const str = (v) => (typeof v === "string" && v ? v : null);
+  // Directory + extension are presentation, not identity: `panel_list_workflows`
+  // reports "workflows/Foo.json" and the canvas reports "Foo" for one workflow.
+  const nameKey = (v) => {
+    const raw = String(v ?? "").trim();
+    if (!raw) return "";
+    const segments = raw.split(/[\\/]/);
+    return baseName(segments[segments.length - 1] ?? raw);
+  };
   const dest = str(requested);
   const active = str(filename);
   const prior = str(previousActive);
@@ -113,7 +126,7 @@ export function describeWorkflowSaveTimeout({
         `and panel_list_workflows reports that same flag. Treat the outcome as UNDETERMINED. `;
 
   // Case 3 — the target is genuinely unknown. Never dressed up as case 2.
-  if (!dest && prior && active && prior !== active) {
+  if (!dest && prior && active && nameKey(prior) !== nameKey(active)) {
     return (
       `workflow_save did not finish within ${seconds}s. ` +
       head +
@@ -123,12 +136,15 @@ export function describeWorkflowSaveTimeout({
     );
   }
 
-  const subject = dest ?? prior ?? active;
+  // When the destination and the canvas are the SAME workflow, prefer the name the
+  // frontend derived: it is the file as it actually exists. `dest` is only needed to
+  // NAME a target the canvas is not showing.
+  const subject = dest && active && nameKey(dest) === nameKey(active) ? active : (dest ?? prior ?? active);
   const who = subject ? `"${subject}"` : "the active workflow";
 
   // Case 1 with a moved canvas: the destination is known, but the flags on screen
   // belong to some other workflow. Report the target; withhold the foreign flags.
-  if (dest && active && active !== dest) {
+  if (dest && active && nameKey(active) !== nameKey(dest)) {
     return (
       `workflow_save did not finish within ${seconds}s for ${who}. ` +
       head +
@@ -138,8 +154,24 @@ export function describeWorkflowSaveTimeout({
     );
   }
 
-  const reads = flags.length ? `The same tab reports ${flags.join(" ")}. ` : "The tab's save flags could not be read. ";
-  return `workflow_save did not finish within ${seconds}s for ${who}. ` + head + reads + verdict + retry;
+  if (!flags.length) {
+    // Nothing was read, so there is no observation to report and nothing to reason
+    // from. Saying "modified:false is also the state of…" here would discuss a flag
+    // this reply never saw.
+    return (
+      `workflow_save did not finish within ${seconds}s for ${who}. ` +
+      head +
+      `The tab's save flags could not be read, so the outcome is UNDETERMINED. ` +
+      retry
+    );
+  }
+  return (
+    `workflow_save did not finish within ${seconds}s for ${who}. ` +
+    head +
+    `The same tab reports ${flags.join(" ")}. ` +
+    verdict +
+    retry
+  );
 }
 
 /**
